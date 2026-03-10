@@ -173,11 +173,7 @@ cargo build --release -p mini-beamline --features ioc
 ./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd
 ```
 
-The CA server port can be changed with the `EPICS_CA_SERVER_PORT` environment variable (default: 5064):
-
-```bash
-EPICS_CA_SERVER_PORT=5065 ./target/release/mini_ioc examples/mini-beamline/ioc/st.cmd
-```
+The CA server port can be changed with the `EPICS_CA_SERVER_PORT` environment variable (default: 5064).
 
 ### Verify
 

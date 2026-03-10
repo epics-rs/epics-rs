@@ -39,6 +39,9 @@ impl SimDetector {
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Simulated detector".into())?;
         base.set_string_param(ad.params.base.model, 0, "Basic simulator".into())?;
+        base.set_string_param(ad.params.base.serial_number, 0, "No serial number".into())?;
+        base.set_string_param(ad.params.base.firmware_version, 0, "No firmware".into())?;
+        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION").into())?;
 
         base.set_int32_param(ad.params.min_x, 0, 0)?;
         base.set_int32_param(ad.params.min_y, 0, 0)?;

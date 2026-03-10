@@ -61,6 +61,13 @@ impl ADDriverBase {
         port_base.set_int32_param(params.base.color_mode, 0, NDColorMode::Mono as i32)?;
         port_base.set_int32_param(params.base.array_callbacks, 0, 1)?;
         port_base.set_float64_param(params.base.pool_max_memory, 0, max_memory as f64 / 1_048_576.0)?;
+        // Initial array size based on detector dimensions and data type (UInt8)
+        port_base.set_int32_param(params.base.array_size_x, 0, max_size_x)?;
+        port_base.set_int32_param(params.base.array_size_y, 0, max_size_y)?;
+        port_base.set_int32_param(params.base.array_size_z, 0, 0)?;
+        let initial_array_bytes = max_size_x as i64 * max_size_y as i64; // UInt8 = 1 byte/element
+        port_base.set_int32_param(params.base.array_size, 0, initial_array_bytes as i32)?;
+
         port_base.set_float64_param(params.gain, 0, 1.0)?;
         port_base.set_int32_param(params.shutter_mode, 0, ShutterMode::None as i32)?;
         port_base.set_float64_param(params.temperature, 0, 25.0)?;

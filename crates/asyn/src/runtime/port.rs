@@ -4,9 +4,8 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::error::AsynStatus;
 use crate::interrupt::InterruptManager;
-use crate::port::{PortDriver, PortDriverBase, PortFlags};
+use crate::port::PortDriver;
 use crate::port_actor::PortActor;
 use crate::port_handle::PortHandle;
 use crate::transport::InProcessClient;
@@ -67,14 +66,14 @@ pub fn create_port_runtime<D: PortDriver>(
 
 /// Create a port runtime from a boxed driver.
 pub fn create_port_runtime_boxed(
-    mut driver: Box<dyn PortDriver>,
+    driver: Box<dyn PortDriver>,
     config: RuntimeConfig,
 ) -> (PortRuntimeHandle, std::thread::JoinHandle<()>) {
     let port_name = driver.base().port_name.clone();
 
     // Event broadcast
     let (event_tx, _) = broadcast::channel(256);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
     // Clone broadcast sender for interrupt subscription
     let broadcast_sender = driver.base().interrupts.broadcast_sender();
@@ -118,6 +117,7 @@ pub fn create_port_runtime_boxed(
 mod tests {
     use super::*;
     use crate::param::ParamType;
+    use crate::port::{PortDriverBase, PortFlags};
 
     struct TestPort {
         base: PortDriverBase,

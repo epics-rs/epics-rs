@@ -125,7 +125,7 @@ pub struct BusyRecord {
     pub rbv: u32,
     pub orbv: u32,
     // HIGH timer state
-    high_active: bool,
+    _high_active: bool,
     // Internal alarm state (set during process, used for IVOA check)
     nsev: AlarmSevr,
 }
@@ -152,7 +152,7 @@ impl Default for BusyRecord {
             mask: 0,
             rbv: 0,
             orbv: 0,
-            high_active: false,
+            _high_active: false,
             nsev: AlarmSevr::None,
         }
     }

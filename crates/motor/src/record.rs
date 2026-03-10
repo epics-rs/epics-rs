@@ -1823,7 +1823,7 @@ mod tests {
         rec.pos.dval = 10.0;
         rec.pos.drbv = 9.5;
 
-        let effects = rec.check_completion();
+        let _effects = rec.check_completion();
         assert!(rec.retry.miss);
         // Should finalize (or delay)
         assert_eq!(rec.stat.phase, MotionPhase::Idle);

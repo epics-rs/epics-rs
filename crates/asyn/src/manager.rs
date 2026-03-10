@@ -166,7 +166,7 @@ impl PortManager {
     /// Takes ownership of the driver. Spawns a runtime thread that exclusively
     /// owns the driver. Returns a [`PortRuntimeHandle`] with shutdown, events,
     /// and client access.
-    pub fn register_port_runtime<D: PortDriver>(&self, mut driver: D) -> PortRuntimeHandle {
+    pub fn register_port_runtime<D: PortDriver>(&self, driver: D) -> PortRuntimeHandle {
         self.register_port_runtime_with_config(driver, RuntimeConfig::default())
     }
 

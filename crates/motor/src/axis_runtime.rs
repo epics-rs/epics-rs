@@ -32,7 +32,7 @@ pub(crate) enum AxisCommand {
     /// Stop active polling.
     StopPolling,
     /// Schedule a delay.
-    ScheduleDelay { id: u64, duration: Duration },
+    ScheduleDelay { duration: Duration },
     /// Shutdown the runtime.
     Shutdown,
 }
@@ -70,8 +70,8 @@ impl AxisHandle {
     }
 
     /// Schedule a delay.
-    pub async fn schedule_delay(&self, id: u64, duration: Duration) {
-        let _ = self.tx.send(AxisCommand::ScheduleDelay { id, duration }).await;
+    pub async fn schedule_delay(&self, _id: u64, duration: Duration) {
+        let _ = self.tx.send(AxisCommand::ScheduleDelay { duration }).await;
     }
 
     /// Take the I/O Intr receiver (can only be called once).
@@ -165,7 +165,6 @@ impl AxisRuntime {
                 self.execute_actions(&actions);
                 self.apply_poll_directive(&actions);
                 if let Some(ref delay) = actions.schedule_delay {
-                    let id = delay.id;
                     let dur = delay.duration;
                     let tx = self.io_intr_tx.clone();
                     // Spawn a delay task - when done, it just triggers io_intr
@@ -189,7 +188,7 @@ impl AxisRuntime {
                 self.active_polling = false;
                 false
             }
-            AxisCommand::ScheduleDelay { id: _, duration } => {
+            AxisCommand::ScheduleDelay { duration } => {
                 self.active_polling = false;
                 let tx = self.io_intr_tx.clone();
                 tokio::spawn(async move {

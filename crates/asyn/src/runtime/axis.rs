@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::error::AsynResult;
 use crate::interfaces::motor::{AsynMotor, MotorStatus};
 use crate::user::AsynUser;
 
@@ -310,6 +309,7 @@ impl AxisRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AsynResult;
 
     struct SimMotor {
         position: f64,

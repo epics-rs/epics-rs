@@ -89,8 +89,8 @@ pub(crate) enum TransportEvent {
         cid: u32,
     },
     ServerError {
-        original_request: Option<u16>,
-        message: String,
+        _original_request: Option<u16>,
+        _message: String,
     },
     TcpClosed {
         server_addr: SocketAddr,

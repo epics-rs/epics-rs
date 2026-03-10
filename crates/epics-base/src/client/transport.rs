@@ -351,8 +351,8 @@ async fn read_loop(
                     };
                     eprintln!("CA server error: cmd={:?} msg={}", orig_cmd, msg);
                     let _ = event_tx.send(TransportEvent::ServerError {
-                        original_request: orig_cmd,
-                        message: msg,
+                        _original_request: orig_cmd,
+                        _message: msg,
                     });
                 }
                 CA_PROTO_SERVER_DISCONN => {

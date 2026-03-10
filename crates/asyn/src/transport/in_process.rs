@@ -3,15 +3,12 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::SystemTime;
 
-use crate::error::{AsynError, AsynStatus};
-use crate::interrupt::InterruptValue;
 use crate::port_handle::PortHandle;
 use crate::protocol::convert::result_to_reply;
 use crate::protocol::event::{EventPayload, PortEvent};
-use crate::protocol::value::{ParamValue, Timestamp};
-use crate::protocol::{EventFilter, PortReply, PortRequest, ReplyPayload};
+use crate::protocol::value::Timestamp;
+use crate::protocol::{EventFilter, PortReply, PortRequest};
 use crate::request::RequestOp;
 use crate::user::AsynUser;
 
@@ -25,14 +22,14 @@ use super::tracker::RequestTracker;
 #[derive(Clone)]
 pub struct InProcessClient {
     handle: PortHandle,
-    tracker: Arc<RequestTracker>,
+    _tracker: Arc<RequestTracker>,
 }
 
 impl InProcessClient {
     pub fn new(handle: PortHandle) -> Self {
         Self {
             handle,
-            tracker: Arc::new(RequestTracker::new()),
+            _tracker: Arc::new(RequestTracker::new()),
         }
     }
 
@@ -137,12 +134,17 @@ impl RuntimeClient for InProcessClient {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
+    use crate::interrupt::InterruptValue;
     use crate::manager::PortManager;
     use crate::param::ParamType;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::protocol::command::PortCommand;
+    use crate::protocol::reply::ReplyPayload;
     use crate::protocol::request::{ProtocolPriority, RequestMeta};
+    use crate::protocol::value::ParamValue;
 
     struct TestPort {
         base: PortDriverBase,

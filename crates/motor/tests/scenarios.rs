@@ -73,7 +73,7 @@ fn absolute_move_reaches_target_and_sets_dmov() {
 
     // Simulate motor reaching target
     complete_move(&mut rec, 50.0);
-    let effects = rec.check_completion();
+    let _effects = rec.check_completion();
 
     // Verify completion
     assert!(rec.stat.dmov);
@@ -163,7 +163,7 @@ fn retry_reissues_move_when_error_exceeds_rdbd() {
 
     // Second retry
     complete_move(&mut rec, 9.98); // still > rdbd
-    let effects = rec.check_completion();
+    let _effects = rec.check_completion();
     assert_eq!(rec.retry.rcnt, 2);
 
     // Third retry

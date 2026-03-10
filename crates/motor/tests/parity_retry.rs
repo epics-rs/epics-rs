@@ -4,8 +4,6 @@ use motor_rs::flags::*;
 use motor_rs::record::MotorRecord;
 
 use asyn_rs::interfaces::motor::MotorStatus;
-use epics_base_rs::server::record::Record;
-use epics_base_rs::types::EpicsValue;
 
 fn make_record() -> MotorRecord {
     let mut rec = MotorRecord::new();

@@ -194,8 +194,6 @@ mod tests {
     use crate::server::database::PvDatabase;
     use crate::server::records::ao::AoRecord;
     use crate::server::records::stringin::StringinRecord;
-    use crate::server::record::Record;
-
     #[test]
     fn test_parse_request_file() {
         let content = "# Comment\nTEMP.VAL\nPRESSURE.VAL\n\n# Another\nSWITCH.VAL\n";

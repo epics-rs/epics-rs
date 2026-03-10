@@ -15,8 +15,8 @@ use crate::poll_loop::PollCommand;
 /// Motor device support — bridges MotorRecord to AsynMotor driver.
 pub struct MotorDeviceSupport {
     motor: Arc<Mutex<dyn AsynMotor>>,
-    addr: i32,
-    timeout: Duration,
+    _addr: i32,
+    _timeout: Duration,
     poll_cmd_tx: mpsc::Sender<PollCommand>,
     io_intr_tx: mpsc::Sender<()>,
     io_intr_rx: Option<mpsc::Receiver<()>>,
@@ -35,8 +35,8 @@ impl MotorDeviceSupport {
         let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
         Self {
             motor,
-            addr,
-            timeout,
+            _addr: addr,
+            _timeout: timeout,
             poll_cmd_tx,
             io_intr_tx,
             io_intr_rx: Some(io_intr_rx),

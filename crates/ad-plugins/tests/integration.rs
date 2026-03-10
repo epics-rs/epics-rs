@@ -205,7 +205,7 @@ fn test_codec_compress_decompress_roundtrip() {
     use ad_plugins::codec::{compress_lz4, decompress_lz4};
 
     // Create array with compressible data (all zeros)
-    let mut arr = NDArray::new(
+    let arr = NDArray::new(
         vec![NDDimension::new(64), NDDimension::new(64)],
         NDDataType::UInt8,
     );

@@ -3,7 +3,7 @@
 //! Provides a single scheduler that manages all scan types (periodic, I/O Intr,
 //! event, delayed) under one abstraction with coalescing and backpressure.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 

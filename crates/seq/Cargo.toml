@@ -5,7 +5,7 @@ edition = "2021"
 description = "Rust-native EPICS sequencer runtime"
 
 [dependencies]
-epics-base-rs = { path = "../epics-base" }
+epics-base-rs = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 tracing = "0.1"

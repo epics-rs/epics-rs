@@ -5,8 +5,8 @@ edition = "2021"
 description = "Rust port of EPICS motor record"
 
 [dependencies]
-epics-base-rs = { path = "../epics-base" }
-asyn-rs = { path = "../asyn" }
+epics-base-rs = { workspace = true }
+asyn-rs = { workspace = true }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 bitflags = "2"
 tracing = "0.1"

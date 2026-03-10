@@ -5,7 +5,7 @@ edition = "2021"
 description = "Rust port of EPICS busy record"
 
 [dependencies]
-epics-base-rs = { path = "../epics-base" }
+epics-base-rs = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -13,4 +13,4 @@ math = []
 epics = ["string", "array"]
 
 [dependencies]
-epics-base-rs = { path = "../epics-base" }
+epics-base-rs = { workspace = true }

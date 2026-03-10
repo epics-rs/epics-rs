@@ -5,5 +5,5 @@ edition = "2021"
 description = "SNL compiler CLI for sequencer-rs"
 
 [dependencies]
-snc-core = { path = "../snc-core" }
+snc-core = { workspace = true }
 clap = { version = "4", features = ["derive"] }

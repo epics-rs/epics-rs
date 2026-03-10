@@ -1,3 +1,12 @@
 [workspace]
 members = ["crates/*", "examples/*"]
 resolver = "2"
+
+[workspace.dependencies]
+ad-core = { path = "crates/ad-core" }
+ad-plugins = { path = "crates/ad-plugins" }
+asyn-rs = { path = "crates/asyn" }
+epics-base-rs = { path = "crates/epics-base" }
+epics-macros = { path = "crates/epics-macros" }
+snc-core = { path = "crates/snc-core" }
+seq = { path = "crates/seq" }

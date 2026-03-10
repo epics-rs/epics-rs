@@ -1,0 +1,1209 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>466</x>
+        <y>87</y>
+        <width>150</width>
+        <height>220</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>150</width>
+        <height>220</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(26, 115, 9);
+  background-color: rgb(200, 200, 200);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>userXXX10more_bare</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="25,125" rowstretch="20,20,20,20,20,20,20,20,20,20,20">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="0" column="0" colspan="2">
+        <widget class="PyDMEnumButton" name="choice_button">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>0</y>
+              <width>150</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${P}user${TYPE}Enable.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}user${TYPE}Enable.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="orientation" stdset="0">
+            <number>1</number>
+          </property>
+          <property name="horizontalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="verticalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginTop" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginBottom" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginLeft" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginRight" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMEnumButton#choice_button {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }
+QPushButton {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>20</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N1}</string>
+          </property>
+          <property name="text">
+            <string>${N1}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N1}</string>
+              <string>user ${TYPE} ${N1} {full}</string>
+              <string>user ${TYPE} ${N1} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N1},S=user${TYPE}${N1}</string>
+              <string>P=${P},C=user${TYPE}${N1},S=user${TYPE}${N1}</string>
+              <string>P=${P},C=user${TYPE}${N1},S=user${TYPE}${N1}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_1">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>40</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N2}</string>
+          </property>
+          <property name="text">
+            <string>${N2}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_1 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N2}</string>
+              <string>user ${TYPE} ${N2} {full}</string>
+              <string>user ${TYPE} ${N2} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N2},S=user${TYPE}${N2}</string>
+              <string>P=${P},C=user${TYPE}${N2},S=user${TYPE}${N2}</string>
+              <string>P=${P},C=user${TYPE}${N2},S=user${TYPE}${N2}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_2">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>60</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N3}</string>
+          </property>
+          <property name="text">
+            <string>${N3}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_2 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N3}</string>
+              <string>user ${TYPE} ${N3} {full}</string>
+              <string>user ${TYPE} ${N3} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N3},S=user${TYPE}${N3}</string>
+              <string>P=${P},C=user${TYPE}${N3},S=user${TYPE}${N3}</string>
+              <string>P=${P},C=user${TYPE}${N3},S=user${TYPE}${N3}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="4" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_3">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>80</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N4}</string>
+          </property>
+          <property name="text">
+            <string>${N4}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_3 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N4}</string>
+              <string>user ${TYPE} ${N4} {full}</string>
+              <string>user ${TYPE} ${N4} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N4},S=user${TYPE}${N4}</string>
+              <string>P=${P},C=user${TYPE}${N4},S=user${TYPE}${N4}</string>
+              <string>P=${P},C=user${TYPE}${N4},S=user${TYPE}${N4}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="5" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_4">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>100</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N5}</string>
+          </property>
+          <property name="text">
+            <string>${N5}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_4 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N5}</string>
+              <string>user ${TYPE} ${N5} {full}</string>
+              <string>user ${TYPE} ${N5} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N5},S=user${TYPE}${N5}</string>
+              <string>P=${P},C=user${TYPE}${N5},S=user${TYPE}${N5}</string>
+              <string>P=${P},C=user${TYPE}${N5},S=user${TYPE}${N5}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_5">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>120</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N6}</string>
+          </property>
+          <property name="text">
+            <string>${N6}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_5 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N6}</string>
+              <string>user ${TYPE} ${N6} {full}</string>
+              <string>user ${TYPE} ${N6} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N6},S=user${TYPE}${N6}</string>
+              <string>P=${P},C=user${TYPE}${N6},S=user${TYPE}${N6}</string>
+              <string>P=${P},C=user${TYPE}${N6},S=user${TYPE}${N6}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="7" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_6">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>140</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N7}</string>
+          </property>
+          <property name="text">
+            <string>${N7}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_6 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N7}</string>
+              <string>user ${TYPE} ${N7} {full}</string>
+              <string>user ${TYPE} ${N7} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N7},S=user${TYPE}${N7}</string>
+              <string>P=${P},C=user${TYPE}${N7},S=user${TYPE}${N7}</string>
+              <string>P=${P},C=user${TYPE}${N7},S=user${TYPE}${N7}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="8" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_7">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>160</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N8}</string>
+          </property>
+          <property name="text">
+            <string>${N8}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_7 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N8}</string>
+              <string>user ${TYPE} ${N8} {full}</string>
+              <string>user ${TYPE} ${N8} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N8},S=user${TYPE}${N8}</string>
+              <string>P=${P},C=user${TYPE}${N8},S=user${TYPE}${N8}</string>
+              <string>P=${P},C=user${TYPE}${N8},S=user${TYPE}${N8}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="9" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_8">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>180</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N9}</string>
+          </property>
+          <property name="text">
+            <string>${N9}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_8 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N9}</string>
+              <string>user ${TYPE} ${N9} {full}</string>
+              <string>user ${TYPE} ${N9} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N9},S=user${TYPE}${N9}</string>
+              <string>P=${P},C=user${TYPE}${N9},S=user${TYPE}${N9}</string>
+              <string>P=${P},C=user${TYPE}${N9},S=user${TYPE}${N9}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="10" column="0">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_9">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>200</y>
+              <width>25</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${N10}</string>
+          </property>
+          <property name="text">
+            <string>${N10}</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_9 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>user ${TYPE} ${N10}</string>
+              <string>user ${TYPE} ${N10} {full}</string>
+              <string>user ${TYPE} ${N10} {demo}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>user$(TYPE).ui</string>
+              <string>user$(TYPE)_full.ui</string>
+              <string>user$(TYPE)_demo.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},C=user${TYPE}${N10},S=user${TYPE}${N10}</string>
+              <string>P=${P},C=user${TYPE}${N10},S=user${TYPE}${N10}</string>
+              <string>P=${P},C=user${TYPE}${N10},S=user${TYPE}${N10}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="1" rowspan="10">
+        <widget class="PyDMFrame" name="composite">
+          <property name="geometry">
+            <rect>
+              <x>25</x>
+              <y>20</y>
+              <width>125</width>
+              <height>200</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <layout class="QGridLayout" name="gridLayout_1" columnstretch="125" rowstretch="20,20,20,20,20,20,20,20,20,20">
+            <property name="leftMargin">
+              <number>0</number>
+            </property>
+            <property name="topMargin">
+              <number>0</number>
+            </property>
+            <property name="rightMargin">
+              <number>0</number>
+            </property>
+            <property name="bottomMargin">
+              <number>0</number>
+            </property>
+            <property name="horizontalSpacing">
+              <number>0</number>
+            </property>
+            <property name="verticalSpacing">
+              <number>0</number>
+            </property>
+            <item row="0" column="0">
+              <widget class="PyDMLineEdit" name="text_entry">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>0</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N1}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N1}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+            <item row="1" column="0">
+              <widget class="PyDMLineEdit" name="text_entry_1">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>20</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N2}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N2}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry_1 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+            <item row="2" column="0">
+              <widget class="PyDMLineEdit" name="text_entry_2">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>40</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N3}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N3}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry_2 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+            <item row="3" column="0">
+              <widget class="PyDMLineEdit" name="text_entry_3">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>60</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N4}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N4}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry_3 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+            <item row="4" column="0">
+              <widget class="PyDMLineEdit" name="text_entry_4">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>80</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N5}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N5}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry_4 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+            <item row="5" column="0">
+              <widget class="PyDMLineEdit" name="text_entry_5">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>100</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N6}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N6}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry_5 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+            <item row="6" column="0">
+              <widget class="PyDMLineEdit" name="text_entry_6">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>120</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N7}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N7}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry_6 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+            <item row="7" column="0">
+              <widget class="PyDMLineEdit" name="text_entry_7">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>140</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N8}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N8}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry_7 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+            <item row="8" column="0">
+              <widget class="PyDMLineEdit" name="text_entry_8">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>160</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N9}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N9}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry_8 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+            <item row="9" column="0">
+              <widget class="PyDMLineEdit" name="text_entry_9">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>180</y>
+                    <width>125</width>
+                    <height>20</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}user${TYPE}${N10}.DESC</string>
+                </property>
+                <property name="toolTip">
+                  <string>${P}user${TYPE}${N10}.DESC</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>12</pointsize>
+                  </font>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMLineEdit#text_entry_9 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+    </layout>
+    <zorder>choice_button</zorder>
+    <zorder>related_display</zorder>
+    <zorder>related_display_1</zorder>
+    <zorder>related_display_2</zorder>
+    <zorder>related_display_3</zorder>
+    <zorder>related_display_4</zorder>
+    <zorder>related_display_5</zorder>
+    <zorder>related_display_6</zorder>
+    <zorder>related_display_7</zorder>
+    <zorder>related_display_8</zorder>
+    <zorder>related_display_9</zorder>
+    <zorder>text_entry</zorder>
+    <zorder>text_entry_1</zorder>
+    <zorder>text_entry_2</zorder>
+    <zorder>text_entry_3</zorder>
+    <zorder>text_entry_4</zorder>
+    <zorder>text_entry_5</zorder>
+    <zorder>text_entry_6</zorder>
+    <zorder>text_entry_7</zorder>
+    <zorder>text_entry_8</zorder>
+    <zorder>text_entry_9</zorder>
+    <zorder>composite</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMEnumButton</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.enum_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMRelatedDisplayButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.related_display_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLineEdit</class>
+      <extends>QLineEdit</extends>
+      <header>pydm.widgets.line_edit</header>
+    </customwidget>
+  </customwidgets>
+</ui>

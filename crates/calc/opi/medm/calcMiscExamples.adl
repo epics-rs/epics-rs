@@ -1,0 +1,1206 @@
+
+file {
+	name="/home/oxygen/MOONEY/epics/synApps/support/calc/calcApp/op/adl/calcMiscExamples.adl"
+	version=030105
+}
+display {
+	object {
+		x=1127
+		y=37
+		width=240
+		height=900
+	}
+	clr=14
+	bclr=1
+	cmap=""
+	gridSpacing=5
+	gridOn=0
+	snapToGrid=1
+}
+"color map" {
+	ncolors=65
+	colors {
+		ffffff,
+		ececec,
+		dadada,
+		c8c8c8,
+		bbbbbb,
+		aeaeae,
+		9e9e9e,
+		919191,
+		858585,
+		787878,
+		696969,
+		5a5a5a,
+		464646,
+		2d2d2d,
+		000000,
+		00d800,
+		1ebb00,
+		339900,
+		2d7f00,
+		216c00,
+		fd0000,
+		de1309,
+		be190b,
+		a01207,
+		820400,
+		5893ff,
+		597ee1,
+		4b6ec7,
+		3a5eab,
+		27548d,
+		fbf34a,
+		f9da3c,
+		eeb62b,
+		e19015,
+		cd6100,
+		ffb0ff,
+		d67fe2,
+		ae4ebc,
+		8b1a96,
+		610a75,
+		a4aaff,
+		8793e2,
+		6a73c1,
+		4d52a4,
+		343386,
+		c7bb6d,
+		b79d5c,
+		a47e3c,
+		7d5627,
+		58340f,
+		99ffff,
+		73dfff,
+		4ea5f9,
+		2a63e4,
+		0a00b8,
+		ebf1b5,
+		d4db9d,
+		bbc187,
+		a6a462,
+		8b8239,
+		73ff6b,
+		52da3b,
+		3cb420,
+		289315,
+		1a7309,
+	}
+}
+"related display" {
+	object {
+		x=0
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-TOP"
+}
+"related display" {
+	object {
+		x=30
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcAlgebraicExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-ALG"
+}
+"related display" {
+	object {
+		x=60
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcTrigExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-TRIG"
+}
+"related display" {
+	object {
+		x=90
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcRelationalExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-REL"
+}
+"related display" {
+	object {
+		x=120
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcBitwiseExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-BIT"
+}
+"related display" {
+	object {
+		x=150
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcMiscExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-MISC"
+}
+"related display" {
+	object {
+		x=180
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcStringExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-STR"
+}
+polyline {
+	object {
+		x=0
+		y=15
+		width=244
+		height=3
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=3
+	}
+	points {
+		(1,16)
+		(242,16)
+	}
+}
+text {
+	object {
+		x=5
+		y=20
+		width=235
+		height=20
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="Miscellaneous"
+	align="horiz. centered"
+}
+text {
+	object {
+		x=5
+		y=35
+		width=235
+		height=20
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="expressions"
+	align="horiz. centered"
+}
+polyline {
+	object {
+		x=0
+		y=55
+		width=244
+		height=3
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=3
+	}
+	points {
+		(1,56)
+		(242,56)
+	}
+}
+text {
+	object {
+		x=6
+		y=80
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="(a)"
+}
+polyline {
+	object {
+		x=0
+		y=57
+		width=224
+		height=1
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=1
+	}
+	points {
+		(0,57)
+		(223,57)
+	}
+}
+text {
+	object {
+		x=6
+		y=60
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=54
+	}
+	textix="Grouping"
+	align="horiz. centered"
+}
+polyline {
+	object {
+		x=7
+		y=75
+		width=223
+		height=1
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=1
+	}
+	points {
+		(7,75)
+		(229,75)
+	}
+}
+text {
+	object {
+		x=6
+		y=110
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="(A)ANDB"
+}
+text {
+	object {
+		x=6
+		y=140
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="AANDB"
+}
+text {
+	object {
+		x=6
+		y=242
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=54
+	}
+	textix="Inputs-as-array expressions"
+	align="horiz. centered"
+}
+polyline {
+	object {
+		x=7
+		y=258
+		width=223
+		height=1
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=1
+	}
+	points {
+		(7,258)
+		(229,258)
+	}
+}
+polyline {
+	object {
+		x=6
+		y=240
+		width=223
+		height=1
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=1
+	}
+	points {
+		(6,240)
+		(228,240)
+	}
+}
+text {
+	object {
+		x=6
+		y=325
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="@(A+3)"
+}
+text {
+	object {
+		x=6
+		y=355
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="@@0"
+}
+text {
+	object {
+		x=16
+		y=95
+		width=219
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="CAN'T USE '[]' or '{}'"
+}
+text {
+	object {
+		x=16
+		y=125
+		width=219
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="SAME AS A&B.  BUT NOTE..."
+}
+text {
+	object {
+		x=16
+		y=155
+		width=219
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="SCALCOUT RECORD WILL PARSE 'AA'"
+}
+text {
+	object {
+		x=16
+		y=165
+		width=219
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="AS A STRING VARIABLE"
+}
+text {
+	object {
+		x=16
+		y=340
+		width=219
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="GET VARIABLE A+3"
+}
+text {
+	object {
+		x=16
+		y=370
+		width=219
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="GET STRING VAR 0 (@@0=AA, ..)"
+}
+"related display" {
+	object {
+		x=210
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcArrayExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-ARR"
+}
+composite {
+	object {
+		x=6
+		y=265
+		width=229
+		height=55
+	}
+	"composite name"=""
+	children {
+		text {
+			object {
+				x=6
+				y=265
+				width=229
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="@0"
+		}
+		text {
+			object {
+				x=6
+				y=295
+				width=229
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="@A+3"
+		}
+		text {
+			object {
+				x=16
+				y=280
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="GET VARIABLE 0 (@0=A, @1=B, ..)"
+		}
+		text {
+			object {
+				x=16
+				y=310
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="GET VARIABLE A; ADD 3 TO IT"
+		}
+	}
+}
+composite {
+	object {
+		x=5
+		y=490
+		width=230
+		height=400
+	}
+	"composite name"=""
+	children {
+		composite {
+			object {
+				x=6
+				y=490
+				width=229
+				height=19
+			}
+			"composite name"=""
+			children {
+				text {
+					object {
+						x=6
+						y=492
+						width=229
+						height=14
+					}
+					"basic attribute" {
+						clr=54
+					}
+					textix="Random number"
+					align="horiz. centered"
+				}
+				polyline {
+					object {
+						x=7
+						y=508
+						width=222
+						height=1
+					}
+					"basic attribute" {
+						clr=54
+						fill="outline"
+						width=1
+					}
+					points {
+						(7,508)
+						(228,508)
+					}
+				}
+				polyline {
+					object {
+						x=6
+						y=490
+						width=222
+						height=1
+					}
+					"basic attribute" {
+						clr=54
+						fill="outline"
+						width=1
+					}
+					points {
+						(6,490)
+						(227,490)
+					}
+				}
+			}
+		}
+		text {
+			object {
+				x=6
+				y=515
+				width=229
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="RNDM"
+		}
+		text {
+			object {
+				x=10
+				y=530
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="RANDOM VALUE IN RANGE (0,1] (NOT ZERO)"
+		}
+		text {
+			object {
+				x=16
+				y=560
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="RANDOM, NORMALLY DISTRIBUTED IN (0,1]"
+		}
+		text {
+			object {
+				x=5
+				y=545
+				width=230
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="NRNDM"
+		}
+		text {
+			object {
+				x=16
+				y=590
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="ARRAY of RANDOM, (0,1]"
+		}
+		text {
+			object {
+				x=5
+				y=575
+				width=230
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="ARNDM"
+		}
+		text {
+			object {
+				x=6
+				y=607
+				width=229
+				height=14
+			}
+			"basic attribute" {
+				clr=54
+			}
+			textix="Store"
+			align="horiz. centered"
+		}
+		polyline {
+			object {
+				x=7
+				y=623
+				width=222
+				height=1
+			}
+			"basic attribute" {
+				clr=54
+				fill="outline"
+				width=1
+			}
+			points {
+				(7,623)
+				(228,623)
+			}
+		}
+		polyline {
+			object {
+				x=6
+				y=605
+				width=222
+				height=1
+			}
+			"basic attribute" {
+				clr=54
+				fill="outline"
+				width=1
+			}
+			points {
+				(6,605)
+				(227,605)
+			}
+		}
+		text {
+			object {
+				x=6
+				y=630
+				width=229
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="A:=B"
+		}
+		text {
+			object {
+				x=10
+				y=645
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="SET INPUT VARIABLE A TO VALUE OF B"
+		}
+		text {
+			object {
+				x=16
+				y=685
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="MULTIPLE EXPRESSIONS, RETURNING A"
+		}
+		text {
+			object {
+				x=5
+				y=670
+				width=230
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="(A:=1;B:=2;C)"
+		}
+		text {
+			object {
+				x=16
+				y=725
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="SET INPUT VARIABLE B TO VALUE OF A"
+		}
+		text {
+			object {
+				x=5
+				y=710
+				width=230
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="@1:=A"
+		}
+		text {
+			object {
+				x=10
+				y=655
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="NOTE: DOES NOT RETURN A VALUE"
+		}
+		text {
+			object {
+				x=15
+				y=695
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="SINGLE VALUE (C)"
+		}
+		text {
+			object {
+				x=6
+				y=742
+				width=229
+				height=14
+			}
+			"basic attribute" {
+				clr=54
+			}
+			textix="Loop"
+			align="horiz. centered"
+		}
+		polyline {
+			object {
+				x=7
+				y=758
+				width=222
+				height=1
+			}
+			"basic attribute" {
+				clr=54
+				fill="outline"
+				width=1
+			}
+			points {
+				(7,758)
+				(228,758)
+			}
+		}
+		polyline {
+			object {
+				x=6
+				y=740
+				width=222
+				height=1
+			}
+			"basic attribute" {
+				clr=54
+				fill="outline"
+				width=1
+			}
+			points {
+				(6,740)
+				(227,740)
+			}
+		}
+		text {
+			object {
+				x=6
+				y=765
+				width=229
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="UNTIL(a:=a-1;a<1)"
+		}
+		text {
+			object {
+				x=10
+				y=780
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="DECREMENT A UNTIL ITS VALUE IS ZERO"
+		}
+		text {
+			object {
+				x=16
+				y=830
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="EXPRESSION WILL NEVER RETURN TRUE"
+		}
+		text {
+			object {
+				x=5
+				y=815
+				width=230
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="UNTIL(0)"
+		}
+		text {
+			object {
+				x=16
+				y=870
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="ILLEGAL: EXPRESSION DOES NOT RETURN"
+		}
+		text {
+			object {
+				x=5
+				y=855
+				width=230
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="UNTIL(a:=a-1)"
+		}
+		text {
+			object {
+				x=10
+				y=800
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="NOTE: UNTIL RETURNS 1, UNLESS ABORTED"
+		}
+		text {
+			object {
+				x=15
+				y=840
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="WILL BE ABORTED AT sCalcLoopMax"
+		}
+		text {
+			object {
+				x=10
+				y=790
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="(LOOP UNTIL EXPRESSION RETURNS TRUE)"
+		}
+		text {
+			object {
+				x=15
+				y=880
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="A VALUE."
+		}
+	}
+}
+text {
+	object {
+		x=5
+		y=205
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="A?B:C"
+}
+text {
+	object {
+		x=6
+		y=185
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=54
+	}
+	textix="'?:' (if-else) operator"
+	align="horiz. centered"
+}
+polyline {
+	object {
+		x=7
+		y=200
+		width=223
+		height=1
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=1
+	}
+	points {
+		(7,200)
+		(229,200)
+	}
+}
+polyline {
+	object {
+		x=6
+		y=182
+		width=223
+		height=1
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=1
+	}
+	points {
+		(6,182)
+		(228,182)
+	}
+}
+text {
+	object {
+		x=15
+		y=220
+		width=219
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="IF (A!=0) RESULT IS B, ELSE C"
+}
+text {
+	object {
+		x=5
+		y=388
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=54
+	}
+	textix="Multiple expressions"
+	align="horiz. centered"
+}
+polyline {
+	object {
+		x=6
+		y=403
+		width=223
+		height=1
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=1
+	}
+	points {
+		(6,403)
+		(228,403)
+	}
+}
+polyline {
+	object {
+		x=5
+		y=385
+		width=223
+		height=1
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=1
+	}
+	points {
+		(5,385)
+		(227,385)
+	}
+}
+text {
+	object {
+		x=5
+		y=408
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="(a:=1;b:=2;c)"
+}
+text {
+	object {
+		x=15
+		y=423
+		width=219
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="MUST RETURN A SINGLE VALUE"
+}
+composite {
+	object {
+		x=5
+		y=435
+		width=229
+		height=25
+	}
+	"composite name"=""
+	children {
+		text {
+			object {
+				x=5
+				y=435
+				width=229
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="(a:=1;b:=2)"
+		}
+		text {
+			object {
+				x=15
+				y=450
+				width=219
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="ILLEGAL: RETURNS NO VALUE"
+		}
+	}
+}
+text {
+	object {
+		x=5
+		y=460
+		width=229
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="(a;cos(b))"
+}
+text {
+	object {
+		x=15
+		y=475
+		width=219
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="ILLEGAL: RETURNS TWO VALUES"
+}

@@ -1,0 +1,11 @@
+[package]
+name = "busy-rs"
+version = "0.2.1"
+edition = "2021"
+description = "Rust port of EPICS busy record"
+
+[dependencies]
+epics-base-rs = { path = "../epics-base" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

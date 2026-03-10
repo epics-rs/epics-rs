@@ -1,0 +1,13 @@
+[package]
+name = "ad-plugins"
+version = "0.2.1"
+edition = "2021"
+description = "NDPlugin implementations for areaDetector-rs"
+
+[dependencies]
+ad-core = { path = "../ad-core" }
+asyn-rs = { path = "../asyn" }
+epics-base-rs = { path = "../epics-base" }
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+parking_lot = "0.12"

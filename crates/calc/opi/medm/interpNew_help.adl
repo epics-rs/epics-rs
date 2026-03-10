@@ -1,0 +1,636 @@
+
+file {
+	name="/home/oxygen/MOONEY/epics/synApps/support/calc/calcApp/op/adl/interpNew_help.adl"
+	version=030107
+}
+display {
+	object {
+		x=643
+		y=418
+		width=480
+		height=400
+	}
+	clr=14
+	bclr=2
+	cmap=""
+	gridSpacing=5
+	gridOn=0
+	snapToGrid=1
+}
+"color map" {
+	ncolors=65
+	colors {
+		ffffff,
+		ececec,
+		dadada,
+		c8c8c8,
+		bbbbbb,
+		aeaeae,
+		9e9e9e,
+		919191,
+		858585,
+		787878,
+		696969,
+		5a5a5a,
+		464646,
+		2d2d2d,
+		000000,
+		00d800,
+		1ebb00,
+		339900,
+		2d7f00,
+		216c00,
+		fd0000,
+		de1309,
+		be190b,
+		a01207,
+		820400,
+		5893ff,
+		597ee1,
+		4b6ec7,
+		3a5eab,
+		27548d,
+		fbf34a,
+		f9da3c,
+		eeb62b,
+		e19015,
+		cd6100,
+		ffb0ff,
+		d67fe2,
+		ae4ebc,
+		8b1a96,
+		610a75,
+		a4aaff,
+		8793e2,
+		6a73c1,
+		4d52a4,
+		343386,
+		c7bb6d,
+		b79d5c,
+		a47e3c,
+		7d5627,
+		58340f,
+		99ffff,
+		73dfff,
+		4ea5f9,
+		2a63e4,
+		0a00b8,
+		ebf1b5,
+		d4db9d,
+		bbc187,
+		a6a462,
+		8b8239,
+		73ff6b,
+		52da3b,
+		3cb420,
+		289315,
+		1a7309,
+	}
+}
+text {
+	object {
+		x=5
+		y=40
+		width=80
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="X (input)"
+	align="horiz. centered"
+}
+"text entry" {
+	object {
+		x=5
+		y=55
+		width=80
+		height=20
+	}
+	control {
+		chan="$(P)interp$(Q)_x.VAL"
+		clr=14
+		bclr=51
+	}
+	limits {
+	}
+}
+composite {
+	object {
+		x=0
+		y=0
+		width=482
+		height=25
+	}
+	"composite name"=""
+	children {
+		rectangle {
+			object {
+				x=0
+				y=0
+				width=480
+				height=25
+			}
+			"basic attribute" {
+				clr=0
+			}
+		}
+		text {
+			object {
+				x=0
+				y=0
+				width=480
+				height=20
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="Lookup table interpolator"
+			align="horiz. centered"
+		}
+		polyline {
+			object {
+				x=0
+				y=22
+				width=481
+				height=3
+			}
+			"basic attribute" {
+				clr=53
+				width=3
+			}
+			points {
+				(1,23)
+				(479,23)
+			}
+		}
+	}
+}
+"related display" {
+	object {
+		x=400
+		y=90
+		width=40
+		height=20
+	}
+	display[0] {
+		label="interp"
+		name="interpNew.adl"
+		args="P=$(P),Q=$(Q)"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-Less"
+}
+text {
+	object {
+		x=10
+		y=110
+		width=450
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="There are two ways to load interpolation tables:"
+}
+text {
+	object {
+		x=80
+		y=159
+		width=390
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="Y1: $(P)interp$(Q).VALB"
+}
+text {
+	object {
+		x=80
+		y=144
+		width=390
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="X:  $(P)interp$(Q).VALA"
+}
+text {
+	object {
+		x=80
+		y=174
+		width=390
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="Y2: $(P)interp$(Q).VALC"
+}
+text {
+	object {
+		x=10
+		y=129
+		width=460
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="1) Write arrays to the following PV's:"
+}
+text {
+	object {
+		x=80
+		y=219
+		width=390
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="$(P)interp$(Q).VALN"
+}
+text {
+	object {
+		x=10
+		y=204
+		width=460
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="   Write the number of points in the arrays to"
+}
+text {
+	object {
+		x=10
+		y=189
+		width=460
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="  (X values must increase with array index.)"
+}
+composite {
+	object {
+		x=45
+		y=30
+		width=400
+		height=71
+	}
+	"composite name"=""
+	children {
+		"text update" {
+			object {
+				x=45
+				y=90
+				width=40
+				height=10
+			}
+			monitor {
+				chan="$(P)interp$(Q)_n"
+				clr=54
+				bclr=2
+			}
+			align="horiz. centered"
+			limits {
+			}
+		}
+		text {
+			object {
+				x=90
+				y=90
+				width=50
+				height=10
+			}
+			"basic attribute" {
+				clr=64
+			}
+			textix=" VALUES)"
+		}
+		"text entry" {
+			object {
+				x=270
+				y=85
+				width=30
+				height=16
+			}
+			control {
+				chan="$(P)interp$(Q).F"
+				clr=14
+				bclr=51
+			}
+			format="string"
+			limits {
+			}
+		}
+		text {
+			object {
+				x=160
+				y=90
+				width=100
+				height=10
+			}
+			"basic attribute" {
+				clr=64
+			}
+			textix="POLYNOMIAL ORDER:"
+		}
+		text {
+			object {
+				x=130
+				y=30
+				width=80
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="Description"
+			align="horiz. centered"
+		}
+		text {
+			object {
+				x=90
+				y=35
+				width=40
+				height=10
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="SHOW"
+			align="horiz. centered"
+		}
+		"text entry" {
+			object {
+				x=130
+				y=45
+				width=80
+				height=20
+			}
+			control {
+				chan="$(P)interp$(Q)_y1.DESC"
+				clr=14
+				bclr=0
+			}
+			format="string"
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=130
+				y=65
+				width=80
+				height=20
+			}
+			control {
+				chan="$(P)interp$(Q)_y2.DESC"
+				clr=14
+				bclr=0
+			}
+			format="string"
+			limits {
+			}
+		}
+		"related display" {
+			object {
+				x=90
+				y=45
+				width=40
+				height=20
+			}
+			display[0] {
+				label="plot"
+				name="arrayPlot.adl"
+				args="P=$(P),X=$(P)interp$(Q).VALA,Y=$(P)interp$(Q).VALB,YLABEL=Y1"
+			}
+			clr=0
+			bclr=17
+			label="-Y1(X)"
+		}
+		"related display" {
+			object {
+				x=90
+				y=65
+				width=40
+				height=20
+			}
+			display[0] {
+				label="plot"
+				name="arrayPlot.adl"
+				args="P=$(P),X=$(P)interp$(Q).VALA,Y=$(P)interp$(Q).VALC,YLABEL=Y2"
+			}
+			clr=0
+			bclr=17
+			label="-Y2(X)"
+		}
+		text {
+			object {
+				x=295
+				y=30
+				width=150
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="Output Link"
+			align="horiz. centered"
+		}
+		"text entry" {
+			object {
+				x=295
+				y=45
+				width=150
+				height=20
+			}
+			control {
+				chan="$(P)interp$(Q)_y1.OUT"
+				clr=14
+				bclr=40
+			}
+			format="string"
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=295
+				y=65
+				width=150
+				height=20
+			}
+			control {
+				chan="$(P)interp$(Q)_y2.OUT"
+				clr=14
+				bclr=40
+			}
+			format="string"
+			limits {
+			}
+		}
+		text {
+			object {
+				x=215
+				y=30
+				width=80
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="Y (output)"
+			align="horiz. centered"
+		}
+		"text update" {
+			object {
+				x=212
+				y=45
+				width=80
+				height=20
+			}
+			monitor {
+				chan="$(P)interp$(Q)_y1.VAL"
+				clr=54
+				bclr=2
+			}
+			align="horiz. centered"
+			limits {
+			}
+		}
+		"text update" {
+			object {
+				x=212
+				y=65
+				width=80
+				height=20
+			}
+			monitor {
+				chan="$(P)interp$(Q)_y1.VAL"
+				clr=54
+				bclr=2
+			}
+			align="horiz. centered"
+			limits {
+			}
+		}
+	}
+}
+text {
+	object {
+		x=10
+		y=344
+		width=460
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="To use interpolation tables, write a value to X."
+}
+text {
+	object {
+		x=10
+		y=239
+		width=460
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="2) Load tables point by point:"
+}
+text {
+	object {
+		x=10
+		y=359
+		width=460
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="Y's will be updated, and values will be written to"
+}
+text {
+	object {
+		x=10
+		y=374
+		width=460
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="output links (if links have been specified)."
+}
+text {
+	object {
+		x=40
+		y=254
+		width=430
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="1) Click 'More/Less' button; select 'Data Entry'."
+}
+text {
+	object {
+		x=40
+		y=269
+		width=430
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="2) Enter values for X, Y1, and Y2.  (Manually"
+}
+text {
+	object {
+		x=40
+		y=304
+		width=430
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="3) Press the 'Add Entry' button."
+}
+text {
+	object {
+		x=40
+		y=319
+		width=430
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="4) Check that number of values has increased."
+}
+text {
+	object {
+		x=40
+		y=285
+		width=430
+		height=15
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="   entered data may be entered in any order.)"
+}

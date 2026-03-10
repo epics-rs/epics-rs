@@ -1,0 +1,8 @@
+[package]
+name = "snc-core"
+version = "0.1.0"
+edition = "2021"
+description = "SNL compiler library for sequencer-rs"
+
+[dependencies]
+thiserror = "2"

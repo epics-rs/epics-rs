@@ -1,0 +1,26 @@
+[package]
+name = "sim-detector"
+version = "0.2.1"
+edition = "2021"
+description = "Simulated areaDetector driver for areadetector-rs"
+
+[features]
+ioc = ["dep:epics-base-rs", "dep:tokio", "dep:ad-plugins", "asyn-rs/epics"]
+
+[dependencies]
+ad-core = { path = "../ad-core" }
+ad-plugins = { path = "../ad-plugins", optional = true }
+asyn-rs = { path = "../asyn" }
+rand = "0.8"
+parking_lot = "0.12"
+epics-base-rs = { path = "../epics-base", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+
+[[bin]]
+name = "sim_ioc"
+path = "src/bin/sim_ioc.rs"
+required-features = ["ioc"]
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"

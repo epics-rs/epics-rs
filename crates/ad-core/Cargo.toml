@@ -1,0 +1,12 @@
+[package]
+name = "ad-core"
+version = "0.2.1"
+edition = "2021"
+description = "Core types and base classes for areaDetector-rs"
+
+[dependencies]
+asyn-rs = { path = "../asyn" }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+thiserror = "2"
+parking_lot = "0.12"

@@ -1,0 +1,16 @@
+[package]
+name = "calc-rs"
+version = "0.2.1"
+edition = "2021"
+description = "EPICS calc expression engine in Rust"
+
+[features]
+default = ["numeric"]
+numeric = []
+string = []
+array = ["math"]
+math = []
+epics = ["string", "array", "dep:epics-base-rs"]
+
+[dependencies]
+epics-base-rs = { path = "../epics-base", optional = true }

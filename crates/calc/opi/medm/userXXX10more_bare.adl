@@ -1,0 +1,524 @@
+
+file {
+	name="/net/s2dserv/xorApps/epics/synApps_5_6/ioc/2bmb/2bmbApp/op/adl/userXXX10more_bare.adl"
+	version=030107
+}
+display {
+	object {
+		x=466
+		y=87
+		width=150
+		height=220
+	}
+	clr=64
+	bclr=3
+	cmap=""
+	gridSpacing=5
+	gridOn=0
+	snapToGrid=0
+}
+"color map" {
+	ncolors=65
+	colors {
+		ffffff,
+		ececec,
+		dadada,
+		c8c8c8,
+		bbbbbb,
+		aeaeae,
+		9e9e9e,
+		919191,
+		858585,
+		787878,
+		696969,
+		5a5a5a,
+		464646,
+		2d2d2d,
+		000000,
+		00d800,
+		1ebb00,
+		339900,
+		2d7f00,
+		216c00,
+		fd0000,
+		de1309,
+		be190b,
+		a01207,
+		820400,
+		5893ff,
+		597ee1,
+		4b6ec7,
+		3a5eab,
+		27548d,
+		fbf34a,
+		f9da3c,
+		eeb62b,
+		e19015,
+		cd6100,
+		ffb0ff,
+		d67fe2,
+		ae4ebc,
+		8b1a96,
+		610a75,
+		a4aaff,
+		8793e2,
+		6a73c1,
+		4d52a4,
+		343386,
+		c7bb6d,
+		b79d5c,
+		a47e3c,
+		7d5627,
+		58340f,
+		99ffff,
+		73dfff,
+		4ea5f9,
+		2a63e4,
+		0a00b8,
+		ebf1b5,
+		d4db9d,
+		bbc187,
+		a6a462,
+		8b8239,
+		73ff6b,
+		52da3b,
+		3cb420,
+		289315,
+		1a7309,
+	}
+}
+"choice button" {
+	object {
+		x=0
+		y=0
+		width=150
+		height=20
+	}
+	control {
+		chan="$(P)user$(TYPE)Enable.VAL"
+		clr=14
+		bclr=51
+	}
+	stacking="column"
+}
+"related display" {
+	object {
+		x=0
+		y=20
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N1)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N1),S=user$(TYPE)$(N1)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N1) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N1),S=user$(TYPE)$(N1)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N1) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N1),S=user$(TYPE)$(N1)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N1)"
+}
+"related display" {
+	object {
+		x=0
+		y=40
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N2)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N2),S=user$(TYPE)$(N2)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N2) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N2),S=user$(TYPE)$(N2)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N2) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N2),S=user$(TYPE)$(N2)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N2)"
+}
+"related display" {
+	object {
+		x=0
+		y=60
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N3)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N3),S=user$(TYPE)$(N3)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N3) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N3),S=user$(TYPE)$(N3)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N3) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N3),S=user$(TYPE)$(N3)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N3)"
+}
+"related display" {
+	object {
+		x=0
+		y=80
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N4)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N4),S=user$(TYPE)$(N4)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N4) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N4),S=user$(TYPE)$(N4)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N4) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N4),S=user$(TYPE)$(N4)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N4)"
+}
+"related display" {
+	object {
+		x=0
+		y=100
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N5)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N5),S=user$(TYPE)$(N5)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N5) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N5),S=user$(TYPE)$(N5)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N5) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N5),S=user$(TYPE)$(N5)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N5)"
+}
+"related display" {
+	object {
+		x=0
+		y=120
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N6)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N6),S=user$(TYPE)$(N6)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N6) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N6),S=user$(TYPE)$(N6)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N6) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N6),S=user$(TYPE)$(N6)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N6)"
+}
+"related display" {
+	object {
+		x=0
+		y=140
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N7)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N7),S=user$(TYPE)$(N7)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N7) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N7),S=user$(TYPE)$(N7)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N7) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N7),S=user$(TYPE)$(N7)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N7)"
+}
+"related display" {
+	object {
+		x=0
+		y=160
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N8)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N8),S=user$(TYPE)$(N8)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N8) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N8),S=user$(TYPE)$(N8)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N8) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N8),S=user$(TYPE)$(N8)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N8)"
+}
+"related display" {
+	object {
+		x=0
+		y=180
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N9)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N9),S=user$(TYPE)$(N9)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N9) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N9),S=user$(TYPE)$(N9)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N9) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N9),S=user$(TYPE)$(N9)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N9)"
+}
+"related display" {
+	object {
+		x=0
+		y=200
+		width=25
+		height=20
+	}
+	display[0] {
+		label="user $(TYPE) $(N10)"
+		name="user$(TYPE).adl"
+		args="P=$(P),C=user$(TYPE)$(N10),S=user$(TYPE)$(N10)"
+	}
+	display[1] {
+		label="user $(TYPE) $(N10) (full)"
+		name="user$(TYPE)_full.adl"
+		args="P=$(P),C=user$(TYPE)$(N10),S=user$(TYPE)$(N10)"
+	}
+	display[2] {
+		label="user $(TYPE) $(N10) (demo)"
+		name="user$(TYPE)_demo.adl"
+		args="P=$(P),C=user$(TYPE)$(N10),S=user$(TYPE)$(N10)"
+	}
+	clr=0
+	bclr=63
+	label="-$(N10)"
+}
+composite {
+	object {
+		x=25
+		y=20
+		width=125
+		height=200
+	}
+	"composite name"=""
+	children {
+		"text entry" {
+			object {
+				x=25
+				y=20
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N1).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=25
+				y=40
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N2).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=25
+				y=60
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N3).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=25
+				y=80
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N4).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=25
+				y=100
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N5).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=25
+				y=120
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N6).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=25
+				y=140
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N7).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=25
+				y=160
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N8).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=25
+				y=180
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N9).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=25
+				y=200
+				width=125
+				height=20
+			}
+			control {
+				chan="$(P)user$(TYPE)$(N10).DESC"
+				clr=54
+				bclr=3
+			}
+			limits {
+			}
+		}
+	}
+}

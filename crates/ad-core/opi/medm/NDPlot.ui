@@ -1,0 +1,225 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>1095</x>
+        <y>344</y>
+        <width>400</width>
+        <height>300</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>400</width>
+        <height>300</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(187, 187, 187);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>NDPlot</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="400" rowstretch="1,25,4,270">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="3" column="0">
+        <widget class="PyDMWaveformPlot" name="cartesian_plot">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>30</y>
+              <width>400</width>
+              <height>270</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>cartesian_plot</string>
+          </property>
+          <property name="title" stdset="0">
+            <string>$(TITLE)</string>
+          </property>
+          <property name="xLabels">
+            <stringlist>
+              <string>${XLABEL}</string>
+            </stringlist>
+          </property>
+          <property name="yLabels">
+            <stringlist>
+              <string>${YLABEL}</string>
+            </stringlist>
+          </property>
+          <property name="curves" stdset="0">
+            <stringlist>
+              <string>{&quot;name&quot;: &quot;curve 1&quot;, &quot;y_channel&quot;: &quot;ca://${P}${R}${DATA}&quot;, &quot;color&quot;: &quot;#000000&quot;, &quot;lineStyle&quot;: 1, &quot;lineWidth&quot;: 1, &quot;symbolSize&quot;: 10, &quot;redraw_mode&quot;: 2, &quot;block_size&quot;: 1200, &quot;x_channel&quot;: null}</string>
+            </stringlist>
+          </property>
+          <property name="autoRangeX" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="autoRangeY" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="axisColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>115</red>
+              <green>223</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="0" rowspan="2">
+        <widget class="PyDMDrawingRectangle" name="rectangle">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>0</y>
+              <width>400</width>
+              <height>26</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>218</red>
+                <green>218</green>
+                <blue>218</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>218</red>
+              <green>218</green>
+              <blue>218</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="0">
+        <widget class="QLabel" name="text">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>1</y>
+              <width>400</width>
+              <height>25</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>${P}${R} ${TITLE}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>15</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>10</red>
+                <green>0</green>
+                <blue>184</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text {
+  color: rgb(10, 0, 184);
+  }</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>cartesian_plot</zorder>
+    <zorder>rectangle</zorder>
+    <zorder>text</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMWaveformPlot</class>
+      <extends>QGraphicsView</extends>
+      <header>pydm.widgets.waveformplot</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingRectangle</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLabel</class>
+      <extends>QLabel</extends>
+      <header>pydm.widgets.label</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

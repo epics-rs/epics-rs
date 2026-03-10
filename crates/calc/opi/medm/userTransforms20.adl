@@ -1,0 +1,823 @@
+
+file {
+	name="C:\Program Files\EPICS WIN32 Extensions\synApps_4_6_adl\userTransforms20.adl"
+	version=020306
+}
+display {
+	object {
+		x=783
+		y=587
+		width=140
+		height=420
+	}
+	clr=64
+	bclr=3
+	cmap=""
+	gridSpacing=5
+	gridOn=0
+	snapToGrid=0
+}
+"color map" {
+	ncolors=65
+	colors {
+		ffffff,
+		ececec,
+		dadada,
+		c8c8c8,
+		bbbbbb,
+		aeaeae,
+		9e9e9e,
+		919191,
+		858585,
+		787878,
+		696969,
+		5a5a5a,
+		464646,
+		2d2d2d,
+		000000,
+		00d800,
+		1ebb00,
+		339900,
+		2d7f00,
+		216c00,
+		fd0000,
+		de1309,
+		be190b,
+		a01207,
+		820400,
+		5893ff,
+		597ee1,
+		4b6ec7,
+		3a5eab,
+		27548d,
+		fbf34a,
+		f9da3c,
+		eeb62b,
+		e19015,
+		cd6100,
+		ffb0ff,
+		d67fe2,
+		ae4ebc,
+		8b1a96,
+		610a75,
+		a4aaff,
+		8793e2,
+		6a73c1,
+		4d52a4,
+		343386,
+		c7bb6d,
+		b79d5c,
+		a47e3c,
+		7d5627,
+		58340f,
+		99ffff,
+		73dfff,
+		4ea5f9,
+		2a63e4,
+		0a00b8,
+		ebf1b5,
+		d4db9d,
+		bbc187,
+		a6a462,
+		8b8239,
+		73ff6b,
+		52da3b,
+		3cb420,
+		289315,
+		1a7309,
+	}
+}
+"choice button" {
+	object {
+		x=0
+		y=0
+		width=140
+		height=20
+	}
+	control {
+		chan="$(P)userTranEnable.VAL"
+		clr=14
+		bclr=51
+	}
+	stacking="column"
+}
+"text entry" {
+	object {
+		x=22
+		y=20
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran1.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=40
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran2.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=60
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran3.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=80
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran4.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=100
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran5.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=120
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran6.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=140
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran7.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=160
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran8.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=180
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran9.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=200
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran10.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=220
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran11.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=240
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran12.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=260
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran13.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=280
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran14.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=300
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran15.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=320
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran16.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=340
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran17.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=360
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran18.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=380
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran19.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=22
+		y=400
+		width=118
+		height=20
+	}
+	control {
+		chan="$(P)userTran20.DESC"
+		clr=54
+		bclr=3
+	}
+	limits {
+	}
+}
+"related display" {
+	object {
+		x=0
+		y=20
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 1"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran1"
+	}
+	display[1] {
+		label="user transform 1 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran1"
+	}
+	clr=14
+	bclr=51
+	label="-1"
+}
+"related display" {
+	object {
+		x=0
+		y=40
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 2"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran2"
+	}
+	display[1] {
+		label="user transform 2 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran2"
+	}
+	clr=14
+	bclr=51
+	label="-2"
+}
+"related display" {
+	object {
+		x=0
+		y=60
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 3"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran3"
+	}
+	display[1] {
+		label="user transform 3 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran3"
+	}
+	clr=14
+	bclr=51
+	label="-3"
+}
+"related display" {
+	object {
+		x=0
+		y=80
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 4"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran4"
+	}
+	display[1] {
+		label="user transform 4 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran4"
+	}
+	clr=14
+	bclr=51
+	label="-4"
+}
+"related display" {
+	object {
+		x=0
+		y=100
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 5"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran5"
+	}
+	display[1] {
+		label="user transform 5 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran5"
+	}
+	clr=14
+	bclr=51
+	label="-5"
+}
+"related display" {
+	object {
+		x=0
+		y=120
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 6"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran6"
+	}
+	display[1] {
+		label="user transform 6 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran6"
+	}
+	clr=14
+	bclr=51
+	label="-6"
+}
+"related display" {
+	object {
+		x=0
+		y=140
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 7"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran7"
+	}
+	display[1] {
+		label="user transform 7 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran7"
+	}
+	clr=14
+	bclr=51
+	label="-7"
+}
+"related display" {
+	object {
+		x=0
+		y=160
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 8"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran8"
+	}
+	display[1] {
+		label="user transform 8 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran8"
+	}
+	clr=14
+	bclr=51
+	label="-8"
+}
+"related display" {
+	object {
+		x=0
+		y=180
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 9"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran9"
+	}
+	display[1] {
+		label="user transform 9 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran9"
+	}
+	clr=14
+	bclr=51
+	label="-9"
+}
+"related display" {
+	object {
+		x=0
+		y=200
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 10"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran10"
+	}
+	display[1] {
+		label="user transform 10 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran10"
+	}
+	clr=14
+	bclr=51
+	label="-10"
+}
+"related display" {
+	object {
+		x=0
+		y=220
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 11"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran11"
+	}
+	display[1] {
+		label="user transform 11 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran11"
+	}
+	clr=14
+	bclr=51
+	label="-11"
+}
+"related display" {
+	object {
+		x=0
+		y=240
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 12"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran12"
+	}
+	display[1] {
+		label="user transform 12 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran12"
+	}
+	clr=14
+	bclr=51
+	label="-12"
+}
+"related display" {
+	object {
+		x=0
+		y=260
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 13"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran13"
+	}
+	display[1] {
+		label="user transform 13 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran13"
+	}
+	clr=14
+	bclr=51
+	label="-13"
+}
+"related display" {
+	object {
+		x=0
+		y=280
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 14"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran14"
+	}
+	display[1] {
+		label="user transform 14 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran14"
+	}
+	clr=14
+	bclr=51
+	label="-14"
+}
+"related display" {
+	object {
+		x=0
+		y=300
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 15"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran15"
+	}
+	display[1] {
+		label="user transform 15 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran15"
+	}
+	clr=14
+	bclr=51
+	label="-15"
+}
+"related display" {
+	object {
+		x=0
+		y=320
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 16"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran16"
+	}
+	display[1] {
+		label="user transform 16 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran16"
+	}
+	clr=14
+	bclr=51
+	label="-16"
+}
+"related display" {
+	object {
+		x=0
+		y=340
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 17"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran17"
+	}
+	display[1] {
+		label="user transform 17 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran17"
+	}
+	clr=14
+	bclr=51
+	label="-17"
+}
+"related display" {
+	object {
+		x=0
+		y=360
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 18"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran18"
+	}
+	display[1] {
+		label="user transform 18 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran18"
+	}
+	clr=14
+	bclr=51
+	label="-18"
+}
+"related display" {
+	object {
+		x=0
+		y=380
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 19"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran19"
+	}
+	display[1] {
+		label="user transform 19 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran19"
+	}
+	clr=14
+	bclr=51
+	label="-19"
+}
+"related display" {
+	object {
+		x=0
+		y=400
+		width=22
+		height=20
+	}
+	display[0] {
+		label="user transform 20"
+		name="userTransform.adl"
+		args="P=$(P),T=userTran20"
+	}
+	display[1] {
+		label="user transform 20 (full)"
+		name="userTransform_full.adl"
+		args="P=$(P),T=userTran20"
+	}
+	clr=14
+	bclr=51
+	label="-20"
+}

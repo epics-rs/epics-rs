@@ -1,0 +1,630 @@
+
+file {
+	name="/home/oxygen/MOONEY/epics/synApps/support/calc/calcApp/op/adl/userArrayCalcPlots10.adl"
+	version=030107
+}
+display {
+	object {
+		x=78
+		y=328
+		width=400
+		height=615
+	}
+	clr=14
+	bclr=0
+	cmap=""
+	gridSpacing=5
+	gridOn=0
+	snapToGrid=1
+}
+"color map" {
+	ncolors=65
+	colors {
+		ffffff,
+		ececec,
+		dadada,
+		c8c8c8,
+		bbbbbb,
+		aeaeae,
+		9e9e9e,
+		919191,
+		858585,
+		787878,
+		696969,
+		5a5a5a,
+		464646,
+		2d2d2d,
+		000000,
+		00d800,
+		1ebb00,
+		339900,
+		2d7f00,
+		216c00,
+		fd0000,
+		de1309,
+		be190b,
+		a01207,
+		820400,
+		5893ff,
+		597ee1,
+		4b6ec7,
+		3a5eab,
+		27548d,
+		fbf34a,
+		f9da3c,
+		eeb62b,
+		e19015,
+		cd6100,
+		ffb0ff,
+		d67fe2,
+		ae4ebc,
+		8b1a96,
+		610a75,
+		a4aaff,
+		8793e2,
+		6a73c1,
+		4d52a4,
+		343386,
+		c7bb6d,
+		b79d5c,
+		a47e3c,
+		7d5627,
+		58340f,
+		99ffff,
+		73dfff,
+		4ea5f9,
+		2a63e4,
+		0a00b8,
+		ebf1b5,
+		d4db9d,
+		bbc187,
+		a6a462,
+		8b8239,
+		73ff6b,
+		52da3b,
+		3cb420,
+		289315,
+		1a7309,
+	}
+}
+text {
+	object {
+		x=0
+		y=0
+		width=200
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="$(P)userArrayCalcs $(N1)-$(N5)"
+	align="horiz. centered"
+}
+text {
+	object {
+		x=200
+		y=0
+		width=200
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="$(P)userArrayCalcs $(N6)-$(N10)"
+	align="horiz. centered"
+}
+"cartesian plot" {
+	object {
+		x=0
+		y=15
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N1).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N1).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N1).NUSE"
+	eraseMode="if zero"
+}
+"cartesian plot" {
+	object {
+		x=200
+		y=15
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N6).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N6).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N6).NUSE"
+	eraseMode="if zero"
+}
+"cartesian plot" {
+	object {
+		x=0
+		y=135
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N2).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N2).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N2).NUSE"
+	eraseMode="if zero"
+}
+"cartesian plot" {
+	object {
+		x=200
+		y=135
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N7).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N7).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N7).NUSE"
+	eraseMode="if zero"
+}
+"cartesian plot" {
+	object {
+		x=0
+		y=255
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N3).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N3).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N3).NUSE"
+	eraseMode="if zero"
+}
+"cartesian plot" {
+	object {
+		x=200
+		y=255
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N8).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N8).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N8).NUSE"
+	eraseMode="if zero"
+}
+"cartesian plot" {
+	object {
+		x=0
+		y=495
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N5).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N5).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N5).NUSE"
+	eraseMode="if zero"
+}
+"cartesian plot" {
+	object {
+		x=200
+		y=495
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N10).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N10).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N10).NUSE"
+	eraseMode="if zero"
+}
+"cartesian plot" {
+	object {
+		x=0
+		y=375
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N4).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N4).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N4).NUSE"
+	eraseMode="if zero"
+}
+"cartesian plot" {
+	object {
+		x=200
+		y=375
+		width=200
+		height=100
+	}
+	plotcom {
+		xlabel="ARRAY INDEX"
+		clr=14
+		bclr=0
+	}
+	style="line"
+	count="$(P)userArrayCalc$(N9).NUSE"
+	trace[0] {
+		ydata="$(P)userArrayCalc$(N9).AVAL"
+		data_clr=14
+		yaxis=0
+	}
+	x_axis {
+		rangeStyle="auto-scale"
+	}
+	y1_axis {
+		rangeStyle="auto-scale"
+	}
+	y2_axis {
+		rangeStyle="auto-scale"
+	}
+	countPvName="$(P)userArrayCalc$(N9).NUSE"
+	eraseMode="if zero"
+}
+composite {
+	object {
+		x=5
+		y=115
+		width=390
+		height=16
+	}
+	"composite name"=""
+	children {
+		"text entry" {
+			object {
+				x=205
+				y=115
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N6).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=5
+				y=115
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N1).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+	}
+}
+composite {
+	object {
+		x=5
+		y=235
+		width=390
+		height=16
+	}
+	"composite name"=""
+	children {
+		"text entry" {
+			object {
+				x=205
+				y=235
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N7).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=5
+				y=235
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N2).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+	}
+}
+composite {
+	object {
+		x=5
+		y=355
+		width=390
+		height=16
+	}
+	"composite name"=""
+	children {
+		"text entry" {
+			object {
+				x=205
+				y=355
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N8).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=5
+				y=355
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N3).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+	}
+}
+composite {
+	object {
+		x=5
+		y=475
+		width=390
+		height=16
+	}
+	"composite name"=""
+	children {
+		"text entry" {
+			object {
+				x=205
+				y=475
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N9).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=5
+				y=475
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N4).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+	}
+}
+composite {
+	object {
+		x=5
+		y=595
+		width=390
+		height=16
+	}
+	"composite name"=""
+	children {
+		"text entry" {
+			object {
+				x=205
+				y=595
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N10).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+		"text entry" {
+			object {
+				x=5
+				y=595
+				width=190
+				height=16
+			}
+			control {
+				chan="$(P)userArrayCalc$(N5).CALC"
+				clr=14
+				bclr=51
+			}
+			limits {
+			}
+		}
+	}
+}

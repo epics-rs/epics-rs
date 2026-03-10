@@ -1,0 +1,395 @@
+
+file {
+	name="/home/oxygen/MOONEY/epics/synApps/support/xxx/xxxApp/op/adl/interpNewData.adl"
+	version=030104
+}
+display {
+	object {
+		x=645
+		y=433
+		width=330
+		height=155
+	}
+	clr=14
+	bclr=2
+	cmap=""
+	gridSpacing=5
+	gridOn=0
+	snapToGrid=0
+}
+"color map" {
+	ncolors=65
+	colors {
+		ffffff,
+		ececec,
+		dadada,
+		c8c8c8,
+		bbbbbb,
+		aeaeae,
+		9e9e9e,
+		919191,
+		858585,
+		787878,
+		696969,
+		5a5a5a,
+		464646,
+		2d2d2d,
+		000000,
+		00d800,
+		1ebb00,
+		339900,
+		2d7f00,
+		216c00,
+		fd0000,
+		de1309,
+		be190b,
+		a01207,
+		820400,
+		5893ff,
+		597ee1,
+		4b6ec7,
+		3a5eab,
+		27548d,
+		fbf34a,
+		f9da3c,
+		eeb62b,
+		e19015,
+		cd6100,
+		ffb0ff,
+		d67fe2,
+		ae4ebc,
+		8b1a96,
+		610a75,
+		a4aaff,
+		8793e2,
+		6a73c1,
+		4d52a4,
+		343386,
+		c7bb6d,
+		b79d5c,
+		a47e3c,
+		7d5627,
+		58340f,
+		99ffff,
+		73dfff,
+		4ea5f9,
+		2a63e4,
+		0a00b8,
+		ebf1b5,
+		d4db9d,
+		bbc187,
+		a6a462,
+		8b8239,
+		73ff6b,
+		52da3b,
+		3cb420,
+		289315,
+		1a7309,
+	}
+}
+text {
+	object {
+		x=99
+		y=30
+		width=80
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="Y"
+	align="horiz. centered"
+}
+"text entry" {
+	object {
+		x=95
+		y=45
+		width=80
+		height=20
+	}
+	control {
+		chan="$(P)interp$(Q)_AddPoint.DO2"
+		clr=14
+		bclr=51
+	}
+	format="string"
+	limits {
+	}
+}
+"text entry" {
+	object {
+		x=95
+		y=65
+		width=80
+		height=20
+	}
+	control {
+		chan="$(P)interp$(Q)_AddPoint.DO3"
+		clr=14
+		bclr=51
+	}
+	format="string"
+	limits {
+	}
+}
+composite {
+	object {
+		x=10
+		y=95
+		width=270
+		height=47
+	}
+	"composite name"=""
+	children {
+		"message button" {
+			object {
+				x=52
+				y=122
+				width=80
+				height=20
+			}
+			control {
+				chan="$(P)interp$(Q)_AddPoint.PROC"
+				clr=14
+				bclr=51
+			}
+			label="Add Entry"
+			press_msg="1"
+		}
+		"message button" {
+			object {
+				x=140
+				y=122
+				width=140
+				height=20
+			}
+			control {
+				chan="$(P)interp$(Q)_DeleteAll.PROC"
+				clr=14
+				bclr=51
+			}
+			label="Delete All Entries"
+			press_msg="1"
+		}
+		"text update" {
+			object {
+				x=10
+				y=98
+				width=40
+				height=14
+			}
+			monitor {
+				chan="$(P)interp$(Q)_n"
+				clr=54
+				bclr=2
+			}
+			align="horiz. centered"
+			limits {
+			}
+		}
+		text {
+			object {
+				x=55
+				y=98
+				width=50
+				height=14
+			}
+			"basic attribute" {
+				clr=64
+			}
+			textix="VALUES"
+		}
+		text {
+			object {
+				x=125
+				y=98
+				width=100
+				height=14
+			}
+			"basic attribute" {
+				clr=64
+			}
+			textix="POLYNOMIAL ORDER:"
+		}
+		"text entry" {
+			object {
+				x=240
+				y=95
+				width=30
+				height=20
+			}
+			control {
+				chan="$(P)interp$(Q).F"
+				clr=14
+				bclr=51
+			}
+			format="string"
+			limits {
+			}
+		}
+	}
+}
+text {
+	object {
+		x=180
+		y=35
+		width=40
+		height=10
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="SHOW"
+	align="horiz. centered"
+}
+"related display" {
+	object {
+		x=180
+		y=45
+		width=40
+		height=20
+	}
+	display[0] {
+		label="Interpolation Table"
+		name="arrayPlot.adl"
+		args="P=$(P),X=$(P)interp$(Q).VALA,Y=$(P)interp$(Q).VALB,YLABEL=Y1"
+	}
+	clr=0
+	bclr=17
+	label="-Y1(X)"
+}
+text {
+	object {
+		x=5
+		y=40
+		width=80
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="X"
+	align="horiz. centered"
+}
+"text entry" {
+	object {
+		x=5
+		y=55
+		width=80
+		height=20
+	}
+	control {
+		chan="$(P)interp$(Q)_AddPoint.DO4"
+		clr=14
+		bclr=51
+	}
+	limits {
+	}
+}
+"related display" {
+	object {
+		x=180
+		y=65
+		width=40
+		height=20
+	}
+	display[0] {
+		label="Interpolation Table"
+		name="arrayPlot.adl"
+		args="P=$(P),X=$(P)interp$(Q).VALA,Y=$(P)interp$(Q).VALC,YLABEL=Y2"
+	}
+	clr=0
+	bclr=17
+	label="-Y2(X)"
+}
+composite {
+	object {
+		x=0
+		y=0
+		width=333
+		height=25
+	}
+	"composite name"=""
+	children {
+		rectangle {
+			object {
+				x=0
+				y=0
+				width=332
+				height=25
+			}
+			"basic attribute" {
+				clr=0
+			}
+		}
+		text {
+			object {
+				x=0
+				y=0
+				width=332
+				height=20
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="Data entry for lookup table $(Q)"
+			align="horiz. centered"
+		}
+		polyline {
+			object {
+				x=0
+				y=22
+				width=332
+				height=3
+			}
+			"basic attribute" {
+				clr=53
+				width=3
+			}
+			points {
+				(1,23)
+				(330,23)
+			}
+		}
+	}
+}
+composite {
+	object {
+		x=220
+		y=40
+		width=100
+		height=35
+	}
+	"composite name"=""
+	children {
+		text {
+			object {
+				x=220
+				y=40
+				width=100
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="Description"
+			align="horiz. centered"
+		}
+		"text entry" {
+			object {
+				x=220
+				y=55
+				width=100
+				height=20
+			}
+			control {
+				chan="$(P)interp$(Q)_y1.DESC"
+				clr=14
+				bclr=0
+			}
+			format="string"
+			limits {
+			}
+		}
+	}
+}

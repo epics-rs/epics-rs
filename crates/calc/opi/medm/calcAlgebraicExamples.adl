@@ -1,0 +1,781 @@
+
+file {
+	name="/home/oxygen4/MOONEY/epics/synAppsSVN/support/calc/calcApp/op/adl/calcAlgebraicExamples.adl"
+	version=030107
+}
+display {
+	object {
+		x=57
+		y=94
+		width=240
+		height=630
+	}
+	clr=14
+	bclr=1
+	cmap=""
+	gridSpacing=5
+	gridOn=0
+	snapToGrid=1
+}
+"color map" {
+	ncolors=65
+	colors {
+		ffffff,
+		ececec,
+		dadada,
+		c8c8c8,
+		bbbbbb,
+		aeaeae,
+		9e9e9e,
+		919191,
+		858585,
+		787878,
+		696969,
+		5a5a5a,
+		464646,
+		2d2d2d,
+		000000,
+		00d800,
+		1ebb00,
+		339900,
+		2d7f00,
+		216c00,
+		fd0000,
+		de1309,
+		be190b,
+		a01207,
+		820400,
+		5893ff,
+		597ee1,
+		4b6ec7,
+		3a5eab,
+		27548d,
+		fbf34a,
+		f9da3c,
+		eeb62b,
+		e19015,
+		cd6100,
+		ffb0ff,
+		d67fe2,
+		ae4ebc,
+		8b1a96,
+		610a75,
+		a4aaff,
+		8793e2,
+		6a73c1,
+		4d52a4,
+		343386,
+		c7bb6d,
+		b79d5c,
+		a47e3c,
+		7d5627,
+		58340f,
+		99ffff,
+		73dfff,
+		4ea5f9,
+		2a63e4,
+		0a00b8,
+		ebf1b5,
+		d4db9d,
+		bbc187,
+		a6a462,
+		8b8239,
+		73ff6b,
+		52da3b,
+		3cb420,
+		289315,
+		1a7309,
+	}
+}
+"related display" {
+	object {
+		x=0
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-TOP"
+}
+"related display" {
+	object {
+		x=30
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcAlgebraicExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-ALG"
+}
+"related display" {
+	object {
+		x=60
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcTrigExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-TRIG"
+}
+"related display" {
+	object {
+		x=90
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcRelationalExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-REL"
+}
+"related display" {
+	object {
+		x=120
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcBitwiseExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-BIT"
+}
+"related display" {
+	object {
+		x=150
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcMiscExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-MISC"
+}
+"related display" {
+	object {
+		x=180
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcStringExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-STR"
+}
+polyline {
+	object {
+		x=0
+		y=60
+		width=244
+		height=3
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=3
+	}
+	points {
+		(1,61)
+		(242,61)
+	}
+}
+polyline {
+	object {
+		x=-5
+		y=15
+		width=243
+		height=3
+	}
+	"basic attribute" {
+		clr=54
+		fill="outline"
+		width=3
+	}
+	points {
+		(-4,16)
+		(236,16)
+	}
+}
+text {
+	object {
+		x=15
+		y=755
+		width=190
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+}
+"related display" {
+	object {
+		x=210
+		y=0
+		width=30
+		height=16
+	}
+	display[0] {
+		name="calcArrayExamples.adl"
+		policy="replace display"
+	}
+	clr=0
+	bclr=17
+	label="-ARR"
+}
+text {
+	object {
+		x=5
+		y=20
+		width=235
+		height=20
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="Algebraic"
+	align="horiz. centered"
+}
+text {
+	object {
+		x=5
+		y=40
+		width=235
+		height=20
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="expressions"
+	align="horiz. centered"
+}
+text {
+	object {
+		x=5
+		y=65
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="ABS(A)"
+}
+text {
+	object {
+		x=5
+		y=95
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="CEIL(A)"
+}
+text {
+	object {
+		x=5
+		y=125
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="EXP(A)"
+}
+text {
+	object {
+		x=5
+		y=155
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="FLOOR(A)"
+}
+text {
+	object {
+		x=5
+		y=195
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="INT(A)"
+}
+text {
+	object {
+		x=5
+		y=225
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="LN(A)"
+}
+text {
+	object {
+		x=5
+		y=240
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="LOGE(A)"
+}
+text {
+	object {
+		x=5
+		y=270
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="LOG(A)"
+}
+text {
+	object {
+		x=5
+		y=300
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="MAX(A,B,...)"
+}
+text {
+	object {
+		x=5
+		y=330
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="MIN(A,B,...)"
+}
+text {
+	object {
+		x=5
+		y=360
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="NINT(A)"
+}
+text {
+	object {
+		x=15
+		y=80
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="ABSOLUTE VALUE"
+}
+text {
+	object {
+		x=15
+		y=110
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="NEAREST MORE-POSITIVE  INTEGER"
+}
+text {
+	object {
+		x=15
+		y=140
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="EXPONENTIAL (e**A)"
+}
+text {
+	object {
+		x=15
+		y=170
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="NEAREST LESS-POSITIVE INTEGER"
+}
+text {
+	object {
+		x=15
+		y=180
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="STRING"
+}
+text {
+	object {
+		x=15
+		y=210
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="NEAREST INTEGER CLOSER TO ZERO"
+}
+text {
+	object {
+		x=15
+		y=255
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="NATURAL LOGARITHM (BASE e)"
+}
+text {
+	object {
+		x=15
+		y=285
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="LOGARITHM (BASE 10)"
+}
+text {
+	object {
+		x=15
+		y=315
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="LARGEST ARG (CLOSEST TO +INF)"
+}
+text {
+	object {
+		x=15
+		y=345
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="SMALLEST ARG (CLOSEST TO -INF)"
+}
+text {
+	object {
+		x=15
+		y=375
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="NEAREST INTEGER"
+}
+text {
+	object {
+		x=5
+		y=390
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="SQR(A)"
+}
+text {
+	object {
+		x=5
+		y=405
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="SQRT(A)"
+}
+text {
+	object {
+		x=5
+		y=435
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="A^B"
+}
+text {
+	object {
+		x=5
+		y=450
+		width=230
+		height=14
+	}
+	"basic attribute" {
+		clr=14
+	}
+	textix="A**B"
+}
+text {
+	object {
+		x=15
+		y=420
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="SQUARE ROOT"
+}
+text {
+	object {
+		x=15
+		y=465
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+	textix="A RAISED TO THE POWER B"
+}
+composite {
+	object {
+		x=5
+		y=520
+		width=230
+		height=105
+	}
+	"composite name"=""
+	children {
+		text {
+			object {
+				x=5
+				y=520
+				width=230
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="A%B"
+		}
+		text {
+			object {
+				x=5
+				y=570
+				width=230
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="A>?B"
+		}
+		text {
+			object {
+				x=5
+				y=600
+				width=230
+				height=14
+			}
+			"basic attribute" {
+				clr=14
+			}
+			textix="A<?B"
+		}
+		text {
+			object {
+				x=15
+				y=535
+				width=220
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="REMAINDER AFTER INT(A) DIVIDED"
+		}
+		text {
+			object {
+				x=15
+				y=545
+				width=220
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="BY INT(B).  IF A<0 OR B<0,"
+		}
+		text {
+			object {
+				x=15
+				y=555
+				width=220
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="RESULT IS MACHINE DEPENDENT"
+		}
+		text {
+			object {
+				x=15
+				y=585
+				width=220
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="MAX(A,B)"
+		}
+		text {
+			object {
+				x=15
+				y=615
+				width=220
+				height=10
+			}
+			"basic attribute" {
+				clr=47
+			}
+			textix="MIN(A,B)"
+		}
+	}
+}
+composite {
+	object {
+		x=15
+		y=485
+		width=220
+		height=30
+	}
+	"composite name"=""
+	children {
+		text {
+			object {
+				x=15
+				y=495
+				width=220
+				height=10
+			}
+			"basic attribute" {
+				clr=20
+			}
+			textix="NEGATIVE, IT MUST BE ENCLOSED IN"
+		}
+		text {
+			object {
+				x=15
+				y=485
+				width=220
+				height=10
+			}
+			"basic attribute" {
+				clr=20
+			}
+			textix="NOTE: PARSER HAS A DEFECT: IF A IS"
+		}
+		text {
+			object {
+				x=15
+				y=505
+				width=220
+				height=10
+			}
+			"basic attribute" {
+				clr=20
+			}
+			textix="PARENTHESES.  E.G.,  (-1)^3"
+		}
+	}
+}
+text {
+	object {
+		x=15
+		y=475
+		width=220
+		height=10
+	}
+	"basic attribute" {
+		clr=47
+	}
+}

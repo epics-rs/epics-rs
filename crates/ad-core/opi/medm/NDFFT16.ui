@@ -1,0 +1,1153 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>559</x>
+        <y>207</y>
+        <width>310</width>
+        <height>225</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>310</width>
+        <height>225</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(187, 187, 187);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>NDFFT16</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="5,23,10,17,3,30,40,40,3,94,26,14,5" rowstretch="5,1,24,1,4,6,20,5,20,5,20,5,20,5,20,5,20,4,1,19,1,9,5">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="1" column="0" rowspan="2" colspan="13">
+        <widget class="PyDMDrawingRectangle" name="rectangle">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>5</y>
+              <width>310</width>
+              <height>25</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>218</red>
+                <green>218</green>
+                <blue>218</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>218</red>
+              <green>218</green>
+              <blue>218</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="0" rowspan="2" colspan="13">
+        <widget class="QLabel" name="text">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>6</y>
+              <width>310</width>
+              <height>25</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>${P} FFTs</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>15</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>10</red>
+                <green>0</green>
+                <blue>184</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text {
+  color: rgb(10, 0, 184);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="10" column="2" colspan="6">
+        <widget class="QLabel" name="text_1">
+          <property name="geometry">
+            <rect>
+              <x>28</x>
+              <y>91</y>
+              <width>140</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>FFT abs. value</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_1</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_1 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="12" column="6" colspan="2">
+        <widget class="QLabel" name="text_2">
+          <property name="geometry">
+            <rect>
+              <x>88</x>
+              <y>116</y>
+              <width>80</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>FFT real</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_2</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_2 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="14" column="3" colspan="5">
+        <widget class="QLabel" name="text_3">
+          <property name="geometry">
+            <rect>
+              <x>38</x>
+              <y>141</y>
+              <width>130</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>FFT imaginary</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_3</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_3 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="16" column="2" colspan="6">
+        <widget class="QLabel" name="text_4">
+          <property name="geometry">
+            <rect>
+              <x>28</x>
+              <y>166</y>
+              <width>140</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Combined plots</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_4</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_4 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="8" column="5" colspan="3">
+        <widget class="QLabel" name="text_5">
+          <property name="geometry">
+            <rect>
+              <x>58</x>
+              <y>66</y>
+              <width>110</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Time series</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_5</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_5 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="4" colspan="6">
+        <widget class="QLabel" name="text_6">
+          <property name="geometry">
+            <rect>
+              <x>55</x>
+              <y>41</y>
+              <width>210</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>1-D Time Series Plots</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_6</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_6 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="5" column="1" rowspan="17" colspan="11">
+        <widget class="PyDMDrawingRectangle" name="rectangle_1">
+          <property name="geometry">
+            <rect>
+              <x>5</x>
+              <y>35</y>
+              <width>300</width>
+              <height>185</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_1</string>
+          </property>
+        </widget>
+      </item>
+      <item row="18" column="7" rowspan="2">
+        <widget class="QLabel" name="text_7">
+          <property name="geometry">
+            <rect>
+              <x>128</x>
+              <y>190</y>
+              <width>40</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>More</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_7</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_7 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="10" column="9" colspan="2">
+        <widget class="PyDMRelatedDisplayButton" name="related_display">
+          <property name="geometry">
+            <rect>
+              <x>171</x>
+              <y>91</y>
+              <width>120</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>FFT abs. value</string>
+          </property>
+          <property name="text">
+            <string>FFT abs. value</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>${T1}</string>
+              <string>${T2}</string>
+              <string>${T3}</string>
+              <string>${T4}</string>
+              <string>${T5}</string>
+              <string>${T6}</string>
+              <string>${T7}</string>
+              <string>${T8}</string>
+              <string>${T9}</string>
+              <string>${T10}</string>
+              <string>${T11}</string>
+              <string>${T12}</string>
+              <string>${T13}</string>
+              <string>${T14}</string>
+              <string>${T15}</string>
+              <string>${T16}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},RTS=${RTS},R=${R1},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R2},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R3},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R4},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R5},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R6},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R7},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R8},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R9},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R10},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R11},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R12},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R13},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R14},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R15},S=FFTAbsValue</string>
+              <string>P=${P},RTS=${RTS},R=${R16},S=FFTAbsValue</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="12" column="9" colspan="2">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_1">
+          <property name="geometry">
+            <rect>
+              <x>171</x>
+              <y>116</y>
+              <width>120</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>FFT real</string>
+          </property>
+          <property name="text">
+            <string>FFT real</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_1 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>${T1}</string>
+              <string>${T2}</string>
+              <string>${T3}</string>
+              <string>${T4}</string>
+              <string>${T5}</string>
+              <string>${T6}</string>
+              <string>${T7}</string>
+              <string>${T8}</string>
+              <string>${T9}</string>
+              <string>${T10}</string>
+              <string>${T11}</string>
+              <string>${T12}</string>
+              <string>${T13}</string>
+              <string>${T14}</string>
+              <string>${T15}</string>
+              <string>${T16}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},RTS=${RTS},R=${R1},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R2},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R3},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R4},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R5},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R6},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R7},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R8},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R9},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R10},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R11},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R12},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R13},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R14},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R15},S=FFTReal</string>
+              <string>P=${P},RTS=${RTS},R=${R16},S=FFTReal</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="14" column="9" colspan="2">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_2">
+          <property name="geometry">
+            <rect>
+              <x>171</x>
+              <y>141</y>
+              <width>120</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>FFT imaginary</string>
+          </property>
+          <property name="text">
+            <string>FFT imaginary</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_2 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>${T1}</string>
+              <string>${T2}</string>
+              <string>${T3}</string>
+              <string>${T4}</string>
+              <string>${T5}</string>
+              <string>${T6}</string>
+              <string>${T7}</string>
+              <string>${T8}</string>
+              <string>${T9}</string>
+              <string>${T10}</string>
+              <string>${T11}</string>
+              <string>${T12}</string>
+              <string>${T13}</string>
+              <string>${T14}</string>
+              <string>${T15}</string>
+              <string>${T16}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+              <string>NDFFTFreqSpectrumPlot.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},RTS=${RTS},R=${R1},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R2},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R3},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R4},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R5},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R6},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R7},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R8},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R9},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R10},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R11},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R12},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R13},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R14},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R15},S=FFTImaginary</string>
+              <string>P=${P},RTS=${RTS},R=${R16},S=FFTImaginary</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="16" column="9" colspan="2">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_3">
+          <property name="geometry">
+            <rect>
+              <x>171</x>
+              <y>166</y>
+              <width>120</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>Combined</string>
+          </property>
+          <property name="text">
+            <string>Combined</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_3 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>${T1}</string>
+              <string>${T2}</string>
+              <string>${T3}</string>
+              <string>${T4}</string>
+              <string>${T5}</string>
+              <string>${T6}</string>
+              <string>${T7}</string>
+              <string>${T8}</string>
+              <string>${T9}</string>
+              <string>${T10}</string>
+              <string>${T11}</string>
+              <string>${T12}</string>
+              <string>${T13}</string>
+              <string>${T14}</string>
+              <string>${T15}</string>
+              <string>${T16}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+              <string>NDFFTPlotAll.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},RTS=${RTS},R=${R1}</string>
+              <string>P=${P},RTS=${RTS},R=${R2}</string>
+              <string>P=${P},RTS=${RTS},R=${R3}</string>
+              <string>P=${P},RTS=${RTS},R=${R4}</string>
+              <string>P=${P},RTS=${RTS},R=${R5}</string>
+              <string>P=${P},RTS=${RTS},R=${R6}</string>
+              <string>P=${P},RTS=${RTS},R=${R7}</string>
+              <string>P=${P},RTS=${RTS},R=${R8}</string>
+              <string>P=${P},RTS=${RTS},R=${R9}</string>
+              <string>P=${P},RTS=${RTS},R=${R10}</string>
+              <string>P=${P},RTS=${RTS},R=${R11}</string>
+              <string>P=${P},RTS=${RTS},R=${R12}</string>
+              <string>P=${P},RTS=${RTS},R=${R13}</string>
+              <string>P=${P},RTS=${RTS},R=${R14}</string>
+              <string>P=${P},RTS=${RTS},R=${R15}</string>
+              <string>P=${P},RTS=${RTS},R=${R16}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="8" column="9" colspan="2">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_4">
+          <property name="geometry">
+            <rect>
+              <x>171</x>
+              <y>66</y>
+              <width>120</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>Time series</string>
+          </property>
+          <property name="text">
+            <string>Time series</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_4 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>${T1}</string>
+              <string>${T2}</string>
+              <string>${T3}</string>
+              <string>${T4}</string>
+              <string>${T5}</string>
+              <string>${T6}</string>
+              <string>${T7}</string>
+              <string>${T8}</string>
+              <string>${T9}</string>
+              <string>${T10}</string>
+              <string>${T11}</string>
+              <string>${T12}</string>
+              <string>${T13}</string>
+              <string>${T14}</string>
+              <string>${T15}</string>
+              <string>${T16}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+              <string>NDFFTTimeSeriesPlot.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},RTS=${RTS},R=${R1}</string>
+              <string>P=${P},RTS=${RTS},R=${R2}</string>
+              <string>P=${P},RTS=${RTS},R=${R3}</string>
+              <string>P=${P},RTS=${RTS},R=${R4}</string>
+              <string>P=${P},RTS=${RTS},R=${R5}</string>
+              <string>P=${P},RTS=${RTS},R=${R6}</string>
+              <string>P=${P},RTS=${RTS},R=${R7}</string>
+              <string>P=${P},RTS=${RTS},R=${R8}</string>
+              <string>P=${P},RTS=${RTS},R=${R9}</string>
+              <string>P=${P},RTS=${RTS},R=${R10}</string>
+              <string>P=${P},RTS=${RTS},R=${R11}</string>
+              <string>P=${P},RTS=${RTS},R=${R12}</string>
+              <string>P=${P},RTS=${RTS},R=${R13}</string>
+              <string>P=${P},RTS=${RTS},R=${R14}</string>
+              <string>P=${P},RTS=${RTS},R=${R15}</string>
+              <string>P=${P},RTS=${RTS},R=${R16}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="19" column="9" rowspan="2" colspan="2">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_5">
+          <property name="geometry">
+            <rect>
+              <x>171</x>
+              <y>191</y>
+              <width>120</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>More</string>
+          </property>
+          <property name="text">
+            <string>More</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_5 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>${T1}</string>
+              <string>${T2}</string>
+              <string>${T3}</string>
+              <string>${T4}</string>
+              <string>${T5}</string>
+              <string>${T6}</string>
+              <string>${T7}</string>
+              <string>${T8}</string>
+              <string>${T9}</string>
+              <string>${T10}</string>
+              <string>${T11}</string>
+              <string>${T12}</string>
+              <string>${T13}</string>
+              <string>${T14}</string>
+              <string>${T15}</string>
+              <string>${T16}</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>NDFFT.ui</string>
+              <string>lNDFFT.ui</string>
+              <string>NDFFT.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},RTS=${RTS},R=${R1},TITLE=${T1}</string>
+              <string>P=${P},RTS=${RTS},R=${R2},TITLE=${T2}</string>
+              <string>P=${P},RTS=${RTS},R=${R3},TITLE=${T3}</string>
+              <string>P=${P},RTS=${RTS},R=${R4},TITLE=${T4}</string>
+              <string>P=${P},RTS=${RTS},R=${R5},TITLE=${T5}</string>
+              <string>P=${P},RTS=${RTS},R=${R6},TITLE=${T6}</string>
+              <string>P=${P},RTS=${RTS},R=${R7},TITLE=${T7}</string>
+              <string>P=${P},RTS=${RTS},R=${R8},TITLE=${T8}</string>
+              <string>P=${P},RTS=${RTS},R=${R9},TITLE=${T9}</string>
+              <string>P=${P},RTS=${RTS},R=${R10},TITLE=${T10}</string>
+              <string>P=${P},RTS=${RTS},R=${R11},TITLE=${T11}</string>
+              <string>P=${P},RTS=${RTS},R=${R12},TITLE=${T12}</string>
+              <string>P=${P},RTS=${RTS},R=${R13},TITLE=${T13}</string>
+              <string>P=${P},RTS=${RTS},R=${R14},TITLE=${T14}</string>
+              <string>P=${P},RTS=${RTS},R=${R15},TITLE=${T15}</string>
+              <string>P=${P},RTS=${RTS},R=${R16},TITLE=${T16}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>rectangle</zorder>
+    <zorder>text</zorder>
+    <zorder>text_1</zorder>
+    <zorder>text_2</zorder>
+    <zorder>text_3</zorder>
+    <zorder>text_4</zorder>
+    <zorder>text_5</zorder>
+    <zorder>text_6</zorder>
+    <zorder>rectangle_1</zorder>
+    <zorder>text_7</zorder>
+    <zorder>related_display</zorder>
+    <zorder>related_display_1</zorder>
+    <zorder>related_display_2</zorder>
+    <zorder>related_display_3</zorder>
+    <zorder>related_display_4</zorder>
+    <zorder>related_display_5</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMDrawingRectangle</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLabel</class>
+      <extends>QLabel</extends>
+      <header>pydm.widgets.label</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMRelatedDisplayButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.related_display_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

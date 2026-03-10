@@ -1,0 +1,11 @@
+[package]
+name = "seq"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-native EPICS sequencer runtime"
+
+[dependencies]
+epics-base-rs = { path = "../epics-base" }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"

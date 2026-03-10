@@ -1489,6 +1489,17 @@ impl PvDatabase {
                         }
                     }
                 }
+                // Check DOL link for output records (ao, longout, bo, mbbo, etc.)
+                if let Some(EpicsValue::String(dol_str)) = instance.record.get_field("DOL") {
+                    if !dol_str.is_empty() {
+                        let parsed = super::record::parse_link_v2(&dol_str);
+                        if let super::record::ParsedLink::Db(ref db) = parsed {
+                            if db.policy == super::record::LinkProcessPolicy::ChannelProcess {
+                                links_to_register.push((db.record.clone(), target_name.clone()));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2641,5 +2652,51 @@ mod tests {
         assert_eq!(super::select_link_indices(1, 10, 6), Vec::<usize>::new());
         // Mask: seln=5 = 0b101 → indices 0 and 2
         assert_eq!(super::select_link_indices(2, 5, 6), vec![0, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_dol_cp_link_registration() {
+        let db = PvDatabase::new();
+
+        // Source record (motor RBV)
+        db.add_record("MTR", Box::new(AoRecord::new(0.0))).await;
+
+        // Output record with DOL CP link
+        let mut ao = AoRecord::new(0.0);
+        ao.omsl = 1;
+        ao.dol = "MTR CP".to_string();
+        db.add_record("MOTOR_POS", Box::new(ao)).await;
+
+        db.setup_cp_links().await;
+
+        let targets = db.get_cp_targets("MTR").await;
+        assert_eq!(targets, vec!["MOTOR_POS"]);
+    }
+
+    #[tokio::test]
+    async fn test_dol_cp_link_triggers_processing() {
+        let db = PvDatabase::new();
+
+        // Source record
+        db.add_record("SRC", Box::new(AoRecord::new(10.0))).await;
+
+        // Output record with closed-loop DOL CP
+        let mut ao = AoRecord::new(0.0);
+        ao.omsl = 1;
+        ao.dol = "SRC CP".to_string();
+        db.add_record("DST", Box::new(ao)).await;
+
+        db.setup_cp_links().await;
+
+        // Process the source — should trigger DST via CP link
+        let mut visited = HashSet::new();
+        db.process_record_with_links("SRC", &mut visited, 0).await.unwrap();
+
+        // DST should have picked up the value from SRC via DOL
+        let val = db.get_pv("DST").await.unwrap();
+        match val {
+            EpicsValue::Double(v) => assert!((v - 10.0).abs() < 1e-10),
+            other => panic!("expected Double(10.0), got {:?}", other),
+        }
     }
 }

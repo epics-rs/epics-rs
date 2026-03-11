@@ -91,11 +91,19 @@ impl IocApplication {
     /// Called as a fallback when a record's DTYP doesn't match any
     /// statically registered factory. The closure receives the DTYP name
     /// and returns `Some(device_support)` if it can handle that DTYP.
+    ///
+    /// Multiple calls are chained: new factory is tried first, then existing.
     pub fn register_dynamic_device_support<F>(mut self, factory: F) -> Self
     where
         F: Fn(&str) -> Option<Box<dyn DeviceSupport>> + Send + Sync + 'static,
     {
-        self.dynamic_device_factory = Some(Box::new(factory));
+        if let Some(existing) = self.dynamic_device_factory.take() {
+            self.dynamic_device_factory = Some(Box::new(move |dtyp: &str| {
+                factory(dtyp).or_else(|| existing(dtyp))
+            }));
+        } else {
+            self.dynamic_device_factory = Some(Box::new(factory));
+        }
         self
     }
 

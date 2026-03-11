@@ -129,16 +129,16 @@ Values must be set before the `miniBeamlineConfig()` call.
 
 ### Motors
 
-Applied to all five motors.
+Motors are configured in `st.cmd` using `simMotorCreate` and `dbLoadRecords`:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MOTOR_VELO` | 1.0 | Velocity |
-| `MOTOR_ACCL` | 0.5 | Acceleration time (s) |
-| `MOTOR_HLM` | 100.0 | High limit |
-| `MOTOR_LLM` | -100.0 | Low limit |
-| `MOTOR_MRES` | 0.001 | Motor resolution |
-| `MOTOR_POLL_MS` | 100 | Poll interval (ms) |
+```
+# simMotorCreate(port, lowLimit, highLimit, [pollMs])
+simMotorCreate("ph_mtr", -100, 100, 100)
+
+# dbLoadRecords(template, macros)
+#   VELO, ACCL, HLM, LLM, MRES, PREC have defaults in motor.template
+dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=ph:mtr,PORT=ph_mtr")
+```
 
 ### MovingDot
 
@@ -162,6 +162,47 @@ epicsEnvSet("DOT_SIZE_X",     "128")
 epicsEnvSet("DOT_SIZE_Y",     "96")
 epicsEnvSet("MOTOR_VELO",     "10.0")
 ```
+
+## Architecture
+
+### IOC startup phases
+
+The IOC follows the standard C EPICS startup sequence:
+
+1. **Phase 1 (st.cmd):** A blocking thread executes the startup script. Commands like `miniBeamlineConfig()`, `simMotorCreate()`, and `dbLoadRecords()` create drivers and load record definitions.
+2. **Phase 2 (iocInit):** The framework wires device support to records by matching each record's DTYP field to a registered factory, then calls `DeviceSupport::init()` and sets up I/O Intr scanning.
+3. **Phase 3 (shell):** An interactive iocsh REPL for runtime inspection (`dbl`, `dbgf`, `dbpf`, etc.).
+
+### Record, DeviceSupport, and Driver
+
+The IOC uses a three-layer architecture. Each layer has a single responsibility and communicates only with its immediate neighbors:
+
+```
+Record  <-->  DeviceSupport  <-->  Driver
+(data)        (translation)        (hardware)
+```
+
+**Record** — holds PV fields (VAL, RBV, DTYP, SCAN, ...) and runs the process cycle. Created by `dbLoadRecords()` from `.template` files. This is what Channel Access clients see and interact with.
+
+**DeviceSupport** — translates between records and drivers. On `read()`, it fetches a value from the driver and writes it into the record. On `write()`, it reads the record's value and sends a command to the driver. Each DeviceSupport instance is bound to exactly one record during iocInit.
+
+**Driver** — controls the actual hardware (or simulator). It knows nothing about EPICS records. It exposes a domain-specific interface (`AsynMotor::move_absolute()`, `PortDriver::write_int32()`, etc.).
+
+| Layer | This IOC's instances | Trait |
+|-------|---------------------|-------|
+| Record | MotorRecord, AiRecord, AoRecord, ... | `Record` |
+| DeviceSupport | `MotorDeviceSupport`, `BeamCurrentDeviceSupport`, `PointDetectorDeviceSupport`, `MovingDotDeviceSupport` | `DeviceSupport` |
+| Driver | `SimMotor`, beam current thread, `PointDetectorRuntime`, `MovingDotRuntime` | `AsynMotor`, `PortDriver`, ... |
+
+Swapping the driver changes the hardware; swapping the device support changes how records map to the driver. The record layer stays the same either way.
+
+### Phase bridge (BeamlineHolder)
+
+Drivers are created during Phase 1 (st.cmd thread), but device support factories run during Phase 2 (tokio thread). `BeamlineHolder` bridges this gap — the config command stores driver handles into it, and the factories read them back out. This is the Rust equivalent of the global variables that C EPICS IOCs use to pass driver handles from `xxxConfigure()` to device support `init()`.
+
+### Template-based motors
+
+Motors use the `simMotorCreate` + `dbLoadRecords("motor.template", ...)` pattern instead of hardcoded Rust. The `simMotorCreate` command creates a `SimMotor` driver and spawns its poll loop. The template creates a `MotorRecord` with a matching DTYP. During iocInit, `DeviceSupport::init()` injects the `SharedDeviceState` into the record via `as_any_mut()` downcast, completing the wiring.
 
 ## Build and Run
 

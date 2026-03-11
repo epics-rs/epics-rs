@@ -495,6 +495,12 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Downcast to concrete type for device support init injection.
+    /// Override in record types that need device support to inject state (e.g., MotorRecord).
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
     /// Whether processing this record should clear UDF.
     /// Override to return false for record types that don't produce a valid value every cycle.
     fn clears_udf(&self) -> bool {

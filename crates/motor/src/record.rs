@@ -80,6 +80,11 @@ impl MotorRecord {
         self
     }
 
+    /// Set the shared device state (for late injection by device support init).
+    pub fn set_device_state(&mut self, state: SharedDeviceState) {
+        self.device_state = Some(state);
+    }
+
     /// Set a pending event for the next process() call.
     pub fn set_event(&mut self, event: MotorEvent) {
         self.pending_event = Some(event);
@@ -1000,6 +1005,14 @@ static FIELDS: &[FieldDesc] = &[
 impl Record for MotorRecord {
     fn record_type(&self) -> &'static str {
         "motor"
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn can_device_write(&self) -> bool {
+        true
     }
 
     fn process(&mut self) -> CaResult<RecordProcessResult> {

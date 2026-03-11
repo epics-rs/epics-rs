@@ -6,13 +6,13 @@ epicsEnvSet("BEAM_AMPLITUDE", "25.0")
 epicsEnvSet("BEAM_PERIOD",    "4.0")
 epicsEnvSet("BEAM_UPDATE_MS", "100")
 
-# ===== Motor parameters =====
-epicsEnvSet("MOTOR_VELO",    "1.0")
-epicsEnvSet("MOTOR_ACCL",    "0.5")
-epicsEnvSet("MOTOR_HLM",     "100.0")
-epicsEnvSet("MOTOR_LLM",     "-100.0")
-epicsEnvSet("MOTOR_MRES",    "0.001")
-epicsEnvSet("MOTOR_POLL_MS", "100")
+# ===== Simulated Motors =====
+# simMotorCreate(port, lowLimit, highLimit, pollMs)
+simMotorCreate("ph_mtr", -100, 100, 100)
+simMotorCreate("edge_mtr", -100, 100, 100)
+simMotorCreate("slit_mtr", -100, 100, 100)
+simMotorCreate("dot_mtrx", -100, 100, 100)
+simMotorCreate("dot_mtry", -100, 100, 100)
 
 # ===== MovingDot detector parameters =====
 epicsEnvSet("DOT_SIZE_X",       "640")
@@ -25,6 +25,13 @@ epicsEnvSet("DOT_N_PER_I_PER_S","200.0")
 
 # Configure all beamline components
 miniBeamlineConfig()
+
+# Load motors
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=ph:mtr,PORT=ph_mtr")
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=edge:mtr,PORT=edge_mtr")
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=slit:mtr,PORT=slit_mtr")
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtrx,PORT=dot_mtrx")
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtry,PORT=dot_mtry")
 
 # Load beam current
 dbLoadRecords("$(MINI_BEAMLINE)/db/beam_current.template", "P=$(PREFIX)")

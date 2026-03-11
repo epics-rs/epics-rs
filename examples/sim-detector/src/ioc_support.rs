@@ -5,10 +5,14 @@ use asyn_rs::adapter::AsynDeviceSupport;
 use asyn_rs::port_handle::PortHandle;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::{DeviceSupport, WriteCompletion};
+use epics_base_rs::server::iocsh::registry::*;
 use epics_base_rs::server::record::{Record, ScanType};
 
+use ad_core::ioc::GenericDriverContext;
 use ad_core::params::ADBaseParams;
+use ad_core::plugin::channel::NDArrayOutput;
 use ad_core::plugin::registry::{ParamInfo, RegistryParamType};
+use crate::driver::{SimDetectorRuntime, create_sim_detector};
 use crate::params::SimDetectorParams;
 use crate::SimDetector;
 
@@ -388,5 +392,90 @@ impl DeviceSupport for SimDeviceSupport {
 
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
         self.inner.io_intr_receiver()
+    }
+}
+
+// ============================================================================
+// IOC registration
+// ============================================================================
+
+/// Register the SimDetector configure command and device support on an [`AdIoc`].
+///
+/// After calling this, `simDetectorConfig(...)` can be used in st.cmd to
+/// create a SimDetector, and records with `DTYP=asynSimDetector` will be
+/// wired automatically.
+pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
+    epics_base_rs::runtime::env::set_default("ADSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
+
+    let driver_handle: Arc<std::sync::Mutex<Option<PortHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let driver_registry: Arc<std::sync::Mutex<Option<Arc<ParamRegistry>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Keep runtime alive for the IOC's lifetime.
+    let driver_runtime: Arc<std::sync::Mutex<Option<SimDetectorRuntime>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // --- simDetectorConfig startup command ---
+    {
+        let mgr = ioc.mgr().clone();
+        let trace = ioc.trace().clone();
+        let ph = driver_handle.clone();
+        let reg = driver_registry.clone();
+        let rt = driver_runtime.clone();
+        ioc.register_startup_command(CommandDef::new(
+            "simDetectorConfig",
+            vec![
+                ArgDesc { name: "portName", arg_type: ArgType::String, optional: false },
+                ArgDesc { name: "sizeX", arg_type: ArgType::Int, optional: true },
+                ArgDesc { name: "sizeY", arg_type: ArgType::Int, optional: true },
+                ArgDesc { name: "maxMemory", arg_type: ArgType::Int, optional: true },
+            ],
+            "simDetectorConfig portName [sizeX] [sizeY] [maxMemory]",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let port_name = match &args[0] {
+                    ArgValue::String(s) => s.clone(),
+                    _ => return Err("portName required".into()),
+                };
+                let size_x = match args.get(1) { Some(ArgValue::Int(n)) => *n as i32, _ => 256 };
+                let size_y = match args.get(2) { Some(ArgValue::Int(n)) => *n as i32, _ => 256 };
+                let max_memory = match args.get(3) { Some(ArgValue::Int(n)) => *n as usize, _ => 50_000_000 };
+
+                println!("simDetectorConfig: port={port_name}, size={size_x}x{size_y}, maxMemory={max_memory}");
+
+                let runtime = create_sim_detector(&port_name, size_x, size_y, max_memory, NDArrayOutput::new())
+                    .map_err(|e| format!("failed to create SimDetector: {e}"))?;
+
+                let registry = Arc::new(build_param_registry_from_params(&runtime.ad_params, &runtime.sim_params));
+                let port_handle = runtime.port_handle().clone();
+
+                asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), trace.clone());
+
+                mgr.set_driver(Arc::new(GenericDriverContext::new(
+                    runtime.pool().clone(),
+                    runtime.array_output().clone(),
+                )));
+
+                *ph.lock().unwrap() = Some(port_handle);
+                *reg.lock().unwrap() = Some(registry);
+                *rt.lock().unwrap() = Some(runtime);
+
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // --- asynSimDetector device support ---
+    {
+        let ph = driver_handle;
+        let reg = driver_registry;
+        ioc.register_device_support("asynSimDetector", move || {
+            let handle = ph.lock().unwrap()
+                .as_ref().expect("simDetectorConfig must be called before iocInit")
+                .clone();
+            let registry = reg.lock().unwrap()
+                .as_ref().expect("simDetectorConfig must be called before iocInit")
+                .clone();
+            Box::new(SimDeviceSupport::from_handle(handle, registry))
+        });
     }
 }

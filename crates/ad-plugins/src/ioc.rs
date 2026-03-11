@@ -1,12 +1,17 @@
-//! IOC plugin registration: C-compatible configure commands for all AD plugins.
+//! IOC plugin registration and areaDetector IOC application framework.
 //!
-//! Provides [`register_all_plugins`] which registers startup commands like
-//! `NDStatsConfigure`, `NDROIConfigure`, etc. on an `IocApplication`.
+//! Provides:
+//! - [`register_all_plugins`]: registers startup commands like
+//!   `NDStatsConfigure`, `NDROIConfigure`, etc. on an `IocApplication`.
+//! - [`AdIoc`]: pre-configured IOC application that handles all common
+//!   areaDetector boilerplate (plugins, device support, asynRecord, etc.).
 
 use std::sync::Arc;
 
-use ad_core::ioc::{dtyp_from_port, extract_plugin_args, plugin_arg_defs, PluginManager};
+use ad_core::ioc::{dtyp_from_port, extract_plugin_args, plugin_arg_defs, PluginManager, register_noop_commands};
 use ad_core::plugin::runtime::create_plugin_runtime;
+use asyn_rs::trace::TraceManager;
+use epics_base_rs::error::CaResult;
 use epics_base_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::iocsh::registry::*;
 
@@ -211,4 +216,157 @@ where
         },
     ));
     result
+}
+
+// ============================================================================
+// AdIoc — Pre-configured IOC application for areaDetector-based systems
+// ============================================================================
+
+/// A pre-configured IOC application for areaDetector-based systems.
+///
+/// Handles all common boilerplate:
+/// - `IocApplication` creation with CA server port
+/// - `TraceManager` and `PluginManager`
+/// - `asynRecord` registration
+/// - All NDPlugin configure commands (`NDStdArraysConfigure`, `NDStatsConfigure`, etc.)
+/// - No-op commands from commonPlugins.cmd
+/// - Plugin device support (dynamic DTYP dispatch)
+/// - Report shell command
+///
+/// Detector libraries register their configure commands and device support
+/// via [`register_startup_command`] and [`register_device_support`], then
+/// call [`run_from_args`] to start the IOC.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[tokio::main]
+/// async fn main() -> CaResult<()> {
+///     epics_base_rs::runtime::env::set_default("MYDET", env!("CARGO_MANIFEST_DIR"));
+///
+///     let mut ioc = AdIoc::new();
+///     my_detector::ioc_support::register(&mut ioc);
+///     ioc.run_from_args().await
+/// }
+/// ```
+pub struct AdIoc {
+    app: Option<IocApplication>,
+    mgr: Arc<PluginManager>,
+    trace: Arc<TraceManager>,
+}
+
+impl AdIoc {
+    /// Create a new AdIoc with default configuration.
+    pub fn new() -> Self {
+        let trace = Arc::new(TraceManager::new());
+        let mgr = PluginManager::new(trace.clone());
+
+        asyn_rs::asyn_record::register_asyn_record_type();
+
+        let app = IocApplication::new().port(
+            std::env::var("EPICS_CA_SERVER_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5064),
+        );
+
+        // Set ADCORE path for commonPlugins.cmd resolution
+        epics_base_rs::runtime::env::set_default(
+            "ADCORE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../ad-core"),
+        );
+
+        Self { app: Some(app), mgr, trace }
+    }
+
+    /// Access the shared `PluginManager`.
+    pub fn mgr(&self) -> &Arc<PluginManager> {
+        &self.mgr
+    }
+
+    /// Access the shared `TraceManager`.
+    pub fn trace(&self) -> &Arc<TraceManager> {
+        &self.trace
+    }
+
+    /// Register a startup command (e.g., detector configure command).
+    pub fn register_startup_command(&mut self, cmd: CommandDef) {
+        let app = self.app.take().unwrap();
+        self.app = Some(app.register_startup_command(cmd));
+    }
+
+    /// Register a static device support factory for a fixed DTYP name.
+    pub fn register_device_support<F>(&mut self, dtyp: &str, factory: F)
+    where
+        F: Fn() -> Box<dyn epics_base_rs::server::device_support::DeviceSupport>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let app = self.app.take().unwrap();
+        self.app = Some(app.register_device_support(dtyp, factory));
+    }
+
+    /// Register a dynamic device support factory (dispatches by DTYP name).
+    pub fn register_dynamic_device_support<F>(&mut self, factory: F)
+    where
+        F: Fn(&str) -> Option<Box<dyn epics_base_rs::server::device_support::DeviceSupport>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let app = self.app.take().unwrap();
+        self.app = Some(app.register_dynamic_device_support(factory));
+    }
+
+    /// Register a shell command.
+    pub fn register_shell_command(&mut self, cmd: CommandDef) {
+        let app = self.app.take().unwrap();
+        self.app = Some(app.register_shell_command(cmd));
+    }
+
+    /// Register an inline EPICS record.
+    pub fn record(&mut self, name: &str, record: impl epics_base_rs::server::record::Record) {
+        let app = self.app.take().unwrap();
+        self.app = Some(app.record(name, record));
+    }
+
+    /// Parse command-line args for the startup script path and run.
+    pub async fn run_from_args(self) -> CaResult<()> {
+        let args: Vec<String> = std::env::args().collect();
+        let script = if args.len() > 1 && !args[1].starts_with('-') {
+            args[1].clone()
+        } else {
+            let bin = args.first().map(|s| s.as_str()).unwrap_or("ioc");
+            eprintln!("Usage: {bin} <st.cmd>");
+            std::process::exit(1);
+        };
+        self.run(&script).await
+    }
+
+    /// Run the IOC with a given startup script path.
+    pub async fn run(self, script: &str) -> CaResult<()> {
+        let mut app = self.app.unwrap();
+
+        // Register all standard plugin configure commands
+        app = register_all_plugins(app, &self.mgr);
+        app = register_noop_commands(app);
+
+        // Plugin device support (dynamic DTYP dispatch)
+        app = self.mgr.register_device_support(app);
+
+        // asynReport shell command
+        let mgr_r = self.mgr.clone();
+        app = app.register_shell_command(CommandDef::new(
+            "asynReport",
+            vec![ArgDesc { name: "level", arg_type: ArgType::Int, optional: true }],
+            "asynReport [level] - Report registered ports and plugins",
+            move |_args: &[ArgValue], _ctx: &CommandContext| {
+                mgr_r.report();
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+
+        app.startup_script(script).run().await
+    }
 }

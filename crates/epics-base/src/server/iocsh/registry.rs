@@ -91,6 +91,11 @@ impl CommandContext {
         &self.db
     }
 
+    /// Access the tokio runtime handle (e.g., for spawning tasks from iocsh commands).
+    pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
+        &self.handle
+    }
+
     /// Run an async future from the blocking REPL thread.
     ///
     /// # Panics

@@ -22,6 +22,7 @@ pub struct MotorDeviceSupport {
     io_intr_rx: Option<mpsc::Receiver<()>>,
     device_state: SharedDeviceState,
     initialized: bool,
+    dtyp_name: String,
 }
 
 impl MotorDeviceSupport {
@@ -42,7 +43,14 @@ impl MotorDeviceSupport {
             io_intr_rx: Some(io_intr_rx),
             device_state,
             initialized: false,
+            dtyp_name: "asynMotor".to_string(),
         }
+    }
+
+    /// Set a custom DTYP name (for simMotorCreate-based registration).
+    pub fn with_dtyp_name(mut self, name: String) -> Self {
+        self.dtyp_name = name;
+        self
     }
 
     /// Get the io_intr sender (for poll loop to trigger record re-processing).
@@ -116,7 +124,13 @@ impl MotorDeviceSupport {
 }
 
 impl DeviceSupport for MotorDeviceSupport {
-    fn init(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+        // Inject device_state into MotorRecord (for template-created records)
+        if let Some(motor_rec) = record.as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
+        {
+            motor_rec.set_device_state(self.device_state.clone());
+        }
         let user = self.make_user();
         let status = {
             let mut motor = self.motor.lock().map_err(|e| {
@@ -156,7 +170,7 @@ impl DeviceSupport for MotorDeviceSupport {
     }
 
     fn dtyp(&self) -> &str {
-        "asynMotor"
+        &self.dtyp_name
     }
 
     fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}

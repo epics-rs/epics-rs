@@ -1,6 +1,20 @@
+//! Mini-beamline IOC binary.
+//!
+//! This file wires together all the simulated hardware for the mini-beamline:
+//! beam current source, 3 point detectors, 1 area detector (MovingDot), 5 motors,
+//! and the standard areaDetector plugin chain.
+//!
+//! The structure follows the C EPICS IOC pattern:
+//!   1. Register iocsh commands and device support factories (Rust side)
+//!   2. Execute st.cmd which calls those commands and loads .db/.template files
+//!   3. iocInit wires device support to records, starts I/O Intr scanning
+//!   4. Interactive iocsh shell for runtime inspection
+//!
+//! Usage:
+//!   cargo run -p mini-beamline --features ioc --bin mini_ioc -- ioc/st.cmd
+
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
@@ -11,9 +25,7 @@ use ad_core::ioc::{PluginManager, register_noop_commands};
 use ad_core::plugin::channel::NDArrayOutput;
 use ad_core::plugin::registry::ParamRegistry;
 
-use motor_rs::builder::{MotorBuilder, MotorSetup};
-use motor_rs::device_support::MotorDeviceSupport;
-use motor_rs::sim_motor::SimMotor;
+use motor_rs::ioc::SimMotorHolder;
 
 use mini_beamline::beam_current::{self, BeamCurrentValue};
 use mini_beamline::beam_current::ioc_support::BeamCurrentDeviceSupport;
@@ -29,33 +41,39 @@ use mini_beamline::moving_dot::ioc_support::{
     build_param_registry as build_md_registry,
 };
 
-/// Read an f64 from an environment variable, returning `default` if unset or unparseable.
+// ============================================================================
+// Environment helpers
+// ============================================================================
+
 fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
-/// Read a u64 from an environment variable, returning `default` if unset or unparseable.
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
-/// Read an i32 from an environment variable, returning `default` if unset or unparseable.
 fn env_i32(name: &str, default: i32) -> i32 {
     std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
-/// Motor info stored for device support wiring.
-struct MotorInfo {
-    device_support: Option<MotorDeviceSupport>,
-}
+// ============================================================================
+// Phase bridge: st.cmd thread → iocInit thread
+//
+// IOC startup has a timing problem: st.cmd runs first (Phase 1) and creates
+// driver runtimes, but device support factories run later during iocInit
+// (Phase 2). BeamlineHolder bridges this gap — the config command stores
+// runtimes into it, and the factories read them back out.
+//
+// This is the Rust equivalent of the global variables that C EPICS IOCs use
+// to pass driver handles from xxxConfigure() to xxxDeviceSupport::init().
+// ============================================================================
 
-/// Shared state between miniBeamlineConfig and device support factories.
 struct BeamlineHolder {
     beam_value: Arc<BeamCurrentValue>,
     beam_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pd_runtimes: std::sync::Mutex<HashMap<String, (PointDetectorRuntime, Arc<ParamRegistry>)>>,
     md_runtime: std::sync::Mutex<Option<(MovingDotRuntime, Arc<ParamRegistry>)>>,
-    motors: std::sync::Mutex<HashMap<String, MotorInfo>>,
     trace: Arc<TraceManager>,
 }
 
@@ -66,13 +84,21 @@ impl BeamlineHolder {
             beam_rx: std::sync::Mutex::new(None),
             pd_runtimes: std::sync::Mutex::new(HashMap::new()),
             md_runtime: std::sync::Mutex::new(None),
-            motors: std::sync::Mutex::new(HashMap::new()),
             trace,
         })
     }
 }
 
-/// DriverContext implementation for MovingDot detector.
+// ============================================================================
+// DriverContext: connects MovingDot to the areaDetector plugin chain
+//
+// When st.cmd runs NDStdArraysConfigure/NDStatsConfigure/etc., the plugin
+// manager needs to know where image data comes from (which NDArrayPool)
+// and how to subscribe to new frames (connect_downstream). This adapter
+// exposes the MovingDot driver's pool and output channel to the plugin
+// infrastructure.
+// ============================================================================
+
 struct MovingDotDriverContext {
     pool: Arc<ad_core::ndarray_pool::NDArrayPool>,
     output: Arc<parking_lot::Mutex<NDArrayOutput>>,
@@ -88,10 +114,15 @@ impl ad_core::ioc::DriverContext for MovingDotDriverContext {
     }
 }
 
+// ============================================================================
+// Main
+// ============================================================================
+
 #[tokio::main]
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // Set macro paths so st.cmd can resolve $(MINI_BEAMLINE)/db/... and $(ADCORE)/ioc/...
     epics_base_rs::runtime::env::set_default("MINI_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
     epics_base_rs::runtime::env::set_default("ADCORE", concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/ad-core"));
 
@@ -102,9 +133,8 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    // Register the full asynRecord type
+    // Global singletons shared across the IOC
     asyn_rs::asyn_record::register_asyn_record_type();
-
     let trace = Arc::new(TraceManager::new());
     let mgr = PluginManager::new(trace.clone());
     let holder = BeamlineHolder::new(trace.clone());
@@ -117,7 +147,18 @@ async fn main() -> CaResult<()> {
             .unwrap_or(5064),
     );
 
-    // ===== miniBeamlineConfig startup command =====
+    // ========================================================================
+    // Startup command: miniBeamlineConfig
+    //
+    // Called from st.cmd as `miniBeamlineConfig()`. Creates all simulated
+    // hardware and stores handles in BeamlineHolder for later device support
+    // wiring. This runs on the st.cmd thread (std::thread, not tokio).
+    //
+    // Creates:
+    //   - Beam current simulator thread (sine wave, configurable via env vars)
+    //   - 3 point detectors (PinHole, Edge, Slit) as asyn ports
+    //   - 1 MovingDot area detector as an asyn port + plugin data source
+    // ========================================================================
     {
         let h = holder.clone();
         let mgr_c = mgr.clone();
@@ -128,7 +169,7 @@ async fn main() -> CaResult<()> {
             move |_args: &[ArgValue], _ctx: &CommandContext| {
                 println!("miniBeamlineConfig: setting up beamline...");
 
-                // 1. Start beam current thread
+                // --- Beam current: background thread producing sine-wave values ---
                 let beam_config = BeamCurrentConfig {
                     offset: env_f64("BEAM_OFFSET", 500.0),
                     amplitude: env_f64("BEAM_AMPLITUDE", 25.0),
@@ -144,7 +185,7 @@ async fn main() -> CaResult<()> {
                 *h.beam_rx.lock().unwrap() = Some(beam_rx);
                 println!("  Beam current thread started");
 
-                // 2. Create 3 point detectors
+                // --- Point detectors: 3 asyn ports with different slit geometries ---
                 let pd_configs = [
                     ("PD_PH", DetectorMode::PinHole),
                     ("PD_EDGE", DetectorMode::Edge),
@@ -160,7 +201,7 @@ async fn main() -> CaResult<()> {
                     println!("  PointDetector '{port}' created");
                 }
 
-                // 3. Create 1 MovingDot detector
+                // --- MovingDot: 2D Gaussian area detector + plugin data source ---
                 let dot_size_x = env_i32("DOT_SIZE_X", 640);
                 let dot_size_y = env_i32("DOT_SIZE_Y", 480);
                 let dot_max_mem = env_u64("DOT_MAX_MEMORY", 50_000_000) as usize;
@@ -183,7 +224,8 @@ async fn main() -> CaResult<()> {
                 let dot_handle = dot_rt.port_handle().clone();
                 asyn_rs::asyn_record::register_port("DOT", dot_handle, h.trace.clone());
 
-                // Set driver context for plugin commands
+                // Connect MovingDot as the data source for the plugin chain
+                // (NDStdArraysConfigure etc. will call connect_downstream on this)
                 mgr_c.set_driver(Arc::new(MovingDotDriverContext {
                     pool: dot_rt.pool().clone(),
                     output: dot_rt.array_output().clone(),
@@ -198,13 +240,33 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    // Register all plugin configure commands (NDStdArraysConfigure, NDStatsConfigure, etc.)
-    app = ad_plugins::ioc::register_all_plugins(app, &mgr);
+    // ========================================================================
+    // areaDetector plugin commands
+    //
+    // Register st.cmd commands for standard AD plugins (NDStdArraysConfigure,
+    // NDStatsConfigure, NDROIConfigure, etc.) so that commonPlugins.cmd works.
+    // Also register no-op stubs for commands we don't implement (e.g. set_requestfile_path).
+    // ========================================================================
 
-    // Register no-op commands from commonPlugins.cmd
+    app = ad_plugins::ioc::register_all_plugins(app, &mgr);
     app = register_noop_commands(app);
 
-    // ===== Device support: beam current =====
+    // ========================================================================
+    // Device support factories
+    //
+    // Each factory maps a DTYP string to a DeviceSupport constructor.
+    // During iocInit (Phase 2), records with matching DTYP get wired to
+    // these factories. The factory closures capture BeamlineHolder to
+    // retrieve the runtime handles created by miniBeamlineConfig.
+    //
+    // DTYP mapping:
+    //   "miniBeamCurrent"   → BeamCurrentDeviceSupport (ai record)
+    //   "asynPointDet_PH"   → PointDetectorDeviceSupport for PinHole port
+    //   "asynPointDet_EDGE" → PointDetectorDeviceSupport for Edge port
+    //   "asynPointDet_SLIT" → PointDetectorDeviceSupport for Slit port
+    //   "asynMovingDot"     → MovingDotDeviceSupport for DOT port
+    // ========================================================================
+
     {
         let h = holder.clone();
         app = app.register_device_support("miniBeamCurrent", move || {
@@ -213,8 +275,6 @@ async fn main() -> CaResult<()> {
             Box::new(BeamCurrentDeviceSupport::new(h.beam_value.clone(), rx))
         });
     }
-
-    // ===== Device support: point detectors =====
     {
         let h = holder.clone();
         app = app.register_device_support("asynPointDet_PH", move || {
@@ -245,8 +305,6 @@ async fn main() -> CaResult<()> {
             ))
         });
     }
-
-    // ===== Device support: moving dot =====
     {
         let h = holder.clone();
         app = app.register_device_support("asynMovingDot", move || {
@@ -258,71 +316,39 @@ async fn main() -> CaResult<()> {
         });
     }
 
-    // ===== Device support: plugins (dynamic lookup by DTYP) =====
+    // ========================================================================
+    // Plugin device support (dynamic DTYP dispatch)
+    //
+    // AD plugins (Stats, ROI, StdArrays, etc.) are configured dynamically
+    // via st.cmd commands like NDStatsConfigure. Their DTYP names are not
+    // known at compile time, so PluginManager provides a dynamic factory
+    // that resolves DTYP → DeviceSupport at iocInit time.
+    // ========================================================================
+
     app = mgr.register_device_support(app);
 
-    // ===== Motor device support: dynamic dispatch =====
-    {
-        let h = holder.clone();
-        app = app.register_dynamic_device_support(move |dtyp_name| {
-            let mut motors = h.motors.lock().unwrap();
-            if let Some(info) = motors.get_mut(dtyp_name) {
-                if let Some(ds) = info.device_support.take() {
-                    return Some(Box::new(ds) as Box<dyn epics_base_rs::server::device_support::DeviceSupport>);
-                }
-            }
-            None
-        });
-    }
+    // ========================================================================
+    // Simulated motors (st.cmd driven)
+    //
+    // Motors use the template-based pattern: st.cmd calls simMotorCreate()
+    // to create a SimMotor driver + poll loop, then dbLoadRecords() loads
+    // motor.template which creates a MotorRecord with matching DTYP.
+    // During iocInit, the dynamic factory wires them together, and
+    // DeviceSupport::init() injects the SharedDeviceState into the record.
+    //
+    // This replaces ~60 lines of hardcoded motor setup with 4 lines here
+    // + configuration in st.cmd (simMotorCreate + dbLoadRecords per motor).
+    // ========================================================================
 
-    // ===== Create motors =====
-    {
-        let mtr_velo = env_f64("MOTOR_VELO", 1.0);
-        let mtr_accl = env_f64("MOTOR_ACCL", 0.5);
-        let mtr_hlm = env_f64("MOTOR_HLM", 100.0);
-        let mtr_llm = env_f64("MOTOR_LLM", -100.0);
-        let mtr_mres = env_f64("MOTOR_MRES", 0.001);
-        let mtr_poll_ms = env_u64("MOTOR_POLL_MS", 100);
+    epics_base_rs::runtime::env::set_default("MOTOR", motor_rs::MOTOR_IOC_DIR);
+    let motor_holder = SimMotorHolder::new();
+    app = app.register_startup_command(motor_holder.sim_motor_create_command());
+    app = app.register_dynamic_device_support(motor_holder.device_support_factory());
 
-        let motor_defs = [
-            ("mini:ph:mtr", "ph_mtr"),
-            ("mini:edge:mtr", "edge_mtr"),
-            ("mini:slit:mtr", "slit_mtr"),
-            ("mini:dot:mtrx", "dot_mtrx"),
-            ("mini:dot:mtry", "dot_mtry"),
-        ];
+    // ========================================================================
+    // Shell commands (available after iocInit in the interactive REPL)
+    // ========================================================================
 
-        for (pv_name, motor_id) in &motor_defs {
-            let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
-                Arc::new(Mutex::new(SimMotor::new().with_limits(mtr_llm, mtr_hlm)));
-
-            let setup = MotorBuilder::new(motor)
-                .poll_interval(Duration::from_millis(mtr_poll_ms))
-                .configure_record(move |rec| {
-                    rec.vel.velo = mtr_velo;
-                    rec.vel.accl = mtr_accl;
-                    rec.limits.dhlm = mtr_hlm;
-                    rec.limits.dllm = mtr_llm;
-                    rec.conv.mres = mtr_mres;
-                    rec.disp.prec = 4;
-                })
-                .build();
-
-            let dtyp = format!("miniMotor_{motor_id}");
-            let MotorSetup { record, device_support, poll_loop, poll_cmd_tx: _ } = setup;
-
-            holder.motors.lock().unwrap().insert(dtyp.clone(), MotorInfo {
-                device_support: Some(device_support),
-            });
-
-            // Spawn poll loop (runs for IOC lifetime)
-            std::mem::forget(tokio::spawn(poll_loop.run()));
-
-            app = app.record(pv_name, record);
-        }
-    }
-
-    // ===== Shell: report =====
     {
         let mgr_r = mgr.clone();
         app = app.register_shell_command(CommandDef::new(
@@ -336,6 +362,10 @@ async fn main() -> CaResult<()> {
             },
         ));
     }
+
+    // ========================================================================
+    // Run: execute st.cmd → iocInit → interactive shell
+    // ========================================================================
 
     app.startup_script(&script)
         .run()

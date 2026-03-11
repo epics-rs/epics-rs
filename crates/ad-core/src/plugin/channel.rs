@@ -215,6 +215,12 @@ impl NDArrayOutput {
         self.senders.retain(|s| s.port_name != port_name);
     }
 
+    /// Remove a sender by port name and return it (if found).
+    pub fn take(&mut self, port_name: &str) -> Option<NDArraySender> {
+        let idx = self.senders.iter().position(|s| s.port_name == port_name)?;
+        Some(self.senders.swap_remove(idx))
+    }
+
     /// Publish an array to all downstream receivers.
     pub fn publish(&self, array: Arc<NDArray>) {
         for sender in &self.senders {

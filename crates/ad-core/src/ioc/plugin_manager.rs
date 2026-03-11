@@ -78,6 +78,10 @@ impl PluginManager {
     ) {
         let port_handle = handle.port_runtime().port_handle().clone();
         let port_name = port_handle.port_name().to_string();
+
+        // Register this plugin's output in the global wiring registry
+        crate::plugin::wiring::register_output(&port_name, handle.array_output().clone());
+
         self.plugins.lock().push(PluginInfo {
             dtyp_name: dtyp.to_string(),
             port_handle: port_handle.clone(),

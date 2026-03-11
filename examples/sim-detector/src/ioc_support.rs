@@ -453,6 +453,7 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     runtime.pool().clone(),
                     runtime.array_output().clone(),
+                    &port_name,
                 )));
 
                 *ph.lock().unwrap() = Some(port_handle);

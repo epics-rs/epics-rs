@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use ad_core::ioc::{dtyp_from_port, extract_plugin_args, plugin_arg_defs, PluginManager, register_noop_commands};
 use ad_core::plugin::runtime::create_plugin_runtime;
+use ad_core::plugin::wiring;
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::ioc_app::IocApplication;
@@ -37,9 +38,11 @@ pub fn register_all_plugins(
                 let pool = drv.pool();
                 let (handle, data, _jh) =
                     crate::std_arrays::create_std_arrays_runtime(&port_name, pool, &ndarray_port);
-                drv.connect_downstream(handle.array_sender().clone());
-                println!("NDStdArraysConfigure: port={port_name}");
                 m.add_plugin(&dtyp, &handle, Some(data));
+                if let Err(e) = wiring::rewire(handle.array_sender(), "", &ndarray_port) {
+                    eprintln!("NDStdArraysConfigure: wiring failed: {e}");
+                }
+                println!("NDStdArraysConfigure: port={port_name}");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -59,11 +62,13 @@ pub fn register_all_plugins(
                 let pool = drv.pool();
                 let (handle, _stats, stats_params, ts_runtime, ts_params, _jh, _ts_actor_jh, _ts_data_jh) =
                     crate::stats::create_stats_runtime(&port_name, pool, queue_size, &ndarray_port);
-                drv.connect_downstream(handle.array_sender().clone());
                 println!("NDStatsConfigure: port={port_name}");
 
                 let registry = Arc::new(crate::stats::build_stats_registry(&handle, &stats_params));
                 m.add_plugin_with_registry(&dtyp, &handle, registry, None);
+                if let Err(e) = wiring::rewire(handle.array_sender(), "", &ndarray_port) {
+                    eprintln!("NDStatsConfigure: wiring failed: {e}");
+                }
 
                 // Register TimeSeries as a separate asyn port
                 let ts_port_name = format!("{port_name}_TS");
@@ -165,9 +170,11 @@ pub fn register_all_plugins(
                     queue_size,
                     &ndarray_port,
                 );
-                drv.connect_downstream(handle.array_sender().clone());
-                println!("{cmd_name}: port={port_name} (stub)");
                 m.add_plugin(&dtyp, &handle, None);
+                if let Err(e) = wiring::rewire(handle.array_sender(), "", &ndarray_port) {
+                    eprintln!("{cmd_name}: wiring failed: {e}");
+                }
+                println!("{cmd_name}: port={port_name} (stub)");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -209,9 +216,11 @@ where
             let drv = m.driver()?;
             let pool = drv.pool();
             let (handle, _jh) = factory(&port_name, queue_size, &ndarray_port, pool);
-            drv.connect_downstream(handle.array_sender().clone());
-            println!("{cmd_name}: port={port_name}");
             m.add_plugin(&dtyp, &handle, None);
+            if let Err(e) = wiring::rewire(handle.array_sender(), "", &ndarray_port) {
+                eprintln!("{cmd_name}: wiring failed: {e}");
+            }
+            println!("{cmd_name}: port={port_name}");
             Ok(CommandOutcome::Continue)
         },
     ));

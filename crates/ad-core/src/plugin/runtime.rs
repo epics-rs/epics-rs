@@ -18,10 +18,11 @@ use super::channel::{ndarray_channel, BlockingProcessFn, NDArrayOutput, NDArrayR
 use super::params::PluginBaseParams;
 
 /// Value sent through the param change channel from control plane to data plane.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ParamChangeValue {
     Int32(i32),
     Float64(f64),
+    Octet(String),
 }
 
 impl ParamChangeValue {
@@ -29,6 +30,7 @@ impl ParamChangeValue {
         match self {
             ParamChangeValue::Int32(v) => *v,
             ParamChangeValue::Float64(v) => *v as i32,
+            ParamChangeValue::Octet(_) => 0,
         }
     }
 
@@ -36,6 +38,14 @@ impl ParamChangeValue {
         match self {
             ParamChangeValue::Int32(v) => *v as f64,
             ParamChangeValue::Float64(v) => *v,
+            ParamChangeValue::Octet(_) => 0.0,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            ParamChangeValue::Octet(s) => Some(s),
+            _ => None,
         }
     }
 }
@@ -247,6 +257,15 @@ impl PortDriver for PluginPortDriver {
         let _ = self.param_change_tx.try_send((reason, ParamChangeValue::Float64(value)));
         Ok(())
     }
+
+    fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+        let reason = user.reason;
+        let s = String::from_utf8_lossy(data).into_owned();
+        self.base.set_string_param(reason, 0, s.clone())?;
+        self.base.call_param_callbacks(0)?;
+        let _ = self.param_change_tx.try_send((reason, ParamChangeValue::Octet(s)));
+        Ok(())
+    }
 }
 
 /// Handle to a running plugin runtime. Provides access to sender and port handle.
@@ -254,6 +273,7 @@ impl PortDriver for PluginPortDriver {
 pub struct PluginRuntimeHandle {
     port_runtime: PortRuntimeHandle,
     array_sender: NDArraySender,
+    array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
     port_name: String,
     pub ndarray_params: NDArrayDriverParams,
     pub plugin_params: PluginBaseParams,
@@ -266,6 +286,10 @@ impl PluginRuntimeHandle {
 
     pub fn array_sender(&self) -> &NDArraySender {
         &self.array_sender
+    }
+
+    pub fn array_output(&self) -> &Arc<parking_lot::Mutex<NDArrayOutput>> {
+        &self.array_output
     }
 
     pub fn port_name(&self) -> &str {
@@ -317,6 +341,7 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
 
     // Shared processor (accessible from both data thread and caller thread)
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+    let array_output_for_handle = array_output.clone();
     let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {
         processor,
         output: array_output,
@@ -336,6 +361,11 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
     let data_blocking = blocking_mode.clone();
     let array_sender = array_sender.with_blocking_support(enabled, blocking_mode, bp);
 
+    // Capture wiring info for data loop
+    let nd_array_port_reason = plugin_params.nd_array_port;
+    let sender_port_name = port_name.to_string();
+    let initial_upstream = ndarray_port.to_string();
+
     // Spawn data processing thread
     let data_jh = thread::Builder::new()
         .name(format!("plugin-data-{port_name}"))
@@ -348,6 +378,9 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
                 blocking_callbacks_reason,
                 data_enabled,
                 data_blocking,
+                nd_array_port_reason,
+                sender_port_name,
+                initial_upstream,
             );
         })
         .expect("failed to spawn plugin data thread");
@@ -355,6 +388,7 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
     let handle = PluginRuntimeHandle {
         port_runtime,
         array_sender,
+        array_output: array_output_for_handle,
         port_name: port_name.to_string(),
         ndarray_params,
         plugin_params,
@@ -371,7 +405,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
     blocking_callbacks_reason: usize,
     enabled: Arc<AtomicBool>,
     blocking_mode: Arc<AtomicBool>,
+    nd_array_port_reason: usize,
+    sender_port_name: String,
+    initial_upstream: String,
 ) {
+    let mut current_upstream = initial_upstream;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -401,6 +439,17 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             if reason == blocking_callbacks_reason {
                                 blocking_mode.store(value.as_i32() != 0, Ordering::Release);
                             }
+                            // Handle NDArrayPort rewiring
+                            if reason == nd_array_port_reason {
+                                if let Some(new_port) = value.as_string() {
+                                    let old = std::mem::replace(&mut current_upstream, new_port.to_string());
+                                    if let Err(e) = super::wiring::rewire_by_name(&sender_port_name, &old, new_port) {
+                                        eprintln!("NDArrayPort rewire failed: {e}");
+                                        // Revert current_upstream on failure
+                                        current_upstream = old;
+                                    }
+                                }
+                            }
                             let snapshot = PluginParamSnapshot {
                                 enable_callbacks: enabled.load(Ordering::Acquire),
                                 reason,
@@ -417,14 +466,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
 }
 
 /// Connect a downstream plugin's sender to a plugin runtime's output.
-/// This must be called before starting acquisition.
-pub fn wire_downstream(
-    _upstream: &PluginRuntimeHandle,
-    _downstream_sender: NDArraySender,
-) {
-    // For Phase 3, wiring is done via the PluginRuntimeHandle's output.
-    // The actual wiring mechanism will be finalized in Phase 4.
-    // For now, tests can use create_plugin_runtime_with_output.
+pub fn wire_downstream(upstream: &PluginRuntimeHandle, downstream_sender: NDArraySender) {
+    upstream.array_output().lock().add(downstream_sender);
 }
 
 /// Create a plugin runtime with a pre-wired output (for testing and direct wiring).
@@ -457,9 +500,11 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let enabled = Arc::new(AtomicBool::new(true));
     let blocking_mode = Arc::new(AtomicBool::new(false));
 
+    let array_output = Arc::new(parking_lot::Mutex::new(output));
+    let array_output_for_handle = array_output.clone();
     let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {
         processor,
-        output: Arc::new(parking_lot::Mutex::new(output)),
+        output: array_output,
         pool,
         ndarray_params,
         plugin_params,
@@ -475,6 +520,11 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let data_blocking = blocking_mode.clone();
     let array_sender = array_sender.with_blocking_support(enabled, blocking_mode, bp);
 
+    // Capture wiring info for data loop
+    let nd_array_port_reason = plugin_params.nd_array_port;
+    let sender_port_name = port_name.to_string();
+    let initial_upstream = ndarray_port.to_string();
+
     let data_jh = thread::Builder::new()
         .name(format!("plugin-data-{port_name}"))
         .spawn(move || {
@@ -486,6 +536,9 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
                 blocking_callbacks_reason,
                 data_enabled,
                 data_blocking,
+                nd_array_port_reason,
+                sender_port_name,
+                initial_upstream,
             );
         })
         .expect("failed to spawn plugin data thread");
@@ -493,6 +546,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let handle = PluginRuntimeHandle {
         port_runtime,
         array_sender,
+        array_output: array_output_for_handle,
         port_name: port_name.to_string(),
         ndarray_params,
         plugin_params,

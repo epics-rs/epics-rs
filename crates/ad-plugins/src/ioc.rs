@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use ad_core::ioc::{dtyp_from_port, extract_plugin_args, plugin_arg_defs, PluginManager, register_noop_commands};
 use ad_core::plugin::runtime::create_plugin_runtime;
-use ad_core::plugin::wiring;
+use ad_core::plugin::wiring::WiringRegistry;
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::ioc_app::IocApplication;
@@ -37,9 +37,9 @@ pub fn register_all_plugins(
                 let drv = m.driver()?;
                 let pool = drv.pool();
                 let (handle, data, _jh) =
-                    crate::std_arrays::create_std_arrays_runtime(&port_name, pool, &ndarray_port);
+                    crate::std_arrays::create_std_arrays_runtime(&port_name, pool, &ndarray_port, m.wiring().clone());
                 m.add_plugin(&dtyp, &handle, Some(data));
-                if let Err(e) = wiring::rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("NDStdArraysConfigure: wiring failed: {e}");
                 }
                 println!("NDStdArraysConfigure: port={port_name}");
@@ -61,12 +61,12 @@ pub fn register_all_plugins(
                 let drv = m.driver()?;
                 let pool = drv.pool();
                 let (handle, _stats, stats_params, ts_runtime, ts_params, _jh, _ts_actor_jh, _ts_data_jh) =
-                    crate::stats::create_stats_runtime(&port_name, pool, queue_size, &ndarray_port);
+                    crate::stats::create_stats_runtime(&port_name, pool, queue_size, &ndarray_port, m.wiring().clone());
                 println!("NDStatsConfigure: port={port_name}");
 
                 let registry = Arc::new(crate::stats::build_stats_registry(&handle, &stats_params));
                 m.add_plugin_with_registry(&dtyp, &handle, registry, None);
-                if let Err(e) = wiring::rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("NDStatsConfigure: wiring failed: {e}");
                 }
 
@@ -84,64 +84,64 @@ pub fn register_all_plugins(
     }
 
     // --- Generic plugins using create_plugin_runtime ---
-    app = register_generic_plugin(&mut app, mgr, "NDROIConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDROIConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::roi::{ROIConfig, ROIProcessor};
-        create_plugin_runtime(port_name, ROIProcessor::new(ROIConfig::default()), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, ROIProcessor::new(ROIConfig::default()), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDProcessConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDProcessConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::process::{ProcessConfig, ProcessProcessor};
-        create_plugin_runtime(port_name, ProcessProcessor::new(ProcessConfig::default()), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, ProcessProcessor::new(ProcessConfig::default()), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDTransformConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDTransformConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::transform::{TransformType, TransformProcessor};
-        create_plugin_runtime(port_name, TransformProcessor::new(TransformType::None), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, TransformProcessor::new(TransformType::None), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDColorConvertConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDColorConvertConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::color_convert::{ColorConvertConfig, ColorConvertProcessor};
         use ad_core::color::{NDColorMode, NDBayerPattern};
         let config = ColorConvertConfig { target_mode: NDColorMode::Mono, bayer_pattern: NDBayerPattern::RGGB, false_color: false };
-        create_plugin_runtime(port_name, ColorConvertProcessor::new(config), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, ColorConvertProcessor::new(config), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDOverlayConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDOverlayConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::overlay::OverlayProcessor;
-        create_plugin_runtime(port_name, OverlayProcessor::new(vec![]), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, OverlayProcessor::new(vec![]), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDFFTConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDFFTConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::fft::{FFTMode, FFTProcessor};
-        create_plugin_runtime(port_name, FFTProcessor::new(FFTMode::Rows1D), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, FFTProcessor::new(FFTMode::Rows1D), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDCircularBuffConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDCircularBuffConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::circular_buff::{CircularBuffProcessor, TriggerCondition};
-        create_plugin_runtime(port_name, CircularBuffProcessor::new(100, 100, TriggerCondition::External), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, CircularBuffProcessor::new(100, 100, TriggerCondition::External), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDCodecConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDCodecConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::codec::{CodecMode, CodecProcessor};
         use ad_core::codec::CodecName;
-        create_plugin_runtime(port_name, CodecProcessor::new(CodecMode::Compress { codec: CodecName::LZ4, quality: 90 }), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, CodecProcessor::new(CodecMode::Compress { codec: CodecName::LZ4, quality: 90 }), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDScatterConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDScatterConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::scatter::ScatterProcessor;
-        create_plugin_runtime(port_name, ScatterProcessor::new(), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, ScatterProcessor::new(), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDGatherConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDGatherConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::gather::GatherProcessor;
-        create_plugin_runtime(port_name, GatherProcessor::new(), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, GatherProcessor::new(), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDFileTIFFConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDFileTIFFConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::file_tiff::TiffFileProcessor;
-        create_plugin_runtime(port_name, TiffFileProcessor::new(), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, TiffFileProcessor::new(), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDFileJPEGConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDFileJPEGConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::file_jpeg::JpegFileProcessor;
-        create_plugin_runtime(port_name, JpegFileProcessor::new(90), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, JpegFileProcessor::new(90), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDFileHDF5Configure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDFileHDF5Configure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::file_hdf5::Hdf5FileProcessor;
-        create_plugin_runtime(port_name, Hdf5FileProcessor::new(), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, Hdf5FileProcessor::new(), pool, queue_size, ndarray_port, wiring)
     });
-    app = register_generic_plugin(&mut app, mgr, "NDFileNetCDFConfigure", |port_name, queue_size, ndarray_port, pool| {
+    app = register_generic_plugin(&mut app, mgr, "NDFileNetCDFConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::file_netcdf::NetcdfFileProcessor;
-        create_plugin_runtime(port_name, NetcdfFileProcessor::new(), pool, queue_size, ndarray_port)
+        create_plugin_runtime(port_name, NetcdfFileProcessor::new(), pool, queue_size, ndarray_port, wiring)
     });
 
     // --- Stub plugins (not yet fully implemented, use PassthroughProcessor) ---
@@ -172,9 +172,10 @@ pub fn register_all_plugins(
                     pool,
                     queue_size,
                     &ndarray_port,
+                    m.wiring().clone(),
                 );
                 m.add_plugin(&dtyp, &handle, None);
-                if let Err(e) = wiring::rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("{cmd_name}: wiring failed: {e}");
                 }
                 println!("{cmd_name}: port={port_name} (stub)");
@@ -199,6 +200,7 @@ where
             usize,
             &str,
             Arc<ad_core::ndarray_pool::NDArrayPool>,
+            Arc<WiringRegistry>,
         ) -> (
             ad_core::plugin::runtime::PluginRuntimeHandle,
             std::thread::JoinHandle<()>,
@@ -218,9 +220,9 @@ where
             let dtyp = dtyp_from_port(&port_name);
             let drv = m.driver()?;
             let pool = drv.pool();
-            let (handle, _jh) = factory(&port_name, queue_size, &ndarray_port, pool);
+            let (handle, _jh) = factory(&port_name, queue_size, &ndarray_port, pool, m.wiring().clone());
             m.add_plugin(&dtyp, &handle, None);
-            if let Err(e) = wiring::rewire(handle.array_sender(), "", &ndarray_port) {
+            if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                 eprintln!("{cmd_name}: wiring failed: {e}");
             }
             println!("{cmd_name}: port={port_name}");

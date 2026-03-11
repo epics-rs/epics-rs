@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc};
 
 use crate::interrupt::InterruptManager;
 use crate::port::PortDriver;
@@ -19,7 +19,10 @@ pub struct PortRuntimeHandle {
     port_handle: PortHandle,
     client: InProcessClient,
     event_tx: broadcast::Sender<RuntimeEvent>,
-    shutdown_tx: watch::Sender<bool>,
+    /// Dropping this sender closes the shutdown channel, signaling the actor to exit.
+    shutdown_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
+    /// Receives a single () when the actor thread exits. Used by shutdown_and_wait().
+    completion_rx: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     port_name: String,
 }
 
@@ -39,9 +42,20 @@ impl PortRuntimeHandle {
         self.event_tx.subscribe()
     }
 
-    /// Signal the runtime to shut down.
+    /// Signal the runtime to shut down (non-blocking).
+    ///
+    /// Closes the shutdown channel, causing the actor thread to exit after
+    /// completing any in-progress request. Does not wait for the thread to stop.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.lock().unwrap().take();
+    }
+
+    /// Signal shutdown and wait for the actor thread to exit.
+    pub fn shutdown_and_wait(&self) {
+        self.shutdown();
+        if let Some(rx) = self.completion_rx.lock().unwrap().take() {
+            let _ = rx.recv();
+        }
     }
 
     /// Port name.
@@ -73,7 +87,12 @@ pub fn create_port_runtime_boxed(
 
     // Event broadcast
     let (event_tx, _) = broadcast::channel(256);
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+
+    // Runtime-private shutdown channel
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+
+    // Completion notification (actor thread → shutdown_and_wait)
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel::<()>();
 
     // Clone broadcast sender for interrupt subscription
     let broadcast_sender = driver.base().interrupts.broadcast_sender();
@@ -92,10 +111,11 @@ pub fn create_port_runtime_boxed(
             let _ = event_tx_clone.send(RuntimeEvent::Started {
                 port_name: name_clone.clone(),
             });
-            actor.run();
+            actor.run_with_shutdown(shutdown_rx);
             let _ = event_tx_clone.send(RuntimeEvent::Stopped {
                 port_name: name_clone,
             });
+            let _ = completion_tx.send(());
         })
         .expect("failed to spawn port runtime thread");
 
@@ -106,7 +126,8 @@ pub fn create_port_runtime_boxed(
         port_handle,
         client,
         event_tx,
-        shutdown_tx,
+        shutdown_tx: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
+        completion_rx: Arc::new(std::sync::Mutex::new(Some(completion_rx))),
         port_name,
     };
 
@@ -220,6 +241,41 @@ mod tests {
         drop(handle);
         let result = jh.join();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn port_runtime_explicit_shutdown() {
+        let (handle, _jh) = create_port_runtime(
+            TestPort::new("rt_explicit_shutdown"),
+            RuntimeConfig::default(),
+        );
+
+        // Write a value first
+        handle
+            .port_handle()
+            .write_int32_blocking(0, 0, 42)
+            .unwrap();
+
+        // Explicit shutdown should cause the actor to stop
+        handle.shutdown_and_wait();
+    }
+
+    #[test]
+    fn port_runtime_shutdown_while_handles_exist() {
+        let (handle, _jh) = create_port_runtime(
+            TestPort::new("rt_shutdown_handles"),
+            RuntimeConfig::default(),
+        );
+
+        // Clone the handle (simulating other code holding a reference)
+        let handle2 = handle.clone();
+
+        // Explicit shutdown should work even with outstanding clones
+        handle.shutdown_and_wait();
+
+        // Subsequent operations on the cloned handle should fail gracefully
+        let result = handle2.port_handle().write_int32_blocking(0, 0, 99);
+        assert!(result.is_err());
     }
 
     #[test]

@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use parking_lot::Mutex;
-
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::device_support::{DeviceSupport, WriteCompletion};
 use epics_base_rs::server::record::{Record, ScanType};
@@ -11,9 +9,8 @@ use epics_base_rs::types::EpicsValue;
 use crate::error::AsynError;
 use crate::interfaces::InterfaceType;
 use crate::interrupt::{InterruptFilter, InterruptSubscription};
-use crate::port::PortDriver;
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
-use crate::request::{CompletionHandle, RequestOp, RequestResult};
+use crate::request::{RequestOp, RequestResult};
 use crate::user::AsynUser;
 
 /// Parsed `@asyn(portName, addr, timeout) drvInfoString` link specification.
@@ -143,17 +140,9 @@ pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
     })
 }
 
-/// Port driver access backend — either legacy mutex or actor handle.
-enum PortBackend {
-    /// Legacy: direct mutex locking on the port driver.
-    Legacy(Arc<Mutex<dyn PortDriver>>),
-    /// Actor: channel-based submission via PortHandle.
-    Handle(PortHandle),
-}
-
 /// Adapter bridging an asyn-rs PortDriver to epics-base-rs DeviceSupport.
 pub struct AsynDeviceSupport {
-    backend: PortBackend,
+    handle: PortHandle,
     addr: i32,
     timeout: Duration,
     drv_info: String,
@@ -176,10 +165,15 @@ pub struct AsynDeviceSupport {
 }
 
 impl AsynDeviceSupport {
-    fn new_inner(backend: PortBackend, link: AsynLink, iface_type: &str) -> Self {
+    /// Create from a [`PortHandle`].
+    pub fn from_handle(
+        handle: PortHandle,
+        link: AsynLink,
+        iface_type: &str,
+    ) -> Self {
         let iface = InterfaceType::from_asyn_name(iface_type);
         Self {
-            backend,
+            handle,
             addr: link.addr,
             timeout: link.timeout,
             drv_info: link.drv_info,
@@ -198,48 +192,13 @@ impl AsynDeviceSupport {
         }
     }
 
-    /// Create from a legacy `Arc<Mutex<dyn PortDriver>>`.
-    pub fn new(
-        port: Arc<Mutex<dyn PortDriver>>,
-        link: AsynLink,
-        iface_type: &str,
-    ) -> Self {
-        Self::new_inner(PortBackend::Legacy(port), link, iface_type)
-    }
-
-    /// Create from a [`PortHandle`] (actor model).
-    pub fn from_handle(
-        handle: PortHandle,
-        link: AsynLink,
-        iface_type: &str,
-    ) -> Self {
-        Self::new_inner(PortBackend::Handle(handle), link, iface_type)
-    }
-
-    /// Create with a typed interface (no string dispatch needed).
-    pub fn with_interface(
-        port: Arc<Mutex<dyn PortDriver>>,
-        link: AsynLink,
-        iface: InterfaceType,
-    ) -> Self {
-        Self::new_inner(
-            PortBackend::Legacy(port),
-            link,
-            iface.asyn_name(),
-        )
-    }
-
     /// Create with a typed interface from a [`PortHandle`].
     pub fn with_interface_handle(
         handle: PortHandle,
         link: AsynLink,
         iface: InterfaceType,
     ) -> Self {
-        Self::new_inner(
-            PortBackend::Handle(handle),
-            link,
-            iface.asyn_name(),
-        )
+        Self::from_handle(handle, link, iface.asyn_name())
     }
 
     /// Set the bit mask for UInt32Digital read/write operations.
@@ -275,20 +234,6 @@ impl AsynDeviceSupport {
     pub fn set_reason(&mut self, reason: usize) {
         self.reason = reason;
         self.reason_set = true;
-    }
-}
-
-/// Bridges asyn-rs CompletionHandle to epics-base-rs WriteCompletion.
-struct AsynWriteCompletion {
-    handle: CompletionHandle,
-}
-
-impl WriteCompletion for AsynWriteCompletion {
-    fn wait(&self, timeout: Duration) -> CaResult<()> {
-        match self.handle.wait(timeout) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(CaError::Protocol(e.to_string())),
-        }
     }
 }
 
@@ -374,10 +319,12 @@ impl AsynDeviceSupport {
         }
     }
 
-    /// PortHandle-based init: resolve reason + optional readback.
-    fn init_handle(&mut self, handle: &PortHandle, record: &mut dyn Record) -> CaResult<()> {
+}
+
+impl DeviceSupport for AsynDeviceSupport {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
         if !self.reason_set {
-            self.reason = handle
+            self.reason = self.handle
                 .drv_user_create_blocking(&self.drv_info)
                 .map_err(asyn_to_ca_error)?;
         }
@@ -387,7 +334,7 @@ impl AsynDeviceSupport {
                 let user = AsynUser::new(self.reason)
                     .with_addr(self.addr)
                     .with_timeout(self.timeout);
-                if let Ok(result) = handle.submit_blocking(op, user) {
+                if let Ok(result) = self.handle.submit_blocking(op, user) {
                     if let Some(val) = self.result_to_value(&result) {
                         let _ = record.set_val(val);
                     }
@@ -397,15 +344,14 @@ impl AsynDeviceSupport {
         Ok(())
     }
 
-    /// PortHandle-based read: submit blocking read, extract value + alarm.
-    fn read_handle(&mut self, handle: &PortHandle, record: &mut dyn Record) -> CaResult<()> {
+    fn read(&mut self, record: &mut dyn Record) -> CaResult<()> {
         let op = self.read_op().ok_or_else(|| {
             CaError::Protocol(format!("unsupported interface type for read: {}", self.iface_type))
         })?;
         let user = AsynUser::new(self.reason)
             .with_addr(self.addr)
             .with_timeout(self.timeout);
-        let result = handle.submit_blocking(op, user).map_err(asyn_to_ca_error)?;
+        let result = self.handle.submit_blocking(op, user).map_err(asyn_to_ca_error)?;
         if let Some(val) = self.result_to_value(&result) {
             record.set_val(val)?;
         }
@@ -415,190 +361,16 @@ impl AsynDeviceSupport {
         Ok(())
     }
 
-    /// PortHandle-based write: submit blocking write.
-    fn write_handle(&mut self, handle: &PortHandle, record: &mut dyn Record) -> CaResult<()> {
+    fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
         if let Some(val) = record.val() {
             if let Some(op) = self.write_op(&val) {
                 let user = AsynUser::new(self.reason)
                     .with_addr(self.addr)
                     .with_timeout(self.timeout);
-                handle.submit_blocking(op, user).map_err(asyn_to_ca_error)?;
+                self.handle.submit_blocking(op, user).map_err(asyn_to_ca_error)?;
             }
         }
         Ok(())
-    }
-}
-
-impl DeviceSupport for AsynDeviceSupport {
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        match &self.backend {
-            PortBackend::Handle(handle) => {
-                let h = handle.clone();
-                return self.init_handle(&h, record);
-            }
-            PortBackend::Legacy(port) => {
-                let port = port.clone();
-                {
-                    let p = port.lock();
-                    if !self.reason_set {
-                        self.reason = p.drv_user_create(&self.drv_info).map_err(asyn_to_ca_error)?;
-                    }
-                }
-
-                if self.initial_readback {
-                    let mut p = port.lock();
-                    let user = AsynUser::new(self.reason).with_addr(self.addr);
-                    match self.iface_type.as_str() {
-                        "asynInt32" => {
-                            if let Ok(v) = p.read_int32(&user) {
-                                let _ = record.set_val(EpicsValue::Long(v));
-                            }
-                        }
-                        "asynInt64" => {
-                            if let Ok(v) = p.read_int64(&user) {
-                                let _ = record.set_val(EpicsValue::Long(v as i32));
-                            }
-                        }
-                        "asynFloat64" => {
-                            if let Ok(v) = p.read_float64(&user) {
-                                let _ = record.set_val(EpicsValue::Double(v));
-                            }
-                        }
-                        "asynOctet" => {
-                            let mut buf = vec![0u8; 256];
-                            if let Ok(n) = p.read_octet(&user, &mut buf) {
-                                let s = String::from_utf8_lossy(&buf[..n]).into_owned();
-                                let _ = record.set_val(EpicsValue::String(s));
-                            }
-                        }
-                        "asynUInt32Digital" => {
-                            if let Ok(v) = p.read_uint32_digital(&user, self.mask) {
-                                let _ = record.set_val(EpicsValue::Long(v as i32));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        match &self.backend {
-            PortBackend::Handle(handle) => {
-                let h = handle.clone();
-                return self.read_handle(&h, record);
-            }
-            PortBackend::Legacy(port) => {
-                let mut port = port.lock();
-                let user = AsynUser::new(self.reason).with_addr(self.addr);
-                match self.iface_type.as_str() {
-                    "asynInt32" => {
-                        let v = port.read_int32(&user).map_err(asyn_to_ca_error)?;
-                        record.set_val(EpicsValue::Long(v))?;
-                    }
-                    "asynInt64" => {
-                        let v = port.read_int64(&user).map_err(asyn_to_ca_error)?;
-                        record.set_val(EpicsValue::Long(v as i32))?;
-                    }
-                    "asynFloat64" => {
-                        let v = port.read_float64(&user).map_err(asyn_to_ca_error)?;
-                        record.set_val(EpicsValue::Double(v))?;
-                    }
-                    "asynOctet" => {
-                        let mut buf = vec![0u8; 256];
-                        let n = port.read_octet(&user, &mut buf).map_err(asyn_to_ca_error)?;
-                        let s = String::from_utf8_lossy(&buf[..n]).into_owned();
-                        record.set_val(EpicsValue::String(s))?;
-                    }
-                    "asynUInt32Digital" => {
-                        let v = port.read_uint32_digital(&user, self.mask).map_err(asyn_to_ca_error)?;
-                        record.set_val(EpicsValue::Long(v as i32))?;
-                    }
-                    "asynEnum" => {
-                        let (idx, _) = port.read_enum(&user).map_err(asyn_to_ca_error)?;
-                        record.set_val(EpicsValue::Long(idx as i32))?;
-                    }
-                    "asynInt32Array" => {
-                        let mut buf = vec![0i32; 4096];
-                        let n = port.read_int32_array(&user, &mut buf).map_err(asyn_to_ca_error)?;
-                        buf.truncate(n);
-                        record.set_val(EpicsValue::LongArray(buf))?;
-                    }
-                    "asynFloat64Array" => {
-                        let mut buf = vec![0f64; 4096];
-                        let n = port.read_float64_array(&user, &mut buf).map_err(asyn_to_ca_error)?;
-                        buf.truncate(n);
-                        record.set_val(EpicsValue::DoubleArray(buf))?;
-                    }
-                    _ => {}
-                }
-                let (_, alarm_status, alarm_severity) = port.base().params
-                    .get_param_status(self.reason, self.addr)
-                    .unwrap_or((crate::error::AsynStatus::Success, 0, 0));
-                self.last_alarm_status = alarm_status;
-                self.last_alarm_severity = alarm_severity;
-                self.last_ts = port.base().params
-                    .get_timestamp(self.reason, self.addr)
-                    .unwrap_or(None);
-                Ok(())
-            }
-        }
-    }
-
-    fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        match &self.backend {
-            PortBackend::Handle(handle) => {
-                let h = handle.clone();
-                return self.write_handle(&h, record);
-            }
-            PortBackend::Legacy(port) => {
-                let mut port = port.lock();
-                let mut user = AsynUser::new(self.reason).with_addr(self.addr);
-                if let Some(val) = record.val() {
-                    match (self.iface_type.as_str(), val) {
-                        ("asynInt32", EpicsValue::Long(v)) => {
-                            port.write_int32(&mut user, v).map_err(asyn_to_ca_error)?;
-                        }
-                        ("asynInt32", EpicsValue::Enum(v)) => {
-                            port.write_int32(&mut user, v as i32).map_err(asyn_to_ca_error)?;
-                        }
-                        ("asynInt32", EpicsValue::Short(v)) => {
-                            port.write_int32(&mut user, v as i32).map_err(asyn_to_ca_error)?;
-                        }
-                        ("asynInt64", EpicsValue::Long(v)) => {
-                            port.write_int64(&mut user, v as i64).map_err(asyn_to_ca_error)?;
-                        }
-                        ("asynFloat64", EpicsValue::Double(v)) => {
-                            port.write_float64(&mut user, v).map_err(asyn_to_ca_error)?;
-                        }
-                        ("asynOctet", EpicsValue::String(ref s)) => {
-                            port.write_octet(&mut user, s.as_bytes())
-                                .map_err(asyn_to_ca_error)?;
-                        }
-                        ("asynUInt32Digital", EpicsValue::Long(v)) => {
-                            port.write_uint32_digital(&mut user, v as u32, self.mask)
-                                .map_err(asyn_to_ca_error)?;
-                        }
-                        ("asynEnum", EpicsValue::Long(v)) => {
-                            port.write_enum(&mut user, v as usize)
-                                .map_err(asyn_to_ca_error)?;
-                        }
-                        ("asynInt32Array", EpicsValue::LongArray(ref data)) => {
-                            port.write_int32_array(&user, data)
-                                .map_err(asyn_to_ca_error)?;
-                        }
-                        ("asynFloat64Array", EpicsValue::DoubleArray(ref data)) => {
-                            port.write_float64_array(&user, data)
-                                .map_err(asyn_to_ca_error)?;
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(())
-            }
-        }
     }
 
     fn dtyp(&self) -> &str {
@@ -623,71 +395,21 @@ impl DeviceSupport for AsynDeviceSupport {
     }
 
     fn write_begin(&mut self, record: &mut dyn Record) -> CaResult<Option<Box<dyn WriteCompletion>>> {
-        match &self.backend {
-            PortBackend::Handle(handle) => {
-                let val = match record.val() {
-                    Some(v) => v,
-                    None => return Ok(None),
-                };
-                let op = match self.write_op(&val) {
-                    Some(op) => op,
-                    None => return Ok(None),
-                };
-                let user = AsynUser::new(self.reason)
-                    .with_addr(self.addr)
-                    .with_timeout(self.timeout);
-                let completion = handle.try_submit(op, user).map_err(asyn_to_ca_error)?;
-                Ok(Some(Box::new(AsynAsyncWriteCompletion {
-                    handle: parking_lot::Mutex::new(Some(completion)),
-                })))
-            }
-            PortBackend::Legacy(port) => {
-                let queue = {
-                    let p = port.lock();
-                    match &p.base().worker_queue {
-                        Some(q) => q.clone(),
-                        None => return Ok(None),
-                    }
-                };
-
-                let val = match record.val() {
-                    Some(v) => v,
-                    None => return Ok(None),
-                };
-
-                let op = match (self.iface_type.as_str(), &val) {
-                    ("asynOctet", EpicsValue::String(s)) => {
-                        RequestOp::OctetWrite { data: s.as_bytes().to_vec() }
-                    }
-                    ("asynInt32", EpicsValue::Long(v)) => {
-                        RequestOp::Int32Write { value: *v }
-                    }
-                    ("asynInt32", EpicsValue::Enum(v)) => {
-                        RequestOp::Int32Write { value: *v as i32 }
-                    }
-                    ("asynInt32", EpicsValue::Short(v)) => {
-                        RequestOp::Int32Write { value: *v as i32 }
-                    }
-                    ("asynInt64", EpicsValue::Long(v)) => {
-                        RequestOp::Int64Write { value: *v as i64 }
-                    }
-                    ("asynFloat64", EpicsValue::Double(v)) => {
-                        RequestOp::Float64Write { value: *v }
-                    }
-                    ("asynUInt32Digital", EpicsValue::Long(v)) => {
-                        RequestOp::UInt32DigitalWrite { value: *v as u32, mask: self.mask }
-                    }
-                    _ => return Ok(None),
-                };
-
-                let user = AsynUser::new(self.reason)
-                    .with_addr(self.addr)
-                    .with_timeout(self.timeout);
-
-                let handle = queue.enqueue(op, user);
-                Ok(Some(Box::new(AsynWriteCompletion { handle })))
-            }
-        }
+        let val = match record.val() {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let op = match self.write_op(&val) {
+            Some(op) => op,
+            None => return Ok(None),
+        };
+        let user = AsynUser::new(self.reason)
+            .with_addr(self.addr)
+            .with_timeout(self.timeout);
+        let completion = self.handle.try_submit(op, user).map_err(asyn_to_ca_error)?;
+        Ok(Some(Box::new(AsynAsyncWriteCompletion {
+            handle: parking_lot::Mutex::new(Some(completion)),
+        })))
     }
 
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
@@ -700,15 +422,7 @@ impl DeviceSupport for AsynDeviceSupport {
             addr: Some(self.addr),
         };
 
-        let (sub, intr_rx) = match &self.backend {
-            PortBackend::Handle(handle) => {
-                handle.interrupts().register_interrupt_user(filter)
-            }
-            PortBackend::Legacy(port) => {
-                let p = port.lock();
-                p.base().interrupts.register_interrupt_user(filter)
-            }
-        };
+        let (sub, intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
         self.interrupt_sub = Some(sub);
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -823,6 +537,8 @@ mod tests {
 
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::param::ParamType;
+    use crate::port_actor::PortActor;
+    use crate::interrupt::InterruptManager;
 
     struct TestPort {
         base: PortDriverBase,
@@ -839,23 +555,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase { &mut self.base }
     }
 
-    fn make_adapter(port: Arc<Mutex<dyn PortDriver>>, scan: ScanType) -> AsynDeviceSupport {
-        let link = AsynLink {
-            port_name: "test".into(),
-            addr: 0,
-            timeout: Duration::from_secs(1),
-            drv_info: "VAL".into(),
-        };
-        let mut ads = AsynDeviceSupport::new(port, link, "asynInt32");
-        ads.reason = 0;
-        ads.set_record_info("TEST:REC", scan);
-        ads
-    }
-
-    fn make_handle_adapter(scan: ScanType) -> AsynDeviceSupport {
-        use crate::port_actor::PortActor;
-        use crate::interrupt::InterruptManager;
-
+    fn make_adapter(scan: ScanType) -> AsynDeviceSupport {
         let driver = TestPort::new();
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -879,24 +579,20 @@ mod tests {
 
     #[test]
     fn test_io_intr_receiver_none_when_passive() {
-        let port: Arc<Mutex<dyn PortDriver>> = Arc::new(Mutex::new(TestPort::new()));
-        let mut ads = make_adapter(port, ScanType::Passive);
+        let mut ads = make_adapter(ScanType::Passive);
         assert!(ads.io_intr_receiver().is_none());
     }
 
     #[tokio::test]
     async fn test_io_intr_receiver_some_when_io_intr() {
-        let port: Arc<Mutex<dyn PortDriver>> = Arc::new(Mutex::new(TestPort::new()));
-        let mut ads = make_adapter(port, ScanType::IoIntr);
+        let mut ads = make_adapter(ScanType::IoIntr);
         let rx = ads.io_intr_receiver();
         assert!(rx.is_some());
     }
 
-    // --- PortHandle-backed adapter tests ---
-
     #[test]
-    fn test_handle_adapter_init_resolves_reason() {
-        let mut ads = make_handle_adapter(ScanType::Passive);
+    fn test_adapter_init_resolves_reason() {
+        let mut ads = make_adapter(ScanType::Passive);
 
         use epics_base_rs::server::records::longin::LonginRecord;
         let mut rec = LonginRecord::new(0);
@@ -905,8 +601,8 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_adapter_write_read() {
-        let mut ads = make_handle_adapter(ScanType::Passive);
+    fn test_adapter_write_read() {
+        let mut ads = make_adapter(ScanType::Passive);
 
         use epics_base_rs::server::records::longin::LonginRecord;
         let mut rec = LonginRecord::new(0);

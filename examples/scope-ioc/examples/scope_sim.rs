@@ -6,13 +6,11 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use scope_ioc::driver::*;
-use asyn_rs::manager::PortManager;
-use asyn_rs::port::PortDriver;
-use asyn_rs::user::AsynUser;
+use asyn_rs::runtime::port::create_port_runtime;
+use asyn_rs::runtime::config::RuntimeConfig;
 
 #[tokio::main]
 async fn main() {
@@ -24,30 +22,24 @@ async fn main() {
     let driver = ScopeSimulator::new("scopeSim", notify.clone());
     let indices = driver.param_indices();
 
-    // 2. Register with PortManager
-    let mgr = PortManager::new();
-    let port = mgr.register_port(driver);
+    // 2. Create port runtime (driver moves into actor thread)
+    let (runtime_handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+    let port_handle = runtime_handle.port_handle().clone();
 
     // 3. Subscribe for interrupt notifications
-    let mut rx = port.lock().base().interrupts.subscribe_async();
+    let mut rx = port_handle.interrupts().subscribe_async();
 
     // 4. Spawn background simulation task
-    let sim_port: Arc<Mutex<dyn PortDriver>> = port.clone();
+    let sim_handle = port_handle.clone();
     let sim_notify = notify.clone();
     tokio::spawn(async move {
-        sim_task_dyn(sim_port, sim_notify, indices).await;
+        sim_task_handle(sim_handle, sim_notify, indices).await;
     });
 
     // 5. Set update time to 0.2s and start running
-    {
-        let mut guard = port.lock();
-        let mut user_ut = AsynUser::new(indices.p_update_time);
-        guard.write_float64(&mut user_ut, 0.2).unwrap();
-        let mut user_noise = AsynUser::new(indices.p_noise_amplitude);
-        guard.write_float64(&mut user_noise, 0.1).unwrap();
-        let mut user_run = AsynUser::new(indices.p_run);
-        guard.write_int32(&mut user_run, 1).unwrap();
-    }
+    port_handle.write_float64(indices.p_update_time, 0, 0.2).await.unwrap();
+    port_handle.write_float64(indices.p_noise_amplitude, 0, 0.1).await.unwrap();
+    port_handle.write_int32(indices.p_run, 0, 1).await.unwrap();
 
     println!("Simulation running (1kHz sine, noise=0.1V, update=0.2s)");
     println!("Waiting for 5 waveform updates...\n");
@@ -59,15 +51,11 @@ async fn main() {
             Ok(iv) => {
                 if iv.reason == indices.p_mean_value {
                     update_count += 1;
-                    let (min_v, max_v, mean_v, wf_len) = {
-                        let guard = port.lock();
-                        let base = guard.base();
-                        let min_v = base.params.get_float64(indices.p_min_value, 0).unwrap_or(0.0);
-                        let max_v = base.params.get_float64(indices.p_max_value, 0).unwrap_or(0.0);
-                        let mean_v = base.params.get_float64(indices.p_mean_value, 0).unwrap_or(0.0);
-                        let wf = base.params.get_float64_array(indices.p_waveform, 0).unwrap_or_default();
-                        (min_v, max_v, mean_v, wf.len())
-                    };
+                    let min_v = port_handle.read_float64(indices.p_min_value, 0).await.unwrap_or(0.0);
+                    let max_v = port_handle.read_float64(indices.p_max_value, 0).await.unwrap_or(0.0);
+                    let mean_v = port_handle.read_float64(indices.p_mean_value, 0).await.unwrap_or(0.0);
+                    let wf = port_handle.read_float64_array(indices.p_waveform, 0, 10000).await.unwrap_or_default();
+                    let wf_len = wf.len();
                     println!(
                         "  Update {update_count}: waveform={wf_len} pts, \
                          min={min_v:.3}, max={max_v:.3}, mean={mean_v:.3}"
@@ -83,12 +71,8 @@ async fn main() {
 
     // 7. Change vertical gain to x10
     println!("\nSwitching vertical gain to x10...");
-    {
-        let mut guard = port.lock();
-        let vgs_idx = guard.base().find_param("P_VertGainSelect").unwrap();
-        let mut user = AsynUser::new(vgs_idx);
-        guard.write_int32(&mut user, 3).unwrap(); // x10
-    }
+    let vgs_idx = port_handle.drv_user_create("P_VertGainSelect").await.unwrap();
+    port_handle.write_int32(vgs_idx, 0, 3).await.unwrap(); // x10
 
     // Receive 2 more updates
     let mut update_count = 0;
@@ -97,15 +81,9 @@ async fn main() {
             Ok(iv) => {
                 if iv.reason == indices.p_mean_value {
                     update_count += 1;
-                    let (min_v, max_v, mean_v) = {
-                        let guard = port.lock();
-                        let base = guard.base();
-                        (
-                            base.params.get_float64(indices.p_min_value, 0).unwrap_or(0.0),
-                            base.params.get_float64(indices.p_max_value, 0).unwrap_or(0.0),
-                            base.params.get_float64(indices.p_mean_value, 0).unwrap_or(0.0),
-                        )
-                    };
+                    let min_v = port_handle.read_float64(indices.p_min_value, 0).await.unwrap_or(0.0);
+                    let max_v = port_handle.read_float64(indices.p_max_value, 0).await.unwrap_or(0.0);
+                    let mean_v = port_handle.read_float64(indices.p_mean_value, 0).await.unwrap_or(0.0);
                     println!(
                         "  Update (x10 gain): min={min_v:.3}, max={max_v:.3}, mean={mean_v:.3}"
                     );
@@ -120,15 +98,10 @@ async fn main() {
 
     // 8. Stop
     println!("\nStopping simulation...");
-    {
-        let mut guard = port.lock();
-        let mut user = AsynUser::new(indices.p_run);
-        guard.write_int32(&mut user, 0).unwrap();
-    }
+    port_handle.write_int32(indices.p_run, 0, 0).await.unwrap();
 
-    // Report
-    println!("\nPort report:");
-    port.lock().report(1);
+    // 9. Shutdown runtime
+    runtime_handle.shutdown_and_wait();
 
     println!("\nDone.");
 }

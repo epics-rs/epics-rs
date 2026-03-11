@@ -45,4 +45,11 @@ dbLoadRecords("$(MINI_BEAMLINE)/db/point_detector.template", "P=$(PREFIX),R=slit
 dbLoadRecords("$(MINI_BEAMLINE)/db/moving_dot.template", "P=$(PREFIX),R=dot:cam:,PORT=DOT,DTYP=asynMovingDot")
 
 # Load standard areaDetector plugins for MovingDot
+epicsEnvSet("PORT",    "DOT")
+epicsEnvSet("QSIZE",   "20")
+epicsEnvSet("XSIZE",   "$(DOT_SIZE_X)")
+epicsEnvSet("YSIZE",   "$(DOT_SIZE_Y)")
+epicsEnvSet("NCHANS",  "2048")
+epicsEnvSet("CBUFFS",  "500")
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
 < $(ADCORE)/ioc/commonPlugins.cmd

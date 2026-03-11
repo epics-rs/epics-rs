@@ -6,14 +6,16 @@ use ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core::ndarray_pool::NDArrayPool;
 use ad_core::driver::ad_driver::ADDriverBase;
 use ad_core::plugin::runtime::NDPluginProcess;
+use ad_core::plugin::wiring::WiringRegistry;
 use ad_plugins::stats::create_stats_runtime;
 use ad_plugins::std_arrays::create_std_arrays_runtime;
 
 #[test]
 fn test_driver_to_stats_pipeline() {
     let pool = Arc::new(ad_core::ndarray_pool::NDArrayPool::new(10_000_000));
+    let wiring = Arc::new(WiringRegistry::new());
     let (stats_handle, stats_data, _params, _ts_runtime, _ts_params, _jh, _ts_actor_jh, _ts_data_jh) =
-        create_stats_runtime("STATS1", pool.clone(), 10, "SIM1");
+        create_stats_runtime("STATS1", pool.clone(), 10, "SIM1", wiring);
 
     let mut driver = ADDriverBase::new("SIM1", 64, 64, 10_000_000).unwrap();
     driver.connect_downstream(stats_handle.array_sender().clone());
@@ -41,7 +43,8 @@ fn test_driver_to_stats_pipeline() {
 #[test]
 fn test_driver_to_std_arrays_pipeline() {
     let pool = Arc::new(ad_core::ndarray_pool::NDArrayPool::new(10_000_000));
-    let (image_handle, image_data, _jh) = create_std_arrays_runtime("IMAGE1", pool.clone(), "SIM1");
+    let wiring = Arc::new(WiringRegistry::new());
+    let (image_handle, image_data, _jh) = create_std_arrays_runtime("IMAGE1", pool.clone(), "SIM1", wiring);
 
     let mut driver = ADDriverBase::new("SIM1", 32, 32, 10_000_000).unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());

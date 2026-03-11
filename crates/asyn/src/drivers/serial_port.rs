@@ -715,6 +715,7 @@ impl Drop for DrvAsynSerialPort {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -1094,9 +1095,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_worker_integration() {
-        use crate::manager::PortManager;
-        use crate::request::RequestOp;
+    fn test_pty_runtime_integration() {
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
 
         let (master, slave, slave_name) = match create_pty_pair() {
             Some(v) => v,
@@ -1111,22 +1111,16 @@ mod tests {
             slave: -1,
         };
 
-        let mgr = PortManager::new();
-        let drv = DrvAsynSerialPort::new("pty_worker", &slave_name).unwrap();
-        let _port = mgr.register_port(drv);
+        let drv = DrvAsynSerialPort::new("pty_rt", &slave_name).unwrap();
+        let (runtime_handle, _jh) = create_port_runtime(drv, RuntimeConfig::default());
+        let ph = runtime_handle.port_handle();
 
-        // Write via worker queue
+        // Write via PortHandle
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
-        let handle = mgr
-            .queue_request(
-                "pty_worker",
-                RequestOp::OctetWrite {
-                    data: b"ping".to_vec(),
-                },
-                user,
-            )
-            .unwrap();
-        handle.wait(Duration::from_secs(2)).unwrap();
+        ph.submit_blocking(
+            crate::request::RequestOp::OctetWrite { data: b"ping".to_vec() },
+            user,
+        ).unwrap();
 
         // Read from master
         let mut buf = [0u8; 32];
@@ -1138,19 +1132,15 @@ mod tests {
         let resp = b"pong";
         unsafe { libc::write(master, resp.as_ptr() as *const libc::c_void, resp.len()) };
 
-        // Read via worker queue
+        // Read via PortHandle
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
-        let handle = mgr
-            .queue_request(
-                "pty_worker",
-                RequestOp::OctetRead { buf_size: 32 },
-                user,
-            )
-            .unwrap();
-        let result = handle.wait(Duration::from_secs(2)).unwrap();
+        let result = ph.submit_blocking(
+            crate::request::RequestOp::OctetRead { buf_size: 32 },
+            user,
+        ).unwrap();
         assert_eq!(result.data.as_deref(), Some(b"pong".as_slice()));
 
-        mgr.unregister_port("pty_worker");
+        runtime_handle.shutdown_and_wait();
     }
 
     #[test]

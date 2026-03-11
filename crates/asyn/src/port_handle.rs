@@ -390,13 +390,23 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Flush changed parameters as interrupt notifications (fire-and-forget).
+    ///
+    /// Safe to call from within a Tokio runtime context.
+    /// The actor processes messages in FIFO order, so prior writes are
+    /// guaranteed to be applied before this callback runs.
+    pub fn call_param_callbacks_no_wait(&self, addr: i32) {
+        let user = AsynUser::new(0).with_addr(addr);
+        self.submit_no_wait(RequestOp::CallParamCallbacks { addr }, user);
+    }
+
     /// Send a write request without waiting for the reply.
     /// The actor still processes it in FIFO order, so a subsequent blocking
     /// call (e.g. call_param_callbacks_blocking) guarantees prior writes are done.
     pub fn submit_no_wait(&self, op: RequestOp, user: AsynUser) {
         let (reply_tx, _reply_rx) = oneshot::channel();
         let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
-        let _ = self.tx.blocking_send(msg);
+        let _ = self.tx.try_send(msg);
     }
 
     pub fn write_int32_no_wait(&self, reason: usize, addr: i32, value: i32) {

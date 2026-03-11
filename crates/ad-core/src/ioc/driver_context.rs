@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::ndarray_pool::NDArrayPool;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender};
+use crate::plugin::wiring::WiringRegistry;
 
 /// Abstraction over a detector driver's runtime, providing what plugin
 /// configure commands need: an array pool and a way to wire downstream.
@@ -22,8 +23,8 @@ pub struct GenericDriverContext {
 }
 
 impl GenericDriverContext {
-    pub fn new(pool: Arc<NDArrayPool>, output: Arc<parking_lot::Mutex<NDArrayOutput>>, port_name: &str) -> Self {
-        crate::plugin::wiring::register_output(port_name, output.clone());
+    pub fn new(pool: Arc<NDArrayPool>, output: Arc<parking_lot::Mutex<NDArrayOutput>>, port_name: &str, wiring: &WiringRegistry) -> Self {
+        wiring.register_output(port_name, output.clone());
         Self { pool, output }
     }
 }

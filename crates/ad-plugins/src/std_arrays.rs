@@ -3,6 +3,7 @@ use std::sync::Arc;
 use ad_core::ndarray::NDArray;
 use ad_core::ndarray_pool::NDArrayPool;
 use ad_core::plugin::runtime::{NDPluginProcess, PluginRuntimeHandle, ProcessResult};
+use ad_core::plugin::wiring::WiringRegistry;
 use parking_lot::Mutex;
 
 /// Pure processing logic: stores the latest array and passes it through.
@@ -46,6 +47,7 @@ pub fn create_std_arrays_runtime(
     port_name: &str,
     pool: Arc<NDArrayPool>,
     ndarray_port: &str,
+    wiring: Arc<WiringRegistry>,
 ) -> (PluginRuntimeHandle, Arc<Mutex<Option<Arc<NDArray>>>>, std::thread::JoinHandle<()>) {
     let processor = StdArraysProcessor::new();
     let data_handle = processor.data_handle();
@@ -56,6 +58,7 @@ pub fn create_std_arrays_runtime(
         pool,
         1, // LatestOnly semantics
         ndarray_port,
+        wiring,
     );
 
     (handle, data_handle, data_jh)
@@ -88,7 +91,8 @@ mod tests {
     #[test]
     fn test_std_arrays_runtime() {
         let pool = Arc::new(NDArrayPool::new(1_000_000));
-        let (handle, data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "");
+        let wiring = Arc::new(WiringRegistry::new());
+        let (handle, data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
 
         handle.array_sender().send(make_array(42));
         std::thread::sleep(std::time::Duration::from_millis(100));

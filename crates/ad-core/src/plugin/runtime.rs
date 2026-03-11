@@ -16,6 +16,7 @@ use crate::params::ndarray_driver::NDArrayDriverParams;
 
 use super::channel::{ndarray_channel, BlockingProcessFn, NDArrayOutput, NDArrayReceiver, NDArraySender};
 use super::params::PluginBaseParams;
+use super::wiring::WiringRegistry;
 
 /// Value sent through the param change channel from control plane to data plane.
 #[derive(Debug, Clone)]
@@ -160,7 +161,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             }
         }
 
-        let _ = self.port_handle.call_param_callbacks_blocking(0);
+        self.port_handle.call_param_callbacks_no_wait(0);
     }
 }
 
@@ -309,6 +310,7 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
     pool: Arc<NDArrayPool>,
     queue_size: usize,
     ndarray_port: &str,
+    wiring: Arc<WiringRegistry>,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
     // Param change channel (control plane -> data plane)
     let (param_tx, param_rx) = tokio::sync::mpsc::channel::<(usize, ParamChangeValue)>(64);
@@ -381,6 +383,7 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
                 nd_array_port_reason,
                 sender_port_name,
                 initial_upstream,
+                wiring,
             );
         })
         .expect("failed to spawn plugin data thread");
@@ -408,6 +411,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
     nd_array_port_reason: usize,
     sender_port_name: String,
     initial_upstream: String,
+    wiring: Arc<WiringRegistry>,
 ) {
     let mut current_upstream = initial_upstream;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -443,7 +447,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             if reason == nd_array_port_reason {
                                 if let Some(new_port) = value.as_string() {
                                     let old = std::mem::replace(&mut current_upstream, new_port.to_string());
-                                    if let Err(e) = super::wiring::rewire_by_name(&sender_port_name, &old, new_port) {
+                                    if let Err(e) = wiring.rewire_by_name(&sender_port_name, &old, new_port) {
                                         eprintln!("NDArrayPort rewire failed: {e}");
                                         // Revert current_upstream on failure
                                         current_upstream = old;
@@ -478,6 +482,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     queue_size: usize,
     output: NDArrayOutput,
     ndarray_port: &str,
+    wiring: Arc<WiringRegistry>,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
     let (param_tx, param_rx) = tokio::sync::mpsc::channel::<(usize, ParamChangeValue)>(64);
 
@@ -539,6 +544,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
                 nd_array_port_reason,
                 sender_port_name,
                 initial_upstream,
+                wiring,
             );
         })
         .expect("failed to spawn plugin data thread");
@@ -594,6 +600,10 @@ mod tests {
         Arc::new(arr)
     }
 
+    fn test_wiring() -> Arc<WiringRegistry> {
+        Arc::new(WiringRegistry::new())
+    }
+
     #[test]
     fn test_passthrough_runtime() {
         let pool = Arc::new(NDArrayPool::new(1_000_000));
@@ -610,6 +620,7 @@ mod tests {
             10,
             output,
             "",
+            test_wiring(),
         );
 
         // Send an array
@@ -630,6 +641,7 @@ mod tests {
             pool,
             10,
             "",
+            test_wiring(),
         );
 
         // Send arrays - they should be consumed silently
@@ -653,6 +665,7 @@ mod tests {
             pool,
             10,
             "",
+            test_wiring(),
         );
 
         // Verify port name
@@ -670,6 +683,7 @@ mod tests {
             pool,
             10,
             "",
+            test_wiring(),
         );
 
         // Drop the handle (closes sender channel, which should cause data thread to exit)
@@ -708,6 +722,7 @@ mod tests {
             pool,
             1,
             "",
+            test_wiring(),
         );
 
         // Fill the queue and overflow
@@ -733,6 +748,7 @@ mod tests {
             10,
             output,
             "",
+            test_wiring(),
         );
 
         // Enable blocking mode
@@ -765,6 +781,7 @@ mod tests {
             10,
             output,
             "",
+            test_wiring(),
         );
 
         // Start in blocking mode
@@ -807,6 +824,7 @@ mod tests {
             10,
             output,
             "",
+            test_wiring(),
         );
 
         // Disable callbacks
@@ -855,6 +873,7 @@ mod tests {
             10,
             output,
             "",
+            test_wiring(),
         );
 
         // Enable blocking mode
@@ -899,6 +918,7 @@ mod tests {
             10,
             output,
             "",
+            test_wiring(),
         );
 
         // Enable blocking mode
@@ -926,5 +946,44 @@ mod tests {
         handle.array_sender().send(make_test_array(2));
         let received = downstream_rx.blocking_recv().unwrap();
         assert_eq!(received.unique_id, 2);
+    }
+
+    /// Phase 0 regression test: process_and_publish inside a current-thread runtime must not panic.
+    #[test]
+    fn test_no_panic_in_current_thread_runtime() {
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            "CURRENT_THREAD_TEST",
+            PassthroughProcessor,
+            pool,
+            10,
+            output,
+            "",
+            test_wiring(),
+        );
+
+        // Enable blocking mode so process_and_publish runs inline
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(handle.plugin_params.blocking_callbacks, 0, 1)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Call send (which calls process_and_publish inline) from inside a current-thread runtime
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle.array_sender().send(make_test_array(99));
+        });
+
+        let received = downstream_rx.blocking_recv().unwrap();
+        assert_eq!(received.unique_id, 99);
     }
 }

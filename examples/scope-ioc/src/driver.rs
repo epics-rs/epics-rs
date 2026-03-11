@@ -364,6 +364,7 @@ pub async fn sim_task(
 
 /// Background simulation task using the trait-object `dyn PortDriver`.
 /// Used by the standalone example which registers with PortManager.
+#[deprecated(note = "use sim_task_handle() with PortHandle instead")]
 pub async fn sim_task_dyn(
     port: Arc<Mutex<dyn PortDriver>>,
     notify: Arc<Notify>,
@@ -400,5 +401,56 @@ pub async fn sim_task_dyn(
             _ = tokio::time::sleep(sleep_dur) => {}
             _ = notify.notified() => {}
         }
+    }
+}
+
+/// Background simulation task using [`asyn_rs::port_handle::PortHandle`].
+///
+/// Reads config and writes results via the actor's async channel API.
+pub async fn sim_task_handle(
+    handle: asyn_rs::port_handle::PortHandle,
+    notify: Arc<Notify>,
+    idx: ParamIndices,
+) {
+    let mut rng = Rng::new(0xDEAD_BEEF_CAFE_1234);
+
+    loop {
+        let config = read_config_handle(&handle, &idx).await;
+
+        if !config.run {
+            notify.notified().await;
+            continue;
+        }
+
+        let result = compute_waveform(&config, &mut rng);
+
+        let _ = handle.write_float64_array(idx.p_waveform, 0, result.waveform).await;
+        let _ = handle.write_float64_array(idx.p_time_base, 0, result.time_base).await;
+        let _ = handle.write_float64(idx.p_min_value, 0, result.min_val).await;
+        let _ = handle.write_float64(idx.p_max_value, 0, result.max_val).await;
+        let _ = handle.write_float64(idx.p_mean_value, 0, result.mean_val).await;
+        let _ = handle.call_param_callbacks(0).await;
+
+        let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_dur) => {}
+            _ = notify.notified() => {}
+        }
+    }
+}
+
+async fn read_config_handle(
+    handle: &asyn_rs::port_handle::PortHandle,
+    idx: &ParamIndices,
+) -> SimConfig {
+    SimConfig {
+        run: handle.read_int32(idx.p_run, 0).await.unwrap_or(0) != 0,
+        max_points: handle.read_int32(idx.p_max_points, 0).await.unwrap_or(DEFAULT_MAX_POINTS) as usize,
+        time_per_div: handle.read_float64(idx.p_time_per_div, 0).await.unwrap_or(0.001),
+        volts_per_div: handle.read_float64(idx.p_volts_per_div, 0).await.unwrap_or(1.0),
+        volt_offset: handle.read_float64(idx.p_volt_offset, 0).await.unwrap_or(0.0),
+        trigger_delay: handle.read_float64(idx.p_trigger_delay, 0).await.unwrap_or(0.0),
+        noise_amplitude: handle.read_float64(idx.p_noise_amplitude, 0).await.unwrap_or(0.0),
+        update_time: handle.read_float64(idx.p_update_time, 0).await.unwrap_or(DEFAULT_UPDATE_TIME),
     }
 }

@@ -1,120 +1,17 @@
 //! Synchronous convenience API for port driver I/O.
 //!
-//! All methods acquire the `Mutex<dyn PortDriver>` lock, because `PortDriver`
-//! methods require `&mut self`. The lock is shared with the broader port driver
-//! infrastructure (adapter, worker, auto-connect) via `Arc<Mutex<dyn PortDriver>>`.
+//! [`SyncIOHandle`] wraps a [`PortHandle`] and provides blocking read/write
+//! methods for each parameter type.
 
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
-
 use crate::error::AsynResult;
 use crate::manager::PortManager;
-use crate::param::EnumEntry;
-use crate::port::PortDriver;
 use crate::port_handle::PortHandle;
 use crate::request::RequestOp;
 use crate::user::AsynUser;
-
-/// Synchronous I/O handle bound to a specific port and address.
-///
-/// All operations acquire the port mutex lock.
-pub struct SyncIO {
-    port: Arc<Mutex<dyn PortDriver>>,
-    addr: i32,
-    timeout: Duration,
-}
-
-impl SyncIO {
-    /// Connect to a named port via the PortManager.
-    pub fn connect(manager: &PortManager, port_name: &str, addr: i32, timeout: Duration) -> AsynResult<Self> {
-        let port = manager.find_port(port_name)?;
-        Ok(Self { port, addr, timeout })
-    }
-
-    /// Create directly from a port reference (for testing or when PortManager is not used).
-    pub fn from_port(port: Arc<Mutex<dyn PortDriver>>, addr: i32, timeout: Duration) -> Self {
-        Self { port, addr, timeout }
-    }
-
-    fn user(&self, reason: usize) -> AsynUser {
-        AsynUser::new(reason)
-            .with_addr(self.addr)
-            .with_timeout(self.timeout)
-    }
-
-    pub fn read_int32(&self, reason: usize) -> AsynResult<i32> {
-        let mut port = self.port.lock();
-        port.read_int32(&self.user(reason))
-    }
-
-    pub fn write_int32(&self, reason: usize, value: i32) -> AsynResult<()> {
-        let mut port = self.port.lock();
-        port.write_int32(&mut self.user(reason), value)
-    }
-
-    pub fn read_int64(&self, reason: usize) -> AsynResult<i64> {
-        let mut port = self.port.lock();
-        port.read_int64(&self.user(reason))
-    }
-
-    pub fn write_int64(&self, reason: usize, value: i64) -> AsynResult<()> {
-        let mut port = self.port.lock();
-        port.write_int64(&mut self.user(reason), value)
-    }
-
-    pub fn read_float64(&self, reason: usize) -> AsynResult<f64> {
-        let mut port = self.port.lock();
-        port.read_float64(&self.user(reason))
-    }
-
-    pub fn write_float64(&self, reason: usize, value: f64) -> AsynResult<()> {
-        let mut port = self.port.lock();
-        port.write_float64(&mut self.user(reason), value)
-    }
-
-    pub fn read_octet(&self, reason: usize, buf: &mut [u8]) -> AsynResult<usize> {
-        let mut port = self.port.lock();
-        port.read_octet(&self.user(reason), buf)
-    }
-
-    pub fn write_octet(&self, reason: usize, data: &[u8]) -> AsynResult<()> {
-        let mut port = self.port.lock();
-        port.write_octet(&mut self.user(reason), data)
-    }
-
-    pub fn read_uint32_digital(&self, reason: usize, mask: u32) -> AsynResult<u32> {
-        let mut port = self.port.lock();
-        port.read_uint32_digital(&self.user(reason), mask)
-    }
-
-    pub fn write_uint32_digital(&self, reason: usize, value: u32, mask: u32) -> AsynResult<()> {
-        let mut port = self.port.lock();
-        port.write_uint32_digital(&mut self.user(reason), value, mask)
-    }
-
-    pub fn read_enum(&self, reason: usize) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
-        let mut port = self.port.lock();
-        port.read_enum(&self.user(reason))
-    }
-
-    pub fn write_enum(&self, reason: usize, index: usize) -> AsynResult<()> {
-        let mut port = self.port.lock();
-        port.write_enum(&mut self.user(reason), index)
-    }
-
-    pub fn read_generic_pointer(&self, reason: usize) -> AsynResult<Arc<dyn Any + Send + Sync>> {
-        let mut port = self.port.lock();
-        port.read_generic_pointer(&self.user(reason))
-    }
-
-    pub fn write_generic_pointer(&self, reason: usize, value: Arc<dyn Any + Send + Sync>) -> AsynResult<()> {
-        let mut port = self.port.lock();
-        port.write_generic_pointer(&mut self.user(reason), value)
-    }
-}
 
 /// Synchronous I/O handle backed by a [`PortHandle`] (actor model).
 ///
@@ -219,6 +116,13 @@ impl SyncIOHandle {
         Ok(())
     }
 
+    pub fn read_generic_pointer(&self, _reason: usize) -> AsynResult<Arc<dyn Any + Send + Sync>> {
+        Err(crate::error::AsynError::Status {
+            status: crate::error::AsynStatus::Error,
+            message: "generic pointer read not supported via actor".into(),
+        })
+    }
+
     pub fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
         self.handle.drv_user_create_blocking(drv_info)
     }
@@ -228,7 +132,8 @@ impl SyncIOHandle {
 mod tests {
     use super::*;
     use crate::param::ParamType;
-    use crate::port::{PortDriverBase, PortFlags};
+    use crate::port::{PortDriver, PortDriverBase, PortFlags};
+    use crate::runtime::{RuntimeConfig, create_port_runtime};
 
     struct TestPort {
         base: PortDriverBase,
@@ -253,62 +158,55 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase { &mut self.base }
     }
 
-    fn make_sync_io() -> SyncIO {
-        let port: Arc<Mutex<dyn PortDriver>> = Arc::new(Mutex::new(TestPort::new()));
-        SyncIO::from_port(port, 0, Duration::from_secs(1))
+    use crate::runtime::PortRuntimeHandle;
+
+    fn make_sync_io() -> (SyncIOHandle, PortRuntimeHandle) {
+        let (handle, _jh) = create_port_runtime(TestPort::new(), RuntimeConfig::default());
+        let sio = SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
+        (sio, handle)
     }
 
     #[test]
     fn test_sync_io_int32_roundtrip() {
-        let sio = make_sync_io();
+        let (sio, _rt) = make_sync_io();
         sio.write_int32(0, 42).unwrap();
         assert_eq!(sio.read_int32(0).unwrap(), 42);
     }
 
     #[test]
     fn test_sync_io_float64_roundtrip() {
-        let sio = make_sync_io();
+        let (sio, _rt) = make_sync_io();
         sio.write_float64(1, 3.14).unwrap();
         assert!((sio.read_float64(1).unwrap() - 3.14).abs() < 1e-10);
     }
 
     #[test]
     fn test_sync_io_octet_roundtrip() {
-        let sio = make_sync_io();
+        let (sio, _rt) = make_sync_io();
         sio.write_octet(2, b"hello").unwrap();
-        let mut buf = [0u8; 32];
-        let n = sio.read_octet(2, &mut buf).unwrap();
-        assert_eq!(&buf[..n], b"hello");
+        let data = sio.read_octet(2, 32).unwrap();
+        assert_eq!(&data[..5], b"hello");
     }
 
     #[test]
     fn test_sync_io_uint32_digital_roundtrip() {
-        let sio = make_sync_io();
+        let (sio, _rt) = make_sync_io();
         sio.write_uint32_digital(3, 0xFF, 0x0F).unwrap();
         assert_eq!(sio.read_uint32_digital(3, 0xFF).unwrap(), 0x0F);
     }
 
     #[test]
-    fn test_sync_io_enum_roundtrip() {
-        let sio = make_sync_io();
-        // Default has sentinel, write index 0
-        sio.write_enum(4, 0).unwrap();
-        let (idx, _) = sio.read_enum(4).unwrap();
-        assert_eq!(idx, 0);
-    }
-
-    #[test]
     fn test_sync_io_int64_roundtrip() {
-        let sio = make_sync_io();
+        let (sio, _rt) = make_sync_io();
         sio.write_int64(6, i64::MIN).unwrap();
         assert_eq!(sio.read_int64(6).unwrap(), i64::MIN);
     }
 
     #[test]
-    fn test_sync_io_connect_via_manager() {
+    fn test_sync_io_via_manager() {
         let mgr = PortManager::new();
         mgr.register_port(TestPort::new());
-        let sio = SyncIO::connect(&mgr, "synctest", 0, Duration::from_secs(1)).unwrap();
+        let sio = SyncIOHandle::connect(&mgr, "synctest", 0, Duration::from_secs(1)).unwrap();
         sio.write_int32(0, 100).unwrap();
         assert_eq!(sio.read_int32(0).unwrap(), 100);
     }

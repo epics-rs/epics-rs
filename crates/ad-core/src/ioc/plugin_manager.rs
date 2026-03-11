@@ -6,6 +6,7 @@ use epics_base_rs::server::ioc_app::IocApplication;
 
 use crate::plugin::registry::{build_plugin_base_registry, ParamRegistry};
 use crate::plugin::runtime::PluginRuntimeHandle;
+use crate::plugin::wiring::WiringRegistry;
 
 use super::plugin_device_support::{ArrayDataHandle, PluginDeviceSupport};
 use super::DriverContext;
@@ -27,6 +28,7 @@ pub struct PluginManager {
     plugins: parking_lot::Mutex<Vec<PluginInfo>>,
     plugin_handles: parking_lot::Mutex<Vec<PluginRuntimeHandle>>,
     trace: Arc<TraceManager>,
+    wiring: Arc<WiringRegistry>,
 }
 
 impl PluginManager {
@@ -36,7 +38,13 @@ impl PluginManager {
             plugins: parking_lot::Mutex::new(Vec::new()),
             plugin_handles: parking_lot::Mutex::new(Vec::new()),
             trace,
+            wiring: Arc::new(WiringRegistry::new()),
         })
+    }
+
+    /// Access the shared wiring registry.
+    pub fn wiring(&self) -> &Arc<WiringRegistry> {
+        &self.wiring
     }
 
     /// Set the driver context. Called when the driver config command runs.
@@ -79,8 +87,8 @@ impl PluginManager {
         let port_handle = handle.port_runtime().port_handle().clone();
         let port_name = port_handle.port_name().to_string();
 
-        // Register this plugin's output in the global wiring registry
-        crate::plugin::wiring::register_output(&port_name, handle.array_output().clone());
+        // Register this plugin's output in the wiring registry
+        self.wiring.register_output(&port_name, handle.array_output().clone());
 
         self.plugins.lock().push(PluginInfo {
             dtyp_name: dtyp.to_string(),

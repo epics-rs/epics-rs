@@ -94,25 +94,10 @@ impl BeamlineHolder {
 //
 // When st.cmd runs NDStdArraysConfigure/NDStatsConfigure/etc., the plugin
 // manager needs to know where image data comes from (which NDArrayPool)
-// and how to subscribe to new frames (connect_downstream). This adapter
-// exposes the MovingDot driver's pool and output channel to the plugin
-// infrastructure.
+// and how to subscribe to new frames (connect_downstream). GenericDriverContext
+// also registers the driver port in the global wiring registry so that
+// plugins can rewire their NDArrayPort at runtime.
 // ============================================================================
-
-struct MovingDotDriverContext {
-    pool: Arc<ad_core::ndarray_pool::NDArrayPool>,
-    output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-}
-
-impl ad_core::ioc::DriverContext for MovingDotDriverContext {
-    fn pool(&self) -> Arc<ad_core::ndarray_pool::NDArrayPool> {
-        self.pool.clone()
-    }
-
-    fn connect_downstream(&self, sender: ad_core::plugin::channel::NDArraySender) {
-        self.output.lock().add(sender);
-    }
-}
 
 // ============================================================================
 // Main
@@ -135,6 +120,7 @@ async fn main() -> CaResult<()> {
 
     // Global singletons shared across the IOC
     asyn_rs::asyn_record::register_asyn_record_type();
+    motor_rs::register_motor_record_type();
     let trace = Arc::new(TraceManager::new());
     let mgr = PluginManager::new(trace.clone());
     let holder = BeamlineHolder::new(trace.clone());
@@ -226,10 +212,14 @@ async fn main() -> CaResult<()> {
 
                 // Connect MovingDot as the data source for the plugin chain
                 // (NDStdArraysConfigure etc. will call connect_downstream on this)
-                mgr_c.set_driver(Arc::new(MovingDotDriverContext {
-                    pool: dot_rt.pool().clone(),
-                    output: dot_rt.array_output().clone(),
-                }));
+                // GenericDriverContext also registers "DOT" in the wiring registry
+                // so plugins can rewire their NDArrayPort at runtime.
+                mgr_c.set_driver(Arc::new(ad_core::ioc::GenericDriverContext::new(
+                    dot_rt.pool().clone(),
+                    dot_rt.array_output().clone(),
+                    "DOT",
+                    mgr_c.wiring(),
+                )));
 
                 *h.md_runtime.lock().unwrap() = Some((dot_rt, dot_registry));
                 println!("  MovingDot detector created");

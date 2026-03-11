@@ -454,6 +454,7 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
                     runtime.pool().clone(),
                     runtime.array_output().clone(),
                     &port_name,
+                    mgr.wiring(),
                 )));
 
                 *ph.lock().unwrap() = Some(port_handle);

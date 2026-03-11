@@ -98,6 +98,7 @@ impl PortActor {
     }
 
     /// Run the actor loop. Returns when the channel is closed (all senders dropped).
+    #[cfg(test)]
     pub fn run(mut self) {
         loop {
             // Drain all pending messages into the heap
@@ -116,6 +117,41 @@ impl PortActor {
             // Process one eligible request from the heap
             self.process_one();
         }
+    }
+
+    /// Run the actor loop with a dedicated shutdown channel.
+    ///
+    /// Returns when either:
+    /// - The main request channel is closed (all senders dropped)
+    /// - The shutdown channel is closed (shutdown signaled)
+    pub fn run_with_shutdown(mut self, mut shutdown_rx: mpsc::Receiver<()>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            loop {
+                // Drain all pending messages into the heap
+                self.drain_channel();
+
+                if self.heap.is_empty() {
+                    // Wait for either a message or shutdown
+                    tokio::select! {
+                        msg = self.rx.recv() => {
+                            match msg {
+                                Some(m) => self.enqueue_message(m),
+                                None => return,
+                            }
+                        }
+                        _ = shutdown_rx.recv() => return,
+                    }
+                    // Drain any more that arrived
+                    self.drain_channel();
+                }
+
+                // Process one eligible request from the heap
+                self.process_one();
+            }
+        });
     }
 
     fn drain_channel(&mut self) {

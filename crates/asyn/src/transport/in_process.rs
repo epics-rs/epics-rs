@@ -133,6 +133,7 @@ impl RuntimeClient for InProcessClient {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::time::SystemTime;
 
@@ -171,8 +172,8 @@ mod tests {
 
     fn make_client() -> (PortManager, InProcessClient) {
         let mgr = PortManager::new();
-        let handle = mgr.register_port_actor(TestPort::new());
-        let client = InProcessClient::new(handle);
+        let rt_handle = mgr.register_port(TestPort::new());
+        let client = InProcessClient::new(rt_handle.port_handle().clone());
         (mgr, client)
     }
 

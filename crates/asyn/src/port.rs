@@ -2,19 +2,16 @@
 //!
 //! # I/O Model
 //!
-//! asyn-rs supports two I/O paths:
+//! Ports are driven by a [`crate::port_actor::PortActor`] running on a dedicated thread.
+//! The actor exclusively owns the driver and processes requests from a channel.
 //!
 //! **Cache path** (default `read_*`/`write_*` methods):
 //! - Default implementations operate on the parameter cache (non-blocking).
 //! - Background tasks update cache via `set_*_param()` + `call_param_callbacks()`.
 //!
-//! **Worker path** (`io_*` methods, called by [`crate::port_worker::PortWorker`]):
-//! - Each port gets a dedicated worker thread with a priority queue.
-//! - The worker dispatches `io_*` methods which, by default, delegate to `read_*`/`write_*`.
-//! - Real I/O drivers (e.g. `DrvAsynIPPort`) override `write_octet`/`read_octet` directly;
-//!   the default `io_*` delegation routes through to the real implementation.
-//! - [`QueuePriority`] controls scheduling order in the worker queue.
-//! - `can_block` indicates the port may perform blocking I/O in `io_*` methods.
+//! **Actor path** (requests submitted via [`crate::port_handle::PortHandle`]):
+//! - Each port gets a dedicated actor thread that dispatches requests to driver methods.
+//! - `can_block` indicates the port may perform blocking I/O.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,23 +42,8 @@ use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 use crate::interpose::{OctetInterpose, OctetInterposeStack};
 use crate::interrupt::{InterruptManager, InterruptValue};
 use crate::param::{EnumEntry, ParamList, ParamType};
-use crate::request::{CancelToken, CompletionHandle, RequestOp};
 use crate::trace::TraceManager;
 use crate::user::AsynUser;
-
-/// Trait for submitting requests to a port's execution path.
-///
-/// Implemented by both `RequestQueue` (threaded, for `can_block=true`) and
-/// `SynchronousQueue` (inline, for `can_block=false`).
-pub trait QueueSubmit: Send + Sync {
-    fn enqueue(&self, op: RequestOp, user: AsynUser) -> CompletionHandle;
-    fn enqueue_cancellable(
-        &self,
-        op: RequestOp,
-        user: AsynUser,
-        cancel: CancelToken,
-    ) -> CompletionHandle;
-}
 
 /// C asyn `queueRequest` priority. In asyn-rs this exists as compatibility
 /// metadata only — there is no actual request queue or priority-based scheduling.
@@ -126,8 +108,6 @@ pub struct PortDriverBase {
     pub auto_connect: bool,
     /// Exception sink injected by [`crate::manager::PortManager`] on registration.
     pub exception_sink: Option<Arc<ExceptionManager>>,
-    /// Worker queue injected by [`crate::manager::PortManager`] on registration.
-    pub worker_queue: Option<Arc<dyn QueueSubmit>>,
     pub options: HashMap<String, String>,
     pub interpose_octet: OctetInterposeStack,
     pub trace: Option<Arc<TraceManager>>,
@@ -149,7 +129,6 @@ impl PortDriverBase {
             enabled: true,
             auto_connect: true,
             exception_sink: None,
-            worker_queue: None,
             options: HashMap::new(),
             interpose_octet: OctetInterposeStack::new(),
             trace: None,

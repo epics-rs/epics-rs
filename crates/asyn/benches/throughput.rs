@@ -1,15 +1,12 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use parking_lot::Mutex;
 
 use asyn_rs::interrupt::{InterruptManager, InterruptValue};
-use asyn_rs::manager::PortManager;
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::port_handle::PortHandle;
-use asyn_rs::sync_io::SyncIO;
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::sync_io::SyncIOHandle;
 
 // -- Minimal test driver for benchmarking --
 
@@ -38,77 +35,48 @@ impl PortDriver for BenchPort {
 
 // -- Helpers --
 
-fn make_sync_io(name: &str) -> SyncIO {
-    let port: Arc<Mutex<dyn PortDriver>> = Arc::new(Mutex::new(BenchPort::new(name)));
-    SyncIO::from_port(port, 0, Duration::from_secs(1))
-}
-
-fn make_actor_handle(name: &str) -> (PortManager, PortHandle) {
-    let mgr = PortManager::new();
-    let handle = mgr.register_port_actor(BenchPort::new(name));
-    (mgr, handle)
+fn make_sync_io(name: &str) -> SyncIOHandle {
+    let (handle, _jh) = create_port_runtime(BenchPort::new(name), RuntimeConfig::default());
+    SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1))
 }
 
 // -- Benchmarks --
 
-fn bench_local_int32_read(c: &mut Criterion) {
+fn bench_actor_int32_read(c: &mut Criterion) {
     let sio = make_sync_io("bench_int32_r");
     sio.write_int32(0, 42).unwrap();
 
-    c.bench_function("local_int32_read", |b| {
+    c.bench_function("actor_int32_read", |b| {
         b.iter(|| {
             let _ = sio.read_int32(0).unwrap();
         });
     });
 }
 
-fn bench_local_float64_write(c: &mut Criterion) {
+fn bench_actor_float64_write(c: &mut Criterion) {
     let sio = make_sync_io("bench_f64_w");
 
-    c.bench_function("local_float64_write", |b| {
+    c.bench_function("actor_float64_write", |b| {
         b.iter(|| {
             sio.write_float64(1, 3.14).unwrap();
         });
     });
 }
 
-fn bench_local_octet_roundtrip(c: &mut Criterion) {
+fn bench_actor_octet_roundtrip(c: &mut Criterion) {
     let sio = make_sync_io("bench_oct_rt");
     let data = b"benchmark test data";
 
-    c.bench_function("local_octet_roundtrip", |b| {
+    c.bench_function("actor_octet_roundtrip", |b| {
         b.iter(|| {
             sio.write_octet(2, data).unwrap();
-            let mut buf = [0u8; 64];
-            let _ = sio.read_octet(2, &mut buf).unwrap();
-        });
-    });
-}
-
-fn bench_actor_int32_read(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-
-    let (_mgr, handle) = rt.block_on(async {
-        let (mgr, h) = make_actor_handle("bench_actor_r");
-        h.write_int32(0, 0, 42).await.unwrap();
-        (mgr, h)
-    });
-
-    c.bench_function("actor_int32_read", |b| {
-        b.iter(|| {
-            handle.read_int32_blocking(0, 0).unwrap();
+            let _ = sio.read_octet(2, 64).unwrap();
         });
     });
 }
 
 fn bench_concurrent_32_producers(c: &mut Criterion) {
-    let port: Arc<Mutex<dyn PortDriver>> =
-        Arc::new(Mutex::new(BenchPort::new("bench_concurrent")));
-    let sio = SyncIO::from_port(port, 0, Duration::from_secs(1));
+    let sio = make_sync_io("bench_concurrent");
 
     // Warm up
     sio.write_int32(0, 0).unwrap();
@@ -148,10 +116,9 @@ fn bench_interrupt_event_throughput(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_local_int32_read,
-    bench_local_float64_write,
-    bench_local_octet_roundtrip,
     bench_actor_int32_read,
+    bench_actor_float64_write,
+    bench_actor_octet_roundtrip,
     bench_concurrent_32_producers,
     bench_interrupt_event_throughput,
 );

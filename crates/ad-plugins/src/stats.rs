@@ -4,6 +4,7 @@ use ad_core::ndarray::{NDArray, NDDataBuffer};
 use ad_core::ndarray_pool::NDArrayPool;
 use ad_core::plugin::registry::{build_plugin_base_registry, ParamInfo, ParamRegistry};
 use ad_core::plugin::runtime::{NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle, ProcessResult};
+use ad_core::plugin::wiring::WiringRegistry;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::Mutex;
@@ -838,6 +839,7 @@ pub fn create_stats_runtime(
     pool: Arc<NDArrayPool>,
     queue_size: usize,
     ndarray_port: &str,
+    wiring: Arc<WiringRegistry>,
 ) -> (
     PluginRuntimeHandle,
     Arc<Mutex<StatsResult>>,
@@ -862,6 +864,7 @@ pub fn create_stats_runtime(
         pool,
         queue_size,
         ndarray_port,
+        wiring,
     );
 
     // Params were populated by register_params (called during create_plugin_runtime)
@@ -1176,8 +1179,9 @@ mod tests {
     #[test]
     fn test_stats_runtime_end_to_end() {
         let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let wiring = Arc::new(WiringRegistry::new());
         let (handle, stats, _params, _ts_runtime, _ts_params, _jh, _ts_actor_jh, _ts_data_jh) =
-            create_stats_runtime("STATS_RT", pool, 10, "");
+            create_stats_runtime("STATS_RT", pool, 10, "", wiring);
 
         let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],

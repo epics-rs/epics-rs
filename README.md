@@ -406,7 +406,7 @@ cargo run --bin sim_ioc --features sim-detector/ioc
 | `calc-rs` | `epics` | no | EPICS 레코드 통합 (transform, scalcout, sseq) |
 | `ad-core` | `ioc` | no | IOC 지원 (epics-base 포함) |
 | `ad-plugins` | `ioc` | no | 플러그인 IOC 지원 |
-| `ad-plugins` | `hdf5` | no | HDF5 파일 플러그인 |
+| `ad-plugins` | `hdf5` | no | HDF5 파일 플러그인 (시스템 HDF5 라이브러리 필요) |
 | `msi-rs` | `cli` | no | `msi-rs` CLI 바이너리 |
 
 ## Testing
@@ -425,6 +425,14 @@ cargo test --workspace --features calc-rs/epics,asyn-rs/epics
 
 - Rust 1.70+
 - tokio runtime
+
+### Optional System Dependencies
+
+| Feature | 라이브러리 | 설치 방법 |
+|---------|-----------|----------|
+| `ad-plugins/hdf5` | HDF5 C library | `brew install hdf5` (macOS) / `apt install libhdf5-dev` (Debian) |
+
+`hdf5` feature를 제외한 모든 크레이트는 순수 Rust이며 시스템 라이브러리가 필요하지 않습니다.
 
 ## License
 

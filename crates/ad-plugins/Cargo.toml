@@ -18,6 +18,7 @@ jpeg-decoder = "0.3"
 tiff = "0.9"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+netcdf3 = "0.6"
 
 [dependencies.hdf5]
 version = "0.8"

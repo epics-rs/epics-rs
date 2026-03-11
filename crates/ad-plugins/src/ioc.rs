@@ -139,13 +139,16 @@ pub fn register_all_plugins(
         use crate::file_hdf5::Hdf5FileProcessor;
         create_plugin_runtime(port_name, Hdf5FileProcessor::new(), pool, queue_size, ndarray_port)
     });
+    app = register_generic_plugin(&mut app, mgr, "NDFileNetCDFConfigure", |port_name, queue_size, ndarray_port, pool| {
+        use crate::file_netcdf::NetcdfFileProcessor;
+        create_plugin_runtime(port_name, NetcdfFileProcessor::new(), pool, queue_size, ndarray_port)
+    });
 
     // --- Stub plugins (not yet fully implemented, use PassthroughProcessor) ---
     for name in &[
         "NDROIStatConfigure",
         "NDAttrConfigure",
         "NDBadPixelConfigure",
-        "NDFileNetCDFConfigure",
         "NDFileNexusConfigure",
         "NDFileMagickConfigure",
         "NDTimeSeriesConfigure",

@@ -1,6 +1,6 @@
 [package]
 name = "autosave-rs"
-version = "0.2.1"
+version.workspace = true
 edition = "2021"
 description = "EPICS autosave ported to Rust — thin wrapper over epics-base-rs"
 license = "MIT"

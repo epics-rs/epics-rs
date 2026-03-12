@@ -1,6 +1,6 @@
 [package]
 name = "motor-rs"
-version = "0.2.1"
+version.workspace = true
 edition = "2021"
 description = "Rust port of EPICS motor record"
 license = "MIT"

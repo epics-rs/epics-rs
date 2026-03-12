@@ -1,6 +1,6 @@
 [package]
 name = "snc"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "SNL compiler CLI for sequencer-rs"
 

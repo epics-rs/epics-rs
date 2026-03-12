@@ -1,6 +1,6 @@
 [package]
 name = "ad-plugins"
-version = "0.2.1"
+version.workspace = true
 edition = "2021"
 description = "NDPlugin implementations for areaDetector-rs"
 

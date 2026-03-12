@@ -27,6 +27,7 @@ pub struct PluginManager {
     driver: parking_lot::Mutex<Option<Arc<dyn DriverContext>>>,
     plugins: parking_lot::Mutex<Vec<PluginInfo>>,
     plugin_handles: parking_lot::Mutex<Vec<PluginRuntimeHandle>>,
+    port_runtimes: parking_lot::Mutex<Vec<asyn_rs::runtime::port::PortRuntimeHandle>>,
     trace: Arc<TraceManager>,
     wiring: Arc<WiringRegistry>,
 }
@@ -37,6 +38,7 @@ impl PluginManager {
             driver: parking_lot::Mutex::new(None),
             plugins: parking_lot::Mutex::new(Vec::new()),
             plugin_handles: parking_lot::Mutex::new(Vec::new()),
+            port_runtimes: parking_lot::Mutex::new(Vec::new()),
             trace,
             wiring: Arc::new(WiringRegistry::new()),
         })
@@ -102,12 +104,15 @@ impl PluginManager {
 
     /// Register a raw port (not a plugin runtime) for device support dispatch.
     /// Used for auxiliary ports like TimeSeries.
+    ///
+    /// The `PortRuntimeHandle` is stored to keep the actor thread alive.
     pub fn add_port(
         &self,
         dtyp: &str,
-        port_handle: PortHandle,
+        runtime: asyn_rs::runtime::port::PortRuntimeHandle,
         registry: Arc<ParamRegistry>,
     ) {
+        let port_handle = runtime.port_handle().clone();
         let port_name = port_handle.port_name().to_string();
         self.plugins.lock().push(PluginInfo {
             dtyp_name: dtyp.to_string(),
@@ -115,6 +120,7 @@ impl PluginManager {
             registry,
             array_data: None,
         });
+        self.port_runtimes.lock().push(runtime);
         asyn_rs::asyn_record::register_port(&port_name, port_handle, self.trace.clone());
     }
 

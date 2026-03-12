@@ -237,10 +237,22 @@ fn expand_includes_inner(
     let parent_dir = path.parent().unwrap_or(Path::new("."));
     stack.push(path.to_path_buf());
 
+    // Local macro overrides from `substitute` directives.
+    // These override the caller-provided macros for subsequent includes.
+    let mut local_macros = macros.clone();
+
     let mut output = String::with_capacity(content.len());
     for line in content.lines() {
-        if let Some(filename) = parse_include_directive(line) {
-            let expanded_filename = substitute_macros(&filename, macros);
+        if let Some(subst_str) = parse_substitute_directive(line) {
+            // Apply substitute overrides to local macros
+            for pair in subst_str.split(',') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    let expanded_v = substitute_macros(v.trim(), &local_macros);
+                    local_macros.insert(k.trim().to_string(), expanded_v);
+                }
+            }
+        } else if let Some(filename) = parse_include_directive(line) {
+            let expanded_filename = substitute_macros(&filename, &local_macros);
             let include_path =
                 resolve_include_path(&expanded_filename, parent_dir, &config.include_paths)?;
             let canonical = include_path
@@ -250,11 +262,13 @@ fn expand_includes_inner(
                     column: 0,
                     message: format!("cannot resolve '{}': {}", include_path.display(), e),
                 })?;
-            let included = expand_includes_inner(&canonical, macros, config, stack)?;
+            let included = expand_includes_inner(&canonical, &local_macros, config, stack)?;
             output.push_str(&included);
             output.push('\n');
         } else {
-            output.push_str(line);
+            // Apply current macros (including substitute overrides) to content lines
+            let expanded_line = substitute_macros(line, &local_macros);
+            output.push_str(&expanded_line);
             output.push('\n');
         }
     }
@@ -283,6 +297,33 @@ fn parse_include_directive(line: &str) -> Option<String> {
         return None;
     }
     // Extract quoted filename
+    let quote_start = rest.find('"')?;
+    let after_quote = &rest[quote_start + 1..];
+    let quote_end = after_quote.find('"')?;
+    Some(after_quote[..quote_end].to_string())
+}
+
+/// Parse a `substitute` directive line.
+///
+/// EPICS DB files use `substitute "NAME=VALUE"` to override macros for subsequent
+/// `include` directives. Returns the quoted content if the line is a substitute directive.
+fn parse_substitute_directive(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return None;
+    }
+    if !trimmed.starts_with("substitute") {
+        return None;
+    }
+    let rest = &trimmed["substitute".len()..];
+    if rest.is_empty() {
+        return None;
+    }
+    let first = rest.chars().next().unwrap();
+    if !first.is_whitespace() && first != '"' {
+        return None;
+    }
+    // Extract quoted content
     let quote_start = rest.find('"')?;
     let after_quote = &rest[quote_start + 1..];
     let quote_end = after_quote.find('"')?;
@@ -350,11 +391,27 @@ fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> String {
     let mut i = 0;
 
     while i < chars.len() {
-        if i + 1 < chars.len() && chars[i] == '$' && chars[i + 1] == '(' {
-            // Find closing ')'
+        if i + 1 < chars.len() && chars[i] == '$' && (chars[i + 1] == '(' || chars[i + 1] == '{') {
+            let close = if chars[i + 1] == '(' { ')' } else { '}' };
+            // Find matching close bracket, respecting nested $() / ${}
             let start = i + 2;
-            if let Some(end) = chars[start..].iter().position(|&c| c == ')') {
-                let macro_content: String = chars[start..start + end].iter().collect();
+            let mut depth = 1usize;
+            let mut j = start;
+            while j < chars.len() && depth > 0 {
+                if j + 1 < chars.len() && chars[j] == '$' && (chars[j + 1] == '(' || chars[j + 1] == '{') {
+                    depth += 1;
+                    j += 2;
+                    continue;
+                }
+                // Only match the corresponding bracket type at the outermost level
+                if (depth == 1 && chars[j] == close) || (depth > 1 && (chars[j] == ')' || chars[j] == '}')) {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let macro_content: String = chars[start..j].iter().collect();
                 let (name, default) = if let Some(eq_pos) = macro_content.find('=') {
                     (&macro_content[..eq_pos], Some(&macro_content[eq_pos + 1..]))
                 } else {
@@ -364,12 +421,22 @@ fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> String {
                 if let Some(val) = macros.get(name) {
                     result.push_str(val);
                 } else if let Some(def) = default {
-                    result.push_str(def);
+                    // Strip outer quotes from default: $(NAME="value") → value
+                    // Matches C EPICS macLib behavior
+                    let def = if def.starts_with('"') && def.ends_with('"') && def.len() >= 2 {
+                        &def[1..def.len() - 1]
+                    } else {
+                        def
+                    };
+                    // Recursively expand macros within the default value
+                    // e.g. $(TS_PORT=$(PORT)_TS) with PORT=ATTR1 → ATTR1_TS
+                    let expanded = substitute_macros(def, macros);
+                    result.push_str(&expanded);
                 } else {
                     // Leave macro unexpanded
                     result.push_str(&format!("$({macro_content})"));
                 }
-                i = start + end + 1;
+                i = j + 1;
                 continue;
             }
         }
@@ -640,6 +707,95 @@ record(stringin, "TEST") {
 "#;
         let records = parse_db(input, &HashMap::new()).unwrap();
         assert_eq!(records[0].fields[0].1, "hello \"world\"");
+    }
+
+    #[test]
+    fn test_macro_with_quoted_default_in_string() {
+        // C EPICS macLib treats quotes inside $(...) as literal characters.
+        // e.g. $(XPOS="") means "default to empty-string pair".
+        let input = r#"
+record(longout, "$(P)$(R)PositionXLink") {
+    field(DOL, "$(XPOS="") CP MS")
+}
+"#;
+        let mut macros = HashMap::new();
+        macros.insert("P".to_string(), "SIM1:".to_string());
+        macros.insert("R".to_string(), "Over1:1:".to_string());
+        macros.insert("XPOS".to_string(), "SIM1:ROI1:MinX_RBV".to_string());
+        let records = parse_db(input, &macros).unwrap();
+        assert_eq!(records[0].fields[0].1, "SIM1:ROI1:MinX_RBV CP MS");
+    }
+
+    #[test]
+    fn test_macro_with_quoted_default_unset() {
+        // When XPOS is not set, $(XPOS="") should expand to "" (literal quotes)
+        let input = r#"
+record(longout, "TEST:Link") {
+    field(DOL, "$(XPOS="") CP MS")
+}
+"#;
+        let macros = HashMap::new();
+        let records = parse_db(input, &macros).unwrap();
+        // With undefined macro and default="", the field gets the raw default
+        assert!(records[0].fields[0].1.contains("CP MS"));
+    }
+
+    #[test]
+    fn test_recursive_macro_default() {
+        // $(TS_PORT=$(PORT)_TS) with PORT=ATTR1 → ATTR1_TS
+        let input = r#"
+record(stringin, "TEST") {
+    field(VAL, "$(TS_PORT=$(PORT)_TS)")
+}
+"#;
+        let mut macros = HashMap::new();
+        macros.insert("PORT".to_string(), "ATTR1".to_string());
+        let records = parse_db(input, &macros).unwrap();
+        assert_eq!(records[0].fields[0].1, "ATTR1_TS");
+    }
+
+    #[test]
+    fn test_substitute_directive_in_expand() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a simple child template
+        let child = dir.path().join("child.db");
+        let mut f = std::fs::File::create(&child).unwrap();
+        writeln!(f, r#"record(ai, "$(P)$(R)Val") {{"#).unwrap();
+        writeln!(f, r#"    field(VAL, "$(ADDR)")"#).unwrap();
+        writeln!(f, r#"}}"#).unwrap();
+
+        // Create parent with substitute + include
+        let parent = dir.path().join("parent.db");
+        let mut f = std::fs::File::create(&parent).unwrap();
+        writeln!(f, r#"substitute "R=A:,ADDR=0""#).unwrap();
+        writeln!(f, r#"include "child.db""#).unwrap();
+        writeln!(f, r#"substitute "R=B:,ADDR=1""#).unwrap();
+        writeln!(f, r#"include "child.db""#).unwrap();
+
+        let mut macros = HashMap::new();
+        macros.insert("P".to_string(), "IOC:".to_string());
+        let config = DbLoadConfig { include_paths: vec![], max_include_depth: 10 };
+        let records = parse_db_file(&parent, &macros, &config).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].name, "IOC:A:Val");
+        assert_eq!(records[0].fields[0].1, "0");
+        assert_eq!(records[1].name, "IOC:B:Val");
+        assert_eq!(records[1].fields[0].1, "1");
+    }
+
+    #[test]
+    fn test_empty_string_numeric_parse() {
+        // C EPICS treats empty VAL as 0 for numeric record types
+        let input = r#"
+record(longin, "TEST:Int") {
+    field(VAL, "")
+}
+"#;
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        // Should parse without error — empty string → 0
+        assert_eq!(records.len(), 1);
     }
 
     #[test]

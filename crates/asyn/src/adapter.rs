@@ -23,10 +23,12 @@ pub struct AsynLink {
 
 /// Parse an asyn link string.
 ///
-/// Accepted formats:
+/// Accepted formats (comma or space delimited, matching C EPICS):
 /// - `@asyn(portName) drvInfo`
 /// - `@asyn(portName, addr) drvInfo`
 /// - `@asyn(portName, addr, timeout) drvInfo`
+/// - `@asyn(portName addr) drvInfo`
+/// - `@asyn(portName addr timeout) drvInfo`
 pub fn parse_asyn_link(s: &str) -> Result<AsynLink, AsynError> {
     let s = s.trim();
     let rest = s
@@ -40,7 +42,13 @@ pub fn parse_asyn_link(s: &str) -> Result<AsynLink, AsynError> {
     let args_str = &rest[..paren_end];
     let drv_info = rest[paren_end + 1..].trim().to_string();
 
-    let parts: Vec<&str> = args_str.split(',').map(|p| p.trim()).collect();
+    // C EPICS pasynEpicsUtils->parseLink accepts both comma and space as delimiters.
+    // Split by comma first; if only one part, try splitting by whitespace.
+    let parts: Vec<&str> = if args_str.contains(',') {
+        args_str.split(',').map(|p| p.trim()).collect()
+    } else {
+        args_str.split_whitespace().collect()
+    };
     if parts.is_empty() || parts[0].is_empty() {
         return Err(AsynError::InvalidLinkSyntax(
             "portName is required".into(),
@@ -497,6 +505,24 @@ mod tests {
     #[test]
     fn test_parse_invalid_timeout() {
         assert!(parse_asyn_link("@asyn(port, 0, xyz) X").is_err());
+    }
+
+    #[test]
+    fn test_parse_space_separated() {
+        // NDCircularBuff.template uses space-separated format: @asyn(PORT 0)DRVINFO
+        let link = parse_asyn_link("@asyn(CB1 0)CIRC_BUFF_CONTROL").unwrap();
+        assert_eq!(link.port_name, "CB1");
+        assert_eq!(link.addr, 0);
+        assert_eq!(link.drv_info, "CIRC_BUFF_CONTROL");
+    }
+
+    #[test]
+    fn test_parse_space_separated_with_timeout() {
+        let link = parse_asyn_link("@asyn(PORT1 2 1.5) PARAM").unwrap();
+        assert_eq!(link.port_name, "PORT1");
+        assert_eq!(link.addr, 2);
+        assert_eq!(link.timeout, Duration::from_secs_f64(1.5));
+        assert_eq!(link.drv_info, "PARAM");
     }
 
     // --- asynMask link tests ---

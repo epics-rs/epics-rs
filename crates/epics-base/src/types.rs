@@ -840,6 +840,19 @@ impl EpicsValue {
 
     /// Parse a string value into an EpicsValue of the given type
     pub fn parse(dbr_type: DbFieldType, s: &str) -> CaResult<Self> {
+        // C EPICS treats empty/whitespace strings as zero for numeric fields
+        let s = s.trim();
+        if s.is_empty() {
+            return match dbr_type {
+                DbFieldType::String => Ok(Self::String(String::new())),
+                DbFieldType::Short => Ok(Self::Short(0)),
+                DbFieldType::Float => Ok(Self::Float(0.0)),
+                DbFieldType::Enum => Ok(Self::Enum(0)),
+                DbFieldType::Char => Ok(Self::Char(0)),
+                DbFieldType::Long => Ok(Self::Long(0)),
+                DbFieldType::Double => Ok(Self::Double(0.0)),
+            };
+        }
         match dbr_type {
             DbFieldType::String => Ok(Self::String(s.to_string())),
             DbFieldType::Short => s

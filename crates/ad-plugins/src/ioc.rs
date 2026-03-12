@@ -74,8 +74,7 @@ pub fn register_all_plugins(
                 let ts_port_name = format!("{port_name}_TS");
                 let ts_dtyp = dtyp_from_port(&ts_port_name);
                 let ts_registry = Arc::new(crate::time_series::build_ts_registry(&ts_params));
-                let ts_port_handle = ts_runtime.port_handle().clone();
-                m.add_port(&ts_dtyp, ts_port_handle, ts_registry);
+                m.add_port(&ts_dtyp, ts_runtime, ts_registry);
                 println!("  TimeSeries port: {ts_port_name} (DTYP: {ts_dtyp})");
 
                 Ok(CommandOutcome::Continue)
@@ -202,8 +201,7 @@ pub fn register_all_plugins(
                         ts_rx,
                     );
                 let ts_registry = Arc::new(crate::time_series::build_ts_registry(&ts_params));
-                let ts_port_handle = ts_runtime.port_handle().clone();
-                m.add_port(&ts_dtyp, ts_port_handle, ts_registry);
+                m.add_port(&ts_dtyp, ts_runtime, ts_registry);
                 println!("  TimeSeries port: {ts_port_name} (DTYP: {ts_dtyp})");
 
                 Ok(CommandOutcome::Continue)

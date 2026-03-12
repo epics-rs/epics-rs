@@ -19,12 +19,14 @@ tiff = "0.9"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 netcdf3 = "0.6"
+rayon = { version = "1", optional = true }
 
 [dependencies.hdf5]
 version = "0.8"
 optional = true
 
 [features]
-default = []
+default = ["parallel"]
 hdf5 = ["dep:hdf5"]
 ioc = ["ad-core/ioc"]
+parallel = ["rayon"]

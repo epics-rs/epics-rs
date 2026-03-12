@@ -1,3 +1,4 @@
+pub mod par_util;
 pub mod std_arrays;
 pub mod stats;
 pub mod roi;

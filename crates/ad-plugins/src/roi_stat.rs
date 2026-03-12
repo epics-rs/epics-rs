@@ -17,6 +17,10 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::Mutex;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+#[cfg(feature = "parallel")]
+use crate::par_util;
 use crate::time_series::{TimeSeriesData, TimeSeriesSender};
 
 /// Configuration for a single ROI region.
@@ -301,6 +305,40 @@ impl NDPluginProcess for ROIStatProcessor {
         // Ensure results vec matches rois
         self.results.resize(self.rois.len(), ROIStatResult::default());
 
+        #[cfg(feature = "parallel")]
+        {
+            let total_elements: usize = self.rois.iter()
+                .filter(|r| r.enabled)
+                .map(|r| r.size[0] * r.size[1])
+                .sum();
+
+            if par_util::should_parallelize(total_elements) {
+                let data = &array.data;
+                let rois = &self.rois;
+                let new_results: Vec<ROIStatResult> = par_util::thread_pool().install(|| {
+                    rois.par_iter()
+                        .map(|roi| {
+                            if roi.enabled {
+                                Self::compute_roi_stats(data, x_size, y_size, roi)
+                            } else {
+                                ROIStatResult::default()
+                            }
+                        })
+                        .collect()
+                });
+                self.results = new_results;
+            } else {
+                for (i, roi) in self.rois.iter().enumerate() {
+                    if !roi.enabled {
+                        self.results[i] = ROIStatResult::default();
+                        continue;
+                    }
+                    self.results[i] = Self::compute_roi_stats(&array.data, x_size, y_size, roi);
+                }
+            }
+        }
+
+        #[cfg(not(feature = "parallel"))]
         for (i, roi) in self.rois.iter().enumerate() {
             if !roi.enabled {
                 self.results[i] = ROIStatResult::default();

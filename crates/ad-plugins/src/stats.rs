@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+#[cfg(feature = "parallel")]
+use crate::par_util;
+
 use ad_core::ndarray::{NDArray, NDDataBuffer};
 use ad_core::ndarray_pool::NDArrayPool;
 use ad_core::plugin::registry::{build_plugin_base_registry, ParamInfo, ParamRegistry};
@@ -125,23 +130,87 @@ pub fn compute_stats(
             if v.is_empty() {
                 return StatsResult::default();
             }
-            let mut min = v[0] as f64;
-            let mut max = v[0] as f64;
-            let mut min_idx: usize = 0;
-            let mut max_idx: usize = 0;
-            let mut total = 0.0f64;
-            for (i, &elem) in v.iter().enumerate() {
-                let f = elem as f64;
-                if f < min { min = f; min_idx = i; }
-                if f > max { max = f; max_idx = i; }
-                total += f;
+
+            let (min, max, min_idx, max_idx, total, variance);
+
+            #[cfg(feature = "parallel")]
+            {
+                if par_util::should_parallelize(v.len()) {
+                    // Parallel: fold+reduce for min/max/total
+                    let (pmin, pmax, pmin_idx, pmax_idx, ptotal) = par_util::thread_pool().install(|| {
+                        v.par_iter().enumerate()
+                            .fold(
+                                || (f64::MAX, f64::MIN, 0usize, 0usize, 0.0f64),
+                                |(mn, mx, mn_i, mx_i, s), (i, &elem)| {
+                                    let f = elem as f64;
+                                    let (new_mn, new_mn_i) = if f < mn { (f, i) } else { (mn, mn_i) };
+                                    let (new_mx, new_mx_i) = if f > mx { (f, i) } else { (mx, mx_i) };
+                                    (new_mn, new_mx, new_mn_i, new_mx_i, s + f)
+                                },
+                            )
+                            .reduce(
+                                || (f64::MAX, f64::MIN, 0, 0, 0.0),
+                                |(mn1, mx1, mn_i1, mx_i1, s1), (mn2, mx2, mn_i2, mx_i2, s2)| {
+                                    let (rmn, rmn_i) = if mn1 <= mn2 { (mn1, mn_i1) } else { (mn2, mn_i2) };
+                                    let (rmx, rmx_i) = if mx1 >= mx2 { (mx1, mx_i1) } else { (mx2, mx_i2) };
+                                    (rmn, rmx, rmn_i, rmx_i, s1 + s2)
+                                },
+                            )
+                    });
+                    min = pmin; max = pmax; min_idx = pmin_idx; max_idx = pmax_idx; total = ptotal;
+                    let mean_tmp = total / v.len() as f64;
+                    variance = par_util::thread_pool().install(|| {
+                        v.par_iter()
+                            .map(|&elem| { let d = elem as f64 - mean_tmp; d * d })
+                            .sum::<f64>()
+                    });
+                } else {
+                    let mut lmin = v[0] as f64;
+                    let mut lmax = v[0] as f64;
+                    let mut lmin_idx: usize = 0;
+                    let mut lmax_idx: usize = 0;
+                    let mut ltotal = 0.0f64;
+                    for (i, &elem) in v.iter().enumerate() {
+                        let f = elem as f64;
+                        if f < lmin { lmin = f; lmin_idx = i; }
+                        if f > lmax { lmax = f; lmax_idx = i; }
+                        ltotal += f;
+                    }
+                    min = lmin; max = lmax; min_idx = lmin_idx; max_idx = lmax_idx; total = ltotal;
+                    let mean_tmp = total / v.len() as f64;
+                    let mut lvar = 0.0f64;
+                    for &elem in v.iter() {
+                        let d = elem as f64 - mean_tmp;
+                        lvar += d * d;
+                    }
+                    variance = lvar;
+                }
             }
+
+            #[cfg(not(feature = "parallel"))]
+            {
+                let mut lmin = v[0] as f64;
+                let mut lmax = v[0] as f64;
+                let mut lmin_idx: usize = 0;
+                let mut lmax_idx: usize = 0;
+                let mut ltotal = 0.0f64;
+                for (i, &elem) in v.iter().enumerate() {
+                    let f = elem as f64;
+                    if f < lmin { lmin = f; lmin_idx = i; }
+                    if f > lmax { lmax = f; lmax_idx = i; }
+                    ltotal += f;
+                }
+                min = lmin; max = lmax; min_idx = lmin_idx; max_idx = lmax_idx; total = ltotal;
+                let mean_tmp = total / v.len() as f64;
+                let mut lvar = 0.0f64;
+                for &elem in v.iter() {
+                    let d = elem as f64 - mean_tmp;
+                    lvar += d * d;
+                }
+                variance = lvar;
+            }
+
             let mean = total / v.len() as f64;
-            let mut variance = 0.0f64;
-            for &elem in v.iter() {
-                let diff = elem as f64 - mean;
-                variance += diff * diff;
-            }
             let sigma = (variance / v.len() as f64).sqrt();
             let x_size = dims.first().map_or(v.len(), |d| d.size);
 
@@ -216,21 +285,66 @@ pub fn compute_centroid(
         return CentroidResult::default();
     }
 
-    // Pass 1: compute M00 (total), M10, M01 for centroid
-    let mut m00 = 0.0f64;
-    let mut m10 = 0.0f64;
-    let mut m01 = 0.0f64;
+    // Collect values into a flat f64 vec for potential parallel access
+    let vals: Vec<f64> = (0..n).map(|i| data.get_as_f64(i).unwrap_or(0.0)).collect();
 
-    for iy in 0..y_size {
-        for ix in 0..x_size {
-            let val = data.get_as_f64(iy * x_size + ix).unwrap_or(0.0);
-            if val < threshold {
-                continue;
+    // Pass 1: compute M00 (total), M10, M01 for centroid
+    let (m00, m10, m01);
+
+    #[cfg(feature = "parallel")]
+    {
+        if par_util::should_parallelize(n) {
+            let xs = x_size;
+            let thr = threshold;
+            let (pm00, pm10, pm01) = par_util::thread_pool().install(|| {
+                vals.par_iter().enumerate()
+                    .fold(
+                        || (0.0f64, 0.0f64, 0.0f64),
+                        |(s00, s10, s01), (i, &val)| {
+                            if val < thr { return (s00, s10, s01); }
+                            let ix = i % xs;
+                            let iy = i / xs;
+                            (s00 + val, s10 + val * ix as f64, s01 + val * iy as f64)
+                        },
+                    )
+                    .reduce(
+                        || (0.0, 0.0, 0.0),
+                        |(a0, a1, a2), (b0, b1, b2)| (a0 + b0, a1 + b1, a2 + b2),
+                    )
+            });
+            m00 = pm00; m10 = pm10; m01 = pm01;
+        } else {
+            let mut lm00 = 0.0f64;
+            let mut lm10 = 0.0f64;
+            let mut lm01 = 0.0f64;
+            for iy in 0..y_size {
+                for ix in 0..x_size {
+                    let val = vals[iy * x_size + ix];
+                    if val < threshold { continue; }
+                    lm00 += val;
+                    lm10 += val * ix as f64;
+                    lm01 += val * iy as f64;
+                }
             }
-            m00 += val;
-            m10 += val * ix as f64;
-            m01 += val * iy as f64;
+            m00 = lm00; m10 = lm10; m01 = lm01;
         }
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut lm00 = 0.0f64;
+        let mut lm10 = 0.0f64;
+        let mut lm01 = 0.0f64;
+        for iy in 0..y_size {
+            for ix in 0..x_size {
+                let val = vals[iy * x_size + ix];
+                if val < threshold { continue; }
+                lm00 += val;
+                lm10 += val * ix as f64;
+                lm01 += val * iy as f64;
+            }
+        }
+        m00 = lm00; m10 = lm10; m01 = lm01;
     }
 
     if m00 == 0.0 {
@@ -241,33 +355,80 @@ pub fn compute_centroid(
     let cy = m01 / m00;
 
     // Pass 2: compute central moments up to 4th order
-    let mut mu20 = 0.0f64;
-    let mut mu02 = 0.0f64;
-    let mut mu11 = 0.0f64;
-    let mut m30_central = 0.0f64;
-    let mut m03_central = 0.0f64;
-    let mut m40_central = 0.0f64;
-    let mut m04_central = 0.0f64;
+    let (mu20, mu02, mu11, m30_central, m03_central, m40_central, m04_central);
 
-    for iy in 0..y_size {
-        for ix in 0..x_size {
-            let val = data.get_as_f64(iy * x_size + ix).unwrap_or(0.0);
-            if val < threshold {
-                continue;
+    #[cfg(feature = "parallel")]
+    {
+        if par_util::should_parallelize(n) {
+            let xs = x_size;
+            let thr = threshold;
+            let (p20, p02, p11, p30, p03, p40, p04) = par_util::thread_pool().install(|| {
+                vals.par_iter().enumerate()
+                    .fold(
+                        || (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64),
+                        |(s20, s02, s11, s30, s03, s40, s04), (i, &val)| {
+                            if val < thr { return (s20, s02, s11, s30, s03, s40, s04); }
+                            let ix = i % xs;
+                            let iy = i / xs;
+                            let dx = ix as f64 - cx;
+                            let dy = iy as f64 - cy;
+                            let dx2 = dx * dx;
+                            let dy2 = dy * dy;
+                            (
+                                s20 + val * dx2,
+                                s02 + val * dy2,
+                                s11 + val * dx * dy,
+                                s30 + val * dx2 * dx,
+                                s03 + val * dy2 * dy,
+                                s40 + val * dx2 * dx2,
+                                s04 + val * dy2 * dy2,
+                            )
+                        },
+                    )
+                    .reduce(
+                        || (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                        |(a0,a1,a2,a3,a4,a5,a6),(b0,b1,b2,b3,b4,b5,b6)|
+                            (a0+b0,a1+b1,a2+b2,a3+b3,a4+b4,a5+b5,a6+b6),
+                    )
+            });
+            mu20 = p20; mu02 = p02; mu11 = p11;
+            m30_central = p30; m03_central = p03; m40_central = p40; m04_central = p04;
+        } else {
+            let mut l20 = 0.0f64; let mut l02 = 0.0f64; let mut l11 = 0.0f64;
+            let mut l30 = 0.0f64; let mut l03 = 0.0f64; let mut l40 = 0.0f64; let mut l04 = 0.0f64;
+            for iy in 0..y_size {
+                for ix in 0..x_size {
+                    let val = vals[iy * x_size + ix];
+                    if val < threshold { continue; }
+                    let dx = ix as f64 - cx; let dy = iy as f64 - cy;
+                    let dx2 = dx * dx; let dy2 = dy * dy;
+                    l20 += val * dx2; l02 += val * dy2; l11 += val * dx * dy;
+                    l30 += val * dx2 * dx; l03 += val * dy2 * dy;
+                    l40 += val * dx2 * dx2; l04 += val * dy2 * dy2;
+                }
             }
-            let dx = ix as f64 - cx;
-            let dy = iy as f64 - cy;
-            let dx2 = dx * dx;
-            let dy2 = dy * dy;
-
-            mu20 += val * dx2;
-            mu02 += val * dy2;
-            mu11 += val * dx * dy;
-            m30_central += val * dx2 * dx;
-            m03_central += val * dy2 * dy;
-            m40_central += val * dx2 * dx2;
-            m04_central += val * dy2 * dy2;
+            mu20 = l20; mu02 = l02; mu11 = l11;
+            m30_central = l30; m03_central = l03; m40_central = l40; m04_central = l04;
         }
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut l20 = 0.0f64; let mut l02 = 0.0f64; let mut l11 = 0.0f64;
+        let mut l30 = 0.0f64; let mut l03 = 0.0f64; let mut l40 = 0.0f64; let mut l04 = 0.0f64;
+        for iy in 0..y_size {
+            for ix in 0..x_size {
+                let val = vals[iy * x_size + ix];
+                if val < threshold { continue; }
+                let dx = ix as f64 - cx; let dy = iy as f64 - cy;
+                let dx2 = dx * dx; let dy2 = dy * dy;
+                l20 += val * dx2; l02 += val * dy2; l11 += val * dx * dy;
+                l30 += val * dx2 * dx; l03 += val * dy2 * dy;
+                l40 += val * dx2 * dx2; l04 += val * dy2 * dy2;
+            }
+        }
+        mu20 = l20; mu02 = l02; mu11 = l11;
+        m30_central = l30; m03_central = l03; m40_central = l40; m04_central = l04;
     }
 
     let sigma_x = (mu20 / m00).sqrt();
@@ -353,16 +514,61 @@ pub fn compute_histogram(
     let range = hist_max - hist_min;
     let n = data.len();
 
-    for i in 0..n {
-        let val = data.get_as_f64(i).unwrap_or(0.0);
-        if val < hist_min {
-            below += 1.0;
-        } else if val > hist_max {
-            above += 1.0;
-        } else {
-            let bin = ((val - hist_min) * (hist_size - 1) as f64 / range + 0.5) as usize;
-            let bin = bin.min(hist_size - 1);
-            histogram[bin] += 1.0;
+    #[cfg(feature = "parallel")]
+    let use_parallel = par_util::should_parallelize(n);
+    #[cfg(not(feature = "parallel"))]
+    let use_parallel = false;
+
+    if use_parallel {
+        #[cfg(feature = "parallel")]
+        {
+            let vals: Vec<f64> = (0..n).map(|i| data.get_as_f64(i).unwrap_or(0.0)).collect();
+            let chunk_size = (n / rayon::current_num_threads().max(1)).max(1024);
+            let hs = hist_size;
+            let hmin = hist_min;
+            let hmax = hist_max;
+            let rng = range;
+            let chunk_results: Vec<(Vec<f64>, f64, f64)> = par_util::thread_pool().install(|| {
+                vals.par_chunks(chunk_size)
+                    .map(|chunk| {
+                        let mut local_hist = vec![0.0f64; hs];
+                        let mut local_below = 0.0f64;
+                        let mut local_above = 0.0f64;
+                        for &val in chunk {
+                            if val < hmin {
+                                local_below += 1.0;
+                            } else if val > hmax {
+                                local_above += 1.0;
+                            } else {
+                                let bin = ((val - hmin) * (hs - 1) as f64 / rng + 0.5) as usize;
+                                let bin = bin.min(hs - 1);
+                                local_hist[bin] += 1.0;
+                            }
+                        }
+                        (local_hist, local_below, local_above)
+                    })
+                    .collect()
+            });
+            for (local_hist, local_below, local_above) in chunk_results {
+                below += local_below;
+                above += local_above;
+                for (i, &count) in local_hist.iter().enumerate() {
+                    histogram[i] += count;
+                }
+            }
+        }
+    } else {
+        for i in 0..n {
+            let val = data.get_as_f64(i).unwrap_or(0.0);
+            if val < hist_min {
+                below += 1.0;
+            } else if val > hist_max {
+                above += 1.0;
+            } else {
+                let bin = ((val - hist_min) * (hist_size - 1) as f64 / range + 0.5) as usize;
+                let bin = bin.min(hist_size - 1);
+                histogram[bin] += 1.0;
+            }
         }
     }
 

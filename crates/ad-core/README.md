@@ -45,6 +45,10 @@ No C dependencies. Just `cargo build`.
 | file_jpeg | JPEG file writing |
 | file_hdf5 | HDF5 file writing |
 
+### Parallel Processing
+
+The `parallel` feature (enabled by default in ad-plugins) uses rayon to parallelize CPU-heavy plugins (Stats, ROIStat, ColorConvert, Process). A shared thread pool sized to `available_cores - 2` prevents over-subscription with port driver threads. See the [ad-plugins README](../ad-plugins/README.md#parallel-processing) for details.
+
 ### sim-detector
 
 - 4 simulation modes: LinearRamp, Peaks, Sine, OffsetNoise

@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+#[cfg(feature = "parallel")]
+use crate::par_util;
+
 use ad_core::color::{self, NDColorMode, NDBayerPattern};
 use ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core::ndarray_pool::NDArrayPool;
@@ -13,12 +18,11 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
     let w = src.dims[0].size;
     let h = src.dims[1].size;
 
-    let get_val = |x: usize, y: usize| -> f64 {
-        let idx = y * w + x;
-        src.data.get_as_f64(idx).unwrap_or(0.0)
-    };
-
+    // Pre-compute source values into a flat f64 vec for efficient random access
     let n = w * h;
+    let src_vals: Vec<f64> = (0..n).map(|i| src.data.get_as_f64(i).unwrap_or(0.0)).collect();
+    let get_val = |x: usize, y: usize| -> f64 { src_vals[y * w + x] };
+
     let mut r = vec![0.0f64; n];
     let mut g = vec![0.0f64; n];
     let mut b = vec![0.0f64; n];
@@ -31,82 +35,103 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
         NDBayerPattern::BGGR => (false, false),
     };
 
-    for y in 0..h {
+    // Helper to demosaic a single row into (r, g, b) slices
+    let demosaic_row = |y: usize, r_row: &mut [f64], g_row: &mut [f64], b_row: &mut [f64]| {
+        let even_row = (y % 2 == 0) == r_row_even;
         for x in 0..w {
-            let idx = y * w + x;
             let val = get_val(x, y);
-            let even_row = (y % 2 == 0) == r_row_even;
             let even_col = (x % 2 == 0) == r_col_even;
 
             match (even_row, even_col) {
                 (true, true) => {
-                    // Red pixel
-                    r[idx] = val;
-                    // Interpolate G from neighbors
-                    let mut gsum = 0.0;
-                    let mut gc = 0;
+                    r_row[x] = val;
+                    let mut gsum = 0.0; let mut gc = 0;
                     if x > 0 { gsum += get_val(x - 1, y); gc += 1; }
                     if x < w - 1 { gsum += get_val(x + 1, y); gc += 1; }
                     if y > 0 { gsum += get_val(x, y - 1); gc += 1; }
                     if y < h - 1 { gsum += get_val(x, y + 1); gc += 1; }
-                    g[idx] = if gc > 0 { gsum / gc as f64 } else { 0.0 };
-                    // Interpolate B from diagonal neighbors
-                    let mut bsum = 0.0;
-                    let mut bc = 0;
+                    g_row[x] = if gc > 0 { gsum / gc as f64 } else { 0.0 };
+                    let mut bsum = 0.0; let mut bc = 0;
                     if x > 0 && y > 0 { bsum += get_val(x - 1, y - 1); bc += 1; }
                     if x < w - 1 && y > 0 { bsum += get_val(x + 1, y - 1); bc += 1; }
                     if x > 0 && y < h - 1 { bsum += get_val(x - 1, y + 1); bc += 1; }
                     if x < w - 1 && y < h - 1 { bsum += get_val(x + 1, y + 1); bc += 1; }
-                    b[idx] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
+                    b_row[x] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
                 }
                 (true, false) | (false, true) => {
-                    // Green pixel
-                    g[idx] = val;
+                    g_row[x] = val;
                     if even_row {
-                        // Green in red row
-                        let mut rsum = 0.0;
-                        let mut rc = 0;
+                        let mut rsum = 0.0; let mut rc = 0;
                         if x > 0 { rsum += get_val(x - 1, y); rc += 1; }
                         if x < w - 1 { rsum += get_val(x + 1, y); rc += 1; }
-                        r[idx] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
-                        let mut bsum = 0.0;
-                        let mut bc = 0;
+                        r_row[x] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
+                        let mut bsum = 0.0; let mut bc = 0;
                         if y > 0 { bsum += get_val(x, y - 1); bc += 1; }
                         if y < h - 1 { bsum += get_val(x, y + 1); bc += 1; }
-                        b[idx] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
+                        b_row[x] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
                     } else {
-                        // Green in blue row
-                        let mut bsum = 0.0;
-                        let mut bc = 0;
+                        let mut bsum = 0.0; let mut bc = 0;
                         if x > 0 { bsum += get_val(x - 1, y); bc += 1; }
                         if x < w - 1 { bsum += get_val(x + 1, y); bc += 1; }
-                        b[idx] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
-                        let mut rsum = 0.0;
-                        let mut rc = 0;
+                        b_row[x] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
+                        let mut rsum = 0.0; let mut rc = 0;
                         if y > 0 { rsum += get_val(x, y - 1); rc += 1; }
                         if y < h - 1 { rsum += get_val(x, y + 1); rc += 1; }
-                        r[idx] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
+                        r_row[x] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
                     }
                 }
                 (false, false) => {
-                    // Blue pixel
-                    b[idx] = val;
-                    let mut gsum = 0.0;
-                    let mut gc = 0;
+                    b_row[x] = val;
+                    let mut gsum = 0.0; let mut gc = 0;
                     if x > 0 { gsum += get_val(x - 1, y); gc += 1; }
                     if x < w - 1 { gsum += get_val(x + 1, y); gc += 1; }
                     if y > 0 { gsum += get_val(x, y - 1); gc += 1; }
                     if y < h - 1 { gsum += get_val(x, y + 1); gc += 1; }
-                    g[idx] = if gc > 0 { gsum / gc as f64 } else { 0.0 };
-                    let mut rsum = 0.0;
-                    let mut rc = 0;
+                    g_row[x] = if gc > 0 { gsum / gc as f64 } else { 0.0 };
+                    let mut rsum = 0.0; let mut rc = 0;
                     if x > 0 && y > 0 { rsum += get_val(x - 1, y - 1); rc += 1; }
                     if x < w - 1 && y > 0 { rsum += get_val(x + 1, y - 1); rc += 1; }
                     if x > 0 && y < h - 1 { rsum += get_val(x - 1, y + 1); rc += 1; }
                     if x < w - 1 && y < h - 1 { rsum += get_val(x + 1, y + 1); rc += 1; }
-                    r[idx] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
+                    r_row[x] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
                 }
             }
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    let use_parallel = par_util::should_parallelize(n);
+    #[cfg(not(feature = "parallel"))]
+    let use_parallel = false;
+
+    if use_parallel {
+        #[cfg(feature = "parallel")]
+        {
+            // Split r, g, b into per-row mutable slices and process in parallel
+            let r_rows: Vec<&mut [f64]> = r.chunks_mut(w).collect();
+            let g_rows: Vec<&mut [f64]> = g.chunks_mut(w).collect();
+            let b_rows: Vec<&mut [f64]> = b.chunks_mut(w).collect();
+
+            par_util::thread_pool().install(|| {
+                r_rows.into_par_iter()
+                    .zip(g_rows.into_par_iter())
+                    .zip(b_rows.into_par_iter())
+                    .enumerate()
+                    .for_each(|(y, ((r_row, g_row), b_row))| {
+                        demosaic_row(y, r_row, g_row, b_row);
+                    });
+            });
+        }
+    } else {
+        for y in 0..h {
+            let row_start = y * w;
+            let row_end = row_start + w;
+            demosaic_row(
+                y,
+                &mut r[row_start..row_end],
+                &mut g[row_start..row_end],
+                &mut b[row_start..row_end],
+            );
         }
     }
 

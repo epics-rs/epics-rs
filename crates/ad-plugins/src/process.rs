@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+#[cfg(feature = "parallel")]
+use crate::par_util;
+
 use ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core::ndarray_pool::NDArrayPool;
 use ad_core::plugin::runtime::{NDPluginProcess, ProcessResult};
@@ -185,46 +190,75 @@ impl ProcessState {
             self.config.save_flat_field = false;
         }
 
-        // 1. Background subtraction
-        if self.config.enable_background {
-            if let Some(ref bg) = self.background {
-                for i in 0..n.min(bg.len()) {
-                    values[i] -= bg[i];
-                }
-            }
-        }
+        // Stages 1-4: element-wise operations (background, flat field, offset+scale, clipping)
+        // These can be combined into a single pass and parallelized.
+        let needs_element_ops = self.config.enable_background
+            || self.config.enable_flat_field
+            || self.config.enable_offset_scale
+            || self.config.enable_low_clip
+            || self.config.enable_high_clip;
 
-        // 2. Flat field normalization
-        if self.config.enable_flat_field {
-            if let Some(ref ff) = self.flat_field {
-                let ff_mean: f64 = ff.iter().sum::<f64>() / ff.len().max(1) as f64;
-                for i in 0..n.min(ff.len()) {
-                    if ff[i] != 0.0 {
-                        values[i] = values[i] * ff_mean / ff[i];
+        if needs_element_ops {
+            let bg = if self.config.enable_background { self.background.as_ref() } else { None };
+            let (ff, ff_mean) = if self.config.enable_flat_field {
+                if let Some(ref ff) = self.flat_field {
+                    let mean = ff.iter().sum::<f64>() / ff.len().max(1) as f64;
+                    (Some(ff.as_slice()), mean)
+                } else {
+                    (None, 0.0)
+                }
+            } else {
+                (None, 0.0)
+            };
+            let do_offset_scale = self.config.enable_offset_scale;
+            let scale = self.config.scale;
+            let offset = self.config.offset;
+            let do_low_clip = self.config.enable_low_clip;
+            let low_clip = self.config.low_clip;
+            let do_high_clip = self.config.enable_high_clip;
+            let high_clip = self.config.high_clip;
+
+            let apply_stages = |i: usize, v: &mut f64| {
+                // Stage 1: Background subtraction
+                if let Some(bg) = bg {
+                    if i < bg.len() {
+                        *v -= bg[i];
                     }
                 }
-            }
-        }
-
-        // 3. Offset + scale
-        if self.config.enable_offset_scale {
-            for v in values.iter_mut() {
-                *v = *v * self.config.scale + self.config.offset;
-            }
-        }
-
-        // 4. Clipping
-        if self.config.enable_low_clip {
-            for v in values.iter_mut() {
-                if *v < self.config.low_clip {
-                    *v = self.config.low_clip;
+                // Stage 2: Flat field normalization
+                if let Some(ff) = ff {
+                    if i < ff.len() && ff[i] != 0.0 {
+                        *v = *v * ff_mean / ff[i];
+                    }
                 }
-            }
-        }
-        if self.config.enable_high_clip {
-            for v in values.iter_mut() {
-                if *v > self.config.high_clip {
-                    *v = self.config.high_clip;
+                // Stage 3: Offset + scale
+                if do_offset_scale {
+                    *v = *v * scale + offset;
+                }
+                // Stage 4: Clipping
+                if do_low_clip && *v < low_clip {
+                    *v = low_clip;
+                }
+                if do_high_clip && *v > high_clip {
+                    *v = high_clip;
+                }
+            };
+
+            #[cfg(feature = "parallel")]
+            let use_parallel = par_util::should_parallelize(n);
+            #[cfg(not(feature = "parallel"))]
+            let use_parallel = false;
+
+            if use_parallel {
+                #[cfg(feature = "parallel")]
+                par_util::thread_pool().install(|| {
+                    values.par_iter_mut().enumerate().for_each(|(i, v)| {
+                        apply_stages(i, v);
+                    });
+                });
+            } else {
+                for (i, v) in values.iter_mut().enumerate() {
+                    apply_stages(i, v);
                 }
             }
         }

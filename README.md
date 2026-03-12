@@ -12,6 +12,8 @@ EPICS is the proven standard for large-scale control systems at accelerator faci
 
 As a controls engineer working across many device types, I needed an environment where **every device could be simulated in software** — motors, detectors, beam diagnostics — all running together on a single laptop without any real hardware. EPICS already supports this through simulation drivers, but the path to get there involves building EPICS Base, then each support module in dependency order, configuring `RELEASE` paths between them, writing `.dbd` registrations, and wiring `Makefile` rules. For experienced EPICS developers this is routine work, but it adds up when the goal is simply to prototype a new driver or test a control sequence.
 
+To give a concrete example: the sim-detector IOC in this project boots with **7,387 records** (5,273 with device support, 1,543 I/O Intr scanned). Reaching that scale in C EPICS means building and linking EPICS Base, asyn, areaDetector core, and every plugin (Stats, ROI, FFT, file writers, overlay, etc.) — each with its own `configure/RELEASE`, `Makefile`, and `.dbd` wiring. In epics-rs, the same full-featured areaDetector plugin environment is a single `cargo build`.
+
 epics-rs takes a different approach to this setup problem by leveraging Rust's Cargo package system. All support modules live in a single workspace, dependencies are declared in `Cargo.toml`, and the entire stack — from Channel Access protocol to areaDetector plugins — builds with one command:
 
 ```bash
@@ -328,6 +330,7 @@ areaDetector framework:
 - **NDArrayPool** — free-list buffer reuse
 - **ADDriverBase** — detector driver base (Single/Multiple/Continuous modes)
 - **23 plugins** — Stats, ROI, ROIStat, Process, Transform, ColorConvert, Overlay, FFT, TimeSeries, CircularBuff, Codec, Gather, Scatter, StdArrays, FileTIFF, FileJPEG, FileHDF5, Attribute, AttrPlot, BadPixel, PosPlugin, Passthrough
+- **Parallel processing** — rayon data-parallelism for CPU-heavy plugins (Stats, ROIStat, ColorConvert, Process). Shared thread pool sized to `available_cores - 2` to leave headroom for driver threads and tokio runtime. Enabled by default; see [ad-plugins README](crates/ad-plugins/README.md#parallel-processing)
 
 ### calc-rs
 
@@ -612,6 +615,7 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 | `calc-rs` | `math` | no | Advanced math functions (diff, fitting, interpolation) |
 | `calc-rs` | `epics` | no | EPICS record integration (transform, scalcout, sseq) |
 | `ad-core` | `ioc` | no | IOC support (includes epics-base) |
+| `ad-plugins` | `parallel` | yes | Rayon data-parallelism for CPU-heavy plugins |
 | `ad-plugins` | `ioc` | no | Plugin IOC support |
 | `ad-plugins` | `hdf5` | no | HDF5 file plugin (requires system HDF5 library) |
 | `msi-rs` | `cli` | no | `msi-rs` CLI binary |

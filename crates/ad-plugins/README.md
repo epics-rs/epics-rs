@@ -72,9 +72,41 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 
 ```toml
 [features]
-default = []
+default = ["parallel"]
+parallel = ["rayon"]    # Rayon data-parallelism for CPU-heavy plugins
 hdf5 = ["dep:hdf5"]    # HDF5 file format (requires libhdf5)
 ioc  = ["ad-core/ioc"]  # IOC startup commands (NDStatsConfigure, etc.)
+```
+
+### Parallel Processing
+
+The `parallel` feature (enabled by default) uses [rayon](https://docs.rs/rayon) to parallelize CPU-heavy image processing in 4 plugins:
+
+| Plugin | Parallelized Operations |
+|--------|------------------------|
+| **NDROIStat** | Per-ROI stats computation (`par_iter` over ROI regions) |
+| **NDStats** | Basic stats (fold+reduce), centroid (fold+reduce), histogram (par_chunks + merge) |
+| **NDColorConvert** | Bayer demosaic (`bayer_to_rgb1` row-parallel) |
+| **NDProcess** | Stages 1–4: background, flat field, offset/scale, clipping (element-wise `par_iter_mut`) |
+
+Not parallelized: FFT (rustfft internal SIMD), recursive filter (IIR dependency chain), profiles (memory access pattern), Overlay/Transform (lightweight).
+
+**Thread pool management:**
+
+All plugins share a single rayon `ThreadPool` to avoid over-subscription when multiple plugins process data concurrently. The pool is sized to `available_cores - 2` (minimum 1), reserving headroom for port driver data threads, autoconnect tasks, and the tokio runtime.
+
+To override the thread count, call `set_num_threads()` before the first array is processed:
+
+```rust
+ad_plugins::par_util::set_num_threads(4);
+```
+
+A minimum element threshold (`PAR_THRESHOLD = 4096`) prevents rayon overhead from dominating on small arrays. Below this threshold, the sequential path is used automatically.
+
+To disable parallelism entirely:
+
+```toml
+ad-plugins = { version = "0.2", default-features = false }
 ```
 
 ## Usage

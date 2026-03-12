@@ -105,9 +105,15 @@ impl PortHandle {
     ) -> AsynResult<AsyncCompletionHandle> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let msg = ActorMessage::new(op, user, cancel, reply_tx);
-        self.tx.try_send(msg).map_err(|_| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("actor channel full or closed for port {}", self.port_name),
+        self.tx.try_send(msg).map_err(|e| {
+            let detail = match e {
+                mpsc::error::TrySendError::Full(_) => "full",
+                mpsc::error::TrySendError::Closed(_) => "closed",
+            };
+            AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("actor channel {} for port {}", detail, self.port_name),
+            }
         })?;
         Ok(AsyncCompletionHandle { rx: reply_rx })
     }

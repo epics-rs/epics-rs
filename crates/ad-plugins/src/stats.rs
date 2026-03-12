@@ -1183,6 +1183,11 @@ mod tests {
         let (handle, stats, _params, _ts_runtime, _ts_params, _jh, _ts_actor_jh, _ts_data_jh) =
             create_stats_runtime("STATS_RT", pool, 10, "", wiring);
 
+        // Plugins default to disabled — enable for test
+        handle.port_runtime().port_handle()
+            .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
         let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,

@@ -131,16 +131,21 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         }
         drop(output);
 
-        // Update base NDArrayDriver params from array metadata
+        // Update base NDArrayDriver params from output array metadata.
+        // Use the first output array if available (reflects ROI/binning/transform),
+        // otherwise fall back to the input array (for sink plugins like Stats).
         self.array_counter += 1;
-        let info = array.info();
-        let color_mode = if array.dims.len() <= 2 { 0 } else { 2 };
+        let report_arr = result.output_arrays.first().map(|a| a.as_ref()).unwrap_or(array);
+        let info = report_arr.info();
+        let color_mode = if report_arr.dims.len() <= 2 { 0 } else { 2 };
         self.port_handle.write_int32_no_wait(self.ndarray_params.array_counter, 0, self.array_counter);
-        self.port_handle.write_int32_no_wait(self.ndarray_params.unique_id, 0, array.unique_id);
-        self.port_handle.write_int32_no_wait(self.ndarray_params.n_dimensions, 0, array.dims.len() as i32);
+        self.port_handle.write_int32_no_wait(self.ndarray_params.unique_id, 0, report_arr.unique_id);
+        self.port_handle.write_int32_no_wait(self.ndarray_params.n_dimensions, 0, report_arr.dims.len() as i32);
         self.port_handle.write_int32_no_wait(self.ndarray_params.array_size_x, 0, info.x_size as i32);
         self.port_handle.write_int32_no_wait(self.ndarray_params.array_size_y, 0, info.y_size as i32);
-        self.port_handle.write_int32_no_wait(self.ndarray_params.data_type, 0, array.data.data_type() as i32);
+        self.port_handle.write_int32_no_wait(self.ndarray_params.array_size_z, 0, info.color_size as i32);
+        self.port_handle.write_int32_no_wait(self.ndarray_params.array_size, 0, info.total_bytes as i32);
+        self.port_handle.write_int32_no_wait(self.ndarray_params.data_type, 0, report_arr.data.data_type() as i32);
         self.port_handle.write_int32_no_wait(self.ndarray_params.color_mode, 0, color_mode);
 
         let ts_f64 = array.timestamp.as_f64();
@@ -207,8 +212,8 @@ impl PluginPortDriver {
         let ndarray_params = NDArrayDriverParams::create(&mut base)?;
         let plugin_params = PluginBaseParams::create(&mut base)?;
 
-        // Set defaults (EnableCallbacks=1: Enable by default)
-        base.set_int32_param(plugin_params.enable_callbacks, 0, 1)?;
+        // Set defaults (EnableCallbacks=0: Disable by default, matching EPICS ADCore)
+        base.set_int32_param(plugin_params.enable_callbacks, 0, 0)?;
         base.set_int32_param(plugin_params.blocking_callbacks, 0, 0)?;
         base.set_int32_param(plugin_params.queue_size, 0, queue_size as i32)?;
         base.set_int32_param(plugin_params.dropped_arrays, 0, 0)?;
@@ -338,7 +343,7 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
     let (array_sender, array_rx) = ndarray_channel(port_name, queue_size);
 
     // Shared mode flags
-    let enabled = Arc::new(AtomicBool::new(true));
+    let enabled = Arc::new(AtomicBool::new(false));
     let blocking_mode = Arc::new(AtomicBool::new(false));
 
     // Shared processor (accessible from both data thread and caller thread)
@@ -502,7 +507,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
 
     let (array_sender, array_rx) = ndarray_channel(port_name, queue_size);
 
-    let enabled = Arc::new(AtomicBool::new(true));
+    let enabled = Arc::new(AtomicBool::new(false));
     let blocking_mode = Arc::new(AtomicBool::new(false));
 
     let array_output = Arc::new(parking_lot::Mutex::new(output));
@@ -604,6 +609,16 @@ mod tests {
         Arc::new(WiringRegistry::new())
     }
 
+    /// Enable callbacks on a plugin handle (plugins default to disabled).
+    fn enable_callbacks(handle: &PluginRuntimeHandle) {
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
     #[test]
     fn test_passthrough_runtime() {
         let pool = Arc::new(NDArrayPool::new(1_000_000));
@@ -622,6 +637,7 @@ mod tests {
             "",
             test_wiring(),
         );
+        enable_callbacks(&handle);
 
         // Send an array
         handle.array_sender().send(make_test_array(42));
@@ -643,6 +659,7 @@ mod tests {
             "",
             test_wiring(),
         );
+        enable_callbacks(&handle);
 
         // Send arrays - they should be consumed silently
         handle.array_sender().send(make_test_array(1));
@@ -724,6 +741,7 @@ mod tests {
             "",
             test_wiring(),
         );
+        enable_callbacks(&handle);
 
         // Fill the queue and overflow
         for i in 0..10 {
@@ -750,6 +768,7 @@ mod tests {
             "",
             test_wiring(),
         );
+        enable_callbacks(&handle);
 
         // Enable blocking mode
         handle
@@ -783,6 +802,7 @@ mod tests {
             "",
             test_wiring(),
         );
+        enable_callbacks(&handle);
 
         // Start in blocking mode
         handle
@@ -875,6 +895,7 @@ mod tests {
             "",
             test_wiring(),
         );
+        enable_callbacks(&handle);
 
         // Enable blocking mode
         handle
@@ -920,6 +941,7 @@ mod tests {
             "",
             test_wiring(),
         );
+        enable_callbacks(&handle);
 
         // Enable blocking mode
         handle
@@ -965,6 +987,7 @@ mod tests {
             "",
             test_wiring(),
         );
+        enable_callbacks(&handle);
 
         // Enable blocking mode so process_and_publish runs inline
         handle

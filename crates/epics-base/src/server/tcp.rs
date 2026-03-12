@@ -337,6 +337,7 @@ async fn dispatch_message(
             let sid = hdr.cid;
             let ioid = hdr.available;
             let requested_type = hdr.data_type;
+            let requested_count = hdr.actual_count();
 
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
@@ -347,7 +348,11 @@ async fn dispatch_message(
             };
 
             let snapshot = get_full_snapshot(&entry.target).await;
-            if let Some(snapshot) = snapshot {
+            if let Some(mut snapshot) = snapshot {
+                // Respect client's requested element count (e.g. caget -# 10)
+                if requested_count > 0 && requested_count < snapshot.value.count() {
+                    snapshot.value.truncate(requested_count as usize);
+                }
                 let data = match encode_dbr(requested_type, &snapshot) {
                     Ok(d) => d,
                     Err(_) => {

@@ -126,6 +126,9 @@ pub fn build_param_registry_from_params(ad: &ADBaseParams, sim: &SimDetectorPara
     map.insert("ArraySizeY_RBV".into(), ParamInfo::int32(base.array_size_y, "ARRAY_SIZE_Y"));
     map.insert("ArraySizeZ_RBV".into(), ParamInfo::int32(base.array_size_z, "ARRAY_SIZE_Z"));
     map.insert("ArraySize_RBV".into(), ParamInfo::int32(base.array_size, "ARRAY_SIZE"));
+    map.insert("ArraySize0_RBV".into(), ParamInfo::int32(base.array_size_x, "ARRAY_SIZE_X"));
+    map.insert("ArraySize1_RBV".into(), ParamInfo::int32(base.array_size_y, "ARRAY_SIZE_Y"));
+    map.insert("ArraySize2_RBV".into(), ParamInfo::int32(base.array_size_z, "ARRAY_SIZE_Z"));
     map.insert("ArrayCounter".into(), ParamInfo::int32(base.array_counter, "ARRAY_COUNTER"));
     map.insert("ArrayCounter_RBV".into(), ParamInfo::int32(base.array_counter, "ARRAY_COUNTER"));
     map.insert("ArrayCallbacks".into(), ParamInfo::int32(base.array_callbacks, "ARRAY_CALLBACKS"));
@@ -304,24 +307,6 @@ pub struct SimDeviceSupport {
 }
 
 impl SimDeviceSupport {
-    /// Create from a legacy `Arc<Mutex<SimDetector>>` (direct locking).
-    pub fn new(
-        driver: Arc<parking_lot::Mutex<SimDetector>>,
-        registry: Arc<ParamRegistry>,
-    ) -> Self {
-        use asyn_rs::adapter::AsynLink;
-        let link = AsynLink {
-            port_name: String::new(),
-            addr: 0,
-            timeout: std::time::Duration::from_secs(1),
-            drv_info: String::new(),
-        };
-        Self {
-            inner: AsynDeviceSupport::new(driver, link, "asynInt32"),
-            registry,
-        }
-    }
-
     /// Create from a [`PortHandle`] (actor model).
     pub fn from_handle(
         handle: PortHandle,
@@ -470,7 +455,13 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
     {
         let ph = driver_handle;
         let reg = driver_registry;
+        // Keep the runtime alive for the IOC's lifetime. This closure is stored
+        // in IocApplication::device_factories which lives until run() returns.
+        // Without this, the runtime is dropped when the startup thread exits,
+        // closing the actor channel before records can be processed.
+        let rt = driver_runtime;
         ioc.register_device_support("asynSimDetector", move || {
+            let _keep_alive = &rt;
             let handle = ph.lock().unwrap()
                 .as_ref().expect("simDetectorConfig must be called before iocInit")
                 .clone();

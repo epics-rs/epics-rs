@@ -110,6 +110,9 @@ pub fn build_param_registry(ad: &ADBaseParams, dot: &MovingDotParams) -> ParamRe
     map.insert("ArraySizeY_RBV".into(), ParamInfo::int32(base.array_size_y, "ARRAY_SIZE_Y"));
     map.insert("ArraySizeZ_RBV".into(), ParamInfo::int32(base.array_size_z, "ARRAY_SIZE_Z"));
     map.insert("ArraySize_RBV".into(), ParamInfo::int32(base.array_size, "ARRAY_SIZE"));
+    map.insert("ArraySize0_RBV".into(), ParamInfo::int32(base.array_size_x, "ARRAY_SIZE_X"));
+    map.insert("ArraySize1_RBV".into(), ParamInfo::int32(base.array_size_y, "ARRAY_SIZE_Y"));
+    map.insert("ArraySize2_RBV".into(), ParamInfo::int32(base.array_size_z, "ARRAY_SIZE_Z"));
     map.insert("ArrayCounter".into(), ParamInfo::int32(base.array_counter, "ARRAY_COUNTER"));
     map.insert("ArrayCounter_RBV".into(), ParamInfo::int32(base.array_counter, "ARRAY_COUNTER"));
     map.insert("ArrayCallbacks".into(), ParamInfo::int32(base.array_callbacks, "ARRAY_CALLBACKS"));

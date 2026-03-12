@@ -359,8 +359,9 @@ record(subArray, "$(P)$(R)Dim0SA_RBV")
 
 record(longin, "$(P)$(R)ArraySize0_RBV")
 {
-    field(INP,  "$(P)$(R)Dim0SA_RBV")
-    field(FLNK, "$(P)$(R)Dim1SA_RBV")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))ARRAY_SIZE_X")
+    field(SCAN, "I/O Intr")
 }
 
 record(subArray, "$(P)$(R)Dim1SA_RBV")
@@ -375,8 +376,9 @@ record(subArray, "$(P)$(R)Dim1SA_RBV")
 
 record(longin, "$(P)$(R)ArraySize1_RBV")
 {
-    field(INP,  "$(P)$(R)Dim1SA_RBV")
-    field(FLNK, "$(P)$(R)Dim2SA_RBV")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))ARRAY_SIZE_Y")
+    field(SCAN, "I/O Intr")
 }
 
 record(subArray, "$(P)$(R)Dim2SA_RBV")
@@ -391,8 +393,9 @@ record(subArray, "$(P)$(R)Dim2SA_RBV")
 
 record(longin, "$(P)$(R)ArraySize2_RBV")
 {
-    field(INP,  "$(P)$(R)Dim2SA_RBV")
-    field(FLNK, "$(P)$(R)Dim3SA_RBV")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))ARRAY_SIZE_Z")
+    field(SCAN, "I/O Intr")
 }
 
 record(subArray, "$(P)$(R)Dim3SA_RBV")

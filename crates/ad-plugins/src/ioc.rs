@@ -84,10 +84,29 @@ pub fn register_all_plugins(
     }
 
     // --- Generic plugins using create_plugin_runtime ---
-    app = register_generic_plugin(&mut app, mgr, "NDROIConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
-        use crate::roi::{ROIConfig, ROIProcessor};
-        create_plugin_runtime(port_name, ROIProcessor::new(ROIConfig::default()), pool, queue_size, ndarray_port, wiring)
-    });
+    {
+        let m = mgr.clone();
+        app = app.register_startup_command(CommandDef::new(
+            "NDROIConfigure",
+            plugin_arg_defs(),
+            "NDROIConfigure portName [queueSize] ...",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
+                let dtyp = dtyp_from_port(&port_name);
+                let drv = m.driver()?;
+                let pool = drv.pool();
+                let (handle, roi_params, _jh) =
+                    crate::roi::create_roi_runtime(&port_name, pool, queue_size, &ndarray_port, m.wiring().clone());
+                let registry = Arc::new(crate::roi::build_roi_registry(&handle, &roi_params));
+                m.add_plugin_with_registry(&dtyp, &handle, registry, None);
+                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                    eprintln!("NDROIConfigure: wiring failed: {e}");
+                }
+                println!("NDROIConfigure: port={port_name}");
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
     app = register_generic_plugin(&mut app, mgr, "NDProcessConfigure", |port_name, queue_size, ndarray_port, pool, wiring| {
         use crate::process::{ProcessConfig, ProcessProcessor};
         create_plugin_runtime(port_name, ProcessProcessor::new(ProcessConfig::default()), pool, queue_size, ndarray_port, wiring)

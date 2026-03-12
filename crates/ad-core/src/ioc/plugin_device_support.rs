@@ -63,6 +63,15 @@ impl DeviceSupport for PluginDeviceSupport {
 
         if suffix == "ArrayData" && self.array_data.is_some() {
             self.is_array_data = true;
+            // Register for I/O Intr on ArrayCounter_RBV param so the waveform
+            // gets processed each time the plugin receives a new array.
+            if let Some(counter_info) = self.registry.get("ArrayCounter_RBV") {
+                self.inner.set_drv_info(&counter_info.drv_info);
+                self.inner.set_reason(counter_info.param_index);
+                self.inner.set_iface_type("asynInt32");
+                self.mapped = true;
+                self.inner.set_record_info(name, scan);
+            }
             return;
         }
 

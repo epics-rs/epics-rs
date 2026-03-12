@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use epics_base_rs::error::{CaError, CaResult};
@@ -535,6 +534,7 @@ mod tests {
         assert!(parse_asyn_mask_link("@asyn(port1, 0, 0xFF) BITS").is_err());
     }
 
+    use std::sync::Arc;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::param::ParamType;
     use crate::port_actor::PortActor;

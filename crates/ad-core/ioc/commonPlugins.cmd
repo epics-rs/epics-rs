@@ -15,54 +15,54 @@
 # ===== File saving plugins =====
 
 NDFileNetCDFConfigure("FileNetCDF1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=netCDF1:,PORT=FileNetCDF1,DTYP=asynFileNetCDF1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDFileNetCDF.template", "P=$(PREFIX),R=netCDF1:,PORT=FileNetCDF1,DTYP=asynFileNetCDF1,NDARRAY_PORT=$(PORT)")
 
 NDFileTIFFConfigure("FileTIFF1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=TIFF1:,PORT=FileTIFF1,DTYP=asynFileTIFF1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDFileTIFF.template", "P=$(PREFIX),R=TIFF1:,PORT=FileTIFF1,DTYP=asynFileTIFF1,NDARRAY_PORT=$(PORT)")
 
 NDFileJPEGConfigure("FileJPEG1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=JPEG1:,PORT=FileJPEG1,DTYP=asynFileJPEG1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDFileJPEG.template", "P=$(PREFIX),R=JPEG1:,PORT=FileJPEG1,DTYP=asynFileJPEG1,NDARRAY_PORT=$(PORT)")
 
 NDFileNexusConfigure("FileNexus1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Nexus1:,PORT=FileNexus1,DTYP=asynFileNexus1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDFileNexus.template", "P=$(PREFIX),R=Nexus1:,PORT=FileNexus1,DTYP=asynFileNexus1,NDARRAY_PORT=$(PORT)")
 
 NDFileHDF5Configure("FileHDF1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=HDF1:,PORT=FileHDF1,DTYP=asynFileHDF1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDFileHDF5.template", "P=$(PREFIX),R=HDF1:,PORT=FileHDF1,DTYP=asynFileHDF1,NDARRAY_PORT=$(PORT)")
 
 #NDFileMagickConfigure("FileMagick1", $(QSIZE), 0, "$(PORT)", 0)
-#dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Magick1:,PORT=FileMagick1,DTYP=asynFileMagick1,NDARRAY_PORT=$(PORT)")
+#dbLoadRecords("NDFileMagick.template", "P=$(PREFIX),R=Magick1:,PORT=FileMagick1,DTYP=asynFileMagick1,NDARRAY_PORT=$(PORT)")
 
 # ===== ROI plugins (4 instances) =====
 
 NDROIConfigure("ROI1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=ROI1:,PORT=ROI1,DTYP=asynROI1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI1:,PORT=ROI1,DTYP=asynROI1,NDARRAY_PORT=$(PORT)")
 
 NDROIConfigure("ROI2", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=ROI2:,PORT=ROI2,DTYP=asynROI2,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI2:,PORT=ROI2,DTYP=asynROI2,NDARRAY_PORT=$(PORT)")
 
 NDROIConfigure("ROI3", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=ROI3:,PORT=ROI3,DTYP=asynROI3,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI3:,PORT=ROI3,DTYP=asynROI3,NDARRAY_PORT=$(PORT)")
 
 NDROIConfigure("ROI4", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=ROI4:,PORT=ROI4,DTYP=asynROI4,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI4:,PORT=ROI4,DTYP=asynROI4,NDARRAY_PORT=$(PORT)")
 
 # ===== ROI statistics =====
 
 NDROIStatConfigure("ROISTAT1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=ROIStat1:,PORT=ROISTAT1,DTYP=asynROISTAT1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDROIStat.template", "P=$(PREFIX),R=ROIStat1:,PORT=ROISTAT1,DTYP=asynROISTAT1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
 
 # ===== Processing plugin =====
 
 NDProcessConfigure("PROC1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Proc1:,PORT=PROC1,DTYP=asynPROC1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDProcess.template", "P=$(PREFIX),R=Proc1:,PORT=PROC1,DTYP=asynPROC1,NDARRAY_PORT=$(PORT)")
 
 # ===== Scatter/Gather =====
 
 NDScatterConfigure("SCATTER1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Scatter1:,PORT=SCATTER1,DTYP=asynSCATTER1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDScatter.template", "P=$(PREFIX),R=Scatter1:,PORT=SCATTER1,DTYP=asynSCATTER1,NDARRAY_PORT=$(PORT)")
 
 NDGatherConfigure("GATHER1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Gather1:,PORT=GATHER1,DTYP=asynGATHER1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDGather.template", "P=$(PREFIX),R=Gather1:,PORT=GATHER1,DTYP=asynGATHER1,NDARRAY_PORT=$(PORT)")
 
 # ===== Statistics plugins (5 instances) =====
 
@@ -84,45 +84,45 @@ dbLoadRecords("NDStats.template", "P=$(PREFIX),R=Stats5:,PORT=STATS5,DTYP=asynST
 # ===== Transform plugin =====
 
 NDTransformConfigure("TRANS1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Trans1:,PORT=TRANS1,DTYP=asynTRANS1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDTransform.template", "P=$(PREFIX),R=Trans1:,PORT=TRANS1,DTYP=asynTRANS1,NDARRAY_PORT=$(PORT)")
 
 # ===== Overlay plugin =====
 
 NDOverlayConfigure("OVER1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Over1:,PORT=OVER1,DTYP=asynOVER1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDOverlay.template", "P=$(PREFIX),R=Over1:,PORT=OVER1,DTYP=asynOVER1,NDARRAY_PORT=$(PORT)")
 
 # ===== Color conversion plugins (2 instances) =====
 
 NDColorConvertConfigure("CC1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=CC1:,PORT=CC1,DTYP=asynCC1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDColorConvert.template", "P=$(PREFIX),R=CC1:,PORT=CC1,DTYP=asynCC1,NDARRAY_PORT=$(PORT)")
 
 NDColorConvertConfigure("CC2", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=CC2:,PORT=CC2,DTYP=asynCC2,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDColorConvert.template", "P=$(PREFIX),R=CC2:,PORT=CC2,DTYP=asynCC2,NDARRAY_PORT=$(PORT)")
 
 # ===== Circular buffer =====
 
 NDCircularBuffConfigure("CB1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=CB1:,PORT=CB1,DTYP=asynCB1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDCircularBuff.template", "P=$(PREFIX),R=CB1:,PORT=CB1,DTYP=asynCB1,NDARRAY_PORT=$(PORT)")
 
 # ===== Attributes =====
 
 NDAttrConfigure("ATTR1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Attr1:,PORT=ATTR1,DTYP=asynATTR1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDAttribute.template", "P=$(PREFIX),R=Attr1:,PORT=ATTR1,DTYP=asynATTR1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
 
 # ===== FFT =====
 
 NDFFTConfigure("FFT1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=FFT1:,PORT=FFT1,DTYP=asynFFT1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDFFT.template", "P=$(PREFIX),R=FFT1:,PORT=FFT1,DTYP=asynFFT1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
 
 # ===== Codec plugins (2 instances) =====
 
 NDCodecConfigure("CODEC1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Codec1:,PORT=CODEC1,DTYP=asynCODEC1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDCodec.template", "P=$(PREFIX),R=Codec1:,PORT=CODEC1,DTYP=asynCODEC1,NDARRAY_PORT=$(PORT)")
 
 NDCodecConfigure("CODEC2", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=Codec2:,PORT=CODEC2,DTYP=asynCODEC2,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDCodec.template", "P=$(PREFIX),R=Codec2:,PORT=CODEC2,DTYP=asynCODEC2,NDARRAY_PORT=$(PORT)")
 
 # ===== Bad pixel =====
 
 NDBadPixelConfigure("BADPIX1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDPluginBase.template", "P=$(PREFIX),R=BadPix1:,PORT=BADPIX1,DTYP=asynBADPIX1,NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDBadPixel.template", "P=$(PREFIX),R=BadPix1:,PORT=BADPIX1,DTYP=asynBADPIX1,NDARRAY_PORT=$(PORT)")

@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core::ndarray_pool::NDArrayPool;
-use ad_core::plugin::runtime::{NDPluginProcess, ProcessResult};
+use ad_core::plugin::registry::{build_plugin_base_registry, ParamInfo, ParamRegistry};
+use ad_core::plugin::runtime::{NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle, ProcessResult};
+use asyn_rs::param::ParamType;
+use asyn_rs::port::PortDriverBase;
 
 /// Per-dimension ROI configuration.
 #[derive(Debug, Clone)]
@@ -233,28 +236,242 @@ fn out_data_fallback(_src: &NDDataBuffer, target: NDDataType, len: usize) -> NDD
     NDDataBuffer::zeros(target, len)
 }
 
+/// Per-dimension param reasons.
+#[derive(Default, Clone, Copy)]
+pub struct ROIDimParams {
+    pub min: usize,
+    pub size: usize,
+    pub bin: usize,
+    pub reverse: usize,
+    pub enable: usize,
+    pub auto_size: usize,
+    pub max_size: usize,
+}
+
+/// Param reasons for all ROI params.
+#[derive(Default)]
+pub struct ROIParams {
+    pub dims: [ROIDimParams; 3],
+    pub enable_scale: usize,
+    pub scale: usize,
+    pub data_type: usize,
+    pub collapse_dims: usize,
+    pub name: usize,
+}
+
 /// Pure ROI processing logic.
 pub struct ROIProcessor {
     config: ROIConfig,
+    params: ROIParams,
 }
 
 impl ROIProcessor {
     pub fn new(config: ROIConfig) -> Self {
-        Self { config }
+        Self { config, params: ROIParams::default() }
+    }
+
+    /// Access the registered ROI param reasons.
+    pub fn params(&self) -> &ROIParams {
+        &self.params
     }
 }
 
 impl NDPluginProcess for ROIProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        // Report input array dimensions as MaxSize params
+        let mut updates = Vec::new();
+        for (i, dim_params) in self.params.dims.iter().enumerate() {
+            let dim_size = array.dims.get(i).map(|d| d.size as i32).unwrap_or(0);
+            updates.push(ParamUpdate::Int32(dim_params.max_size, dim_size));
+        }
+
         match extract_roi_2d(array, &self.config) {
-            Some(roi_arr) => ProcessResult::arrays(vec![Arc::new(roi_arr)]),
-            None => ProcessResult::empty(),
+            Some(roi_arr) => ProcessResult {
+                output_arrays: vec![Arc::new(roi_arr)],
+                param_updates: updates,
+            },
+            None => ProcessResult::sink(updates),
         }
     }
 
     fn plugin_type(&self) -> &str {
         "NDPluginROI"
     }
+
+    fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), asyn_rs::error::AsynError> {
+        let dim_names = ["DIM0", "DIM1", "DIM2"];
+        for (i, prefix) in dim_names.iter().enumerate() {
+            self.params.dims[i].min = base.create_param(&format!("{prefix}_MIN"), ParamType::Int32)?;
+            self.params.dims[i].size = base.create_param(&format!("{prefix}_SIZE"), ParamType::Int32)?;
+            self.params.dims[i].bin = base.create_param(&format!("{prefix}_BIN"), ParamType::Int32)?;
+            self.params.dims[i].reverse = base.create_param(&format!("{prefix}_REVERSE"), ParamType::Int32)?;
+            self.params.dims[i].enable = base.create_param(&format!("{prefix}_ENABLE"), ParamType::Int32)?;
+            self.params.dims[i].auto_size = base.create_param(&format!("{prefix}_AUTO_SIZE"), ParamType::Int32)?;
+            self.params.dims[i].max_size = base.create_param(&format!("{prefix}_MAX_SIZE"), ParamType::Int32)?;
+
+            // Set initial values from config
+            base.set_int32_param(self.params.dims[i].min, 0, self.config.dims[i].min as i32)?;
+            base.set_int32_param(self.params.dims[i].size, 0, self.config.dims[i].size as i32)?;
+            base.set_int32_param(self.params.dims[i].bin, 0, self.config.dims[i].bin as i32)?;
+            base.set_int32_param(self.params.dims[i].reverse, 0, self.config.dims[i].reverse as i32)?;
+            base.set_int32_param(self.params.dims[i].enable, 0, self.config.dims[i].enable as i32)?;
+            base.set_int32_param(self.params.dims[i].auto_size, 0, self.config.dims[i].auto_size as i32)?;
+        }
+        self.params.enable_scale = base.create_param("ENABLE_SCALE", ParamType::Int32)?;
+        self.params.scale = base.create_param("SCALE_VALUE", ParamType::Float64)?;
+        self.params.data_type = base.create_param("ROI_DATA_TYPE", ParamType::Int32)?;
+        self.params.collapse_dims = base.create_param("COLLAPSE_DIMS", ParamType::Int32)?;
+        self.params.name = base.create_param("NAME", ParamType::Octet)?;
+
+        base.set_int32_param(self.params.enable_scale, 0, self.config.enable_scale as i32)?;
+        base.set_float64_param(self.params.scale, 0, self.config.scale)?;
+        base.set_int32_param(self.params.data_type, 0, -1)?; // -1 = Automatic
+        base.set_int32_param(self.params.collapse_dims, 0, self.config.collapse_dims as i32)?;
+
+        Ok(())
+    }
+
+    fn on_param_change(&mut self, reason: usize, snapshot: &PluginParamSnapshot) {
+        let p = &self.params;
+        for i in 0..3 {
+            if reason == p.dims[i].min {
+                self.config.dims[i].min = snapshot.value.as_i32().max(0) as usize;
+                return;
+            }
+            if reason == p.dims[i].size {
+                self.config.dims[i].size = snapshot.value.as_i32().max(0) as usize;
+                return;
+            }
+            if reason == p.dims[i].bin {
+                self.config.dims[i].bin = snapshot.value.as_i32().max(1) as usize;
+                return;
+            }
+            if reason == p.dims[i].reverse {
+                self.config.dims[i].reverse = snapshot.value.as_i32() != 0;
+                return;
+            }
+            if reason == p.dims[i].enable {
+                self.config.dims[i].enable = snapshot.value.as_i32() != 0;
+                return;
+            }
+            if reason == p.dims[i].auto_size {
+                self.config.dims[i].auto_size = snapshot.value.as_i32() != 0;
+                return;
+            }
+        }
+        if reason == p.enable_scale {
+            self.config.enable_scale = snapshot.value.as_i32() != 0;
+        } else if reason == p.scale {
+            self.config.scale = snapshot.value.as_f64();
+        } else if reason == p.data_type {
+            let v = snapshot.value.as_i32();
+            self.config.data_type = if v < 0 { None } else { NDDataType::from_ordinal(v as u8) };
+        } else if reason == p.collapse_dims {
+            self.config.collapse_dims = snapshot.value.as_i32() != 0;
+        }
+    }
+}
+
+/// Create an ROI plugin runtime, returning the handle and param reasons.
+pub fn create_roi_runtime(
+    port_name: &str,
+    pool: Arc<NDArrayPool>,
+    queue_size: usize,
+    ndarray_port: &str,
+    wiring: Arc<ad_core::plugin::wiring::WiringRegistry>,
+) -> (
+    ad_core::plugin::runtime::PluginRuntimeHandle,
+    ROIParams,
+    std::thread::JoinHandle<()>,
+) {
+    let processor = ROIProcessor::new(ROIConfig::default());
+    let (handle, jh) = ad_core::plugin::runtime::create_plugin_runtime(
+        port_name,
+        processor,
+        pool,
+        queue_size,
+        ndarray_port,
+        wiring,
+    );
+    // Recreate param layout on a scratch PortDriverBase to get matching reasons.
+    let params = {
+        let mut base = asyn_rs::port::PortDriverBase::new("_scratch_", 1, asyn_rs::port::PortFlags::default());
+        let _ = ad_core::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core::plugin::params::PluginBaseParams::create(&mut base);
+        let mut p = ROIParams::default();
+        let dim_names = ["DIM0", "DIM1", "DIM2"];
+        for (i, prefix) in dim_names.iter().enumerate() {
+            p.dims[i].min = base.create_param(&format!("{prefix}_MIN"), asyn_rs::param::ParamType::Int32).unwrap();
+            p.dims[i].size = base.create_param(&format!("{prefix}_SIZE"), asyn_rs::param::ParamType::Int32).unwrap();
+            p.dims[i].bin = base.create_param(&format!("{prefix}_BIN"), asyn_rs::param::ParamType::Int32).unwrap();
+            p.dims[i].reverse = base.create_param(&format!("{prefix}_REVERSE"), asyn_rs::param::ParamType::Int32).unwrap();
+            p.dims[i].enable = base.create_param(&format!("{prefix}_ENABLE"), asyn_rs::param::ParamType::Int32).unwrap();
+            p.dims[i].auto_size = base.create_param(&format!("{prefix}_AUTO_SIZE"), asyn_rs::param::ParamType::Int32).unwrap();
+            p.dims[i].max_size = base.create_param(&format!("{prefix}_MAX_SIZE"), asyn_rs::param::ParamType::Int32).unwrap();
+        }
+        p.enable_scale = base.create_param("ENABLE_SCALE", asyn_rs::param::ParamType::Int32).unwrap();
+        p.scale = base.create_param("SCALE_VALUE", asyn_rs::param::ParamType::Float64).unwrap();
+        p.data_type = base.create_param("ROI_DATA_TYPE", asyn_rs::param::ParamType::Int32).unwrap();
+        p.collapse_dims = base.create_param("COLLAPSE_DIMS", asyn_rs::param::ParamType::Int32).unwrap();
+        p.name = base.create_param("NAME", asyn_rs::param::ParamType::Octet).unwrap();
+        p
+    };
+    (handle, params, jh)
+}
+
+/// Build a ParamRegistry that maps NDROI.template record suffixes to asyn param indices.
+pub fn build_roi_registry(h: &PluginRuntimeHandle, rp: &ROIParams) -> ParamRegistry {
+    let mut map = build_plugin_base_registry(h);
+
+    let dim_suffixes = [
+        ("X", 0),
+        ("Y", 1),
+        ("Z", 2),
+    ];
+    for (suffix, i) in &dim_suffixes {
+        let d = &rp.dims[*i];
+        let dim_idx = *i;
+        // Min
+        map.insert(format!("Min{suffix}"), ParamInfo::int32(d.min, &format!("DIM{dim_idx}_MIN")));
+        map.insert(format!("Min{suffix}_RBV"), ParamInfo::int32(d.min, &format!("DIM{dim_idx}_MIN")));
+        // Size
+        map.insert(format!("Size{suffix}"), ParamInfo::int32(d.size, &format!("DIM{dim_idx}_SIZE")));
+        map.insert(format!("Size{suffix}_RBV"), ParamInfo::int32(d.size, &format!("DIM{dim_idx}_SIZE")));
+        // Bin
+        map.insert(format!("Bin{suffix}"), ParamInfo::int32(d.bin, &format!("DIM{dim_idx}_BIN")));
+        map.insert(format!("Bin{suffix}_RBV"), ParamInfo::int32(d.bin, &format!("DIM{dim_idx}_BIN")));
+        // Reverse
+        map.insert(format!("Reverse{suffix}"), ParamInfo::int32(d.reverse, &format!("DIM{dim_idx}_REVERSE")));
+        map.insert(format!("Reverse{suffix}_RBV"), ParamInfo::int32(d.reverse, &format!("DIM{dim_idx}_REVERSE")));
+        // Enable
+        map.insert(format!("Enable{suffix}"), ParamInfo::int32(d.enable, &format!("DIM{dim_idx}_ENABLE")));
+        map.insert(format!("Enable{suffix}_RBV"), ParamInfo::int32(d.enable, &format!("DIM{dim_idx}_ENABLE")));
+        // AutoSize
+        map.insert(format!("AutoSize{suffix}"), ParamInfo::int32(d.auto_size, &format!("DIM{dim_idx}_AUTO_SIZE")));
+        map.insert(format!("AutoSize{suffix}_RBV"), ParamInfo::int32(d.auto_size, &format!("DIM{dim_idx}_AUTO_SIZE")));
+        // MaxSize (read-only)
+        map.insert(format!("MaxSize{suffix}_RBV"), ParamInfo::int32(d.max_size, &format!("DIM{dim_idx}_MAX_SIZE")));
+    }
+
+    // Scaling
+    map.insert("EnableScale".into(), ParamInfo::int32(rp.enable_scale, "ENABLE_SCALE"));
+    map.insert("EnableScale_RBV".into(), ParamInfo::int32(rp.enable_scale, "ENABLE_SCALE"));
+    map.insert("Scale".into(), ParamInfo::float64(rp.scale, "SCALE_VALUE"));
+    map.insert("Scale_RBV".into(), ParamInfo::float64(rp.scale, "SCALE_VALUE"));
+
+    // Data type
+    map.insert("DataTypeOut".into(), ParamInfo::int32(rp.data_type, "ROI_DATA_TYPE"));
+    map.insert("DataTypeOut_RBV".into(), ParamInfo::int32(rp.data_type, "ROI_DATA_TYPE"));
+
+    // CollapseDims
+    map.insert("CollapseDims".into(), ParamInfo::int32(rp.collapse_dims, "COLLAPSE_DIMS"));
+    map.insert("CollapseDims_RBV".into(), ParamInfo::int32(rp.collapse_dims, "COLLAPSE_DIMS"));
+
+    // Name
+    map.insert("Name".into(), ParamInfo::string(rp.name, "NAME"));
+    map.insert("Name_RBV".into(), ParamInfo::string(rp.name, "NAME"));
+
+    map
 }
 
 #[cfg(test)]

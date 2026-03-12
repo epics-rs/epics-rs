@@ -725,6 +725,19 @@ impl EpicsValue {
         }
     }
 
+    /// Truncate an array value to at most `max` elements. Scalars are unchanged.
+    pub fn truncate(&mut self, max: usize) {
+        match self {
+            Self::ShortArray(arr) => arr.truncate(max),
+            Self::FloatArray(arr) => arr.truncate(max),
+            Self::EnumArray(arr) => arr.truncate(max),
+            Self::DoubleArray(arr) => arr.truncate(max),
+            Self::LongArray(arr) => arr.truncate(max),
+            Self::CharArray(arr) => arr.truncate(max),
+            _ => {}
+        }
+    }
+
     /// Convert to a different native type (scalar only; arrays use first element).
     pub fn convert_to(&self, target: DbFieldType) -> EpicsValue {
         if self.dbr_type() == target {

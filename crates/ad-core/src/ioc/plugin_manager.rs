@@ -141,8 +141,15 @@ impl PluginManager {
                     let registry = p.registry.clone();
                     let dtyp = p.dtyp_name.clone();
                     let array_data = p.array_data.clone();
+                    // Parse addr from INP/OUT link if available
+                    let addr = {
+                        let link_str = if !ctx.inp.is_empty() { ctx.inp } else { ctx.out };
+                        asyn_rs::adapter::parse_asyn_link(link_str)
+                            .map(|l| l.addr)
+                            .unwrap_or(0)
+                    };
                     return Some(
-                        Box::new(PluginDeviceSupport::new(handle, registry, &dtyp, array_data))
+                        Box::new(PluginDeviceSupport::with_addr(handle, registry, &dtyp, array_data, addr))
                             as Box<dyn epics_base_rs::server::device_support::DeviceSupport>,
                     );
                 }
@@ -161,7 +168,7 @@ impl PluginManager {
                             let dtyp = ctx.dtyp.to_string();
                             let array_data = p.array_data.clone();
                             return Some(
-                                Box::new(PluginDeviceSupport::new(handle, registry, &dtyp, array_data))
+                                Box::new(PluginDeviceSupport::with_addr(handle, registry, &dtyp, array_data, link.addr))
                                     as Box<dyn epics_base_rs::server::device_support::DeviceSupport>,
                             );
                         }

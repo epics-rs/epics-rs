@@ -4,9 +4,18 @@
 //! the plugin computes min, max, mean, total, and net (background-subtracted total).
 //! Optionally accumulates time series data in circular buffers.
 
+use std::sync::Arc;
+
 use ad_core::ndarray::{NDArray, NDDataBuffer};
 use ad_core::ndarray_pool::NDArrayPool;
-use ad_core::plugin::runtime::{NDPluginProcess, ProcessResult};
+use ad_core::plugin::registry::{build_plugin_base_registry, ParamInfo, ParamRegistry};
+use ad_core::plugin::runtime::{
+    NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle, ProcessResult,
+};
+use ad_core::plugin::wiring::WiringRegistry;
+use asyn_rs::param::ParamType;
+use asyn_rs::port::PortDriverBase;
+use parking_lot::Mutex;
 
 use crate::time_series::{TimeSeriesData, TimeSeriesSender};
 
@@ -69,6 +78,35 @@ pub fn roi_stat_ts_channel_names(num_rois: usize) -> Vec<String> {
     names
 }
 
+/// Parameter indices for NDROIStat plugin-specific params.
+///
+/// Per-ROI params use a single index and are differentiated by asyn addr (0..N).
+#[derive(Clone, Copy, Default)]
+pub struct ROIStatParams {
+    // Global (addr 0)
+    pub reset_all: usize,
+    pub ts_control: usize,
+    pub ts_num_points: usize,
+    pub ts_current_point: usize,
+    pub ts_acquiring: usize,
+    // Per-ROI (same index, different addr)
+    pub use_: usize,
+    pub name: usize,
+    pub reset: usize,
+    pub bgd_width: usize,
+    pub dim0_min: usize,
+    pub dim1_min: usize,
+    pub dim0_size: usize,
+    pub dim1_size: usize,
+    pub dim0_max_size: usize,
+    pub dim1_max_size: usize,
+    pub min_value: usize,
+    pub max_value: usize,
+    pub mean_value: usize,
+    pub total: usize,
+    pub net: usize,
+}
+
 /// Processor that computes ROI statistics on 2D arrays.
 pub struct ROIStatProcessor {
     rois: Vec<ROIStatROI>,
@@ -80,6 +118,10 @@ pub struct ROIStatProcessor {
     ts_current: usize,
     /// Optional sender to push flattened stats to a TimeSeriesPortDriver.
     ts_sender: Option<TimeSeriesSender>,
+    /// Registered asyn param indices.
+    params: ROIStatParams,
+    /// Shared cell to export params after register_params is called.
+    params_out: Arc<Mutex<ROIStatParams>>,
 }
 
 impl ROIStatProcessor {
@@ -96,7 +138,14 @@ impl ROIStatProcessor {
             ts_num_points,
             ts_current: 0,
             ts_sender: None,
+            params: ROIStatParams::default(),
+            params_out: Arc::new(Mutex::new(ROIStatParams::default())),
         }
+    }
+
+    /// Get a shared handle to the params (populated after register_params is called).
+    pub fn params_handle(&self) -> Arc<Mutex<ROIStatParams>> {
+        self.params_out.clone()
     }
 
     /// Get the current results for all ROIs.
@@ -299,12 +348,179 @@ impl NDPluginProcess for ROIStatProcessor {
             let _ = sender.try_send(TimeSeriesData { values });
         }
 
-        ProcessResult::sink(vec![])
+        // Build per-ROI param updates
+        let p = &self.params;
+        let mut updates = Vec::new();
+        for (i, result) in self.results.iter().enumerate() {
+            let addr = i as i32;
+            updates.push(ParamUpdate::float64_addr(p.min_value, addr, result.min));
+            updates.push(ParamUpdate::float64_addr(p.max_value, addr, result.max));
+            updates.push(ParamUpdate::float64_addr(p.mean_value, addr, result.mean));
+            updates.push(ParamUpdate::float64_addr(p.total, addr, result.total));
+            updates.push(ParamUpdate::float64_addr(p.net, addr, result.net));
+            updates.push(ParamUpdate::int32_addr(p.dim0_max_size, addr, x_size as i32));
+            updates.push(ParamUpdate::int32_addr(p.dim1_max_size, addr, y_size as i32));
+        }
+        updates.push(ParamUpdate::int32(p.ts_current_point, self.ts_current as i32));
+        updates.push(ParamUpdate::int32(p.ts_acquiring, if self.ts_mode == TSMode::Acquiring { 1 } else { 0 }));
+
+        ProcessResult::sink(updates)
     }
 
     fn plugin_type(&self) -> &str {
         "NDPluginROIStat"
     }
+
+    fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), asyn_rs::error::AsynError> {
+        // Global params
+        self.params.reset_all = base.create_param("ROISTAT_RESETALL", ParamType::Int32)?;
+        self.params.ts_control = base.create_param("ROISTAT_TS_CONTROL", ParamType::Int32)?;
+        self.params.ts_num_points = base.create_param("ROISTAT_TS_NUM_POINTS", ParamType::Int32)?;
+        base.set_int32_param(self.params.ts_num_points, 0, self.ts_num_points as i32)?;
+        self.params.ts_current_point = base.create_param("ROISTAT_TS_CURRENT_POINT", ParamType::Int32)?;
+        self.params.ts_acquiring = base.create_param("ROISTAT_TS_ACQUIRING", ParamType::Int32)?;
+
+        // Per-ROI params (single index, differentiated by addr)
+        self.params.use_ = base.create_param("ROISTAT_USE", ParamType::Int32)?;
+        self.params.name = base.create_param("ROISTAT_NAME", ParamType::Octet)?;
+        self.params.reset = base.create_param("ROISTAT_RESET", ParamType::Int32)?;
+        self.params.bgd_width = base.create_param("ROISTAT_BGD_WIDTH", ParamType::Int32)?;
+        self.params.dim0_min = base.create_param("ROISTAT_DIM0_MIN", ParamType::Int32)?;
+        self.params.dim1_min = base.create_param("ROISTAT_DIM1_MIN", ParamType::Int32)?;
+        self.params.dim0_size = base.create_param("ROISTAT_DIM0_SIZE", ParamType::Int32)?;
+        self.params.dim1_size = base.create_param("ROISTAT_DIM1_SIZE", ParamType::Int32)?;
+        self.params.dim0_max_size = base.create_param("ROISTAT_DIM0_MAX_SIZE", ParamType::Int32)?;
+        self.params.dim1_max_size = base.create_param("ROISTAT_DIM1_MAX_SIZE", ParamType::Int32)?;
+        self.params.min_value = base.create_param("ROISTAT_MIN_VALUE", ParamType::Float64)?;
+        self.params.max_value = base.create_param("ROISTAT_MAX_VALUE", ParamType::Float64)?;
+        self.params.mean_value = base.create_param("ROISTAT_MEAN_VALUE", ParamType::Float64)?;
+        self.params.total = base.create_param("ROISTAT_TOTAL", ParamType::Float64)?;
+        self.params.net = base.create_param("ROISTAT_NET", ParamType::Float64)?;
+
+        // Set initial per-ROI values
+        for (i, roi) in self.rois.iter().enumerate() {
+            let addr = i as i32;
+            base.set_int32_param(self.params.use_, addr, roi.enabled as i32)?;
+            base.set_int32_param(self.params.bgd_width, addr, roi.bgd_width as i32)?;
+            base.set_int32_param(self.params.dim0_min, addr, roi.offset[0] as i32)?;
+            base.set_int32_param(self.params.dim1_min, addr, roi.offset[1] as i32)?;
+            base.set_int32_param(self.params.dim0_size, addr, roi.size[0] as i32)?;
+            base.set_int32_param(self.params.dim1_size, addr, roi.size[1] as i32)?;
+        }
+
+        // Export params
+        *self.params_out.lock() = self.params;
+
+        Ok(())
+    }
+
+    fn on_param_change(&mut self, reason: usize, snapshot: &PluginParamSnapshot) {
+        let addr = snapshot.addr as usize;
+        let p = &self.params;
+
+        if reason == p.use_ && addr < self.rois.len() {
+            self.rois[addr].enabled = snapshot.value.as_i32() != 0;
+        } else if reason == p.dim0_min && addr < self.rois.len() {
+            self.rois[addr].offset[0] = snapshot.value.as_i32().max(0) as usize;
+        } else if reason == p.dim1_min && addr < self.rois.len() {
+            self.rois[addr].offset[1] = snapshot.value.as_i32().max(0) as usize;
+        } else if reason == p.dim0_size && addr < self.rois.len() {
+            self.rois[addr].size[0] = snapshot.value.as_i32().max(0) as usize;
+        } else if reason == p.dim1_size && addr < self.rois.len() {
+            self.rois[addr].size[1] = snapshot.value.as_i32().max(0) as usize;
+        } else if reason == p.bgd_width && addr < self.rois.len() {
+            self.rois[addr].bgd_width = snapshot.value.as_i32().max(0) as usize;
+        } else if reason == p.reset && addr < self.rois.len() {
+            self.results[addr] = ROIStatResult::default();
+        } else if reason == p.reset_all {
+            for r in &mut self.results {
+                *r = ROIStatResult::default();
+            }
+        } else if reason == p.ts_control {
+            let mode = if snapshot.value.as_i32() != 0 { TSMode::Acquiring } else { TSMode::Idle };
+            self.set_ts_mode(mode);
+        } else if reason == p.ts_num_points {
+            self.ts_num_points = snapshot.value.as_i32().max(0) as usize;
+        }
+    }
+}
+
+/// Create a ROIStat plugin runtime with multi-addr support.
+///
+/// Returns:
+/// - Plugin runtime handle
+/// - ROIStatParams (for building registry)
+/// - Thread join handle
+pub fn create_roi_stat_runtime(
+    port_name: &str,
+    pool: Arc<NDArrayPool>,
+    queue_size: usize,
+    ndarray_port: &str,
+    wiring: Arc<WiringRegistry>,
+    num_rois: usize,
+) -> (PluginRuntimeHandle, ROIStatParams, std::thread::JoinHandle<()>) {
+    let rois: Vec<ROIStatROI> = (0..num_rois).map(|_| ROIStatROI::default()).collect();
+    let processor = ROIStatProcessor::new(rois, 2048);
+    let params_handle = processor.params_handle();
+
+    let (handle, jh) = ad_core::plugin::runtime::create_plugin_runtime_multi_addr(
+        port_name,
+        processor,
+        pool,
+        queue_size,
+        ndarray_port,
+        wiring,
+        num_rois,
+    );
+
+    // Params were populated by register_params and exported via the shared handle.
+    let roi_stat_params = *params_handle.lock();
+
+    (handle, roi_stat_params, jh)
+}
+
+/// Build a ParamRegistry that maps NDROIStat template record suffixes to asyn param indices.
+pub fn build_roi_stat_registry(h: &PluginRuntimeHandle, rp: &ROIStatParams) -> ParamRegistry {
+    let mut map = build_plugin_base_registry(h);
+
+    // Global params
+    map.insert("ResetAll".into(), ParamInfo::int32(rp.reset_all, "ROISTAT_RESETALL"));
+    map.insert("TSControl".into(), ParamInfo::int32(rp.ts_control, "ROISTAT_TS_CONTROL"));
+    map.insert("TSControl_RBV".into(), ParamInfo::int32(rp.ts_control, "ROISTAT_TS_CONTROL"));
+    map.insert("TSNumPoints".into(), ParamInfo::int32(rp.ts_num_points, "ROISTAT_TS_NUM_POINTS"));
+    map.insert("TSNumPoints_RBV".into(), ParamInfo::int32(rp.ts_num_points, "ROISTAT_TS_NUM_POINTS"));
+    map.insert("TSCurrentPoint".into(), ParamInfo::int32(rp.ts_current_point, "ROISTAT_TS_CURRENT_POINT"));
+    map.insert("TSAcquiring".into(), ParamInfo::int32(rp.ts_acquiring, "ROISTAT_TS_ACQUIRING"));
+
+    // Per-ROI params (same indices for all addrs — addr is resolved via the link)
+    map.insert("Use".into(), ParamInfo::int32(rp.use_, "ROISTAT_USE"));
+    map.insert("Use_RBV".into(), ParamInfo::int32(rp.use_, "ROISTAT_USE"));
+    map.insert("Name".into(), ParamInfo::string(rp.name, "ROISTAT_NAME"));
+    map.insert("Name_RBV".into(), ParamInfo::string(rp.name, "ROISTAT_NAME"));
+    map.insert("Reset".into(), ParamInfo::int32(rp.reset, "ROISTAT_RESET"));
+    map.insert("BgdWidth".into(), ParamInfo::int32(rp.bgd_width, "ROISTAT_BGD_WIDTH"));
+    map.insert("BgdWidth_RBV".into(), ParamInfo::int32(rp.bgd_width, "ROISTAT_BGD_WIDTH"));
+
+    // ROI geometry
+    map.insert("MinX".into(), ParamInfo::int32(rp.dim0_min, "ROISTAT_DIM0_MIN"));
+    map.insert("MinX_RBV".into(), ParamInfo::int32(rp.dim0_min, "ROISTAT_DIM0_MIN"));
+    map.insert("MinY".into(), ParamInfo::int32(rp.dim1_min, "ROISTAT_DIM1_MIN"));
+    map.insert("MinY_RBV".into(), ParamInfo::int32(rp.dim1_min, "ROISTAT_DIM1_MIN"));
+    map.insert("SizeX".into(), ParamInfo::int32(rp.dim0_size, "ROISTAT_DIM0_SIZE"));
+    map.insert("SizeX_RBV".into(), ParamInfo::int32(rp.dim0_size, "ROISTAT_DIM0_SIZE"));
+    map.insert("SizeY".into(), ParamInfo::int32(rp.dim1_size, "ROISTAT_DIM1_SIZE"));
+    map.insert("SizeY_RBV".into(), ParamInfo::int32(rp.dim1_size, "ROISTAT_DIM1_SIZE"));
+    map.insert("MaxSizeX_RBV".into(), ParamInfo::int32(rp.dim0_max_size, "ROISTAT_DIM0_MAX_SIZE"));
+    map.insert("MaxSizeY_RBV".into(), ParamInfo::int32(rp.dim1_max_size, "ROISTAT_DIM1_MAX_SIZE"));
+
+    // Statistics readbacks
+    map.insert("MinValue_RBV".into(), ParamInfo::float64(rp.min_value, "ROISTAT_MIN_VALUE"));
+    map.insert("MaxValue_RBV".into(), ParamInfo::float64(rp.max_value, "ROISTAT_MAX_VALUE"));
+    map.insert("MeanValue_RBV".into(), ParamInfo::float64(rp.mean_value, "ROISTAT_MEAN_VALUE"));
+    map.insert("Total_RBV".into(), ParamInfo::float64(rp.total, "ROISTAT_TOTAL"));
+    map.insert("Net_RBV".into(), ParamInfo::float64(rp.net, "ROISTAT_NET"));
+
+    map
 }
 
 #[cfg(test)]

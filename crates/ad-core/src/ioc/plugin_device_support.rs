@@ -34,10 +34,20 @@ impl PluginDeviceSupport {
         dtyp_name: &str,
         array_data: Option<ArrayDataHandle>,
     ) -> Self {
+        Self::with_addr(handle, registry, dtyp_name, array_data, 0)
+    }
+
+    pub fn with_addr(
+        handle: PortHandle,
+        registry: Arc<ParamRegistry>,
+        dtyp_name: &str,
+        array_data: Option<ArrayDataHandle>,
+        addr: i32,
+    ) -> Self {
         use asyn_rs::adapter::AsynLink;
         let link = AsynLink {
             port_name: String::new(),
-            addr: 0,
+            addr,
             timeout: std::time::Duration::from_secs(1),
             drv_info: String::new(),
         };

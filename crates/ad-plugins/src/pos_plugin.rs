@@ -175,8 +175,8 @@ impl NDPluginProcess for PosPluginProcessor {
         self.expected_id = array.unique_id + 1;
 
         let updates = vec![
-            ParamUpdate::Int32(0, self.missing_frames as i32),
-            ParamUpdate::Int32(1, self.duplicate_frames as i32),
+            ParamUpdate::int32(0, self.missing_frames as i32),
+            ParamUpdate::int32(1, self.duplicate_frames as i32),
         ];
 
         ProcessResult {

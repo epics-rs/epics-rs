@@ -282,7 +282,7 @@ impl NDPluginProcess for ROIProcessor {
         let mut updates = Vec::new();
         for (i, dim_params) in self.params.dims.iter().enumerate() {
             let dim_size = array.dims.get(i).map(|d| d.size as i32).unwrap_or(0);
-            updates.push(ParamUpdate::Int32(dim_params.max_size, dim_size));
+            updates.push(ParamUpdate::int32(dim_params.max_size, dim_size));
         }
 
         match extract_roi_2d(array, &self.config) {

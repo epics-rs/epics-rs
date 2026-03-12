@@ -85,8 +85,8 @@ impl NDPluginProcess for AttributeProcessor {
         }
 
         let updates = vec![
-            ParamUpdate::Float64(self.params.value, self.value),
-            ParamUpdate::Float64(self.params.value_sum, self.value_sum),
+            ParamUpdate::float64(self.params.value, self.value),
+            ParamUpdate::float64(self.params.value_sum, self.value_sum),
         ];
 
         ProcessResult::sink(updates)

@@ -53,8 +53,27 @@ impl ParamChangeValue {
 
 /// A single parameter update produced by a plugin's process_array.
 pub enum ParamUpdate {
-    Int32(usize, i32),
-    Float64(usize, f64),
+    Int32 { reason: usize, addr: i32, value: i32 },
+    Float64 { reason: usize, addr: i32, value: f64 },
+}
+
+impl ParamUpdate {
+    /// Create an Int32 update at addr 0.
+    pub fn int32(reason: usize, value: i32) -> Self {
+        Self::Int32 { reason, addr: 0, value }
+    }
+    /// Create a Float64 update at addr 0.
+    pub fn float64(reason: usize, value: f64) -> Self {
+        Self::Float64 { reason, addr: 0, value }
+    }
+    /// Create an Int32 update at a specific addr.
+    pub fn int32_addr(reason: usize, addr: i32, value: i32) -> Self {
+        Self::Int32 { reason, addr, value }
+    }
+    /// Create a Float64 update at a specific addr.
+    pub fn float64_addr(reason: usize, addr: i32, value: f64) -> Self {
+        Self::Float64 { reason, addr, value }
+    }
 }
 
 /// Result of processing one array: output arrays + param updates to write back.
@@ -102,6 +121,8 @@ pub struct PluginParamSnapshot {
     pub enable_callbacks: bool,
     /// The param reason that changed.
     pub reason: usize,
+    /// The address (sub-device) that changed.
+    pub addr: i32,
     /// The new value.
     pub value: ParamChangeValue,
 }
@@ -155,18 +176,29 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
 
         self.port_handle.write_float64_no_wait(self.plugin_params.execution_time, 0, elapsed_ms);
 
+        // Collect unique addrs that have updates (beyond addr 0 which is always flushed)
+        let mut extra_addrs: Vec<i32> = Vec::new();
         for update in &result.param_updates {
             match update {
-                ParamUpdate::Int32(reason, value) => {
-                    self.port_handle.write_int32_no_wait(*reason, 0, *value);
+                ParamUpdate::Int32 { reason, addr, value } => {
+                    self.port_handle.write_int32_no_wait(*reason, *addr, *value);
+                    if *addr != 0 && !extra_addrs.contains(addr) {
+                        extra_addrs.push(*addr);
+                    }
                 }
-                ParamUpdate::Float64(reason, value) => {
-                    self.port_handle.write_float64_no_wait(*reason, 0, *value);
+                ParamUpdate::Float64 { reason, addr, value } => {
+                    self.port_handle.write_float64_no_wait(*reason, *addr, *value);
+                    if *addr != 0 && !extra_addrs.contains(addr) {
+                        extra_addrs.push(*addr);
+                    }
                 }
             }
         }
 
         self.port_handle.call_param_callbacks_no_wait(0);
+        for addr in extra_addrs {
+            self.port_handle.call_param_callbacks_no_wait(addr);
+        }
     }
 }
 
@@ -188,7 +220,7 @@ pub struct PluginPortDriver {
     base: PortDriverBase,
     ndarray_params: NDArrayDriverParams,
     plugin_params: PluginBaseParams,
-    param_change_tx: tokio::sync::mpsc::Sender<(usize, ParamChangeValue)>,
+    param_change_tx: tokio::sync::mpsc::Sender<(usize, i32, ParamChangeValue)>,
 }
 
 impl PluginPortDriver {
@@ -197,12 +229,13 @@ impl PluginPortDriver {
         plugin_type_name: &str,
         queue_size: usize,
         ndarray_port: &str,
-        param_change_tx: tokio::sync::mpsc::Sender<(usize, ParamChangeValue)>,
+        max_addr: usize,
+        param_change_tx: tokio::sync::mpsc::Sender<(usize, i32, ParamChangeValue)>,
         processor: &mut P,
     ) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
-            1,
+            max_addr,
             PortFlags {
                 can_block: true,
                 ..Default::default()
@@ -250,26 +283,29 @@ impl PortDriver for PluginPortDriver {
 
     fn io_write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        self.base.set_int32_param(reason, 0, value)?;
-        self.base.call_param_callbacks(0)?;
-        let _ = self.param_change_tx.try_send((reason, ParamChangeValue::Int32(value)));
+        let addr = user.addr;
+        self.base.set_int32_param(reason, addr, value)?;
+        self.base.call_param_callbacks(addr)?;
+        let _ = self.param_change_tx.try_send((reason, addr, ParamChangeValue::Int32(value)));
         Ok(())
     }
 
     fn io_write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.base.set_float64_param(reason, 0, value)?;
-        self.base.call_param_callbacks(0)?;
-        let _ = self.param_change_tx.try_send((reason, ParamChangeValue::Float64(value)));
+        let addr = user.addr;
+        self.base.set_float64_param(reason, addr, value)?;
+        self.base.call_param_callbacks(addr)?;
+        let _ = self.param_change_tx.try_send((reason, addr, ParamChangeValue::Float64(value)));
         Ok(())
     }
 
     fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
         let reason = user.reason;
+        let addr = user.addr;
         let s = String::from_utf8_lossy(data).into_owned();
-        self.base.set_string_param(reason, 0, s.clone())?;
-        self.base.call_param_callbacks(0)?;
-        let _ = self.param_change_tx.try_send((reason, ParamChangeValue::Octet(s)));
+        self.base.set_string_param(reason, addr, s.clone())?;
+        self.base.call_param_callbacks(addr)?;
+        let _ = self.param_change_tx.try_send((reason, addr, ParamChangeValue::Octet(s)));
         Ok(())
     }
 }
@@ -311,20 +347,35 @@ impl PluginRuntimeHandle {
 /// - `JoinHandle` for the data processing thread
 pub fn create_plugin_runtime<P: NDPluginProcess>(
     port_name: &str,
-    mut processor: P,
+    processor: P,
     pool: Arc<NDArrayPool>,
     queue_size: usize,
     ndarray_port: &str,
     wiring: Arc<WiringRegistry>,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
+    create_plugin_runtime_multi_addr(port_name, processor, pool, queue_size, ndarray_port, wiring, 1)
+}
+
+/// Create a plugin runtime with multi-addr support.
+///
+/// `max_addr` specifies the number of addresses (sub-devices) the port supports.
+pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
+    port_name: &str,
+    mut processor: P,
+    pool: Arc<NDArrayPool>,
+    queue_size: usize,
+    ndarray_port: &str,
+    wiring: Arc<WiringRegistry>,
+    max_addr: usize,
+) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
     // Param change channel (control plane -> data plane)
-    let (param_tx, param_rx) = tokio::sync::mpsc::channel::<(usize, ParamChangeValue)>(64);
+    let (param_tx, param_rx) = tokio::sync::mpsc::channel::<(usize, i32, ParamChangeValue)>(64);
 
     // Capture plugin type before mutable borrow
     let plugin_type_name = processor.plugin_type().to_string();
 
     // Create the port driver for control plane
-    let driver = PluginPortDriver::new(port_name, &plugin_type_name, queue_size, ndarray_port, param_tx, &mut processor)
+    let driver = PluginPortDriver::new(port_name, &plugin_type_name, queue_size, ndarray_port, max_addr, param_tx, &mut processor)
         .expect("failed to create plugin port driver");
 
     let enable_callbacks_reason = driver.plugin_params.enable_callbacks;
@@ -408,7 +459,7 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
 fn plugin_data_loop<P: NDPluginProcess>(
     shared: Arc<parking_lot::Mutex<SharedProcessorInner<P>>>,
     mut array_rx: NDArrayReceiver,
-    mut param_rx: tokio::sync::mpsc::Receiver<(usize, ParamChangeValue)>,
+    mut param_rx: tokio::sync::mpsc::Receiver<(usize, i32, ParamChangeValue)>,
     enable_callbacks_reason: usize,
     blocking_callbacks_reason: usize,
     enabled: Arc<AtomicBool>,
@@ -441,7 +492,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                 }
                 param = param_rx.recv() => {
                     match param {
-                        Some((reason, value)) => {
+                        Some((reason, addr, value)) => {
                             if reason == enable_callbacks_reason {
                                 enabled.store(value.as_i32() != 0, Ordering::Release);
                             }
@@ -462,6 +513,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             let snapshot = PluginParamSnapshot {
                                 enable_callbacks: enabled.load(Ordering::Acquire),
                                 reason,
+                                addr,
                                 value,
                             };
                             shared.lock().processor.on_param_change(reason, &snapshot);
@@ -489,10 +541,10 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     ndarray_port: &str,
     wiring: Arc<WiringRegistry>,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
-    let (param_tx, param_rx) = tokio::sync::mpsc::channel::<(usize, ParamChangeValue)>(64);
+    let (param_tx, param_rx) = tokio::sync::mpsc::channel::<(usize, i32, ParamChangeValue)>(64);
 
     let plugin_type_name = processor.plugin_type().to_string();
-    let driver = PluginPortDriver::new(port_name, &plugin_type_name, queue_size, ndarray_port, param_tx, &mut processor)
+    let driver = PluginPortDriver::new(port_name, &plugin_type_name, queue_size, ndarray_port, 1, param_tx, &mut processor)
         .expect("failed to create plugin port driver");
 
     let enable_callbacks_reason = driver.plugin_params.enable_callbacks;

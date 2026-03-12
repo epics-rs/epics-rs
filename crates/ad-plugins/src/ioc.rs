@@ -209,9 +209,33 @@ pub fn register_all_plugins(
         ));
     }
 
+    // --- NDROIStatConfigure ---
+    {
+        let m = mgr.clone();
+        app = app.register_startup_command(CommandDef::new(
+            "NDROIStatConfigure",
+            plugin_arg_defs(),
+            "NDROIStatConfigure portName [queueSize] ...",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
+                let dtyp = dtyp_from_port(&port_name);
+                let drv = m.driver()?;
+                let pool = drv.pool();
+                let (handle, roi_stat_params, _jh) =
+                    crate::roi_stat::create_roi_stat_runtime(&port_name, pool, queue_size, &ndarray_port, m.wiring().clone(), 8);
+                let registry = Arc::new(crate::roi_stat::build_roi_stat_registry(&handle, &roi_stat_params));
+                m.add_plugin_with_registry(&dtyp, &handle, registry, None);
+                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                    eprintln!("NDROIStatConfigure: wiring failed: {e}");
+                }
+                println!("NDROIStatConfigure: port={port_name}");
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
     // --- Stub plugins (not yet fully implemented, use PassthroughProcessor) ---
     for name in &[
-        "NDROIStatConfigure",
         "NDBadPixelConfigure",
         "NDFileNexusConfigure",
         "NDFileMagickConfigure",

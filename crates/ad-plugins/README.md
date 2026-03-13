@@ -74,7 +74,7 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 [features]
 default = ["parallel"]
 parallel = ["rayon"]    # Rayon data-parallelism for CPU-heavy plugins
-hdf5 = ["dep:hdf5"]    # HDF5 file format (requires libhdf5)
+hdf5 = ["dep:hdf5-metno"]  # HDF5 file format (built from bundled source, requires cmake)
 ioc  = ["ad-core/ioc"]  # IOC startup commands (NDStatsConfigure, etc.)
 ```
 

@@ -24,12 +24,13 @@ serde = { version = "1", features = ["derive"] }
 netcdf3 = "0.6"
 rayon = { version = "1", optional = true }
 
-[dependencies.hdf5]
-version = "0.8"
+[dependencies.hdf5-metno]
+version = "0.12"
+features = ["static"]
 optional = true
 
 [features]
 default = ["parallel"]
-hdf5 = ["dep:hdf5"]
+hdf5 = ["dep:hdf5-metno"]
 ioc = ["ad-core/ioc"]
 parallel = ["rayon"]

@@ -14,7 +14,7 @@ use ad_core::plugin::runtime::{NDPluginProcess, ProcessResult};
 #[cfg(feature = "hdf5")]
 mod hdf5_real {
     use super::*;
-    use hdf5::File as H5File;
+    use hdf5_metno::File as H5File;
 
     /// HDF5 file writer using the hdf5 crate.
     pub struct Hdf5RealWriter {
@@ -54,7 +54,6 @@ mod hdf5_real {
             let h5file = self.file.as_ref()
                 .ok_or_else(|| ADError::UnsupportedConversion("no HDF5 file open".into()))?;
 
-            let info = array.info();
             let dataset_name = if self.frame_count == 0 {
                 self.dataset_name.clone()
             } else {
@@ -68,7 +67,7 @@ mod hdf5_real {
                 NDDataBuffer::U8(v) => {
                     let ds = h5file.new_dataset::<u8>()
                         .shape(&shape[..])
-                        .create(&dataset_name)
+                        .create(dataset_name.as_str())
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
                     ds.write_raw(v)
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
@@ -76,7 +75,7 @@ mod hdf5_real {
                 NDDataBuffer::U16(v) => {
                     let ds = h5file.new_dataset::<u16>()
                         .shape(&shape[..])
-                        .create(&dataset_name)
+                        .create(dataset_name.as_str())
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
                     ds.write_raw(v)
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
@@ -84,7 +83,7 @@ mod hdf5_real {
                 NDDataBuffer::I32(v) => {
                     let ds = h5file.new_dataset::<i32>()
                         .shape(&shape[..])
-                        .create(&dataset_name)
+                        .create(dataset_name.as_str())
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
                     ds.write_raw(v)
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
@@ -92,7 +91,7 @@ mod hdf5_real {
                 NDDataBuffer::F32(v) => {
                     let ds = h5file.new_dataset::<f32>()
                         .shape(&shape[..])
-                        .create(&dataset_name)
+                        .create(dataset_name.as_str())
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
                     ds.write_raw(v)
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
@@ -100,7 +99,7 @@ mod hdf5_real {
                 NDDataBuffer::F64(v) => {
                     let ds = h5file.new_dataset::<f64>()
                         .shape(&shape[..])
-                        .create(&dataset_name)
+                        .create(dataset_name.as_str())
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
                     ds.write_raw(v)
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
@@ -110,7 +109,7 @@ mod hdf5_real {
                     let raw = array.data.as_u8_slice();
                     let ds = h5file.new_dataset::<u8>()
                         .shape([raw.len()])
-                        .create(&dataset_name)
+                        .create(dataset_name.as_str())
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
                     ds.write_raw(raw)
                         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
@@ -122,11 +121,11 @@ mod hdf5_real {
                 let val_str = attr.value.as_string();
                 // HDF5 string attributes on the dataset
                 if let Ok(ds) = h5file.dataset(&dataset_name) {
-                    let _ = ds.new_attr::<hdf5::types::VarLenUnicode>()
+                    let _ = ds.new_attr::<hdf5_metno::types::VarLenUnicode>()
                         .shape(())
-                        .create(&attr.name)
+                        .create(attr.name.as_str())
                         .and_then(|a| {
-                            let s: hdf5::types::VarLenUnicode = val_str.parse().unwrap_or_default();
+                            let s: hdf5_metno::types::VarLenUnicode = val_str.parse().unwrap_or_default();
                             a.write_scalar(&s)
                         });
                 }

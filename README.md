@@ -616,7 +616,7 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 | `ad-core` | `ioc` | no | IOC support (includes epics-base) |
 | `ad-plugins` | `parallel` | yes | Rayon data-parallelism for CPU-heavy plugins |
 | `ad-plugins` | `ioc` | no | Plugin IOC support |
-| `ad-plugins` | `hdf5` | no | HDF5 file plugin (requires system HDF5 library) |
+| `ad-plugins` | `hdf5` | no | HDF5 file plugin (HDF5 2.0 built from bundled source, requires cmake) |
 | `msi-rs` | `cli` | no | `msi-rs` CLI binary |
 
 ## Testing
@@ -640,9 +640,9 @@ Test coverage: protocol encoding, wire format golden packets, snapshot generatio
 
 | Feature | Library | Installation |
 |---------|---------|--------------|
-| `ad-plugins/hdf5` | HDF5 C library | `brew install hdf5` (macOS) / `apt install libhdf5-dev` (Debian) |
+| `ad-plugins/hdf5` | cmake | `brew install cmake` (macOS) / `apt install cmake` (Debian) / `winget install Kitware.CMake` (Windows) |
 
-All crates except the `hdf5` feature are pure Rust and require no system libraries.
+The `hdf5` feature builds HDF5 2.0 from bundled source (via `hdf5-metno-src`), so no separate HDF5 installation is needed — only cmake is required. All other crates are pure Rust and require no system libraries.
 
 ## License
 

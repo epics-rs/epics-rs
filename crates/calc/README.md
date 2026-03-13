@@ -1,4 +1,4 @@
-# calc-rs
+# epics-calc-rs
 
 Pure Rust implementation of the [EPICS calc engine](https://github.com/epics-modules/calc) — expression compiler and evaluator supporting numeric, string, and array calculations.
 

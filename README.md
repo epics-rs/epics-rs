@@ -75,7 +75,7 @@ epics-rs/
 ```
 epics-base-rs ◄─── epics-macros (proc macro)
     ▲
-    ├── calc-rs (epics feature)
+    ├── epics-calc-rs (epics feature)
     ├── autosave-rs
     ├── busy-rs
     ├── seq
@@ -331,7 +331,7 @@ areaDetector framework:
 - **23 plugins** — Stats, ROI, ROIStat, Process, Transform, ColorConvert, Overlay, FFT, TimeSeries, CircularBuff, Codec, Gather, Scatter, StdArrays, FileTIFF, FileJPEG, FileHDF5, Attribute, AttrPlot, BadPixel, PosPlugin, Passthrough
 - **Parallel processing** — rayon data-parallelism for CPU-heavy plugins (Stats, ROIStat, ColorConvert, Process). Shared thread pool sized to `available_cores - 2` to leave headroom for driver threads and tokio runtime. Enabled by default; see [ad-plugins README](crates/ad-plugins/README.md#parallel-processing)
 
-### calc-rs
+### epics-calc-rs
 
 Expression engine:
 
@@ -612,11 +612,11 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 | Crate | Feature | Default | Description |
 |-------|---------|---------|-------------|
 | `asyn-rs` | `epics` | no | Enable epics-base adapter bridge |
-| `calc-rs` | `numeric` | yes | Numeric expression engine |
-| `calc-rs` | `string` | no | String expressions |
-| `calc-rs` | `array` | no | Array expressions |
-| `calc-rs` | `math` | no | Advanced math functions (diff, fitting, interpolation) |
-| `calc-rs` | `epics` | no | EPICS record integration (transform, scalcout, sseq) |
+| `epics-calc-rs` | `numeric` | yes | Numeric expression engine |
+| `epics-calc-rs` | `string` | no | String expressions |
+| `epics-calc-rs` | `array` | no | Array expressions |
+| `epics-calc-rs` | `math` | no | Advanced math functions (diff, fitting, interpolation) |
+| `epics-calc-rs` | `epics` | no | EPICS record integration (transform, scalcout, sseq) |
 | `ad-core` | `ioc` | no | IOC support (includes epics-base) |
 | `ad-plugins` | `parallel` | yes | Rayon data-parallelism for CPU-heavy plugins |
 | `ad-plugins` | `ioc` | no | Plugin IOC support |
@@ -630,7 +630,7 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 cargo test --workspace
 
 # With optional features
-cargo test --workspace --features calc-rs/epics,asyn-rs/epics
+cargo test --workspace --features epics-calc-rs/epics,asyn-rs/epics
 ```
 
 Test coverage: protocol encoding, wire format golden packets, snapshot generation, GR/CTRL metadata serialization, record processing, link chains, calc engine, .db parsing, access security, autosave, iocsh, IOC builder, event scheduling, motor state machine, asyn port driver, etc.

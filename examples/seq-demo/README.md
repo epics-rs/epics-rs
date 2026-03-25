@@ -73,10 +73,25 @@ cargo run -p seq-demo
 cargo run -p seq-demo -- "P=myprefix:"
 ```
 
-Before running, create the target PVs (e.g., via softioc-rs):
+Before running, start a soft IOC that hosts the target PVs. The `P` macro must match between the IOC and seq-demo:
 
 ```bash
+# Terminal 1: start the IOC (default prefix is SEQ:)
 softioc-rs --record ai:SEQ:counter --record bo:SEQ:light
+
+# Terminal 2: run seq-demo with matching prefix
+cargo run -p seq-demo                    # uses default P=SEQ:
+cargo run -p seq-demo -- "P=SEQ:"        # explicit, same as default
+```
+
+To use a custom prefix, both sides must agree:
+
+```bash
+# Terminal 1
+softioc-rs --record ai:test:counter --record bo:test:light
+
+# Terminal 2
+cargo run -p seq-demo -- "P=test:"
 ```
 
 ## License

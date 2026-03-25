@@ -149,8 +149,12 @@ cargo build --release
 # Simple PVs
 softioc-rs --pv TEMP:double:25.0 --pv MSG:string:hello
 
-# With records
-softioc-rs --record ai:SENSOR:0.0 --record bo:SWITCH:0
+# PV names with colons (EPICS convention)
+softioc-rs --pv SEQ:counter:double:25.0 --pv SYS:status:string:OK
+
+# With records (value is optional, defaults to 0)
+softioc-rs --record ai:SENSOR:0.0 --record bo:SWITCH:1
+softioc-rs --record ai:SEQ:counter --record bo:SEQ:light
 
 # From a .db file
 softioc-rs --db my_ioc.db -m "P=TEST:,R=TEMP"
@@ -158,6 +162,8 @@ softioc-rs --db my_ioc.db -m "P=TEST:,R=TEMP"
 # Custom port
 softioc-rs --db my_ioc.db --port 5065
 ```
+
+PV names can contain colons (e.g., `SEQ:counter`). For `--record`, the last `:` segment is used as the initial value only if it parses as the expected type; otherwise the entire remainder is treated as the PV name. For `--pv`, the type keyword (`double`, `string`, etc.) is detected automatically.
 
 ### Client Tools
 

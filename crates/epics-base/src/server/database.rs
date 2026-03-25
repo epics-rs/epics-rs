@@ -22,23 +22,23 @@ pub fn parse_pv_name(name: &str) -> (&str, &str) {
 fn apply_timestamp(common: &mut super::record::CommonFields, is_soft: bool) {
     match common.tse {
         0 => {
-            // System time (default behavior)
+            // generalTime current time (default behavior)
             if is_soft || common.time == std::time::SystemTime::UNIX_EPOCH {
-                common.time = crate::runtime::time::now_wall();
+                common.time = crate::runtime::general_time::get_current();
             }
         }
         -1 => {
-            // Device-provided time; fallback to system time if not set
+            // Device-provided time; fallback to generalTime BestTime if not set
             if common.time == std::time::SystemTime::UNIX_EPOCH {
-                common.time = crate::runtime::time::now_wall();
+                common.time = crate::runtime::general_time::get_event(-1);
             }
         }
         -2 => {
             // Keep TIME field as-is
         }
         _ => {
-            // generalTime (not implemented), fallback to system time
-            common.time = crate::runtime::time::now_wall();
+            // generalTime event time
+            common.time = crate::runtime::general_time::get_event(common.tse as i32);
         }
     }
 }

@@ -1211,7 +1211,7 @@ impl RecordInstance {
         // Transfer nsta/nsev → sevr/stat, detect alarm change
         let alarm_result = recgbl::rec_gbl_reset_alarms(&mut self.common);
 
-        self.common.time = crate::runtime::time::now_wall();
+        self.common.time = crate::runtime::general_time::get_current();
         if self.record.clears_udf() {
             self.common.udf = false;
         }

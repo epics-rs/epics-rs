@@ -4,6 +4,8 @@ Pure Rust implementation of [EPICS Base](https://epics-controls.org/) — Channe
 
 No C dependencies. No `libca`. Just `cargo build`.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 All binaries use the `-rs` suffix (e.g. `caget-rs`, `caput-rs`, `softioc-rs`) to avoid conflicts with the C EPICS tools.
 
 ## Features

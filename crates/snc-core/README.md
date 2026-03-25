@@ -4,6 +4,8 @@ Compiler library for EPICS [Sequencer](https://epics-controls.org/) Neutral Lang
 
 No C dependencies. Pure Rust.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Pipeline
 
 ```

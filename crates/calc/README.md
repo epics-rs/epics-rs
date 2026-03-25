@@ -4,6 +4,8 @@ Pure Rust implementation of the [EPICS calc engine](https://github.com/epics-mod
 
 No C dependencies. Just `cargo build`.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Features
 
 ### Expression Engine

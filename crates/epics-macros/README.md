@@ -4,6 +4,8 @@ Procedural macro crate providing `#[derive(EpicsRecord)]` for implementing EPICS
 
 Generates the `Record` trait implementation (field descriptors, get/put dispatch) from a struct definition, so each record file focuses only on its unique processing logic.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Usage
 
 ```rust

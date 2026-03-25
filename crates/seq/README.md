@@ -4,6 +4,8 @@ Rust-native [EPICS sequencer](https://github.com/epics-modules/sequencer) — SN
 
 No C dependencies. Just `cargo build`.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Workspace
 
 | Crate | Description |

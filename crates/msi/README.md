@@ -6,6 +6,8 @@ No EPICS dependencies. Pure text processing.
 
 Output is identical to C msi for ADCore/ADSimDetector templates (verified by golden tests).
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## CLI
 
 ```bash

@@ -4,6 +4,8 @@ NDPlugin implementations for [areaDetector-rs](../ad-core/). 23 image processing
 
 No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT).
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Plugins
 
 ### Statistical Analysis

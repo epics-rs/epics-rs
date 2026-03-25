@@ -4,6 +4,8 @@ Pure Rust implementation of the [EPICS motor record](https://github.com/epics-mo
 
 No C dependencies. Just `cargo build`.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Features
 
 - Full motor record processing with multi-phase motion state machine

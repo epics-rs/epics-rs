@@ -4,6 +4,8 @@ Rust port of [EPICS asyn](https://epics-modules.github.io/master/asyn/R4-44/asyn
 
 No C dependencies. Pure Rust. Integrates with [epics-ca](https://github.com/physwkim/epics-base-rs) via the optional `epics` feature.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Overview
 
 asyn-rs provides the same driver model as C asyn, but uses Rust's type system and tokio for safety and concurrency:

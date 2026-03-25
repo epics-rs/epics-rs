@@ -4,6 +4,8 @@ Command-line SNL (Sequencer Neutral Language) compiler for EPICS. Compiles `.st`
 
 Uses [snc-core](../snc-core/) for the compiler pipeline and targets the [seq](../seq/) async runtime.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Usage
 
 ```bash

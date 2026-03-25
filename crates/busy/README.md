@@ -4,6 +4,8 @@ Pure Rust implementation of the [EPICS busy record](https://github.com/epics-mod
 
 No C dependencies. Just `cargo build`.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Features
 
 - VAL=1 (busy), VAL=0 (done) semantics

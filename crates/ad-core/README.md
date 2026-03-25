@@ -4,6 +4,8 @@ Pure Rust implementation of [EPICS areaDetector](https://github.com/areaDetector
 
 No C dependencies. Just `cargo build`.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Workspace
 
 | Crate | Description |

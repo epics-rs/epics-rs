@@ -4,6 +4,8 @@ Pure Rust implementation of [EPICS autosave](https://github.com/epics-modules/au
 
 No C dependencies. Just `cargo build`.
 
+**Repository:** <https://github.com/epics-rs/epics-rs>
+
 ## Features
 
 - **C-compatible st.cmd commands** — same syntax as C autosave

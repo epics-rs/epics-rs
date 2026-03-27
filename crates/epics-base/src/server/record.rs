@@ -1208,8 +1208,11 @@ impl RecordInstance {
             });
         }
         if let RecordProcessResult::AsyncPendingNotify(fields) = process_result {
-            // Async with immediate notification of intermediate state (e.g. DMOV=0).
-            std::mem::forget(_guard);
+            // Intermediate notification (e.g. DMOV=0 at move start).
+            // Unlike AsyncPending, we DO release the processing flag so
+            // subsequent I/O Intr cycles can continue processing normally.
+            self.common.time = crate::runtime::general_time::get_current();
+            // _guard drops here, clearing the processing flag
             return Ok(ProcessSnapshot {
                 changed_fields: fields,
                 event_mask: EventMask::VALUE | EventMask::ALARM,
@@ -1260,6 +1263,9 @@ impl RecordInstance {
                     changed_fields.push((field.clone(), val));
                 }
             }
+        }
+        if !changed_fields.is_empty() {
+            event_mask |= EventMask::VALUE;
         }
 
         Ok(ProcessSnapshot { changed_fields, event_mask })

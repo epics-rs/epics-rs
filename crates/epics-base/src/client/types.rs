@@ -27,6 +27,13 @@ pub(crate) enum TransportCommand {
         ioid: u32,
         server_addr: SocketAddr,
     },
+    Write {
+        sid: u32,
+        data_type: u16,
+        count: u32,
+        payload: Vec<u8>,
+        server_addr: SocketAddr,
+    },
     WriteNotify {
         sid: u32,
         data_type: u16,

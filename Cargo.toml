@@ -4,17 +4,17 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.5.1"
+version = "0.5.2"
 authors = ["Sang Woo Kim <sngwkim915@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/epics-rs/epics-rs"
 
 [workspace.dependencies]
-ad-core = { path = "crates/ad-core", version = "0.5.1" }
-ad-plugins = { path = "crates/ad-plugins", version = "0.5.1" }
-asyn-rs = { path = "crates/asyn", version = "0.5.1" }
-epics-base-rs = { path = "crates/epics-base", version = "0.5.1" }
-epics-macros = { path = "crates/epics-macros", version = "0.5.1" }
-snc-core = { path = "crates/snc-core", version = "0.5.1" }
-epics-seq = { path = "crates/seq", version = "0.5.1" }
-motor-rs = { path = "crates/motor", version = "0.5.1" }
+ad-core = { path = "crates/ad-core", version = "0.5.2" }
+ad-plugins = { path = "crates/ad-plugins", version = "0.5.2" }
+asyn-rs = { path = "crates/asyn", version = "0.5.2" }
+epics-base-rs = { path = "crates/epics-base", version = "0.5.2" }
+epics-macros = { path = "crates/epics-macros", version = "0.5.2" }
+snc-core = { path = "crates/snc-core", version = "0.5.2" }
+epics-seq = { path = "crates/seq", version = "0.5.2" }
+motor-rs = { path = "crates/motor", version = "0.5.2" }

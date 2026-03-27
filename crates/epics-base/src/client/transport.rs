@@ -102,6 +102,30 @@ pub(crate) async fn run_transport_manager(
                     let _ = w.flush().await;
                 }
             }
+            TransportCommand::Write {
+                sid,
+                data_type,
+                count,
+                payload,
+                server_addr,
+            } => {
+                if let Some(conn) = connections.get(&server_addr) {
+                    let padded_len = align8(payload.len());
+                    let mut padded = payload;
+                    padded.resize(padded_len, 0);
+
+                    let mut hdr = CaHeader::new(CA_PROTO_WRITE);
+                    hdr.data_type = data_type;
+                    hdr.cid = sid;
+                    hdr.set_payload_size(padded.len(), count);
+
+                    let hdr_bytes = hdr.to_bytes_extended();
+                    let mut w = conn.writer.lock().await;
+                    let _ = w.write_all(&hdr_bytes).await;
+                    let _ = w.write_all(&padded).await;
+                    let _ = w.flush().await;
+                }
+            }
             TransportCommand::WriteNotify {
                 sid,
                 data_type,

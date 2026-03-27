@@ -387,6 +387,37 @@ impl CaChannel {
             .map_err(|_| CaError::Shutdown)?
     }
 
+    /// Fire-and-forget put (CA_PROTO_WRITE). Returns immediately without
+    /// waiting for server acknowledgement. Used by ophyd's EpicsMotor.set()
+    /// which monitors DMOV for completion instead.
+    pub async fn put_nowait(&self, value: &EpicsValue) -> CaResult<()> {
+        let (info_tx, info_rx) = oneshot::channel();
+        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
+            cid: self.cid,
+            reply: info_tx,
+        });
+        let snap = info_rx
+            .await
+            .map_err(|_| CaError::Shutdown)?
+            .ok_or(CaError::Disconnected)?;
+
+        if snap.state != ChannelState::Connected {
+            return Err(CaError::Disconnected);
+        }
+
+        let payload = value.to_bytes();
+        let count = value.count() as u32;
+        let _ = self.transport_tx.send(TransportCommand::Write {
+            sid: snap.sid,
+            data_type: snap.native_type as u16,
+            count,
+            payload,
+            server_addr: snap.server_addr,
+        });
+
+        Ok(())
+    }
+
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {
         // Wait for connection first
         self.wait_connected(Duration::from_secs(5)).await?;
@@ -740,13 +771,18 @@ fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)));
     }
-    // DNS resolution
+    // DNS resolution — prefer IPv4 (CA protocol is IPv4-only)
     use std::net::ToSocketAddrs;
     let addr_str = format!("{host}:{port}");
-    addr_str
+    let addrs: Vec<SocketAddr> = addr_str
         .to_socket_addrs()
         .map_err(|e| CaError::Protocol(format!("cannot resolve '{host}': {e}")))?
-        .next()
+        .collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(addrs.first())
+        .copied()
         .ok_or_else(|| CaError::Protocol(format!("no addresses for '{host}'")))
 }
 

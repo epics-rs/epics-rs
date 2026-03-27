@@ -160,8 +160,17 @@ fn cmd_dbpf() -> CommandDef {
                 EpicsValue::String(value_str.clone())
             };
 
-            ctx.block_on(ctx.db().put_pv(name, value))
-                .map_err(|e| format!("{e}"))?;
+            // Use put_record_field_from_ca for records (triggers process like CA put).
+            // Fall back to put_pv for simple PVs.
+            let put_result = ctx.block_on(async {
+                let db = ctx.db();
+                if db.get_record(base).await.is_some() {
+                    db.put_record_field_from_ca(base, &field, value).await
+                } else {
+                    db.put_pv(name, value).await
+                }
+            });
+            put_result.map_err(|e| format!("{e}"))?;
 
             // Read back to confirm
             match ctx.block_on(ctx.db().get_pv(name)) {

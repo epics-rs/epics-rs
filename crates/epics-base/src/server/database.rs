@@ -19,13 +19,12 @@ pub fn parse_pv_name(name: &str) -> (&str, &str) {
 
 /// Apply timestamp to a record based on its TSE field.
 /// `is_soft` indicates a Soft Channel device type.
-fn apply_timestamp(common: &mut super::record::CommonFields, is_soft: bool) {
+fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
     match common.tse {
         0 => {
-            // generalTime current time (default behavior)
-            if is_soft || common.time == std::time::SystemTime::UNIX_EPOCH {
-                common.time = crate::runtime::general_time::get_current();
-            }
+            // generalTime current time (default behavior).
+            // Always update — C EPICS recGblGetTimeStamp sets TIME on every process.
+            common.time = crate::runtime::general_time::get_current();
         }
         -1 => {
             // Device-provided time; fallback to generalTime BestTime if not set
@@ -229,17 +228,8 @@ impl PvDatabase {
                     drop(instance);
                     self.update_scan_index(base, s, s, old_phas, new_phas).await;
                 }
-                CommonFieldPutResult::NoChange => {
-                    drop(instance);
-                }
+                CommonFieldPutResult::NoChange => {}
             }
-
-            // Process the record after field put (mirrors put_record_field_from_ca behavior).
-            // For Passive records, this triggers normal processing.
-            // For I/O Intr and periodic records, the put_field already set last_write;
-            // we must process so the record can act on the new value (e.g., motor move).
-            let mut visited = std::collections::HashSet::new();
-            let _ = self.process_record_with_links(base, &mut visited, 0).await;
 
             return Ok(());
         }
@@ -883,6 +873,29 @@ impl PvDatabase {
                 // PACT stays set; skip alarm/timestamp/snapshot/OUT/FLNK
                 return Ok(());
             }
+            if let super::record::RecordProcessResult::AsyncPendingNotify(fields) = process_result {
+                // Intermediate notification (e.g. DMOV=0 at move start).
+                // Execute device write first so the move command reaches the driver,
+                // then flush DMOV=0 etc. to monitors.
+                if !is_soft {
+                    if let Some(mut dev) = instance.device.take() {
+                        let _ = dev.write(&mut *instance.record);
+                        instance.device = Some(dev);
+                    }
+                }
+                apply_timestamp(&mut instance.common, is_soft);
+                let snapshot = super::record::ProcessSnapshot {
+                    changed_fields: fields,
+                    event_mask: crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::ALARM,
+                };
+                let rec_clone = rec.clone();
+                drop(instance);
+                {
+                    let inst = rec_clone.read().await;
+                    inst.notify_from_snapshot(&snapshot);
+                }
+                return Ok(());
+            }
 
             // Evaluate alarms (accumulates into nsta/nsev)
             instance.evaluate_alarms();
@@ -1019,20 +1032,25 @@ impl PvDatabase {
                 event_mask |= EventMask::ALARM;
             }
 
-            // Build snapshot — only include fields when something actually triggered
+            // Build snapshot
             let mut changed_fields = Vec::new();
             if include_val {
                 if let Some(val) = instance.record.val() {
                     changed_fields.push(("VAL".to_string(), val));
                 }
-                // Include other subscribed fields only when value changes
-                for (field, subs) in &instance.subscribers {
-                    if !subs.is_empty() && field != "VAL" && field != "SEVR" && field != "STAT" && field != "UDF" {
-                        if let Some(val) = instance.resolve_field(field) {
-                            changed_fields.push((field.clone(), val));
-                        }
+            }
+            // Always include subscribed fields — C EPICS posts all monitored
+            // fields on every process cycle, not just when VAL changes.
+            for (field, subs) in &instance.subscribers {
+                if !subs.is_empty() && field != "VAL" && field != "SEVR" && field != "STAT" && field != "UDF" {
+                    if let Some(val) = instance.resolve_field(field) {
+                        changed_fields.push((field.clone(), val));
                     }
                 }
+            }
+            // Ensure event_mask includes VALUE when we have subscribed field updates
+            if !changed_fields.is_empty() {
+                event_mask |= crate::server::recgbl::EventMask::VALUE;
             }
             if alarm_result.alarm_changed {
                 changed_fields.push(("SEVR".to_string(), EpicsValue::Short(instance.common.sevr as i16)));

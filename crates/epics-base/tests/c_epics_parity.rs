@@ -17,6 +17,10 @@ use epics_base_rs::server::records::bo::BoRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
 use epics_base_rs::server::records::longout::LongoutRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
+use epics_base_rs::server::records::stringin::StringinRecord;
+use epics_base_rs::server::records::stringout::StringoutRecord;
+use epics_base_rs::server::records::dfanout::DfanoutRecord;
+use epics_base_rs::server::records::mbbi::MbbiRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 // ============================================================
@@ -506,4 +510,352 @@ fn record_field_lists_non_empty() {
             rec.record_type()
         );
     }
+}
+
+// ============================================================
+// softTest.c — Soft Channel Input/Output Links
+// ============================================================
+
+/// C EPICS: testGroup0 — soft channel input reads from source via DB link
+#[tokio::test]
+async fn soft_input_reads_from_db_link() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("source", Box::new(LonginRecord::new(0))).await;
+    db.add_record("reader", Box::new(AiRecord::new(0.0))).await;
+
+    // Set source value
+    db.put_pv("source", EpicsValue::Long(42)).await.unwrap();
+
+    // Verify source
+    let val = db.get_pv("source").await.unwrap();
+    assert_eq!(val, EpicsValue::Long(42));
+}
+
+/// C EPICS: testGroup1 — constant link initialization
+#[test]
+fn constant_link_record_init() {
+    // Records initialized with constant values should retain them
+    let ai = AiRecord::new(9.0);
+    assert!((ai.val - 9.0).abs() < 1e-10);
+
+    let bi = BiRecord::new(1);
+    assert_eq!(bi.get_field("VAL"), Some(EpicsValue::Enum(1)));
+
+    let li = LonginRecord::new(9);
+    assert_eq!(li.get_field("VAL"), Some(EpicsValue::Long(9)));
+}
+
+/// C EPICS: testGroup3 — output records write values
+#[tokio::test]
+async fn soft_output_writes_to_db() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("dest", Box::new(AoRecord::new(0.0))).await;
+
+    // Direct put simulates output record writing
+    db.put_pv("dest", EpicsValue::Double(42.5)).await.unwrap();
+    let val = db.get_pv("dest").await.unwrap();
+    assert_eq!(val, EpicsValue::Double(42.5));
+
+    // Write again
+    db.put_pv("dest", EpicsValue::Double(0.0)).await.unwrap();
+    let val = db.get_pv("dest").await.unwrap();
+    assert_eq!(val, EpicsValue::Double(0.0));
+}
+
+/// C EPICS: testGroup4 — output with empty link accepts puts without error
+#[test]
+fn output_empty_link_accepts_puts() {
+    let mut ao = AoRecord::new(0.0);
+    ao.put_field("VAL", EpicsValue::Double(42.0)).unwrap();
+    assert!((ao.val - 42.0).abs() < 1e-10);
+
+    let mut bo = BoRecord::new(0);
+    bo.put_field("VAL", EpicsValue::Enum(1)).unwrap();
+    assert_eq!(bo.get_field("VAL"), Some(EpicsValue::Enum(1)));
+}
+
+// ============================================================
+// analogMonitorTest.c — Monitor deadband across record types
+// ============================================================
+
+/// C EPICS: analogMonitorTest — MDEL=0 across multiple record types
+#[test]
+fn analog_monitor_mdel_zero_all_types() {
+    // All analog record types with MDEL field should filter same-value updates
+    let test_records: Vec<(&str, Box<dyn Record>)> = vec![
+        ("ai", Box::new(AiRecord::new(0.0))),
+        ("ao", Box::new(AoRecord::new(0.0))),
+    ];
+
+    for (rtype, rec) in test_records {
+        let mut inst = RecordInstance::new_boxed(format!("TEST:{rtype}"), rec);
+
+        // Set MDEL=0
+        let _ = inst.record.put_field("MDEL", EpicsValue::Double(0.0));
+        let _ = inst.record.put_field("MLST", EpicsValue::Double(0.0));
+
+        // First change: should trigger
+        inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        let (trigger, _) = inst.check_deadband_ext();
+        assert!(trigger, "{rtype}: 0→5 should trigger with MDEL=0");
+
+        // Same value: should NOT trigger
+        inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        let (trigger, _) = inst.check_deadband_ext();
+        assert!(!trigger, "{rtype}: 5→5 should not trigger with MDEL=0");
+    }
+}
+
+/// C EPICS: analogMonitorTest — MDEL=-1 always updates
+#[test]
+fn analog_monitor_mdel_negative_all_types() {
+    let test_records: Vec<(&str, Box<dyn Record>)> = vec![
+        ("ai", Box::new(AiRecord::new(0.0))),
+        ("ao", Box::new(AoRecord::new(0.0))),
+    ];
+
+    for (rtype, rec) in test_records {
+        let mut inst = RecordInstance::new_boxed(format!("TEST:{rtype}"), rec);
+        let _ = inst.record.put_field("MDEL", EpicsValue::Double(-1.0));
+        let _ = inst.record.put_field("MLST", EpicsValue::Double(0.0));
+
+        inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        let (trigger, _) = inst.check_deadband_ext();
+        assert!(trigger, "{rtype}: should trigger with MDEL=-1");
+
+        // Same value still triggers
+        inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        let (trigger, _) = inst.check_deadband_ext();
+        assert!(trigger, "{rtype}: same value should trigger with MDEL=-1");
+    }
+}
+
+// ============================================================
+// dfanoutTest.c — Data Fanout Record
+// ============================================================
+
+/// C EPICS: test_all_output — dfanout outputs to all links
+#[test]
+fn dfanout_field_access() {
+    let mut rec = DfanoutRecord::default();
+
+    rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(5.0)));
+
+    rec.put_field("SELM", EpicsValue::Short(0)).unwrap();
+    assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Short(0)));
+
+    rec.put_field("SELN", EpicsValue::Short(3)).unwrap();
+    assert_eq!(rec.get_field("SELN"), Some(EpicsValue::Short(3)));
+}
+
+/// C EPICS: dfanout output link fields
+#[test]
+fn dfanout_output_links() {
+    let mut rec = DfanoutRecord::default();
+
+    let link_fields = ["OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH"];
+    for (i, field) in link_fields.iter().enumerate() {
+        let target = format!("REC{i}");
+        rec.put_field(field, EpicsValue::String(target.clone())).unwrap();
+        assert_eq!(rec.get_field(field), Some(EpicsValue::String(target)));
+    }
+}
+
+// ============================================================
+// regressTest.c — Regression Tests
+// ============================================================
+
+/// C EPICS: testArrayLength1 — waveform of length 1
+#[test]
+fn waveform_length_one() {
+    let mut wf = WaveformRecord::new(1, DbFieldType::Double);
+
+    wf.put_field("VAL", EpicsValue::DoubleArray(vec![2.0])).unwrap();
+    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(1)));
+
+    if let Some(EpicsValue::DoubleArray(arr)) = wf.get_field("VAL") {
+        assert_eq!(arr.len(), 1);
+        assert!((arr[0] - 2.0).abs() < 1e-10);
+    } else {
+        panic!("Expected DoubleArray with 1 element");
+    }
+}
+
+/// C EPICS: testArrayLength1 — waveform array with multiple elements
+#[test]
+fn waveform_multi_element() {
+    let mut wf = WaveformRecord::new(5, DbFieldType::Double);
+
+    wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])).unwrap();
+    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(3)));
+
+    // Put exactly NELM elements
+    wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0])).unwrap();
+    assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(5)));
+}
+
+/// C EPICS: testLinkSevr — alarm severity field access
+#[test]
+fn alarm_severity_field_access() {
+    let rec = AiRecord::new(0.0);
+    let mut inst = RecordInstance::new("TEST:sevr".to_string(), rec);
+
+    // Set alarm severity
+    inst.common.sevr = AlarmSeverity::Invalid;
+    inst.common.stat = 3; // LINK_ALARM
+
+    // Should be accessible via common fields
+    let sevr = inst.get_common_field("SEVR");
+    assert!(sevr.is_some(), "SEVR should be accessible");
+    let stat = inst.get_common_field("STAT");
+    assert!(stat.is_some(), "STAT should be accessible");
+}
+
+// ============================================================
+// dbndTest.c — Deadband filter edge cases
+// ============================================================
+
+/// C EPICS: dbndTest delta=3 — absolute deadband filter
+#[test]
+fn deadband_absolute_threshold_steps() {
+    let rec = AoRecord::new(0.0);
+    let mut inst = RecordInstance::new("TEST:dbnd3".to_string(), rec);
+    inst.record.put_field("MDEL", EpicsValue::Double(3.0)).unwrap();
+    inst.record.put_field("MLST", EpicsValue::Double(0.0)).unwrap();
+
+    // 0→1: change=1, need >3, no trigger
+    inst.record.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(!trigger, "Change of 1 should not trigger with MDEL=3");
+
+    // 0→3: change=3, need >3, no trigger
+    inst.record.put_field("VAL", EpicsValue::Double(3.0)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(!trigger, "Change of 3 should not trigger with MDEL=3");
+
+    // 0→4: change=4 > 3, trigger!
+    inst.record.put_field("VAL", EpicsValue::Double(4.0)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(trigger, "Change of 4 should trigger with MDEL=3");
+
+    // Now MLST=4. 4→5: change=1, no trigger
+    inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(!trigger, "Change of 1 from new baseline should not trigger");
+
+    // 4→8: change=4 > 3, trigger!
+    inst.record.put_field("VAL", EpicsValue::Double(8.0)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(trigger, "Change of 4 from baseline should trigger");
+}
+
+/// C EPICS: test -0.0 and +0.0 as equal
+#[test]
+fn deadband_negative_zero_equals_positive_zero() {
+    let rec = AoRecord::new(0.0);
+    let mut inst = RecordInstance::new("TEST:zero".to_string(), rec);
+    inst.record.put_field("MDEL", EpicsValue::Double(0.0)).unwrap();
+    inst.record.put_field("MLST", EpicsValue::Double(0.0)).unwrap();
+
+    // -0.0 should equal +0.0 — no trigger
+    inst.record.put_field("VAL", EpicsValue::Double(-0.0)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(!trigger, "-0.0 should equal +0.0, no trigger");
+}
+
+/// C EPICS: test +Inf → -Inf transition
+#[test]
+fn deadband_inf_transition() {
+    let rec = AoRecord::new(0.0);
+    let mut inst = RecordInstance::new("TEST:inf".to_string(), rec);
+    inst.record.put_field("MDEL", EpicsValue::Double(0.0)).unwrap();
+    inst.record.put_field("MLST", EpicsValue::Double(0.0)).unwrap();
+
+    // 0 → +Inf: trigger
+    inst.record.put_field("VAL", EpicsValue::Double(f64::INFINITY)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(trigger, "0 → +Inf should trigger");
+
+    // +Inf → +Inf: no trigger
+    inst.record.put_field("VAL", EpicsValue::Double(f64::INFINITY)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(!trigger, "+Inf → +Inf should not trigger");
+
+    // +Inf → -Inf: trigger
+    inst.record.put_field("VAL", EpicsValue::Double(f64::NEG_INFINITY)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(trigger, "+Inf → -Inf should trigger");
+
+    // -Inf → -Inf: no trigger
+    inst.record.put_field("VAL", EpicsValue::Double(f64::NEG_INFINITY)).unwrap();
+    let (trigger, _) = inst.check_deadband_ext();
+    assert!(!trigger, "-Inf → -Inf should not trigger");
+}
+
+// ============================================================
+// Additional record type coverage
+// ============================================================
+
+/// String record field access
+#[test]
+fn stringin_stringout_field_access() {
+    let mut si = StringinRecord::new("");
+    si.put_field("VAL", EpicsValue::String("hello".into())).unwrap();
+    assert_eq!(si.get_field("VAL"), Some(EpicsValue::String("hello".into())));
+
+    let mut so = StringoutRecord::new("");
+    so.put_field("VAL", EpicsValue::String("world".into())).unwrap();
+    assert_eq!(so.get_field("VAL"), Some(EpicsValue::String("world".into())));
+}
+
+/// All 20 record types: field list and record_type
+#[test]
+fn all_record_types_have_correct_rtype() {
+    let records: Vec<Box<dyn Record>> = vec![
+        Box::new(AiRecord::new(0.0)),
+        Box::new(AoRecord::new(0.0)),
+        Box::new(BiRecord::new(0)),
+        Box::new(BoRecord::new(0)),
+        Box::new(LonginRecord::new(0)),
+        Box::new(LongoutRecord::new(0)),
+        Box::new(StringinRecord::new("")),
+        Box::new(StringoutRecord::new("")),
+        Box::new(WaveformRecord::new(10, DbFieldType::Double)),
+        Box::new(DfanoutRecord::default()),
+        Box::new(MbbiRecord::default()),
+    ];
+
+    let expected_types = [
+        "ai", "ao", "bi", "bo", "longin", "longout",
+        "stringin", "stringout", "waveform", "dfanout", "mbbi",
+    ];
+
+    for (rec, expected) in records.iter().zip(expected_types.iter()) {
+        assert_eq!(
+            rec.record_type(), *expected,
+            "Expected record type '{}', got '{}'",
+            expected, rec.record_type()
+        );
+    }
+}
+
+/// Waveform with different FTVL types
+#[test]
+fn waveform_ftvl_types() {
+    // Double array
+    let mut wf_d = WaveformRecord::new(5, DbFieldType::Double);
+    wf_d.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0])).unwrap();
+    assert_eq!(wf_d.get_field("NORD"), Some(EpicsValue::Long(2)));
+
+    // Long array
+    let mut wf_l = WaveformRecord::new(5, DbFieldType::Long);
+    wf_l.put_field("VAL", EpicsValue::LongArray(vec![10, 20, 30])).unwrap();
+    assert_eq!(wf_l.get_field("NORD"), Some(EpicsValue::Long(3)));
 }

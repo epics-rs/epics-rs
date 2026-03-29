@@ -590,3 +590,249 @@ fn sim_motor_same_position_dmov_transition() {
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert!((rec.pos.rbv - 5.0).abs() < 1e-6);
 }
+
+/// Sequential moves: move to multiple positions and verify each.
+/// Ported from ophyd test_move.
+#[test]
+fn sequential_moves_verify_position() {
+    let mut rec = make_record();
+
+    let positions = [0.1, 0.0, 0.1, 0.1, 0.0, -5.0, 5.0];
+
+    for &target in &positions {
+        rec.put_field("VAL", EpicsValue::Double(target)).unwrap();
+        let effects = rec.plan_motion(CommandSource::Val);
+
+        // Move should always start (DMOV=0), even for same position
+        assert!(!rec.stat.dmov, "DMOV should be 0 after move to {target}");
+
+        // Simulate completion
+        complete_move(&mut rec, target);
+        let _effects = rec.check_completion();
+
+        assert!(rec.stat.dmov, "DMOV should be 1 after completion at {target}");
+        assert_eq!(rec.stat.phase, MotionPhase::Idle);
+        assert!(
+            (rec.pos.rbv - target).abs() < 1e-6,
+            "RBV should be {target}, got {}",
+            rec.pos.rbv
+        );
+        assert!(
+            (rec.pos.val - target).abs() < 1e-6,
+            "VAL should be {target}, got {}",
+            rec.pos.val
+        );
+    }
+}
+
+/// Calibration: set_current_position changes offset without moving.
+/// Ported from ophyd test_calibration.
+#[test]
+fn calibration_set_current_position_updates_offset() {
+    let mut rec = make_record();
+
+    // Start at position 0
+    complete_move(&mut rec, 0.0);
+    let _ = rec.check_completion();
+    assert!((rec.pos.val - 0.0).abs() < 1e-6);
+    assert!((rec.pos.off - 0.0).abs() < 1e-6);
+
+    // Enter SET mode
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Set);
+
+    // Write new position: "I am now at 10.0"
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Set);
+
+    // Should issue SetPosition, not a move
+    assert!(
+        effects.commands.iter().any(|c| matches!(c, MotorCommand::SetPosition { .. })),
+        "SET mode should issue SetPosition command"
+    );
+
+    // Verify offset changed: OFF = new_val - dial = 10.0 - 0.0 = 10.0
+    assert!(
+        (rec.pos.off - 10.0).abs() < 1e-6,
+        "OFF should be 10.0, got {}",
+        rec.pos.off
+    );
+    assert!(
+        (rec.pos.val - 10.0).abs() < 1e-6,
+        "VAL should read 10.0, got {}",
+        rec.pos.val
+    );
+    // DVAL/DRBV should remain at 0 (dial didn't change)
+    assert!(
+        (rec.pos.dval - 0.0).abs() < 1e-6,
+        "DVAL should still be 0.0, got {}",
+        rec.pos.dval
+    );
+
+    // Leave SET mode
+    rec.put_field("SET", EpicsValue::Short(0)).unwrap();
+
+    // Now move to 0 in user coords (should move dial to -10)
+    rec.put_field("VAL", EpicsValue::Double(0.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(!rec.stat.dmov);
+    assert!(
+        effects.commands.iter().any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "Should issue a real move after leaving SET mode"
+    );
+}
+
+/// SimMotor sequential moves end-to-end.
+/// Ported from ophyd test_move with actual motor simulation.
+#[test]
+fn sim_motor_sequential_moves() {
+    let mut motor = SimMotor::new();
+    let user = AsynUser::new(0);
+    let mut rec = make_record();
+
+    let targets = [0.5, 0.0, 0.5, -1.0];
+
+    for &target in &targets {
+        rec.put_field("VAL", EpicsValue::Double(target)).unwrap();
+        let effects = rec.plan_motion(CommandSource::Val);
+        assert!(!rec.stat.dmov);
+
+        for cmd in &effects.commands {
+            if let MotorCommand::MoveAbsolute { position, velocity, acceleration } = cmd {
+                motor.move_absolute(&user, *position, *velocity, *acceleration).unwrap();
+            }
+        }
+
+        // Wait for SimMotor to reach target
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(20));
+            let status = motor.poll(&user).unwrap();
+            rec.process_motor_info(&status);
+            let _effects = rec.check_completion();
+            if rec.stat.dmov {
+                break;
+            }
+        }
+
+        assert!(rec.stat.dmov, "Motor should reach target {target}");
+        assert!(
+            (rec.pos.rbv - target).abs() < 0.01,
+            "RBV should be ~{target}, got {}",
+            rec.pos.rbv
+        );
+    }
+}
+
+/// RBV updates during move — verify intermediate positions.
+/// Ported from ophyd test_watchers.
+#[test]
+fn rbv_updates_during_move() {
+    let mut motor = SimMotor::new();
+    let user = AsynUser::new(0);
+    let mut rec = make_record();
+    rec.vel.velo = 5.0; // slower velocity so we can observe intermediate positions
+
+    rec.put_field("VAL", EpicsValue::Double(2.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    for cmd in &effects.commands {
+        if let MotorCommand::MoveAbsolute { position, velocity, acceleration } = cmd {
+            motor.move_absolute(&user, *position, *velocity, *acceleration).unwrap();
+        }
+    }
+
+    let mut rbv_history: Vec<f64> = Vec::new();
+
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(20));
+        let status = motor.poll(&user).unwrap();
+        rec.process_motor_info(&status);
+        rbv_history.push(rec.pos.rbv);
+        let _effects = rec.check_completion();
+        if rec.stat.dmov {
+            break;
+        }
+    }
+
+    assert!(rec.stat.dmov, "Motor should complete the move");
+    assert!(
+        rbv_history.len() > 1,
+        "Should have multiple RBV updates during move, got {}",
+        rbv_history.len()
+    );
+    // RBV should be monotonically increasing (moving from 0 to 2)
+    for i in 1..rbv_history.len() {
+        assert!(
+            rbv_history[i] >= rbv_history[i - 1] - 1e-10,
+            "RBV should be monotonically increasing: {} < {}",
+            rbv_history[i],
+            rbv_history[i - 1]
+        );
+    }
+    // Final RBV should be at target
+    assert!(
+        (rec.pos.rbv - 2.0).abs() < 0.01,
+        "Final RBV should be ~2.0, got {}",
+        rec.pos.rbv
+    );
+}
+
+/// Homing with SimMotor end-to-end.
+/// Ported from ophyd test_homing_forward/reverse.
+#[test]
+fn sim_motor_homing() {
+    let mut motor = SimMotor::new();
+    let user = AsynUser::new(0);
+    let mut rec = make_record();
+
+    // Move to 5.0 first
+    rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    for cmd in &effects.commands {
+        if let MotorCommand::MoveAbsolute { position, velocity, acceleration } = cmd {
+            motor.move_absolute(&user, *position, *velocity, *acceleration).unwrap();
+        }
+    }
+    // Wait for move to complete (distance=5, velocity=10 → 0.5s)
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(20));
+        let status = motor.poll(&user).unwrap();
+        rec.process_motor_info(&status);
+        let _ = rec.check_completion();
+        if rec.stat.dmov { break; }
+    }
+    assert!(rec.stat.dmov, "First move to 5.0 should complete");
+
+    // Home forward
+    rec.ctrl.homf = true;
+    let effects = rec.plan_motion(CommandSource::Homf);
+    assert!(!rec.stat.dmov);
+    assert!(
+        effects.commands.iter().any(|c| matches!(c, MotorCommand::Home { .. })),
+        "Should issue Home command"
+    );
+
+    for cmd in &effects.commands {
+        if let MotorCommand::Home { velocity, forward, .. } = cmd {
+            motor.home(&user, *velocity, *forward).unwrap();
+        }
+    }
+
+    // Wait for homing to complete
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(20));
+        let status = motor.poll(&user).unwrap();
+        rec.process_motor_info(&status);
+        let _ = rec.check_completion();
+        if rec.stat.dmov {
+            break;
+        }
+    }
+
+    assert!(rec.stat.dmov, "Homing should complete");
+    assert!(
+        (rec.pos.drbv - 0.0).abs() < 0.01,
+        "After homing, DRBV should be near 0, got {}",
+        rec.pos.drbv
+    );
+}

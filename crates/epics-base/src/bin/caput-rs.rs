@@ -24,25 +24,29 @@ async fn main() {
     let args = Args::parse();
     let client = CaClient::new().await.expect("failed to create CA client");
 
-    if args.callback {
-        match client.caput_callback(&args.pv_name, &args.value, args.timeout).await {
-            Ok(()) => {
-                println!("{} <- {}", args.pv_name, args.value);
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
+    // Read old value before writing
+    let old_value = match client.caget(&args.pv_name).await {
+        Ok((_type, val)) => val,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
+    };
+
+    let result = if args.callback {
+        client.caput_callback(&args.pv_name, &args.value, args.timeout).await
     } else {
-        match client.caput(&args.pv_name, &args.value).await {
-            Ok(()) => {
-                println!("{} <- {}", args.pv_name, args.value);
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
+        client.caput(&args.pv_name, &args.value).await
+    };
+
+    match result {
+        Ok(()) => {
+            println!("Old : {} {}", args.pv_name, old_value);
+            println!("New : {} {}", args.pv_name, args.value);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
     }
 }

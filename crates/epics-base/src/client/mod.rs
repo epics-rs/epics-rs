@@ -167,11 +167,11 @@ impl CaClient {
         result
     }
 
+    /// Fire-and-forget write (CA_PROTO_WRITE). Matches C `caput` behavior.
     pub async fn caput(&self, pv_name: &str, value_str: &str) -> CaResult<()> {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
-        // Get channel info to parse value
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
             cid: ch.cid,
@@ -183,7 +183,28 @@ impl CaClient {
             .ok_or(CaError::Disconnected)?;
 
         let value = EpicsValue::parse(snap.native_type, value_str)?;
-        ch.put(&value).await?;
+        ch.put_nowait(&value).await?;
+        let _ = self.coord_tx.send(CoordRequest::DropChannel { cid: ch.cid });
+        Ok(())
+    }
+
+    /// Write with completion callback (CA_PROTO_WRITE_NOTIFY). Matches C `caput -c`.
+    pub async fn caput_callback(&self, pv_name: &str, value_str: &str, timeout_secs: f64) -> CaResult<()> {
+        let ch = self.create_channel(pv_name);
+        ch.wait_connected(Duration::from_secs(3)).await?;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
+            cid: ch.cid,
+            reply: reply_tx,
+        });
+        let snap = reply_rx
+            .await
+            .map_err(|_| CaError::Shutdown)?
+            .ok_or(CaError::Disconnected)?;
+
+        let value = EpicsValue::parse(snap.native_type, value_str)?;
+        ch.put_with_timeout(&value, Duration::from_secs_f64(timeout_secs)).await?;
         let _ = self.coord_tx.send(CoordRequest::DropChannel { cid: ch.cid });
         Ok(())
     }
@@ -382,6 +403,48 @@ impl CaChannel {
         });
 
         tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .map_err(|_| CaError::Timeout)?
+            .map_err(|_| CaError::Shutdown)?
+    }
+
+    /// Write with completion callback and configurable timeout.
+    pub async fn put_with_timeout(&self, value: &EpicsValue, timeout: Duration) -> CaResult<()> {
+        let (info_tx, info_rx) = oneshot::channel();
+        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
+            cid: self.cid,
+            reply: info_tx,
+        });
+        let snap = info_rx
+            .await
+            .map_err(|_| CaError::Shutdown)?
+            .ok_or(CaError::Disconnected)?;
+
+        if snap.state != ChannelState::Connected {
+            return Err(CaError::Disconnected);
+        }
+
+        let ioid = alloc_ioid();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.coord_tx.send(CoordRequest::WriteNotify {
+            cid: self.cid,
+            ioid,
+            value: value.clone(),
+            reply: reply_tx,
+        });
+
+        let payload = value.to_bytes();
+        let count = value.count() as u32;
+        let _ = self.transport_tx.send(TransportCommand::WriteNotify {
+            sid: snap.sid,
+            data_type: snap.native_type as u16,
+            count,
+            ioid,
+            payload,
+            server_addr: snap.server_addr,
+        });
+
+        tokio::time::timeout(timeout, reply_rx)
             .await
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)?

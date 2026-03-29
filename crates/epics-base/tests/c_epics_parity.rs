@@ -21,6 +21,12 @@ use epics_base_rs::server::records::stringin::StringinRecord;
 use epics_base_rs::server::records::stringout::StringoutRecord;
 use epics_base_rs::server::records::dfanout::DfanoutRecord;
 use epics_base_rs::server::records::mbbi::MbbiRecord;
+use epics_base_rs::server::records::mbbo::MbboRecord;
+use epics_base_rs::server::records::compress::CompressRecord;
+use epics_base_rs::server::records::histogram::HistogramRecord;
+use epics_base_rs::server::records::sel::SelRecord;
+use epics_base_rs::server::records::seq::SeqRecord;
+use epics_base_rs::server::records::sub_record::SubRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 // ============================================================
@@ -858,4 +864,308 @@ fn waveform_ftvl_types() {
     let mut wf_l = WaveformRecord::new(5, DbFieldType::Long);
     wf_l.put_field("VAL", EpicsValue::LongArray(vec![10, 20, 30])).unwrap();
     assert_eq!(wf_l.get_field("NORD"), Some(EpicsValue::Long(3)));
+}
+
+// ============================================================
+// compressTest.c — Compress Record (circular buffer + algorithms)
+// ============================================================
+
+/// C EPICS: testFIFOCirc — FIFO circular buffer
+#[test]
+fn compress_fifo_circular_buffer() {
+    let mut rec = CompressRecord::new(4, 3); // NSAM=4, ALG=Circular Buffer
+
+    // Push values into circular buffer
+    rec.push_value(1.1);
+    assert_eq!(rec.off, 1);
+
+    rec.push_value(2.1);
+    rec.push_value(3.1);
+    rec.push_value(4.1);
+    assert_eq!(rec.off, 4); // wraps next
+
+    // Buffer full, next push overwrites oldest (FIFO)
+    rec.push_value(5.1);
+    assert_eq!(rec.off, 5);
+    // Buffer should be [5.1, 2.1, 3.1, 4.1] in storage order
+    // Reading in order: [2.1, 3.1, 4.1, 5.1]
+
+    rec.push_value(6.1);
+    // Buffer should be [5.1, 6.1, 3.1, 4.1] in storage order
+    // Reading in order: [3.1, 4.1, 5.1, 6.1]
+}
+
+/// C EPICS: testNto1Average — N to 1 average compression
+#[test]
+fn compress_n_to_1_average() {
+    let mut rec = CompressRecord::new(1, 2); // NSAM=1, ALG=Mean
+    rec.n = 4; // Average 4 values into 1
+
+    // Push 4 values: average of [1, 2, 3, 4] = 2.5
+    rec.push_value(1.0);
+    rec.push_value(2.0);
+    rec.push_value(3.0);
+    rec.push_value(4.0);
+
+    assert!(
+        (rec.val[0] - 2.5).abs() < 1e-10,
+        "N-to-1 average of [1,2,3,4] should be 2.5, got {}",
+        rec.val[0]
+    );
+}
+
+/// C EPICS: testNto1LowValue — N to 1 low value
+#[test]
+fn compress_n_to_1_low_value() {
+    let mut rec = CompressRecord::new(1, 0); // NSAM=1, ALG=Low
+    rec.n = 4;
+
+    rec.push_value(3.0);
+    rec.push_value(1.0);
+    rec.push_value(4.0);
+    rec.push_value(2.0);
+
+    assert!(
+        (rec.val[0] - 1.0).abs() < 1e-10,
+        "N-to-1 low of [3,1,4,2] should be 1.0, got {}",
+        rec.val[0]
+    );
+}
+
+/// C EPICS: testNto1HighValue — N to 1 high value
+#[test]
+fn compress_n_to_1_high_value() {
+    let mut rec = CompressRecord::new(1, 1); // NSAM=1, ALG=High
+    rec.n = 4;
+
+    rec.push_value(3.0);
+    rec.push_value(1.0);
+    rec.push_value(4.0);
+    rec.push_value(2.0);
+
+    assert!(
+        (rec.val[0] - 4.0).abs() < 1e-10,
+        "N-to-1 high of [3,1,4,2] should be 4.0, got {}",
+        rec.val[0]
+    );
+}
+
+// ============================================================
+// mbbioDirectTest.c — Multi-bit Binary I/O
+// ============================================================
+
+/// C EPICS: mbbi state string access
+#[test]
+fn mbbi_state_strings() {
+    let mut rec = MbbiRecord::default();
+    rec.put_field("ZRST", EpicsValue::String("Zero".into())).unwrap();
+    rec.put_field("ONST", EpicsValue::String("One".into())).unwrap();
+    rec.put_field("TWST", EpicsValue::String("Two".into())).unwrap();
+
+    assert_eq!(rec.get_field("ZRST"), Some(EpicsValue::String("Zero".into())));
+    assert_eq!(rec.get_field("ONST"), Some(EpicsValue::String("One".into())));
+    assert_eq!(rec.get_field("TWST"), Some(EpicsValue::String("Two".into())));
+
+    // Set VAL to each state
+    rec.put_field("VAL", EpicsValue::Enum(0)).unwrap();
+    assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Enum(0)));
+    rec.put_field("VAL", EpicsValue::Enum(2)).unwrap();
+    assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Enum(2)));
+}
+
+/// C EPICS: mbbo state string and value access
+#[test]
+fn mbbo_state_strings_and_values() {
+    let mut rec = MbboRecord::default();
+    rec.put_field("ZRST", EpicsValue::String("Off".into())).unwrap();
+    rec.put_field("ONST", EpicsValue::String("Low".into())).unwrap();
+    rec.put_field("TWST", EpicsValue::String("High".into())).unwrap();
+
+    // Default ZRVL=0, ONVL=1, TWVL=2
+    assert_eq!(rec.get_field("ZRVL"), Some(EpicsValue::Long(0)));
+    assert_eq!(rec.get_field("ONVL"), Some(EpicsValue::Long(1)));
+    assert_eq!(rec.get_field("TWVL"), Some(EpicsValue::Long(2)));
+
+    rec.put_field("VAL", EpicsValue::Enum(1)).unwrap();
+    assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Enum(1)));
+}
+
+/// C EPICS: mbbi 16 state values
+#[test]
+fn mbbi_all_16_states() {
+    let rec = MbbiRecord::default();
+    // Default values: ZRVL=0, ONVL=1, ..., FFVL=15
+    for i in 0..16u16 {
+        let field = match i {
+            0 => "ZRVL", 1 => "ONVL", 2 => "TWVL", 3 => "THVL",
+            4 => "FRVL", 5 => "FVVL", 6 => "SXVL", 7 => "SVVL",
+            8 => "EIVL", 9 => "NIVL", 10 => "TEVL", 11 => "ELVL",
+            12 => "TVVL", 13 => "TTVL", 14 => "FTVL", 15 => "FFVL",
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            rec.get_field(field),
+            Some(EpicsValue::Long(i as i32)),
+            "State {i} value mismatch"
+        );
+    }
+}
+
+// ============================================================
+// Additional record types — field access and process
+// ============================================================
+
+/// Sel record — selector field access
+#[test]
+fn sel_record_field_access() {
+    let mut rec = SelRecord::default();
+    rec.put_field("VAL", EpicsValue::Double(3.14)).unwrap();
+    assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(3.14)));
+    assert_eq!(rec.record_type(), "sel");
+}
+
+/// Seq record — sequence field access
+#[test]
+fn seq_record_field_access() {
+    let mut rec = SeqRecord::default();
+    rec.put_field("SELM", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Short(1)));
+    rec.put_field("DLY1", EpicsValue::Double(0.5)).unwrap();
+    assert_eq!(rec.get_field("DLY1"), Some(EpicsValue::Double(0.5)));
+    assert_eq!(rec.record_type(), "seq");
+}
+
+/// Histogram record — field access
+#[test]
+fn histogram_record_field_access() {
+    let rec = HistogramRecord::default();
+    assert_eq!(rec.record_type(), "histogram");
+    assert!(rec.field_list().iter().any(|f| f.name == "VAL"));
+}
+
+/// Sub record — subroutine field access
+#[test]
+fn sub_record_field_access() {
+    let mut rec = SubRecord::default();
+    rec.put_field("VAL", EpicsValue::Double(99.0)).unwrap();
+    assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(99.0)));
+    assert_eq!(rec.record_type(), "sub");
+}
+
+// ============================================================
+// Database-level integration tests
+// ============================================================
+
+/// C EPICS: multiple records in database, independent access
+#[tokio::test]
+async fn database_multiple_records() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("ai1", Box::new(AiRecord::new(1.0))).await;
+    db.add_record("ai2", Box::new(AiRecord::new(2.0))).await;
+    db.add_record("bo1", Box::new(BoRecord::new(0))).await;
+    db.add_record("lo1", Box::new(LongoutRecord::new(100))).await;
+
+    assert_eq!(db.get_pv("ai1").await.unwrap(), EpicsValue::Double(1.0));
+    assert_eq!(db.get_pv("ai2").await.unwrap(), EpicsValue::Double(2.0));
+    assert_eq!(db.get_pv("bo1").await.unwrap(), EpicsValue::Enum(0));
+    assert_eq!(db.get_pv("lo1").await.unwrap(), EpicsValue::Long(100));
+
+    // Modify one, others unchanged
+    db.put_pv("ai1", EpicsValue::Double(99.0)).await.unwrap();
+    assert_eq!(db.get_pv("ai1").await.unwrap(), EpicsValue::Double(99.0));
+    assert_eq!(db.get_pv("ai2").await.unwrap(), EpicsValue::Double(2.0));
+}
+
+/// C EPICS: record not found returns error
+#[tokio::test]
+async fn database_record_not_found() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    let result = db.get_pv("nonexistent").await;
+    assert!(result.is_err(), "Getting nonexistent PV should fail");
+}
+
+/// C EPICS: put to record field via database
+#[tokio::test]
+async fn database_put_record_field() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("myrec", Box::new(AoRecord::new(0.0))).await;
+
+    // Put to EGU field
+    if let Some(rec) = db.get_record("myrec").await {
+        let mut inst = rec.write().await;
+        inst.record.put_field("EGU", EpicsValue::String("degC".into())).unwrap();
+    }
+
+    // Verify
+    if let Some(rec) = db.get_record("myrec").await {
+        let inst = rec.read().await;
+        assert_eq!(inst.record.get_field("EGU"), Some(EpicsValue::String("degC".into())));
+    }
+}
+
+/// C EPICS: DISP field blocks CA puts
+#[tokio::test]
+async fn database_disp_blocks_ca_put() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("disp_rec", Box::new(AoRecord::new(0.0))).await;
+
+    // Set DISP=1
+    if let Some(rec) = db.get_record("disp_rec").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("DISP", EpicsValue::Char(1)).unwrap();
+    }
+
+    // CA put should be rejected
+    let result = db.put_record_field_from_ca("disp_rec", "VAL", EpicsValue::Double(42.0)).await;
+    assert!(result.is_err(), "DISP=1 should block CA puts to VAL");
+}
+
+/// C EPICS: PROC put triggers processing
+#[tokio::test]
+async fn database_proc_triggers_processing() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("proc_rec", Box::new(AoRecord::new(5.0))).await;
+
+    // PROC should trigger processing
+    let result = db.put_record_field_from_ca("proc_rec", "PROC", EpicsValue::Char(1)).await;
+    assert!(result.is_ok());
+
+    // UDF should be cleared after processing
+    if let Some(rec) = db.get_record("proc_rec").await {
+        let inst = rec.read().await;
+        assert!(!inst.common.udf, "UDF should be cleared after PROC");
+    }
+}
+
+/// C EPICS: all record names returned from database
+#[tokio::test]
+async fn database_all_record_names() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("rec_a", Box::new(AiRecord::new(0.0))).await;
+    db.add_record("rec_b", Box::new(AoRecord::new(0.0))).await;
+    db.add_record("rec_c", Box::new(BiRecord::new(0))).await;
+
+    let names = db.all_record_names().await;
+    assert_eq!(names.len(), 3);
+    assert!(names.contains(&"rec_a".to_string()));
+    assert!(names.contains(&"rec_b".to_string()));
+    assert!(names.contains(&"rec_c".to_string()));
 }

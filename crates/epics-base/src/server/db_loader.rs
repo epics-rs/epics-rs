@@ -22,7 +22,9 @@ fn get_registry() -> &'static Mutex<HashMap<String, RecordFactory>> {
 /// This allows external crates to override built-in record stubs.
 /// The factory is checked FIRST in `create_record()`, so it takes priority.
 pub fn register_record_type(name: &str, factory: RecordFactory) {
-    let mut reg = get_registry().lock().unwrap();
+    let mut reg = get_registry()
+        .lock()
+        .expect("record factory registry mutex poisoned");
     reg.insert(name.to_string(), factory);
 }
 
@@ -292,6 +294,7 @@ fn parse_include_directive(line: &str) -> Option<String> {
     if rest.is_empty() {
         return None;
     }
+    // SAFETY: `rest` is non-empty (checked by `is_empty()` above)
     let first = rest.chars().next().unwrap();
     if !first.is_whitespace() && first != '"' {
         return None;
@@ -319,6 +322,7 @@ fn parse_substitute_directive(line: &str) -> Option<String> {
     if rest.is_empty() {
         return None;
     }
+    // SAFETY: `rest` is non-empty (checked by `is_empty()` above)
     let first = rest.chars().next().unwrap();
     if !first.is_whitespace() && first != '"' {
         return None;

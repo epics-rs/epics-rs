@@ -153,8 +153,11 @@ impl CaHeader {
     pub fn to_bytes_extended(&self) -> Vec<u8> {
         let mut buf = self.to_bytes().to_vec();
         if self.is_extended() {
+            // SAFETY: is_extended() guarantees extended_postsize.is_some()
             buf.extend_from_slice(&self.extended_postsize.unwrap().to_be_bytes());
-            buf.extend_from_slice(&self.extended_count.unwrap().to_be_bytes());
+            // SAFETY: extended_count is always set alongside extended_postsize
+            // in both set_payload_size() and from_bytes_extended()
+            buf.extend_from_slice(&self.extended_count.unwrap_or(0).to_be_bytes());
         }
         buf
     }

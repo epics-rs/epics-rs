@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Unified scan event scheduler (Phase 5).
 //!
 //! Provides a single scheduler that manages all scan types (periodic, I/O Intr,

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #![allow(unused_imports)]
 //! Interpose (middleware) framework for layered I/O processing.
 //!

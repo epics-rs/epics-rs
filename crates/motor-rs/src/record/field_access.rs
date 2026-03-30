@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::FieldDesc;
 use epics_base_rs::types::{DbFieldType, EpicsValue};

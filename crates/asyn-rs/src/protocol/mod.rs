@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #![allow(unused_imports)]
 //! Pure-data protocol types for port communication.
 //!

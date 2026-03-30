@@ -1,3 +1,4 @@
+#![allow(unused_imports, clippy::all)]
 use std::time::{Duration, SystemTime};
 use epics_base_rs::types::*;
 use epics_base_rs::server::snapshot::*;

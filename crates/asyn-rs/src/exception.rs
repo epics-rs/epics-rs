@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Global exception callback system.
 //!
 //! [`ExceptionManager`] is owned by [`crate::manager::PortManager`] and delivers

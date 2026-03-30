@@ -1,9 +1,0 @@
-$(P)interp_mode
-$(P)interp.VALA
-$(P)interp.VALB
-$(P)interp.VALC
-$(P)interp.VALN
-$(P)interp_n
-$(P)interp_x
-$(P)interp_y1
-$(P)interp_y2

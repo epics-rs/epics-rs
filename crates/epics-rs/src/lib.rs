@@ -17,11 +17,10 @@
 //! | `asyn` | Async port driver framework | no |
 //! | `motor` | Motor record + SimMotor | no |
 //! | `ad` | areaDetector (core + plugins) | no |
-//! | `calc` | Calc expression engine | no |
-//! | `autosave` | PV save/restore | no |
-//! | `busy` | Busy record | no |
+//! | `calc` | Calc expression engine | always |
+//! | `autosave` | PV save/restore | always |
+//! | `busy` | Busy record | always |
 //! | `seq` | Sequencer runtime | no |
-//! | `msi` | Macro substitution tool | no |
 //! | `full` | Everything | no |
 
 /// Core IOC infrastructure — record system, database, iocsh, types.
@@ -51,19 +50,21 @@ pub use ad_core_rs as ad_core;
 #[cfg(feature = "ad")]
 pub use ad_plugins_rs as ad_plugins;
 
-/// Calc expression engine.
-#[cfg(feature = "calc")]
-pub use epics_calc_rs as calc;
+/// Calc expression engine (re-exported from epics-base-rs).
+pub mod calc {
+    pub use epics_base_rs::calc::*;
+}
 
-/// PV automatic save/restore.
-#[cfg(feature = "autosave")]
-pub use autosave_rs as autosave;
+/// PV automatic save/restore (re-exported from epics-base-rs).
+pub mod autosave {
+    pub use epics_base_rs::server::autosave::*;
+}
 
-/// Busy record.
-#[cfg(feature = "busy")]
-pub use busy_rs as busy;
+/// Busy record (re-exported from epics-base-rs).
+pub mod busy {
+    pub use epics_base_rs::server::records::busy::*;
+}
 
 /// Sequencer runtime.
 #[cfg(feature = "seq")]
 pub use epics_seq_rs as seq;
-

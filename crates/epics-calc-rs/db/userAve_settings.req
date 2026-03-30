@@ -1,8 +1,0 @@
-$(P)userAve$(N).DESC
-$(P)userAve$(N).SCAN
-$(P)userAve$(N).INPB
-$(P)userAve$(N).A
-$(P)userAve$(N).PREC
-$(P)userAve$(N)_mode
-$(P)userAve$(N)_algorithm
-$(P)userAve$(N).FLNK

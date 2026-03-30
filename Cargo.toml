@@ -4,11 +4,8 @@ default-members = [
     "crates/ad-core-rs",
     "crates/ad-plugins-rs",
     "crates/asyn-rs",
-    "crates/autosave-rs",
-    "crates/busy-rs",
     "crates/epics-base-rs",
     "crates/epics-ca-rs",
-    "crates/epics-calc-rs",
     "crates/epics-macros-rs",
     "crates/epics-pva-rs",
     "crates/epics-rs",
@@ -30,11 +27,8 @@ repository = "https://github.com/epics-rs/epics-rs"
 ad-core-rs = { path = "crates/ad-core-rs", version = "0.7.0" }
 ad-plugins-rs = { path = "crates/ad-plugins-rs", version = "0.7.0" }
 asyn-rs = { path = "crates/asyn-rs", version = "0.7.0" }
-autosave-rs = { path = "crates/autosave-rs", version = "0.7.0" }
-busy-rs = { path = "crates/busy-rs", version = "0.7.0" }
 epics-base-rs = { path = "crates/epics-base-rs", version = "0.7.0" }
 epics-ca-rs = { path = "crates/epics-ca-rs", version = "0.7.0" }
-epics-calc-rs = { path = "crates/epics-calc-rs", version = "0.7.0" }
 epics-macros-rs = { path = "crates/epics-macros-rs", version = "0.7.0" }
 epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.7.0" }
 epics-seq-rs = { path = "crates/epics-seq-rs", version = "0.7.0" }

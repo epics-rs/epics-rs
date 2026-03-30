@@ -1,4 +1,0 @@
-# FILE... userCalcN_settings.req
-# USAGE.. userCalcN.db fields autosave'd.
-
-file swait_settings.req P=$(P)userCalc$(N)

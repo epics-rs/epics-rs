@@ -15,9 +15,6 @@ asyn-rs = { workspace = true, optional = true }
 motor-rs = { workspace = true, optional = true }
 ad-core-rs = { workspace = true, optional = true }
 ad-plugins-rs = { workspace = true, optional = true }
-epics-calc-rs = { workspace = true, optional = true }
-autosave-rs = { workspace = true, optional = true }
-busy-rs = { workspace = true, optional = true }
 epics-seq-rs = { workspace = true, optional = true }
 
 [features]
@@ -27,8 +24,9 @@ pva = ["dep:epics-pva-rs"]
 asyn = ["dep:asyn-rs"]
 motor = ["dep:asyn-rs", "dep:motor-rs"]
 ad = ["dep:asyn-rs", "dep:ad-core-rs", "dep:ad-plugins-rs"]
-calc = ["dep:epics-calc-rs"]
-autosave = ["dep:autosave-rs"]
-busy = ["dep:busy-rs"]
+# calc, autosave, and busy are always available through epics-base-rs
+calc = []
+autosave = []
+busy = []
 seq = ["dep:epics-seq-rs"]
 full = ["ca", "pva", "asyn", "motor", "ad", "calc", "autosave", "busy", "seq"]

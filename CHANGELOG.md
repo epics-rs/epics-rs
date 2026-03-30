@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.2
+
+- Fix asyn-rs epics feature compilation (get_port export, AsynRecord import)
+- Migrate record factory registration from global registry to IocApplication injection
+- Replace global port registry with shared PortRegistry instance
+- Add feature matrix to CI (asyn-rs/epics, ad-core-rs/ioc, ad-plugins-rs/ioc)
+- Add IocApplication::register_record_type() method
+- Add motor_record_factory() and asyn_record_factory() returning injectable tuples
+
 ## v0.7.1
 
 ### Architecture

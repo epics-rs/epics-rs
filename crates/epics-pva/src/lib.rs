@@ -1,3 +1,13 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::map_entry,
+    clippy::new_without_default,
+    clippy::redundant_closure,
+    clippy::single_match,
+    clippy::type_complexity,
+    clippy::unnecessary_cast
+)]
+
 //! EPICS pvAccess protocol — client (experimental).
 //!
 //! This crate provides the pvAccess wire protocol implementation,

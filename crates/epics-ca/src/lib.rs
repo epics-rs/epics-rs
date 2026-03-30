@@ -1,3 +1,14 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::map_entry,
+    clippy::io_other_error,
+    clippy::new_without_default,
+    clippy::redundant_closure,
+    clippy::single_match,
+    clippy::type_complexity,
+    clippy::unnecessary_cast
+)]
+
 //! EPICS Channel Access protocol — client and server.
 //!
 //! This crate provides the CA wire protocol implementation,

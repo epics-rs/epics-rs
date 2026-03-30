@@ -205,11 +205,9 @@ impl CaServerBuilder {
                 }
                 // Resolve subroutine for sub records
                 if instance.record.record_type() == "sub" {
-                    if let Some(snam_val) = instance.record.get_field("SNAM") {
-                        if let EpicsValue::String(snam) = snam_val {
-                            if let Some(sub_fn) = self.subroutine_registry.get(&snam) {
-                                instance.subroutine = Some(sub_fn.clone());
-                            }
+                    if let Some(EpicsValue::String(snam)) = instance.record.get_field("SNAM") {
+                        if let Some(sub_fn) = self.subroutine_registry.get(&snam) {
+                            instance.subroutine = Some(sub_fn.clone());
                         }
                     }
                 }

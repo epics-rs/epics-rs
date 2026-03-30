@@ -514,12 +514,10 @@ impl PvaClient {
 
                     if resp_ioid == ioid && subcmd == 0x00 {
                         // Data event
-                        if let Ok(field) =
+                        if let Ok(PvField::Structure(s)) =
                             read_structure_value_with_bitset(payload, &mut pos, &field_desc, be)
                         {
-                            if let PvField::Structure(s) = field {
-                                callback(&s);
-                            }
+                            callback(&s);
                         }
 
                         pipeline_credits -= 1;

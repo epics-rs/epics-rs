@@ -11,7 +11,6 @@ default-members = [
     "crates/epics-ca",
     "crates/epics-macros",
     "crates/motor",
-    "crates/msi",
     "crates/seq",
     "crates/snc",
     "crates/epics-pva",
@@ -41,4 +40,4 @@ motor-rs = { path = "crates/motor", version = "0.7.0" }
 epics-calc-rs = { path = "crates/calc", version = "0.7.0" }
 autosave-rs = { path = "crates/autosave", version = "0.7.0" }
 busy-rs = { path = "crates/busy", version = "0.7.0" }
-msi-rs = { path = "crates/msi", version = "0.7.0" }
+

@@ -67,6 +67,3 @@ pub use busy_rs as busy;
 #[cfg(feature = "seq")]
 pub use epics_seq_rs as seq;
 
-/// Macro substitution & include tool.
-#[cfg(feature = "msi")]
-pub use msi_rs as msi;

@@ -492,7 +492,6 @@ dependencies = [
  "epics-pva-rs",
  "epics-seq-rs",
  "motor-rs",
- "msi-rs",
 ]
 
 [[package]]
@@ -985,15 +984,6 @@ dependencies = [
  "epics-ca-rs",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "msi-rs"
-version = "0.7.0"
-dependencies = [
- "clap",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]

@@ -19,7 +19,6 @@ epics-calc-rs = { workspace = true, optional = true }
 autosave-rs = { workspace = true, optional = true }
 busy-rs = { workspace = true, optional = true }
 epics-seq-rs = { workspace = true, optional = true }
-msi-rs = { workspace = true, optional = true }
 
 [features]
 default = ["ca"]
@@ -32,5 +31,4 @@ calc = ["dep:epics-calc-rs"]
 autosave = ["dep:autosave-rs"]
 busy = ["dep:busy-rs"]
 seq = ["dep:epics-seq-rs"]
-msi = ["dep:msi-rs"]
-full = ["ca", "pva", "asyn", "motor", "ad", "calc", "autosave", "busy", "seq", "msi"]
+full = ["ca", "pva", "asyn", "motor", "ad", "calc", "autosave", "busy", "seq"]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use asyn_rs::adapter::AsynDeviceSupport;
 use asyn_rs::port_handle::PortHandle;
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceSupport, WriteCompletion};
+use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, WriteCompletion};
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 
@@ -104,7 +104,7 @@ impl DeviceSupport for PluginDeviceSupport {
         if self.is_array_data || !self.mapped { Ok(()) } else { self.inner.init(record) }
     }
 
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         if self.is_array_data {
             if let Some(ref data_handle) = self.array_data {
                 let guard = data_handle.lock();
@@ -113,9 +113,9 @@ impl DeviceSupport for PluginDeviceSupport {
                     record.set_val(EpicsValue::CharArray(bytes.to_vec()))?;
                 }
             }
-            return Ok(());
+            return Ok(DeviceReadOutcome::ok());
         }
-        if self.mapped { self.inner.read(record) } else { Ok(()) }
+        if self.mapped { self.inner.read(record) } else { Ok(DeviceReadOutcome::ok()) }
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {

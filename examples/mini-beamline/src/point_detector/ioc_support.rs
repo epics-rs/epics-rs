@@ -4,7 +4,7 @@ use std::sync::Arc;
 use asyn_rs::adapter::AsynDeviceSupport;
 use asyn_rs::port_handle::PortHandle;
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceSupport, WriteCompletion};
+use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, WriteCompletion};
 use epics_base_rs::server::record::{Record, ScanType};
 
 use ad_core_rs::plugin::registry::{ParamInfo, ParamRegistry, RegistryParamType};
@@ -84,7 +84,7 @@ impl DeviceSupport for PointDetectorDeviceSupport {
         self.inner.init(record)
     }
 
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         self.inner.read(record)
     }
 

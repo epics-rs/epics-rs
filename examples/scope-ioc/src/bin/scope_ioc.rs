@@ -17,7 +17,7 @@ use asyn_rs::port::PortDriver;
 use asyn_rs::user::AsynUser;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::device_support::DeviceSupport;
+use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
 use epics_ca_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::iocsh::registry::*;
 use epics_base_rs::server::record::{Record, ScanType};
@@ -168,10 +168,10 @@ impl DeviceSupport for ScopeDeviceSupport {
         Some(rx)
     }
 
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let info = match self.mapping {
             Some(info) => info,
-            None => return Ok(()),
+            None => return Ok(DeviceReadOutcome::ok()),
         };
         let drv = self.driver.lock();
         match info.param_type {
@@ -201,7 +201,7 @@ impl DeviceSupport for ScopeDeviceSupport {
                 record.set_val(EpicsValue::DoubleArray(arr.to_vec()))?;
             }
         }
-        Ok(())
+        Ok(DeviceReadOutcome::ok())
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {

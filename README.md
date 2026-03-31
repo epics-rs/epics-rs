@@ -739,8 +739,8 @@ Final responsibility for correctness of the port remains with the maintainers.
 
 ## License
 
-The Rust code authored in this repository is licensed under MIT. See
-[`LICENSE`](LICENSE).
+This software is distributed under the [EPICS Open License](LICENSE), the same
+license used by EPICS Base and most EPICS community modules.
 
 This repository also reimplements and, in a few places, bundles material from
 EPICS-related upstream projects. See [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES)

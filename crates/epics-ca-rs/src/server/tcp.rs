@@ -474,10 +474,8 @@ async fn dispatch_message(
                 // background task to await completion and send the response.
                 // This avoids blocking the client handler loop, which would
                 // freeze all camonitor subscriptions on this connection.
-                let completion_rx = match write_result {
-                    Ok(rx) => rx,
-                    Err(_) => None,
-                };
+                let completion_rx: Option<tokio::sync::oneshot::Receiver<()>> =
+                    write_result.unwrap_or_default();
 
                 if let Some(rx) = completion_rx {
                     let writer_c = writer.clone();

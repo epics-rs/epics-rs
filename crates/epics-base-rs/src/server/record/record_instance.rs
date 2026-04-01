@@ -370,12 +370,18 @@ impl RecordInstance {
             }
             "ACKS" => {
                 if let EpicsValue::Short(v) = value {
-                    self.common.acks = AlarmSeverity::from_u16(v as u16);
+                    let sev = AlarmSeverity::from_u16(v as u16);
+                    // Writing ACKS clears alarm acknowledge if written severity >= current
+                    if sev >= self.common.sevr {
+                        self.common.acks = AlarmSeverity::NoAlarm;
+                    }
                 }
             }
             "ACKT" => {
-                if let EpicsValue::Char(v) = value {
-                    self.common.ackt = v != 0;
+                match value {
+                    EpicsValue::Char(v) => self.common.ackt = v != 0,
+                    EpicsValue::Short(v) => self.common.ackt = v != 0,
+                    _ => {}
                 }
             }
             "UDF" => {
@@ -920,6 +926,7 @@ impl RecordInstance {
                     if !posting_mask.is_empty() && sub_mask.intersects(posting_mask) {
                         let _ = sub.tx.try_send(MonitorEvent {
                             snapshot: mon_snap.clone(),
+                            origin: 0,
                         });
                     }
                 }
@@ -929,6 +936,11 @@ impl RecordInstance {
 
     /// Notify subscribers of a specific field, filtering by event mask.
     pub fn notify_field(&self, field: &str, mask: crate::server::recgbl::EventMask) {
+        self.notify_field_with_origin(field, mask, 0);
+    }
+
+    /// Notify subscribers with an origin tag for self-write filtering.
+    pub fn notify_field_with_origin(&self, field: &str, mask: crate::server::recgbl::EventMask, origin: u64) {
         if let Some(subs) = self.subscribers.get(field) {
             if let Some(value) = self.resolve_field(field) {
                 let mon_snap = self.make_monitor_snapshot(value);
@@ -937,6 +949,7 @@ impl RecordInstance {
                     if mask.is_empty() || sub_mask.intersects(mask) {
                         let _ = sub.tx.try_send(MonitorEvent {
                             snapshot: mon_snap.clone(),
+                            origin,
                         });
                     }
                 }

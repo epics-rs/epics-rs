@@ -4,7 +4,7 @@ A beamline simulation IOC for epics-rs, inspired by
 [caproto](https://github.com/caproto/caproto)'s
 [`ioc_examples/mini_beamline.py`](https://github.com/caproto/caproto/blob/master/caproto/ioc_examples/mini_beamline.py).
 
-Provides a simulated beam current, three 1D point detectors, one 2D area detector (MovingDot), and five simulation motors.
+Provides a simulated beam current, three 1D point detectors, one 2D area detector (MovingDot), a Kohzu double-crystal monochromator (DCM), an HSC-1 slit controller, a quad BPM, and eight simulation motors.
 
 ## Devices
 
@@ -39,9 +39,46 @@ Follows the ADDriver pattern and supports Single/Multiple/Continuous image modes
 - Background noise: `Poisson(lambda=1000)`
 - When the shutter is closed, only background noise is produced (dark frame)
 
+### Kohzu DCM (Double Crystal Monochromator)
+
+Simulates a Kohzu-style double-crystal monochromator using the `kohzuCtl` state machine from `optics-rs`. Three `SimMotor` axes (Theta, Y, Z) are driven by the controller based on energy setpoint.
+
+| PV | Type | Description |
+|----|------|-------------|
+| `mini:BraggEAO` | ao | Energy setpoint (keV) |
+| `mini:BraggERdbkAO` | ao | Energy readback (keV) |
+| `mini:BraggLambdaRdbkAO` | ao | Wavelength readback (A) |
+| `mini:BraggThetaRdbkAO` | ao | Theta readback (deg) |
+| `mini:KohzuMoving` | busy | Moving indicator |
+| `mini:KohzuModeBO` | bo | Manual(0) / Auto(1) |
+
+Set the energy and the controller calculates the Bragg angle, then drives the theta motor:
+
+```bash
+caput mini:BraggEAO 8.0
+caget mini:BraggThetaRdbkAO
+camonitor mini:dcm:theta.RBV
+```
+
+### HSC-1 Slit Controller
+
+Simulated XIA HSC-1 four-blade slit using `SimHsc` from `optics-rs`. Supports gap/center and individual blade control.
+
+| PV | Description |
+|----|-------------|
+| HSC parameters | Exposed via asyn port driver (H_GAP, H_CENTER, TOP, BOTTOM, LEFT, RIGHT) |
+
+### Quad BPM
+
+Simulated Oxford quad X-ray beam position monitor using `SimQxbpm`. Reports X/Y beam position from four simulated diode currents.
+
+| PV | Description |
+|----|-------------|
+| QXBPM parameters | Exposed via asyn port driver (X_POS, Y_POS, CURRENT_A-D) |
+
 ### Motors
 
-Five full MotorRecords using `SimMotor` from `motor-rs`:
+Eight full MotorRecords using `SimMotor` from `motor-rs`:
 
 | PV | Description |
 |----|-------------|
@@ -50,6 +87,9 @@ Five full MotorRecords using `SimMotor` from `motor-rs`:
 | `mini:slit:mtr` | Slit detector motor |
 | `mini:dot:mtrx` | MovingDot X-axis motor |
 | `mini:dot:mtry` | MovingDot Y-axis motor |
+| `mini:dcm:theta` | DCM Theta motor (-10 to 90 deg) |
+| `mini:dcm:y` | DCM Y motor |
+| `mini:dcm:z` | DCM Z motor |
 
 ## PV Reference
 
@@ -152,6 +192,37 @@ dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=ph:mtr,PORT=ph_mtr")
 | `DOT_BACKGROUND` | 1000.0 | Background noise (Poisson lambda) |
 | `DOT_N_PER_I_PER_S` | 200.0 | Photons per mA per second |
 
+### Optics Devices
+
+Optics devices are configured in `st.cmd`:
+
+```bash
+# Kohzu DCM: 3 SimMotors + kohzuSeq.db + kohzuCtl state machine
+simMotorCreate("dcm_theta", -10, 90, 100)
+simMotorCreate("dcm_y", -50, 50, 100)
+simMotorCreate("dcm_z", -50, 50, 100)
+dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:theta,PORT=dcm_theta")
+dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:y,PORT=dcm_y")
+dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:z,PORT=dcm_z")
+dbLoadRecords("$(OPTICS)/db/kohzuSeq.db", "P=mini:,M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z")
+seqStart("kohzuCtl", "P=mini:,M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z")
+
+# HSC-1 slit: SimHsc port driver
+simHscCreate("HSC1", 100)
+
+# Quad BPM: SimQxbpm port driver (beam at center)
+simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
+```
+
+To switch from simulation to real hardware, replace the `sim*Create` commands:
+
+```bash
+# Real hardware (same DB templates, same seqStart)
+# motorCreate("dcm_theta", "/dev/ttyUSB0", ...)
+# hscCreate("HSC1", "/dev/ttyUSB1", 9600, 100)
+# qxbpmCreate("QXBPM1", "/dev/ttyUSB2", 9600, 100)
+```
+
 ### Example
 
 ```
@@ -219,6 +290,11 @@ The CA server port can be changed with the `EPICS_CA_SERVER_PORT` environment va
 ### Verify
 
 ```bash
+# Set DCM energy and watch the theta motor move
+caput mini:BraggEAO 8.0
+camonitor mini:dcm:theta.RBV
+caget mini:BraggThetaRdbkAO
+
 # Monitor beam current
 camonitor mini:current
 

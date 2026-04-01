@@ -1,0 +1,427 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>371</x>
+        <y>130</y>
+        <width>130</width>
+        <height>100</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>130</width>
+        <height>100</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(218, 218, 218);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>CoarseFineMotor</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="5,55,30,10,2,3,22,3" rowstretch="20,3,2,10,10,20,10,20,5">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="5" column="1" colspan="3">
+        <widget class="PyDMEnumComboBox" name="menu">
+          <property name="geometry">
+            <rect>
+              <x>5</x>
+              <y>45</y>
+              <width>95</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${P}mode</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}mode</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMEnumComboBox#menu {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="1" rowspan="2" colspan="5">
+        <widget class="QLabel" name="text">
+          <property name="geometry">
+            <rect>
+              <x>5</x>
+              <y>25</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Mode</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="0" rowspan="2" colspan="8">
+        <widget class="PyDMDrawingRectangle" name="rectangle">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>0</y>
+              <width>130</width>
+              <height>23</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>255</red>
+                <green>255</green>
+                <blue>255</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>255</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="0" colspan="8">
+        <widget class="QLabel" name="text_1">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>0</y>
+              <width>130</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Coarse/Fine</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_1</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_1 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="4" column="5" rowspan="2" colspan="2">
+        <widget class="PyDMRelatedDisplayButton" name="related_display">
+          <property name="geometry">
+            <rect>
+              <x>102</x>
+              <y>35</y>
+              <width>25</width>
+              <height>30</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>?</string>
+          </property>
+          <property name="text">
+            <string>?</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>18</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>mode descriptions</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>CoarseFineMotorHelp.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="7" column="3" colspan="5">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_1">
+          <property name="geometry">
+            <rect>
+              <x>90</x>
+              <y>75</y>
+              <width>40</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>More</string>
+          </property>
+          <property name="text">
+            <string>More</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_1 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(51, 153, 0);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>Graphic of stage</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>CoarseFineMotorShow.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},M=MOT,PM=${PM},CM=${CM},FM=${FM}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>false</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="7" column="1">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_2">
+          <property name="geometry">
+            <rect>
+              <x>5</x>
+              <y>75</y>
+              <width>55</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>Motors</string>
+          </property>
+          <property name="text">
+            <string>Motors</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_2 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(40, 147, 21);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>Combined {soft} motor</string>
+              <string>Actual motors</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>motorx.ui</string>
+              <string>motor2x.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},M=MOT</string>
+              <string>P=${PM},M1=${CM},M2=${FM}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>menu</zorder>
+    <zorder>text</zorder>
+    <zorder>rectangle</zorder>
+    <zorder>text_1</zorder>
+    <zorder>related_display</zorder>
+    <zorder>related_display_1</zorder>
+    <zorder>related_display_2</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMEnumComboBox</class>
+      <extends>QComboBox</extends>
+      <header>pydm.widgets.enum_combo_box</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLabel</class>
+      <extends>QLabel</extends>
+      <header>pydm.widgets.label</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingRectangle</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMRelatedDisplayButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.related_display_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

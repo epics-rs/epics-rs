@@ -1,5 +1,5 @@
 /// Alarm severity levels matching EPICS base.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 #[repr(u16)]
 pub enum AlarmSeverity {
     #[default]

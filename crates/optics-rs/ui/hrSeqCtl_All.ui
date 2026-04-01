@@ -1,0 +1,5446 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>159</x>
+        <y>54</y>
+        <width>650</width>
+        <height>310</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>650</width>
+        <height>310</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(200, 200, 200);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>hrSeqCtl_All</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="2,3,15,39,1,2,6,6,3,3,2,1,1,10,2,4,3,3,3,1,1,5,5,9,45,15,6,3,1,3,1,1,1,1,3,1,9,5,15,5,5,20,5,16,4,1,2,1,1,1,4,15,40,15,5,5,15,5,4,1,5,6,9,4,1,5,20,5,20,5,20,20,6,9,1,7,12,5,20,3,12,4,1,13,7,4,9,6,1" rowstretch="2,17,1,2,11,1,3,3,3,7,1,3,1,2,3,3,3,3,6,5,3,2,4,1,2,9,1,8,1,1,19,1,1,2,5,4,1,9,3,2,1,2,9,1,1,9,4,1,3,3,2,2,3,1,1,2,2,1,2,1,1,1,3,1,2,10,4,2,1,5,4,2,1,1,2,5,2,3,5,1,2,15,2,15,3,4,3">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="33" column="0" colspan="88">
+        <widget class="PyDMDrawingLine" name="polyline">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>133</y>
+              <width>649</width>
+              <height>2</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="10" column="70" rowspan="9" colspan="9">
+        <widget class="PyDMLineEdit" name="text_entry">
+          <property name="geometry">
+            <rect>
+              <x>490</x>
+              <y>50</y>
+              <width>100</width>
+              <height>25</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta2AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_Theta2AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>15</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="78" rowspan="4">
+        <widget class="PyDMPushButton" name="message_button">
+          <property name="geometry">
+            <rect>
+              <x>570</x>
+              <y>90</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&gt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_Theta2IncBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta2IncBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="71" rowspan="4" colspan="7">
+        <widget class="PyDMLineEdit" name="text_entry_1">
+          <property name="geometry">
+            <rect>
+              <x>510</x>
+              <y>90</y>
+              <width>60</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta2TweakAI</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_Theta2TweakAI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_1 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="70" rowspan="4">
+        <widget class="PyDMPushButton" name="message_button_1">
+          <property name="geometry">
+            <rect>
+              <x>490</x>
+              <y>90</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&lt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_Theta2DecBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta2DecBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_1 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="19" column="70" rowspan="5" colspan="9">
+        <widget class="PyDMLabel" name="text_update">
+          <property name="geometry">
+            <rect>
+              <x>490</x>
+              <y>75</y>
+              <width>100</width>
+              <height>15</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_Theta2AO.DRVL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta2AO.DRVL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>9</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="70" rowspan="3" colspan="9">
+        <widget class="QLabel" name="text">
+          <property name="geometry">
+            <rect>
+              <x>490</x>
+              <y>0</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>TH2 {deg.}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="70" rowspan="6" colspan="9">
+        <widget class="PyDMLabel" name="text_update_1">
+          <property name="geometry">
+            <rect>
+              <x>490</x>
+              <y>34</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_Theta2RdbkAO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta2RdbkAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_1 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="70" rowspan="3" colspan="9">
+        <widget class="PyDMLabel" name="text_update_2">
+          <property name="geometry">
+            <rect>
+              <x>490</x>
+              <y>19</y>
+              <width>100</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_Theta2AO.DRVH</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta2AO.DRVH</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_2 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="19" column="80" rowspan="4" colspan="7">
+        <widget class="QLabel" name="text_1">
+          <property name="geometry">
+            <rect>
+              <x>593</x>
+              <y>75</y>
+              <width>50</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>LowLim</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>236</red>
+                <green>236</green>
+                <blue>236</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_1</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_1 {
+  color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="13" column="80" rowspan="5" colspan="7">
+        <widget class="QLabel" name="text_2">
+          <property name="geometry">
+            <rect>
+              <x>593</x>
+              <y>55</y>
+              <width>50</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Desired</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>236</red>
+                <green>236</green>
+                <blue>236</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_2</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_2 {
+  color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="7" column="80" rowspan="4" colspan="7">
+        <widget class="QLabel" name="text_3">
+          <property name="geometry">
+            <rect>
+              <x>593</x>
+              <y>37</y>
+              <width>50</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Actual</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>236</red>
+                <green>236</green>
+                <blue>236</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_3</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_3 {
+  color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="80" rowspan="3" colspan="7">
+        <widget class="QLabel" name="text_4">
+          <property name="geometry">
+            <rect>
+              <x>593</x>
+              <y>19</y>
+              <width>50</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>HighLim</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>236</red>
+                <green>236</green>
+                <blue>236</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_4</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_4 {
+  color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="10" column="49" rowspan="9" colspan="8">
+        <widget class="PyDMLineEdit" name="text_entry_2">
+          <property name="geometry">
+            <rect>
+              <x>300</x>
+              <y>50</y>
+              <width>100</width>
+              <height>25</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta1AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_Theta1AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>15</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_2 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="55" rowspan="4" colspan="2">
+        <widget class="PyDMPushButton" name="message_button_2">
+          <property name="geometry">
+            <rect>
+              <x>380</x>
+              <y>90</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&gt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_Theta1IncBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta1IncBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_2 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="52" rowspan="4" colspan="3">
+        <widget class="PyDMLineEdit" name="text_entry_3">
+          <property name="geometry">
+            <rect>
+              <x>320</x>
+              <y>90</y>
+              <width>60</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta1TweakAI</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_Theta1TweakAI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_3 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="49" rowspan="4" colspan="3">
+        <widget class="PyDMPushButton" name="message_button_3">
+          <property name="geometry">
+            <rect>
+              <x>300</x>
+              <y>90</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&lt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_Theta1DecBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta1DecBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_3 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="19" column="49" rowspan="5" colspan="8">
+        <widget class="PyDMLabel" name="text_update_3">
+          <property name="geometry">
+            <rect>
+              <x>300</x>
+              <y>75</y>
+              <width>100</width>
+              <height>15</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_Theta1AO.DRVL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta1AO.DRVL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>9</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_3 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="49" rowspan="3" colspan="8">
+        <widget class="QLabel" name="text_5">
+          <property name="geometry">
+            <rect>
+              <x>300</x>
+              <y>0</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>TH1 {deg.}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_5</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_5 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="49" rowspan="6" colspan="8">
+        <widget class="PyDMLabel" name="text_update_4">
+          <property name="geometry">
+            <rect>
+              <x>300</x>
+              <y>34</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_Theta1RdbkAO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta1RdbkAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_4 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="49" rowspan="3" colspan="8">
+        <widget class="PyDMLabel" name="text_update_5">
+          <property name="geometry">
+            <rect>
+              <x>300</x>
+              <y>19</y>
+              <width>100</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_Theta1AO.DRVH</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Theta1AO.DRVH</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_5 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="19" column="20" rowspan="5" colspan="15">
+        <widget class="PyDMLabel" name="text_update_6">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>75</y>
+              <width>100</width>
+              <height>15</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_LambdaAO.DRVL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_LambdaAO.DRVL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>9</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_6 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="10" column="20" rowspan="9" colspan="15">
+        <widget class="PyDMLineEdit" name="text_entry_4">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>50</y>
+              <width>100</width>
+              <height>25</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_LambdaAO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_LambdaAO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>15</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_4 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="26" rowspan="4" colspan="9">
+        <widget class="PyDMPushButton" name="message_button_4">
+          <property name="geometry">
+            <rect>
+              <x>190</x>
+              <y>90</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&gt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_LambdaIncBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_LambdaIncBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_4 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="24" rowspan="4">
+        <widget class="PyDMLineEdit" name="text_entry_5">
+          <property name="geometry">
+            <rect>
+              <x>130</x>
+              <y>90</y>
+              <width>45</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_LambdaTweakAI</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_LambdaTweakAI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_5 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="20" rowspan="4" colspan="4">
+        <widget class="PyDMPushButton" name="message_button_5">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>90</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&lt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_LambdaDecBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_LambdaDecBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_5 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="25" column="25" rowspan="2">
+        <widget class="PyDMLabel" name="text_update_7">
+          <property name="geometry">
+            <rect>
+              <x>175</x>
+              <y>92</y>
+              <width>15</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_LambdaTweakAI.EGU</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_LambdaTweakAI.EGU</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_7 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="19" column="0" rowspan="5" colspan="16">
+        <widget class="PyDMLabel" name="text_update_8">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>75</y>
+              <width>100</width>
+              <height>15</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_EAO.DRVL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_EAO.DRVL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>9</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_8 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="10" column="0" rowspan="9" colspan="16">
+        <widget class="PyDMLineEdit" name="text_entry_6">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>50</y>
+              <width>100</width>
+              <height>25</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_EAO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_EAO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>15</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_6 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="3" rowspan="4" colspan="2">
+        <widget class="PyDMLineEdit" name="text_entry_7">
+          <property name="geometry">
+            <rect>
+              <x>20</x>
+              <y>90</y>
+              <width>40</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_ETweakAI</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_ETweakAI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_7 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="0" rowspan="4" colspan="3">
+        <widget class="PyDMPushButton" name="message_button_6">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>90</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&lt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_EDecBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_EDecBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_6 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="10" rowspan="4" colspan="6">
+        <widget class="PyDMPushButton" name="message_button_7">
+          <property name="geometry">
+            <rect>
+              <x>80</x>
+              <y>90</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&gt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_EIncBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_EIncBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_7 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="25" column="5" rowspan="2" colspan="5">
+        <widget class="PyDMLabel" name="text_update_9">
+          <property name="geometry">
+            <rect>
+              <x>60</x>
+              <y>92</y>
+              <width>20</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_ETweakAI.EGU</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_ETweakAI.EGU</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_9 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="0" rowspan="3" colspan="16">
+        <widget class="PyDMLabel" name="text_update_10">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>19</y>
+              <width>100</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_EAO.DRVH</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_EAO.DRVH</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_10 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="0" rowspan="6" colspan="16">
+        <widget class="PyDMLabel" name="text_update_11">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>34</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_ERdbkAO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_ERdbkAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_11 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="0" rowspan="3" colspan="16">
+        <widget class="QLabel" name="text_6">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>0</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>E {keV}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_6</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_6 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="20" rowspan="6" colspan="15">
+        <widget class="PyDMLabel" name="text_update_12">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>34</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_LambdaRdbkAO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_LambdaRdbkAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_12 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="20" rowspan="3" colspan="15">
+        <widget class="PyDMLabel" name="text_update_13">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>19</y>
+              <width>100</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_LambdaAO.DRVH</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_LambdaAO.DRVH</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_13 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="20" rowspan="3" colspan="15">
+        <widget class="QLabel" name="text_7">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>0</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Lambda {A}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_7</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_7 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="37" rowspan="28" colspan="12">
+        <widget class="PyDMDrawingRectangle" name="rectangle">
+          <property name="geometry">
+            <rect>
+              <x>220</x>
+              <y>0</y>
+              <width>80</width>
+              <height>110</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>174</red>
+                <green>174</green>
+                <blue>174</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>174</red>
+              <green>174</green>
+              <blue>174</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="43" rowspan="3" colspan="2">
+        <widget class="QLabel" name="text_8">
+          <property name="geometry">
+            <rect>
+              <x>275</x>
+              <y>2</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>L1</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_8</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_8 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="43" rowspan="5" colspan="2">
+        <widget class="PyDMLineEdit" name="text_entry_8">
+          <property name="geometry">
+            <rect>
+              <x>275</x>
+              <y>20</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_L1AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_L1AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_8 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="41" rowspan="3">
+        <widget class="QLabel" name="text_9">
+          <property name="geometry">
+            <rect>
+              <x>250</x>
+              <y>2</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>K1</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_9</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_9 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="41" rowspan="5">
+        <widget class="PyDMLineEdit" name="text_entry_9">
+          <property name="geometry">
+            <rect>
+              <x>250</x>
+              <y>20</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_K1AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_K1AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_9 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="38" rowspan="3" colspan="2">
+        <widget class="QLabel" name="text_10">
+          <property name="geometry">
+            <rect>
+              <x>225</x>
+              <y>2</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>H1</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_10</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_10 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="38" rowspan="5" colspan="2">
+        <widget class="PyDMLineEdit" name="text_entry_10">
+          <property name="geometry">
+            <rect>
+              <x>225</x>
+              <y>20</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_H1AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_H1AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_10 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="9" column="38" rowspan="5" colspan="2">
+        <widget class="QLabel" name="text_11">
+          <property name="geometry">
+            <rect>
+              <x>225</x>
+              <y>43</y>
+              <width>20</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>a</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_11</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_11 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="8" column="39" rowspan="7" colspan="6">
+        <widget class="PyDMLineEdit" name="text_entry_11">
+          <property name="geometry">
+            <rect>
+              <x>240</x>
+              <y>40</y>
+              <width>55</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_A1AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_A1AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_11 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="16" column="39" rowspan="5" colspan="6">
+        <widget class="PyDMLineEdit" name="text_entry_12">
+          <property name="geometry">
+            <rect>
+              <x>240</x>
+              <y>63</y>
+              <width>55</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_2d1AO</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_2d1AO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_12 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="17" column="38" rowspan="3" colspan="2">
+        <widget class="QLabel" name="text_12">
+          <property name="geometry">
+            <rect>
+              <x>225</x>
+              <y>66</y>
+              <width>20</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>2d</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_12</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_12 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="22" column="38" rowspan="4" colspan="7">
+        <widget class="PyDMEnumComboBox" name="menu">
+          <property name="geometry">
+            <rect>
+              <x>225</x>
+              <y>85</y>
+              <width>70</width>
+              <height>16</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_1TypeMO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_1TypeMO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>9</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMEnumComboBox#menu {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="37" rowspan="28" colspan="12">
+        <widget class="PyDMDrawingRectangle" name="rectangle_1">
+          <property name="geometry">
+            <rect>
+              <x>220</x>
+              <y>0</y>
+              <width>80</width>
+              <height>110</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_1</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="60" rowspan="28" colspan="10">
+        <widget class="PyDMDrawingRectangle" name="rectangle_2">
+          <property name="geometry">
+            <rect>
+              <x>410</x>
+              <y>0</y>
+              <width>80</width>
+              <height>110</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>174</red>
+                <green>174</green>
+                <blue>174</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>174</red>
+              <green>174</green>
+              <blue>174</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_2</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="68" rowspan="3">
+        <widget class="QLabel" name="text_13">
+          <property name="geometry">
+            <rect>
+              <x>465</x>
+              <y>2</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>L2</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_13</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_13 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="68" rowspan="5">
+        <widget class="PyDMLineEdit" name="text_entry_13">
+          <property name="geometry">
+            <rect>
+              <x>465</x>
+              <y>20</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_L2AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_L2AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_13 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="66" rowspan="3">
+        <widget class="QLabel" name="text_14">
+          <property name="geometry">
+            <rect>
+              <x>440</x>
+              <y>2</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>K2</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_14</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_14 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="66" rowspan="5">
+        <widget class="PyDMLineEdit" name="text_entry_14">
+          <property name="geometry">
+            <rect>
+              <x>440</x>
+              <y>20</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_K2AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_K2AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_14 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="61" rowspan="3" colspan="4">
+        <widget class="QLabel" name="text_15">
+          <property name="geometry">
+            <rect>
+              <x>415</x>
+              <y>2</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>H2</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_15</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_15 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="61" rowspan="5" colspan="4">
+        <widget class="PyDMLineEdit" name="text_entry_15">
+          <property name="geometry">
+            <rect>
+              <x>415</x>
+              <y>20</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_H2AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_H2AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_15 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="9" column="61" rowspan="5" colspan="2">
+        <widget class="QLabel" name="text_16">
+          <property name="geometry">
+            <rect>
+              <x>415</x>
+              <y>43</y>
+              <width>15</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>a</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_16</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_16 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="8" column="63" rowspan="7" colspan="6">
+        <widget class="PyDMLineEdit" name="text_entry_16">
+          <property name="geometry">
+            <rect>
+              <x>430</x>
+              <y>40</y>
+              <width>55</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_A2AO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_A2AO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_16 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="16" column="63" rowspan="5" colspan="6">
+        <widget class="PyDMLineEdit" name="text_entry_17">
+          <property name="geometry">
+            <rect>
+              <x>430</x>
+              <y>63</y>
+              <width>55</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_2d2AO</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_2d2AO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_17 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="17" column="61" rowspan="3" colspan="2">
+        <widget class="QLabel" name="text_17">
+          <property name="geometry">
+            <rect>
+              <x>415</x>
+              <y>66</y>
+              <width>15</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>2d</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_17</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_17 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="22" column="61" rowspan="4" colspan="8">
+        <widget class="PyDMEnumComboBox" name="menu_1">
+          <property name="geometry">
+            <rect>
+              <x>415</x>
+              <y>85</y>
+              <width>70</width>
+              <height>16</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_2TypeMO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_2TypeMO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>9</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMEnumComboBox#menu_1 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="60" rowspan="28" colspan="10">
+        <widget class="PyDMDrawingRectangle" name="rectangle_3">
+          <property name="geometry">
+            <rect>
+              <x>410</x>
+              <y>0</y>
+              <width>80</width>
+              <height>110</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_3</string>
+          </property>
+        </widget>
+      </item>
+      <item row="72" column="76" rowspan="9" colspan="8">
+        <widget class="PyDMLabel" name="text_18">
+          <property name="geometry">
+            <rect>
+              <x>553</x>
+              <y>246</y>
+              <width>70</width>
+              <height>22</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Moving</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>13</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>153</red>
+                <green>255</green>
+                <blue>255</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}HR${N}_Moving&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="toolTip">
+            <string>text_18</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_18 {
+  color: rgb(153, 255, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="48" column="21" rowspan="6" colspan="8">
+        <widget class="PyDMLabel" name="text_update_14">
+          <property name="geometry">
+            <rect>
+              <x>111</x>
+              <y>187</y>
+              <width>89</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1CmdAO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1CmdAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_14 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="45" column="22" rowspan="3" colspan="5">
+        <widget class="PyDMLabel" name="text_update_15">
+          <property name="geometry">
+            <rect>
+              <x>116</x>
+              <y>173</y>
+              <width>80</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1RdbkAI</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1RdbkAI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_15 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="44" column="19" rowspan="11" colspan="11">
+        <widget class="PyDMDrawingRectangle" name="rectangle_4">
+          <property name="geometry">
+            <rect>
+              <x>109</x>
+              <y>172</y>
+              <width>94</width>
+              <height>30</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>115</red>
+                <green>255</green>
+                <blue>107</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>115</red>
+              <green>255</green>
+              <blue>107</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}HR${N}_phi1DmovBI&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_4</string>
+          </property>
+        </widget>
+      </item>
+      <item row="35" column="18" rowspan="6" colspan="9">
+        <widget class="QLabel" name="text_19">
+          <property name="geometry">
+            <rect>
+              <x>106</x>
+              <y>140</y>
+              <width>90</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Phi 1</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_19</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_19 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="55" column="32" rowspan="9" colspan="16">
+        <widget class="PyDMLabel" name="text_update_16">
+          <property name="geometry">
+            <rect>
+              <x>205</x>
+              <y>202</y>
+              <width>94</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi2SetAO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi2SetAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_16 {
+  color: rgb(205, 97, 0);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="55" column="20" rowspan="9" colspan="11">
+        <widget class="PyDMLabel" name="text_update_17">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>202</y>
+              <width>94</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1SetAO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1SetAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_17 {
+  color: rgb(205, 97, 0);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="63" column="20" rowspan="6" colspan="11">
+        <widget class="PyDMLineEdit" name="text_entry_18">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>215</y>
+              <width>94</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1OffAO</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_phi1OffAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_18 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="63" column="32" rowspan="6" colspan="16">
+        <widget class="PyDMLineEdit" name="text_entry_19">
+          <property name="geometry">
+            <rect>
+              <x>205</x>
+              <y>215</y>
+              <width>94</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi2OffAO</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_phi2OffAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_19 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="44" column="36" rowspan="3" colspan="8">
+        <widget class="PyDMLabel" name="text_update_18">
+          <property name="geometry">
+            <rect>
+              <x>211</x>
+              <y>172</y>
+              <width>80</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi2RdbkAI</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi2RdbkAI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_18 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="50" column="15" rowspan="11" colspan="8">
+        <widget class="PyDMDrawingPie" name="arc">
+          <property name="geometry">
+            <rect>
+              <x>96</x>
+              <y>193</y>
+              <width>25</width>
+              <height>18</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>225</red>
+                <green>144</green>
+                <blue>21</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>225</red>
+              <green>144</green>
+              <blue>21</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="startAngle" stdset="0">
+            <double>90.0</double>
+          </property>
+          <property name="spanAngle" stdset="0">
+            <double>-180.0</double>
+          </property>
+        </widget>
+      </item>
+      <item row="49" column="17" rowspan="4" colspan="4">
+        <widget class="PyDMDrawingPolyline" name="polyline_1">
+          <property name="geometry">
+            <rect>
+              <x>103</x>
+              <y>190</y>
+              <width>8</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_1</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>225</red>
+                <green>144</green>
+                <blue>21</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>225</red>
+              <green>144</green>
+              <blue>21</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="points" stdset="0">
+            <stringlist>
+              <string>-1, -1</string>
+              <string>5, 2</string>
+              <string>-1, 7</string>
+            </stringlist>
+          </property>
+        </widget>
+      </item>
+      <item row="56" column="8" colspan="6">
+        <widget class="PyDMDrawingLine" name="polyline_2">
+          <property name="geometry">
+            <rect>
+              <x>74</x>
+              <y>204</y>
+              <width>20</width>
+              <height>2</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_2</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>225</red>
+                <green>144</green>
+                <blue>21</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::DashLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>225</red>
+              <green>144</green>
+              <blue>21</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::DashLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="35" column="36" rowspan="6" colspan="14">
+        <widget class="QLabel" name="text_20">
+          <property name="geometry">
+            <rect>
+              <x>211</x>
+              <y>140</y>
+              <width>90</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Phi 2</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_20</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_20 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="39" column="20" rowspan="4" colspan="8">
+        <widget class="PyDMLabel" name="text_update_19">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>157</y>
+              <width>89</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1PvSI</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1PvSI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_19 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="39" column="33" rowspan="4" colspan="12">
+        <widget class="PyDMLabel" name="text_update_20">
+          <property name="geometry">
+            <rect>
+              <x>206</x>
+              <y>157</y>
+              <width>89</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi2PvSI</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi2PvSI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_20 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="48" column="34" rowspan="6" colspan="12">
+        <widget class="PyDMLabel" name="text_update_21">
+          <property name="geometry">
+            <rect>
+              <x>207</x>
+              <y>187</y>
+              <width>89</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi2CmdAO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi2CmdAO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_21 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="44" column="31" rowspan="11" colspan="16">
+        <widget class="PyDMDrawingRectangle" name="rectangle_5">
+          <property name="geometry">
+            <rect>
+              <x>204</x>
+              <y>172</y>
+              <width>94</width>
+              <height>30</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>115</red>
+                <green>255</green>
+                <blue>107</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>115</red>
+              <green>255</green>
+              <blue>107</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}HR${N}_phi2DmovBI&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_5</string>
+          </property>
+        </widget>
+      </item>
+      <item row="42" column="1" rowspan="16" colspan="8">
+        <widget class="PyDMEnumButton" name="choice_button">
+          <property name="geometry">
+            <rect>
+              <x>2</x>
+              <y>162</y>
+              <width>75</width>
+              <height>45</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_ModeBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_ModeBO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>13</pointsize>
+            </font>
+          </property>
+          <property name="orientation" stdset="0">
+            <number>2</number>
+          </property>
+          <property name="horizontalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="verticalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginTop" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginBottom" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginLeft" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginRight" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMEnumButton#choice_button {
+  color: rgb(0, 0, 0);
+  background-color: rgb(225, 144, 21);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }
+QPushButton {
+  color: rgb(0, 0, 0);
+  background-color: rgb(225, 144, 21);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="60" column="1" rowspan="9" colspan="8">
+        <widget class="PyDMPushButton" name="message_button_8">
+          <property name="geometry">
+            <rect>
+              <x>2</x>
+              <y>210</y>
+              <width>75</width>
+              <height>25</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Move</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>15</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_PutBO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_PutBO</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_8 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(225, 144, 21);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="55" column="51" rowspan="9" colspan="3">
+        <widget class="QLabel" name="text_21">
+          <property name="geometry">
+            <rect>
+              <x>305</x>
+              <y>202</y>
+              <width>70</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Motor Write</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>205</red>
+                <green>97</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_21</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_21 {
+  color: rgb(205, 97, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="44" column="51" rowspan="3" colspan="3">
+        <widget class="QLabel" name="text_22">
+          <property name="geometry">
+            <rect>
+              <x>305</x>
+              <y>172</y>
+              <width>70</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Motor Read</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>45</red>
+                <green>45</green>
+                <blue>45</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_22</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_22 {
+  color: rgb(45, 45, 45);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="48" column="51" rowspan="6" colspan="3">
+        <widget class="QLabel" name="text_23">
+          <property name="geometry">
+            <rect>
+              <x>305</x>
+              <y>187</y>
+              <width>70</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Motor Write</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>45</red>
+                <green>45</green>
+                <blue>45</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_23</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_23 {
+  color: rgb(45, 45, 45);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="39" column="51" rowspan="4" colspan="7">
+        <widget class="QLabel" name="text_24">
+          <property name="geometry">
+            <rect>
+              <x>305</x>
+              <y>157</y>
+              <width>100</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Motor PV name</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>45</red>
+                <green>45</green>
+                <blue>45</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_24</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_24 {
+  color: rgb(45, 45, 45);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="65" column="51" rowspan="2" colspan="3">
+        <widget class="QLabel" name="text_25">
+          <property name="geometry">
+            <rect>
+              <x>305</x>
+              <y>218</y>
+              <width>70</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Offset</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>45</red>
+                <green>45</green>
+                <blue>45</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_25</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_25 {
+  color: rgb(45, 45, 45);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="68" column="51" rowspan="6" colspan="3">
+        <widget class="QLabel" name="text_26">
+          <property name="geometry">
+            <rect>
+              <x>305</x>
+              <y>234</y>
+              <width>70</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Angle</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>45</red>
+                <green>45</green>
+                <blue>45</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_26</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_26 {
+  color: rgb(45, 45, 45);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="44" column="56" rowspan="2" colspan="4">
+        <widget class="PyDMLabel" name="text_update_22">
+          <property name="geometry">
+            <rect>
+              <x>385</x>
+              <y>172</y>
+              <width>25</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1RdbkAI.EGU</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1RdbkAI.EGU</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_22 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="48" column="56" rowspan="4" colspan="4">
+        <widget class="PyDMLabel" name="text_update_23">
+          <property name="geometry">
+            <rect>
+              <x>385</x>
+              <y>187</y>
+              <width>25</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1CmdAO.EGU</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1CmdAO.EGU</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_23 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="55" column="56" rowspan="7" colspan="4">
+        <widget class="PyDMLabel" name="text_update_24">
+          <property name="geometry">
+            <rect>
+              <x>385</x>
+              <y>202</y>
+              <width>25</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1SetAO.EGU</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1SetAO.EGU</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_24 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="65" column="53" colspan="7">
+        <widget class="PyDMLabel" name="text_update_25">
+          <property name="geometry">
+            <rect>
+              <x>360</x>
+              <y>218</y>
+              <width>50</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1OffAO.EGU</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1OffAO.EGU</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_25 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="68" column="53" rowspan="3" colspan="7">
+        <widget class="PyDMLabel" name="text_update_26">
+          <property name="geometry">
+            <rect>
+              <x>360</x>
+              <y>234</y>
+              <width>50</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1AO.EGU</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1AO.EGU</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_26 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="39" column="0" rowspan="31" colspan="13">
+        <widget class="PyDMDrawingRectangle" name="rectangle_6">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>157</y>
+              <width>84</width>
+              <height>83</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>225</red>
+                <green>144</green>
+                <blue>21</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>225</red>
+              <green>144</green>
+              <blue>21</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_6</string>
+          </property>
+        </widget>
+      </item>
+      <item row="68" column="32" rowspan="6" colspan="16">
+        <widget class="PyDMLabel" name="text_update_27">
+          <property name="geometry">
+            <rect>
+              <x>205</x>
+              <y>234</y>
+              <width>94</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi2AO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi2AO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_27 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="68" column="20" rowspan="6" colspan="11">
+        <widget class="PyDMLabel" name="text_update_28">
+          <property name="geometry">
+            <rect>
+              <x>110</x>
+              <y>234</y>
+              <width>94</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_phi1AO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_phi1AO</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_28 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="72" column="76" rowspan="9" colspan="8">
+        <widget class="PyDMLabel" name="text_27">
+          <property name="geometry">
+            <rect>
+              <x>553</x>
+              <y>246</y>
+              <width>70</width>
+              <height>22</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Done</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>13</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>77</red>
+                <green>82</green>
+                <blue>164</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}HR${N}_Moving&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="toolTip">
+            <string>text_27</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_27 {
+  color: rgb(77, 82, 164);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="59" column="75" rowspan="14" colspan="11">
+        <widget class="PyDMPushButton" name="message_button_9">
+          <property name="geometry">
+            <rect>
+              <x>546</x>
+              <y>209</y>
+              <width>88</width>
+              <height>38</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>All Stop</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>20</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}allstop.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}allstop.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_9 {
+  color: rgb(251, 243, 74);
+  background-color: rgb(253, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="51" column="63" rowspan="24" colspan="9">
+        <widget class="PyDMEnumButton" name="choice_button_1">
+          <property name="geometry">
+            <rect>
+              <x>430</x>
+              <y>195</y>
+              <width>100</width>
+              <height>55</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_Mode2MO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_Mode2MO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>10</pointsize>
+            </font>
+          </property>
+          <property name="orientation" stdset="0">
+            <number>2</number>
+          </property>
+          <property name="horizontalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="verticalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginTop" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginBottom" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginLeft" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginRight" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMEnumButton#choice_button_1 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }
+QPushButton {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="41" column="63" rowspan="5" colspan="9">
+        <widget class="PyDMEnumButton" name="choice_button_2">
+          <property name="geometry">
+            <rect>
+              <x>430</x>
+              <y>160</y>
+              <width>100</width>
+              <height>22</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_UseSetBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_UseSetBO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>13</pointsize>
+            </font>
+          </property>
+          <property name="orientation" stdset="0">
+            <number>1</number>
+          </property>
+          <property name="horizontalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="verticalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginTop" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginBottom" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginLeft" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginRight" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMEnumButton#choice_button_2 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }
+QPushButton {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="37" column="63" rowspan="3" colspan="9">
+        <widget class="QLabel" name="text_28">
+          <property name="geometry">
+            <rect>
+              <x>430</x>
+              <y>145</y>
+              <width>100</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Calibration</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>45</red>
+                <green>45</green>
+                <blue>45</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_28</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_28 {
+  color: rgb(45, 45, 45);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="78" column="7" rowspan="8" colspan="57">
+        <widget class="PyDMDrawingRectangle" name="rectangle_7">
+          <property name="geometry">
+            <rect>
+              <x>68</x>
+              <y>260</y>
+              <width>366</width>
+              <height>47</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}HR${N}_AlertBO&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_7</string>
+          </property>
+        </widget>
+      </item>
+      <item row="79" column="11" rowspan="3" colspan="51">
+        <widget class="PyDMLabel" name="text_update_29">
+          <property name="geometry">
+            <rect>
+              <x>82</x>
+              <y>265</y>
+              <width>339</width>
+              <height>18</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_SeqMsg1SI</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_SeqMsg1SI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>10</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_29 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="83" column="11" rowspan="2" colspan="51">
+        <widget class="PyDMLabel" name="text_update_30">
+          <property name="geometry">
+            <rect>
+              <x>82</x>
+              <y>285</y>
+              <width>339</width>
+              <height>18</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_SeqMsg2SI</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_SeqMsg2SI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>10</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_30 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(236, 236, 236);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="80" column="2" rowspan="4" colspan="2">
+        <widget class="PyDMPushButton" name="message_button_10">
+          <property name="geometry">
+            <rect>
+              <x>5</x>
+              <y>266</y>
+              <width>54</width>
+              <height>34</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>OK</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>20</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_OperAckBO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_OperAckBO</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_10 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="76" column="0" colspan="73">
+        <widget class="PyDMDrawingLine" name="polyline_3">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>255</y>
+              <width>536</width>
+              <height>2</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_3</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="39" column="74" rowspan="7" colspan="11">
+        <widget class="PyDMLineEdit" name="text_entry_20">
+          <property name="geometry">
+            <rect>
+              <x>545</x>
+              <y>157</y>
+              <width>85</width>
+              <height>25</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_worldOffAO.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_worldOffAO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>15</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_20 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="46" column="83" rowspan="9" colspan="2">
+        <widget class="PyDMPushButton" name="message_button_11">
+          <property name="geometry">
+            <rect>
+              <x>610</x>
+              <y>182</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&gt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_worldIncBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_worldIncBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_11 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="46" column="77" rowspan="9" colspan="6">
+        <widget class="PyDMLineEdit" name="text_entry_21">
+          <property name="geometry">
+            <rect>
+              <x>565</x>
+              <y>182</y>
+              <width>45</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_worldTweakAI</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_worldTweakAI</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_21 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="46" column="74" rowspan="9" colspan="3">
+        <widget class="PyDMPushButton" name="message_button_12">
+          <property name="geometry">
+            <rect>
+              <x>545</x>
+              <y>182</y>
+              <width>20</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>&lt;</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_worldDecBO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_worldDecBO.VAL</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_12 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="35" column="74" rowspan="6" colspan="7">
+        <widget class="QLabel" name="text_29">
+          <property name="geometry">
+            <rect>
+              <x>545</x>
+              <y>140</y>
+              <width>60</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>world</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_29</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_29 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="36" column="81" rowspan="2" colspan="4">
+        <widget class="PyDMLabel" name="text_update_31">
+          <property name="geometry">
+            <rect>
+              <x>605</x>
+              <y>144</y>
+              <width>25</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}HR${N}_worldOffAO.EGU</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_worldOffAO.EGU</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update_31 {
+  color: rgb(10, 0, 184);
+  background-color: rgb(200, 200, 200);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="29" column="0" rowspan="2" colspan="5">
+        <widget class="PyDMRelatedDisplayButton" name="related_display">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>111</y>
+              <width>60</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>ScanParm</string>
+          </property>
+          <property name="text">
+            <string>ScanParm</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display {
+  color: rgb(255, 255, 255);
+  background-color: rgb(51, 153, 0);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>Setup scan parameters</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>scanParms.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},Q=HR${N}_E,PV=HR${N}_EAO</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="29" column="11" rowspan="2" colspan="6">
+        <widget class="PyDMPushButton" name="message_button_13">
+          <property name="geometry">
+            <rect>
+              <x>82</x>
+              <y>111</y>
+              <width>21</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Go</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_E:scanParms.GO</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_E:scanParms.GO</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_13 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="29" column="6" rowspan="2" colspan="6">
+        <widget class="PyDMPushButton" name="message_button_14">
+          <property name="geometry">
+            <rect>
+              <x>62</x>
+              <y>111</y>
+              <width>21</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Ld</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_E:scanParms.LOAD</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_E:scanParms.LOAD</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_14 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="30" column="59" rowspan="2" colspan="23">
+        <widget class="PyDMEnumButton" name="choice_button_3">
+          <property name="geometry">
+            <rect>
+              <x>409</x>
+              <y>112</y>
+              <width>200</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${P}HR${N}_GeomMO.VAL</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}HR${N}_GeomMO.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="orientation" stdset="0">
+            <number>1</number>
+          </property>
+          <property name="horizontalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="verticalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginTop" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginBottom" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginLeft" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginRight" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMEnumButton#choice_button_3 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }
+QPushButton {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>polyline</zorder>
+    <zorder>text_entry</zorder>
+    <zorder>message_button</zorder>
+    <zorder>text_entry_1</zorder>
+    <zorder>message_button_1</zorder>
+    <zorder>text_update</zorder>
+    <zorder>text</zorder>
+    <zorder>text_update_1</zorder>
+    <zorder>text_update_2</zorder>
+    <zorder>text_1</zorder>
+    <zorder>text_2</zorder>
+    <zorder>text_3</zorder>
+    <zorder>text_4</zorder>
+    <zorder>text_entry_2</zorder>
+    <zorder>message_button_2</zorder>
+    <zorder>text_entry_3</zorder>
+    <zorder>message_button_3</zorder>
+    <zorder>text_update_3</zorder>
+    <zorder>text_5</zorder>
+    <zorder>text_update_4</zorder>
+    <zorder>text_update_5</zorder>
+    <zorder>text_update_6</zorder>
+    <zorder>text_entry_4</zorder>
+    <zorder>message_button_4</zorder>
+    <zorder>text_entry_5</zorder>
+    <zorder>message_button_5</zorder>
+    <zorder>text_update_7</zorder>
+    <zorder>text_update_8</zorder>
+    <zorder>text_entry_6</zorder>
+    <zorder>text_entry_7</zorder>
+    <zorder>message_button_6</zorder>
+    <zorder>message_button_7</zorder>
+    <zorder>text_update_9</zorder>
+    <zorder>text_update_10</zorder>
+    <zorder>text_update_11</zorder>
+    <zorder>text_6</zorder>
+    <zorder>text_update_12</zorder>
+    <zorder>text_update_13</zorder>
+    <zorder>text_7</zorder>
+    <zorder>rectangle</zorder>
+    <zorder>text_8</zorder>
+    <zorder>text_entry_8</zorder>
+    <zorder>text_9</zorder>
+    <zorder>text_entry_9</zorder>
+    <zorder>text_10</zorder>
+    <zorder>text_entry_10</zorder>
+    <zorder>text_11</zorder>
+    <zorder>text_entry_11</zorder>
+    <zorder>text_entry_12</zorder>
+    <zorder>text_12</zorder>
+    <zorder>menu</zorder>
+    <zorder>rectangle_1</zorder>
+    <zorder>rectangle_2</zorder>
+    <zorder>text_13</zorder>
+    <zorder>text_entry_13</zorder>
+    <zorder>text_14</zorder>
+    <zorder>text_entry_14</zorder>
+    <zorder>text_15</zorder>
+    <zorder>text_entry_15</zorder>
+    <zorder>text_16</zorder>
+    <zorder>text_entry_16</zorder>
+    <zorder>text_entry_17</zorder>
+    <zorder>text_17</zorder>
+    <zorder>menu_1</zorder>
+    <zorder>rectangle_3</zorder>
+    <zorder>text_18</zorder>
+    <zorder>text_update_14</zorder>
+    <zorder>text_update_15</zorder>
+    <zorder>rectangle_4</zorder>
+    <zorder>text_19</zorder>
+    <zorder>text_update_16</zorder>
+    <zorder>text_update_17</zorder>
+    <zorder>text_entry_18</zorder>
+    <zorder>text_entry_19</zorder>
+    <zorder>text_update_18</zorder>
+    <zorder>arc</zorder>
+    <zorder>polyline_1</zorder>
+    <zorder>polyline_2</zorder>
+    <zorder>text_20</zorder>
+    <zorder>text_update_19</zorder>
+    <zorder>text_update_20</zorder>
+    <zorder>text_update_21</zorder>
+    <zorder>rectangle_5</zorder>
+    <zorder>choice_button</zorder>
+    <zorder>message_button_8</zorder>
+    <zorder>text_21</zorder>
+    <zorder>text_22</zorder>
+    <zorder>text_23</zorder>
+    <zorder>text_24</zorder>
+    <zorder>text_25</zorder>
+    <zorder>text_26</zorder>
+    <zorder>text_update_22</zorder>
+    <zorder>text_update_23</zorder>
+    <zorder>text_update_24</zorder>
+    <zorder>text_update_25</zorder>
+    <zorder>text_update_26</zorder>
+    <zorder>rectangle_6</zorder>
+    <zorder>text_update_27</zorder>
+    <zorder>text_update_28</zorder>
+    <zorder>text_27</zorder>
+    <zorder>message_button_9</zorder>
+    <zorder>choice_button_1</zorder>
+    <zorder>choice_button_2</zorder>
+    <zorder>text_28</zorder>
+    <zorder>rectangle_7</zorder>
+    <zorder>text_update_29</zorder>
+    <zorder>text_update_30</zorder>
+    <zorder>message_button_10</zorder>
+    <zorder>polyline_3</zorder>
+    <zorder>text_entry_20</zorder>
+    <zorder>message_button_11</zorder>
+    <zorder>text_entry_21</zorder>
+    <zorder>message_button_12</zorder>
+    <zorder>text_29</zorder>
+    <zorder>text_update_31</zorder>
+    <zorder>related_display</zorder>
+    <zorder>message_button_13</zorder>
+    <zorder>message_button_14</zorder>
+    <zorder>choice_button_3</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMDrawingPolyline</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingLine</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLineEdit</class>
+      <extends>QLineEdit</extends>
+      <header>pydm.widgets.line_edit</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMPushButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.pushbutton</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLabel</class>
+      <extends>QLabel</extends>
+      <header>pydm.widgets.label</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingRectangle</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMEnumComboBox</class>
+      <extends>QComboBox</extends>
+      <header>pydm.widgets.enum_combo_box</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingPie</class>
+      <extends>PyDMDrawingArc</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMEnumButton</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.enum_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMRelatedDisplayButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.related_display_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingArc</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+  </customwidgets>
+</ui>

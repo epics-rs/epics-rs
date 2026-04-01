@@ -1,0 +1,77 @@
+record(transform,"$(P)$(H)transcalc")
+{
+    field(INPA,"$(P)$(H)trans$(A) CP NMS")
+    field(INPB,"$(P)$(H)trans$(B) CP NMS")
+    field(CLCC,"A*B")
+    field(CLCD,"1/C")
+    field(OUTC,"$(P)$(H)trans PP NMS")
+    field(OUTD,"$(P)$(H)invTrans PP NMS")
+}
+record(ao,"$(P)$(H)filterAl")
+{
+	field(VAL,"0")
+	field(DESC,"Al filter thickness")
+	field(EGU, "mm")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)filterTi")
+{
+	field(VAL,"0")
+	field(DESC,"Ti filter thickness")
+	field(EGU, "mm")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)filterGlass")
+{
+	field(VAL,"0")
+	field(DESC,"Glass filter thickness")
+	field(EGU, "mm")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)trans")
+{
+	field(VAL,"1")
+	field(DESC,"selected transmission")
+	field(EGU, "")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)invTrans")
+{
+	field(VAL,"1")
+	field(DESC,"1/transmission")
+	field(EGU, "")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)E:local")
+{
+	field(DESC,"energy")
+	field(EGU, "keV")
+	field(HOPR,"400")
+	field(LOPR,"1")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)displayEnergy")
+{
+	field(DESC,"energy")
+	field(EGU, "keV")
+	field(HOPR,"400")
+	field(LOPR,"1")
+	field(PREC,"3")
+}
+record(bo,"$(P)$(H)useMono")
+{
+	field(VAL,"1")
+	field(ZNAM,"local E")
+	field(ONAM,"mono E")
+	field(DESC,"local/mono energy")
+}
+record(stringout,"$(P)$(H)OtherShow") {
+}
+record(waveform,"$(P)$(H)E") {
+	field(NELM, "300")
+	field(FTVL,"FLOAT")
+}
+record(waveform,"$(P)$(H)T") {
+	field(NELM, "300")
+	field(FTVL,"FLOAT")
+}

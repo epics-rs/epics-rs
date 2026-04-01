@@ -40,7 +40,7 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 - **asyn framework** — actor-based async port driver model
 - **Motor record** — 9-phase state machine, coordinate transforms, backlash compensation
 - **areaDetector** — NDArray, driver base, 23 plugins
-- **Sequencer** — SNL compiler + runtime
+- **Optics** — 6-DOF table record, monochromator/slit/filter/BPM controllers, X-ray absorption data
 - **Standard records** — epid (PID/MaxMin feedback), throttle (rate-limited output), timestamp
 - **Scaler** — 64-channel counter with presets, auto-count, delayed start
 - **Calc engine** — numeric/string/array expressions
@@ -67,9 +67,9 @@ epics-rs = { git = "https://github.com/epics-rs/epics-rs" }
 | `calc` | Calc expression engine | no |
 | `autosave` | PV save/restore | no |
 | `busy` | Busy record | no |
-| `seq` | Sequencer runtime | no |
 | `std` | Standard records (epid, throttle, timestamp) | no |
 | `scaler` | Scaler record (64-channel counter) | no |
+| `optics` | Optics (table, monochromator, slit, filter, BPM) | no |
 | `full` | Everything | no |
 
 ```toml
@@ -96,14 +96,12 @@ epics-rs/
 │   ├── ad-plugins-rs/    # 23 NDPlugins (Stats, ROI, FFT, TIFF, JPEG, HDF5, etc.)
 │   ├── std-rs/           # Standard records (epid, throttle, timestamp) + device support
 │   ├── scaler-rs/        # Scaler record (64-channel counter) + device support
-│   ├── epics-seq-rs/     # Sequencer runtime (state machine execution)
-│   ├── snc-core-rs/      # SNL compiler library (lexer, parser, codegen)
-│   └── snc-rs/           # SNL compiler CLI
+│   └── optics-rs/        # Optics (table, monochromator, slit, filter, BPM)
 └── examples/
     ├── scope-ioc/        # Digital oscilloscope simulator
-    ├── mini-beamline/    # Beamline simulator with 5 motors + detectors
+    ├── mini-beamline/    # Beamline simulator with DCM, slit, BPM, detectors
     ├── sim-detector/     # areaDetector simulation driver
-    └── seq-demo/         # Sequencer demo
+    └── ...               # Other examples
 ```
 
 ### Crate Dependency Graph
@@ -113,15 +111,14 @@ epics-rs (umbrella — feature-gated re-exports)
     │
     ├── epics-base-rs ◄─── epics-macros-rs (proc macro)
     │       ▲
-    │       ├── epics-seq-rs
-    │       │    └── snc-core-rs
     │       ├── asyn-rs
     │       │    └── motor-rs
     │       ├── ad-core-rs
     │       │    ├── asyn-rs
     │       │    └── ad-plugins-rs
     │       ├── std-rs (epid, throttle, timestamp)
-    │       └── scaler-rs (64-channel counter)
+    │       ├── scaler-rs (64-channel counter)
+    │       └── optics-rs (table, monochromator, slit, filter, BPM)
     │
     ├── epics-ca-rs (Channel Access protocol)
     └── epics-pva-rs (pvAccess protocol, experimental)
@@ -443,12 +440,19 @@ Port of the EPICS [scaler](https://github.com/epics-modules/scaler) module:
 - **Asyn device support** — bridges to ScalerDriver trait (reset, read, write_preset, arm, done)
 - **Software scaler driver** — for testing/simulation
 
-### seq & snc-core
+### optics-rs
 
-EPICS sequencer:
+Port of the EPICS [optics](https://github.com/epics-modules/optics) synApps module:
 
-- **Runtime (seq)** — state set execution, pvGet/pvPut/pvMonitor, event flags
-- **Compiler (snc-core)** — SNL lexer/parser, AST, IR, semantic analysis, Rust code generation
+- **table record** — 6-DOF optical table with 4 geometry modes (SRI, GEOCARS, NEWPORT, PNC), motor-to-user/user-to-motor coordinate transforms, polynomial limit interpolation
+- **Monochromator controllers** — Kohzu DCM (`kohzuCtl`), HR analyzer (`hrCtl`), multi-layer mono (`ml_monoCtl`) as async state machines
+- **Diffractometer** — 4-circle orientation matrix (`orient`) with HKL-to-angles / angles-to-HKL
+- **Filter controllers** — automatic filter selection (`filterDrive`), XIA PF4 dual filter (`pf4`) using Chantler X-ray absorption data (22 elements)
+- **Device drivers** — HSC-1 slit controller (`SimHsc` / serial), quad BPM (`SimQxbpm` / serial) as asyn port drivers
+- **Ion chamber** — I₀ intensity calculation with gas mixture absorption
+- **`seqStart` command** — general-purpose launcher for all optics state machines (replaces C EPICS `seq`)
+- **36 database templates** and PyDM UI screens bundled
+- **362 tests** including 46 golden tests verified against compiled C tableRecord.c output
 
 ### Autosave (in epics-base-rs)
 
@@ -530,8 +534,11 @@ Inspired by [caproto's mini_beamline](https://github.com/caproto/caproto/blob/ma
 
 - **Beam current** — sinusoidal oscillation (500 mA offset, 25 mA amplitude, 4 s period)
 - **3 point detectors** — PinHole (Gaussian), Edge (error function), Slit (double error function)
-- **5 motors** — SimMotor records with coordinate transforms and backlash compensation
+- **8 motors** — SimMotor records (5 for detectors + 3 for DCM)
 - **MovingDot** — 2D area detector producing Gaussian spot images with Poisson noise
+- **Kohzu DCM** — double crystal monochromator with energy→Bragg angle control
+- **HSC-1 slit** — simulated 4-blade slit controller
+- **Quad BPM** — simulated beam position monitor
 
 **Build and run:**
 
@@ -544,6 +551,11 @@ cargo run --release -p mini-beamline --features ioc --bin mini_ioc -- examples/m
 ```bash
 # Monitor beam current
 camonitor mini:current
+
+# Set DCM energy and watch the theta motor
+caput mini:BraggEAO 8.0
+caget mini:BraggThetaRdbkAO
+camonitor mini:dcm:theta.RBV
 
 # Move the pinhole motor and watch the detector respond
 caput mini:ph:mtr 0
@@ -618,22 +630,6 @@ pydm opi/pydm/NDStdArrays.ui -m "P=SIM1:,R=image1:"
 
 ---
 
-### seq-demo — Sequencer Demo
-
-Demonstrates the SNL (State Notation Language) runtime with two concurrent state machines coordinating via event flags and PV monitoring.
-
-**Build and run:**
-
-```bash
-# First, start an IOC to serve the PVs
-softioc-rs --record ai:SEQ:counter --record bo:SEQ:light
-
-# In another terminal, run the sequencer
-cargo run --release -p seq-demo
-```
-
----
-
 ### Using PyDM with epics-rs
 
 [PyDM](https://slaclab.github.io/pydm/) (Python Display Manager) works out of the box with epics-rs because the Channel Access protocol is wire-compatible.
@@ -660,6 +656,9 @@ pydm <path-to-ui-file> -m "P=<prefix>,R=<record>"
 | `opi/pydm/` | areaDetector + plugins | ADTop, Stats, ROI, FFT, file writers, etc. |
 | `crates/motor-rs/opi/pydm/` | Motor record | Motor control panels |
 | `crates/asyn-rs/opi/pydm/` | asyn record | Port driver diagnostics |
+| `crates/optics-rs/ui/` | Optics module | DCM, slit, filter, table, orient, BPM screens |
+| `crates/std-rs/ui/` | Standard module | PID, timer, shutter, misc screens |
+| `crates/scaler-rs/ui/` | Scaler module | Counter displays (16/32/64 channel) |
 | `examples/scope-ioc/opi/pydm/` | Scope simulator | Waveform display |
 | `examples/sim-detector/opi/pydm/` | SimDetector | Detector-specific controls |
 
@@ -697,7 +696,6 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 | Binary | Description |
 |--------|-------------|
 | `softioc-rs` | Soft IOC server |
-| `snc-rs` | SNL compiler |
 
 ## Feature Flags
 
@@ -712,11 +710,11 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 ## Testing
 
 ```bash
-# All tests (2,145+)
+# All tests (2,349+)
 cargo test --workspace
 ```
 
-Test coverage: protocol encoding, wire format golden packets, snapshot generation, GR/CTRL metadata serialization, record processing, link chains, calc engine, .db parsing, access security, autosave, iocsh, IOC builder, event scheduling, motor state machine, asyn port driver, PID algorithms, scaler state machine, SNL compiler, derive macros, pvAccess serialization, etc.
+Test coverage: protocol encoding, wire format golden packets, snapshot generation, GR/CTRL metadata serialization, record processing, link chains, calc engine, .db parsing, access security, autosave, iocsh, IOC builder, event scheduling, motor state machine, asyn port driver, PID algorithms, scaler state machine, optics table record (46 golden tests vs C), crystallography, X-ray absorption, monochromator/slit/filter/BPM controllers, derive macros, pvAccess serialization, etc.
 
 ## Requirements
 

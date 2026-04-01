@@ -1,0 +1,320 @@
+record(ai,"$(P)$(MONO)ZVel") {
+	field(PREC,"5")
+}
+record(ai,"$(P)$(MONO)ZRdbk") {
+	field(PREC,"3")
+}
+record(ai,"$(P)$(MONO)YVel") {
+	field(PREC,"5")
+}
+record(ai,"$(P)$(MONO)YRdbk") {
+	field(PREC,"3")
+}
+record(ai,"$(P)$(MONO)ThetaVel") {
+	field(PREC,"5")
+}
+record(ai,"$(P)$(MONO)ThetaMotRdbk") {
+	field(PREC,"5")
+}
+record(ao,"$(P)$(MONO)ZSet") {
+	field(DESC,"Kohzu Z")
+	field(PREC,"3")
+	field(EGU,"mm")
+}
+record(ao,"$(P)$(MONO)ZCmd") {
+	field(PREC,"3")
+}
+record(ao,"$(P)$(MONO)YSet") {
+	field(DESC,"Kohzu Y")
+	field(PREC,"3")
+	field(EGU,"mm")
+}
+record(ao,"$(P)$(MONO)YCmd") {
+	field(PREC,"3")
+}
+record(ao,"$(P)$(MONO)H") {
+	field(DESC,"Miller index H")
+	field(PINI,"YES")
+	field(DOL,"1")
+	field(DRVH,"15")
+	field(DRVL,"0")
+	field(HOPR,"15")
+	field(LOPR,"0")
+}
+record(ao,"$(P)$(MONO)K") {
+	field(DESC,"Miller index K")
+	field(PINI,"YES")
+	field(DOL,"1")
+	field(DRVH,"15")
+	field(DRVL,"0")
+	field(HOPR,"15")
+	field(LOPR,"0")
+}
+record(ao,"$(P)$(MONO)L") {
+	field(DESC,"Miller index L")
+	field(PINI,"YES")
+	field(DOL,"1")
+	field(DRVH,"15")
+	field(DRVL,"0")
+	field(HOPR,"15")
+	field(LOPR,"0")
+}
+record(ao,"$(P)$(MONO)A") {
+	field(DESC,"Lattice constant")
+	field(PINI,"YES")
+	field(DOL,"5.43102")
+	field(PREC,"5")
+	field(EGUF,"20")
+	field(EGUL,"0.1")
+	field(EGU,"Angstroms")
+	field(DRVH,"20")
+	field(DRVL,"0.1")
+	field(HOPR,"20")
+	field(LOPR,"0.1")
+}
+record(bo, "$(P)$(MONO)startMove") {
+	field(DOL, "1")
+	field(OUT, "$(P)$(MONO)isSoftMove PP")
+	field(FLNK, "$(P)$(MONO)PutMoving.PROC PP")
+}
+record(dfanout, "$(P)$(MONO)isSoftMove") {
+	field(OUTA, "$(P)$(MONO)E.LOCK")
+	field(OUTB, "$(P)$(MONO)Lambda.LOCK")
+	field(OUTC, "$(P)$(MONO)Theta.LOCK")
+}
+record(motor, "$(P)$(MONO)E") {
+	field(DESC,"Kohzu Energy")
+	field(DTYP, "Soft Channel")
+	field(OUT, "$(P)$(MONO)startMove PP MS")
+	field(RDBL, "$(P)$(MONO)ERdbk NPP MS")
+	field(MRES, ".00001")
+	field(RRES, "1")
+	field(URIP, "Yes")
+	field(PREC, "5")
+	field(EGU, "mm")
+	field(TWV, "1")
+	field(DINP, "$(P)$(MONO)Done NPP MS")
+	field(RTRY, "0")
+}
+record(motor, "$(P)$(MONO)Lambda") {
+	field(DESC,"Kohzu Wavelength")
+	field(DTYP, "Soft Channel")
+	field(OUT, "$(P)$(MONO)startMove PP MS")
+	field(RDBL, "$(P)$(MONO)LambdaRdbk NPP MS")
+	field(MRES, ".00001")
+	field(RRES, "1")
+	field(URIP, "Yes")
+	field(PREC, "5")
+	field(EGU, "Angstroms")
+	field(TWV, "1")
+	field(DINP, "$(P)$(MONO)Done NPP MS")
+	field(RTRY, "0")
+}
+record(ao, "$(P)$(MONO)thetaResCopy") {
+	field(DOL, "$(P)$(M_THETA).MRES CP")
+	field(OMSL, "closed_loop")
+	field(OUT, "$(P)$(MONO)Theta.MRES")
+}
+record(motor, "$(P)$(MONO)Theta") {
+	field(DESC,"Kohzu Theta")
+	field(DTYP, "Soft Channel")
+	field(OUT, "$(P)$(MONO)startMove PP MS")
+	field(RDBL, "$(P)$(MONO)ThetaRdbk NPP MS")
+	field(MRES, ".00001")
+	field(RRES, "1")
+	field(URIP, "Yes")
+	field(PREC, "5")
+	field(EGU, "degrees")
+	field(TWV, "1")
+	field(DINP, "$(P)$(MONO)Done NPP MS")
+	field(RTRY, "0")
+}
+#record(ao,"$(P)$(MONO)Theta") {
+#	field(DESC,"Kohzu Theta")
+#	field(FLNK,"$(P)$(MONO)PutMoving.PROC  PP MS")
+#	field(PREC,"5")
+#	field(EGU,"degrees")
+#}
+record(ao,"$(P)$(MONO)ERdbk") {
+	field(DESC,"Kohzu Energy Readback")
+	field(PREC,"4")
+	field(EGU,"keV")
+}
+record(ao,"$(P)$(MONO)LambdaRdbk") {
+	field(DESC,"Kohzu Wavelength Readback")
+	field(PREC,"5")
+	field(EGU,"Angstroms")
+}
+record(ao,"$(P)$(MONO)ThetaRdbk") {
+	field(DESC,"Kohzu Theta Readback")
+	field(PREC,"5")
+	field(EGU,"degrees")
+}
+record(ao,"$(P)$(MONO)ThetaSet") {
+	field(DESC,"Kohzu Theta Set")
+	field(PREC,"5")
+	field(EGU,"keV")
+}
+record(ao,"$(P)$(MONO)2dSpacing") {
+	field(DESC,"Crystal 2d spacing")
+	field(PINI,"YES")
+	field(DOL,"1")
+	field(PREC,"5")
+	field(EGU,"Angstroms")
+}
+record(ao,"$(P)$(MONO)ThetaCmd") {
+	field(PREC,"5")
+}
+record(ao,"$(P)$(MONO)yOffset") {
+	field(DESC,"y offset")
+	field(PINI,"YES")
+	field(DOL,"1")
+	field(PREC,"3")
+	field(EGU,"mm")
+	field(DRVH,"$(yOffHi)")
+	field(DRVL,"$(yOffLo)")
+}
+record(bi,"$(P)$(MONO)zSimLls") {
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+record(bi,"$(P)$(MONO)zSimHls") {
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+record(bi,"$(P)$(MONO)ySimLls") {
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+record(bi,"$(P)$(MONO)ySimHls") {
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+record(bi,"$(P)$(MONO)thetaSimHls") {
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+record(bi,"$(P)$(MONO)thetaSimLls") {
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+record(bi,"$(P)$(MONO)ZDmov") {
+	field(ZNAM,"Stopped")
+	field(ONAM,"Moving")
+}
+record(bi,"$(P)$(MONO)YDmov") {
+	field(ZNAM,"Stopped")
+	field(ONAM,"Moving")
+}
+record(bi,"$(P)$(MONO)ThetaDmov") {
+	field(ZNAM,"Stopped")
+	field(ONAM,"Moving")
+}
+record(bo,"$(P)$(MONO)Put1") {
+	field(SDIS,"$(P)$(MONO)Put.VAL  NPP MS")
+	field(DOL,"1")
+	field(OUT,"$(P)$(MONO)Moving.VAL  PP MS")
+}
+record(bo,"$(P)$(MONO)Alert") {
+	field(ZNAM,"Normal")
+	field(ONAM,"Alert")
+	field(OSV,"MAJOR")
+}
+record(bo,"$(P)$(MONO)Mode") {
+	field(DESC,"Disable Kohzu_poke")
+	field(ZNAM,"Manual")
+	field(ONAM,"Auto")
+}
+record(bo,"$(P)$(MONO)Put") {
+	field(DESC,"Manually Poke values")
+	field(FLNK,"$(P)$(MONO)Put1.VAL  PP MS")
+	field(OUT,"0")
+	field(ZNAM,"Idle")
+	field(ONAM,"Go")
+}
+record(bo,"$(P)$(MONO)OperAck") {
+	field(ZNAM,"Normal")
+	field(ONAM,"Ack")
+	field(OSV,"MAJOR")
+}
+record(bo,"$(P)$(MONO)UseSet") {
+	field(DESC,"Put motors in Use/Set mode")
+	field(ZNAM,"Use")
+	field(ONAM,"Set")
+}
+record(bo,"$(P)$(MONO)PutMoving") {
+	field(DOL,"1")
+	field(OUT,"$(P)$(MONO)Moving.VAL  PP MS")
+}
+record(mbbo,"$(P)$(MONO)Type") {
+	field(DTYP,"Raw Soft Channel")
+	field(FLNK,"$(P)$(MONO)TypeSQ.PROC  PP MS")
+	field(ZRVL,"0x1")
+	field(ONVL,"0x2")
+	field(TWVL,"0x3")
+	field(THVL,"0x4")
+	field(ZRST,"Silicon")
+	field(ONST,"Germanium")
+	field(TWST,"Diamond")
+	field(THST,"Si (77K)")
+}
+record(mbbo,"$(P)$(MONO)Mode2") {
+	field(DTYP,"Raw Soft Channel")
+	field(ONVL,"0x1")
+	field(TWVL,"0x2")
+	field(THVL,"0x3")
+	field(ZRST,"Normal")
+	field(ONST,"Channel Cut")
+	field(TWST,"Freeze Z")
+	field(THST,"Freeze Y")
+}
+record(seq,"$(P)$(MONO)TypeSQ") {
+	field(SELM,"Specified")
+	field(SELL,"$(P)$(MONO)Type.RVAL  NPP NMS")
+	field(PREC,"7")
+	field(DOL1,"5.4310196")
+	field(LNK1,"$(P)$(MONO)A.VAL  PP MS")
+	field(DOL2,"5.657952")
+	field(LNK2,"$(P)$(MONO)A.VAL  PP MS")
+	field(DOL3,"3.56688")
+	field(LNK3,"$(P)$(MONO)A.VAL  PP MS")
+	field(DOL4,"5.4295")
+	field(LNK4,"$(P)$(MONO)A.VAL  PP MS")
+}
+record(stringin,"$(P)$(MONO)ZPv") {
+	field(VAL,"$(P)$(M_Z)")
+}
+record(stringin,"$(P)$(MONO)YPv") {
+	field(VAL,"$(P)$(M_Y)")
+}
+record(stringin,"$(P)$(MONO)SeqMsg1") {
+	field(VAL,"Kohzu Control Not Ready")
+}
+record(stringin,"$(P)$(MONO)SeqMsg2") {
+	field(VAL,"Kohzu Control Not Ready")
+}
+record(stringin,"$(P)$(MONO)ThetaPv") {
+	field(VAL,"$(P)$(M_THETA)")
+}
+record(busy,"$(P)$(MONO)Moving") {
+	field(DESC,"Kohzu moving")
+	field(OUT, "$(P)$(MONO)DoneCalc.A PP")
+}
+record(calcout, "$(P)$(MONO)DoneCalc") {
+	field(CALC, "!A")
+	field(OUT, "$(P)$(MONO)Done PP")
+}
+record(bo,"$(P)$(MONO)Done") {
+	field(DESC,"Kohzu done")
+}
+record(calcout, "$(P)$(MONO)clearIsSoftMove") {
+	field(INPA, "$(P)$(MONO)Moving CP")
+	field(CALC, "A")
+	field(OOPT, "When Zero")
+	field(OUT, "$(P)$(MONO)isSoftMove PP")
+}
+
+
+record(longout,"$(P)$(MONO)CtlDebug") {
+	field(DOL,"0")
+}

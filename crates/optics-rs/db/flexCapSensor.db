@@ -1,0 +1,56 @@
+### Convert the cap_sensor voltage to motor units
+
+record(ai, "$(P)$(C):voltage")
+{
+	field(DESC, "cap sensor voltage")
+        field(INP,  "$(V) CP NMS")
+	field(PREC, "$(PREC=5)")
+	field(EGU,  "V")
+}
+
+record(calcout, "$(P)$(C):posCalc")
+{
+	field(DESC, "cap sensor pos calc")
+	field(INPA, "$(P)$(C):voltage CP NMS")
+	field(INPB, "$(P)$(C):umPerV CP NMS")
+	field(INPC, "$(P)$(C):offset CP NMS")
+	field(CALC, "A * B + C")
+	field(OUT,  "$(P)$(C):pos  PP NMS")
+	field(PREC, "$(PREC=5)")
+	field(EGU,  "$(EGU=um)")
+}
+
+record(ao, "$(P)$(C):pos")
+{
+	field(DESC, "cap sensor position")
+	field(PREC, "$(PREC=5)")
+	field(EGU,  "$(EGU=um)")
+}
+
+record(ao, "$(P)$(C):umPerV")
+{
+	field(DESC, "um per Volt")
+	field(PREC, "$(PREC=5)")
+	field(VAL,  "$(UMV)")
+	field(EGU,  "$(EGU=um)")
+}
+
+record(ao, "$(P)$(C):offset")
+{
+	field(DESC, "cap sensor offset")
+	field(PREC, "$(PREC=5)")
+	field(VAL,  "$(OFF)")
+	field(EGU,  "$(EGU=um)")
+	
+}
+
+record(calcout, "$(P)$(C):zero")
+{
+	field(DESC, "zero cap sensor offset")
+	field(PREC, "$(PREC=5)")
+	field(INPA, "$(P)$(C):offset NPP NMS")
+	field(INPB, "$(P)$(C):posCalc NPP NMS")
+	field(CALC, "A-B")
+	field(SCAN, "Passive")
+	field(OUT,  "$(P)$(C):offset PP NMS")
+}

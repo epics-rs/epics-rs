@@ -14,6 +14,17 @@ simMotorCreate("slit_mtr", -100, 100, 100)
 simMotorCreate("dot_mtrx", -100, 100, 100)
 simMotorCreate("dot_mtry", -100, 100, 100)
 
+# ===== Kohzu DCM (Double Crystal Monochromator) =====
+simMotorCreate("dcm_theta", -10, 90, 100)
+simMotorCreate("dcm_y", -50, 50, 100)
+simMotorCreate("dcm_z", -50, 50, 100)
+
+# ===== Simulated HSC-1 Slit Controller =====
+simHscCreate("HSC1", 100)
+
+# ===== Simulated Quad BPM =====
+simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
+
 # ===== MovingDot detector parameters =====
 epicsEnvSet("DOT_SIZE_X",       "640")
 epicsEnvSet("DOT_SIZE_Y",       "480")
@@ -32,6 +43,17 @@ dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=edge:mtr,PORT=edge_mtr")
 dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=slit:mtr,PORT=slit_mtr")
 dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtrx,PORT=dot_mtrx")
 dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtry,PORT=dot_mtry")
+
+# Load DCM motors and sequencer database
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:theta,PORT=dcm_theta")
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:y,PORT=dcm_y")
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:z,PORT=dcm_z")
+# Widen DCM Z soft limits for full energy range (5-20 keV needs Z up to ~200mm)
+dbpf("$(PREFIX)dcm:z.DHLM", "250")
+dbpf("$(PREFIX)dcm:z.DLLM", "-250")
+dbpf("$(PREFIX)dcm:y.DHLM", "250")
+dbpf("$(PREFIX)dcm:y.DLLM", "-250")
+dbLoadRecords("$(OPTICS)/db/kohzuSeq.db", "P=$(PREFIX),M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z,yOffHi=50,yOffLo=-50")
 
 # Load beam current
 dbLoadRecords("$(MINI_BEAMLINE)/db/beam_current.template", "P=$(PREFIX)")
@@ -53,6 +75,9 @@ epicsEnvSet("NCHANS",  "2048")
 epicsEnvSet("CBUFFS",  "500")
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
 < $(ADCORE)/ioc/commonPlugins.cmd
+
+# ===== State machines (spawned here, wait internally for iocInit + PV availability) =====
+seqStart("kohzuCtl", "P=$(PREFIX),M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z")
 
 # ===== Autosave =====
 set_savefile_path("$(MINI_BEAMLINE)/ioc/autosave")

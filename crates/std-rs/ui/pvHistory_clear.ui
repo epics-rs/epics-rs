@@ -1,0 +1,249 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>664</x>
+        <y>270</y>
+        <width>305</width>
+        <height>110</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>305</width>
+        <height>110</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(251, 243, 74);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>pvHistory_clear</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="5,82,120,98" rowstretch="20,20,20,20,2,20,8">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="1" column="1" colspan="3">
+        <widget class="QLabel" name="text">
+          <property name="geometry">
+            <rect>
+              <x>5</x>
+              <y>20</y>
+              <width>300</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>If you really want to erase</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="1" colspan="3">
+        <widget class="QLabel" name="text_1">
+          <property name="geometry">
+            <rect>
+              <x>5</x>
+              <y>40</y>
+              <width>300</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>all ${P}history${N} arrays,</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_1</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_1 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="1" colspan="3">
+        <widget class="QLabel" name="text_2">
+          <property name="geometry">
+            <rect>
+              <x>5</x>
+              <y>60</y>
+              <width>300</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>click on this button.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_2</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_2 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="5" column="2">
+        <widget class="PyDMPushButton" name="message_button">
+          <property name="geometry">
+            <rect>
+              <x>87</x>
+              <y>82</y>
+              <width>120</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Erase all data</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}history${N}.A</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}history${N}.A</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>text</zorder>
+    <zorder>text_1</zorder>
+    <zorder>text_2</zorder>
+    <zorder>message_button</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMLabel</class>
+      <extends>QLabel</extends>
+      <header>pydm.widgets.label</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMPushButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.pushbutton</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

@@ -1,0 +1,165 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>313</x>
+        <y>445</y>
+        <width>490</width>
+        <height>400</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>490</width>
+        <height>400</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(200, 200, 200);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>table_full_refresh</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="395,10,85" rowstretch="31,20,349">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="3" column="2">
+        <widget class="PyDMLabel" name="text_update">
+          <property name="geometry">
+            <rect>
+              <x>405</x>
+              <y>519</y>
+              <width>285</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>PV: ${P}${T}.DESC</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${T}.DESC</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="textInteractionFlags">
+            <set>Qt::TextSelectableByKeyboard|Qt::TextSelectableByMouse</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLabel#text_update {
+  color: rgb(10, 0, 184);
+  background-color: rgb(255, 255, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="1" colspan="2">
+        <widget class="PyDMRelatedDisplayButton" name="related_display">
+          <property name="geometry">
+            <rect>
+              <x>395</x>
+              <y>31</y>
+              <width>95</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>Press again</string>
+          </property>
+          <property name="text">
+            <string>Press again</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display {
+  color: rgb(255, 255, 255);
+  background-color: rgb(51, 153, 0);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>Refresh fixed-point menu</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>table_full.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},Q=${Q},T=${T},M0X=${M0X},M0Y=${M0Y},M1Y=${M1Y},M2X=${M2X},M2Y=${M2Y},M2Z=${M2Z}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>false</bool>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>text_update</zorder>
+    <zorder>related_display</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMLabel</class>
+      <extends>QLabel</extends>
+      <header>pydm.widgets.label</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMRelatedDisplayButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.related_display_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

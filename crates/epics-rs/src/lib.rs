@@ -20,7 +20,6 @@
 //! | `calc` | Calc expression engine | always |
 //! | `autosave` | PV save/restore | always |
 //! | `busy` | Busy record | always |
-//! | `seq` | Sequencer runtime | no |
 //! | `std` | Standard records (epid, throttle, timestamp) | no |
 //! | `scaler` | Scaler record (multi-channel counter) | no |
 //! | `full` | Everything | no |
@@ -67,10 +66,6 @@ pub mod busy {
     pub use epics_base_rs::server::records::busy::*;
 }
 
-/// Sequencer runtime.
-#[cfg(feature = "seq")]
-pub use epics_seq_rs as seq;
-
 /// Standard records (epid, throttle, timestamp) and device support.
 #[cfg(feature = "std")]
 pub use std_rs as std_mod;
@@ -78,3 +73,7 @@ pub use std_rs as std_mod;
 /// Scaler record — multi-channel counter with preset and auto-count support.
 #[cfg(feature = "scaler")]
 pub use scaler_rs as scaler;
+
+/// Optics record types and device support (table, monochromator, filters, etc.).
+#[cfg(feature = "optics")]
+pub use optics_rs as optics;

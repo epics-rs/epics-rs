@@ -1,0 +1,1929 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>809</x>
+        <y>252</y>
+        <width>500</width>
+        <height>560</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>500</width>
+        <height>560</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(255, 255, 255);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>inlinkHelp</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="40,2,1,149,1,1,6,12,1,2,5,280" rowstretch="4,20,3,4,2,3,1,13,1,2,2,5,14,1,14,6,14,11,14,1,14,6,14,1,14,1,14,1,14,6,14,6,14,1,14,1,14,6,14,1,14,11,14,1,14,1,14,1,14,1,14,10,2,8,2,3,1,13,1,2,2,2,14,1,14,1,14,11,14,1,14,1,14,11">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="4" column="1" rowspan="7" colspan="9">
+        <widget class="PyDMDrawingRectangle" name="rectangle">
+          <property name="geometry">
+            <rect>
+              <x>40</x>
+              <y>31</y>
+              <width>175</width>
+              <height>24</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle</string>
+          </property>
+        </widget>
+      </item>
+      <item row="5" column="2" rowspan="5" colspan="7">
+        <widget class="PyDMDrawingRectangle" name="rectangle_1">
+          <property name="geometry">
+            <rect>
+              <x>42</x>
+              <y>33</y>
+              <width>171</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>164</red>
+                <green>170</green>
+                <blue>255</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>164</red>
+              <green>170</green>
+              <blue>255</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_1</string>
+          </property>
+        </widget>
+      </item>
+      <item row="54" column="1" rowspan="7" colspan="5">
+        <widget class="PyDMDrawingRectangle" name="rectangle_2">
+          <property name="geometry">
+            <rect>
+              <x>40</x>
+              <y>424</y>
+              <width>154</width>
+              <height>24</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_2</string>
+          </property>
+        </widget>
+      </item>
+      <item row="55" column="2" rowspan="5" colspan="2">
+        <widget class="PyDMDrawingRectangle" name="rectangle_3">
+          <property name="geometry">
+            <rect>
+              <x>42</x>
+              <y>426</y>
+              <width>150</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>255</red>
+                <green>176</green>
+                <blue>255</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>255</red>
+              <green>176</green>
+              <blue>255</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle_3</string>
+          </property>
+        </widget>
+      </item>
+      <item row="7" column="0" rowspan="2">
+        <widget class="QLabel" name="text">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>37</y>
+              <width>40</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> This</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="7" column="11" rowspan="2">
+        <widget class="QLabel" name="text_1">
+          <property name="geometry">
+            <rect>
+              <x>220</x>
+              <y>37</y>
+              <width>300</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>is a standard EPICS link.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_1</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_1 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="12" column="0" colspan="12">
+        <widget class="QLabel" name="text_2">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>60</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> It accepts a PV name followed by an process command {e.g., ' NPP'},</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_2</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_2 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="14" column="0" colspan="12">
+        <widget class="QLabel" name="text_3">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>75</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> followed by an alarm command {e.g., ' NMS'; ignore this.}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_3</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_3 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="16" column="0" colspan="12">
+        <widget class="QLabel" name="text_4">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>95</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> Here are the possible process commands for an input link:</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_4</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_4 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="30" column="0" colspan="12">
+        <widget class="QLabel" name="text_5">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>220</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>    CA - Read a value without causing processing to occur.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_5</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_5 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="22" column="0" colspan="12">
+        <widget class="QLabel" name="text_6">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>155</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>    PP - Process the target record, and then read a value from it.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_6</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_6 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="20" column="0" colspan="12">
+        <widget class="QLabel" name="text_7">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>135</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>         record named in the link}.  This is the default command.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_7</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_7 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="18" column="0" colspan="12">
+        <widget class="QLabel" name="text_8">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>120</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>   NPP - Just read a value; don't process the target record {the</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_8</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_8 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="2" rowspan="2" colspan="6">
+        <widget class="QLabel" name="text_9">
+          <property name="geometry">
+            <rect>
+              <x>42</x>
+              <y>36</y>
+              <width>170</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>xxx:userCalc1.VAL PP NMS</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_9</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_9 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="0" colspan="12">
+        <widget class="QLabel" name="text_10">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>170</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>         If you want EPICS to trace the processing {e.g., if the sscan </string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_10</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_10 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="26" column="0" colspan="12">
+        <widget class="QLabel" name="text_11">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>185</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>         record will drive this record, and wait for it to complete},</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_11</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_11 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="28" column="0" colspan="12">
+        <widget class="QLabel" name="text_12">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>200</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>         then you must use 'PP'.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_12</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_12 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="40" column="0" colspan="12">
+        <widget class="QLabel" name="text_13">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>305</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>         value 'Passive'.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_13</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_13 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="38" column="0" colspan="12">
+        <widget class="QLabel" name="text_14">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>290</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>   CPP - Same as CP, but process me only if my SCAN field has the</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_14</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_14 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="36" column="0" colspan="12">
+        <widget class="QLabel" name="text_15">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>270</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>         {Be careful with this.  Infinite loops are possible.}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_15</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_15 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="34" column="0" colspan="12">
+        <widget class="QLabel" name="text_16">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>255</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>         give me the new value before I process.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_16</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_16 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="32" column="0" colspan="12">
+        <widget class="QLabel" name="text_17">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>240</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>    CP - Process ME whenever the value of the named PV changes, and</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_17</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_17 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="0" colspan="12">
+        <widget class="QLabel" name="text_18">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>4</y>
+              <width>500</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>INPUT-LINK HELP</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_18</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_18 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="0" colspan="12">
+        <widget class="PyDMDrawingLine" name="polyline">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>24</y>
+              <width>508</width>
+              <height>3</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>10</red>
+                <green>0</green>
+                <blue>184</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>10</red>
+              <green>0</green>
+              <blue>184</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>3</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>3</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="42" column="0" colspan="12">
+        <widget class="QLabel" name="text_19">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>330</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> NOTE: If the target record is in a different crate, the process</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_19</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_19 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="44" column="0" colspan="12">
+        <widget class="QLabel" name="text_20">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>345</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> commands 'NPP' and 'PP' will be treated as if 'CA' had been specified.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_20</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_20 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="46" column="0" colspan="12">
+        <widget class="QLabel" name="text_21">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>360</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> {If you want to wait for completion in this case, you must use a</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_21</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_21 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="48" column="0" colspan="12">
+        <widget class="QLabel" name="text_22">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>375</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> 'dynamic' output link to trigger processing, and a separate input</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_22</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_22 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="64" column="0" colspan="12">
+        <widget class="QLabel" name="text_23">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>465</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> accepts only a PV name.  The role of the process command is taken</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_23</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_23 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="62" column="0" colspan="12">
+        <widget class="QLabel" name="text_24">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>450</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> of the CA/CP EPICS link commands described above.  This type of link</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_24</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_24 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="57" column="0" rowspan="2">
+        <widget class="QLabel" name="text_25">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>430</y>
+              <width>40</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> This</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_25</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_25 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="57" column="7" rowspan="2" colspan="5">
+        <widget class="QLabel" name="text_26">
+          <property name="geometry">
+            <rect>
+              <x>200</x>
+              <y>430</y>
+              <width>300</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>is a 'dynamic' link, an early prototype</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_26</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_26 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="52" column="0" colspan="12">
+        <widget class="PyDMDrawingLine" name="polyline_1">
+          <property name="geometry">
+            <rect>
+              <x>-1</x>
+              <y>414</y>
+              <width>507</width>
+              <height>2</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_1</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="56" column="3" rowspan="2" colspan="2">
+        <widget class="QLabel" name="text_27">
+          <property name="geometry">
+            <rect>
+              <x>43</x>
+              <y>429</y>
+              <width>150</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>xxx:userCalc1.VAL</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_27</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_27 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="68" column="0" colspan="12">
+        <widget class="QLabel" name="text_28">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>505</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> For user calcs {i.e., swait records}, input links can behave like</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_28</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_28 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="70" column="0" colspan="12">
+        <widget class="QLabel" name="text_29">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>520</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> 'CP' links if the record's SCAN field is set to 'I/O Intr' and the</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_29</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_29 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="66" column="0" colspan="12">
+        <widget class="QLabel" name="text_30">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>480</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> by a separate field.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_30</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_30 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="72" column="0" colspan="12">
+        <widget class="QLabel" name="text_31">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>535</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> link's 'trigger' field is set to 'Yes'.</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_31</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_31 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="50" column="0" colspan="12">
+        <widget class="QLabel" name="text_32">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>390</y>
+              <width>500</width>
+              <height>14</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string> link to read the resulting value.}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>8</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_32</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_32 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>rectangle</zorder>
+    <zorder>rectangle_1</zorder>
+    <zorder>rectangle_2</zorder>
+    <zorder>rectangle_3</zorder>
+    <zorder>text</zorder>
+    <zorder>text_1</zorder>
+    <zorder>text_2</zorder>
+    <zorder>text_3</zorder>
+    <zorder>text_4</zorder>
+    <zorder>text_5</zorder>
+    <zorder>text_6</zorder>
+    <zorder>text_7</zorder>
+    <zorder>text_8</zorder>
+    <zorder>text_9</zorder>
+    <zorder>text_10</zorder>
+    <zorder>text_11</zorder>
+    <zorder>text_12</zorder>
+    <zorder>text_13</zorder>
+    <zorder>text_14</zorder>
+    <zorder>text_15</zorder>
+    <zorder>text_16</zorder>
+    <zorder>text_17</zorder>
+    <zorder>text_18</zorder>
+    <zorder>polyline</zorder>
+    <zorder>text_19</zorder>
+    <zorder>text_20</zorder>
+    <zorder>text_21</zorder>
+    <zorder>text_22</zorder>
+    <zorder>text_23</zorder>
+    <zorder>text_24</zorder>
+    <zorder>text_25</zorder>
+    <zorder>text_26</zorder>
+    <zorder>polyline_1</zorder>
+    <zorder>text_27</zorder>
+    <zorder>text_28</zorder>
+    <zorder>text_29</zorder>
+    <zorder>text_30</zorder>
+    <zorder>text_31</zorder>
+    <zorder>text_32</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMDrawingRectangle</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLabel</class>
+      <extends>QLabel</extends>
+      <header>pydm.widgets.label</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingPolyline</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingLine</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

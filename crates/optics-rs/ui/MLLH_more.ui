@@ -1,0 +1,1505 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>993</x>
+        <y>401</y>
+        <width>390</width>
+        <height>420</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>390</width>
+        <height>420</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(200, 200, 200);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>MLLH_more</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="10,18,22,36,1,1,3,1,4,1,7,2,1,1,6,1,4,1,7,1,2,13,17,31,19,4,1,5,13,18,9,30,3,19,6,3,1,8,5,5,1,39,10" rowstretch="206,9,15,15,5,19,1,1,19,1,10,2,3,5,1,12,2,4,1,5,8,3,7,3,6,1,5,11,1,3,7,2,7,3,8,9">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="22" column="11" rowspan="6" colspan="30">
+        <widget class="PyDMDrawingRectangle" name="rectangle">
+          <property name="geometry">
+            <rect>
+              <x>104</x>
+              <y>347</y>
+              <width>237</width>
+              <height>33</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="16" rowspan="3" colspan="3">
+        <widget class="PyDMDrawingEllipse" name="oval">
+          <property name="geometry">
+            <rect>
+              <x>115</x>
+              <y>357</y>
+              <width>12</width>
+              <height>12</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="35" rowspan="3" colspan="3">
+        <widget class="PyDMDrawingEllipse" name="oval_1">
+          <property name="geometry">
+            <rect>
+              <x>318</x>
+              <y>357</y>
+              <width>12</width>
+              <height>12</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="9" column="18" rowspan="5" colspan="4">
+        <widget class="PyDMDrawingPie" name="arc">
+          <property name="geometry">
+            <rect>
+              <x>120</x>
+              <y>290</y>
+              <width>23</width>
+              <height>21</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="startAngle" stdset="0">
+            <double>120.0</double>
+          </property>
+          <property name="spanAngle" stdset="0">
+            <double>-125.0</double>
+          </property>
+        </widget>
+      </item>
+      <item row="10" column="7" rowspan="5" colspan="8">
+        <widget class="PyDMDrawingPie" name="arc_1">
+          <property name="geometry">
+            <rect>
+              <x>91</x>
+              <y>291</y>
+              <width>23</width>
+              <height>21</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="startAngle" stdset="0">
+            <double>295.0</double>
+          </property>
+          <property name="spanAngle" stdset="0">
+            <double>-125.0</double>
+          </property>
+        </widget>
+      </item>
+      <item row="14" column="12" rowspan="8">
+        <widget class="PyDMDrawingLine" name="polyline">
+          <property name="geometry">
+            <rect>
+              <x>107</x>
+              <y>311</y>
+              <width>0</width>
+              <height>36</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="14" column="19" rowspan="8">
+        <widget class="PyDMDrawingLine" name="polyline_1">
+          <property name="geometry">
+            <rect>
+              <x>128</x>
+              <y>311</y>
+              <width>0</width>
+              <height>36</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_1</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="8" column="12" rowspan="2">
+        <widget class="PyDMDrawingLine" name="polyline_2">
+          <property name="geometry">
+            <rect>
+              <x>107</x>
+              <y>271</y>
+              <width>0</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_2</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="8" column="19" rowspan="2">
+        <widget class="PyDMDrawingLine" name="polyline_3">
+          <property name="geometry">
+            <rect>
+              <x>128</x>
+              <y>271</y>
+              <width>0</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_3</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="14" colspan="6">
+        <widget class="PyDMDrawingLine" name="polyline_4">
+          <property name="geometry">
+            <rect>
+              <x>108</x>
+              <y>270</y>
+              <width>20</width>
+              <height>0</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_4</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="13" column="24" rowspan="4" colspan="6">
+        <widget class="PyDMLineEdit" name="text_entry">
+          <property name="geometry">
+            <rect>
+              <x>191</x>
+              <y>306</y>
+              <width>60</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}xLen</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}${Q}xLen</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="16" column="2" rowspan="5" colspan="4">
+        <widget class="PyDMLineEdit" name="text_entry_1">
+          <property name="geometry">
+            <rect>
+              <x>28</x>
+              <y>324</y>
+              <width>60</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}zBendLen</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}${Q}zBendLen</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_1 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="12" column="7" rowspan="13">
+        <widget class="PyDMDrawingLine" name="polyline_5">
+          <property name="geometry">
+            <rect>
+              <x>92</x>
+              <y>303</y>
+              <width>0</width>
+              <height>60</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_5</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${Q}xLen&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}xLen</string>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="30" column="26" rowspan="3">
+        <widget class="PyDMDrawingLine" name="polyline_6">
+          <property name="geometry">
+            <rect>
+              <x>215</x>
+              <y>384</y>
+              <width>0</width>
+              <height>16</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_6</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${Q}xLen&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}xLen</string>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="31" column="29" rowspan="4" colspan="4">
+        <widget class="PyDMLineEdit" name="text_entry_2">
+          <property name="geometry">
+            <rect>
+              <x>233</x>
+              <y>391</y>
+              <width>60</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}zNoseLen</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}${Q}zNoseLen</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_2 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="18" column="17" colspan="19">
+        <widget class="PyDMDrawingLine" name="polyline_7">
+          <property name="geometry">
+            <rect>
+              <x>119</x>
+              <y>331</y>
+              <width>202</width>
+              <height>0</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_7</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${Q}xLen&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}xLen</string>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="29" column="25" rowspan="2" colspan="3">
+        <widget class="PyDMDrawingIrregularPolygon" name="polygon">
+          <property name="geometry">
+            <rect>
+              <x>210</x>
+              <y>381</y>
+              <width>10</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polygon</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${Q}zBendLen&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="points" stdset="0">
+            <stringlist>
+              <string>-1, 9</string>
+              <string>3, -1</string>
+              <string>9, 9</string>
+              <string>-1, 9</string>
+            </stringlist>
+          </property>
+        </widget>
+      </item>
+      <item row="17" column="34" rowspan="3" colspan="3">
+        <widget class="PyDMDrawingIrregularPolygon" name="polygon_1">
+          <property name="geometry">
+            <rect>
+              <x>312</x>
+              <y>326</y>
+              <width>10</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polygon_1</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${Q}zBendLen&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="points" stdset="0">
+            <stringlist>
+              <string>-1, -1</string>
+              <string>9, 3</string>
+              <string>-1, 9</string>
+              <string>-1, -1</string>
+            </stringlist>
+          </property>
+        </widget>
+      </item>
+      <item row="17" column="18" rowspan="3" colspan="3">
+        <widget class="PyDMDrawingIrregularPolygon" name="polygon_2">
+          <property name="geometry">
+            <rect>
+              <x>120</x>
+              <y>326</y>
+              <width>10</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polygon_2</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${Q}zBendLen&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="points" stdset="0">
+            <stringlist>
+              <string>9, -1</string>
+              <string>-1, 3</string>
+              <string>9, 9</string>
+              <string>9, -1</string>
+            </stringlist>
+          </property>
+        </widget>
+      </item>
+      <item row="32" column="25" rowspan="2" colspan="3">
+        <widget class="PyDMDrawingIrregularPolygon" name="polygon_3">
+          <property name="geometry">
+            <rect>
+              <x>210</x>
+              <y>393</y>
+              <width>10</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polygon_3</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${Q}zBendLen&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="points" stdset="0">
+            <stringlist>
+              <string>9, -1</string>
+              <string>5, 9</string>
+              <string>-1, -1</string>
+              <string>9, -1</string>
+            </stringlist>
+          </property>
+        </widget>
+      </item>
+      <item row="23" column="4" rowspan="3" colspan="5">
+        <widget class="PyDMDrawingIrregularPolygon" name="polygon_4">
+          <property name="geometry">
+            <rect>
+              <x>86</x>
+              <y>354</y>
+              <width>10</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polygon_4</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${Q}zBendLen&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="points" stdset="0">
+            <stringlist>
+              <string>9, -1</string>
+              <string>5, 9</string>
+              <string>-1, -1</string>
+              <string>9, -1</string>
+            </stringlist>
+          </property>
+        </widget>
+      </item>
+      <item row="11" column="5" rowspan="3" colspan="5">
+        <widget class="PyDMDrawingIrregularPolygon" name="polygon_5">
+          <property name="geometry">
+            <rect>
+              <x>87</x>
+              <y>301</y>
+              <width>10</width>
+              <height>10</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polygon_5</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${Q}zBendLen&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]!=0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="points" stdset="0">
+            <stringlist>
+              <string>-1, 9</string>
+              <string>3, -1</string>
+              <string>9, 9</string>
+              <string>-1, 9</string>
+            </stringlist>
+          </property>
+        </widget>
+      </item>
+      <item row="0" column="0" colspan="43">
+        <widget class="PyDMEmbeddedDisplay" name="composite">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>0</y>
+              <width>390</width>
+              <height>206</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>composite</string>
+          </property>
+          <property name="filename" stdset="0">
+            <string>MLLH_bare.ui</string>
+          </property>
+          <property name="macros" stdset="0">
+            <string>P=${P},Q=${Q}</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="32" rowspan="2" colspan="7">
+        <widget class="PyDMRelatedDisplayButton" name="related_display">
+          <property name="geometry">
+            <rect>
+              <x>290</x>
+              <y>230</y>
+              <width>45</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>debug</string>
+          </property>
+          <property name="text">
+            <string>debug</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display {
+  color: rgb(255, 255, 255);
+  background-color: rgb(51, 153, 0);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>th</string>
+              <string>z</string>
+              <string>x</string>
+              <string>t1</string>
+              <string>t2</string>
+              <string>t3</string>
+              <string>calcDone</string>
+              <string>softPut</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>motorx.ui</string>
+              <string>motorx.ui</string>
+              <string>motorx.ui</string>
+              <string>yyTransform.ui</string>
+              <string>yyTransform.ui</string>
+              <string>yyTransform.ui</string>
+              <string>yyCalcoutRecord.ui</string>
+              <string>yySeq.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},M=${Q}th</string>
+              <string>P=${P},M=${Q}z</string>
+              <string>P=${P},M=${Q}x</string>
+              <string>P=${P},T=${Q}t1</string>
+              <string>P=${P},T=${Q}t2</string>
+              <string>P=${P},T=${Q}t3</string>
+              <string>P=${P},C=${Q}calcDone</string>
+              <string>P=${P},S=${Q}softPut</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="40" rowspan="2" colspan="2">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_1">
+          <property name="geometry">
+            <rect>
+              <x>340</x>
+              <y>230</y>
+              <width>40</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>Less</string>
+          </property>
+          <property name="text">
+            <string>Less</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_1 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(51, 153, 0);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>more</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>MLLH.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},Q=${Q}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>false</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="1" rowspan="2" colspan="2">
+        <widget class="PyDMPushButton" name="message_button">
+          <property name="geometry">
+            <rect>
+              <x>10</x>
+              <y>230</y>
+              <width>40</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Sync</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}${Q}sync</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}sync</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="23" rowspan="2" colspan="8">
+        <widget class="PyDMPushButton" name="message_button_1">
+          <property name="geometry">
+            <rect>
+              <x>160</x>
+              <y>215</y>
+              <width>100</width>
+              <height>30</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Stop MLLH</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>18</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}${Q}stop</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}stop</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_1 {
+  color: rgb(251, 243, 74);
+  background-color: rgb(253, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>rectangle</zorder>
+    <zorder>oval</zorder>
+    <zorder>oval_1</zorder>
+    <zorder>arc</zorder>
+    <zorder>arc_1</zorder>
+    <zorder>polyline</zorder>
+    <zorder>polyline_1</zorder>
+    <zorder>polyline_2</zorder>
+    <zorder>polyline_3</zorder>
+    <zorder>polyline_4</zorder>
+    <zorder>text_entry</zorder>
+    <zorder>text_entry_1</zorder>
+    <zorder>polyline_5</zorder>
+    <zorder>polyline_6</zorder>
+    <zorder>text_entry_2</zorder>
+    <zorder>polyline_7</zorder>
+    <zorder>polygon</zorder>
+    <zorder>polygon_1</zorder>
+    <zorder>polygon_2</zorder>
+    <zorder>polygon_3</zorder>
+    <zorder>polygon_4</zorder>
+    <zorder>polygon_5</zorder>
+    <zorder>composite</zorder>
+    <zorder>related_display</zorder>
+    <zorder>related_display_1</zorder>
+    <zorder>message_button</zorder>
+    <zorder>message_button_1</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMDrawingRectangle</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingEllipse</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingPie</class>
+      <extends>PyDMDrawingArc</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingPolyline</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingLine</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLineEdit</class>
+      <extends>QLineEdit</extends>
+      <header>pydm.widgets.line_edit</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingIrregularPolygon</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMEmbeddedDisplay</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.embedded_display</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMRelatedDisplayButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.related_display_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMPushButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.pushbutton</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingArc</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+  </customwidgets>
+</ui>

@@ -1,0 +1,434 @@
+grecord(ai,"$(P)HR$(N)_ETweakAI") {
+	field(DTYP,"Soft Channel")
+	field(INP,"0.01")
+	field(PREC,"1")
+	field(EGU,"meV")
+}
+grecord(ai,"$(P)HR$(N)_LambdaTweakAI") {
+	field(DTYP,"Soft Channel")
+	field(INP,"0.01")
+	field(PREC,"2")
+	field(EGU,"fm")
+}
+grecord(ai,"$(P)HR$(N)_Theta1TweakAI") {
+	field(DTYP,"Soft Channel")
+	field(INP,"0.01")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ai,"$(P)HR$(N)_Theta2TweakAI") {
+	field(DTYP,"Soft Channel")
+	field(INP,"0.01")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ai,"$(P)HR$(N)_phi1RdbkAI") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"3")
+	field(EGU,"urad")
+}
+grecord(ai,"$(P)HR$(N)_phi2RdbkAI") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"3")
+	field(EGU,"urad")
+}
+grecord(ai,"$(P)HR$(N)_worldTweakAI") {
+	field(DTYP,"Soft Channel")
+	field(INP,"0.01")
+	field(PREC,"3")
+	field(EGU,"urad")
+}
+grecord(ao,"$(P)HR$(N)_2d1AO") {
+	field(DESC,"Crystal 1 2d spacing")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"1")
+	field(PREC,"5")
+	field(EGU,"Anstroms")
+}
+grecord(ao,"$(P)HR$(N)_2d2AO") {
+	field(DESC,"Crystal 1 2d spacing")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"1")
+	field(PREC,"5")
+	field(EGU,"Angstroms")
+}
+grecord(ao,"$(P)HR$(N)_A1AO") {
+	field(DESC,"Lattice constant")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"5.43102")
+	field(PREC,"5")
+	field(EGUF,"20")
+	field(EGUL,"0.1")
+	field(EGU,"Angstroms")
+	field(DRVH,"20")
+	field(DRVL,"0.1")
+	field(HOPR,"20")
+	field(LOPR,"0.1")
+}
+grecord(ao,"$(P)HR$(N)_A2AO") {
+	field(DESC,"Lattice constant")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"5.43102")
+	field(PREC,"5")
+	field(EGUF,"20")
+	field(EGUL,"0.1")
+	field(EGU,"Angstroms")
+	field(DRVH,"20")
+	field(DRVL,"0.1")
+	field(HOPR,"20")
+	field(LOPR,"0.1")
+}
+grecord(ao,"$(P)HR$(N)_EAO") {
+	field(DESC,"HR Energy")
+	field(DTYP,"Soft Channel")
+	field(FLNK,"$(P)HR$(N)_PutMoving.PROC  PP MS")
+	field(PREC,"7")
+	field(EGU,"keV")
+}
+grecord(ao,"$(P)HR$(N)_ERdbkAO") {
+	field(DESC,"HR Energy Readback")
+	field(DTYP,"Soft Channel")
+	field(PREC,"7")
+	field(EGU,"keV")
+}
+grecord(ao,"$(P)HR$(N)_H1AO") {
+	field(DESC,"Miller index H")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"1")
+	field(DRVH,"20")
+	field(HOPR,"20")
+}
+grecord(ao,"$(P)HR$(N)_H2AO") {
+	field(DESC,"Miller index H")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"1")
+	field(DRVH,"20")
+	field(HOPR,"20")
+}
+grecord(ao,"$(P)HR$(N)_K1AO") {
+	field(DESC,"Miller index K")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"1")
+	field(DRVH,"20")
+	field(HOPR,"20")
+}
+grecord(ao,"$(P)HR$(N)_K2AO") {
+	field(DESC,"Miller index K")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"1")
+	field(DRVH,"20")
+	field(HOPR,"20")
+}
+grecord(ao,"$(P)HR$(N)_L1AO") {
+	field(DESC,"Miller index L")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"1")
+	field(DRVH,"20")
+	field(HOPR,"20")
+}
+grecord(ao,"$(P)HR$(N)_L2AO") {
+	field(DESC,"Miller index L")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"1")
+	field(DRVH,"20")
+	field(HOPR,"20")
+}
+grecord(ao,"$(P)HR$(N)_LambdaAO") {
+	field(DESC,"HR Wavelength")
+	field(DTYP,"Soft Channel")
+	field(FLNK,"$(P)HR$(N)_PutMoving.PROC  PP MS")
+	field(PREC,"8")
+	field(EGU,"Angstroms")
+	field(DRVH,"10")
+	field(DRVL,"0.05")
+}
+grecord(ao,"$(P)HR$(N)_LambdaRdbkAO") {
+	field(DESC,"HR Wavelength Readback")
+	field(DTYP,"Soft Channel")
+	field(PREC,"8")
+	field(EGU,"Angstroms")
+}
+grecord(ao,"$(P)HR$(N)_Theta1AO") {
+	field(DTYP,"Soft Channel")
+	field(FLNK,"$(P)HR$(N)_PutMoving.PROC  PP MS")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_Theta1RdbkAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_Theta2AO") {
+	field(DTYP,"Soft Channel")
+	field(FLNK,"$(P)HR$(N)_PutMoving.PROC  PP MS")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_Theta2RdbkAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_phi1AO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_phi1CmdAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"3")
+	field(EGU,"urad")
+}
+grecord(ao,"$(P)HR$(N)_phi1OffAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_phi1RdbkAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_phi1SetAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"3")
+	field(EGU,"urad")
+}
+grecord(ao,"$(P)HR$(N)_phi2AO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_phi2CmdAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"3")
+	field(EGU,"urad")
+}
+grecord(ao,"$(P)HR$(N)_phi2OffAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_phi2RdbkAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"7")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)HR$(N)_phi2SetAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"3")
+	field(EGU,"urad")
+}
+grecord(ao,"$(P)HR$(N)_worldOffAO") {
+	field(DTYP,"Soft Channel")
+	field(PREC,"3")
+	field(EGU,"urad")
+}
+grecord(bi,"$(P)HR$(N)_phi1DmovBI") {
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"Stopped")
+	field(ONAM,"Moving")
+}
+grecord(bi,"$(P)HR$(N)_phi1SimHlsBI") {
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+grecord(bi,"$(P)HR$(N)_phi1SimLlsBI") {
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+grecord(bi,"$(P)HR$(N)_phi2DmovBI") {
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"Stopped")
+	field(ONAM,"Moving")
+}
+grecord(bi,"$(P)HR$(N)_phi2SimHlsBI") {
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+grecord(bi,"$(P)HR$(N)_phi2SimLlsBI") {
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"No Limit")
+	field(ONAM,"Limit")
+}
+grecord(bo,"$(P)HR$(N)_AlertBO") {
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"Normal")
+	field(ONAM,"Alert")
+	field(OSV,"MAJOR")
+}
+grecord(bo,"$(P)HR$(N)_EDecBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(bo,"$(P)HR$(N)_EIncBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(bo,"$(P)HR$(N)_LambdaDecBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(bo,"$(P)HR$(N)_LambdaIncBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(bo,"$(P)HR$(N)_ModeBO") {
+	field(DESC,"Disable automove")
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"Manual")
+	field(ONAM,"Auto")
+}
+grecord(bo,"$(P)HR$(N)_OperAckBO") {
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"Normal")
+	field(ONAM,"Ack")
+	field(OSV,"MAJOR")
+}
+grecord(bo,"$(P)HR$(N)_Put1") {
+	field(DTYP,"Soft Channel")
+	field(SDIS,"$(P)HR$(N)_PutBO.VAL  NPP MS")
+	field(DOL,"1")
+	field(OUT,"$(P)HR$(N)_Moving.VAL  PP MS")
+}
+grecord(bo,"$(P)HR$(N)_PutBO") {
+	field(DESC,"Manually Poke values")
+	field(DTYP,"Soft Channel")
+	field(FLNK,"$(P)HR$(N)_Put1.VAL  PP MS")
+	field(ZNAM,"Idle")
+	field(ONAM,"Go")
+}
+grecord(bo,"$(P)HR$(N)_PutMoving") {
+	field(DTYP,"Soft Channel")
+	field(DOL,"1")
+	field(OUT,"$(P)HR$(N)_Moving.VAL  PP MS")
+}
+grecord(bo,"$(P)HR$(N)_Theta1DecBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(bo,"$(P)HR$(N)_Theta1IncBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(bo,"$(P)HR$(N)_Theta2DecBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(bo,"$(P)HR$(N)_Theta2IncBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(bo,"$(P)HR$(N)_UseSetBO") {
+	field(DESC,"Put motors in Use/Set mode")
+	field(DTYP,"Soft Channel")
+	field(ZNAM,"Use")
+	field(ONAM,"Set")
+}
+grecord(bo,"$(P)HR$(N)_worldDecBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(bo,"$(P)HR$(N)_worldIncBO") {
+	field(DTYP,"Soft Channel")
+}
+grecord(mbbo,"$(P)HR$(N)_GeomMO") {
+	field(DTYP,"Raw Soft Channel")
+	field(ONVL,"0x1")
+	field(TWVL,"0")
+	field(ZRST,"Nested")
+	field(ONST,"Symmetric")
+}
+grecord(mbbo,"$(P)HR$(N)_1TypeMO") {
+	field(DTYP,"Raw Soft Channel")
+	field(FLNK,"$(P)HR$(N)_1TypeSQ.VAL  PP MS")
+	field(ZRVL,"0x1")
+	field(ONVL,"0x2")
+	field(TWVL,"0x3")
+	field(ZRST,"Silicon")
+	field(ONST,"Germanium")
+	field(TWST,"Diamond")
+}
+grecord(mbbo,"$(P)HR$(N)_2TypeMO") {
+	field(DTYP,"Raw Soft Channel")
+	field(FLNK,"$(P)HR$(N)_2TypeSQ.VAL  PP MS")
+	field(ZRVL,"0x1")
+	field(ONVL,"0x2")
+	field(TWVL,"0x3")
+	field(ZRST,"Silicon")
+	field(ONST,"Germanium")
+	field(TWST,"Diamond")
+}
+grecord(mbbo,"$(P)HR$(N)_Mode2MO") {
+	field(DTYP,"Raw Soft Channel")
+	field(ONVL,"0x1")
+	field(TWVL,"0x2")
+	field(ZRST,"Theta1 only")
+	field(ONST,"Theta1 and 2")
+	field(TWST,"Rock Theta2")
+}
+grecord(seq,"$(P)HR$(N)_1TypeSQ") {
+	field(SELM,"Specified")
+	field(SELL,"$(P)HR$(N)_1TypeMO.RVAL  PP NMS")
+	field(PREC,"7")
+	field(DOL1,"5.4310196")
+	field(LNK1,"$(P)HR$(N)_A1AO.VAL  PP MS")
+	field(DOL2,"5.657952")
+	field(LNK2,"$(P)HR$(N)_A1AO.VAL  PP MS")
+	field(DOL3,"3.56688")
+	field(LNK3,"$(P)HR$(N)_A1AO.VAL  PP MS")
+}
+grecord(seq,"$(P)HR$(N)_2TypeSQ") {
+	field(SELM,"Specified")
+	field(SELL,"$(P)HR$(N)_2TypeMO.RVAL  PP NMS")
+	field(PREC,"7")
+	field(DOL1,"5.4310196")
+	field(LNK1,"$(P)HR$(N)_A2AO.VAL  PP MS")
+	field(DOL2,"5.657952")
+	field(LNK2,"$(P)HR$(N)_A2AO.VAL  PP MS")
+	field(DOL3,"3.56688")
+	field(LNK3,"$(P)HR$(N)_A2AO.VAL  PP MS")
+}
+grecord(stringin,"$(P)HR$(N)_SeqMsg1SI") {
+	field(DTYP,"Soft Channel")
+	field(VAL,"HR Control Not Ready")
+}
+grecord(stringin,"$(P)HR$(N)_SeqMsg2SI") {
+	field(DTYP,"Soft Channel")
+	field(VAL,"HR Control Not Ready")
+}
+grecord(stringin,"$(P)HR$(N)_phi1PvSI") {
+	field(DTYP,"Soft Channel")
+	field(VAL,"$(P)$(M_PHI1)")
+}
+grecord(stringin,"$(P)HR$(N)_phi2PvSI") {
+	field(DTYP,"Soft Channel")
+	field(VAL,"$(P)$(M_PHI2)")
+}
+grecord(busy,"$(P)HR$(N)_Moving") {
+}
+grecord(longout,"$(P)HR$(N)CtlDebug") {
+	field(DOL,"0")
+}
+
+grecord(ao,"$(P)HR$(N)_thetaMin") {
+	field(DESC,"min theta angle (deg)")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"0.5")
+	field(PREC,"2")
+	field(EGU,"Degrees")
+}
+grecord(ao,"$(P)HR$(N)_thetaMax") {
+	field(DESC,"min theta angle (deg)")
+	field(PINI,"YES")
+	field(DTYP,"Soft Channel")
+	field(DOL,"89.5")
+	field(PREC,"2")
+	field(EGU,"Degrees")
+}

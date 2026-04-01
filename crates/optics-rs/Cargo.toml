@@ -1,0 +1,18 @@
+[package]
+name = "optics-rs"
+version.workspace = true
+edition.workspace = true
+description = "Rust port of EPICS synApps optics module"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+epics-base-rs = { workspace = true }
+epics-ca-rs = { workspace = true }
+asyn-rs = { workspace = true }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

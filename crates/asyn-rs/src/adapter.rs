@@ -385,8 +385,11 @@ impl DeviceSupport for AsynDeviceSupport {
                 }
                 return Ok(DeviceReadOutcome::ok());
             }
-            // No cached value — this is the initial read or a missed interrupt.
-            // Fall through to blocking read.
+            // No cached value — skip this cycle. The next interrupt will
+            // provide the value. Falling through to a blocking read here
+            // causes timeouts at startup when the driver hasn't produced
+            // its first value yet.
+            return Ok(DeviceReadOutcome::ok());
         }
 
         let op = self.read_op().ok_or_else(|| {

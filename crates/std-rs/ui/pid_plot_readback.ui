@@ -1,0 +1,279 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>596</x>
+        <y>273</y>
+        <width>600</width>
+        <height>480</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>600</width>
+        <height>480</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(187, 187, 187);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>pid_plot_readback</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="1,20,160,10,100,309" rowstretch="1,400,17,20,5,20,17">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="1" column="1" colspan="5">
+        <widget class="PyDMTimePlot" name="strip_chart">
+          <property name="geometry">
+            <rect>
+              <x>1</x>
+              <y>1</y>
+              <width>600</width>
+              <height>400</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>strip_chart</string>
+          </property>
+          <property name="title" stdset="0">
+            <string>$(P)$(PID) setpoint and readback</string>
+          </property>
+          <property name="updateInterval" stdset="0">
+            <double>30.000000</double>
+          </property>
+          <property name="curves" stdset="0">
+            <stringlist>
+              <string>{&quot;color&quot;: &quot;#fd0000&quot;, &quot;lineStyle&quot;: 1, &quot;lineWidth&quot;: 1, &quot;channel&quot;: &quot;ca://${P}${PID}.VAL&quot;, &quot;name&quot;: &quot;$(P)$(PID).VAL&quot;}</string>
+              <string>{&quot;color&quot;: &quot;#0a00b8&quot;, &quot;lineStyle&quot;: 1, &quot;lineWidth&quot;: 1, &quot;channel&quot;: &quot;ca://${P}${PID}.CVAL&quot;, &quot;name&quot;: &quot;$(P)$(PID).CVAL&quot;}</string>
+            </stringlist>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="4">
+        <widget class="PyDMLineEdit" name="text_entry">
+          <property name="geometry">
+            <rect>
+              <x>191</x>
+              <y>418</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${PID}.HOPR</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}${PID}.HOPR</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="5" column="4">
+        <widget class="PyDMLineEdit" name="text_entry_1">
+          <property name="geometry">
+            <rect>
+              <x>191</x>
+              <y>443</y>
+              <width>100</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${PID}.LOPR</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}${PID}.LOPR</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_1 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="5" column="2">
+        <widget class="QLabel" name="text">
+          <property name="geometry">
+            <rect>
+              <x>21</x>
+              <y>443</y>
+              <width>160</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Display miniumum</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="2">
+        <widget class="QLabel" name="text_1">
+          <property name="geometry">
+            <rect>
+              <x>21</x>
+              <y>418</y>
+              <width>160</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Display maxiumum</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_1</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_1 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>strip_chart</zorder>
+    <zorder>text_entry</zorder>
+    <zorder>text_entry_1</zorder>
+    <zorder>text</zorder>
+    <zorder>text_1</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMTimePlot</class>
+      <extends>QGraphicsView</extends>
+      <header>pydm.widgets.timeplot</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLineEdit</class>
+      <extends>QLineEdit</extends>
+      <header>pydm.widgets.line_edit</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLabel</class>
+      <extends>QLabel</extends>
+      <header>pydm.widgets.label</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

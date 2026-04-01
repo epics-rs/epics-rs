@@ -1,0 +1,225 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>1591</x>
+        <y>254</y>
+        <width>140</width>
+        <height>110</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>140</width>
+        <height>110</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(200, 200, 200);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>filterbox_less</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="5,7,26,5,26,5,26,5,26,4,5" rowstretch="5,6,88,6,5">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="1" column="1" rowspan="3" colspan="9">
+        <widget class="PyDMDrawingRectangle" name="rectangle">
+          <property name="geometry">
+            <rect>
+              <x>5</x>
+              <y>5</y>
+              <width>130</width>
+              <height>100</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="NoBrush">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>2.0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="toolTip">
+            <string>rectangle</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="2">
+        <widget class="PyDMEmbeddedDisplay" name="composite">
+          <property name="geometry">
+            <rect>
+              <x>12</x>
+              <y>11</y>
+              <width>26</width>
+              <height>88</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>composite</string>
+          </property>
+          <property name="filename" stdset="0">
+            <string>filter_blade.ui</string>
+          </property>
+          <property name="macros" stdset="0">
+            <string>P=${P},R=${R},N=${N4}</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="4">
+        <widget class="PyDMEmbeddedDisplay" name="composite_1">
+          <property name="geometry">
+            <rect>
+              <x>43</x>
+              <y>11</y>
+              <width>26</width>
+              <height>88</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>composite_1</string>
+          </property>
+          <property name="filename" stdset="0">
+            <string>filter_blade.ui</string>
+          </property>
+          <property name="macros" stdset="0">
+            <string>P=${P},R=${R},N=${N3}</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="6">
+        <widget class="PyDMEmbeddedDisplay" name="composite_2">
+          <property name="geometry">
+            <rect>
+              <x>74</x>
+              <y>11</y>
+              <width>26</width>
+              <height>88</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>composite_2</string>
+          </property>
+          <property name="filename" stdset="0">
+            <string>filter_blade.ui</string>
+          </property>
+          <property name="macros" stdset="0">
+            <string>P=${P},R=${R},N=${N2}</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="8">
+        <widget class="PyDMEmbeddedDisplay" name="composite_3">
+          <property name="geometry">
+            <rect>
+              <x>105</x>
+              <y>11</y>
+              <width>26</width>
+              <height>88</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>composite_3</string>
+          </property>
+          <property name="filename" stdset="0">
+            <string>filter_blade.ui</string>
+          </property>
+          <property name="macros" stdset="0">
+            <string>P=${P},R=${R},N=${N1}</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>rectangle</zorder>
+    <zorder>composite</zorder>
+    <zorder>composite_1</zorder>
+    <zorder>composite_2</zorder>
+    <zorder>composite_3</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMDrawingRectangle</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMEmbeddedDisplay</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.embedded_display</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

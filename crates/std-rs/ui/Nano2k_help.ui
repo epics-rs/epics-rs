@@ -1,0 +1,36 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>355</x>
+        <y>482</y>
+        <width>400</width>
+        <height>130</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>400</width>
+        <height>130</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(236, 236, 236);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>Nano2k_help</string>
+    </property>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

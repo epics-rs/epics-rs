@@ -1,0 +1,216 @@
+grecord(ai,"$(P)ml_monoZVel") {
+	field(PREC,"5")
+}
+grecord(ai,"$(P)ml_monoZRdbk") {
+	field(PREC,"3")
+}
+grecord(ai,"$(P)ml_monoETweak") {
+	field(INP,"0.01")
+	field(PREC,"4")
+}
+grecord(ai,"$(P)ml_monoLambdaTweak") {
+	field(INP,"0.01")
+	field(PREC,"3")
+}
+grecord(ai,"$(P)ml_monoThetaTweak") {
+	field(INP,"0.01")
+	field(PREC,"3")
+}
+grecord(ai,"$(P)ml_monoThetaVel") {
+	field(PREC,"5")
+}
+grecord(ai,"$(P)ml_monoTheta2Vel") {
+	field(PREC,"5")
+}
+grecord(ai,"$(P)ml_monoThetaRdbkEcho") {
+	field(PREC,"5")
+}
+grecord(ai,"$(P)ml_monoTheta2RdbkEcho") {
+	field(PREC,"5")
+}
+grecord(ao,"$(P)ml_monoZSet") {
+	field(DESC,"ml_mono Z")
+	field(PREC,"3")
+	field(EGU,"mm")
+}
+grecord(ao,"$(P)ml_monoZCmd") {
+	field(PREC,"3")
+}
+
+grecord(ao,"$(P)ml_monoOrder") {
+	field(DESC,"Diffraction Order")
+	field(PINI,"YES")
+	field(DOL,"1")
+	field(DRVH,"15")
+	field(DRVL,"0")
+	field(HOPR,"15")
+	field(LOPR,"0")
+}
+grecord(ao,"$(P)ml_monoD") {
+	field(DESC,"Physical D spacing")
+	field(PINI,"YES")
+	field(DOL,"24.25")
+	field(PREC,"3")
+	field(EGUF,"200")
+	field(EGUL,"0.1")
+	field(EGU,"Angstroms")
+	field(DRVH,"200")
+	field(DRVL,"0.1")
+	field(HOPR,"200")
+	field(LOPR,"0.1")
+}
+grecord(ao,"$(P)ml_monoE") {
+	field(DESC,"ml_mono Energy")
+	field(FLNK,"$(P)ml_monoPutMoving.PROC  PP MS")
+	field(OUT,"0")
+	field(PREC,"4")
+	field(EGU,"keV")
+	field(DRVL,"0")
+	field(LOPR,"0")
+}
+grecord(ao,"$(P)ml_monoLambda") {
+	field(DESC,"ml_mono Wavelength")
+	field(FLNK,"$(P)ml_monoPutMoving.PROC  PP MS")
+	field(OUT,"0")
+	field(PREC,"5")
+	field(EGU,"Angstroms")
+	field(DRVH,"20")
+	field(DRVL,"0.05")
+}
+grecord(ao,"$(P)ml_monoTheta") {
+	field(DESC,"ml_mono Theta")
+	field(FLNK,"$(P)ml_monoPutMoving.PROC  PP MS")
+	field(PREC,"5")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)ml_monoERdbk") {
+	field(DESC,"ml_mono Energy Readback")
+	field(PREC,"4")
+	field(EGU,"keV")
+}
+grecord(ao,"$(P)ml_monoLambdaRdbk") {
+	field(DESC,"ml_mono Wavelength Readback")
+	field(PREC,"5")
+	field(EGU,"Angstroms")
+}
+grecord(ao,"$(P)ml_monoThetaRdbk") {
+	field(DESC,"ml_mono Theta Readback")
+	field(PREC,"5")
+	field(EGU,"degrees")
+}
+grecord(ao,"$(P)ml_monoThetaSet") {
+	field(DESC,"ml_mono Theta Set")
+	field(PREC,"5")
+	field(EGU,"keV")
+}
+grecord(ao,"$(P)ml_monoTheta2Set") {
+	field(DESC,"ml_mono Theta2 Set")
+	field(PREC,"5")
+	field(EGU,"keV")
+}
+grecord(ao,"$(P)ml_monoThetaCmd") {
+	field(PREC,"5")
+}
+grecord(ao,"$(P)ml_monoTheta2Cmd") {
+	field(PREC,"5")
+}
+grecord(ao,"$(P)ml_mono_yOffset") {
+	field(DESC,"y offset")
+	field(DOL,"1")
+	field(PREC,"3")
+	field(EGU,"mm")
+}
+grecord(bi,"$(P)ml_monoZDmov") {
+	field(ZNAM,"Stopped")
+	field(ONAM,"Moving")
+}
+grecord(bi,"$(P)ml_monoThetaDmov") {
+	field(ZNAM,"Stopped")
+	field(ONAM,"Moving")
+}
+grecord(bi,"$(P)ml_monoTheta2Dmov") {
+	field(ZNAM,"Stopped")
+	field(ONAM,"Moving")
+}
+grecord(bo,"$(P)ml_monoPut1") {
+	field(SDIS,"$(P)ml_monoPut.VAL  NPP MS")
+	field(DOL,"1")
+	field(OUT,"$(P)ml_monoMoving.VAL  PP MS")
+}
+grecord(bo,"$(P)ml_monoEInc") {
+	field(FLNK,"0")
+}
+grecord(bo,"$(P)ml_monoEDec") {
+	field(FLNK,"0")
+}
+grecord(bo,"$(P)ml_monoLambdaInc") {
+	field(FLNK,"0")
+}
+grecord(bo,"$(P)ml_monoLambdaDec") {
+	field(FLNK,"0")
+}
+grecord(bo,"$(P)ml_monoThetaInc") {
+	field(FLNK,"0")
+}
+grecord(bo,"$(P)ml_monoThetaDec") {
+	field(FLNK,"0")
+}
+grecord(bo,"$(P)ml_monoAlert") {
+	field(ZNAM,"Normal")
+	field(ONAM,"Alert")
+	field(OSV,"MAJOR")
+}
+grecord(bo,"$(P)ml_monoMode") {
+	field(DESC,"Disable ml_mono_poke")
+	field(ZNAM,"Manual")
+	field(ONAM,"Auto")
+}
+grecord(bo,"$(P)ml_monoPut") {
+	field(DESC,"Manually Poke values")
+	field(FLNK,"$(P)ml_monoPut1.VAL  PP MS")
+	field(OUT,"0")
+	field(ZNAM,"Idle")
+	field(ONAM,"Go")
+}
+grecord(bo,"$(P)ml_monoOperAck") {
+	field(ZNAM,"Normal")
+	field(ONAM,"Ack")
+	field(OSV,"MAJOR")
+}
+grecord(bo,"$(P)ml_monoUseSet") {
+	field(DESC,"Put motors in Use/Set mode")
+	field(ZNAM,"Use")
+	field(ONAM,"Set")
+}
+grecord(bo,"$(P)ml_monoPutMoving") {
+	field(DOL,"1")
+	field(OUT,"$(P)ml_monoMoving.VAL  PP MS")
+}
+
+grecord(mbbo,"$(P)ml_monoMode2") {
+	field(DTYP,"Raw Soft Channel")
+	field(ONVL,"0x1")
+	field(ZRST,"Normal")
+	field(ONST,"Freeze Z")
+}
+
+grecord(stringin,"$(P)ml_monoZPv") {
+}
+grecord(stringin,"$(P)ml_monoYPv") {
+}
+grecord(stringin,"$(P)ml_monoSeqMsg1") {
+	field(VAL,"ml_mono Control Not Ready")
+}
+grecord(stringin,"$(P)ml_monoSeqMsg2") {
+	field(VAL,"ml_mono Control Not Ready")
+}
+grecord(stringin,"$(P)ml_monoThetaPv") {
+}
+grecord(stringin,"$(P)ml_monoTheta2Pv") {
+}
+grecord(busy,"$(P)ml_monoMoving") {
+	field(DESC,"ml_mono moving (set by SNL)")
+}
+grecord(longout,"$(P)ml_monoCtlDebug") {
+	field(DOL,"0")
+}

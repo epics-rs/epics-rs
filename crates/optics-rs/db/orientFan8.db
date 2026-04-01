@@ -1,0 +1,620 @@
+
+record(dfanout, "$(P)orientFan:A0_11") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):A0_11")
+  field(OUTB, "$(P)$(O2):A0_11")
+  field(OUTC, "$(P)$(O3):A0_11")
+  field(OUTD, "$(P)$(O4):A0_11")
+  field(OUTE, "$(P)$(O5):A0_11")
+  field(OUTF, "$(P)$(O6):A0_11")
+  field(OUTG, "$(P)$(O7):A0_11")
+  field(OUTH, "$(P)$(O8):A0_11")
+  field(DOL, "$(P)$(OM):A0_11 CP")
+}
+
+record(dfanout, "$(P)orientFan:A0_12") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):A0_12")
+  field(OUTB, "$(P)$(O2):A0_12")
+  field(OUTC, "$(P)$(O3):A0_12")
+  field(OUTD, "$(P)$(O4):A0_12")
+  field(OUTE, "$(P)$(O5):A0_12")
+  field(OUTF, "$(P)$(O6):A0_12")
+  field(OUTG, "$(P)$(O7):A0_12")
+  field(OUTH, "$(P)$(O8):A0_12")
+  field(DOL, "$(P)$(OM):A0_12 CP")
+}
+
+record(dfanout, "$(P)orientFan:A0_13") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):A0_13")
+  field(OUTB, "$(P)$(O2):A0_13")
+  field(OUTC, "$(P)$(O3):A0_13")
+  field(OUTD, "$(P)$(O4):A0_13")
+  field(OUTE, "$(P)$(O5):A0_13")
+  field(OUTF, "$(P)$(O6):A0_13")
+  field(OUTG, "$(P)$(O7):A0_13")
+  field(OUTH, "$(P)$(O8):A0_13")
+  field(DOL, "$(P)$(OM):A0_13 CP")
+}
+
+record(dfanout, "$(P)orientFan:A0_21") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):A0_21")
+  field(OUTB, "$(P)$(O2):A0_21")
+  field(OUTC, "$(P)$(O3):A0_21")
+  field(OUTD, "$(P)$(O4):A0_21")
+  field(OUTE, "$(P)$(O5):A0_21")
+  field(OUTF, "$(P)$(O6):A0_21")
+  field(OUTG, "$(P)$(O7):A0_21")
+  field(OUTH, "$(P)$(O8):A0_21")
+  field(DOL, "$(P)$(OM):A0_21 CP")
+}
+
+record(dfanout, "$(P)orientFan:A0_22") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):A0_22")
+  field(OUTB, "$(P)$(O2):A0_22")
+  field(OUTC, "$(P)$(O3):A0_22")
+  field(OUTD, "$(P)$(O4):A0_22")
+  field(OUTE, "$(P)$(O5):A0_22")
+  field(OUTF, "$(P)$(O6):A0_22")
+  field(OUTG, "$(P)$(O7):A0_22")
+  field(OUTH, "$(P)$(O8):A0_22")
+  field(DOL, "$(P)$(OM):A0_22 CP")
+}
+
+record(dfanout, "$(P)orientFan:A0_23") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):A0_23")
+  field(OUTB, "$(P)$(O2):A0_23")
+  field(OUTC, "$(P)$(O3):A0_23")
+  field(OUTD, "$(P)$(O4):A0_23")
+  field(OUTE, "$(P)$(O5):A0_23")
+  field(OUTF, "$(P)$(O6):A0_23")
+  field(OUTG, "$(P)$(O7):A0_23")
+  field(OUTH, "$(P)$(O8):A0_23")
+  field(DOL, "$(P)$(OM):A0_23 CP")
+}
+
+record(dfanout, "$(P)orientFan:A0_31") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):A0_31")
+  field(OUTB, "$(P)$(O2):A0_31")
+  field(OUTC, "$(P)$(O3):A0_31")
+  field(OUTD, "$(P)$(O4):A0_31")
+  field(OUTE, "$(P)$(O5):A0_31")
+  field(OUTF, "$(P)$(O6):A0_31")
+  field(OUTG, "$(P)$(O7):A0_31")
+  field(OUTH, "$(P)$(O8):A0_31")
+  field(DOL, "$(P)$(OM):A0_31 CP")
+}
+
+record(dfanout, "$(P)orientFan:A0_32") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):A0_32")
+  field(OUTB, "$(P)$(O2):A0_32")
+  field(OUTC, "$(P)$(O3):A0_32")
+  field(OUTD, "$(P)$(O4):A0_32")
+  field(OUTE, "$(P)$(O5):A0_32")
+  field(OUTF, "$(P)$(O6):A0_32")
+  field(OUTG, "$(P)$(O7):A0_32")
+  field(OUTH, "$(P)$(O8):A0_32")
+  field(DOL, "$(P)$(OM):A0_32 CP")
+}
+
+record(dfanout, "$(P)orientFan:A0_33") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):A0_33")
+  field(OUTB, "$(P)$(O2):A0_33")
+  field(OUTC, "$(P)$(O3):A0_33")
+  field(OUTD, "$(P)$(O4):A0_33")
+  field(OUTE, "$(P)$(O5):A0_33")
+  field(OUTF, "$(P)$(O6):A0_33")
+  field(OUTG, "$(P)$(O7):A0_33")
+  field(OUTH, "$(P)$(O8):A0_33")
+  field(DOL, "$(P)$(OM):A0_33 CP")
+}
+
+# OMTX
+record(dfanout, "$(P)orientFan:OMTX_11") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):OMTX_11")
+  field(OUTB, "$(P)$(O2):OMTX_11")
+  field(OUTC, "$(P)$(O3):OMTX_11")
+  field(OUTD, "$(P)$(O4):OMTX_11")
+  field(OUTE, "$(P)$(O5):OMTX_11")
+  field(OUTF, "$(P)$(O6):OMTX_11")
+  field(OUTG, "$(P)$(O7):OMTX_11")
+  field(OUTH, "$(P)$(O8):OMTX_11")
+  field(DOL, "$(P)$(OM):OMTX_11 CP")
+}
+
+record(dfanout, "$(P)orientFan:OMTX_12") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):OMTX_12")
+  field(OUTB, "$(P)$(O2):OMTX_12")
+  field(OUTC, "$(P)$(O3):OMTX_12")
+  field(OUTD, "$(P)$(O4):OMTX_12")
+  field(OUTE, "$(P)$(O5):OMTX_12")
+  field(OUTF, "$(P)$(O6):OMTX_12")
+  field(OUTG, "$(P)$(O7):OMTX_12")
+  field(OUTH, "$(P)$(O8):OMTX_12")
+  field(DOL, "$(P)$(OM):OMTX_12 CP")
+}
+
+record(dfanout, "$(P)orientFan:OMTX_13") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):OMTX_13")
+  field(OUTB, "$(P)$(O2):OMTX_13")
+  field(OUTC, "$(P)$(O3):OMTX_13")
+  field(OUTD, "$(P)$(O4):OMTX_13")
+  field(OUTE, "$(P)$(O5):OMTX_13")
+  field(OUTF, "$(P)$(O6):OMTX_13")
+  field(OUTG, "$(P)$(O7):OMTX_13")
+  field(OUTH, "$(P)$(O8):OMTX_13")
+  field(DOL, "$(P)$(OM):OMTX_13 CP")
+}
+
+record(dfanout, "$(P)orientFan:OMTX_21") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):OMTX_21")
+  field(OUTB, "$(P)$(O2):OMTX_21")
+  field(OUTC, "$(P)$(O3):OMTX_21")
+  field(OUTD, "$(P)$(O4):OMTX_21")
+  field(OUTE, "$(P)$(O5):OMTX_21")
+  field(OUTF, "$(P)$(O6):OMTX_21")
+  field(OUTG, "$(P)$(O7):OMTX_21")
+  field(OUTH, "$(P)$(O8):OMTX_21")
+  field(DOL, "$(P)$(OM):OMTX_21 CP")
+}
+
+record(dfanout, "$(P)orientFan:OMTX_22") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):OMTX_22")
+  field(OUTB, "$(P)$(O2):OMTX_22")
+  field(OUTC, "$(P)$(O3):OMTX_22")
+  field(OUTD, "$(P)$(O4):OMTX_22")
+  field(OUTE, "$(P)$(O5):OMTX_22")
+  field(OUTF, "$(P)$(O6):OMTX_22")
+  field(OUTG, "$(P)$(O7):OMTX_22")
+  field(OUTH, "$(P)$(O8):OMTX_22")
+  field(DOL, "$(P)$(OM):OMTX_22 CP")
+}
+
+record(dfanout, "$(P)orientFan:OMTX_23") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):OMTX_23")
+  field(OUTB, "$(P)$(O2):OMTX_23")
+  field(OUTC, "$(P)$(O3):OMTX_23")
+  field(OUTD, "$(P)$(O4):OMTX_23")
+  field(OUTE, "$(P)$(O5):OMTX_23")
+  field(OUTF, "$(P)$(O6):OMTX_23")
+  field(OUTG, "$(P)$(O7):OMTX_23")
+  field(OUTH, "$(P)$(O8):OMTX_23")
+  field(DOL, "$(P)$(OM):OMTX_23 CP")
+}
+
+record(dfanout, "$(P)orientFan:OMTX_31") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):OMTX_31")
+  field(OUTB, "$(P)$(O2):OMTX_31")
+  field(OUTC, "$(P)$(O3):OMTX_31")
+  field(OUTD, "$(P)$(O4):OMTX_31")
+  field(OUTE, "$(P)$(O5):OMTX_31")
+  field(OUTF, "$(P)$(O6):OMTX_31")
+  field(OUTG, "$(P)$(O7):OMTX_31")
+  field(OUTH, "$(P)$(O8):OMTX_31")
+  field(DOL, "$(P)$(OM):OMTX_31 CP")
+}
+
+record(dfanout, "$(P)orientFan:OMTX_32") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):OMTX_32")
+  field(OUTB, "$(P)$(O2):OMTX_32")
+  field(OUTC, "$(P)$(O3):OMTX_32")
+  field(OUTD, "$(P)$(O4):OMTX_32")
+  field(OUTE, "$(P)$(O5):OMTX_32")
+  field(OUTF, "$(P)$(O6):OMTX_32")
+  field(OUTG, "$(P)$(O7):OMTX_32")
+  field(OUTH, "$(P)$(O8):OMTX_32")
+  field(DOL, "$(P)$(OM):OMTX_32 CP")
+}
+
+record(dfanout, "$(P)orientFan:OMTX_33") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):OMTX_33")
+  field(OUTB, "$(P)$(O2):OMTX_33")
+  field(OUTC, "$(P)$(O3):OMTX_33")
+  field(OUTD, "$(P)$(O4):OMTX_33")
+  field(OUTE, "$(P)$(O5):OMTX_33")
+  field(OUTF, "$(P)$(O6):OMTX_33")
+  field(OUTG, "$(P)$(O7):OMTX_33")
+  field(OUTH, "$(P)$(O8):OMTX_33")
+  field(DOL, "$(P)$(OM):OMTX_33 CP")
+}
+
+record(dfanout, "$(P)orientFan:a") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):a")
+  field(OUTB, "$(P)$(O2):a")
+  field(OUTC, "$(P)$(O3):a")
+  field(OUTD, "$(P)$(O4):a")
+  field(OUTE, "$(P)$(O5):a")
+  field(OUTF, "$(P)$(O6):a")
+  field(OUTG, "$(P)$(O7):a")
+  field(OUTH, "$(P)$(O8):a")
+  field(DOL, "$(P)$(OM):a CP")
+}
+
+record(dfanout, "$(P)orientFan:b") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):b")
+  field(OUTB, "$(P)$(O2):b")
+  field(OUTC, "$(P)$(O3):b")
+  field(OUTD, "$(P)$(O4):b")
+  field(OUTE, "$(P)$(O5):b")
+  field(OUTF, "$(P)$(O6):b")
+  field(OUTG, "$(P)$(O7):b")
+  field(OUTH, "$(P)$(O8):b")
+  field(DOL, "$(P)$(OM):b CP")
+}
+
+record(dfanout, "$(P)orientFan:c") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):c")
+  field(OUTB, "$(P)$(O2):c")
+  field(OUTC, "$(P)$(O3):c")
+  field(OUTD, "$(P)$(O4):c")
+  field(OUTE, "$(P)$(O5):c")
+  field(OUTF, "$(P)$(O6):c")
+  field(OUTG, "$(P)$(O7):c")
+  field(OUTH, "$(P)$(O8):c")
+  field(DOL, "$(P)$(OM):c CP")
+}
+
+record(dfanout, "$(P)orientFan:alpha") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):alpha")
+  field(OUTB, "$(P)$(O2):alpha")
+  field(OUTC, "$(P)$(O3):alpha")
+  field(OUTD, "$(P)$(O4):alpha")
+  field(OUTE, "$(P)$(O5):alpha")
+  field(OUTF, "$(P)$(O6):alpha")
+  field(OUTG, "$(P)$(O7):alpha")
+  field(OUTH, "$(P)$(O8):alpha")
+  field(DOL, "$(P)$(OM):alpha CP")
+}
+
+record(dfanout, "$(P)orientFan:beta") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):beta")
+  field(OUTB, "$(P)$(O2):beta")
+  field(OUTC, "$(P)$(O3):beta")
+  field(OUTD, "$(P)$(O4):beta")
+  field(OUTE, "$(P)$(O5):beta")
+  field(OUTF, "$(P)$(O6):beta")
+  field(OUTG, "$(P)$(O7):beta")
+  field(OUTH, "$(P)$(O8):beta")
+  field(DOL, "$(P)$(OM):beta CP")
+}
+
+record(dfanout, "$(P)orientFan:gamma") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):gamma")
+  field(OUTB, "$(P)$(O2):gamma")
+  field(OUTC, "$(P)$(O3):gamma")
+  field(OUTD, "$(P)$(O4):gamma")
+  field(OUTE, "$(P)$(O5):gamma")
+  field(OUTF, "$(P)$(O6):gamma")
+  field(OUTG, "$(P)$(O7):gamma")
+  field(OUTH, "$(P)$(O8):gamma")
+  field(DOL, "$(P)$(OM):gamma CP")
+}
+
+record(dfanout, "$(P)orientFan:lambda") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):lambda")
+  field(OUTB, "$(P)$(O2):lambda")
+  field(OUTC, "$(P)$(O3):lambda")
+  field(OUTD, "$(P)$(O4):lambda")
+  field(OUTE, "$(P)$(O5):lambda")
+  field(OUTF, "$(P)$(O6):lambda")
+  field(OUTG, "$(P)$(O7):lambda")
+  field(OUTH, "$(P)$(O8):lambda")
+  field(DOL, "$(P)$(OM):lambda CP")
+}
+
+record(dfanout, "$(P)orientFan:energy") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):energy")
+  field(OUTB, "$(P)$(O2):energy")
+  field(OUTC, "$(P)$(O3):energy")
+  field(OUTD, "$(P)$(O4):energy")
+  field(OUTE, "$(P)$(O5):energy")
+  field(OUTF, "$(P)$(O6):energy")
+  field(OUTG, "$(P)$(O7):energy")
+  field(OUTH, "$(P)$(O8):energy")
+  field(DOL, "$(P)$(OM):energy CP")
+}
+
+record(dfanout, "$(P)orientFan:motGet_Auto") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):motGet_Auto")
+  field(OUTB, "$(P)$(O2):motGet_Auto")
+  field(OUTC, "$(P)$(O3):motGet_Auto")
+  field(OUTD, "$(P)$(O4):motGet_Auto")
+  field(OUTE, "$(P)$(O5):motGet_Auto")
+  field(OUTF, "$(P)$(O6):motGet_Auto")
+  field(OUTG, "$(P)$(O7):motGet_Auto")
+  field(OUTH, "$(P)$(O8):motGet_Auto")
+  field(DOL, "0")
+}
+
+record(dfanout, "$(P)orientFan:motPut_Auto") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):motPut_Auto")
+  field(OUTB, "$(P)$(O2):motPut_Auto")
+  field(OUTC, "$(P)$(O3):motPut_Auto")
+  field(OUTD, "$(P)$(O4):motPut_Auto")
+  field(OUTE, "$(P)$(O5):motPut_Auto")
+  field(OUTF, "$(P)$(O6):motPut_Auto")
+  field(OUTG, "$(P)$(O7):motPut_Auto")
+  field(OUTH, "$(P)$(O8):motPut_Auto")
+  field(DOL, "0")
+}
+
+record(dfanout, "$(P)orientFan:Mode") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):Mode")
+  field(OUTB, "$(P)$(O2):Mode")
+  field(OUTC, "$(P)$(O3):Mode")
+  field(OUTD, "$(P)$(O4):Mode")
+  field(OUTE, "$(P)$(O5):Mode")
+  field(OUTF, "$(P)$(O6):Mode")
+  field(OUTG, "$(P)$(O7):Mode")
+  field(OUTH, "$(P)$(O8):Mode")
+  field(DOL, "$(P)$(OM):Mode CP")
+}
+
+record(dfanout, "$(P)orientFan:H1") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):H1")
+  field(OUTB, "$(P)$(O2):H1")
+  field(OUTC, "$(P)$(O3):H1")
+  field(OUTD, "$(P)$(O4):H1")
+  field(OUTE, "$(P)$(O5):H1")
+  field(OUTF, "$(P)$(O6):H1")
+  field(OUTG, "$(P)$(O7):H1")
+  field(OUTH, "$(P)$(O8):H1")
+  field(DOL, "$(P)$(OM):H1 CP")
+}
+
+record(dfanout, "$(P)orientFan:K1") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):K1")
+  field(OUTB, "$(P)$(O2):K1")
+  field(OUTC, "$(P)$(O3):K1")
+  field(OUTD, "$(P)$(O4):K1")
+  field(OUTE, "$(P)$(O5):K1")
+  field(OUTF, "$(P)$(O6):K1")
+  field(OUTG, "$(P)$(O7):K1")
+  field(OUTH, "$(P)$(O8):K1")
+  field(DOL, "$(P)$(OM):K1 CP")
+}
+
+record(dfanout, "$(P)orientFan:L1") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):L1")
+  field(OUTB, "$(P)$(O2):L1")
+  field(OUTC, "$(P)$(O3):L1")
+  field(OUTD, "$(P)$(O4):L1")
+  field(OUTE, "$(P)$(O5):L1")
+  field(OUTF, "$(P)$(O6):L1")
+  field(OUTG, "$(P)$(O7):L1")
+  field(OUTH, "$(P)$(O8):L1")
+  field(DOL, "$(P)$(OM):L1 CP")
+}
+
+record(dfanout, "$(P)orientFan:TTH1") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):TTH1")
+  field(OUTB, "$(P)$(O2):TTH1")
+  field(OUTC, "$(P)$(O3):TTH1")
+  field(OUTD, "$(P)$(O4):TTH1")
+  field(OUTE, "$(P)$(O5):TTH1")
+  field(OUTF, "$(P)$(O6):TTH1")
+  field(OUTG, "$(P)$(O7):TTH1")
+  field(OUTH, "$(P)$(O8):TTH1")
+  field(DOL, "$(P)$(OM):TTH1 CP")
+}
+
+record(dfanout, "$(P)orientFan:TH1") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):TH1")
+  field(OUTB, "$(P)$(O2):TH1")
+  field(OUTC, "$(P)$(O3):TH1")
+  field(OUTD, "$(P)$(O4):TH1")
+  field(OUTE, "$(P)$(O5):TH1")
+  field(OUTF, "$(P)$(O6):TH1")
+  field(OUTG, "$(P)$(O7):TH1")
+  field(OUTH, "$(P)$(O8):TH1")
+  field(DOL, "$(P)$(OM):TH1 CP")
+}
+
+record(dfanout, "$(P)orientFan:CHI1") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):CHI1")
+  field(OUTB, "$(P)$(O2):CHI1")
+  field(OUTC, "$(P)$(O3):CHI1")
+  field(OUTD, "$(P)$(O4):CHI1")
+  field(OUTE, "$(P)$(O5):CHI1")
+  field(OUTF, "$(P)$(O6):CHI1")
+  field(OUTG, "$(P)$(O7):CHI1")
+  field(OUTH, "$(P)$(O8):CHI1")
+  field(DOL, "$(P)$(OM):CHI1 CP")
+}
+
+record(dfanout, "$(P)orientFan:PHI1") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):PHI1")
+  field(OUTB, "$(P)$(O2):PHI1")
+  field(OUTC, "$(P)$(O3):PHI1")
+  field(OUTD, "$(P)$(O4):PHI1")
+  field(OUTE, "$(P)$(O5):PHI1")
+  field(OUTF, "$(P)$(O6):PHI1")
+  field(OUTG, "$(P)$(O7):PHI1")
+  field(OUTH, "$(P)$(O8):PHI1")
+  field(DOL, "$(P)$(OM):PHI1 CP")
+}
+
+# secondary reflection
+record(dfanout, "$(P)orientFan:H2") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):H2")
+  field(OUTB, "$(P)$(O2):H2")
+  field(OUTC, "$(P)$(O3):H2")
+  field(OUTD, "$(P)$(O4):H2")
+  field(OUTE, "$(P)$(O5):H2")
+  field(OUTF, "$(P)$(O6):H2")
+  field(OUTG, "$(P)$(O7):H2")
+  field(OUTH, "$(P)$(O8):H2")
+  field(DOL, "$(P)$(OM):H2 CP")
+}
+
+record(dfanout, "$(P)orientFan:K2") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):K2")
+  field(OUTB, "$(P)$(O2):K2")
+  field(OUTC, "$(P)$(O3):K2")
+  field(OUTD, "$(P)$(O4):K2")
+  field(OUTE, "$(P)$(O5):K2")
+  field(OUTF, "$(P)$(O6):K2")
+  field(OUTG, "$(P)$(O7):K2")
+  field(OUTH, "$(P)$(O8):K2")
+  field(DOL, "$(P)$(OM):K2 CP")
+}
+
+record(dfanout, "$(P)orientFan:L2") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):L2")
+  field(OUTB, "$(P)$(O2):L2")
+  field(OUTC, "$(P)$(O3):L2")
+  field(OUTD, "$(P)$(O4):L2")
+  field(OUTE, "$(P)$(O5):L2")
+  field(OUTF, "$(P)$(O6):L2")
+  field(OUTG, "$(P)$(O7):L2")
+  field(OUTH, "$(P)$(O8):L2")
+  field(DOL, "$(P)$(OM):L2 CP")
+}
+
+record(dfanout, "$(P)orientFan:TTH2") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):TTH2")
+  field(OUTB, "$(P)$(O2):TTH2")
+  field(OUTC, "$(P)$(O3):TTH2")
+  field(OUTD, "$(P)$(O4):TTH2")
+  field(OUTE, "$(P)$(O5):TTH2")
+  field(OUTF, "$(P)$(O6):TTH2")
+  field(OUTG, "$(P)$(O7):TTH2")
+  field(OUTH, "$(P)$(O8):TTH2")
+  field(DOL, "$(P)$(OM):TTH2 CP")
+}
+
+record(dfanout, "$(P)orientFan:TH2") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):TH2")
+  field(OUTB, "$(P)$(O2):TH2")
+  field(OUTC, "$(P)$(O3):TH2")
+  field(OUTD, "$(P)$(O4):TH2")
+  field(OUTE, "$(P)$(O5):TH2")
+  field(OUTF, "$(P)$(O6):TH2")
+  field(OUTG, "$(P)$(O7):TH2")
+  field(OUTH, "$(P)$(O8):TH2")
+  field(DOL, "$(P)$(OM):TH2 CP")
+}
+
+record(dfanout, "$(P)orientFan:CHI2") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):CHI2")
+  field(OUTB, "$(P)$(O2):CHI2")
+  field(OUTC, "$(P)$(O3):CHI2")
+  field(OUTD, "$(P)$(O4):CHI2")
+  field(OUTE, "$(P)$(O5):CHI2")
+  field(OUTF, "$(P)$(O6):CHI2")
+  field(OUTG, "$(P)$(O7):CHI2")
+  field(OUTH, "$(P)$(O8):CHI2")
+  field(DOL, "$(P)$(OM):CHI2 CP")
+}
+
+record(dfanout, "$(P)orientFan:PHI2") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):PHI2")
+  field(OUTB, "$(P)$(O2):PHI2")
+  field(OUTC, "$(P)$(O3):PHI2")
+  field(OUTD, "$(P)$(O4):PHI2")
+  field(OUTE, "$(P)$(O5):PHI2")
+  field(OUTF, "$(P)$(O6):PHI2")
+  field(OUTG, "$(P)$(O7):PHI2")
+  field(OUTH, "$(P)$(O8):PHI2")
+  field(DOL, "$(P)$(OM):PHI2 CP")
+}
+
+record(dfanout, "$(P)orientFan:TH") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):TH PP")
+  field(OUTB, "$(P)$(O2):TH PP")
+  field(OUTC, "$(P)$(O3):TH PP")
+  field(OUTD, "$(P)$(O4):TH PP")
+  field(OUTE, "$(P)$(O5):TH PP")
+  field(OUTF, "$(P)$(O6):TH PP")
+  field(OUTG, "$(P)$(O7):TH PP")
+  field(OUTH, "$(P)$(O8):TH PP")
+  field(DOL, "$(P)$(OM):TH CP")
+}
+
+record(dfanout, "$(P)orientFan:CHI") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):CHI PP")
+  field(OUTB, "$(P)$(O2):CHI PP")
+  field(OUTC, "$(P)$(O3):CHI PP")
+  field(OUTD, "$(P)$(O4):CHI PP")
+  field(OUTE, "$(P)$(O5):CHI PP")
+  field(OUTF, "$(P)$(O6):CHI PP")
+  field(OUTG, "$(P)$(O7):CHI PP")
+  field(OUTH, "$(P)$(O8):CHI PP")
+  field(DOL, "$(P)$(OM):CHI CP")
+}
+
+record(dfanout, "$(P)orientFan:PHI") {
+  field(OMSL, "closed_loop")
+  field(OUTA, "$(P)$(O1):PHI PP")
+  field(OUTB, "$(P)$(O2):PHI PP")
+  field(OUTC, "$(P)$(O3):PHI PP")
+  field(OUTD, "$(P)$(O4):PHI PP")
+  field(OUTE, "$(P)$(O5):PHI PP")
+  field(OUTF, "$(P)$(O6):PHI PP")
+  field(OUTG, "$(P)$(O7):PHI PP")
+  field(OUTH, "$(P)$(O8):PHI PP")
+  field(DOL, "$(P)$(OM):PHI CP")
+}
+
+record(transform, "$(P)orientFan:TTH") {
+  field(INPA, "$(P)$(OM):TTH CP")
+  field(CLCB, "A+.954")
+  field(CLCC, "A+1.909")
+  field(CLCD, "A+2.862")
+  field(CLCE, "A+3.814")
+  field(CLCF, "A-.954")
+  field(CLCG, "A-1.909")
+  field(CLCH, "A-2.862")
+  field(CLCI, "A-3.814")
+  field(OUTB, "$(P)$(O1):TTH PP")
+  field(OUTC, "$(P)$(O2):TTH PP")
+  field(OUTD, "$(P)$(O3):TTH PP")
+  field(OUTE, "$(P)$(O4):TTH PP")
+  field(OUTF, "$(P)$(O5):TTH PP")
+  field(OUTG, "$(P)$(O6):TTH PP")
+  field(OUTH, "$(P)$(O7):TTH PP")
+  field(OUTI, "$(P)$(O8):TTH PP")
+}

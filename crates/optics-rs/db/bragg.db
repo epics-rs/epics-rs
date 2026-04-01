@@ -1,0 +1,277 @@
+grecord(ao,"$(P)Bragg_H")
+{
+	field(DESC,"Miller index H")
+	field(PINI,"YES")
+	field(OUT,"$(P)Bragg_2d_spacing.B PP MS")
+	field(DOL,"1")
+	field(DRVH,"15")
+	field(HOPR,"15")
+}
+grecord(ao,"$(P)Bragg_K")
+{
+	field(DESC,"Miller index k")
+	field(PINI,"YES")
+	field(OUT,"$(P)Bragg_2d_spacing.C PP MS")
+	field(DOL,"1")
+	field(DRVH,"15")
+	field(HOPR,"15")
+}
+grecord(ao,"$(P)Bragg_L")
+{
+	field(DESC,"Miller index l")
+	field(PINI,"YES")
+	field(OUT,"$(P)Bragg_2d_spacing.D PP MS")
+	field(DOL,"1")
+	field(DRVH,"15")
+	field(HOPR,"15")
+}
+grecord(ao,"$(P)Bragg_a")
+{
+	field(DESC,"Lattice constant")
+	field(PINI,"YES")
+	field(OUT,"$(P)Bragg_2d_spacing.E PP MS")
+	field(DOL,"5.43102")
+	field(PREC,"5")
+	field(EGUF,"20")
+	field(EGUL,"0.1")
+	field(EGU,"Angstroms")
+	field(DRVH,"20")
+	field(DRVL,"0.1")
+	field(HOPR,"20")
+	field(LOPR,"0.1")
+}
+grecord(transform,"$(P)Bragg_2d_spacing")
+{
+	field(DESC,"Calculate 2d crystal spacing")
+	field(CLCA,"0")
+	field(CLCE,"5.43102")
+	field(CLCF,"e/sqr(b*b+c*c+d*d)")
+	field(CLCG,"2*f")
+	field(INPB,"$(P)Bragg_H.VAL NPP NMS")
+	field(INPC,"$(P)Bragg_K.VAL NPP NMS")
+	field(INPD,"$(P)Bragg_L.VAL NPP NMS")
+	field(INPE,"$(P)Bragg_a.VAL NPP NMS")
+	field(OUTA,"$(P)Kohzu_run.VAL PP MS")
+	field(EGU,"Angstroms")
+	field(PREC,"5")
+}
+grecord(bo,"$(P)Kohzu_flink")
+{
+	field(DISV,"0")
+	field(SDIS,"$(P)Kohzu_run.VAL NPP NMS")
+	field(FLNK,"$(P)Kohzu_put.PROCPP PP MS")
+}
+grecord(bo,"$(P)Kohzu_run")
+{
+	field(DESC,"Disable Kohzu_poke")
+	field(ZNAM,"Manual")
+	field(ONAM,"Auto")
+}
+grecord(fanout,"$(P)mTheta_flink")
+{
+	field(LNK1,"$(P)BraggBackProp.PROCPP PP MS")
+	field(LNK2,"$(P)Bragg_limits.PROCPP PP MS")
+}
+grecord(transform,"$(P)Bragg_ELT")
+{
+	field(DESC,"Calc energy,wavelength,theta")
+	field(FLNK,"$(P)Kohzu_flink.PROC PP MS")
+	field(CLCA,"12.3984244")
+	field(CLCB,"a/c")
+	field(CLCC,"a/b")
+	field(CLCD,"asin(min(1,c/f))/D2R")
+	field(CLCE,"min(i,max(j,d))")
+	field(CLCG,"f*sin(d*D2R)")
+	field(CLCH,"a/g")
+	field(INPI,"$(P)$(M_THETA).HLM NPP NMS")
+	field(INPJ,"$(P)$(M_THETA).LLM NPP NMS")
+	field(OUTE,"$(P)Bragg_theta.VAL PP MS")
+	field(OUTG,"$(P)Bragg_lambda.VAL PP MS")
+	field(OUTH,"$(P)Bragg_E.VAL PP MS")
+	field(PREC,"5")
+}
+grecord(transform,"$(P)Kohzu_put")
+{
+	field(SDIS,"$(P)BraggBackProp.PACT NPP NMS")
+	field(INPC,"$(P)Bragg_ELT.E PP MS")
+	field(OUTC,"$(P)$(M_THETA).VAL PP MS")
+	field(PREC,"5")
+}
+grecord(transform,"$(P)Bragg_limits")
+{
+	field(DESC,"Calc energy,wavelen,lim")
+	field(CLCD,"12.3984244")
+	field(CLCE,"c*sin(a*D2R)")
+	field(CLCF,"c*sin(b*D2R)")
+	field(CLCG,"d/f")
+	field(CLCH,"d/e")
+	field(INPA,"$(P)$(M_THETA).HLM NPP NMS")
+	field(INPB,"$(P)$(M_THETA).LLM NPP NMS")
+	field(PREC,"5")
+}
+grecord(transform,"$(P)Bragg_readback")
+{
+	field(DESC,"Bragg readback calc")
+	field(CLCC,"b*sin(a*D2R)")
+	field(CLCD,"12.3984244")
+	field(CLCE,"d/c")
+	field(INPA,"$(P)$(M_THETA).RBV NPP NMS")
+	field(PREC,"5")
+}
+grecord(ao,"$(P)Bragg_E")
+{
+	field(DESC,"Bragg Energy (keV)")
+	field(OUT,"$(P)Bragg_E_put.VAL PP MS")
+	field(PREC,"4")
+	field(EGU,"keV")
+	field(DRVH,"200")
+	field(HOPR,"200")
+}
+grecord(ao,"$(P)Bragg_lambda")
+{
+	field(DESC,"Bragg Wavelength (Angstroms)")
+	field(OUT,"$(P)Bragg_ELT.C PP MS")
+	field(PREC,"4")
+	field(EGU,"Angstroms")
+	field(DRVH,"20")
+	field(DRVL,"0.05")
+	field(HOPR,"200")
+}
+grecord(ao,"$(P)Bragg_theta")
+{
+	field(DESC,"Bragg angle (degrees)")
+	field(OUT,"$(P)Bragg_ELT.D PP MS")
+	field(PREC,"5")
+	field(EGU,"degrees")
+	field(DRVH,"90")
+	field(HOPR,"90")
+}
+grecord(ao,"$(P)BraggBackProp")
+{
+	field(OUT,"$(P)Bragg_ELT.D PP MS")
+	field(DOL,"$(P)$(M_THETA).VAL NPP NMS")
+	field(OMSL,"closed_loop")
+	field(PREC,"5")
+}
+grecord(motor,"$(P)$(M_THETA)")
+{
+	field(DESC,"theta")
+	field(DTYP,"OMS VME58")
+	field(FLNK,"$(P)mTheta_flink.PROCPP PP MS")
+	field(DIR,"Neg")
+	field(VELO,"1")
+	field(BDST,"0.01")
+	field(BVEL,"1")
+	field(BACC,"0.2")
+	field(RDBL,"$(P)HeidEncoderRead_m1.VAL PP MS")
+	field(RLNK,"$(P)Bragg_readback.PROC PP MS")
+	field(MRES,"4.0e-06")
+	field(RRES,"-1")
+	field(PREC,"7")
+	field(EGU,"degrees")
+	field(DHLM,"360")
+	field(DLLM,"-360")
+	field(RDBD,"0.001")
+	field(TWV,"1")
+}
+grecord(transform,"$(P)Bragg_2d_put")
+{
+	field(CLCB,"a")
+	field(CLCC,"a")
+	field(INPA,"$(P)Bragg_2d_spacing.G PP MS")
+	field(OUTA,"$(P)Bragg_ELT.F PP MS")
+	field(OUTB,"$(P)Bragg_readback.B PP MS")
+	field(OUTC,"$(P)Bragg_limits.C PP MS")
+}
+grecord(swait,"$(P)Kohzu_done")
+{
+	field(DESC,"Kohzu done moving")
+	field(SCAN,"I/O Intr")
+	field(PINI,"YES")
+	field(INAN,"$(P)$(M_THETA).DMOV")
+	field(CALC,"(a)=1")
+	field(OOPT,"Transition To Non-zero")
+	field(DOLD,"1")
+}
+grecord(bo,"$(P)Bragg_E_inc")
+{
+	field(DISV,"0")
+	field(SDIS,"$(P)Bragg_E_inc.VAL NPP NMS")
+	field(FLNK,"$(P)Bragg_E_tweak.PROC PP MS")
+}
+grecord(transform,"$(P)Bragg_E_tweak")
+{
+	field(CLCE,"a?c+d:b?c-d:c")
+	field(INPA,"$(P)Bragg_E_inc.VAL NPP NMS")
+	field(INPB,"$(P)Bragg_E_dec.VAL NPP NMS")
+	field(INPC,"$(P)Bragg_E.VAL NPP NMS")
+	field(INPD,"0.1")
+	field(OUTE,"$(P)Bragg_E.VAL PP MS")
+	field(PREC,"4")
+}
+grecord(bo,"$(P)Bragg_E_dec")
+{
+	field(DISV,"0")
+	field(SDIS,"$(P)Bragg_E_dec.VAL NPP NMS")
+	field(FLNK,"$(P)Bragg_E_tweak.PROC PP MS")
+}
+grecord(bo,"$(P)Bragg_lambda_inc")
+{
+	field(DISV,"0")
+	field(SDIS,"$(P)Bragg_lambda_inc.VAL NPP NMS")
+	field(FLNK,"$(P)Bragg_lambda_tweak.PROC PP MS")
+}
+grecord(transform,"$(P)Bragg_lambda_tweak")
+{
+	field(CLCE,"a?c+d:b?c-d:c")
+	field(INPA,"$(P)Bragg_lambda_inc.VAL NPP NMS")
+	field(INPB,"$(P)Bragg_lambda_dec.VAL NPP NMS")
+	field(INPC,"$(P)Bragg_lambda.VAL NPP NMS")
+	field(INPD,"0.1")
+	field(OUTE,"$(P)Bragg_lambda.VAL PP MS")
+	field(PREC,"4")
+}
+grecord(bo,"$(P)Bragg_lambda_dec")
+{
+	field(DISV,"0")
+	field(SDIS,"$(P)Bragg_lambda_dec.VAL NPP NMS")
+	field(FLNK,"$(P)Bragg_lambda_tweak.PROC PP MS")
+}
+grecord(bo,"$(P)Bragg_theta_inc")
+{
+	field(DISV,"0")
+	field(SDIS,"$(P)Bragg_theta_inc.VAL NPP NMS")
+	field(FLNK,"$(P)Bragg_theta_tweak.PROC PP MS")
+}
+grecord(transform,"$(P)Bragg_theta_tweak")
+{
+	field(CLCE,"a?c+d:b?c-d:c")
+	field(INPA,"$(P)Bragg_theta_inc.VAL NPP NMS")
+	field(INPB,"$(P)Bragg_theta_dec.VAL NPP NMS")
+	field(INPC,"$(P)Bragg_theta.VAL NPP NMS")
+	field(INPD,"0.1")
+	field(OUTE,"$(P)Bragg_theta.VAL PP MS")
+	field(PREC,"4")
+}
+grecord(bo,"$(P)Bragg_theta_dec")
+{
+	field(DISV,"0")
+	field(SDIS,"$(P)Bragg_theta_dec.VAL NPP NMS")
+	field(FLNK,"$(P)Bragg_theta_tweak.PROC PP MS")
+}
+grecord(ao,"$(P)Bragg_E_put")
+{
+	field(DESC,"Bragg Energy (keV)")
+	field(OUT,"$(P)Bragg_ELT.B PP MS")
+	field(PREC,"4")
+	field(EGU,"keV")
+	field(DRVH,"200")
+	field(HOPR,"200")
+}
+grecord(ai,"$(P)HeidEncoderRead_m1")
+{
+	field(DESC,"Heidenhain AWE 1024 read")
+	field(DTYP,"Heidenhein Encoder")
+	field(INP,"#L10 A$(A) @2")
+	field(PREC,"5")
+}

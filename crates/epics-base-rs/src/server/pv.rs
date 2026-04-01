@@ -8,6 +8,16 @@ use crate::types::{DbFieldType, EpicsValue};
 #[derive(Debug, Clone)]
 pub struct MonitorEvent {
     pub snapshot: Snapshot,
+    /// Origin writer ID. When non-zero, subscribers with the same
+    /// `ignore_origin` can filter out self-triggered events.
+    /// Used to prevent sequencer write-back loops.
+    ///
+    /// **Scope**: Currently tagged on `put_pv_and_post_with_origin` events only.
+    /// Events from `process_record_with_links` (process path) always have
+    /// origin=0. If a future sequencer needs to filter process-path events
+    /// too, origin tagging can be extended to the process path by passing
+    /// origin through `ProcessOutcome` or `process_record_with_links`.
+    pub origin: u64,
 }
 
 /// A subscriber waiting for PV value updates.
@@ -63,7 +73,7 @@ impl ProcessVariable {
         });
         for sub in subs.iter() {
             let snapshot = Snapshot::new(value.clone(), 0, 0, crate::runtime::time::now_wall());
-            let _ = sub.tx.try_send(MonitorEvent { snapshot });
+            let _ = sub.tx.try_send(MonitorEvent { snapshot, origin: 0 });
         }
     }
 

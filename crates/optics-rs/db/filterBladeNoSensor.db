@@ -1,0 +1,134 @@
+# EPICS database template for a 1-blade filter unit.
+# The filter is assumed to have a binary output bit to drive the blade and no
+# sensors to say whether it is in or out.
+#
+# C.M. Schlepuetz
+# December 21, 2012
+#
+# $Revision: 5042 $
+# $Date: 2013-01-31 16:46:29 -0600 (Thu, 31 Jan 2013) $
+# $Author: cschlep $
+# $URL: https://subversion.xray.aps.anl.gov/bcdaioc/33bmTEST/33bmTESTApp/Db/filterBladeNoSensor.db $
+#
+##############################################################################
+# Required substitutions:
+#   P          = Prefix, usually the IOC name, e.g.: "iocA:"
+#   R          = Record, the name of the filter record, e.g.: "filter:"
+#   N          = Filter number, the identifier for the filter blade, e.g.: "1"
+#   DESC       = Description of the filter blade, e.g.: "Filter 1"
+#   OUT        = Name of the binary output channel, e.g.: "iocA:9440:c0:Out0"
+#   OUT_STRING = String value of the ouput channel when the filter is OUT
+#   IN_STRING  = String value of the ouput channel when the filter is IN
+##############################################################################
+
+
+# Define the actuator "Set" record.
+#   0 = filter is out
+#   1 = filter is in
+record(bo, "$(P)$(R)Fi$(N):Set") {
+  field (DESC, "$(DESC) actuator")
+  field (DTYP, "Soft Channel")
+  field (ZNAM, "Out")
+  field (ONAM, "In")
+  field (FLNK, "$(P)$(R)Fi$(N):OutSet.PROC")
+}
+
+# Set the actual output channel value:
+#   Set == 0 --> OutSet = $(OUT_STRING)
+#   Set == 1 --> OutSet = $(IN_STRING)
+record(scalcout, "$(P)$(R)Fi$(N):OutSet") {
+  field (AA,  "$(OUT_STRING)")
+  field (BB,  "$(IN_STRING)")
+  field (INPA,"$(P)$(R)Fi$(N):Set NPP NMS")
+  field (CALC,"A?BB:AA")
+  field (OUT, "$(OUT) PP NMS")
+  field (FLNK,"$(P)$(R)SetBusy.PROC")
+}
+
+# Read back the filter position from actual ouput channel
+record(scalcout, "$(P)$(R)Fi$(N):OutGet") {
+  field (BB,  "$(IN_STRING)")
+  field (INAA, "$(OUT) CP")
+  field (CALC, "AA==BB?1:0")
+}
+
+# Define the "Enable" record.
+# When == 1, the filter is included the transmission calculations,
+# otherwise it is assumed to be unavailable and out of the current beam path.
+record(bo, "$(P)$(R)Fi$(N):Enable") {
+  field(DESC, "$(DESC) enabled")
+  field(DTYP, "Soft Channel")
+  field(ZNAM, "Disable")
+  field(ONAM, "Enable")
+  field(ZSV, "MAJOR")
+  field(OSV, "NO_ALARM")
+  field(SCAN, "Passive")
+  field(VAL,  "1")
+  field(FLNK, "$(P)$(R)SetBusy.PROC")
+}
+
+# Define the "Lock" record.
+# When == 1, the filter is not allowed to  be changed
+# by the automatic transmission adjustments.
+record(bo, "$(P)$(R)Fi$(N):Lock") {
+  field(DESC, "$(DESC) lock")
+  field(ZNAM, "Free")
+  field(ONAM, "Lock")
+  field(SCAN, "Passive")
+  field(VAL,  "0")
+  field (FLNK, "$(P)$(R)SetBusy.PROC")
+}
+
+# The filter thickness
+record(ao, "$(P)$(R)Fi$(N):Thickness") {
+  field(DESC, "$(DESC) thickness [um]")
+  field(PREC, "2")
+  field(VAL, "100")
+  field (FLNK, "$(P)$(R)SetBusy.PROC")
+}
+
+# The filter material list
+record(mbbo, "$(P)$(R)Fi$(N):Material") {
+  field(DESC, "$(DESC) material")
+  field(ZRVL, "0")
+  field(ZRST, "Be")
+  field(ONVL, "1")
+  field(ONST, "C")
+  field(TWVL, "2")
+  field(TWST, "Al")
+  field(THVL, "3")
+  field(THST, "Si")
+  field(FRVL, "4")
+  field(FRST, "Ti")
+  field(FVVL, "5")
+  field(FVST, "Cr")
+  field(SXVL, "6")
+  field(SXST, "Fe")
+  field(SVVL, "7")
+  field(SVST, "Co")
+  field(EIVL, "8")
+  field(EIST, "Cu")
+  field(NIVL, "9")
+  field(NIST, "Ge")
+  field(TEVL, "10")
+  field(TEST, "Mo")
+  field(ELVL, "11")
+  field(ELST, "Ag")
+  field(TVVL, "12")
+  field(TVST, "Ta")
+  field(TTVL, "13")
+  field(TTST, "W")
+  field(FTVL, "14")
+  field(FTST, "Au")
+  field(FFVL, "15")
+  field(FFST, "Pb")  
+  field(VAL,  "1")
+  field (FLNK, "$(P)$(R)SetBusy.PROC")
+}
+
+# The filter transmission
+record(ai, "$(P)$(R)Fi$(N):Transmission") {
+  field(DESC, "$(DESC) transmission")
+  field(PREC, "2")
+}
+

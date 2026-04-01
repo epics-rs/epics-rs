@@ -282,6 +282,23 @@ impl EpicsValue {
         if self.dbr_type() == target {
             return self.clone();
         }
+        // Menu string resolution: when converting String to Short/Enum,
+        // try resolve_menu_string first (e.g. "MINOR" -> 1).
+        if let EpicsValue::String(s) = self {
+            match target {
+                DbFieldType::Short => {
+                    if let Some(idx) = Self::resolve_menu_string(s) {
+                        return EpicsValue::Short(idx);
+                    }
+                }
+                DbFieldType::Enum => {
+                    if let Some(idx) = Self::resolve_menu_string(s) {
+                        return EpicsValue::Enum(idx as u16);
+                    }
+                }
+                _ => {}
+            }
+        }
         match target {
             DbFieldType::String => EpicsValue::String(format!("{self}")),
             DbFieldType::Short => EpicsValue::Short(self.to_f64().unwrap_or(0.0) as i16),
@@ -394,9 +411,8 @@ impl EpicsValue {
         }
         match dbr_type {
             DbFieldType::String => Ok(Self::String(s.to_string())),
-            DbFieldType::Short => s
-                .parse::<i16>()
-                .map(Self::Short)
+            DbFieldType::Short => Self::parse_int(s)
+                .map(|v| Self::Short(v as i16))
                 .or_else(|_| {
                     Self::resolve_menu_string(s)
                         .map(Self::Short)
@@ -406,26 +422,38 @@ impl EpicsValue {
                 .parse::<f32>()
                 .map(Self::Float)
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
-            DbFieldType::Enum => s
-                .parse::<u16>()
-                .map(Self::Enum)
+            DbFieldType::Enum => Self::parse_int(s)
+                .map(|v| Self::Enum(v as u16))
                 .or_else(|_| {
                     Self::resolve_menu_string(s)
                         .map(|v| Self::Enum(v as u16))
                         .ok_or_else(|| CaError::InvalidValue(format!("invalid enum or menu string: {s}")))
                 }),
-            DbFieldType::Char => s
-                .parse::<u8>()
-                .map(Self::Char)
+            DbFieldType::Char => Self::parse_int(s)
+                .map(|v| Self::Char(v as u8))
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
-            DbFieldType::Long => s
-                .parse::<i32>()
-                .map(Self::Long)
+            DbFieldType::Long => Self::parse_int(s)
+                .map(|v| Self::Long(v as i32))
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
             DbFieldType::Double => s
                 .parse::<f64>()
                 .map(Self::Double)
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
+        }
+    }
+
+    /// Parse an integer string with C-style radix prefixes (0x for hex, 0 for octal).
+    fn parse_int(s: &str) -> CaResult<i64> {
+        let s = s.trim();
+        if s.starts_with("0x") || s.starts_with("0X") {
+            i64::from_str_radix(&s[2..], 16)
+                .map_err(|e| CaError::InvalidValue(e.to_string()))
+        } else if s.starts_with('0') && s.len() > 1 && s.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
+            i64::from_str_radix(&s[1..], 8)
+                .map_err(|e| CaError::InvalidValue(e.to_string()))
+        } else {
+            s.parse::<i64>()
+                .map_err(|e| CaError::InvalidValue(e.to_string()))
         }
     }
 }

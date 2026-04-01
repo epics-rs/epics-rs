@@ -1,0 +1,23 @@
+grecord(bo,"$(P)$(LOCK)lock")
+{
+	field(OUT,"$(P)$(LOCK)lockOut.A PP MS")
+	field(ZNAM,"Lock")
+	field(ONAM,"Unlock")
+}
+grecord(swait,"$(P)$(LOCK)lockOut")
+{
+	field(OUTN,"$(LOCK_PV)")
+	field(INAP,"No")
+	field(INBP,"No")
+	field(INCP,"No")
+	field(INDP,"No")
+	field(INEP,"No")
+	field(INFP,"No")
+	field(INGP,"No")
+	field(INHP,"No")
+	field(INIP,"No")
+	field(INJP,"No")
+	field(INKP,"No")
+	field(INLP,"No")
+	field(CALC,"a*4095")
+}

@@ -1,0 +1,323 @@
+grecord(stringout, "$(P)$(HSC)port")
+{
+	field(DESC, "name of serial port")
+}
+grecord(stringout, "$(P)$(HSC)hID")
+{
+	field(DESC, "horizontal slit ID")
+}
+grecord(stringout, "$(P)$(HSC)vID")
+{
+	field(DESC, "vertical slit ID")
+}
+grecord(bo, "$(P)$(HSC)hOrient")
+{
+	field(DESC, "horizontal orientation")
+	field(ZNAM, "LR")
+	field(ONAM, "RL")
+}
+grecord(bo, "$(P)$(HSC)vOrient")
+{
+	field(DESC, "vertical orientation")
+	field(ZNAM, "TB")
+	field(ONAM, "BT")
+}
+grecord(bo, "$(P)$(HSC)init")
+{
+	field(DESC, "initialize flag")
+	field(ZNAM, "off")
+	field(ONAM, "init")
+}
+grecord(bo, "$(P)$(HSC)enable")
+{
+	field(DESC, "enable flag")
+	field(ZNAM, "disable")
+	field(ONAM, "enable")
+}
+grecord(bo, "$(P)$(HSC)locate")
+{
+	field(DESC, "locate positions")
+	field(ZNAM, "off")
+	field(ONAM, "locate")
+}
+grecord(bo, "$(P)$(HSC)calib")
+{
+	field(DESC, "calibrate flag")
+	field(ZNAM, "off")
+	field(ONAM, "calibrate")
+}
+grecord(ao, "$(P)$(HSC)t")
+{
+	field(DESC, "top")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(ASLO, "0.0025")
+	field(AOFF, "-1")
+	field(HOPR, "10")
+	field(LOPR, "-1")
+	field(EGUF, "10")
+	field(EGUL, "-1")
+}
+grecord(ao, "$(P)$(HSC)tRB")
+{
+	field(DESC, "top readback")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(ASLO, "0.0025")
+	field(AOFF, "-1")
+	field(HOPR, "10")
+	field(LOPR, "-1")
+	field(EGUF, "10")
+	field(EGUL, "-1")
+}
+grecord(ao, "$(P)$(HSC)l")
+{
+	field(DESC, "left")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(ASLO, "0.0025")
+	field(AOFF, "-1")
+	field(HOPR, "10")
+	field(LOPR, "-1")
+	field(EGUF, "10")
+	field(EGUL, "-1")
+}
+grecord(ao, "$(P)$(HSC)lRB")
+{
+	field(DESC, "left readback")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(ASLO, "0.0025")
+	field(AOFF, "-1")
+	field(HOPR, "10")
+	field(LOPR, "-1")
+	field(EGUF, "10")
+	field(EGUL, "-1")
+}
+grecord(ao, "$(P)$(HSC)b")
+{
+	field(DESC, "bottom")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(ASLO, "0.0025")
+	field(AOFF, "-1")
+	field(HOPR, "10")
+	field(LOPR, "-1")
+	field(EGUF, "10")
+	field(EGUL, "-1")
+}
+grecord(ao, "$(P)$(HSC)bRB")
+{
+	field(DESC, "bottom readback")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(ASLO, "0.0025")
+	field(AOFF, "-1")
+	field(HOPR, "10")
+	field(LOPR, "-1")
+	field(EGUF, "10")
+	field(EGUL, "-1")
+}
+grecord(ao, "$(P)$(HSC)r")
+{
+	field(DESC, "right")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(ASLO, "0.0025")
+	field(AOFF, "-1")
+	field(HOPR, "10")
+	field(LOPR, "-1")
+	field(EGUF, "10")
+	field(EGUL, "-1")
+}
+grecord(ao, "$(P)$(HSC)rRB")
+{
+	field(DESC, "right readback")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(ASLO, "0.0025")
+	field(AOFF, "-1")
+	field(HOPR, "10")
+	field(LOPR, "-1")
+	field(EGUF, "10")
+	field(EGUL, "-1")
+}
+grecord(ao, "$(P)$(HSC)width")
+{
+	field(DESC, "width")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(HOPR, "20")
+	field(LOPR, "0")
+	field(EGUF, "20")
+	field(EGUL, "0")
+}
+grecord(ao, "$(P)$(HSC)widthRB")
+{
+	field(DESC, "width readback")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(HOPR, "20")
+	field(LOPR, "0")
+	field(EGUF, "20")
+	field(EGUL, "0")
+}
+grecord(ao, "$(P)$(HSC)height")
+{
+	field(DESC, "height")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(HOPR, "20")
+	field(LOPR, "0")
+	field(EGUF, "20")
+	field(EGUL, "0")
+}
+grecord(ao, "$(P)$(HSC)heightRB")
+{
+	field(DESC, "height readback")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(HOPR, "20")
+	field(LOPR, "0")
+	field(EGUF, "20")
+	field(EGUL, "0")
+}
+grecord(ao, "$(P)$(HSC)h0")
+{
+	field(DESC, "hor center")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(HOPR, "5.5")
+	field(LOPR, "-5.5")
+	field(EGUF, "5.5")
+	field(EGUL, "-5.5")
+}
+grecord(ao, "$(P)$(HSC)h0RB")
+{
+	field(DESC, "hor center readback")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(HOPR, "5.5")
+	field(LOPR, "-5.5")
+	field(EGUF, "5.5")
+	field(EGUL, "-5.5")
+}
+grecord(ao, "$(P)$(HSC)v0")
+{
+	field(DESC, "ver center")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(HOPR, "5.5")
+	field(LOPR, "-5.5")
+	field(EGUF, "5.5")
+	field(EGUL, "-5.5")
+}
+grecord(ao, "$(P)$(HSC)v0RB")
+{
+	field(DESC, "ver center readback")
+	field(EGU,  "mm")
+	field(PREC, "4")
+	field(HOPR, "5.5")
+	field(LOPR, "-5.5")
+	field(EGUF, "5.5")
+	field(EGUL, "-5.5")
+}
+grecord(bo, "$(P)$(HSC)stop")
+{
+	field(DESC, "stop all axes")
+	field(ZNAM, "idle")
+	field(ONAM, "STOP")
+}
+grecord(longout, "$(P)$(HSC)debug")
+{
+	field(DESC, "debug flag")
+	field(HOPR, "10")
+	field(LOPR, "0")
+}
+grecord(longout, "$(P)$(HSC)error")
+{
+	field(DESC, "error code")
+	#field(ZNAM, "ok")
+	#field(ONAM, "error")
+}
+grecord(stringout, "$(P)$(HSC)errMsg")
+{
+	field(DESC, "error message")
+}
+grecord(stringout, "$(P)$(HSC)msg1")
+{
+	field(DESC, "message #1")
+}
+grecord(stringout, "$(P)$(HSC)msg2")
+{
+	field(DESC, "message #2")
+}
+grecord(stringout, "$(P)$(HSC)msg3")
+{
+	field(DESC, "message #3")
+}
+grecord(bo, "$(P)$(HSC)hBusy")
+{
+	field(DESC, "horizontal axes busy")
+	field(ZNAM, "idle")
+	field(ONAM, "busy")
+}
+grecord(bo, "$(P)$(HSC)vBusy")
+{
+	field(DESC, "vertical axes busy")
+	field(ZNAM, "idle")
+	field(ONAM, "busy")
+}
+
+
+#############################################################################
+#  Illinois Open Source License
+#  University of Illinois
+#  Open Source License
+#
+#
+#  Copyright (c) 2004,  UNICAT.  All rights reserved.
+#
+#
+#  Developed by:
+#
+#  UNICAT, Advanced Photon Source, Argonne National Laboratory
+#
+#  Frederick Seitz Materials Research Laboratory,
+#  University of Illinois at Urbana-Champaign
+#
+#  http://www.uni.aps.anl.gov
+#
+#  Permission is hereby granted, free of charge, to any person obtaining a
+#  copy of this software and associated documentation files (the
+#  "Software"), to deal with the Software without restriction, including
+#  without limitation the rights to use, copy, modify, merge, publish,
+#  distribute, sublicense, and/or sell copies of the Software, and to
+#  permit persons to whom the Software is furnished to do so, subject to
+#  the following conditions:
+#
+#
+#  Redistributions of source code must retain the above copyright notice,
+#  this list of conditions and the following disclaimers.
+#
+#
+#  Redistributions in binary form must reproduce the above copyright
+#  notice, this list of conditions and the following disclaimers in the
+#  documentation and/or other materials provided with the distribution.
+#
+#
+#  Neither the names of UNICAT, Frederick Seitz Materials Research
+#  Laboratory, University of Illinois at Urbana-Champaign,
+#  nor the names of its contributors may be used to endorse or promote
+#  products derived from this Software without specific prior written
+#  permission.
+#
+#
+#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+#  OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+#  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+#  IN NO EVENT SHALL THE CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR
+#  ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+#  TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#  SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE SOFTWARE.
+#############################################################################

@@ -187,7 +187,7 @@ impl IocBuilder {
 
                 // Device support based on DTYP
                 let dtyp = instance.common.dtyp.clone();
-                if !dtyp.is_empty() && dtyp != "Soft Channel" {
+                if !crate::server::device_support::is_soft_dtyp(&dtyp) {
                     if let Some(factory) = self.device_factories.get(&dtyp) {
                         let mut dev = factory();
                         let _ = dev.init(&mut *instance.record);

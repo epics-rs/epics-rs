@@ -1,0 +1,161 @@
+grecord(swait,"$(P)$(Q)motorOut")
+{
+	field(DISV,"0")
+	field(SDIS,"$(P)$(LOCK)lock.VAL NPP NMS")
+	field(OUTN,"$(P)$(MOTOR).VAL")
+	field(INAP,"No")
+	field(INBP,"No")
+	field(INCP,"No")
+	field(INDP,"No")
+	field(INEP,"No")
+	field(INFP,"No")
+	field(INGP,"No")
+	field(INHP,"No")
+	field(INIP,"No")
+	field(INJP,"No")
+	field(INKP,"No")
+	field(INLP,"No")
+	field(CALC,"a")
+}
+grecord(ao,"$(P)$(Q)pos1Put")
+{
+	field(OUT,"$(P)$(Q)motorOut.A PP MS")
+	field(DOL,"$(P)$(Q)pos1.VAL NPP NMS")
+	field(OMSL,"closed_loop")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)pos2Put")
+{
+	field(OUT,"$(P)$(Q)motorOut.A PP MS")
+	field(DOL,"$(P)$(Q)pos2.VAL NPP NMS")
+	field(OMSL,"closed_loop")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)pos3Put")
+{
+	field(OUT,"$(P)$(Q)motorOut.A PP MS")
+	field(DOL,"$(P)$(Q)pos3.VAL NPP NMS")
+	field(OMSL,"closed_loop")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)pos4Put")
+{
+	field(OUT,"$(P)$(Q)motorOut.A PP MS")
+	field(DOL,"$(P)$(Q)pos4.VAL NPP NMS")
+	field(OMSL,"closed_loop")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)pos5Put")
+{
+	field(OUT,"$(P)$(Q)motorOut.A PP MS")
+	field(DOL,"$(P)$(Q)pos5.VAL NPP NMS")
+	field(OMSL,"closed_loop")
+	field(PREC,"3")
+}
+grecord(fanout,"$(P)$(Q)FO")
+{
+	field(SDIS,"$(P)$(Q)Naming.VAL PP MS")
+	field(SELM,"Specified")
+	field(LNK1,"$(P)$(Q)posHPut.PROC PP MS")
+	field(LNK2,"$(P)$(Q)pos1Put.PROC PP MS")
+	field(LNK3,"$(P)$(Q)pos2Put.PROC PP MS")
+	field(LNK4,"$(P)$(Q)pos3Put.PROC PP MS")
+	field(LNK5,"$(P)$(Q)pos4Put.PROC PP MS")
+	field(LNK6,"$(P)$(Q)pos5Put.PROC PP MS")
+}
+grecord(mbbo,"$(P)$(Q)select")
+{
+	field(DTYP,"Raw Soft Channel")
+	field(NOBT,"3")
+	field(OUT,"$(P)$(Q)FO.SELN PP MS")
+	field(ZRVL,"0x6")
+	field(ONVL,"0x5")
+	field(TWVL,"0x4")
+	field(THVL,"0x3")
+	field(FRVL,"0x2")
+	field(FVVL,"0x1")
+	field(ZRST,"Pos. 5")
+	field(ONST,"Pos. 4")
+	field(TWST,"Pos. 3")
+	field(THST,"Pos. 2")
+	field(FRST,"Pos. 1")
+	field(FVST,"LowLimit")
+}
+grecord(ao,"$(P)$(Q)posHPut")
+{
+	field(OUT,"$(P)$(Q)motorOut.A PP MS")
+	field(DOL,"$(P)$(Q)posHome.VAL NPP NMS")
+	field(OMSL,"closed_loop")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)posHome")
+{
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)pos1")
+{
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)pos2")
+{
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)pos3")
+{
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)pos4")
+{
+	field(PREC,"3")
+}
+grecord(ao,"$(P)$(Q)pos5")
+{
+	field(PREC,"3")
+}
+grecord(stringout,"$(P)$(Q)name5")
+{
+	field(PINI,"YES")
+	field(VAL,"Pos. 5")
+	field(OUT,"$(P)$(Q)select.ZRST PP MS")
+}
+grecord(stringout,"$(P)$(Q)name4")
+{
+	field(PINI,"YES")
+	field(VAL,"Pos. 4")
+	field(OUT,"$(P)$(Q)select.ONST PP MS")
+}
+grecord(stringout,"$(P)$(Q)name3")
+{
+	field(PINI,"YES")
+	field(VAL,"Pos. 3")
+	field(OUT,"$(P)$(Q)select.TWST PP MS")
+}
+grecord(stringout,"$(P)$(Q)name2")
+{
+	field(PINI,"YES")
+	field(VAL,"Pos. 2")
+	field(OUT,"$(P)$(Q)select.THST PP MS")
+}
+grecord(stringout,"$(P)$(Q)name1")
+{
+	field(PINI,"YES")
+	field(VAL,"Pos. 1")
+	field(OUT,"$(P)$(Q)select.FRST PP MS")
+}
+grecord(stringout,"$(P)$(Q)nameHome")
+{
+	field(PINI,"YES")
+	field(VAL,"LowLimit")
+	field(OUT,"$(P)$(Q)select.FVST PP MS")
+}
+grecord(calc,"$(P)$(Q)Naming")
+{
+	field(DESC,"Disable filter while naming")
+	field(CALC,"(a||b||c||d||e||f)?1:0")
+	field(INPA,"$(P)$(Q)name5.PACT NPP NMS")
+	field(INPB,"$(P)$(Q)name4.PACT NPP NMS")
+	field(INPC,"$(P)$(Q)name3.PACT NPP NMS")
+	field(INPD,"$(P)$(Q)name2.PACT NPP NMS")
+	field(INPE,"$(P)$(Q)name1.PACT NPP NMS")
+	field(INPF,"$(P)$(Q)nameHome.PACT NPP NMS")
+}

@@ -1,0 +1,69 @@
+# This database implements the transformation necessary for variable
+# mask aperture slits
+#
+# The horizontal and vertical slit sizes are each controlled by a single
+# motor (yaw and pitch, respectively) 
+#
+#
+# size = $(P)$(VMAS)C1 - $(P)$(VMAS)C2 * $(P)$(M1DRV) 
+# 
+# Where:
+#	$(P)$(VMAS)C1 = horizontal aperture size when mask angle is 0 degrees
+#	$(P)$(VMAS)C2 = ratio of edge separation to motor lever arm 
+
+#
+# These two records are where the soft motors write their output.
+# They are needed because writing to a transform record field does not
+# cause the record to process?
+# We use forward links to the transform record (rather than making the INPA
+# field of the transform record CP) so that the scan record waits 
+# for the motors to move.
+grecord(ao,"$(P)$(VMAS)DVAL") {
+	field(FLNK, "$(P)$(T)Drive")
+	field(PREC, "8")
+}
+
+# This record is processed whenever the soft motor record VMAS writes
+# new values to the DVAL records above.
+# Note: the INPA field get their values directly from the .DVAL
+# fields of the soft motor records, rather than from the DVAL record above.
+# This is because the .DVAL fields are always correct, while the DVAL records
+# do not get updated when the soft motor .DVAL fields are modified in SET mode.
+grecord(transform,"$(P)$(T)Drive") {
+	field(INPA,"$(P)$(VMAS).DVAL NPP NMS")
+	field(INPB,"$(P)$(VMAS)C1.VAL NPP NMS")
+	field(INPC,"$(P)$(VMAS)C2.VAL NPP NMS")
+#	field(INPD,"$(P)$(VMAS)C3.VAL NPP NMS")
+#	field(INPE,"$(P)$(VMAS)C4.VAL NPP NMS")
+	field(CLCG,"(B - A) / C")
+    field(OUTG,"$(P)$(M1DRV) PP MS")
+	field(PREC,"$(PREC)")
+}
+
+# This record calculates the readback positions of the soft motors.  It 
+# processes whenever the readbacks of the real motors change, or whenever
+# one of the the geometry constants changes.
+grecord(transform,"$(P)$(T)Readback") {
+	field(INPA,"$(P)$(M1RBV) CP MS")
+	field(INPB,"$(P)$(VMAS)C1.VAL CP NMS")
+	field(INPC,"$(P)$(VMAS)C2.VAL CP NMS")
+#	field(INPD,"$(P)$(VMAS)C3.VAL NPP NMS")
+#	field(INPE,"$(P)$(VMAS)C4.VAL NPP NMS")
+	field(CLCG,"B - C * A")
+	field(IVLA,"Do Nothing")
+	field(PREC,"$(PREC)")
+}
+
+# This record processes if either of the soft motor STOP fields is set.
+grecord(dfanout,"$(P)$(T)Stop") {
+        field(VAL,"1")
+        field(OUTA,"$(P)$(M1STOP) PP MS")
+}
+
+# This record computes whether the compound motor is done moving.  
+# It goes to 1 when both real motors are done moving.
+# positions of the real motors.
+grecord(calcout,"$(P)$(T)Done") {
+        field(INPA,"$(P)$(M1DONE) CP MS")
+        field(CALC,"A")
+}

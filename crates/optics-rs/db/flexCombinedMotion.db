@@ -1,0 +1,194 @@
+### Configure a soft motor for the combined motion, which uses the cap sensor as feedback
+
+record(motor,"$(P)$(M)")
+{
+    field(DTYP,"Soft Channel")
+    field(DESC,"$(DESC)")
+    field(OUT,"$(P)$(M):setPoint PP MS")
+    field(RDBL,"$(P)$(C):pos  NPP MS")
+    field(URIP,"Yes")
+    field(STOO,"$(P)$(M):stop  PP MS")
+    field(DINP,"$(P)$(M):dmov  NPP MS")
+    field(MRES,"0.0001")
+    field(RRES,"1.000")
+    field(PREC,"4")
+    field(DHLM,"$(DHLM=0)")
+    field(DLLM,"$(DLLM=0)")
+    field(TWV,"$(TWV=1)")
+    field(RTRY,"$(RTRY=0)")
+    field(EGU,"$(EGU=um)") 
+    # Setting NTM=NO eliminates tdir messages after every move
+    field(NTM, "NO")
+    field(SDIS, "$(P)$(M)_able.VAL")
+}
+
+record(bo, "$(P)$(M)_able") {
+  field(DESC, "motor enable")
+  field(PINI, "YES")
+  field(OUT, "$(P)$(M).DISP")
+  field(ZNAM, "Enable")
+  field(ONAM, "Disable")
+}
+
+### Records that are used by the sequence program
+
+record(longout, "$(P)$(M):debug")
+{
+  field(VAL, "10")
+}
+
+record(mbbo, "$(P)$(M):mode")
+{
+  field(DESC, "combined mode")
+  field(VAL,  "0")
+  field(ZRST, "fast")
+  field(ZRVL, "0")
+  field(ONST, "precise")
+  field(ONVL, "1")
+  field(TWST, "coarse")
+  field(TWVL, "2")
+  field(THST, "fine")
+  field(THVL, "3")
+  field(OMSL, "supervisory")
+}
+
+record(ao, "$(P)$(M):deadband")
+{
+  field(DESC, "Coarse motor deadband")
+  field(VAL,  "0.03")
+  field(PREC, 3)
+}
+
+record(longout, "$(P)$(M):retries")
+{
+  field(DESC, "Coarse motor retries")
+  field(VAL,  "0")
+}
+
+record(longout, "$(P)$(M):maxRetries")
+{
+  field(DESC, "Coarse motor max retries")
+  field(VAL,  "10")
+}
+
+record(ao, "$(P)$(M):setPoint")
+{
+  field(DESC, "Combined-motion target")
+  field(PREC, 4)
+  field(LOPR, "-100000.0")
+  field(HOPR, "100000.0")
+  field(MDEL, "-1")
+  field(FLNK, "$(P)$(M):setBusy")
+}
+
+record(calcout, "$(P)$(M):setBusy")
+{
+  field(DESC, "Set busy")
+  field(CALC, "1")
+  field(OUT,  "$(P)$(M):busy PP")
+  field(OOPT, "Every Time")
+}
+
+record(busy, "$(P)$(M):busy")
+{
+  field(DESC, "Combined-motion busy")
+}
+
+record(calcout, "$(P)$(M):resetBusy")
+{
+  field(DESC, "Reset busy")
+  field(CALC, "0")
+  field(OUT,  "$(P)$(M):busy CA")
+  field(OOPT, "Every Time")
+}
+
+record(ao, "$(P)$(M):upperLimit")
+{
+  field(DESC, "Upper fine motor limit")
+  field(VAL,  "$(HLM)")
+  field(PREC, 3)
+}
+
+record(ao, "$(P)$(M):homePos")
+{
+  field(DESC, "fine motor home position")
+  field(VAL,  "$(HOME)")
+  field(PREC, 3)
+}
+
+record(ao, "$(P)$(M):lowerLimit")
+{
+  field(DESC, "Lower fine motor limit")
+  field(VAL,  "$(LLM)")
+  field(PREC, 3)
+}
+
+record(bo, "$(P)$(M):stop")
+{
+  field(DESC, "Stop motors")
+  field(VAL,  "0")
+  field(ZNAM, "Done")
+  field(ONAM, "Stop")
+}
+
+record(calcout, "$(P)$(M):dmov")
+{
+  field(DESC, "Done-moving calc")
+  field(INPA, "$(P)$(M):busy CP NMS")
+  field(CALC, "!A")
+}
+
+# The following records allow the piezo to be moved to its home position
+# and the coarse motor to be repositioned to hold the previous position
+# with a single button press
+
+record(busy, $(P)$(M):rehome) 
+{
+  field(DESC, "Re-home the piezo")
+}
+
+record(stringin, $(P)$(M):lastMode)
+{
+  field(DESC, "Store the last mode")
+  field(INP,  "$(P)$(M):mode")
+  field(SCAN, "Passive")
+}
+
+record(calcout, "$(P)$(M):rehomeCalc")
+{
+  field(DESC, "Rehome trigger calc")
+  field(INPA, "$(P)$(M):rehome CP")
+  field(CALC, "A")
+  field(OOPT, "Transition To Non-zero")
+  field(DOPT, "Use CALC")
+  field(OUT,  "$(P)$(M):rehomeSeq.PROC PP")
+}
+
+record(sseq, "$(P)$(M):rehomeSeq")
+{
+  field(DESC, "Re-home the piezo")
+  field(SELM, "All")
+  # Store the last mode
+  field(DOL1, "1")
+  field(LNK1, "$(P)$(M):lastMode.PROC CA")
+  field(WAIT1, "Wait")
+  # Set the mode to coarse
+  field(DOL2, "2")
+  field(LNK2, "$(P)$(M):mode.VAL CA")
+  field(WAIT2, "Wait")
+  # Tell the motor to go to the last target position
+  #!field(DOL3, "1")
+  #!field(LNK3, "$(P)$(M):setPoint.PROC CA")
+  # Tell the motor to go to the current readback position
+  field(DOL3, "$(P)$(C):pos NPP")
+  field(LNK3, "$(P)$(M):setPoint.VAL CA")
+  field(WAIT3, "Wait")
+  # Restore the last mode
+  field(DOL4, "$(P)$(M):lastMode")
+  field(LNK4, "$(P)$(M):mode CA")
+  field(WAIT4, "Wait")
+  # Reset the rehome busy
+  field(DOL5, "0")
+  field(LNK5, "$(P)$(M):rehome CA")
+  field(WAIT5, "NoWait")
+}

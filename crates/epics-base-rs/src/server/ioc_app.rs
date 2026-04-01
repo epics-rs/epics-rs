@@ -391,7 +391,7 @@ pub(crate) async fn wire_device_support(
         if let Some(rec_arc) = db.get_record(&name).await {
             let mut instance = rec_arc.write().await;
             let dtyp = instance.common.dtyp.clone();
-            if !dtyp.is_empty() && dtyp != "Soft Channel" {
+            if !crate::server::device_support::is_soft_dtyp(&dtyp) {
                 let ctx = DeviceSupportContext {
                     dtyp: &dtyp,
                     inp: &instance.common.inp,

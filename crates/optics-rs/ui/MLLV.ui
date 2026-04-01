@@ -1,0 +1,333 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>261</x>
+        <y>346</y>
+        <width>640</width>
+        <height>250</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>640</width>
+        <height>250</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(200, 200, 200);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>MLLV</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="20,110,140,100,110,70,5,70,15" rowstretch="206,9,20,10,5">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="0" column="0" colspan="9">
+        <widget class="PyDMEmbeddedDisplay" name="composite">
+          <property name="geometry">
+            <rect>
+              <x>0</x>
+              <y>0</y>
+              <width>640</width>
+              <height>206</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>composite</string>
+          </property>
+          <property name="filename" stdset="0">
+            <string>MLLV_bare.ui</string>
+          </property>
+          <property name="macros" stdset="0">
+            <string>P=${P},Q=${Q}</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="5">
+        <widget class="PyDMRelatedDisplayButton" name="related_display">
+          <property name="geometry">
+            <rect>
+              <x>480</x>
+              <y>215</y>
+              <width>70</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>debug</string>
+          </property>
+          <property name="text">
+            <string>debug</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display {
+  color: rgb(255, 255, 255);
+  background-color: rgb(51, 153, 0);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>th</string>
+              <string>z</string>
+              <string>y</string>
+              <string>chi</string>
+              <string>x</string>
+              <string>tFwd</string>
+              <string>tRev</string>
+              <string>tLimits</string>
+              <string>tLimits1</string>
+              <string>calcDone</string>
+              <string>closeGate</string>
+              <string>misc</string>
+              <string>softPut</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>motorx.ui</string>
+              <string>motorx.ui</string>
+              <string>motorx.ui</string>
+              <string>motorx.ui</string>
+              <string>motorx.ui</string>
+              <string>yyTransform.ui</string>
+              <string>yyTransform.ui</string>
+              <string>yyTransform.ui</string>
+              <string>yyTransform.ui</string>
+              <string>yyCalcoutRecord.ui</string>
+              <string>yyCalcoutRecord.ui</string>
+              <string>MLLV_misc.ui</string>
+              <string>yySeq.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},M=${Q}th</string>
+              <string>P=${P},M=${Q}z</string>
+              <string>P=${P},M=${Q}y</string>
+              <string>P=${P},M=${Q}chi</string>
+              <string>P=${P},M=${Q}x</string>
+              <string>P=${P},T=${Q}tFwd</string>
+              <string>P=${P},T=${Q}tRev</string>
+              <string>P=${P},T=${Q}tLimits</string>
+              <string>P=${P},T=${Q}tLimits1</string>
+              <string>P=${P},C=${Q}calcDone</string>
+              <string>P=${P},C=${Q}closeGate</string>
+              <string>P=${P},Q=${Q}</string>
+              <string>P=${P},S=${Q}softPut</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>true</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="7">
+        <widget class="PyDMRelatedDisplayButton" name="related_display_1">
+          <property name="geometry">
+            <rect>
+              <x>555</x>
+              <y>215</y>
+              <width>70</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>More</string>
+          </property>
+          <property name="text">
+            <string>More</string>
+          </property>
+          <property name="showIcon" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMRelatedDisplayButton#related_display_1 {
+  color: rgb(255, 255, 255);
+  background-color: rgb(51, 153, 0);
+  }</string>
+          </property>
+          <property name="titles" stdset="0">
+            <stringlist>
+              <string>more</string>
+            </stringlist>
+          </property>
+          <property name="filenames" stdset="0">
+            <stringlist>
+              <string>MLLV_more.ui</string>
+            </stringlist>
+          </property>
+          <property name="macros" stdset="0">
+            <stringlist>
+              <string>P=${P},Q=${Q}</string>
+            </stringlist>
+          </property>
+          <property name="openInNewWindow" stdset="0">
+            <bool>false</bool>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="1">
+        <widget class="PyDMPushButton" name="message_button">
+          <property name="geometry">
+            <rect>
+              <x>20</x>
+              <y>215</y>
+              <width>110</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Sync to motors</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}${Q}sync</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}sync</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button {
+  color: rgb(0, 0, 0);
+  background-color: rgb(115, 223, 255);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="2" column="3" rowspan="2">
+        <widget class="PyDMPushButton" name="message_button_1">
+          <property name="geometry">
+            <rect>
+              <x>270</x>
+              <y>215</y>
+              <width>100</width>
+              <height>30</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>Stop MLLV</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>18</pointsize>
+            </font>
+          </property>
+          <property name="toolTip">
+            <string>${P}${Q}stop</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${Q}stop</string>
+          </property>
+          <property name="pressValue" stdset="0">
+            <string>1</string>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMPushButton#message_button_1 {
+  color: rgb(251, 243, 74);
+  background-color: rgb(253, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>composite</zorder>
+    <zorder>related_display</zorder>
+    <zorder>related_display_1</zorder>
+    <zorder>message_button</zorder>
+    <zorder>message_button_1</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMEmbeddedDisplay</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.embedded_display</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMRelatedDisplayButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.related_display_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMPushButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.pushbutton</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

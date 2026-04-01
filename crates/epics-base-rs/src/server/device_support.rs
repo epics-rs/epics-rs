@@ -1,6 +1,18 @@
 use crate::error::CaResult;
 use crate::server::record::{ProcessAction, Record, ScanType};
 
+/// Check if a DTYP string represents a soft/built-in device support
+/// that doesn't require an explicit device support registration.
+/// Matches C EPICS built-in soft device support names.
+pub fn is_soft_dtyp(dtyp: &str) -> bool {
+    dtyp.is_empty()
+        || dtyp == "Soft Channel"
+        || dtyp == "Raw Soft Channel"
+        || dtyp == "Async Soft Channel"
+        || dtyp == "Soft Timestamp"
+        || dtyp == "Sec Past Epoch"
+}
+
 /// Handle for waiting on asynchronous write completion.
 /// Returned by [`DeviceSupport::write_begin`] when the write is submitted
 /// to a worker queue rather than executed synchronously.

@@ -1,0 +1,166 @@
+record(ao,"$(P)$(H)trans$(B)")
+{
+	field(VAL,"1")
+	field(DESC,"bank selected transmission")
+	field(EGU, "")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)invTrans$(B)")
+{
+	field(VAL,"1")
+	field(DESC,"bank 1/transmission")
+	field(EGU, "")
+	field(PREC,"3")
+}
+record(mbbo,"$(P)$(H)debug$(B)")
+{
+	field(VAL,"0")
+	field(DESC,"bank debug")
+	field(ZRST,"0")
+	field(ONST,"1")
+	field(TWST,"2")
+	field(THST,"3")
+	field(FRST,"4")
+	field(FVST,"5")
+	field(SXST,"6")
+	field(SVST,"7")
+	field(EIST,"8")
+	field(NIST,"9")
+	field(TEST,"10")
+}
+record(mbbo,"$(P)$(H)fPos$(B)")
+{
+	field(VAL,"0")
+	field(DESC,"filter combination")
+	field(ZRST,"0")
+	field(ONST,"1")
+	field(TWST,"2")
+	field(THST,"3")
+	field(FRST,"4")
+	field(FVST,"5")
+	field(SXST,"6")
+	field(SVST,"7")
+	field(EIST,"8")
+	field(NIST,"9")
+	field(TEST,"10")
+	field(ELST,"11")
+	field(TVST,"12")
+	field(TTST,"13")
+	field(FTST,"14")
+	field(FFST,"15")
+}
+record(mbbo,"$(P)$(H)bank$(B)")
+{
+	field(DESC,"filter bank control")
+	field(VAL,"0")
+	field(ZRST,"off")
+	field(ONST,"enabled")
+	field(TWST,"recalc trans")
+	field(THST,"recalc all")
+}
+record(longout,"$(P)$(H)bitFlag$(B)")
+{
+	field(DESC,"filter bit flag indicator")
+}
+record(ao,"$(P)$(H)status$(B)")
+{
+	field(DESC,"filter bit status")
+	field(EGU, "")
+	field(PREC,"5")
+}
+record(ao,"$(P)$(H)f1$(B)")
+{
+	field(VAL,"0.1626")
+	field(DESC,"filter 1")
+	field(EGU, "mm")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)f2$(B)")
+{
+	field(VAL,"0.3226")
+	field(DESC,"filter 2")
+	field(EGU, "mm")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)f3$(B)")
+{
+	field(VAL,"0.6325")
+	field(DESC,"filter 3")
+	field(EGU, "mm")
+	field(PREC,"3")
+}
+record(ao,"$(P)$(H)f4$(B)")
+{
+	field(VAL,"1.27")
+	field(DESC,"filter 4")
+	field(EGU, "mm")
+	field(PREC,"3")
+}
+record(mbbo,"$(P)$(H)Z1$(B)")
+{
+	field(VAL,"0")
+	field(ZRST,"Al")
+	field(ONST,"Ti")
+	field(TWST,"Glass")
+	field(THST,"Other")
+	field(DESC,"material filter 1")
+}
+record(mbbo,"$(P)$(H)Z2$(B)")
+{
+	field(VAL,"0")
+	field(ZRST,"Al")
+	field(ONST,"Ti")
+	field(TWST,"Glass")
+	field(THST,"Other")
+	field(DESC,"material filter 2")
+}
+record(mbbo,"$(P)$(H)Z3$(B)")
+{
+	field(VAL,"0")
+	field(ZRST,"Al")
+	field(ONST,"Ti")
+	field(TWST,"Glass")
+	field(THST,"Other")
+	field(DESC,"material filter 3")
+}
+record(mbbo,"$(P)$(H)Z4$(B)")
+{
+	field(VAL,"0")
+	field(ZRST,"Al")
+	field(ONST,"Ti")
+	field(TWST,"Glass")
+	field(THST,"Other")
+	field(DESC,"material filter 4")
+}
+record(stringout,"$(P)$(H)Other1$(B)") {
+}
+record(stringout,"$(P)$(H)Other2$(B)") {
+}
+record(stringout,"$(P)$(H)Other3$(B)") {
+}
+record(stringout,"$(P)$(H)Other4$(B)") {
+}
+record(transform, "$(P)$(H)ftweak$(B)") {
+	field(INPC, "$(P)$(H)fPos$(B)")
+	field(CLCD, "min(15,max(0,a?c+1:b?c-1:c))")
+	field(OUTD, "$(P)$(H)fPos$(B) PP")
+	field(OUTE, "$(P)$(H)ftweak$(B).A")
+	field(OUTF, "$(P)$(H)ftweak$(B).B")
+}
+record(longout,"$(P)$(H)OtherLegal1$(B)") {
+}
+record(longout,"$(P)$(H)OtherLegal2$(B)") {
+}
+record(longout,"$(P)$(H)OtherLegal3$(B)") {
+}
+record(longout,"$(P)$(H)OtherLegal4$(B)") {
+}
+
+record(bo,"$(P)$(H)displayBit1$(B)") {
+}
+record(bo,"$(P)$(H)displayBit2$(B)") {
+}
+record(bo,"$(P)$(H)displayBit3$(B)") {
+}
+record(bo,"$(P)$(H)displayBit4$(B)") {
+}

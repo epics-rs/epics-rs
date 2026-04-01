@@ -404,7 +404,10 @@ pub fn apply_fields(
             .find(|f| f.name == upper_name.as_str());
 
         if let Some(desc) = field_desc {
-            let value = EpicsValue::parse(desc.dbf_type, value_str)?;
+            let value = EpicsValue::parse(desc.dbf_type, value_str)
+                .map_err(|e| CaError::InvalidValue(
+                    format!("field {upper_name} (type {:?}): cannot parse '{}': {e}", desc.dbf_type, value_str)
+                ))?;
             record.put_field(&upper_name, value)?;
         } else {
             // Store as common field for RecordInstance to handle

@@ -131,13 +131,47 @@ static FIELDS: &[FieldDesc] = &[
     FieldDesc { name: "SIMS", dbf_type: DbFieldType::Short, read_only: false },
 ];
 
+/// Try to parse a DOL string as a constant value.
+/// Returns Some(f64) if it's a number, None if it's a link (PV name).
+fn dol_as_constant(dol: &str) -> Option<f64> {
+    let s = dol.trim();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<f64>().ok()
+}
+
 impl Record for AoRecord {
     fn record_type(&self) -> &'static str {
         "ao"
     }
 
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            // If DOL contains a constant value, use it as the initial VAL.
+            // This matches C EPICS: when DOL is a constant (not a link),
+            // init_record sets VAL from DOL and marks UDF=false.
+            if let Some(v) = dol_as_constant(&self.dol) {
+                self.val = v;
+                self.oval = v;
+            }
+        }
+        Ok(())
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if self.drvh != self.drvl {
+        // DOL/OMSL handling is done by the framework (processing.rs) which:
+        // - Reads DOL link value before calling process()
+        // - Applies OIF=0 (Full) or OIF=1 (Incremental: VAL += DOL)
+        // The record only handles constant DOL values that the framework
+        // can't resolve (pure numeric strings without a PV target).
+        if self.omsl == 1 && !self.dol.is_empty() {
+            if let Some(v) = dol_as_constant(&self.dol) {
+                self.val = v;
+            }
+            // PV link DOL: framework already applied the value
+        }
+        if self.drvh != self.drvl && self.drvh > self.drvl {
             self.val = self.val.clamp(self.drvl, self.drvh);
         }
 

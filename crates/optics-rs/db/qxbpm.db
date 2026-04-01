@@ -1,0 +1,438 @@
+#
+# file:     qxbpm.db
+# date:     2007 February 12
+# author:   Pete R. Jemian, jemian@anl.gov
+# purpose:  support the Oxford Instruments Quad X-ray Beam Position Monitor
+
+record(stringout, "$(P)port")
+record(bo, "$(P)enable") {
+	field(DESC, "turn on/off this software")
+	field(ZNAM, "disable")
+	field(ONAM, "enable")
+}
+record(bo, "$(P)init") {
+	field(DESC, "reinitialize this software")
+	field(ZNAM, "idle")
+	field(ONAM, "init")
+}
+record(longout, "$(P)address") {
+	field(DESC, "device address")
+	field(HOPR, "15")
+	field(LOPR, "0")
+	field(VAL,  "0")
+}
+record(bo,        "$(P)current:low")
+record(bo,        "$(P)current:ok")
+record(bo,        "$(P)error")
+record(stringout, "$(P)errMsg")
+record(longout,   "$(P)debug")
+record(ao, "$(P)pos:x") {
+	field(DESC, "X position")
+	field(EGU,  "mm")
+	field(PREC, "5")
+}
+record(ao, "$(P)pos:y") {
+	field(DESC, "Y position")
+	field(EGU,  "mm")
+	field(PREC, "5")
+}
+record(ao, "$(P)current:total") {
+	field(DESC, "total diode current")
+	field(EGU,  "A")
+	field(PREC, "5")
+}
+record(longout, "$(P)current:a:raw") { field(DESC, "raw A diode current") }
+record(longout, "$(P)current:b:raw") { field(DESC, "raw B diode current") }
+record(longout, "$(P)current:c:raw") { field(DESC, "raw C diode current") }
+record(longout, "$(P)current:d:raw") { field(DESC, "raw D diode current") }
+record(longout, "$(P)current:low:raw") { field(DESC, "raw diode current limit") }
+record(ao, "$(P)current:a") {
+	field(DESC, "A diode current")
+	field(EGU,  "A")
+	field(PREC, "5")
+}
+record(ao, "$(P)current:b") {
+	field(DESC, "B diode current")
+	field(EGU,  "A")
+	field(PREC, "5")
+}
+record(ao, "$(P)current:c") {
+	field(DESC, "C diode current")
+	field(EGU,  "A")
+	field(PREC, "5")
+}
+record(ao, "$(P)current:d") {
+	field(DESC, "D diode current")
+	field(EGU,  "A")
+	field(PREC, "5")
+}
+record(mbbo, "$(P)mode") {
+	field(DESC, "sampling mode")
+	field(NOBT, "2")
+	field(ZRVL, "0")
+	field(ONVL, "1")
+	field(TWVL, "2")
+	field(ZRST, "SINGLE")         
+	field(ONST, "AVERAGE")          
+	field(TWST, "WINDOW")           
+}
+record(longout, "$(P)buflen") {
+	field(DESC, "# values to avg/window")
+# From: scott.mowat@oxford-danfysik.com
+# Subject: QBPM averaging limitation found following further testing
+# Date: Fri, 10 Dec 2004 09:05:42 -0000
+# There has been a software limitation found during further testing whereby
+# the system falls over when using averaging of more than 50 points on channel
+# 4.  This is simply due to the lack of available memory in the system.  There
+# is no plan to upgrade the system so please be advised that you should use no
+# more than 50 measurements when filtering the signal.
+	field(HOPR, "50")
+	field(LOPR, "1")
+	field(VAL,  "1")
+}
+record(ao,      "$(P)period") {
+	field(DESC, "sampling period")
+	field(EGU,  "sec")
+	field(PREC, "2")
+	field(VAL,  "0.1")
+	field(HOPR, "10000")
+	field(LOPR, "0.05")
+}
+record(mbbo, "$(P)gain") {
+	field(DESC, "amplifier range")
+	field(NOBT, "3")
+	field(ZRVL, "0")
+	field(ONVL, "1")
+	field(TWVL, "2")
+	field(THVL, "3")
+	field(FRVL, "4")
+	field(FVVL, "5")
+	field(ZRST, "350 nA")         
+	field(ONST, "700 nA")         
+	field(TWST, "1400 nA")        
+	field(THST, "7 uA")           
+	field(FRST, "70 uA")          
+	field(FVST, "700 uA")         
+}
+record(ao,      "$(P)GX") {
+	field(DESC, "X position scale factor")         
+	field(EGU,  "mm")         
+	field(PREC, "5")         
+}
+record(ao,      "$(P)GY") {
+	field(DESC, "Y position scale factor")         
+	field(EGU,  "mm")         
+	field(PREC, "5")         
+}
+#
+# photodiode current multipliers for 
+# on each amplifier gain range
+#
+### 2005-01-28,PRJ:
+###   replaced database part
+
+
+record(ao, "$(P)r1:A1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r1:A2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r1:B1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r1:B2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r1:C1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r1:C2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r1:D1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r1:D2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r2:A1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r2:A2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r2:B1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r2:B2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r2:C1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r2:C2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r2:D1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r2:D2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r3:A1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r3:A2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r3:B1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r3:B2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r3:C1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r3:C2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r3:D1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r3:D2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r4:A1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r4:A2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r4:B1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r4:B2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r4:C1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r4:C2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r4:D1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r4:D2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r5:A1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r5:A2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r5:B1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r5:B2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r5:C1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r5:C2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r5:D1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r5:D2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r6:A1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r6:A2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r6:B1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r6:B2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r6:C1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r6:C2") {
+	field(DESC, "diode dark signal")         
+}
+
+record(ao, "$(P)r6:D1") {
+	field(DESC, "raw conversion factor")         
+	field(EGU,  "Amps/raw count")         
+	field(PREC, "4")         
+}
+
+record(longout, "$(P)r6:D2") {
+	field(DESC, "diode dark signal")         
+}
+
+
+#
+# plotting feature
+#
+### 2007-01-29,PRJ:
+###   added calculation to show offset from reference position
+###   sort of like the following error in a PID loop
+
+record(ao, "$(P)ref:x") {
+	field(DESC, "X reference")
+	field(EGU,  "mm")
+	field(PREC, "5")
+}
+record(ao, "$(P)ref:y") {
+	field(DESC, "Y reference")
+	field(EGU,  "mm")
+	field(PREC, "5")
+}
+record(calcout, "$(P)diff:x") {
+	field(DESC, "X position difference")
+	field(EGU,  "mm")
+	field(PREC, "5")
+	field(INPA, "$(P)pos:x")
+	field(INPB, "$(P)ref:x")
+	field(CALC, "A-B")
+	field(SCAN, ".1 second")
+}
+record(calcout, "$(P)diff:y") {
+	field(DESC, "Y position difference")
+	field(EGU,  "mm")
+	field(PREC, "5")
+	field(INPA, "$(P)pos:y")
+	field(INPB, "$(P)ref:y")
+	field(CALC, "A-B")
+	field(SCAN, ".1 second")
+}
+
+
+#
+# set offsets feature
+#
+### 2007-02-12,PRJ:
+###   add additional state set to discover the offsets 
+###   from the amplifiers at each gain setting
+###   and to set the default settings (two separate parts)
+
+record(bo, "$(P)set_offsets") {
+	field(DESC, "measure offsets")
+	field(ZNAM, "idle")
+	field(ONAM, "measure")
+}
+record(bo, "$(P)set_defaults") {
+	field(DESC, "set default values")
+	field(ZNAM, "idle")
+	field(ONAM, "set")
+}
+record(ao,      "$(P)settling") {
+	field(DESC, "settling for offset reading")
+	field(EGU,  "sec")
+	field(PREC, "2")
+	field(VAL,  "2.5")
+	field(HOPR, "15")
+	field(LOPR, "0.05")
+}

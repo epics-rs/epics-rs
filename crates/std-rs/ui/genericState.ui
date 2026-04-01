@@ -1,0 +1,391 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>2688</x>
+        <y>378</y>
+        <width>750</width>
+        <height>59</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>750</width>
+        <height>59</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(187, 187, 187);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>genericState</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="9,86,5,184,5,114,5,239,5,86,12" rowstretch="16,24,2,17">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="1" column="3" rowspan="2">
+        <widget class="PyDMEnumButton" name="choice_button">
+          <property name="geometry">
+            <rect>
+              <x>100</x>
+              <y>16</y>
+              <width>184</width>
+              <height>26</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>${P}${S}mode${N}</string>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${S}mode${N}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>15</pointsize>
+            </font>
+          </property>
+          <property name="orientation" stdset="0">
+            <number>1</number>
+          </property>
+          <property name="horizontalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="verticalSpacing" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginTop" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginBottom" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginLeft" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="marginRight" stdset="0">
+            <number>0</number>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMEnumButton#choice_button {
+  color: rgb(0, 0, 0);
+  background-color: rgb(187, 187, 187);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }
+QPushButton {
+  color: rgb(0, 0, 0);
+  background-color: rgb(187, 187, 187);
+  margin: 0px;
+  padding: 0px;
+  min-width: 0px;
+  min-height: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="5">
+        <widget class="PyDMLineEdit" name="text_entry">
+          <property name="geometry">
+            <rect>
+              <x>289</x>
+              <y>16</y>
+              <width>114</width>
+              <height>24</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${S}val${N}</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}${S}val${N}</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>14</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry {
+  color: rgb(0, 0, 0);
+  background-color: rgb(187, 187, 187);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="7">
+        <widget class="PyDMLineEdit" name="text_entry_1">
+          <property name="geometry">
+            <rect>
+              <x>408</x>
+              <y>16</y>
+              <width>239</width>
+              <height>24</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${P}${S}pv${N}.VAL</string>
+          </property>
+          <property name="toolTip">
+            <string>${P}${S}pv${N}.VAL</string>
+          </property>
+          <property name="displayFormat" stdset="0">
+            <enum>PyDMLineEdit::String</enum>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>14</pointsize>
+            </font>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">PyDMLineEdit#text_entry_1 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(187, 187, 187);
+  border: 1px solid black;
+  margin: 0px;
+  padding: 0px;
+  spacing: 0px;
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="1">
+        <widget class="PyDMFrame" name="composite">
+          <property name="geometry">
+            <rect>
+              <x>9</x>
+              <y>16</y>
+              <width>86</width>
+              <height>24</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${S}mode${N}&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;(ch[0])==0&quot;}]</string>
+          </property>
+          <layout class="QGridLayout" name="gridLayout_1" columnstretch="86" rowstretch="24">
+            <property name="leftMargin">
+              <number>0</number>
+            </property>
+            <property name="topMargin">
+              <number>0</number>
+            </property>
+            <property name="rightMargin">
+              <number>0</number>
+            </property>
+            <property name="bottomMargin">
+              <number>0</number>
+            </property>
+            <property name="horizontalSpacing">
+              <number>0</number>
+            </property>
+            <property name="verticalSpacing">
+              <number>0</number>
+            </property>
+            <item row="0" column="0">
+              <widget class="PyDMPushButton" name="message_button">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>0</y>
+                    <width>86</width>
+                    <height>24</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="text">
+                  <string>Save</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>14</pointsize>
+                  </font>
+                </property>
+                <property name="toolTip">
+                  <string>${P}${S}inCalc${N}.PROC</string>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}${S}inCalc${N}.PROC</string>
+                </property>
+                <property name="pressValue" stdset="0">
+                  <string>1</string>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMPushButton#message_button {
+  color: rgb(0, 0, 0);
+  background-color: rgb(253, 0, 0);
+  }</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+      <item row="1" column="9">
+        <widget class="PyDMFrame" name="composite_1">
+          <property name="geometry">
+            <rect>
+              <x>652</x>
+              <y>16</y>
+              <width>86</width>
+              <height>24</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${P}${S}mode${N}&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;(ch[0])!=0&quot;}]</string>
+          </property>
+          <layout class="QGridLayout" name="gridLayout_2" columnstretch="86" rowstretch="24">
+            <property name="leftMargin">
+              <number>0</number>
+            </property>
+            <property name="topMargin">
+              <number>0</number>
+            </property>
+            <property name="rightMargin">
+              <number>0</number>
+            </property>
+            <property name="bottomMargin">
+              <number>0</number>
+            </property>
+            <property name="horizontalSpacing">
+              <number>0</number>
+            </property>
+            <property name="verticalSpacing">
+              <number>0</number>
+            </property>
+            <item row="0" column="0">
+              <widget class="PyDMPushButton" name="message_button_1">
+                <property name="geometry">
+                  <rect>
+                    <x>0</x>
+                    <y>0</y>
+                    <width>86</width>
+                    <height>24</height>
+                  </rect>
+                </property>
+                <property name="sizePolicy">
+                  <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                  </sizepolicy>
+                </property>
+                <property name="text">
+                  <string>Apply</string>
+                </property>
+                <property name="font">
+                  <font>
+                    <pointsize>14</pointsize>
+                  </font>
+                </property>
+                <property name="toolTip">
+                  <string>${P}${S}outCalc${N}.PROC</string>
+                </property>
+                <property name="channel" stdset="0">
+                  <string>ca://${P}${S}outCalc${N}.PROC</string>
+                </property>
+                <property name="pressValue" stdset="0">
+                  <string>1</string>
+                </property>
+                <property name="styleSheet">
+                  <string notr="true">PyDMPushButton#message_button_1 {
+  color: rgb(0, 0, 0);
+  background-color: rgb(0, 216, 0);
+  }</string>
+                </property>
+              </widget>
+            </item>
+          </layout>
+        </widget>
+      </item>
+    </layout>
+    <zorder>choice_button</zorder>
+    <zorder>text_entry</zorder>
+    <zorder>text_entry_1</zorder>
+    <zorder>message_button</zorder>
+    <zorder>composite</zorder>
+    <zorder>message_button_1</zorder>
+    <zorder>composite_1</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMEnumButton</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.enum_button</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMLineEdit</class>
+      <extends>QLineEdit</extends>
+      <header>pydm.widgets.line_edit</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMPushButton</class>
+      <extends>QPushButton</extends>
+      <header>pydm.widgets.pushbutton</header>
+    </customwidget>
+  </customwidgets>
+</ui>

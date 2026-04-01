@@ -9,12 +9,10 @@ default-members = [
     "crates/epics-macros-rs",
     "crates/epics-pva-rs",
     "crates/epics-rs",
-    "crates/epics-seq-rs",
     "crates/motor-rs",
-    "crates/snc-core-rs",
-    "crates/snc-rs",
     "crates/std-rs",
     "crates/scaler-rs",
+    "crates/optics-rs",
 ]
 resolver = "3"
 
@@ -33,8 +31,7 @@ epics-base-rs = { path = "crates/epics-base-rs", version = "0.7.3" }
 epics-ca-rs = { path = "crates/epics-ca-rs", version = "0.7.3" }
 epics-macros-rs = { path = "crates/epics-macros-rs", version = "0.7.3" }
 epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.7.3" }
-epics-seq-rs = { path = "crates/epics-seq-rs", version = "0.7.3" }
 motor-rs = { path = "crates/motor-rs", version = "0.7.3" }
-snc-core-rs = { path = "crates/snc-core-rs", version = "0.7.3" }
 std-rs = { path = "crates/std-rs", version = "0.7.3" }
 scaler-rs = { path = "crates/scaler-rs", version = "0.7.3" }
+optics-rs = { path = "crates/optics-rs", version = "0.7.3" }

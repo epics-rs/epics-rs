@@ -1,0 +1,270 @@
+########### SVN repository information ###################
+# $Date$
+# $Author$
+# $Revision$
+# $URL$
+# $Id$
+########### SVN repository information ###################
+#
+# file:     fb_epid.db
+# purpose:  use the epid record for software feedback
+
+#------------------------------------------
+#  P    prefix for this instance of this database
+#------------------------------------------
+#  $(P):in.INAN        holds PV name of input PV (by default)
+#  $(IN)               PV name: input signal
+#  $(OUT)              PV name: output positioner
+#  $(MODE)             choice:  PID or Max/Min
+#  $(CALC)             string:  calculation, 1=feedback on, 0=feedback off
+#  $(PERMIT1)          PV name: boolean value to permit operations
+#  $(PERMIT2)          PV name: boolean value to permit operations
+#  $(PERMIT3)          PV name: boolean value to permit operations
+#  $(PERMIT4)          PV name: boolean value to permit operations
+
+# Use on instance of this database for each feedback channel.
+# If two different methods for feedback are desired
+# for a given axis, call two instances of this database.
+# For example, on 33ID for feedback of the DCM crystal 2 PZT,
+#  one might choose either the XBPM position signal or the 
+#  D3 graphite foil intensity to drive the PZT position.
+#
+#  These might be the XBPM position feedback terms:
+#    P       = iad:fbe:xbpm:y
+#    IN      = iad:xbpm:pos:y
+#    OUT     = iad:540:c0:out0
+#    MODE    = PID
+#    CALC    = A&&B&&C
+#    PERMIT1 = iad:beamAvailable.VAL
+#    PERMIT2 = iad:xbpm:current:ok.VAL
+#    PERMIT3 = 
+#    PERMIT4 = 
+#
+#  These might be the D3 foil feedback terms:
+#    P       = iad:fbe:D3:y
+#    IN      = iad:540:c0:in10
+#    OUT     = iad:540:c0:out0
+#    MODE    = Max/Min
+#    CALC    = A&&B
+#    PERMIT1 = iad:beamAvailable.VAL
+#    PERMIT2 = 
+#    PERMIT3 = 
+#    PERMIT4 = 
+
+# For each channel:
+#  signal(ao or other)
+#    -> in(swait)
+#    --> epid
+#    ---> obuf(swait) 
+#    ----> out(swait)
+#    -----> positioner(motor or ao)
+
+# Theory of operation:
+# 1. A signal is available as an EPICS process variable.
+#    The signal source can be in the VME with the feedback software
+#    or in another VME available on the local network.
+# 2. An input calculation (swait record) is used to allow some
+#    flexibility for conditioning the input signal to the feedback.
+# 3. An epid record is used to provide real-time feedback
+#    and recalculate the output variable.
+# 4. The output from the epid record is buffered by
+#    the outbuf calculation which watches the Feedback ON (FBON)
+#    switch and retains the previous output value if the feedback
+#    software is switched off.
+# 5. An output calculation is used to allow some flexibility
+#    for conditioning the output signal to the positioner.
+#    The conditioned epid result is pushed to the positioner.
+# 6. A positioner responds to the result from the epid record
+#    and thus further modifies the input signal.
+# 7. The feedback can be switched on manually, subject to
+#    the logic of some other calculation.  For example,
+#    shutter closed could suspend feedback.  In this case,
+#    the output is not driven.
+# 8. When the feedback is switched on, the positioner should
+#    not jerk to a different position.  The feedback software
+#    must be prepared to start moving the positioner from its 
+#    present location.
+
+# References
+#  epid          http://cars9.uchicago.edu/software/epics/epidRecord.html
+#  swait         http://www.aps.anl.gov/bcda/synApps/calc/swaitRecord.html
+#  PID tuning    see the epid documentation (above)
+
+#------------------------------------------
+
+   #
+   # epid record to actually calculate the 
+   # feedback response to the input
+   #
+grecord(epid, "$(P)") {
+	field(DESC, "EPID feedback")
+	field(INP,  "$(P):in")
+	field(FMOD, "$(MODE)")
+	field(FBON, "Off")
+	field(SCAN, "Passive")
+	field(KP,   "0")
+	field(KI,   "0")
+	field(KD,   "0")
+	field(I,    "0")
+	field(DRVL, "0")
+	field(DRVH, "0")
+	field(EGU,  "feedback")
+	field(PREC, "4")
+}
+   #
+   # Input calculation to the epid record
+   # Users can adjust the input based on a simple calculation
+   # or a more complex database resulting in this simple calculation
+   # By default, $(P):in.INAN is the PV name of the input signal
+   #
+grecord(swait, "$(P):in") {
+        field(DESC, "EPID feedback input")
+        field(PREC, "5")
+        field(SCAN, "I/O Intr")
+        field(CALC, "A")
+        field(INAN, "$(IN)")
+        field(INAP, "1")
+}
+   #
+   # Output buffer from epid record
+   # This record overcomes a limitation observed in the 
+   # epid record when $(P).FBON=0 but $(P).OVAL is changed anyway.
+   # In this record, $(P):obuf.VAL will not change when $(P).FBON=0
+   #
+grecord(swait, "$(P):obuf") {
+        field(DESC, "EPID FBON output buffer")
+        field(PREC, "5")
+        field(SCAN, "I/O Intr")
+        field(CALC, "B?A:C")
+        field(INAN, "$(P).OVAL")
+        field(INAP, "1")
+        field(INBN, "$(P).FBON")
+        field(INBP, "1")
+        field(INCN, "$(P):obuf.VAL")
+        field(INCP, "1")
+}
+   #
+   # Provide the output from the epid record (through the output buffer)
+   # The intent here is to provide the user with a means
+   # of modifying the output signal from the epid record.
+   # Whether or not this is a good idea remains to be seen.
+   # This record pulls the value from $(P):obuf
+   # $(P):out.OUTN holds the PV name of the output positioner.
+   #
+   # Instead, could make this a seq record, eliminating the calculation.
+   #
+grecord(swait, "$(P):out") {
+        field(DESC, "EPID feedback output")
+        field(PREC, "5")
+        field(SCAN, "I/O Intr")
+        field(CALC, "A")
+        field(INAN, "$(P):obuf.VAL")
+        field(INAP, "1")
+        field(OUTN, "$(OUT)")
+}
+
+   #
+   # bumpless start feature
+   #
+   # When $(P).FBON transitions from 0 to 1 (as feedback starts up),
+   # it is necessary to grab the current value of the
+   # output positioner and push it into $(P).I
+   # However, since the user might change $(P):out.OUTN,
+   # $(P):outpv detects this change and rewrites $(P):resume.INBN.
+   # $(P):resume.INBN holds the PV name of the output positioner
+   #
+grecord(sseq, "$(P):outpv") {
+        field(DESC, "follow OUT PV name")
+        field(SCAN, "I/O Intr")
+        field(DOL1, "$(P):out.OUTN")
+        field(DLY1, "0")
+        field(LNK1, "$(P):resume.INBN")
+}
+grecord(swait, "$(P):resume") {
+        field(DESC, "EPID feedback input")
+        field(PREC, "5")
+        field(SCAN, "I/O Intr")
+        field(CALC, "!C&&D?B:A")
+        field(INAN, "$(P):resume.VAL")
+        field(INAP, "1")
+        field(INBN, "$(OUT)")
+        field(INBP, "1")
+        field(INCN, "$(P):resume.D")
+        field(INCP, "0")
+        field(INDN, "$(P).FBON")
+        field(INDP, "1")
+        field(OOPT, "On Change")
+        field(OUTN, "$(P).I")
+}
+
+   #
+   # permit
+   #
+   # Sometimes, the feedback software must be suspended.
+   # This must happen automatically, based on some 
+   # simple calculation or a more complex database 
+   # resulting in this simple calculation.
+   # $(P):enable drives the $(P).FBON field
+   #
+grecord(bo, "$(P):on")
+{
+	field(DESC, "off/on")
+	field(ZNAM, "off")
+	field(ONAM, "on")
+}
+grecord(swait, "$(P):enable") {
+        field(DESC, "EPID feedback permit")
+        field(PREC, "5")
+        field(SCAN, "I/O Intr")
+        field(CALC, "A&&B")
+        field(INAN, "$(P):on.VAL")
+        field(INAP, "1")
+        field(INBN, "$(PERMIT1)")
+        field(INBP, "1")
+        field(INCN, "$(PERMIT2)")
+        field(INCP, "1")
+        field(INDN, "$(PERMIT3)")
+        field(INDP, "1")
+        field(INEN, "$(PERMIT4)")
+        field(INEP, "1")
+        field(OOPT, "On Change")
+        # drive the epid FBON field
+        field(OUTN, "$(P).FBON")
+}
+
+
+#--------------------------------------------
+# simulate a temperature sensor and heater
+#----------------------
+# A : minimum "temperature" allowed
+# B : cooling rate parameter
+# C : heater power
+# D : output of PID loop
+# E : heater relay closes when D > E
+# F : current "temperature"
+#----------------------
+# PID loop terms:
+#   $(P):in.INAN = "$(P):sim"
+#   $(P):out.OUTN = "$(P):sim.D"
+#   $(P):enable.INAN = "$(P):on.VAL"
+#   $(P).KP = "0.01"
+#   $(P).KI = "0.1"
+#   $(P).I = "0.0"
+#   $(P).KD = "0.0"
+#   $(P).DRVL = "0.0"
+#   $(P).DRVH = "1.0"
+#   $(P).FMOD = "PID"
+#----------------------
+grecord(swait, "$(P):sim") {
+        field(DESC, "EPID Temperature Controller simulator")
+        field(PREC, "5")
+        field(SCAN, ".1 second")
+        field(CALC, "max(A,F*(1-B)+C*D*G)")
+	field(A,    "0.1")	# minimum "temperature"
+	field(B,    "0.05")	# cooling rate parameter
+	field(C,    "30")	# heater power
+	field(D,    "0")	# driven by epid loop
+	field(E,    "0.8")	# relay close threshold
+	field(INFN, "$(P):sim.VAL")
+	field(INGN, "$(P).FBON")# is feedback ON?
+}

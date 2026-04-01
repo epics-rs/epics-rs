@@ -148,11 +148,11 @@ impl PvDatabase {
             let rtype = instance.record.record_type();
 
             let inp = instance.parsed_inp.clone();
-            let is_soft = instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
+            let is_soft = crate::server::device_support::is_soft_dtyp(&instance.common.dtyp);
 
             // DOL link info for output records with OMSL=CLOSED_LOOP
             let dol = match rtype {
-                "ao" | "longout" | "bo" | "mbbo" => {
+                "ao" | "longout" | "bo" | "mbbo" | "stringout" => {
                     let omsl = instance.record.get_field("OMSL")
                         .and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None })
                         .unwrap_or(0);
@@ -308,11 +308,28 @@ impl PvDatabase {
                 instance = rec.write().await;
             }
 
+            // Note: C EPICS LCNT prevents reentrant processing of the same
+            // record within a single processing chain. In Rust, this is handled
+            // by the `visited` HashSet (cycle detection) and the `processing`
+            // AtomicBool guard. LCNT is not needed as a separate mechanism
+            // because async processing with visited sets already prevents
+            // the runaway loops that LCNT guards against in C.
+
             // Tell the record whether device support already computed.
             // Records that override set_device_did_compute() use this to
             // skip their built-in computation (e.g., epid PID).
             if device_did_compute {
                 instance.record.set_device_did_compute(true);
+            }
+
+            // TPRO: trace processing (C EPICS dbProcess prints context when TPRO>0)
+            if instance.common.tpro {
+                eprintln!(
+                    "[TPRO] {}: process (SCAN={:?}, PACT={})",
+                    instance.name,
+                    instance.common.scan,
+                    instance.processing.load(std::sync::atomic::Ordering::Relaxed)
+                );
             }
 
             // Process

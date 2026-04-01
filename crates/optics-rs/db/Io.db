@@ -1,0 +1,206 @@
+grecord(mbbo,"$(P)debug")
+{
+	field(DESC,"debug value for Io")
+	field(ZRST,"0")
+	field(ONST,"1")
+	field(TWST,"2")
+	field(THST,"3")
+	field(FRST,"4")
+	field(FVST,"5")
+	field(SXST,"6")
+	field(SVST,"7")
+	field(EIST,"8")
+	field(NIST,"9")
+	field(TEST,"10")
+}
+grecord(ao,"$(P)VperA")
+{
+	field(DESC,"Current gain")
+	field(EGU, "V/A")
+	field(HOPR,"1.e12")
+	field(LOPR,"1")
+	field(PREC,"0")
+}
+grecord(ao,"$(P)v2f")
+{
+	field(DESC,"Voltage to frequency")
+	field(EGU, "Hz/V")
+	field(HOPR,"1.e7")
+	field(LOPR,"1")
+	field(PREC,"0")
+}
+grecord(ao,"$(P)E_using")
+{
+	field(DESC,"energy")
+	field(EGU, "keV")
+	field(HOPR,"200")
+	field(LOPR,"1")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)xN2")
+{
+	field(DESC,"fraction N2")
+	field(EGU, "atm")
+	field(HOPR,"4")
+	field(LOPR,"0")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)xAr")
+{
+	field(DESC,"fraction Argon")
+	field(EGU, "atm")
+	field(HOPR,"4")
+	field(LOPR,"0")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)xHe")
+{
+	field(DESC,"fraction He")
+	field(EGU, "atm")
+	field(HOPR,"4")
+	field(LOPR,"0")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)xAir")
+{
+	field(DESC,"fraction air")
+	field(EGU, "atm")
+	field(HOPR,"4")
+	field(LOPR,"0")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)xCO2")
+{
+	field(DESC,"fraction CO2")
+	field(EGU, "atm")
+	field(HOPR,"4")
+	field(LOPR,"0")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)activeLen")
+{
+	field(DESC,"active length")
+	field(EGU, "mm")
+	field(HOPR,"200")
+	field(LOPR,".1")
+	field(PREC,"1")
+}
+grecord(ao,"$(P)deadFront")
+{
+	field(DESC,"dead length at front")
+	field(EGU, "mm")
+	field(HOPR,"200")
+	field(LOPR,".1")
+	field(PREC,"1")
+}
+grecord(ao,"$(P)deadRear")
+{
+	field(DESC,"dead length at rear")
+	field(EGU, "mm")
+	field(HOPR,"200")
+	field(LOPR,".1")
+	field(PREC,"1")
+}
+grecord(ao,"$(P)kapton1")
+{
+	field(DESC,"Kapton before Io")
+	field(EGU, "inch")
+	field(HOPR,"0.01")
+	field(LOPR,"0")
+	field(PREC,"4")
+}
+grecord(ao,"$(P)kapton2")
+{
+	field(DESC,"Kapton after Io")
+	field(EGU, "inch")
+	field(HOPR,"0.01")
+	field(LOPR,"0")
+	field(PREC,"4")
+}
+grecord(ao,"$(P)HePath")
+{
+	field(DESC,"He path after Io")
+	field(EGU, "mm")
+	field(HOPR,"1.E5")
+	field(LOPR,"0")
+	field(PREC,"1")
+}
+grecord(ao,"$(P)airPath")
+{
+	field(DESC,"Air path after Io")
+	field(EGU, "mm")
+	field(HOPR,"1.E5")
+	field(LOPR,"0")
+	field(PREC,"1")
+}
+grecord(ao,"$(P)Be")
+{
+	field(DESC,"Be after Io")
+	field(EGU, "inch")
+	field(HOPR,"0.01")
+	field(LOPR,"0")
+	field(PREC,"4")
+}
+grecord(ao,"$(P)efficiency")
+{
+	field(DESC,"Detector efficiency")
+	field(EGU, "")
+	field(HOPR,"1")
+	field(LOPR,"0")
+	field(PREC,"3")
+}
+grecord(bo,"$(P)ArPcntr")
+{
+	field(DESC,"Argon Proportional counter")
+	field(ZNAM,"manual")
+	field(ONAM,"Ar")
+}
+grecord(mbbo,"$(P)scaler")
+{
+	field(DESC,"scaler channel for Io")
+	field(ZRST,"0")
+	field(ONST,"1")
+	field(TWST,"2")
+	field(THST,"3")
+	field(FRST,"4")
+	field(FVST,"5")
+	field(SXST,"6")
+	field(SVST,"7")
+	field(EIST,"8")
+	field(NIST,"9")
+	field(TEST,"10")
+	field(ELST,"11")
+	field(TVST,"12")
+	field(TTST,"13")
+	field(FTST,"14")
+	field(FFST,"15")
+}
+grecord(ao,"$(P)flux")
+{
+	field(DESC,"flux before Io")
+	field(EGU, "ph/sec")
+	field(LOPR,"0")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)detector")
+{
+	field(DESC,"flux at detector")
+	field(EGU, "ph/sec")
+	field(LOPR,"0")
+	field(PREC,"3")
+}
+grecord(ao,"$(P)ionPhotons")
+{
+	field(DESC,"flux used in chamber")
+	field(EGU, "ph/sec")
+	field(LOPR,"0")
+	field(PREC,"1")
+}
+grecord(ao,"$(P)ionAbs")
+{
+	field(DESC,"transmission factor")
+	field(EGU, "")
+	field(HOPR,"1")
+	field(LOPR,"0")
+	field(PREC,"3")
+}

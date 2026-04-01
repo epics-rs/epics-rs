@@ -15,9 +15,9 @@ asyn-rs = { workspace = true, optional = true }
 motor-rs = { workspace = true, optional = true }
 ad-core-rs = { workspace = true, optional = true }
 ad-plugins-rs = { workspace = true, optional = true }
-epics-seq-rs = { workspace = true, optional = true }
 std-rs = { workspace = true, optional = true }
 scaler-rs = { workspace = true, optional = true }
+optics-rs = { workspace = true, optional = true }
 
 [features]
 default = ["ca"]
@@ -30,7 +30,7 @@ ad = ["dep:asyn-rs", "dep:ad-core-rs", "dep:ad-plugins-rs"]
 calc = []
 autosave = []
 busy = []
-seq = ["dep:epics-seq-rs"]
 std = ["dep:std-rs"]
 scaler = ["dep:scaler-rs"]
-full = ["ca", "pva", "asyn", "motor", "ad", "calc", "autosave", "busy", "seq", "std", "scaler"]
+optics = ["dep:optics-rs"]
+full = ["ca", "pva", "asyn", "motor", "ad", "calc", "autosave", "busy", "std", "scaler", "optics"]

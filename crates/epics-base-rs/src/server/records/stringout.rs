@@ -6,6 +6,10 @@ pub struct StringoutRecord {
     #[field(type = "String")]
     pub val: String,
     #[field(type = "Short")]
+    pub omsl: i16,
+    #[field(type = "String")]
+    pub dol: String,
+    #[field(type = "Short")]
     pub simm: i16,
     #[field(type = "String")]
     pub siml: String,
@@ -19,6 +23,8 @@ impl Default for StringoutRecord {
     fn default() -> Self {
         Self {
             val: String::new(),
+            omsl: 0,
+            dol: String::new(),
             simm: 0,
             siml: String::new(),
             siol: String::new(),

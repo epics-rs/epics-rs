@@ -1,0 +1,3166 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>559</x>
+        <y>36</y>
+        <width>375</width>
+        <height>190</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>375</width>
+        <height>190</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(235, 241, 181);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>sectorStatus</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="23,8,21,19,2,2,2,1,4,45,4,10,1,1,4,1,1,7,1,1,5,1,13,22,8,1,1,11,2,4,1,4,1,8,1,1,6,1,13,31,11,1,4,6,1,10,1,2,13,9,1,23" rowstretch="7,20,29,5,6,3,1,1,5,1,1,1,1,1,5,1,1,1,1,1,5,1,1,1,1,1,5,1,1,1,1,1,5,1,1,10,3,1,7,3,1,6,1,2,1,6,1,5,24">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="4" column="11" rowspan="4" colspan="4">
+        <widget class="QLabel" name="text">
+          <property name="geometry">
+            <rect>
+              <x>131</x>
+              <y>61</y>
+              <width>16</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>100</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="31" column="8" rowspan="3" colspan="5">
+        <widget class="PyDMScaleIndicator" name="bar">
+          <property name="geometry">
+            <rect>
+              <x>78</x>
+              <y>111</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}ide:memory</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}ide:memory</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="25" column="8" rowspan="3" colspan="5">
+        <widget class="PyDMScaleIndicator" name="bar_1">
+          <property name="geometry">
+            <rect>
+              <x>78</x>
+              <y>101</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idd:memory</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}idd:memory</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="19" column="8" rowspan="3" colspan="5">
+        <widget class="PyDMScaleIndicator" name="bar_2">
+          <property name="geometry">
+            <rect>
+              <x>78</x>
+              <y>91</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idc:memory</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}idc:memory</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="13" column="8" rowspan="3" colspan="5">
+        <widget class="PyDMScaleIndicator" name="bar_3">
+          <property name="geometry">
+            <rect>
+              <x>78</x>
+              <y>81</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idb:memory</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}idb:memory</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="7" column="8" rowspan="3" colspan="5">
+        <widget class="PyDMScaleIndicator" name="bar_4">
+          <property name="geometry">
+            <rect>
+              <x>78</x>
+              <y>71</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}ida:memory</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}ida:memory</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="30" column="1" rowspan="3" colspan="4">
+        <widget class="QLabel" name="text_1">
+          <property name="geometry">
+            <rect>
+              <x>23</x>
+              <y>110</y>
+              <width>50</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>IOC${S}IDE</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_1</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_1 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="7" column="35" rowspan="3" colspan="7">
+        <widget class="PyDMScaleIndicator" name="bar_5">
+          <property name="geometry">
+            <rect>
+              <x>241</x>
+              <y>71</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}ida:cpu</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}ida:cpu</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="13" column="35" rowspan="3" colspan="7">
+        <widget class="PyDMScaleIndicator" name="bar_6">
+          <property name="geometry">
+            <rect>
+              <x>241</x>
+              <y>81</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idb:cpu</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}idb:cpu</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="19" column="35" rowspan="3" colspan="7">
+        <widget class="PyDMScaleIndicator" name="bar_7">
+          <property name="geometry">
+            <rect>
+              <x>241</x>
+              <y>91</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idc:cpu</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}idc:cpu</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="25" column="35" rowspan="3" colspan="7">
+        <widget class="PyDMScaleIndicator" name="bar_8">
+          <property name="geometry">
+            <rect>
+              <x>241</x>
+              <y>101</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idd:cpu</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}idd:cpu</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="31" column="35" rowspan="3" colspan="7">
+        <widget class="PyDMScaleIndicator" name="bar_9">
+          <property name="geometry">
+            <rect>
+              <x>241</x>
+              <y>111</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}ide:cpu</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}ide:cpu</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="4" column="40" rowspan="4" colspan="3">
+        <widget class="QLabel" name="text_2">
+          <property name="geometry">
+            <rect>
+              <x>293</x>
+              <y>61</y>
+              <width>16</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>100</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_2</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_2 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="4" column="35" rowspan="4" colspan="2">
+        <widget class="QLabel" name="text_3">
+          <property name="geometry">
+            <rect>
+              <x>241</x>
+              <y>61</y>
+              <width>7</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>0</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_3</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_3 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="8" column="47" rowspan="3" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval">
+          <property name="geometry">
+            <rect>
+              <x>327</x>
+              <y>72</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}ida:status</string>
+          </property>
+          <property name="toolTip">
+            <string>oval</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${S}ida:status&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="14" column="47" rowspan="3" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_1">
+          <property name="geometry">
+            <rect>
+              <x>327</x>
+              <y>82</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>82</red>
+                <green>218</green>
+                <blue>59</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>82</red>
+              <green>218</green>
+              <blue>59</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="14" column="47" rowspan="3" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_2">
+          <property name="geometry">
+            <rect>
+              <x>327</x>
+              <y>82</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idb:status</string>
+          </property>
+          <property name="toolTip">
+            <string>oval_2</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${S}idb:status&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="20" column="47" rowspan="3" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_3">
+          <property name="geometry">
+            <rect>
+              <x>327</x>
+              <y>92</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>82</red>
+                <green>218</green>
+                <blue>59</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>82</red>
+              <green>218</green>
+              <blue>59</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="20" column="47" rowspan="3" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_4">
+          <property name="geometry">
+            <rect>
+              <x>327</x>
+              <y>92</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idc:status</string>
+          </property>
+          <property name="toolTip">
+            <string>oval_4</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${S}idc:status&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="26" column="47" rowspan="3" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_5">
+          <property name="geometry">
+            <rect>
+              <x>327</x>
+              <y>102</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>82</red>
+                <green>218</green>
+                <blue>59</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>82</red>
+              <green>218</green>
+              <blue>59</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="26" column="47" rowspan="3" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_6">
+          <property name="geometry">
+            <rect>
+              <x>327</x>
+              <y>102</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idd:status</string>
+          </property>
+          <property name="toolTip">
+            <string>oval_6</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${S}idd:status&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="32" column="47" rowspan="3" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_7">
+          <property name="geometry">
+            <rect>
+              <x>327</x>
+              <y>112</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>82</red>
+                <green>218</green>
+                <blue>59</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>82</red>
+              <green>218</green>
+              <blue>59</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="32" column="47" rowspan="3" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_8">
+          <property name="geometry">
+            <rect>
+              <x>327</x>
+              <y>112</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}ide:status</string>
+          </property>
+          <property name="toolTip">
+            <string>oval_8</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${S}ide:status&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="16" rowspan="42">
+        <widget class="PyDMDrawingLine" name="polyline">
+          <property name="geometry">
+            <rect>
+              <x>149</x>
+              <y>70</y>
+              <width>0</width>
+              <height>96</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::DashLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::DashLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="32" rowspan="42">
+        <widget class="PyDMDrawingLine" name="polyline_1">
+          <property name="geometry">
+            <rect>
+              <x>232</x>
+              <y>70</y>
+              <width>0</width>
+              <height>96</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_1</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::DashLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::DashLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="44" rowspan="42">
+        <widget class="PyDMDrawingLine" name="polyline_2">
+          <property name="geometry">
+            <rect>
+              <x>316</x>
+              <y>70</y>
+              <width>0</width>
+              <height>96</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>polyline_2</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::DashLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>0</double>
+          </property>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+          <property name="penWidth" stdset="0">
+            <double>1</double>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::DashLine</enum>
+          </property>
+          <property name="penColor" stdset="0"/>
+          <property name="penCapStyle" stdset="0">
+            <enum>Qt::FlatCap</enum>
+          </property>
+        </widget>
+      </item>
+      <item row="1" column="3" colspan="45">
+        <widget class="QLabel" name="text_4">
+          <property name="geometry">
+            <rect>
+              <x>52</x>
+              <y>7</y>
+              <width>277</width>
+              <height>20</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>SECTOR ${S} IOC STATUS</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>12</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_4</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_4 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="37" column="10" rowspan="3" colspan="4">
+        <widget class="QLabel" name="text_5">
+          <property name="geometry">
+            <rect>
+              <x>127</x>
+              <y>132</y>
+              <width>16</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>100</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_5</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_5 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="37" column="6" rowspan="3" colspan="3">
+        <widget class="QLabel" name="text_6">
+          <property name="geometry">
+            <rect>
+              <x>75</x>
+              <y>132</y>
+              <width>7</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>0</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_6</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_6 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="45" column="7" rowspan="2" colspan="5">
+        <widget class="PyDMScaleIndicator" name="bar_10">
+          <property name="geometry">
+            <rect>
+              <x>77</x>
+              <y>154</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}bmc:memory</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}bmc:memory</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="41" column="7" rowspan="2" colspan="5">
+        <widget class="PyDMScaleIndicator" name="bar_11">
+          <property name="geometry">
+            <rect>
+              <x>77</x>
+              <y>144</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}bma:memory</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}bma:memory</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="37" column="40" rowspan="3" colspan="3">
+        <widget class="QLabel" name="text_7">
+          <property name="geometry">
+            <rect>
+              <x>293</x>
+              <y>132</y>
+              <width>16</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>100</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_7</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_7 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="37" column="36" rowspan="3" colspan="2">
+        <widget class="QLabel" name="text_8">
+          <property name="geometry">
+            <rect>
+              <x>242</x>
+              <y>132</y>
+              <width>7</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>0</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_8</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_8 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="45" column="34" rowspan="2" colspan="7">
+        <widget class="PyDMScaleIndicator" name="bar_12">
+          <property name="geometry">
+            <rect>
+              <x>240</x>
+              <y>154</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}bmc:cpu</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}bmc:cpu</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="41" column="34" rowspan="2" colspan="7">
+        <widget class="PyDMScaleIndicator" name="bar_13">
+          <property name="geometry">
+            <rect>
+              <x>240</x>
+              <y>144</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}bma:cpu</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}bma:cpu</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="40" column="46" rowspan="2" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_9">
+          <property name="geometry">
+            <rect>
+              <x>326</x>
+              <y>143</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>82</red>
+                <green>218</green>
+                <blue>59</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>82</red>
+              <green>218</green>
+              <blue>59</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="40" column="46" rowspan="2" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_10">
+          <property name="geometry">
+            <rect>
+              <x>326</x>
+              <y>143</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}bma:status</string>
+          </property>
+          <property name="toolTip">
+            <string>oval_10</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${S}bma:status&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="44" column="46" rowspan="2" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_11">
+          <property name="geometry">
+            <rect>
+              <x>326</x>
+              <y>153</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>82</red>
+                <green>218</green>
+                <blue>59</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>82</red>
+              <green>218</green>
+              <blue>59</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="44" column="46" rowspan="2" colspan="4">
+        <widget class="PyDMDrawingEllipse" name="oval_12">
+          <property name="geometry">
+            <rect>
+              <x>326</x>
+              <y>153</y>
+              <width>25</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}bmc:status</string>
+          </property>
+          <property name="toolTip">
+            <string>oval_12</string>
+          </property>
+          <property name="rules" stdset="0">
+            <string>[{&quot;name&quot;: &quot;visibility&quot;, &quot;property&quot;: &quot;Visible&quot;, &quot;channels&quot;: [{&quot;channel&quot;: &quot;ca://${S}bmc:status&quot;, &quot;trigger&quot;: true, &quot;use_enum&quot;: false}], &quot;expression&quot;: &quot;ch[0]==0&quot;}]</string>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>253</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="penStyle" stdset="0">
+            <enum>Qt::SolidLine</enum>
+          </property>
+          <property name="penColor" stdset="0">
+            <color>
+              <red>253</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="45" column="2" rowspan="2" colspan="2">
+        <widget class="QLabel" name="text_9">
+          <property name="geometry">
+            <rect>
+              <x>31</x>
+              <y>154</y>
+              <width>40</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>IOC${S}BMB</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_9</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_9 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="41" column="2" rowspan="2" colspan="2">
+        <widget class="QLabel" name="text_10">
+          <property name="geometry">
+            <rect>
+              <x>31</x>
+              <y>144</y>
+              <width>40</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>IOC${S}BMA</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_10</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_10 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="49" column="39" colspan="10">
+        <widget class="QLabel" name="text_11">
+          <property name="geometry">
+            <rect>
+              <x>262</x>
+              <y>888</y>
+              <width>80</width>
+              <height>9</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>9/22/1998 GRG</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_11</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_11 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="4" column="19" rowspan="4" colspan="3">
+        <widget class="QLabel" name="text_12">
+          <property name="geometry">
+            <rect>
+              <x>157</x>
+              <y>61</y>
+              <width>7</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>0</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_12</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_12 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="31" column="20" rowspan="3" colspan="9">
+        <widget class="PyDMScaleIndicator" name="bar_14">
+          <property name="geometry">
+            <rect>
+              <x>158</x>
+              <y>111</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}ide:fd</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}ide:fd</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="25" column="20" rowspan="3" colspan="9">
+        <widget class="PyDMScaleIndicator" name="bar_15">
+          <property name="geometry">
+            <rect>
+              <x>158</x>
+              <y>101</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idd:fd</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}idd:fd</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="19" column="20" rowspan="3" colspan="9">
+        <widget class="PyDMScaleIndicator" name="bar_16">
+          <property name="geometry">
+            <rect>
+              <x>158</x>
+              <y>91</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idc:fd</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}idc:fd</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="13" column="20" rowspan="3" colspan="9">
+        <widget class="PyDMScaleIndicator" name="bar_17">
+          <property name="geometry">
+            <rect>
+              <x>158</x>
+              <y>81</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}idb:fd</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}idb:fd</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="7" column="20" rowspan="3" colspan="9">
+        <widget class="PyDMScaleIndicator" name="bar_18">
+          <property name="geometry">
+            <rect>
+              <x>158</x>
+              <y>71</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}ida:fd</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}ida:fd</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="3" column="23" rowspan="2" colspan="2">
+        <widget class="QLabel" name="text_13">
+          <property name="geometry">
+            <rect>
+              <x>177</x>
+              <y>56</y>
+              <width>30</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>${S}ID</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_13</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_13 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="4" column="27" rowspan="4" colspan="4">
+        <widget class="QLabel" name="text_14">
+          <property name="geometry">
+            <rect>
+              <x>209</x>
+              <y>61</y>
+              <width>18</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>150</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_14</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_14 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="36" column="23" rowspan="3">
+        <widget class="QLabel" name="text_15">
+          <property name="geometry">
+            <rect>
+              <x>177</x>
+              <y>129</y>
+              <width>22</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>${S}BM</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_15</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_15 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="38" column="18" rowspan="3" colspan="3">
+        <widget class="QLabel" name="text_16">
+          <property name="geometry">
+            <rect>
+              <x>156</x>
+              <y>133</y>
+              <width>7</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>0</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_16</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_16 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="45" column="18" rowspan="2" colspan="10">
+        <widget class="PyDMScaleIndicator" name="bar_19">
+          <property name="geometry">
+            <rect>
+              <x>156</x>
+              <y>154</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}bmc:fd</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}bmc:fd</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="41" column="18" rowspan="2" colspan="10">
+        <widget class="PyDMScaleIndicator" name="bar_20">
+          <property name="geometry">
+            <rect>
+              <x>156</x>
+              <y>144</y>
+              <width>64</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="channel" stdset="0">
+            <string>ca://${S}bma:fd</string>
+          </property>
+          <property name="toolTip">
+            <string>${S}bma:fd</string>
+          </property>
+          <property name="orientation" stdset="0">
+            <string>Qt::Horizontal</string>
+          </property>
+          <property name="showLimitLabels" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValueLabel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="limitsFromChannel" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="barIndicator" stdset="0">
+            <bool>true</bool>
+          </property>
+          <property name="showValue" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showTicks" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="showLimits" stdset="0">
+            <bool>false</bool>
+          </property>
+          <property name="indicatorColor" stdset="0">
+            <color>
+              <red>0</red>
+              <green>0</green>
+              <blue>0</blue>
+            </color>
+          </property>
+          <property name="backgroundColor" stdset="0">
+            <color>
+              <red>153</red>
+              <green>255</green>
+              <blue>255</blue>
+            </color>
+          </property>
+        </widget>
+      </item>
+      <item row="38" column="26" rowspan="3" colspan="4">
+        <widget class="QLabel" name="text_17">
+          <property name="geometry">
+            <rect>
+              <x>208</x>
+              <y>133</y>
+              <width>18</width>
+              <height>11</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>150</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_17</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_17 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="6" column="1" rowspan="3" colspan="4">
+        <widget class="QLabel" name="text_18">
+          <property name="geometry">
+            <rect>
+              <x>23</x>
+              <y>70</y>
+              <width>50</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>IOC${S}IDA</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_18</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_18 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="12" column="1" rowspan="3" colspan="4">
+        <widget class="QLabel" name="text_19">
+          <property name="geometry">
+            <rect>
+              <x>23</x>
+              <y>80</y>
+              <width>50</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>IOC${S}IDB</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_19</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_19 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="18" column="1" rowspan="3" colspan="4">
+        <widget class="QLabel" name="text_20">
+          <property name="geometry">
+            <rect>
+              <x>23</x>
+              <y>90</y>
+              <width>50</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>IOC${S}IDC</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_20</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_20 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+      <item row="24" column="1" rowspan="3" colspan="4">
+        <widget class="QLabel" name="text_21">
+          <property name="geometry">
+            <rect>
+              <x>23</x>
+              <y>100</y>
+              <width>50</width>
+              <height>7</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="text">
+            <string>IOC${S}IDD</string>
+          </property>
+          <property name="font">
+            <font>
+              <pointsize>6</pointsize>
+            </font>
+          </property>
+          <property name="brush" stdset="0">
+            <brush brushstyle="SolidPattern">
+              <color alpha="255">
+                <red>0</red>
+                <green>0</green>
+                <blue>0</blue>
+              </color>
+            </brush>
+          </property>
+          <property name="toolTip">
+            <string>text_21</string>
+          </property>
+          <property name="alignment">
+            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+          <property name="styleSheet">
+            <string notr="true">QLabel#text_21 {
+  color: rgb(0, 0, 0);
+  }</string>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>text</zorder>
+    <zorder>bar</zorder>
+    <zorder>bar_1</zorder>
+    <zorder>bar_2</zorder>
+    <zorder>bar_3</zorder>
+    <zorder>bar_4</zorder>
+    <zorder>text_1</zorder>
+    <zorder>bar_5</zorder>
+    <zorder>bar_6</zorder>
+    <zorder>bar_7</zorder>
+    <zorder>bar_8</zorder>
+    <zorder>bar_9</zorder>
+    <zorder>text_2</zorder>
+    <zorder>text_3</zorder>
+    <zorder>oval</zorder>
+    <zorder>oval_1</zorder>
+    <zorder>oval_2</zorder>
+    <zorder>oval_3</zorder>
+    <zorder>oval_4</zorder>
+    <zorder>oval_5</zorder>
+    <zorder>oval_6</zorder>
+    <zorder>oval_7</zorder>
+    <zorder>oval_8</zorder>
+    <zorder>polyline</zorder>
+    <zorder>polyline_1</zorder>
+    <zorder>polyline_2</zorder>
+    <zorder>text_4</zorder>
+    <zorder>text_5</zorder>
+    <zorder>text_6</zorder>
+    <zorder>bar_10</zorder>
+    <zorder>bar_11</zorder>
+    <zorder>text_7</zorder>
+    <zorder>text_8</zorder>
+    <zorder>bar_12</zorder>
+    <zorder>bar_13</zorder>
+    <zorder>oval_9</zorder>
+    <zorder>oval_10</zorder>
+    <zorder>oval_11</zorder>
+    <zorder>oval_12</zorder>
+    <zorder>text_9</zorder>
+    <zorder>text_10</zorder>
+    <zorder>text_11</zorder>
+    <zorder>text_12</zorder>
+    <zorder>bar_14</zorder>
+    <zorder>bar_15</zorder>
+    <zorder>bar_16</zorder>
+    <zorder>bar_17</zorder>
+    <zorder>bar_18</zorder>
+    <zorder>text_13</zorder>
+    <zorder>text_14</zorder>
+    <zorder>text_15</zorder>
+    <zorder>text_16</zorder>
+    <zorder>bar_19</zorder>
+    <zorder>bar_20</zorder>
+    <zorder>text_17</zorder>
+    <zorder>text_18</zorder>
+    <zorder>text_19</zorder>
+    <zorder>text_20</zorder>
+    <zorder>text_21</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMLabel</class>
+      <extends>QLabel</extends>
+      <header>pydm.widgets.label</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMScaleIndicator</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.scale</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingEllipse</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingPolyline</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMDrawingLine</class>
+      <extends>QWidget</extends>
+      <header>pydm.widgets.drawing</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

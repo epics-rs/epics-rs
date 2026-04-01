@@ -57,6 +57,51 @@ impl DbFieldType {
     pub fn ctrl_dbr_type(&self) -> u16 {
         *self as u16 + 28
     }
+
+    /// Calculate total buffer size for N elements of this type.
+    /// Equivalent to C EPICS dbValueSize(type) * count.
+    pub fn buffer_size(&self, count: usize) -> usize {
+        self.element_size() * count
+    }
+
+    /// Map field type to request type (C EPICS mapDBFToDBR).
+    /// DBF_MENU and DBF_DEVICE map to DBR_ENUM in C EPICS.
+    /// In Rust these are already represented as DbFieldType::Enum,
+    /// so this is an identity mapping for documentation/completeness.
+    pub fn to_dbr_type(&self) -> DbFieldType {
+        *self
+    }
+}
+
+/// Calculate buffer size for a DBR type including metadata.
+/// dbr_type 0-6: value only
+/// dbr_type 7-13 (STS): +4 bytes (status + severity)
+/// dbr_type 14-20 (TIME): +12 bytes (status + severity + stamp)
+/// dbr_type 21-27 (GR): variable (includes limits, units, precision)
+/// dbr_type 28-34 (CTRL): variable (includes control limits)
+pub fn dbr_buffer_size(dbr_type: u16, native_type: DbFieldType, count: usize) -> usize {
+    let value_size = native_type.element_size() * count;
+    let meta_size = match dbr_type / 7 {
+        0 => 0,                // Plain
+        1 => 4,                // STS: status(2) + severity(2)
+        2 => 12,               // TIME: status(2) + severity(2) + stamp(8)
+        3 => {                 // GR: varies by type
+            match native_type {
+                DbFieldType::String => 4,
+                DbFieldType::Enum => 4 + 16 * 26, // status + enum strings
+                _ => 4 + 8 + 16 + 8 * 6, // status + precision + units + 6 limits
+            }
+        }
+        4 => {                 // CTRL: varies by type
+            match native_type {
+                DbFieldType::String => 4,
+                DbFieldType::Enum => 4 + 16 * 26,
+                _ => 4 + 8 + 16 + 8 * 8, // status + precision + units + 8 limits
+            }
+        }
+        _ => 0,
+    };
+    meta_size + value_size
 }
 
 /// Extract the native DBF type index (0-6) from any DBR type code.

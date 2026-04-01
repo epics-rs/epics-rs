@@ -61,7 +61,9 @@ impl PvDatabase {
                 }
             };
 
-            // Try record-specific field first; only fall back to common on FieldNotFound
+            // put_pv is C EPICS dbPut: write value + special/on_put.
+            // Does NOT post monitor events (use put_pv_and_post for that).
+            // Does NOT clear UDF or trigger processing.
             use crate::server::record::CommonFieldPutResult;
             let common_result = match instance.record.put_field(&field, value.clone()) {
                 Ok(()) => {
@@ -72,9 +74,6 @@ impl PvDatabase {
                 Err(CaError::FieldNotFound(_)) => instance.put_common_field(&field, value)?,
                 Err(e) => return Err(e),
             };
-
-            instance.cleanup_subscribers();
-            instance.notify_field(&field, crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG);
 
             // Update scan index if SCAN or PHAS changed
             match common_result {
@@ -87,6 +86,88 @@ impl PvDatabase {
                     self.update_scan_index(base, s, s, old_phas, new_phas).await;
                 }
                 CommonFieldPutResult::NoChange => {}
+            }
+
+            return Ok(());
+        }
+
+        Err(CaError::ChannelNotFound(name.to_string()))
+    }
+
+    /// Write a value and post monitor events if changed.
+    /// Equivalent to C EPICS `dbPut` + `db_post_events(DBE_VALUE|DBE_LOG)`.
+    ///
+    /// Use for readback/status mirror PVs that are written by sequencer-style
+    /// code and need to be visible to CA monitors without triggering record
+    /// processing. Clears UDF/UDF_ALARM on primary field write.
+    ///
+    /// `origin`: writer ID for self-write filtering. Subscribers with the
+    /// same `ignore_origin` will skip this event. Pass 0 to disable.
+    pub async fn put_pv_and_post(&self, name: &str, value: EpicsValue) -> CaResult<()> {
+        self.put_pv_and_post_with_origin(name, value, 0).await
+    }
+
+    /// Like `put_pv_and_post` but with explicit origin tag.
+    pub async fn put_pv_and_post_with_origin(&self, name: &str, value: EpicsValue, origin: u64) -> CaResult<()> {
+        let (base, field) = super::parse_pv_name(name);
+        let field = field.to_ascii_uppercase();
+
+        if let Some(rec) = self.inner.records.read().await.get(base) {
+            let mut instance = rec.write().await;
+
+            // Type coercion
+            let value = {
+                let target_type = instance.record.field_list().iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(&field))
+                    .map(|f| f.dbf_type);
+                if let Some(target) = target_type {
+                    if value.dbr_type() != target {
+                        value.convert_to(target)
+                    } else {
+                        value
+                    }
+                } else {
+                    value
+                }
+            };
+
+            let old_value = instance.record.get_field(&field);
+            let old_stat = instance.common.stat;
+            let old_sevr = instance.common.sevr;
+
+            // Write value + special/on_put
+            match instance.record.put_field(&field, value.clone()) {
+                Ok(()) => {
+                    instance.record.on_put(&field);
+                    let _ = instance.record.special(&field, true);
+                    // Clear UDF/UDF_ALARM on primary field write
+                    if field == instance.record.primary_field() {
+                        instance.common.udf = false;
+                        if instance.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM {
+                            instance.common.stat = 0;
+                            instance.common.sevr = crate::server::record::AlarmSeverity::NoAlarm;
+                        }
+                    }
+                }
+                Err(CaError::FieldNotFound(_)) => {
+                    instance.put_common_field(&field, value)?;
+                }
+                Err(e) => return Err(e),
+            }
+
+            // Post monitor events if value or alarm changed
+            let new_value = instance.record.get_field(&field);
+            let value_changed = old_value != new_value;
+            let alarm_changed = old_stat != instance.common.stat || old_sevr != instance.common.sevr;
+            if value_changed || alarm_changed {
+                // Update timestamp so the snapshot carries current time
+                instance.common.time = crate::runtime::general_time::get_current();
+                instance.cleanup_subscribers();
+                instance.notify_field_with_origin(&field,
+                    crate::server::recgbl::EventMask::VALUE
+                    | crate::server::recgbl::EventMask::LOG
+                    | crate::server::recgbl::EventMask::ALARM,
+                    origin);
             }
 
             return Ok(());
@@ -168,6 +249,24 @@ impl PvDatabase {
                     value
                 }
             };
+
+            // SPC_NOMOD: reject writes to read-only fields (C EPICS S_db_noMod)
+            let is_read_only = instance
+                .record
+                .field_list()
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(&field))
+                .is_some_and(|f| f.read_only);
+            if is_read_only {
+                instance.common.putf = false;
+                return Err(CaError::ReadOnlyField(field));
+            }
+
+            // Pre-write special hook (C EPICS dbPutSpecial pass=0)
+            if let Err(e) = instance.record.special(&field, false) {
+                instance.common.putf = false;
+                return Err(e);
+            }
 
             // Try record-specific field first; fall back to common on FieldNotFound.
             // For record-owned fields, call on_put() and special() after successful put,

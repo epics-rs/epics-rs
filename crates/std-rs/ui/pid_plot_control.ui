@@ -1,0 +1,97 @@
+<?xml version="1.0" ?>
+<ui version="4.0">
+  <class>Dialog</class>
+  <widget class="PyDMFrame" name="screen">
+    <property name="geometry">
+      <rect>
+        <x>351</x>
+        <y>377</y>
+        <width>600</width>
+        <height>405</height>
+      </rect>
+    </property>
+    <property name="minimumSize">
+      <size>
+        <width>600</width>
+        <height>405</height>
+      </size>
+    </property>
+    <property name="styleSheet">
+      <string notr="true">PyDMFrame#screen {
+  color: rgb(0, 0, 0);
+  background-color: rgb(187, 187, 187);
+  }</string>
+    </property>
+    <property name="windowTitle">
+      <string>pid_plot_control</string>
+    </property>
+    <layout class="QGridLayout" name="gridLayout" columnstretch="1,599" rowstretch="1,400,4">
+      <property name="leftMargin">
+        <number>0</number>
+      </property>
+      <property name="topMargin">
+        <number>0</number>
+      </property>
+      <property name="rightMargin">
+        <number>0</number>
+      </property>
+      <property name="bottomMargin">
+        <number>0</number>
+      </property>
+      <property name="horizontalSpacing">
+        <number>0</number>
+      </property>
+      <property name="verticalSpacing">
+        <number>0</number>
+      </property>
+      <item row="1" column="1">
+        <widget class="PyDMTimePlot" name="strip_chart">
+          <property name="geometry">
+            <rect>
+              <x>1</x>
+              <y>1</y>
+              <width>600</width>
+              <height>400</height>
+            </rect>
+          </property>
+          <property name="sizePolicy">
+            <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+            </sizepolicy>
+          </property>
+          <property name="toolTip">
+            <string>strip_chart</string>
+          </property>
+          <property name="title" stdset="0">
+            <string>$(P)$(PID).OVAL (control value)</string>
+          </property>
+          <property name="updateInterval" stdset="0">
+            <double>30.000000</double>
+          </property>
+          <property name="xLabels">
+            <string>Time (seconds)</string>
+          </property>
+          <property name="curves" stdset="0">
+            <stringlist>
+              <string>{&quot;color&quot;: &quot;#216c00&quot;, &quot;lineStyle&quot;: 1, &quot;lineWidth&quot;: 1, &quot;channel&quot;: &quot;ca://${P}${PID}.OVAL&quot;, &quot;name&quot;: &quot;$(P)$(PID).OVAL&quot;}</string>
+            </stringlist>
+          </property>
+        </widget>
+      </item>
+    </layout>
+    <zorder>strip_chart</zorder>
+  </widget>
+  <customwidgets>
+    <customwidget>
+      <class>PyDMTimePlot</class>
+      <extends>QGraphicsView</extends>
+      <header>pydm.widgets.timeplot</header>
+    </customwidget>
+    <customwidget>
+      <class>PyDMFrame</class>
+      <extends>QFrame</extends>
+      <header>pydm.widgets.frame</header>
+    </customwidget>
+  </customwidgets>
+</ui>

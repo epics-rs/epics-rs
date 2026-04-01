@@ -1,0 +1,190 @@
+# EPICS database template for the main filter drive application
+#
+# C.M. Schlepuetz
+# December 21, 2012
+#
+# $Revision: 5042 $
+# $Date: 2013-01-31 16:46:29 -0600 (Thu, 31 Jan 2013) $
+# $Author: cschlep $
+# $URL: https://subversion.xray.aps.anl.gov/bcdaioc/33bmTEST/33bmTESTApp/Db/filterDrive.db $
+#
+##############################################################################
+# Required substitutions:
+#   P    = Prefix, usually the IOC name, e.g.: "iocA:"
+#   R    = Record, the name of the filter record, e.g.: "filter:"
+#   DESC = Description of the filterDrive program, e.g.: "33-ID filters"
+#   KEV  = Name of PV channel giving beam energy in keV.
+##############################################################################
+
+
+# The global busy record
+record(busy, "$(P)$(R)Status") {
+  field(DESC, "$(DESC) status")
+  field(ZNAM, "Done")
+  field(ONAM, "Busy")
+  field(ZSV,  "NO_ALARM")
+  field(OSV,  "MINOR")
+  field(VAL,  "0")
+}
+
+# Set the busy record
+record(bo,"$(P)$(R)SetBusy") {
+  field(DESC, "$(DESC) set status")
+  field(OUT,  "$(P)$(R)Status PP MS")
+  field(ZNAM, "Done")
+  field(ONAM, "Set")
+  field(VAL,  "1")
+}
+
+# The description
+record(stringin, "$(P)$(R)Description"){
+  field(DESC, "$(DESC) description")
+  field(VAL,  "$(DESC)")
+}
+
+# The transmission setpoint
+record(ao, "$(P)$(R)TransmissionSetpoint"){
+  field(DESC, "$(DESC) transm setpoint")
+  field(VAL,  "0.0")
+  field(DRVH, "1.0")
+  field(DRVL, "0.0")
+  field(FLNK, "$(P)$(R)SetBusy")
+  field(PREC, "5")
+  field(MDEL, "-1")
+}
+
+# The filter mask setpoint
+record(ao, "$(P)$(R)FilterMaskSetpoint"){
+  field(DESC, "$(DESC) mask setpoint")
+  field(VAL,  "0.0")
+  field(FLNK, "$(P)$(R)SetBusy")
+  field(PREC, "0")
+  field(MDEL, "-1")
+}
+
+# A step up in transmission
+record(bo, "$(P)$(R)TransmissionStepUp"){
+  field(DESC, "$(DESC) transm step up")
+  field(VAL,  "0")
+  field(ZNAM, "Done")
+  field(ONAM, "Step up")
+  field(FLNK, "$(P)$(R)SetBusy.PROC")
+}
+
+# A step down in transmission
+record(bo, "$(P)$(R)TransmissionStepDown"){
+  field(DESC, "$(DESC) transm step down")
+  field(VAL,  "0")
+  field(ZNAM, "Done")
+  field(ONAM, "Step down")
+  field(FLNK, "$(P)$(R)SetBusy.PROC")
+}
+
+# Select the source field for the energy
+record(bo, "$(P)$(R)EnergySelect") {
+  field(DESC, "$(DESC) energy selection")
+  field(DTYP, "Soft Channel")
+  field(ZNAM, "Mono")
+  field(ONAM, "Local")
+  field(FLNK, "$(P)$(R)Energy")
+}
+
+# The local energy
+record(ao, "$(P)$(R)EnergyLocal") {
+  field(PINI,"YES")
+  field(DESC, "$(DESC) local energy")
+  field(VAL,  "12.398")
+  field(PREC, "4")
+  field(FLNK, "$(P)$(R)Energy")
+}
+
+# The beamline energy
+record(ao, "$(P)$(R)EnergyBeamline") {
+  field(DESC, "$(DESC) beamline energy")
+  field(DOL,  "$(KEV) CP")
+  field(OMSL, "closed_loop")
+  field(PREC, "4")
+  field(FLNK, "$(P)$(R)Energy")
+}
+
+# Calculate the energy to be used
+record(calc, "$(P)$(R)Energy"){
+  field(DESC, "$(DESC) energy")
+  field(SCAN, "Passive")
+  field(INPA, "$(P)$(R)EnergySelect.RVAL")
+  field(INPB, "$(P)$(R)EnergyBeamline")
+  field(INPC, "$(P)$(R)EnergyLocal")
+  field(CALC, "(A==0)?B:C")
+  field(PREC, "4")
+  field(SCAN, "9")
+}
+
+# Change transmission by a factor
+record(ao, "$(P)$(R)TransmissionFactor"){
+  field(DESC, "$(DESC) transm change factor")
+  field(VAL,  "1.0")
+  field(FLNK, "$(P)$(R)TransmissionTimesFactor")
+  field(PREC, "5")
+}
+
+# Calculate new transmission based on multiplicative factor
+record(calcout, "$(P)$(R)TransmissionTimesFactor"){
+  field(DESC, "$(DESC) multiply transm")
+  field(SCAN, "Passive")
+  field(INPA, "$(P)$(R)Transmission")
+  field(INPB, "$(P)$(R)TransmissionFactor")
+  field(CALC, "A*B")
+  field(OUT,  "$(P)$(R)TransmissionSetpoint PP")
+}
+
+record(stringin, "$(P)$(R)Message"){
+  field(DESC, "$(DESC) message")
+  field(VAL,  "")
+}
+
+# The wait time for filter actuators
+record(ao, "$(P)$(R)WaitTime"){
+  field(DESC, "$(DESC) wait time")
+  field(VAL,  "0.5")
+  field(PREC, "4")
+}
+
+# Debug level
+record(ao,"$(P)$(R)Debug"){
+  field(DESC, "$(DESC) debug level")
+  field(VAL,"0")
+}
+
+# The overall transmission value of all active filters
+record(ai, "$(P)$(R)Transmission"){
+  field(DESC, "$(DESC) transm value")
+  field(VAL,  "1.0")
+  field(PREC, "4")
+}
+
+# The current filter mask
+record(ai, "$(P)$(R)FilterMask"){
+  field(DESC, "$(DESC) filter mask")
+  field(VAL,  "0")
+}
+
+# The overall transmission of the next step up
+record(ai, "$(P)$(R)TransmissionUp"){
+  field(DESC, "$(DESC) transm value up")
+  field(VAL,  "1.0")
+  field(PREC, "4")
+}
+
+# The overall transmission of the next step down
+record(ai, "$(P)$(R)TransmissionDown"){
+  field(DESC, "$(DESC) transm value down")
+  field(VAL,  "1.0")
+  field(PREC, "4")
+}
+
+# The total number of filters
+record(ai, "$(P)$(R)NumFilters"){
+  field(DESC, "$(DESC) number of filters")
+  field(VAL,  "0")
+  field(PREC, "0")
+}

@@ -107,9 +107,10 @@ impl BeamlineHolder {
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Set macro paths so st.cmd can resolve $(MINI_BEAMLINE)/db/... and $(ADCORE)/ioc/...
+    // Set macro paths so st.cmd can resolve $(MINI_BEAMLINE)/db/..., $(ADCORE)/ioc/..., $(OPTICS)/db/...
     epics_base_rs::runtime::env::set_default("MINI_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
     epics_base_rs::runtime::env::set_default("ADCORE", concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/ad-core-rs"));
+    epics_base_rs::runtime::env::set_default("OPTICS", optics_rs::OPTICS_DB_DIR.trim_end_matches("/db"));
 
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
@@ -343,6 +344,50 @@ async fn main() -> CaResult<()> {
     let motor_holder = SimMotorHolder::new();
     app = app.register_startup_command(motor_holder.sim_motor_create_command());
     app = app.register_dynamic_device_support(motor_holder.device_support_factory());
+
+    // ========================================================================
+    // Optics serial device drivers (SimHsc slit, SimQxbpm beam position monitor)
+    //
+    // Called from st.cmd as:
+    //   simHscCreate("HSC1", 100)
+    //   simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
+    // ========================================================================
+
+    let hsc_holder = optics_rs::drivers::hsc::HscHolder::new();
+    app = app.register_startup_command(hsc_holder.sim_hsc_create_command());
+
+    let qxbpm_holder = optics_rs::drivers::qxbpm::QxbpmHolder::new();
+    app = app.register_startup_command(qxbpm_holder.sim_qxbpm_create_command());
+
+    // ========================================================================
+    // Optics SNL program launcher (replaces C EPICS `seq &program, "macros"`)
+    //
+    // Called from st.cmd as:
+    //   seqStart("kohzuCtl", "P=mini:,M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z")
+    //   seqStart("hrCtl", "P=mini:,N=1,M_PHI1=hr:phi1,M_PHI2=hr:phi2")
+    //   seqStart("orient", "P=mini:,PM=mini:,mTTH=tth,mTH=th,mCHI=chi,mPHI=phi")
+    // ========================================================================
+
+    app = app.register_startup_command(CommandDef::new(
+        "seqStart",
+        vec![
+            ArgDesc { name: "program", arg_type: ArgType::String, optional: false },
+            ArgDesc { name: "macros", arg_type: ArgType::String, optional: false },
+        ],
+        "seqStart program macros - Start an optics SNL program",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let program = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => return Err("expected program name".into()),
+            };
+            let macros = match &args[1] {
+                ArgValue::String(s) => s.clone(),
+                _ => return Err("expected macros string".into()),
+            };
+            optics_rs::seq_runner::seq_start(&program, &macros, ctx.runtime_handle(), ctx.db())?;
+            Ok(CommandOutcome::Continue)
+        },
+    ));
 
     // ========================================================================
     // Shell commands (available after iocInit in the interactive REPL)

@@ -1,6 +1,6 @@
 #![allow(clippy::approx_constant, clippy::manual_range_contains)]
 
-use epics_base_rs::calc::{acalc, ArrayInputs, ArrayStackValue};
+use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, acalc};
 
 fn eval_arr_with(expr: &str, inputs: &mut ArrayInputs) -> ArrayStackValue {
     acalc(expr, inputs).unwrap()
@@ -102,7 +102,10 @@ fn test_cat_arrays() {
     inputs.arrays[0] = vec![1.0, 2.0, 3.0];
     inputs.arrays[1] = vec![4.0, 5.0, 6.0];
     let result = eval_arr_with("CAT(AA, BB)", &mut inputs);
-    assert_eq!(result, ArrayStackValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+    assert_eq!(
+        result,
+        ArrayStackValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    );
 }
 
 #[test]

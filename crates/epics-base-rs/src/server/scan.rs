@@ -32,7 +32,10 @@ impl ScanScheduler {
         let pini_records = self.db.pini_records().await;
         for name in &pini_records {
             let mut visited = HashSet::new();
-            let _ = self.db.process_record_with_links(name, &mut visited, 0).await;
+            let _ = self
+                .db
+                .process_record_with_links(name, &mut visited, 0)
+                .await;
         }
 
         // Spawn a task for each periodic scan rate

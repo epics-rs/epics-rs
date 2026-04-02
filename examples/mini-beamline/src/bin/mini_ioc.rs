@@ -18,34 +18,43 @@ use std::sync::Arc;
 
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
-use epics_ca_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::iocsh::registry::*;
+use epics_ca_rs::server::ioc_app::IocApplication;
 
 use ad_core_rs::ioc::{PluginManager, register_noop_commands};
 use ad_core_rs::plugin::channel::NDArrayOutput;
 
 use motor_rs::ioc::SimMotorHolder;
 
-use mini_beamline::beam_current::{self, BeamCurrentValue};
 use mini_beamline::beam_current::ioc_support::BeamCurrentDeviceSupport;
-use mini_beamline::physics::{DetectorMode, BeamCurrentConfig, MovingDotImageConfig};
-use mini_beamline::point_detector::{self, PointDetectorRuntime};
+use mini_beamline::beam_current::{self, BeamCurrentValue};
 use mini_beamline::moving_dot::driver::{MovingDotRuntime, create_moving_dot_with_config};
+use mini_beamline::physics::{BeamCurrentConfig, DetectorMode, MovingDotImageConfig};
+use mini_beamline::point_detector::{self, PointDetectorRuntime};
 
 // ============================================================================
 // Environment helpers
 // ============================================================================
 
 fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_i32(name: &str, default: i32) -> i32 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 // ============================================================================
@@ -100,8 +109,14 @@ async fn main() -> CaResult<()> {
 
     // Set macro paths so st.cmd can resolve $(MINI_BEAMLINE)/db/..., $(ADCORE)/ioc/..., $(OPTICS)/db/...
     epics_base_rs::runtime::env::set_default("MINI_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
-    epics_base_rs::runtime::env::set_default("ADCORE", concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/ad-core-rs"));
-    epics_base_rs::runtime::env::set_default("OPTICS", optics_rs::OPTICS_DB_DIR.trim_end_matches("/db"));
+    epics_base_rs::runtime::env::set_default(
+        "ADCORE",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/ad-core-rs"),
+    );
+    epics_base_rs::runtime::env::set_default(
+        "OPTICS",
+        optics_rs::OPTICS_DB_DIR.trim_end_matches("/db"),
+    );
 
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
@@ -116,7 +131,7 @@ async fn main() -> CaResult<()> {
 
     // Enable autosave startup commands (set_savefile_path, create_monitor_set, etc.)
     let autosave_config = Arc::new(std::sync::Mutex::new(
-        epics_base_rs::server::autosave::startup::AutosaveStartupConfig::new()
+        epics_base_rs::server::autosave::startup::AutosaveStartupConfig::new(),
     ));
 
     // Register record types via injection (not global registry)
@@ -163,11 +178,15 @@ async fn main() -> CaResult<()> {
                     period: env_f64("BEAM_PERIOD", 4.0),
                 };
                 let beam_interval = env_u64("BEAM_UPDATE_MS", 100);
-                println!("  Beam config: offset={}, amp={}, period={}s, interval={}ms",
-                    beam_config.offset, beam_config.amplitude, beam_config.period, beam_interval);
+                println!(
+                    "  Beam config: offset={}, amp={}, period={}s, interval={}ms",
+                    beam_config.offset, beam_config.amplitude, beam_config.period, beam_interval
+                );
 
                 let (_beam_jh, beam_rx) = beam_current::start_beam_current_thread(
-                    h.beam_value.clone(), beam_config, beam_interval,
+                    h.beam_value.clone(),
+                    beam_config,
+                    beam_interval,
                 );
                 *h.beam_rx.lock().unwrap() = Some(beam_rx);
                 println!("  Beam current thread started");
@@ -197,15 +216,26 @@ async fn main() -> CaResult<()> {
                     background: env_f64("DOT_BACKGROUND", 1000.0),
                     n_per_i_per_s: env_f64("DOT_N_PER_I_PER_S", 200.0),
                 };
-                println!("  MovingDot config: {}x{}, sigma=({},{}), bg={}, N/I/s={}",
-                    dot_size_x, dot_size_y,
-                    dot_image_config.sigma_x, dot_image_config.sigma_y,
-                    dot_image_config.background, dot_image_config.n_per_i_per_s);
+                println!(
+                    "  MovingDot config: {}x{}, sigma=({},{}), bg={}, N/I/s={}",
+                    dot_size_x,
+                    dot_size_y,
+                    dot_image_config.sigma_x,
+                    dot_image_config.sigma_y,
+                    dot_image_config.background,
+                    dot_image_config.n_per_i_per_s
+                );
 
                 let dot_output = NDArrayOutput::new();
                 let dot_rt = create_moving_dot_with_config(
-                    "DOT", dot_size_x, dot_size_y, dot_max_mem, dot_output, dot_image_config,
-                ).map_err(|e| format!("failed to create MovingDot: {e}"))?;
+                    "DOT",
+                    dot_size_x,
+                    dot_size_y,
+                    dot_max_mem,
+                    dot_output,
+                    dot_image_config,
+                )
+                .map_err(|e| format!("failed to create MovingDot: {e}"))?;
                 let dot_handle = dot_rt.port_handle().clone();
                 asyn_rs::asyn_record::register_port("DOT", dot_handle, h.trace.clone());
 
@@ -267,7 +297,11 @@ async fn main() -> CaResult<()> {
     {
         let h = holder.clone();
         app = app.register_device_support("miniBeamCurrent", move || {
-            let rx = h.beam_rx.lock().unwrap().take()
+            let rx = h
+                .beam_rx
+                .lock()
+                .unwrap()
+                .take()
                 .expect("miniBeamlineConfig must be called before iocInit");
             Box::new(BeamCurrentDeviceSupport::new(h.beam_value.clone(), rx))
         });
@@ -324,8 +358,16 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(CommandDef::new(
         "seqStart",
         vec![
-            ArgDesc { name: "program", arg_type: ArgType::String, optional: false },
-            ArgDesc { name: "macros", arg_type: ArgType::String, optional: false },
+            ArgDesc {
+                name: "program",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "macros",
+                arg_type: ArgType::String,
+                optional: false,
+            },
         ],
         "seqStart program macros - Start an optics SNL program",
         move |args: &[ArgValue], ctx: &CommandContext| {
@@ -350,7 +392,11 @@ async fn main() -> CaResult<()> {
         let mgr_r = mgr.clone();
         app = app.register_shell_command(CommandDef::new(
             "miniBeamlineReport",
-            vec![ArgDesc { name: "level", arg_type: ArgType::Int, optional: true }],
+            vec![ArgDesc {
+                name: "level",
+                arg_type: ArgType::Int,
+                optional: true,
+            }],
             "miniBeamlineReport [level] - Report beamline status",
             move |_args: &[ArgValue], _ctx: &CommandContext| {
                 println!("Mini Beamline Report");

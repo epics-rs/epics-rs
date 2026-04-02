@@ -78,7 +78,11 @@ impl PortDriver for MovingDotDetector {
         let acquire_idx = self.ad.params.acquire;
 
         if reason == acquire_idx {
-            let acquiring = self.ad.port_base.get_int32_param(acquire_idx, 0).unwrap_or(0);
+            let acquiring = self
+                .ad
+                .port_base
+                .get_int32_param(acquire_idx, 0)
+                .unwrap_or(0);
             if value != 0 && acquiring == 0 {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 let _ = self.acq_tx.send(AcqCommand::Start);
@@ -89,7 +93,10 @@ impl PortDriver for MovingDotDetector {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
             }
         } else {
-            self.ad.port_base.params.set_int32(reason, user.addr, value)?;
+            self.ad
+                .port_base
+                .params
+                .set_int32(reason, user.addr, value)?;
             if reason == self.dot_params.shutter_open {
                 self.dirty.lock().set();
             }
@@ -103,7 +110,10 @@ impl PortDriver for MovingDotDetector {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad.port_base.params.set_float64(reason, user.addr, value)?;
+        self.ad
+            .port_base
+            .params
+            .set_float64(reason, user.addr, value)?;
 
         let is_cp_linked = reason == self.dot_params.motor_x_pos
             || reason == self.dot_params.motor_y_pos
@@ -173,7 +183,14 @@ pub fn create_moving_dot(
     max_memory: usize,
     array_output: NDArrayOutput,
 ) -> AsynResult<MovingDotRuntime> {
-    create_moving_dot_with_config(port_name, size_x, size_y, max_memory, array_output, MovingDotImageConfig::default())
+    create_moving_dot_with_config(
+        port_name,
+        size_x,
+        size_y,
+        max_memory,
+        array_output,
+        MovingDotImageConfig::default(),
+    )
 }
 
 /// Create a MovingDot detector with custom image generation config.
@@ -231,8 +248,18 @@ mod tests {
     fn test_create_moving_dot() {
         let rt = create_moving_dot("DOT_TEST", 640, 480, 10_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
-        assert_eq!(handle.read_int32_blocking(rt.ad_params.max_size_x, 0).unwrap(), 640);
-        assert_eq!(handle.read_int32_blocking(rt.ad_params.max_size_y, 0).unwrap(), 480);
+        assert_eq!(
+            handle
+                .read_int32_blocking(rt.ad_params.max_size_x, 0)
+                .unwrap(),
+            640
+        );
+        assert_eq!(
+            handle
+                .read_int32_blocking(rt.ad_params.max_size_y, 0)
+                .unwrap(),
+            480
+        );
     }
 
     #[test]
@@ -240,16 +267,26 @@ mod tests {
         let rt = create_moving_dot("DOT_SINGLE", 64, 48, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
 
-        handle.write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Single as i32).unwrap();
-        handle.write_float64_blocking(rt.ad_params.acquire_time, 0, 0.001).unwrap();
-        handle.write_float64_blocking(rt.ad_params.acquire_period, 0, 0.001).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Single as i32)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_time, 0, 0.001)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_period, 0, 0.001)
+            .unwrap();
 
-        handle.write_int32_blocking(rt.ad_params.acquire, 0, 1).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.acquire, 0, 1)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let acquire = handle.read_int32_blocking(rt.ad_params.acquire, 0).unwrap();
         assert_eq!(acquire, 0, "acquire should be 0 after Single mode");
-        let counter = handle.read_int32_blocking(rt.ad_params.base.array_counter, 0).unwrap();
+        let counter = handle
+            .read_int32_blocking(rt.ad_params.base.array_counter, 0)
+            .unwrap();
         assert!(counter >= 1, "should have produced at least 1 frame");
     }
 }

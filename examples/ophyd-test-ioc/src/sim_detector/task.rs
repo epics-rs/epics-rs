@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use asyn_rs::port_handle::PortHandle;
 
@@ -42,8 +42,12 @@ impl AcquisitionContext {
         if wait_for_plugins {
             self.queued_counter.wait_until_zero(Duration::from_secs(5));
         }
-        let _ = self.port_handle.write_int32_blocking(self.ad.acquire_busy, 0, 0);
-        let _ = self.port_handle.write_int32_blocking(self.ad.status, 0, ADStatus::Idle as i32);
+        let _ = self
+            .port_handle
+            .write_int32_blocking(self.ad.acquire_busy, 0, 0);
+        let _ = self
+            .port_handle
+            .write_int32_blocking(self.ad.status, 0, ADStatus::Idle as i32);
         let _ = self.port_handle.write_int32_blocking(self.ad.acquire, 0, 0);
         let _ = self.port_handle.call_param_callbacks_blocking(0);
     }
@@ -96,18 +100,28 @@ fn acquisition_loop(ctx: AcquisitionContext) {
         }
 
         // Initialize counters
-        let _ = ctx.port_handle.write_int32_blocking(ctx.ad.num_images_counter, 0, 0);
-        let _ = ctx.port_handle.write_int32_blocking(ctx.ad.status, 0, ADStatus::Acquire as i32);
-        let _ = ctx.port_handle.write_int32_blocking(ctx.ad.acquire_busy, 0, 1);
+        let _ = ctx
+            .port_handle
+            .write_int32_blocking(ctx.ad.num_images_counter, 0, 0);
+        let _ = ctx
+            .port_handle
+            .write_int32_blocking(ctx.ad.status, 0, ADStatus::Acquire as i32);
+        let _ = ctx
+            .port_handle
+            .write_int32_blocking(ctx.ad.acquire_busy, 0, 1);
 
         let mut num_counter = 0;
-        let mut array_counter = ctx.port_handle.read_int32_blocking(ctx.ad.base.array_counter, 0).unwrap_or(0);
+        let mut array_counter = ctx
+            .port_handle
+            .read_int32_blocking(ctx.ad.base.array_counter, 0)
+            .unwrap_or(0);
 
         // Read initial config
-        let mut config = match MovingDotConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.dot) {
-            Ok(cfg) => cfg,
-            Err(_) => continue,
-        };
+        let mut config =
+            match MovingDotConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.dot) {
+                Ok(cfg) => cfg,
+                Err(_) => continue,
+            };
 
         loop {
             let start_time = Instant::now();
@@ -117,7 +131,11 @@ fn acquisition_loop(ctx: AcquisitionContext) {
             let reset = dirty_flags.any;
 
             if reset {
-                config = match MovingDotConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.dot) {
+                config = match MovingDotConfigSnapshot::read_via_handle(
+                    &ctx.port_handle,
+                    &ctx.ad,
+                    &ctx.dot,
+                ) {
                     Ok(cfg) => cfg,
                     Err(_) => break,
                 };
@@ -139,10 +157,7 @@ fn acquisition_loop(ctx: AcquisitionContext) {
             );
 
             // Build NDArray from f64 data
-            let dims = vec![
-                NDDimension::new(height),
-                NDDimension::new(width),
-            ];
+            let dims = vec![NDDimension::new(height), NDDimension::new(width)];
             let mut frame = NDArray {
                 unique_id: 0,
                 timestamp: ad_core_rs::timestamp::EpicsTimestamp::default(),
@@ -167,11 +182,25 @@ fn acquisition_loop(ctx: AcquisitionContext) {
             frame.unique_id = array_counter;
             frame.timestamp = ad_core_rs::timestamp::EpicsTimestamp::now();
 
-            ctx.port_handle.write_int32_no_wait(ctx.ad.base.array_counter, 0, array_counter);
-            ctx.port_handle.write_int32_no_wait(ctx.ad.num_images_counter, 0, num_counter);
-            ctx.port_handle.write_float64_no_wait(ctx.ad.base.timestamp_rbv, 0, frame.timestamp.as_f64());
-            ctx.port_handle.write_int32_no_wait(ctx.ad.base.epics_ts_sec, 0, frame.timestamp.sec as i32);
-            ctx.port_handle.write_int32_no_wait(ctx.ad.base.epics_ts_nsec, 0, frame.timestamp.nsec as i32);
+            ctx.port_handle
+                .write_int32_no_wait(ctx.ad.base.array_counter, 0, array_counter);
+            ctx.port_handle
+                .write_int32_no_wait(ctx.ad.num_images_counter, 0, num_counter);
+            ctx.port_handle.write_float64_no_wait(
+                ctx.ad.base.timestamp_rbv,
+                0,
+                frame.timestamp.as_f64(),
+            );
+            ctx.port_handle.write_int32_no_wait(
+                ctx.ad.base.epics_ts_sec,
+                0,
+                frame.timestamp.sec as i32,
+            );
+            ctx.port_handle.write_int32_no_wait(
+                ctx.ad.base.epics_ts_nsec,
+                0,
+                frame.timestamp.nsec as i32,
+            );
             let _ = ctx.port_handle.call_param_callbacks_blocking(0);
 
             if config.array_callbacks {

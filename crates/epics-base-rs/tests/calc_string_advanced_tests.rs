@@ -1,6 +1,6 @@
 #![allow(clippy::approx_constant)]
 
-use epics_base_rs::calc::{scalc, CalcError, StackValue, StringInputs};
+use epics_base_rs::calc::{CalcError, StackValue, StringInputs, scalc};
 
 fn eval_str(expr: &str) -> StackValue {
     let mut inputs = StringInputs::new();

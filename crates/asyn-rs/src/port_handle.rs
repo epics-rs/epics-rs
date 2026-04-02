@@ -56,12 +56,19 @@ impl std::future::Future for AsyncCompletionHandle {
 ///
 /// All methods construct the appropriate [`RequestOp`], send it to the actor,
 /// and return a completion handle.
+/// Shared driver handle for direct (non-actor) I/O on `can_block=false` ports.
+/// Matches C EPICS's lockPort pattern: lock mutex, call method, unlock.
+pub(crate) type SharedDriver = Arc<parking_lot::Mutex<Box<dyn crate::port::PortDriver>>>;
+
 #[derive(Clone)]
 pub struct PortHandle {
     tx: mpsc::Sender<ActorMessage>,
     port_name: String,
     interrupts: Arc<InterruptManager>,
-    can_block: bool,
+    /// For `can_block=false` ports: direct access to the driver (bypasses actor channel).
+    direct_driver: Option<SharedDriver>,
+    /// Set when shutdown is called; direct_driver operations check this.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PortHandle {
@@ -74,18 +81,25 @@ impl PortHandle {
             tx,
             port_name,
             interrupts,
-            can_block: false,
+            direct_driver: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// Set whether this port can perform blocking I/O.
-    pub fn set_can_block(&mut self, can_block: bool) {
-        self.can_block = can_block;
+    /// Set the shared driver for direct I/O (`can_block=false` ports).
+    pub(crate) fn set_direct_driver(&mut self, driver: SharedDriver) {
+        self.direct_driver = Some(driver);
+    }
+
+    /// Mark this port as shut down (direct_driver operations will fail).
+    pub fn mark_shutdown(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether this port can perform blocking I/O.
     pub fn can_block(&self) -> bool {
-        self.can_block
+        self.direct_driver.is_none()
     }
 
     /// Port name this handle is connected to.
@@ -99,11 +113,15 @@ impl PortHandle {
     }
 
     /// Submit a request and return an async completion handle (non-blocking submission).
-    pub fn try_submit(
-        &self,
-        op: RequestOp,
-        user: AsynUser,
-    ) -> AsynResult<AsyncCompletionHandle> {
+    pub fn try_submit(&self, op: RequestOp, user: AsynUser) -> AsynResult<AsyncCompletionHandle> {
+        // For can_block=false: execute directly, return pre-completed handle
+        if self.direct_driver.is_some() {
+            let mut user = user;
+            let result = self.dispatch_direct(&mut user, &op);
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let _ = reply_tx.send(result);
+            return Ok(AsyncCompletionHandle { rx: reply_rx });
+        }
         let cancel = CancelToken::new();
         self.try_submit_cancellable(op, user, cancel)
     }
@@ -134,18 +152,25 @@ impl PortHandle {
     ///
     /// Works both from plain threads and from within a tokio runtime context
     /// (uses `block_in_place` when called from an async context).
-    pub fn submit_blocking(
-        &self,
-        op: RequestOp,
-        user: AsynUser,
-    ) -> AsynResult<RequestResult> {
+    pub fn submit_blocking(&self, op: RequestOp, mut user: AsynUser) -> AsynResult<RequestResult> {
+        // For can_block=false ports: lock driver mutex and call directly.
+        // No channel send, no context switch — matches C EPICS lockPort.
+        if self.direct_driver.is_some() {
+            if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("port {} is shut down", self.port_name),
+                });
+            }
+            return self.dispatch_direct(&mut user, &op);
+        }
+
+        // can_block=true: go through actor channel
         if tokio::runtime::Handle::try_current().is_ok() {
-            // Inside a tokio runtime — use block_in_place to avoid panicking
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(self.submit(op, user))
             })
         } else {
-            // Plain thread — use blocking_send/blocking_recv directly
             let (reply_tx, reply_rx) = oneshot::channel();
             let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
             self.tx.blocking_send(msg).map_err(|_| AsynError::Status {
@@ -161,6 +186,11 @@ impl PortHandle {
 
     /// Submit a request and await completion (for async callers).
     pub async fn submit(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
+        // For can_block=false: execute directly (no channel round-trip)
+        if self.direct_driver.is_some() {
+            let mut user = user;
+            return self.dispatch_direct(&mut user, &op);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
         self.tx.send(msg).await.map_err(|_| AsynError::Status {
@@ -220,7 +250,12 @@ impl PortHandle {
         Ok(())
     }
 
-    pub async fn read_octet(&self, reason: usize, addr: i32, buf_size: usize) -> AsynResult<Vec<u8>> {
+    pub async fn read_octet(
+        &self,
+        reason: usize,
+        addr: i32,
+        buf_size: usize,
+    ) -> AsynResult<Vec<u8>> {
         let user = AsynUser::new(reason).with_addr(addr);
         let result = self.submit(RequestOp::OctetRead { buf_size }, user).await?;
         result.data.ok_or_else(|| AsynError::Status {
@@ -235,9 +270,16 @@ impl PortHandle {
         Ok(())
     }
 
-    pub async fn read_uint32_digital(&self, reason: usize, addr: i32, mask: u32) -> AsynResult<u32> {
+    pub async fn read_uint32_digital(
+        &self,
+        reason: usize,
+        addr: i32,
+        mask: u32,
+    ) -> AsynResult<u32> {
         let user = AsynUser::new(reason).with_addr(addr);
-        let result = self.submit(RequestOp::UInt32DigitalRead { mask }, user).await?;
+        let result = self
+            .submit(RequestOp::UInt32DigitalRead { mask }, user)
+            .await?;
         result.uint_val.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: "uint32 read returned no value".into(),
@@ -317,7 +359,8 @@ impl PortHandle {
         data: Vec<i32>,
     ) -> AsynResult<()> {
         let user = AsynUser::new(reason).with_addr(addr);
-        self.submit(RequestOp::Int32ArrayWrite { data }, user).await?;
+        self.submit(RequestOp::Int32ArrayWrite { data }, user)
+            .await?;
         Ok(())
     }
 
@@ -344,14 +387,16 @@ impl PortHandle {
         data: Vec<f64>,
     ) -> AsynResult<()> {
         let user = AsynUser::new(reason).with_addr(addr);
-        self.submit(RequestOp::Float64ArrayWrite { data }, user).await?;
+        self.submit(RequestOp::Float64ArrayWrite { data }, user)
+            .await?;
         Ok(())
     }
 
     /// Flush changed parameters as interrupt notifications (async).
     pub async fn call_param_callbacks(&self, addr: i32) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);
-        self.submit(RequestOp::CallParamCallbacks { addr }, user).await?;
+        self.submit(RequestOp::CallParamCallbacks { addr }, user)
+            .await?;
         Ok(())
     }
 
@@ -422,6 +467,14 @@ impl PortHandle {
     /// The actor still processes it in FIFO order, so a subsequent blocking
     /// call (e.g. call_param_callbacks_blocking) guarantees prior writes are done.
     pub fn submit_no_wait(&self, op: RequestOp, user: AsynUser) {
+        if self.direct_driver.is_some() {
+            if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let mut user = user;
+            let _ = self.dispatch_direct(&mut user, &op);
+            return;
+        }
         let (reply_tx, _reply_rx) = oneshot::channel();
         let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
         let _ = self.tx.try_send(msg);
@@ -437,13 +490,14 @@ impl PortHandle {
         self.submit_no_wait(RequestOp::Float64Write { value }, user);
     }
 
-
     // --- Option convenience methods ---
 
     pub fn get_option_blocking(&self, key: &str) -> AsynResult<String> {
         let user = AsynUser::default();
         let result = self.submit_blocking(
-            RequestOp::GetOption { key: key.to_string() },
+            RequestOp::GetOption {
+                key: key.to_string(),
+            },
             user,
         )?;
         result.option_value.ok_or_else(|| AsynError::Status {
@@ -455,7 +509,10 @@ impl PortHandle {
     pub fn set_option_blocking(&self, key: &str, value: &str) -> AsynResult<()> {
         let user = AsynUser::default();
         self.submit_blocking(
-            RequestOp::SetOption { key: key.to_string(), value: value.to_string() },
+            RequestOp::SetOption {
+                key: key.to_string(),
+                value: value.to_string(),
+            },
             user,
         )?;
         Ok(())
@@ -463,10 +520,14 @@ impl PortHandle {
 
     pub async fn get_option(&self, key: &str) -> AsynResult<String> {
         let user = AsynUser::default();
-        let result = self.submit(
-            RequestOp::GetOption { key: key.to_string() },
-            user,
-        ).await?;
+        let result = self
+            .submit(
+                RequestOp::GetOption {
+                    key: key.to_string(),
+                },
+                user,
+            )
+            .await?;
         result.option_value.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: "get_option returned no value".into(),
@@ -476,10 +537,24 @@ impl PortHandle {
     pub async fn set_option(&self, key: &str, value: &str) -> AsynResult<()> {
         let user = AsynUser::default();
         self.submit(
-            RequestOp::SetOption { key: key.to_string(), value: value.to_string() },
+            RequestOp::SetOption {
+                key: key.to_string(),
+                value: value.to_string(),
+            },
             user,
-        ).await?;
+        )
+        .await?;
         Ok(())
+    }
+
+    fn dispatch_direct(&self, user: &mut AsynUser, op: &RequestOp) -> AsynResult<RequestResult> {
+        let driver = self
+            .direct_driver
+            .as_ref()
+            .expect("direct driver must exist");
+        let mut guard = driver.lock();
+        crate::port_actor::prepare_io(&mut **guard, op, user.addr)?;
+        crate::port_actor::dispatch_io(&mut **guard, user, op)
     }
 }
 
@@ -570,9 +645,7 @@ mod tests {
         completion.wait_blocking(Duration::from_secs(1)).unwrap();
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
-        let completion = handle
-            .try_submit(RequestOp::Int32Read, user)
-            .unwrap();
+        let completion = handle.try_submit(RequestOp::Int32Read, user).unwrap();
         let result = completion.wait_blocking(Duration::from_secs(1)).unwrap();
         assert_eq!(result.int_val, Some(55));
     }

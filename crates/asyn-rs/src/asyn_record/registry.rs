@@ -32,7 +32,9 @@ impl Default for PortRegistry {
 
 impl PortRegistry {
     pub fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn register(&self, name: &str, handle: PortHandle, trace: Arc<TraceManager>) {
@@ -80,4 +82,3 @@ pub fn register_asyn_record_type() {
 }
 
 // ===== Transfer Mode =====
-

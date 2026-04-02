@@ -1,6 +1,6 @@
 #![allow(clippy::approx_constant)]
 
-use epics_base_rs::calc::{scalc, scalc_compile, scalc_eval, CalcError, StackValue, StringInputs};
+use epics_base_rs::calc::{CalcError, StackValue, StringInputs, scalc, scalc_compile, scalc_eval};
 
 fn eval_str(expr: &str) -> StackValue {
     let mut inputs = StringInputs::new();
@@ -81,10 +81,7 @@ fn test_string_concat() {
 
 #[test]
 fn test_string_concat_empty() {
-    assert_eq!(
-        eval_str(r#""hello" + """#),
-        StackValue::Str("hello".into())
-    );
+    assert_eq!(eval_str(r#""hello" + """#), StackValue::Str("hello".into()));
 }
 
 // --- String subtract (-) ---
@@ -107,76 +104,43 @@ fn test_string_subtract_no_match() {
 
 #[test]
 fn test_string_subtract_full() {
-    assert_eq!(
-        eval_str(r#""abc" - "abc""#),
-        StackValue::Str("".into())
-    );
+    assert_eq!(eval_str(r#""abc" - "abc""#), StackValue::Str("".into()));
 }
 
 // --- String comparison ---
 
 #[test]
 fn test_string_eq() {
-    assert_eq!(
-        eval_str(r#""abc" == "abc""#),
-        StackValue::Double(1.0)
-    );
-    assert_eq!(
-        eval_str(r#""abc" == "def""#),
-        StackValue::Double(0.0)
-    );
+    assert_eq!(eval_str(r#""abc" == "abc""#), StackValue::Double(1.0));
+    assert_eq!(eval_str(r#""abc" == "def""#), StackValue::Double(0.0));
 }
 
 #[test]
 fn test_string_ne() {
-    assert_eq!(
-        eval_str(r#""abc" != "def""#),
-        StackValue::Double(1.0)
-    );
-    assert_eq!(
-        eval_str(r#""abc" != "abc""#),
-        StackValue::Double(0.0)
-    );
+    assert_eq!(eval_str(r#""abc" != "def""#), StackValue::Double(1.0));
+    assert_eq!(eval_str(r#""abc" != "abc""#), StackValue::Double(0.0));
 }
 
 #[test]
 fn test_string_lt() {
-    assert_eq!(
-        eval_str(r#""abc" < "def""#),
-        StackValue::Double(1.0)
-    );
-    assert_eq!(
-        eval_str(r#""def" < "abc""#),
-        StackValue::Double(0.0)
-    );
+    assert_eq!(eval_str(r#""abc" < "def""#), StackValue::Double(1.0));
+    assert_eq!(eval_str(r#""def" < "abc""#), StackValue::Double(0.0));
 }
 
 #[test]
 fn test_string_le() {
-    assert_eq!(
-        eval_str(r#""abc" <= "abc""#),
-        StackValue::Double(1.0)
-    );
-    assert_eq!(
-        eval_str(r#""abc" <= "def""#),
-        StackValue::Double(1.0)
-    );
+    assert_eq!(eval_str(r#""abc" <= "abc""#), StackValue::Double(1.0));
+    assert_eq!(eval_str(r#""abc" <= "def""#), StackValue::Double(1.0));
 }
 
 #[test]
 fn test_string_gt() {
-    assert_eq!(
-        eval_str(r#""def" > "abc""#),
-        StackValue::Double(1.0)
-    );
+    assert_eq!(eval_str(r#""def" > "abc""#), StackValue::Double(1.0));
 }
 
 #[test]
 fn test_string_ge() {
-    assert_eq!(
-        eval_str(r#""abc" >= "abc""#),
-        StackValue::Double(1.0)
-    );
+    assert_eq!(eval_str(r#""abc" >= "abc""#), StackValue::Double(1.0));
 }
 
 // --- TypeMismatch tests ---
@@ -206,10 +170,7 @@ fn test_type_mismatch_compare() {
 
 #[test]
 fn test_str_function() {
-    assert_eq!(
-        eval_str("STR(3.14)"),
-        StackValue::Str("3.14".into())
-    );
+    assert_eq!(eval_str("STR(3.14)"), StackValue::Str("3.14".into()));
 }
 
 #[test]

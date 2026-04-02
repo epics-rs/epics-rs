@@ -1,8 +1,8 @@
 use epics_base_rs::types::EpicsValue;
 
 use epics_base_rs::server::autosave::save_file::{
-    parse_save_value, read_save_file, validate_save_file, value_to_save_str, write_save_file,
-    SaveEntry,
+    SaveEntry, parse_save_value, read_save_file, validate_save_file, value_to_save_str,
+    write_save_file,
 };
 
 #[tokio::test]
@@ -97,18 +97,16 @@ async fn test_string_with_special_chars() {
 
     let entries = vec![SaveEntry {
         pv_name: "STR".into(),
-        value: value_to_save_str(&EpicsValue::String("test \"quoted\" with\\backslash".into())),
+        value: value_to_save_str(&EpicsValue::String(
+            "test \"quoted\" with\\backslash".into(),
+        )),
         connected: true,
     }];
 
     write_save_file(&path, &entries).await.unwrap();
     let loaded = read_save_file(&path).await.unwrap().unwrap();
 
-    let parsed = parse_save_value(
-        &loaded[0].value,
-        &EpicsValue::String(String::new()),
-    )
-    .unwrap();
+    let parsed = parse_save_value(&loaded[0].value, &EpicsValue::String(String::new())).unwrap();
     match parsed {
         EpicsValue::String(s) => assert_eq!(s, "test \"quoted\" with\\backslash"),
         _ => panic!("expected String"),

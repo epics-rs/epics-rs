@@ -1,11 +1,11 @@
-pub mod registry;
 mod commands;
+pub mod registry;
 
-use std::sync::{Arc, RwLock};
 use std::fs::File;
+use std::sync::{Arc, RwLock};
 
-use registry::*;
 use crate::server::database::PvDatabase;
+use registry::*;
 
 /// Interactive IOC shell with extensible command registration.
 pub struct IocShell {
@@ -43,7 +43,9 @@ impl IocShell {
         // Handle `< filename` include syntax
         if let Some(rest) = line.strip_prefix('<') {
             let filename = registry::substitute_env_vars(rest.trim());
-            return self.execute_script(&filename).map(|_| CommandOutcome::Continue);
+            return self
+                .execute_script(&filename)
+                .map(|_| CommandOutcome::Continue);
         }
 
         // Handle `> filename` / `>> filename` output redirection
@@ -61,14 +63,17 @@ impl IocShell {
     fn execute_command(&self, line: &str, redirect: Option<&Redirect>) -> CommandResult {
         if let Some(redir) = redirect {
             let file_result = if redir.append {
-                std::fs::OpenOptions::new().create(true).append(true).open(&redir.path)
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&redir.path)
             } else {
                 File::create(&redir.path)
             };
             match file_result {
-                Ok(file) => {
-                    self.ctx.with_output(file, || self.execute_command_inner(line))
-                }
+                Ok(file) => self
+                    .ctx
+                    .with_output(file, || self.execute_command_inner(line)),
                 Err(e) => {
                     eprintln!("cannot open '{}': {}", redir.path, e);
                     Ok(CommandOutcome::Continue)
@@ -105,8 +110,8 @@ impl IocShell {
 
     /// Execute a script file line by line, echoing each line like C++ iocsh.
     pub fn execute_script(&self, path: &str) -> Result<(), String> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read '{}': {}", path, e))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
 
         for (line_num, line) in content.lines().enumerate() {
             // Echo each line (C++ iocsh behavior)
@@ -206,10 +211,13 @@ fn parse_redirect(line: &str) -> (&str, Option<Redirect>) {
             if path.is_empty() {
                 (line, None)
             } else {
-                (cmd, Some(Redirect {
-                    path: registry::substitute_env_vars(path),
-                    append: is_append,
-                }))
+                (
+                    cmd,
+                    Some(Redirect {
+                        path: registry::substitute_env_vars(path),
+                        append: is_append,
+                    }),
+                )
             }
         }
         None => (line, None),
@@ -226,7 +234,8 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let handle = rt.handle().clone();
         rt.block_on(async {
-            db.add_record("TEST_REC", Box::new(AiRecord::new(42.0))).await;
+            db.add_record("TEST_REC", Box::new(AiRecord::new(42.0)))
+                .await;
         });
         std::mem::forget(rt);
         IocShell::new(db, handle)
@@ -311,7 +320,10 @@ mod tests {
         let result = shell.execute_line(&line);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
         let content = std::fs::read_to_string(&tmp).unwrap();
-        assert!(content.contains("TEST_REC"), "dbl output should contain TEST_REC, got: {content}");
+        assert!(
+            content.contains("TEST_REC"),
+            "dbl output should contain TEST_REC, got: {content}"
+        );
         std::fs::remove_file(&tmp).ok();
     }
 

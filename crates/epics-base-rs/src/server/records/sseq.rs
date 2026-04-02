@@ -7,12 +7,12 @@ const NUM_STEPS: usize = 10;
 /// A single step in the string sequence.
 #[derive(Clone, Default)]
 struct SseqStep {
-    dly: f64,       // Delay before executing this step
-    dol: String,    // Input link (DOLn)
-    dov: f64,       // Numeric value (DOn)
-    lnk: String,    // Output link (LNKn)
+    dly: f64,        // Delay before executing this step
+    dol: String,     // Input link (DOLn)
+    dov: f64,        // Numeric value (DOn)
+    lnk: String,     // Output link (LNKn)
     str_val: String, // String value (STRn)
-    wait: i16,      // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
+    wait: i16,       // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
 }
 
 /// Sseq record — string sequence record.
@@ -22,7 +22,7 @@ struct SseqStep {
 /// by SELM (All, Specified, Mask) with SELN as the selection value.
 pub struct SseqRecord {
     pub val: i32,
-    pub selm: i16,  // 0=All, 1=Specified, 2=Mask
+    pub selm: i16, // 0=All, 1=Specified, 2=Mask
     pub seln: u16,
     pub sell: String,
     pub prec: i16,
@@ -89,75 +89,343 @@ impl SseqRecord {
 }
 
 static SSEQ_FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "SELM", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SELN", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SELL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "PREC", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "ABORT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "BUSY", dbf_type: DbFieldType::Short, read_only: true },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SELM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SELN",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SELL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ABORT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BUSY",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
     // Steps 1-9
-    FieldDesc { name: "DLY1", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOL1", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DO1", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNK1", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STR1", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAIT1", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DLY2", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOL2", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DO2", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNK2", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STR2", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAIT2", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DLY3", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOL3", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DO3", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNK3", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STR3", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAIT3", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DLY4", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOL4", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DO4", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNK4", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STR4", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAIT4", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DLY5", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOL5", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DO5", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNK5", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STR5", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAIT5", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DLY6", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOL6", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DO6", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNK6", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STR6", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAIT6", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DLY7", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOL7", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DO7", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNK7", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STR7", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAIT7", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DLY8", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOL8", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DO8", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNK8", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STR8", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAIT8", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DLY9", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOL9", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DO9", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNK9", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STR9", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAIT9", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "DLY1",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL1",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DO1",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK1",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STR1",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAIT1",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLY2",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL2",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DO2",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK2",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STR2",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAIT2",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLY3",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL3",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DO3",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK3",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STR3",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAIT3",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLY4",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL4",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DO4",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK4",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STR4",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAIT4",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLY5",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL5",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DO5",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK5",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STR5",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAIT5",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLY6",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL6",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DO6",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK6",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STR6",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAIT6",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLY7",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL7",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DO7",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK7",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STR7",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAIT7",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLY8",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL8",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DO8",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK8",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STR8",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAIT8",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLY9",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL9",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DO9",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK9",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STR9",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAIT9",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // Step 10 (A suffix)
-    FieldDesc { name: "DLYA", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DOLA", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DOA", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LNKA", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "STRA", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "WAITA", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "DLYA",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOLA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOA",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNKA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STRA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "WAITA",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for SseqRecord {
@@ -213,34 +481,98 @@ impl Record for SseqRecord {
             "VAL" => {
                 self.val = match value {
                     EpicsValue::Long(v) => v,
-                    _ => value.to_f64().map(|v| v as i32).ok_or_else(|| CaError::TypeMismatch("VAL".into()))?,
+                    _ => value
+                        .to_f64()
+                        .map(|v| v as i32)
+                        .ok_or_else(|| CaError::TypeMismatch("VAL".into()))?,
                 };
                 Ok(())
             }
-            "SELM" => match value { EpicsValue::Short(v) => { self.selm = v; Ok(()) } _ => Err(CaError::TypeMismatch("SELM".into())) },
-            "SELN" => {
-                match value {
-                    EpicsValue::Short(v) => { self.seln = v as u16; Ok(()) }
-                    _ => {
-                        let v = value.to_f64().ok_or_else(|| CaError::TypeMismatch("SELN".into()))?;
-                        self.seln = v as u16;
-                        Ok(())
-                    }
+            "SELM" => match value {
+                EpicsValue::Short(v) => {
+                    self.selm = v;
+                    Ok(())
                 }
-            }
-            "SELL" => match value { EpicsValue::String(s) => { self.sell = s; Ok(()) } _ => Err(CaError::TypeMismatch("SELL".into())) },
-            "PREC" => match value { EpicsValue::Short(v) => { self.prec = v; Ok(()) } _ => Err(CaError::TypeMismatch("PREC".into())) },
-            "ABORT" => match value { EpicsValue::Short(v) => { self.abort = v; Ok(()) } _ => Err(CaError::TypeMismatch("ABORT".into())) },
+                _ => Err(CaError::TypeMismatch("SELM".into())),
+            },
+            "SELN" => match value {
+                EpicsValue::Short(v) => {
+                    self.seln = v as u16;
+                    Ok(())
+                }
+                _ => {
+                    let v = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch("SELN".into()))?;
+                    self.seln = v as u16;
+                    Ok(())
+                }
+            },
+            "SELL" => match value {
+                EpicsValue::String(s) => {
+                    self.sell = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SELL".into())),
+            },
+            "PREC" => match value {
+                EpicsValue::Short(v) => {
+                    self.prec = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("PREC".into())),
+            },
+            "ABORT" => match value {
+                EpicsValue::Short(v) => {
+                    self.abort = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("ABORT".into())),
+            },
             _ => {
                 if let Some((idx, prefix)) = Self::step_index_from_suffix(name) {
                     let step = &mut self.steps[idx];
                     return match prefix {
-                        "DLY" => { step.dly = value.to_f64().ok_or_else(|| CaError::TypeMismatch(name.into()))?; Ok(()) }
-                        "DOL" => match value { EpicsValue::String(s) => { step.dol = s; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-                        "DO" => { step.dov = value.to_f64().ok_or_else(|| CaError::TypeMismatch(name.into()))?; Ok(()) }
-                        "LNK" => match value { EpicsValue::String(s) => { step.lnk = s; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-                        "STR" => match value { EpicsValue::String(s) => { step.str_val = s; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-                        "WAIT" => match value { EpicsValue::Short(v) => { step.wait = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
+                        "DLY" => {
+                            step.dly = value
+                                .to_f64()
+                                .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                            Ok(())
+                        }
+                        "DOL" => match value {
+                            EpicsValue::String(s) => {
+                                step.dol = s;
+                                Ok(())
+                            }
+                            _ => Err(CaError::TypeMismatch(name.into())),
+                        },
+                        "DO" => {
+                            step.dov = value
+                                .to_f64()
+                                .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                            Ok(())
+                        }
+                        "LNK" => match value {
+                            EpicsValue::String(s) => {
+                                step.lnk = s;
+                                Ok(())
+                            }
+                            _ => Err(CaError::TypeMismatch(name.into())),
+                        },
+                        "STR" => match value {
+                            EpicsValue::String(s) => {
+                                step.str_val = s;
+                                Ok(())
+                            }
+                            _ => Err(CaError::TypeMismatch(name.into())),
+                        },
+                        "WAIT" => match value {
+                            EpicsValue::Short(v) => {
+                                step.wait = v;
+                                Ok(())
+                            }
+                            _ => Err(CaError::TypeMismatch(name.into())),
+                        },
                         _ => Err(CaError::FieldNotFound(name.to_string())),
                     };
                 }
@@ -286,16 +618,28 @@ mod tests {
         let mut rec = SseqRecord::new();
         rec.put_field("DLY1", EpicsValue::Double(1.5)).unwrap();
         rec.put_field("DO1", EpicsValue::Double(42.0)).unwrap();
-        rec.put_field("STR1", EpicsValue::String("hello".into())).unwrap();
-        rec.put_field("LNK1", EpicsValue::String("target.VAL".into())).unwrap();
-        rec.put_field("DOL1", EpicsValue::String("source.VAL".into())).unwrap();
+        rec.put_field("STR1", EpicsValue::String("hello".into()))
+            .unwrap();
+        rec.put_field("LNK1", EpicsValue::String("target.VAL".into()))
+            .unwrap();
+        rec.put_field("DOL1", EpicsValue::String("source.VAL".into()))
+            .unwrap();
         rec.put_field("WAIT1", EpicsValue::Short(1)).unwrap();
 
         assert_eq!(rec.get_field("DLY1"), Some(EpicsValue::Double(1.5)));
         assert_eq!(rec.get_field("DO1"), Some(EpicsValue::Double(42.0)));
-        assert_eq!(rec.get_field("STR1"), Some(EpicsValue::String("hello".into())));
-        assert_eq!(rec.get_field("LNK1"), Some(EpicsValue::String("target.VAL".into())));
-        assert_eq!(rec.get_field("DOL1"), Some(EpicsValue::String("source.VAL".into())));
+        assert_eq!(
+            rec.get_field("STR1"),
+            Some(EpicsValue::String("hello".into()))
+        );
+        assert_eq!(
+            rec.get_field("LNK1"),
+            Some(EpicsValue::String("target.VAL".into()))
+        );
+        assert_eq!(
+            rec.get_field("DOL1"),
+            Some(EpicsValue::String("source.VAL".into()))
+        );
         assert_eq!(rec.get_field("WAIT1"), Some(EpicsValue::Short(1)));
     }
 
@@ -304,13 +648,21 @@ mod tests {
         let mut rec = SseqRecord::new();
         rec.put_field("DLYA", EpicsValue::Double(2.0)).unwrap();
         rec.put_field("DOA", EpicsValue::Double(99.0)).unwrap();
-        rec.put_field("STRA", EpicsValue::String("step10".into())).unwrap();
-        rec.put_field("LNKA", EpicsValue::String("out10.VAL".into())).unwrap();
+        rec.put_field("STRA", EpicsValue::String("step10".into()))
+            .unwrap();
+        rec.put_field("LNKA", EpicsValue::String("out10.VAL".into()))
+            .unwrap();
 
         assert_eq!(rec.get_field("DLYA"), Some(EpicsValue::Double(2.0)));
         assert_eq!(rec.get_field("DOA"), Some(EpicsValue::Double(99.0)));
-        assert_eq!(rec.get_field("STRA"), Some(EpicsValue::String("step10".into())));
-        assert_eq!(rec.get_field("LNKA"), Some(EpicsValue::String("out10.VAL".into())));
+        assert_eq!(
+            rec.get_field("STRA"),
+            Some(EpicsValue::String("step10".into()))
+        );
+        assert_eq!(
+            rec.get_field("LNKA"),
+            Some(EpicsValue::String("out10.VAL".into()))
+        );
     }
 
     #[test]
@@ -319,7 +671,8 @@ mod tests {
         // Set all 10 steps
         for i in 1..=9 {
             let dly_name = format!("DLY{}", i);
-            rec.put_field(&dly_name, EpicsValue::Double(i as f64)).unwrap();
+            rec.put_field(&dly_name, EpicsValue::Double(i as f64))
+                .unwrap();
         }
         rec.put_field("DLYA", EpicsValue::Double(10.0)).unwrap();
 
@@ -377,7 +730,10 @@ mod tests {
     #[test]
     fn test_sseq_type_mismatch() {
         let mut rec = SseqRecord::new();
-        assert!(rec.put_field("SELM", EpicsValue::String("x".into())).is_err());
+        assert!(
+            rec.put_field("SELM", EpicsValue::String("x".into()))
+                .is_err()
+        );
         assert!(rec.put_field("STR1", EpicsValue::Double(1.0)).is_err());
     }
 

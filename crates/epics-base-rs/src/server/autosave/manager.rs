@@ -51,10 +51,7 @@ impl AutosaveBuilder {
                 cfg.macros.entry(k.clone()).or_insert_with(|| v.clone());
             }
             let save_set = SaveSet::new(cfg).await?;
-            sets.push((
-                Arc::new(save_set),
-                Arc::new(tokio::sync::Mutex::new(())),
-            ));
+            sets.push((Arc::new(save_set), Arc::new(tokio::sync::Mutex::new(()))));
         }
 
         let (shutdown_tx, _) = watch::channel(false);
@@ -186,48 +183,46 @@ impl AutosaveManager {
                     SaveStrategy::OnChange {
                         min_interval,
                         float_epsilon,
-                    } => {
-                        tokio::spawn(async move {
-                            let mut ticker = tokio::time::interval(min_interval);
-                            let mut last_snapshot: HashMap<String, String> = HashMap::new();
+                    } => tokio::spawn(async move {
+                        let mut ticker = tokio::time::interval(min_interval);
+                        let mut last_snapshot: HashMap<String, String> = HashMap::new();
 
-                            loop {
-                                tokio::select! {
-                                    _ = ticker.tick() => {
-                                        let pv_names = set.pv_names();
-                                        let mut current_snapshot = HashMap::new();
-                                        let mut changed = false;
+                        loop {
+                            tokio::select! {
+                                _ = ticker.tick() => {
+                                    let pv_names = set.pv_names();
+                                    let mut current_snapshot = HashMap::new();
+                                    let mut changed = false;
 
-                                        for pv in &pv_names {
-                                            if let Ok(val) = db.get_pv(pv).await {
-                                                let val_str = save_file::value_to_save_str(&val);
-                                                if let Some(old_str) = last_snapshot.get(pv) {
-                                                    if !values_equal_str(old_str, &val_str, float_epsilon) {
-                                                        changed = true;
-                                                    }
+                                    for pv in &pv_names {
+                                        if let Ok(val) = db.get_pv(pv).await {
+                                            let val_str = save_file::value_to_save_str(&val);
+                                            if let Some(old_str) = last_snapshot.get(pv) {
+                                                if !values_equal_str(old_str, &val_str, float_epsilon) {
+                                                    changed = true;
                                                 }
-                                                current_snapshot.insert(pv.clone(), val_str);
                                             }
+                                            current_snapshot.insert(pv.clone(), val_str);
                                         }
-
-                                        if changed && !last_snapshot.is_empty() {
-                                            let _guard = lock.lock().await;
-                                            let result = set.save_once(&db).await;
-                                            if let Some(ref prefix) = status_prefix {
-                                                update_status_pvs(&db, prefix, &set, &result).await;
-                                            }
-                                        }
-                                        last_snapshot = current_snapshot;
                                     }
-                                    _ = shutdown_rx.changed() => {
-                                        if *shutdown_rx.borrow() {
-                                            break;
+
+                                    if changed && !last_snapshot.is_empty() {
+                                        let _guard = lock.lock().await;
+                                        let result = set.save_once(&db).await;
+                                        if let Some(ref prefix) = status_prefix {
+                                            update_status_pvs(&db, prefix, &set, &result).await;
                                         }
+                                    }
+                                    last_snapshot = current_snapshot;
+                                }
+                                _ = shutdown_rx.changed() => {
+                                    if *shutdown_rx.borrow() {
+                                        break;
                                     }
                                 }
                             }
-                        })
-                    }
+                        }
+                    }),
                     SaveStrategy::Manual => {
                         // No background task for manual sets
                         continue;
@@ -245,11 +240,7 @@ impl AutosaveManager {
     }
 
     /// Manual save for a specific set.
-    pub async fn manual_save(
-        &self,
-        set_name: &str,
-        db: &PvDatabase,
-    ) -> AutosaveResult<usize> {
+    pub async fn manual_save(&self, set_name: &str, db: &PvDatabase) -> AutosaveResult<usize> {
         let (set, lock) = self
             .find_set(set_name)
             .ok_or_else(|| AutosaveError::PvNotFound(format!("save set '{set_name}' not found")))?;
@@ -287,14 +278,14 @@ impl AutosaveManager {
 
     /// Get the list of save set names.
     pub fn set_names(&self) -> Vec<String> {
-        self.sets.iter().map(|(s, _)| s.config().name.clone()).collect()
+        self.sets
+            .iter()
+            .map(|(s, _)| s.config().name.clone())
+            .collect()
     }
 
     /// Find a save set by name.
-    fn find_set(
-        &self,
-        name: &str,
-    ) -> Option<(Arc<SaveSet>, Arc<tokio::sync::Mutex<()>>)> {
+    fn find_set(&self, name: &str) -> Option<(Arc<SaveSet>, Arc<tokio::sync::Mutex<()>>)> {
         self.sets
             .iter()
             .find(|(s, _)| s.config().name == name)
@@ -349,10 +340,7 @@ async fn update_status_pvs(
     }
 
     let _ = db
-        .put_pv_no_process(
-            &format!("{prefix}SR_status"),
-            EpicsValue::Long(status_code),
-        )
+        .put_pv_no_process(&format!("{prefix}SR_status"), EpicsValue::Long(status_code))
         .await;
 
     // Heartbeat

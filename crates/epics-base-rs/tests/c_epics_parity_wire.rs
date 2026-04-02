@@ -5,9 +5,11 @@
 //!   - DB loader: modules/database/test/ioc/db/dbStaticTest.c
 //!   - autosave: modules/database/test/std/rec/asTestLib.c
 
-use epics_ca_rs::protocol::{CaHeader, CA_PROTO_VERSION, CA_PROTO_SEARCH, CA_PROTO_READ_NOTIFY,
-    CA_PROTO_WRITE_NOTIFY, CA_PROTO_RSRV_IS_UP, pad_string, align8};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_ca_rs::protocol::{
+    CA_PROTO_READ_NOTIFY, CA_PROTO_RSRV_IS_UP, CA_PROTO_SEARCH, CA_PROTO_VERSION,
+    CA_PROTO_WRITE_NOTIFY, CaHeader, align8, pad_string,
+};
 
 // ============================================================
 // CA Wire Protocol — Header Encoding/Decoding
@@ -348,10 +350,16 @@ fn autosave_value_to_save_str() {
     // C autosave uses scientific notation for doubles
     let s = value_to_save_str(&EpicsValue::Double(42.5));
     let parsed: f64 = s.parse().unwrap();
-    assert!((parsed - 42.5).abs() < 1e-10, "Double roundtrip: {s} -> {parsed}");
+    assert!(
+        (parsed - 42.5).abs() < 1e-10,
+        "Double roundtrip: {s} -> {parsed}"
+    );
     assert_eq!(value_to_save_str(&EpicsValue::Long(100)), "100");
     let s = value_to_save_str(&EpicsValue::String("hello".into()));
-    assert!(s.contains("hello"), "String save format should contain 'hello': {s}");
+    assert!(
+        s.contains("hello"),
+        "String save format should contain 'hello': {s}"
+    );
 }
 
 #[test]

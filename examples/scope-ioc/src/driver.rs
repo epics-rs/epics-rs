@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use asyn_rs::runtime::sync::Notify;
+use parking_lot::Mutex;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::{EnumEntry, ParamType};
@@ -26,9 +26,16 @@ pub const DEFAULT_UPDATE_TIME: f64 = 0.5;
 
 pub const VERT_GAIN_CHOICES: &[(&str, i32)] = &[("x1", 1), ("x2", 2), ("x5", 5), ("x10", 10)];
 pub const TIME_PER_DIV_CHOICES: &[(&str, f64)] = &[
-    ("0.001", 0.001), ("0.002", 0.002), ("0.005", 0.005),
-    ("0.01", 0.01), ("0.02", 0.02), ("0.05", 0.05),
-    ("0.1", 0.1), ("0.2", 0.2), ("0.5", 0.5), ("1.0", 1.0),
+    ("0.001", 0.001),
+    ("0.002", 0.002),
+    ("0.005", 0.005),
+    ("0.01", 0.01),
+    ("0.02", 0.02),
+    ("0.05", 0.05),
+    ("0.1", 0.1),
+    ("0.2", 0.2),
+    ("0.5", 0.5),
+    ("1.0", 1.0),
 ];
 
 // --- Simple xorshift64 RNG (no rand dependency) ---
@@ -36,14 +43,18 @@ pub const TIME_PER_DIV_CHOICES: &[(&str, f64)] = &[
 pub struct Rng(u64);
 
 impl Rng {
-    pub fn new(seed: u64) -> Self { Self(seed.max(1)) }
+    pub fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
     pub fn next_f64(&mut self) -> f64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         (self.0 as f64) / (u64::MAX as f64)
     }
-    pub fn next_centered(&mut self) -> f64 { self.next_f64() * 2.0 - 1.0 }
+    pub fn next_centered(&mut self) -> f64 {
+        self.next_f64() * 2.0 - 1.0
+    }
 }
 
 // --- ScopeSimulator driver ---
@@ -72,30 +83,59 @@ pub struct ScopeSimulator {
 
 impl ScopeSimulator {
     pub fn new(port_name: &str, notify: Arc<Notify>) -> Self {
-        let flags = PortFlags { can_block: true, ..PortFlags::default() };
+        let flags = PortFlags {
+            can_block: true,
+            ..PortFlags::default()
+        };
         let mut base = PortDriverBase::new(port_name, 1, flags);
 
         let p_run = base.create_param("P_Run", ParamType::Int32).unwrap();
         let p_max_points = base.create_param("P_MaxPoints", ParamType::Int32).unwrap();
-        let p_time_per_div = base.create_param("P_TimePerDiv", ParamType::Float64).unwrap();
-        let p_time_per_div_select = base.create_param("P_TimePerDivSelect", ParamType::Enum).unwrap();
+        let p_time_per_div = base
+            .create_param("P_TimePerDiv", ParamType::Float64)
+            .unwrap();
+        let p_time_per_div_select = base
+            .create_param("P_TimePerDivSelect", ParamType::Enum)
+            .unwrap();
         let p_vert_gain = base.create_param("P_VertGain", ParamType::Float64).unwrap();
-        let p_vert_gain_select = base.create_param("P_VertGainSelect", ParamType::Enum).unwrap();
-        let p_volts_per_div = base.create_param("P_VoltsPerDiv", ParamType::Float64).unwrap();
-        let p_volts_per_div_select = base.create_param("P_VoltsPerDivSelect", ParamType::Enum).unwrap();
-        let p_volt_offset = base.create_param("P_VoltOffset", ParamType::Float64).unwrap();
-        let p_trigger_delay = base.create_param("P_TriggerDelay", ParamType::Float64).unwrap();
-        let p_noise_amplitude = base.create_param("P_NoiseAmplitude", ParamType::Float64).unwrap();
-        let p_update_time = base.create_param("P_UpdateTime", ParamType::Float64).unwrap();
-        let p_waveform = base.create_param("P_Waveform", ParamType::Float64Array).unwrap();
-        let p_time_base = base.create_param("P_TimeBase", ParamType::Float64Array).unwrap();
+        let p_vert_gain_select = base
+            .create_param("P_VertGainSelect", ParamType::Enum)
+            .unwrap();
+        let p_volts_per_div = base
+            .create_param("P_VoltsPerDiv", ParamType::Float64)
+            .unwrap();
+        let p_volts_per_div_select = base
+            .create_param("P_VoltsPerDivSelect", ParamType::Enum)
+            .unwrap();
+        let p_volt_offset = base
+            .create_param("P_VoltOffset", ParamType::Float64)
+            .unwrap();
+        let p_trigger_delay = base
+            .create_param("P_TriggerDelay", ParamType::Float64)
+            .unwrap();
+        let p_noise_amplitude = base
+            .create_param("P_NoiseAmplitude", ParamType::Float64)
+            .unwrap();
+        let p_update_time = base
+            .create_param("P_UpdateTime", ParamType::Float64)
+            .unwrap();
+        let p_waveform = base
+            .create_param("P_Waveform", ParamType::Float64Array)
+            .unwrap();
+        let p_time_base = base
+            .create_param("P_TimeBase", ParamType::Float64Array)
+            .unwrap();
         let p_min_value = base.create_param("P_MinValue", ParamType::Float64).unwrap();
         let p_max_value = base.create_param("P_MaxValue", ParamType::Float64).unwrap();
-        let p_mean_value = base.create_param("P_MeanValue", ParamType::Float64).unwrap();
+        let p_mean_value = base
+            .create_param("P_MeanValue", ParamType::Float64)
+            .unwrap();
 
         base.set_int32_param(p_run, 0, 0).unwrap();
-        base.set_int32_param(p_max_points, 0, DEFAULT_MAX_POINTS).unwrap();
-        base.set_float64_param(p_update_time, 0, DEFAULT_UPDATE_TIME).unwrap();
+        base.set_int32_param(p_max_points, 0, DEFAULT_MAX_POINTS)
+            .unwrap();
+        base.set_float64_param(p_update_time, 0, DEFAULT_UPDATE_TIME)
+            .unwrap();
         base.set_float64_param(p_volt_offset, 0, 0.0).unwrap();
         base.set_float64_param(p_trigger_delay, 0, 0.0).unwrap();
         base.set_float64_param(p_noise_amplitude, 0, 0.0).unwrap();
@@ -104,24 +144,40 @@ impl ScopeSimulator {
         base.set_float64_param(p_time_per_div, 0, 0.001).unwrap();
 
         let vert_choices: Arc<[EnumEntry]> = Arc::from(
-            VERT_GAIN_CHOICES.iter()
-                .map(|(s, v)| EnumEntry { string: s.to_string(), value: *v, severity: 0 })
+            VERT_GAIN_CHOICES
+                .iter()
+                .map(|(s, v)| EnumEntry {
+                    string: s.to_string(),
+                    value: *v,
+                    severity: 0,
+                })
                 .collect::<Vec<_>>(),
         );
-        base.set_enum_choices_param(p_vert_gain_select, 0, vert_choices).unwrap();
+        base.set_enum_choices_param(p_vert_gain_select, 0, vert_choices)
+            .unwrap();
         base.set_enum_index_param(p_vert_gain_select, 0, 0).unwrap();
 
         let time_choices: Arc<[EnumEntry]> = Arc::from(
-            TIME_PER_DIV_CHOICES.iter().enumerate()
-                .map(|(i, (s, _))| EnumEntry { string: s.to_string(), value: i as i32, severity: 0 })
+            TIME_PER_DIV_CHOICES
+                .iter()
+                .enumerate()
+                .map(|(i, (s, _))| EnumEntry {
+                    string: s.to_string(),
+                    value: i as i32,
+                    severity: 0,
+                })
                 .collect::<Vec<_>>(),
         );
-        base.set_enum_choices_param(p_time_per_div_select, 0, time_choices).unwrap();
-        base.set_enum_index_param(p_time_per_div_select, 0, 0).unwrap();
+        base.set_enum_choices_param(p_time_per_div_select, 0, time_choices)
+            .unwrap();
+        base.set_enum_index_param(p_time_per_div_select, 0, 0)
+            .unwrap();
 
         let vpd_choices = Self::make_volts_per_div_choices(1.0);
-        base.set_enum_choices_param(p_volts_per_div_select, 0, vpd_choices).unwrap();
-        base.set_enum_index_param(p_volts_per_div_select, 0, 0).unwrap();
+        base.set_enum_choices_param(p_volts_per_div_select, 0, vpd_choices)
+            .unwrap();
+        base.set_enum_index_param(p_volts_per_div_select, 0, 0)
+            .unwrap();
 
         // Pre-compute initial waveform/time_base so PINI records get real data
         {
@@ -137,30 +193,56 @@ impl ScopeSimulator {
             };
             let mut rng = Rng::new(0xDEAD_BEEF_CAFE_1234);
             let result = compute_waveform(&initial_config, &mut rng);
-            let _ = base.params.set_float64_array(p_waveform, 0, result.waveform);
-            let _ = base.params.set_float64_array(p_time_base, 0, result.time_base);
+            let _ = base
+                .params
+                .set_float64_array(p_waveform, 0, result.waveform);
+            let _ = base
+                .params
+                .set_float64_array(p_time_base, 0, result.time_base);
             let _ = base.set_float64_param(p_min_value, 0, result.min_val);
             let _ = base.set_float64_param(p_max_value, 0, result.max_val);
             let _ = base.set_float64_param(p_mean_value, 0, result.mean_val);
         }
 
         Self {
-            base, notify,
-            p_run, p_max_points, p_time_per_div, p_time_per_div_select,
-            p_vert_gain, p_vert_gain_select, p_volts_per_div, p_volts_per_div_select,
-            p_volt_offset, p_trigger_delay, p_noise_amplitude, p_update_time,
-            p_waveform, p_time_base, p_min_value, p_max_value, p_mean_value,
+            base,
+            notify,
+            p_run,
+            p_max_points,
+            p_time_per_div,
+            p_time_per_div_select,
+            p_vert_gain,
+            p_vert_gain_select,
+            p_volts_per_div,
+            p_volts_per_div_select,
+            p_volt_offset,
+            p_trigger_delay,
+            p_noise_amplitude,
+            p_update_time,
+            p_waveform,
+            p_time_base,
+            p_min_value,
+            p_max_value,
+            p_mean_value,
         }
     }
 
     pub fn make_volts_per_div_choices(vert_gain: f64) -> Arc<[EnumEntry]> {
         let base_values = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0];
-        Arc::from(base_values.iter().enumerate()
-            .map(|(i, &v)| {
-                let scaled = v / vert_gain;
-                EnumEntry { string: format!("{scaled:.2}"), value: i as i32, severity: 0 }
-            })
-            .collect::<Vec<_>>())
+        Arc::from(
+            base_values
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let scaled = v / vert_gain;
+                    EnumEntry {
+                        string: format!("{scaled:.2}"),
+                        value: i as i32,
+                        severity: 0,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     pub fn param_indices(&self) -> ParamIndices {
@@ -183,8 +265,12 @@ impl ScopeSimulator {
 }
 
 impl PortDriver for ScopeSimulator {
-    fn base(&self) -> &PortDriverBase { &self.base }
-    fn base_mut(&mut self) -> &mut PortDriverBase { &mut self.base }
+    fn base(&self) -> &PortDriverBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut PortDriverBase {
+        &mut self.base
+    }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.base.check_ready()?;
@@ -194,18 +280,26 @@ impl PortDriver for ScopeSimulator {
             || user.reason == self.p_time_per_div_select;
 
         if is_enum {
-            self.base.params.set_enum_index(user.reason, user.addr, value as usize)?;
+            self.base
+                .params
+                .set_enum_index(user.reason, user.addr, value as usize)?;
         } else {
             self.base.params.set_int32(user.reason, user.addr, value)?;
         }
 
         if user.reason == self.p_run {
-            if value != 0 { self.notify.notify_one(); }
+            if value != 0 {
+                self.notify.notify_one();
+            }
         } else if user.reason == self.p_vert_gain_select {
-            let gain = VERT_GAIN_CHOICES.get(value as usize).map(|(_, v)| *v as f64).unwrap_or(1.0);
+            let gain = VERT_GAIN_CHOICES
+                .get(value as usize)
+                .map(|(_, v)| *v as f64)
+                .unwrap_or(1.0);
             self.base.set_float64_param(self.p_vert_gain, 0, gain)?;
             let choices = Self::make_volts_per_div_choices(gain);
-            self.base.set_enum_choices_param(self.p_volts_per_div_select, 0, choices)?;
+            self.base
+                .set_enum_choices_param(self.p_volts_per_div_select, 0, choices)?;
             let (idx, ch) = self.base.get_enum_param(self.p_volts_per_div_select, 0)?;
             if let Ok(v) = ch[idx].string.parse::<f64>() {
                 self.base.set_float64_param(self.p_volts_per_div, 0, v)?;
@@ -228,9 +322,17 @@ impl PortDriver for ScopeSimulator {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         self.base.check_ready()?;
-        let value = if user.reason == self.p_update_time { value.max(MIN_UPDATE_TIME) } else { value };
-        self.base.params.set_float64(user.reason, user.addr, value)?;
-        if user.reason == self.p_update_time { self.notify.notify_one(); }
+        let value = if user.reason == self.p_update_time {
+            value.max(MIN_UPDATE_TIME)
+        } else {
+            value
+        };
+        self.base
+            .params
+            .set_float64(user.reason, user.addr, value)?;
+        if user.reason == self.p_update_time {
+            self.notify.notify_one();
+        }
         self.base.call_param_callback(user.addr, user.reason)?;
         Ok(())
     }
@@ -285,13 +387,31 @@ pub struct SimResult {
 pub fn read_config(base: &PortDriverBase, idx: &ParamIndices) -> SimConfig {
     SimConfig {
         run: base.params.get_int32(idx.p_run, 0).unwrap_or(0) != 0,
-        max_points: base.params.get_int32(idx.p_max_points, 0).unwrap_or(DEFAULT_MAX_POINTS) as usize,
-        time_per_div: base.params.get_float64(idx.p_time_per_div, 0).unwrap_or(0.001),
-        volts_per_div: base.params.get_float64(idx.p_volts_per_div, 0).unwrap_or(1.0),
+        max_points: base
+            .params
+            .get_int32(idx.p_max_points, 0)
+            .unwrap_or(DEFAULT_MAX_POINTS) as usize,
+        time_per_div: base
+            .params
+            .get_float64(idx.p_time_per_div, 0)
+            .unwrap_or(0.001),
+        volts_per_div: base
+            .params
+            .get_float64(idx.p_volts_per_div, 0)
+            .unwrap_or(1.0),
         volt_offset: base.params.get_float64(idx.p_volt_offset, 0).unwrap_or(0.0),
-        trigger_delay: base.params.get_float64(idx.p_trigger_delay, 0).unwrap_or(0.0),
-        noise_amplitude: base.params.get_float64(idx.p_noise_amplitude, 0).unwrap_or(0.0),
-        update_time: base.params.get_float64(idx.p_update_time, 0).unwrap_or(DEFAULT_UPDATE_TIME),
+        trigger_delay: base
+            .params
+            .get_float64(idx.p_trigger_delay, 0)
+            .unwrap_or(0.0),
+        noise_amplitude: base
+            .params
+            .get_float64(idx.p_noise_amplitude, 0)
+            .unwrap_or(0.0),
+        update_time: base
+            .params
+            .get_float64(idx.p_update_time, 0)
+            .unwrap_or(DEFAULT_UPDATE_TIME),
     }
 }
 
@@ -312,22 +432,32 @@ pub fn compute_waveform(config: &SimConfig, rng: &mut Rng) -> SimResult {
         let y = AMPLITUDE * (2.0 * std::f64::consts::PI * FREQUENCY * t).sin()
             + config.noise_amplitude * rng.next_centered();
         let scaled = NUM_DIVISIONS / 2.0 + (config.volt_offset + y) / config.volts_per_div;
-        if scaled < min_val { min_val = scaled; }
-        if scaled > max_val { max_val = scaled; }
+        if scaled < min_val {
+            min_val = scaled;
+        }
+        if scaled > max_val {
+            max_val = scaled;
+        }
         sum += scaled;
         waveform.push(scaled);
     }
 
-    let mean_val = if num_points > 0 { sum / num_points as f64 } else { 0.0 };
-    SimResult { waveform, time_base, min_val, max_val, mean_val }
+    let mean_val = if num_points > 0 {
+        sum / num_points as f64
+    } else {
+        0.0
+    };
+    SimResult {
+        waveform,
+        time_base,
+        min_val,
+        max_val,
+        mean_val,
+    }
 }
 
 /// Background simulation task using the concrete ScopeSimulator type.
-pub async fn sim_task(
-    port: Arc<Mutex<ScopeSimulator>>,
-    notify: Arc<Notify>,
-    idx: ParamIndices,
-) {
+pub async fn sim_task(port: Arc<Mutex<ScopeSimulator>>, notify: Arc<Notify>, idx: ParamIndices) {
     let mut rng = Rng::new(0xDEAD_BEEF_CAFE_1234);
 
     loop {
@@ -346,8 +476,12 @@ pub async fn sim_task(
         {
             let mut guard = port.lock();
             let base = &mut guard.base;
-            let _ = base.params.set_float64_array(idx.p_waveform, 0, result.waveform);
-            let _ = base.params.set_float64_array(idx.p_time_base, 0, result.time_base);
+            let _ = base
+                .params
+                .set_float64_array(idx.p_waveform, 0, result.waveform);
+            let _ = base
+                .params
+                .set_float64_array(idx.p_time_base, 0, result.time_base);
             let _ = base.set_float64_param(idx.p_min_value, 0, result.min_val);
             let _ = base.set_float64_param(idx.p_max_value, 0, result.max_val);
             let _ = base.set_float64_param(idx.p_mean_value, 0, result.mean_val);
@@ -388,8 +522,12 @@ pub async fn sim_task_dyn(
         {
             let mut guard = port.lock();
             let base = guard.base_mut();
-            let _ = base.params.set_float64_array(idx.p_waveform, 0, result.waveform);
-            let _ = base.params.set_float64_array(idx.p_time_base, 0, result.time_base);
+            let _ = base
+                .params
+                .set_float64_array(idx.p_waveform, 0, result.waveform);
+            let _ = base
+                .params
+                .set_float64_array(idx.p_time_base, 0, result.time_base);
             let _ = base.set_float64_param(idx.p_min_value, 0, result.min_val);
             let _ = base.set_float64_param(idx.p_max_value, 0, result.max_val);
             let _ = base.set_float64_param(idx.p_mean_value, 0, result.mean_val);
@@ -424,11 +562,21 @@ pub async fn sim_task_handle(
 
         let result = compute_waveform(&config, &mut rng);
 
-        let _ = handle.write_float64_array(idx.p_waveform, 0, result.waveform).await;
-        let _ = handle.write_float64_array(idx.p_time_base, 0, result.time_base).await;
-        let _ = handle.write_float64(idx.p_min_value, 0, result.min_val).await;
-        let _ = handle.write_float64(idx.p_max_value, 0, result.max_val).await;
-        let _ = handle.write_float64(idx.p_mean_value, 0, result.mean_val).await;
+        let _ = handle
+            .write_float64_array(idx.p_waveform, 0, result.waveform)
+            .await;
+        let _ = handle
+            .write_float64_array(idx.p_time_base, 0, result.time_base)
+            .await;
+        let _ = handle
+            .write_float64(idx.p_min_value, 0, result.min_val)
+            .await;
+        let _ = handle
+            .write_float64(idx.p_max_value, 0, result.max_val)
+            .await;
+        let _ = handle
+            .write_float64(idx.p_mean_value, 0, result.mean_val)
+            .await;
         let _ = handle.call_param_callbacks(0).await;
 
         let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
@@ -445,12 +593,33 @@ async fn read_config_handle(
 ) -> SimConfig {
     SimConfig {
         run: handle.read_int32(idx.p_run, 0).await.unwrap_or(0) != 0,
-        max_points: handle.read_int32(idx.p_max_points, 0).await.unwrap_or(DEFAULT_MAX_POINTS) as usize,
-        time_per_div: handle.read_float64(idx.p_time_per_div, 0).await.unwrap_or(0.001),
-        volts_per_div: handle.read_float64(idx.p_volts_per_div, 0).await.unwrap_or(1.0),
-        volt_offset: handle.read_float64(idx.p_volt_offset, 0).await.unwrap_or(0.0),
-        trigger_delay: handle.read_float64(idx.p_trigger_delay, 0).await.unwrap_or(0.0),
-        noise_amplitude: handle.read_float64(idx.p_noise_amplitude, 0).await.unwrap_or(0.0),
-        update_time: handle.read_float64(idx.p_update_time, 0).await.unwrap_or(DEFAULT_UPDATE_TIME),
+        max_points: handle
+            .read_int32(idx.p_max_points, 0)
+            .await
+            .unwrap_or(DEFAULT_MAX_POINTS) as usize,
+        time_per_div: handle
+            .read_float64(idx.p_time_per_div, 0)
+            .await
+            .unwrap_or(0.001),
+        volts_per_div: handle
+            .read_float64(idx.p_volts_per_div, 0)
+            .await
+            .unwrap_or(1.0),
+        volt_offset: handle
+            .read_float64(idx.p_volt_offset, 0)
+            .await
+            .unwrap_or(0.0),
+        trigger_delay: handle
+            .read_float64(idx.p_trigger_delay, 0)
+            .await
+            .unwrap_or(0.0),
+        noise_amplitude: handle
+            .read_float64(idx.p_noise_amplitude, 0)
+            .await
+            .unwrap_or(0.0),
+        update_time: handle
+            .read_float64(idx.p_update_time, 0)
+            .await
+            .unwrap_or(DEFAULT_UPDATE_TIME),
     }
 }

@@ -40,10 +40,7 @@ impl ColorLayout {
     /// - RGB1: `[3, size_x, size_y]` (colorDim=0)
     pub fn make_dims(&self) -> Vec<NDDimension> {
         match self.color_mode {
-            ColorMode::Mono => vec![
-                NDDimension::new(self.size_x),
-                NDDimension::new(self.size_y),
-            ],
+            ColorMode::Mono => vec![NDDimension::new(self.size_x), NDDimension::new(self.size_y)],
             ColorMode::RGB1 => vec![
                 NDDimension::new(3),
                 NDDimension::new(self.size_x),

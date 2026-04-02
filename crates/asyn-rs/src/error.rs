@@ -25,7 +25,10 @@ pub enum AsynError {
     ParamIndexOutOfRange(usize),
 
     #[error("type mismatch: expected {expected}, got {actual}")]
-    TypeMismatch { expected: &'static str, actual: &'static str },
+    TypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
 
     #[error("interface not supported: {0}")]
     InterfaceNotSupported(String),

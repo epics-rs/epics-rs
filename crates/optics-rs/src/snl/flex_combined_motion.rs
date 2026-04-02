@@ -307,7 +307,8 @@ impl FlexController {
         match self.mode {
             FlexMode::FineOnly => {
                 // Fine-only: clamp to limits
-                self.dist_calc = clamp_to_limits(self.dist_calc, self.lower_limit, self.upper_limit);
+                self.dist_calc =
+                    clamp_to_limits(self.dist_calc, self.lower_limit, self.upper_limit);
                 self.fine_pos = self.dist_calc;
                 actions.move_fine = Some(self.fine_pos);
                 // Done
@@ -353,8 +354,7 @@ impl FlexController {
         match self.mode {
             FlexMode::Normal => {
                 // Re-enter calcDistance in case long move didn't reach target
-                self.dist_calc =
-                    calc_distance(self.new_set_point, self.pos_monitor, self.fine_rbv);
+                self.dist_calc = calc_distance(self.new_set_point, self.pos_monitor, self.fine_rbv);
 
                 if self.dist_calc >= self.upper_limit || self.dist_calc <= self.lower_limit {
                     self.fine_home =
@@ -446,7 +446,11 @@ impl FlexController {
 
     /// Handle stop request.
     pub fn handle_stop(&mut self) -> FlexActions {
-        let mut actions = FlexActions { stop_coarse: true, reset_stop: true, ..Default::default() };
+        let mut actions = FlexActions {
+            stop_coarse: true,
+            reset_stop: true,
+            ..Default::default()
+        };
         self.busy = false;
         actions.set_busy = Some(false);
         self.state = FlexState::Idle;
@@ -515,7 +519,7 @@ pub async fn run(config: FlexConfig) -> Result<(), Box<dyn std::error::Error + S
     use epics_base_rs::types::EpicsValue;
     use epics_ca_rs::client::{CaChannel, CaClient};
     use tokio::select;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     async fn get_f64(ch: &CaChannel) -> f64 {
         match ch.get().await {
@@ -570,11 +574,26 @@ pub async fn run(config: FlexConfig) -> Result<(), Box<dyn std::error::Error + S
     let mut ctrl = {
         let mut ctrl = FlexController::default();
         ctrl.mode = FlexMode::from(get_i32(&ch_mode).await);
-        ctrl.deadband = { let v = get_f64(&ch_deadband).await; if v > 0.0 { v } else { 0.001 } };
-        ctrl.coarse_mres = { let v = get_f64(&ch_coarse_mres).await; if v > 0.0 { v } else { 0.001 } };
-        ctrl.max_retries = { let v = get_i32(&ch_max_retries).await; if v > 0 { v } else { 5 } };
-        ctrl.upper_limit = { let v = get_f64(&ch_upper_limit).await; if v != 0.0 { v } else { 100.0 } };
-        ctrl.lower_limit = { let v = get_f64(&ch_lower_limit).await; if v != 0.0 { v } else { -100.0 } };
+        ctrl.deadband = {
+            let v = get_f64(&ch_deadband).await;
+            if v > 0.0 { v } else { 0.001 }
+        };
+        ctrl.coarse_mres = {
+            let v = get_f64(&ch_coarse_mres).await;
+            if v > 0.0 { v } else { 0.001 }
+        };
+        ctrl.max_retries = {
+            let v = get_i32(&ch_max_retries).await;
+            if v > 0 { v } else { 5 }
+        };
+        ctrl.upper_limit = {
+            let v = get_f64(&ch_upper_limit).await;
+            if v != 0.0 { v } else { 100.0 }
+        };
+        ctrl.lower_limit = {
+            let v = get_f64(&ch_lower_limit).await;
+            if v != 0.0 { v } else { -100.0 }
+        };
         ctrl.home_pos = get_f64(&ch_home_pos).await;
         ctrl.pos_monitor = get_f64(&ch_pos_monitor).await;
         ctrl.fine_rbv = get_f64(&ch_fine_rbv).await;

@@ -175,10 +175,13 @@ mod tests {
 
     #[test]
     fn test_both_pv_and_path() {
-        let ctx = MacroContext::from_map([
-            ("P".into(), "IOC:".into()),
-            ("FILE".into(), "settings".into()),
-        ].into());
+        let ctx = MacroContext::from_map(
+            [
+                ("P".into(), "IOC:".into()),
+                ("FILE".into(), "settings".into()),
+            ]
+            .into(),
+        );
         assert_eq!(
             ctx.expand("${FILE}/$(P)temp", "test", 1).unwrap(),
             "settings/IOC:temp"

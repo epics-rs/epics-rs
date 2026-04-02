@@ -34,7 +34,10 @@ impl TransformType {
 
     /// Whether this transform swaps x and y dimensions.
     pub fn swaps_dims(&self) -> bool {
-        matches!(self, Self::Rot90CW | Self::Rot90CCW | Self::FlipDiag | Self::FlipAntiDiag)
+        matches!(
+            self,
+            Self::Rot90CW | Self::Rot90CCW | Self::FlipDiag | Self::FlipAntiDiag
+        )
     }
 }
 
@@ -130,7 +133,10 @@ impl NDPluginProcess for TransformProcessor {
         "NDPluginTransform"
     }
 
-    fn register_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
         base.create_param("TRANSFORM_TYPE", ParamType::Int32)?;
         Ok(())

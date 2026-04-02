@@ -5,8 +5,8 @@ impl MotorRecord {
     pub fn check_completion(&mut self) -> ProcessEffects {
         let mut effects = ProcessEffects::default();
 
-        let driver_done = self.stat.msta.contains(MstaFlags::DONE)
-            && !self.stat.msta.contains(MstaFlags::MOVING);
+        let driver_done =
+            self.stat.msta.contains(MstaFlags::DONE) && !self.stat.msta.contains(MstaFlags::MOVING);
 
         if !driver_done {
             // Still moving, keep polling
@@ -159,9 +159,7 @@ impl MotorRecord {
                 let correction = diff * self.retry.frac;
                 self.pos.drbv + correction
             }
-            RetryMode::Geometric => {
-                self.pos.dval
-            }
+            RetryMode::Geometric => self.pos.dval,
             RetryMode::InPosition => {
                 // InPosition: don't reissue move, just wait for driver
                 self.pos.dval

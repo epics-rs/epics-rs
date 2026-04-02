@@ -1,12 +1,12 @@
-use rand::rngs::StdRng;
 use rand::Rng;
+use rand::rngs::StdRng;
 use std::f64::consts::PI;
 
 use ad_core_rs::ndarray::NDDataBuffer;
 
-use ad_core_rs::color_layout::ColorLayout;
-use ad_core_rs::pixel_cast::{with_buffer, with_buffer_mut, PixelCast};
 use crate::types::{SimMode, SineOperation};
+use ad_core_rs::color_layout::ColorLayout;
+use ad_core_rs::pixel_cast::{PixelCast, with_buffer, with_buffer_mut};
 
 const MAX_PEAK_SIGMA: i32 = 4;
 
@@ -152,16 +152,25 @@ pub fn accumulate_linear_ramp(
     // Otherwise write directly to raw.
     // Helper: fill ramp pattern into a buffer
     fn fill_ramp<T: PixelCast>(
-        data: &mut [T], layout: &ColorLayout, size_x: usize, size_y: usize,
-        inc_mono: f64, inc_red: f64, inc_green: f64, inc_blue: f64,
-        gain_x: f64, gain_y: f64, reset: bool,
+        data: &mut [T],
+        layout: &ColorLayout,
+        size_x: usize,
+        size_y: usize,
+        inc_mono: f64,
+        inc_red: f64,
+        inc_green: f64,
+        inc_blue: f64,
+        gain_x: f64,
+        gain_y: f64,
+        reset: bool,
     ) {
         if reset {
             for y in 0..size_y {
                 match layout.color_mode {
                     ad_core_rs::driver::ColorMode::Mono => {
                         for x in 0..size_x {
-                            data[layout.index(x, y, 0)] = T::from_f64(inc_mono * (gain_x * x as f64 + gain_y * y as f64));
+                            data[layout.index(x, y, 0)] =
+                                T::from_f64(inc_mono * (gain_x * x as f64 + gain_y * y as f64));
                         }
                     }
                     _ => {
@@ -199,7 +208,10 @@ pub fn accumulate_linear_ramp(
 
     if use_background {
         with_buffer_mut!(ramp_buf, |data| {
-            fill_ramp(data, layout, size_x, size_y, inc_mono, inc_red, inc_green, inc_blue, gain_x, gain_y, reset);
+            fill_ramp(
+                data, layout, size_x, size_y, inc_mono, inc_red, inc_green, inc_blue, gain_x,
+                gain_y, reset,
+            );
         });
         // Add ramp to raw: read ramp as f64 vec, then add to raw
         let ramp_f64: Vec<f64> = with_buffer!(&*ramp_buf, |v| {
@@ -212,7 +224,10 @@ pub fn accumulate_linear_ramp(
         });
     } else {
         with_buffer_mut!(raw, |data| {
-            fill_ramp(data, layout, size_x, size_y, inc_mono, inc_red, inc_green, inc_blue, gain_x, gain_y, reset);
+            fill_ramp(
+                data, layout, size_x, size_y, inc_mono, inc_red, inc_green, inc_blue, gain_x,
+                gain_y, reset,
+            );
         });
     }
 }
@@ -240,8 +255,12 @@ pub fn accumulate_peaks(
             for i in 0..peak_full_width_y {
                 for j in 0..peak_full_width_x {
                     let idx = (i * size_x + j) as usize;
-                    let gauss_y = (-((i - peak_full_width_y / 2) as f64 / peak.width_y as f64).powi(2) / 2.0).exp();
-                    let gauss_x = (-((j - peak_full_width_x / 2) as f64 / peak.width_x as f64).powi(2) / 2.0).exp();
+                    let gauss_y =
+                        (-((i - peak_full_width_y / 2) as f64 / peak.width_y as f64).powi(2) / 2.0)
+                            .exp();
+                    let gauss_x =
+                        (-((j - peak_full_width_x / 2) as f64 / peak.width_x as f64).powi(2) / 2.0)
+                            .exp();
                     if idx < data.len() {
                         data[idx] = PixelCast::from_f64(gains.gain * gauss_x * gauss_y);
                     }
@@ -293,13 +312,16 @@ pub fn accumulate_peaks(
                                 let gi = layout.index(x_out as usize, y_out as usize, 1);
                                 let bi = layout.index(x_out as usize, y_out as usize, 2);
                                 raw_v[ri] = PixelCast::from_f64(
-                                    PixelCast::to_f64(raw_v[ri]) + gains.gain_red * gain_variation * pv,
+                                    PixelCast::to_f64(raw_v[ri])
+                                        + gains.gain_red * gain_variation * pv,
                                 );
                                 raw_v[gi] = PixelCast::from_f64(
-                                    PixelCast::to_f64(raw_v[gi]) + gains.gain_green * gain_variation * pv,
+                                    PixelCast::to_f64(raw_v[gi])
+                                        + gains.gain_green * gain_variation * pv,
                                 );
                                 raw_v[bi] = PixelCast::from_f64(
-                                    PixelCast::to_f64(raw_v[bi]) + gains.gain_blue * gain_variation * pv,
+                                    PixelCast::to_f64(raw_v[bi])
+                                        + gains.gain_blue * gain_variation * pv,
                                 );
                             }
                         }
@@ -400,14 +422,19 @@ pub fn accumulate_sine(
                         let gi = layout.index(x, y, 1);
                         let bi = layout.index(x, y, 2);
                         data[ri] = PixelCast::from_f64(
-                            PixelCast::to_f64(data[ri]) + gains.gain * gains.gain_red * state.x_sine1[x],
+                            PixelCast::to_f64(data[ri])
+                                + gains.gain * gains.gain_red * state.x_sine1[x],
                         );
                         data[gi] = PixelCast::from_f64(
-                            PixelCast::to_f64(data[gi]) + gains.gain * gains.gain_green * state.y_sine1[y],
+                            PixelCast::to_f64(data[gi])
+                                + gains.gain * gains.gain_green * state.y_sine1[y],
                         );
                         data[bi] = PixelCast::from_f64(
                             PixelCast::to_f64(data[bi])
-                                + gains.gain * gains.gain_blue * (state.x_sine2[x] + state.y_sine2[y]) / 2.0,
+                                + gains.gain
+                                    * gains.gain_blue
+                                    * (state.x_sine2[x] + state.y_sine2[y])
+                                    / 2.0,
                         );
                     }
                 }
@@ -575,7 +602,15 @@ mod tests {
             step_y: 0,
             height_variation: 0.0,
         };
-        accumulate_peaks(&mut raw, &mut peak_buf, &layout, &peak, &gains, true, &mut rng);
+        accumulate_peaks(
+            &mut raw,
+            &mut peak_buf,
+            &layout,
+            &peak,
+            &gains,
+            true,
+            &mut rng,
+        );
         if let NDDataBuffer::F64(v) = &raw {
             // Center should have max value
             let center = layout.index(32, 32, 0);
@@ -595,10 +630,26 @@ mod tests {
         let mut state = SineState::new();
         let gains = default_gains();
         let sine = SineParams {
-            x_sine1: SineWave { amplitude: 100.0, frequency: 1.0, phase: 0.0 },
-            x_sine2: SineWave { amplitude: 0.0, frequency: 0.0, phase: 0.0 },
-            y_sine1: SineWave { amplitude: 50.0, frequency: 1.0, phase: 0.0 },
-            y_sine2: SineWave { amplitude: 0.0, frequency: 0.0, phase: 0.0 },
+            x_sine1: SineWave {
+                amplitude: 100.0,
+                frequency: 1.0,
+                phase: 0.0,
+            },
+            x_sine2: SineWave {
+                amplitude: 0.0,
+                frequency: 0.0,
+                phase: 0.0,
+            },
+            y_sine1: SineWave {
+                amplitude: 50.0,
+                frequency: 1.0,
+                phase: 0.0,
+            },
+            y_sine2: SineWave {
+                amplitude: 0.0,
+                frequency: 0.0,
+                phase: 0.0,
+            },
             x_op: SineOperation::Add,
             y_op: SineOperation::Add,
         };
@@ -619,10 +670,26 @@ mod tests {
         let mut state = SineState::new();
         let gains = default_gains();
         let sine = SineParams {
-            x_sine1: SineWave { amplitude: 100.0, frequency: 1.0, phase: 0.0 },
-            x_sine2: SineWave { amplitude: 0.0, frequency: 0.0, phase: 0.0 },
-            y_sine1: SineWave { amplitude: 0.0, frequency: 0.0, phase: 0.0 },
-            y_sine2: SineWave { amplitude: 0.0, frequency: 0.0, phase: 0.0 },
+            x_sine1: SineWave {
+                amplitude: 100.0,
+                frequency: 1.0,
+                phase: 0.0,
+            },
+            x_sine2: SineWave {
+                amplitude: 0.0,
+                frequency: 0.0,
+                phase: 0.0,
+            },
+            y_sine1: SineWave {
+                amplitude: 0.0,
+                frequency: 0.0,
+                phase: 0.0,
+            },
+            y_sine2: SineWave {
+                amplitude: 0.0,
+                frequency: 0.0,
+                phase: 0.0,
+            },
             x_op: SineOperation::Add,
             y_op: SineOperation::Add,
         };
@@ -653,22 +720,57 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let gains = default_gains();
         let peak_p = PeakParams {
-            start_x: 0, start_y: 0, width_x: 1, width_y: 1,
-            num_x: 0, num_y: 0, step_x: 0, step_y: 0, height_variation: 0.0,
+            start_x: 0,
+            start_y: 0,
+            width_x: 1,
+            width_y: 1,
+            num_x: 0,
+            num_y: 0,
+            step_x: 0,
+            step_y: 0,
+            height_variation: 0.0,
         };
         let sine_p = SineParams {
-            x_sine1: SineWave { amplitude: 0.0, frequency: 0.0, phase: 0.0 },
-            x_sine2: SineWave { amplitude: 0.0, frequency: 0.0, phase: 0.0 },
-            y_sine1: SineWave { amplitude: 0.0, frequency: 0.0, phase: 0.0 },
-            y_sine2: SineWave { amplitude: 0.0, frequency: 0.0, phase: 0.0 },
+            x_sine1: SineWave {
+                amplitude: 0.0,
+                frequency: 0.0,
+                phase: 0.0,
+            },
+            x_sine2: SineWave {
+                amplitude: 0.0,
+                frequency: 0.0,
+                phase: 0.0,
+            },
+            y_sine1: SineWave {
+                amplitude: 0.0,
+                frequency: 0.0,
+                phase: 0.0,
+            },
+            y_sine2: SineWave {
+                amplitude: 0.0,
+                frequency: 0.0,
+                phase: 0.0,
+            },
             x_op: SineOperation::Add,
             y_op: SineOperation::Add,
         };
 
         compute_frame(
-            &mut raw, &mut bg, &mut ramp, &mut peak, &mut sine_state,
-            &layout, SimMode::OffsetNoise, &gains, &peak_p, &sine_p,
-            10.0, 5.0, true, true, &mut rng,
+            &mut raw,
+            &mut bg,
+            &mut ramp,
+            &mut peak,
+            &mut sine_state,
+            &layout,
+            SimMode::OffsetNoise,
+            &gains,
+            &peak_p,
+            &sine_p,
+            10.0,
+            5.0,
+            true,
+            true,
+            &mut rng,
         );
 
         if let NDDataBuffer::F64(v) = &raw {

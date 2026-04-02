@@ -4,9 +4,9 @@ mod links;
 mod processing;
 mod scan_index;
 
+use crate::runtime::sync::RwLock;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use crate::runtime::sync::RwLock;
 
 use crate::server::pv::ProcessVariable;
 use crate::server::record::{Record, RecordInstance, ScanType};
@@ -77,7 +77,9 @@ fn select_link_indices(selm: i16, seln: i16, count: usize) -> Vec<usize> {
             let i = seln as usize;
             if i < count { vec![i] } else { vec![] }
         }
-        2 => (0..count).filter(|i| (seln as u16) & (1 << i) != 0).collect(),
+        2 => (0..count)
+            .filter(|i| (seln as u16) & (1 << i) != 0)
+            .collect(),
         _ => (0..count).collect(),
     }
 }
@@ -97,7 +99,8 @@ impl PvDatabase {
     /// Add a simple PV with an initial value.
     pub async fn add_pv(&self, name: &str, initial: EpicsValue) {
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        self.inner.simple_pvs
+        self.inner
+            .simple_pvs
             .write()
             .await
             .insert(name.to_string(), pv);
@@ -108,14 +111,16 @@ impl PvDatabase {
         let instance = RecordInstance::new_boxed(name.to_string(), record);
         let scan = instance.common.scan;
         let phas = instance.common.phas;
-        self.inner.records
+        self.inner
+            .records
             .write()
             .await
             .insert(name.to_string(), Arc::new(RwLock::new(instance)));
 
         // Register in scan index
         if scan != ScanType::Passive {
-            self.inner.scan_index
+            self.inner
+                .scan_index
                 .write()
                 .await
                 .entry(scan)
@@ -158,9 +163,6 @@ impl PvDatabase {
         None
     }
 
-
-
-
     /// Get a record Arc by name.
     pub async fn get_record(&self, name: &str) -> Option<Arc<RwLock<RecordInstance>>> {
         self.inner.records.read().await.get(name).cloned()
@@ -170,7 +172,6 @@ impl PvDatabase {
     pub async fn all_record_names(&self) -> Vec<String> {
         self.inner.records.read().await.keys().cloned().collect()
     }
-
 }
 
 #[cfg(test)]
@@ -180,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn test_select_link_indices() {
         // All
-        assert_eq!(select_link_indices(0, 0, 6), vec![0,1,2,3,4,5]);
+        assert_eq!(select_link_indices(0, 0, 6), vec![0, 1, 2, 3, 4, 5]);
         // Specified
         assert_eq!(select_link_indices(1, 2, 6), vec![2]);
         assert_eq!(select_link_indices(1, 10, 6), Vec::<usize>::new());

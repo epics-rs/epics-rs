@@ -24,13 +24,8 @@ pub struct VerifyEntry {
 }
 
 /// Compare saved values against live PV values.
-pub async fn verify(
-    db: &PvDatabase,
-    save_file_path: &Path,
-) -> AutosaveResult<Vec<VerifyEntry>> {
-    let entries = read_save_file(save_file_path)
-        .await?
-        .unwrap_or_default();
+pub async fn verify(db: &PvDatabase, save_file_path: &Path) -> AutosaveResult<Vec<VerifyEntry>> {
+    let entries = read_save_file(save_file_path).await?.unwrap_or_default();
 
     let mut results = Vec::new();
 

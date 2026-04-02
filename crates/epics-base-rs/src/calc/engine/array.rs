@@ -1,13 +1,10 @@
-use super::array_value::{zip_map, ArrayStackValue};
+use super::array_value::{ArrayStackValue, zip_map};
 use super::error::CalcError;
 use super::opcodes::{ArrayOp, CoreOp, Opcode};
 use super::{ArrayInputs, CompiledExpr};
 use crate::calc::math::{derivative, fitting, stats};
 
-pub fn eval(
-    expr: &CompiledExpr,
-    inputs: &mut ArrayInputs,
-) -> Result<ArrayStackValue, CalcError> {
+pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackValue, CalcError> {
     let mut stack: Vec<ArrayStackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
@@ -65,13 +62,21 @@ pub fn eval(
                 CoreOp::Div => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| if y == 0.0 { f64::NAN } else { x / y })?);
+                    stack.push(zip_map(
+                        a,
+                        b,
+                        |x, y| if y == 0.0 { f64::NAN } else { x / y },
+                    )?);
                 }
                 CoreOp::Mod => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     stack.push(zip_map(a, b, |x, y| {
-                        if y as i64 == 0 { f64::NAN } else { ((x as i64) % (y as i64)) as f64 }
+                        if y as i64 == 0 {
+                            f64::NAN
+                        } else {
+                            ((x as i64) % (y as i64)) as f64
+                        }
                     })?);
                 }
                 CoreOp::Neg => {
@@ -88,44 +93,76 @@ pub fn eval(
                 CoreOp::Eq => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| if (x - y).abs() < 1e-11 { 1.0 } else { 0.0 })?);
+                    stack.push(zip_map(a, b, |x, y| {
+                        if (x - y).abs() < 1e-11 { 1.0 } else { 0.0 }
+                    })?);
                 }
                 CoreOp::Ne => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| if (x - y).abs() > 1e-11 { 1.0 } else { 0.0 })?);
+                    stack.push(zip_map(a, b, |x, y| {
+                        if (x - y).abs() > 1e-11 { 1.0 } else { 0.0 }
+                    })?);
                 }
                 CoreOp::Lt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| if (y - x) > 1e-11 { 1.0 } else { 0.0 })?);
+                    stack.push(zip_map(
+                        a,
+                        b,
+                        |x, y| if (y - x) > 1e-11 { 1.0 } else { 0.0 },
+                    )?);
                 }
                 CoreOp::Le => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| if (x - y).abs() < 1e-11 || x < y { 1.0 } else { 0.0 })?);
+                    stack.push(zip_map(a, b, |x, y| {
+                        if (x - y).abs() < 1e-11 || x < y {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })?);
                 }
                 CoreOp::Gt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| if (x - y) > 1e-11 { 1.0 } else { 0.0 })?);
+                    stack.push(zip_map(
+                        a,
+                        b,
+                        |x, y| if (x - y) > 1e-11 { 1.0 } else { 0.0 },
+                    )?);
                 }
                 CoreOp::Ge => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| if (x - y).abs() < 1e-11 || x > y { 1.0 } else { 0.0 })?);
+                    stack.push(zip_map(a, b, |x, y| {
+                        if (x - y).abs() < 1e-11 || x > y {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })?);
                 }
 
                 // Logical
                 CoreOp::And => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| if x != 0.0 && y != 0.0 { 1.0 } else { 0.0 })?);
+                    stack.push(zip_map(
+                        a,
+                        b,
+                        |x, y| if x != 0.0 && y != 0.0 { 1.0 } else { 0.0 },
+                    )?);
                 }
                 CoreOp::Or => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| if x != 0.0 || y != 0.0 { 1.0 } else { 0.0 })?);
+                    stack.push(zip_map(
+                        a,
+                        b,
+                        |x, y| if x != 0.0 || y != 0.0 { 1.0 } else { 0.0 },
+                    )?);
                 }
                 CoreOp::Not => {
                     let a = pop1(&mut stack)?;
@@ -176,34 +213,91 @@ pub fn eval(
                 CoreOp::CondEnd => {}
 
                 // Unary math functions (element-wise)
-                CoreOp::Abs => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.abs())); }
-                CoreOp::Sqrt => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.sqrt())); }
-                CoreOp::Exp => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.exp())); }
-                CoreOp::Log10 => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.log10())); }
-                CoreOp::LogE => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.ln())); }
-                CoreOp::Log2 => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.log2())); }
-                CoreOp::Sin => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.sin())); }
-                CoreOp::Cos => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.cos())); }
-                CoreOp::Tan => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.tan())); }
-                CoreOp::Asin => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.asin())); }
-                CoreOp::Acos => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.acos())); }
-                CoreOp::Atan => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.atan())); }
-                CoreOp::Sinh => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.sinh())); }
-                CoreOp::Cosh => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.cosh())); }
-                CoreOp::Tanh => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.tanh())); }
-                CoreOp::Ceil => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.ceil())); }
-                CoreOp::Floor => { let a = pop1(&mut stack)?; stack.push(a.map(|x| x.floor())); }
+                CoreOp::Abs => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.abs()));
+                }
+                CoreOp::Sqrt => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.sqrt()));
+                }
+                CoreOp::Exp => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.exp()));
+                }
+                CoreOp::Log10 => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.log10()));
+                }
+                CoreOp::LogE => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.ln()));
+                }
+                CoreOp::Log2 => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.log2()));
+                }
+                CoreOp::Sin => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.sin()));
+                }
+                CoreOp::Cos => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.cos()));
+                }
+                CoreOp::Tan => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.tan()));
+                }
+                CoreOp::Asin => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.asin()));
+                }
+                CoreOp::Acos => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.acos()));
+                }
+                CoreOp::Atan => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.atan()));
+                }
+                CoreOp::Sinh => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.sinh()));
+                }
+                CoreOp::Cosh => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.cosh()));
+                }
+                CoreOp::Tanh => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.tanh()));
+                }
+                CoreOp::Ceil => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.ceil()));
+                }
+                CoreOp::Floor => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| x.floor()));
+                }
                 CoreOp::Nint => {
                     let a = pop1(&mut stack)?;
                     stack.push(a.map(|x| {
-                        let rounded = if x >= 0.0 { (x + 0.5) as i64 } else { (x - 0.5) as i64 };
+                        let rounded = if x >= 0.0 {
+                            (x + 0.5) as i64
+                        } else {
+                            (x - 0.5) as i64
+                        };
                         rounded as f64
                     }));
                 }
 
                 CoreOp::IsNan(nargs) => {
                     let n = *nargs as usize;
-                    if stack.len() < n { return Err(CalcError::Underflow); }
+                    if stack.len() < n {
+                        return Err(CalcError::Underflow);
+                    }
                     let mut result = false;
                     for _ in 0..n {
                         let v = pop1_f64(&mut stack)?;
@@ -213,11 +307,17 @@ pub fn eval(
                 }
                 CoreOp::IsInf => {
                     let a = pop1_f64(&mut stack)?;
-                    stack.push(ArrayStackValue::Double(if a.is_infinite() { 1.0 } else { 0.0 }));
+                    stack.push(ArrayStackValue::Double(if a.is_infinite() {
+                        1.0
+                    } else {
+                        0.0
+                    }));
                 }
                 CoreOp::Finite(nargs) => {
                     let n = *nargs as usize;
-                    if stack.len() < n { return Err(CalcError::Underflow); }
+                    if stack.len() < n {
+                        return Err(CalcError::Underflow);
+                    }
                     let mut result = true;
                     for _ in 0..n {
                         let v = pop1_f64(&mut stack)?;
@@ -234,21 +334,29 @@ pub fn eval(
 
                 CoreOp::Max(nargs) => {
                     let n = *nargs as usize;
-                    if stack.len() < n { return Err(CalcError::Underflow); }
+                    if stack.len() < n {
+                        return Err(CalcError::Underflow);
+                    }
                     let mut result = pop1_f64(&mut stack)?;
                     for _ in 1..n {
                         let v = pop1_f64(&mut stack)?;
-                        if v > result || result.is_nan() { result = v; }
+                        if v > result || result.is_nan() {
+                            result = v;
+                        }
                     }
                     stack.push(ArrayStackValue::Double(result));
                 }
                 CoreOp::Min(nargs) => {
                     let n = *nargs as usize;
-                    if stack.len() < n { return Err(CalcError::Underflow); }
+                    if stack.len() < n {
+                        return Err(CalcError::Underflow);
+                    }
                     let mut result = pop1_f64(&mut stack)?;
                     for _ in 1..n {
                         let v = pop1_f64(&mut stack)?;
-                        if v < result || result.is_nan() { result = v; }
+                        if v < result || result.is_nan() {
+                            result = v;
+                        }
                     }
                     stack.push(ArrayStackValue::Double(result));
                 }
@@ -330,7 +438,11 @@ pub fn eval(
                         ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
                     };
                     let max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    stack.push(ArrayStackValue::Double(if arr.is_empty() { 0.0 } else { max }));
+                    stack.push(ArrayStackValue::Double(if arr.is_empty() {
+                        0.0
+                    } else {
+                        max
+                    }));
                 }
                 ArrayOp::ArrayMin => {
                     let v = pop1(&mut stack)?;
@@ -339,13 +451,21 @@ pub fn eval(
                         ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
                     };
                     let min = arr.iter().cloned().fold(f64::INFINITY, f64::min);
-                    stack.push(ArrayStackValue::Double(if arr.is_empty() { 0.0 } else { min }));
+                    stack.push(ArrayStackValue::Double(if arr.is_empty() {
+                        0.0
+                    } else {
+                        min
+                    }));
                 }
                 ArrayOp::IndexMax => {
                     let v = pop1(&mut stack)?;
                     let arr = v.as_array()?;
-                    let idx = arr.iter().enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    let idx = arr
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(i, _)| i as f64)
                         .unwrap_or(0.0);
                     stack.push(ArrayStackValue::Double(idx));
@@ -353,8 +473,12 @@ pub fn eval(
                 ArrayOp::IndexMin => {
                     let v = pop1(&mut stack)?;
                     let arr = v.as_array()?;
-                    let idx = arr.iter().enumerate()
-                        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    let idx = arr
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(i, _)| i as f64)
                         .unwrap_or(0.0);
                     stack.push(ArrayStackValue::Double(idx));
@@ -362,7 +486,9 @@ pub fn eval(
                 ArrayOp::IndexZero => {
                     let v = pop1(&mut stack)?;
                     let arr = v.as_array()?;
-                    let idx = arr.iter().position(|&x| x == 0.0)
+                    let idx = arr
+                        .iter()
+                        .position(|&x| x == 0.0)
                         .map(|i| i as f64)
                         .unwrap_or(-1.0);
                     stack.push(ArrayStackValue::Double(idx));
@@ -370,7 +496,9 @@ pub fn eval(
                 ArrayOp::IndexNonZero => {
                     let v = pop1(&mut stack)?;
                     let arr = v.as_array()?;
-                    let idx = arr.iter().position(|&x| x != 0.0)
+                    let idx = arr
+                        .iter()
+                        .position(|&x| x != 0.0)
                         .map(|i| i as f64)
                         .unwrap_or(-1.0);
                     stack.push(ArrayStackValue::Double(idx));
@@ -473,7 +601,9 @@ pub fn eval(
                     let ya = y.as_array()?;
                     let (a0, a1, a2) = fitting::fitpoly(xa, ya, None);
                     // Compute residual sum of squares
-                    let rss: f64 = xa.iter().zip(ya.iter())
+                    let rss: f64 = xa
+                        .iter()
+                        .zip(ya.iter())
                         .map(|(&xi, &yi)| {
                             let pred = a0 + a1 * xi + a2 * xi * xi;
                             (yi - pred).powi(2)
@@ -489,7 +619,10 @@ pub fn eval(
                     let ya = y.as_array()?;
                     let ma = mask.as_array()?;
                     let (a0, a1, a2) = fitting::fitpoly(xa, ya, Some(ma));
-                    let rss: f64 = xa.iter().zip(ya.iter()).zip(ma.iter())
+                    let rss: f64 = xa
+                        .iter()
+                        .zip(ya.iter())
+                        .zip(ma.iter())
                         .filter(|&((_, _), &m)| m != 0.0)
                         .map(|((&xi, &yi), _)| {
                             let pred = a0 + a1 * xi + a2 * xi * xi;
@@ -505,7 +638,10 @@ pub fn eval(
         }
     }
 
-    Ok(stack.last().cloned().unwrap_or(ArrayStackValue::Double(0.0)))
+    Ok(stack
+        .last()
+        .cloned()
+        .unwrap_or(ArrayStackValue::Double(0.0)))
 }
 
 fn pop1(stack: &mut Vec<ArrayStackValue>) -> Result<ArrayStackValue, CalcError> {
@@ -530,11 +666,17 @@ fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, 
         match &code[pc] {
             Opcode::Core(CoreOp::CondIf) => depth += 1,
             Opcode::Core(CoreOp::CondElse) => {
-                if depth == 0 && find_else { return Ok(pc + 1); }
+                if depth == 0 && find_else {
+                    return Ok(pc + 1);
+                }
             }
             Opcode::Core(CoreOp::CondEnd) => {
-                if depth == 0 && !find_else { return Ok(pc + 1); }
-                if depth > 0 { depth -= 1; }
+                if depth == 0 && !find_else {
+                    return Ok(pc + 1);
+                }
+                if depth > 0 {
+                    depth -= 1;
+                }
             }
             Opcode::Core(CoreOp::End) => break,
             _ => {}
@@ -554,7 +696,9 @@ fn simple_random() -> f64 {
             .unwrap_or_default()
             .as_nanos() as u64;
     }
-    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    s = s
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     SEED.store(s, Ordering::Relaxed);
     ((s >> 11) as f64) / ((1u64 << 53) as f64) + f64::MIN_POSITIVE
 }

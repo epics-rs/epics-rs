@@ -14,7 +14,7 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 use tracing::info;
 
-use crate::db_access::{alloc_origin, DbChannel, DbMultiMonitor};
+use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 use crate::snl::kohzu_ctl::HC;
 
 // ---------------------------------------------------------------------------
@@ -67,7 +67,11 @@ pub enum HrGeometry {
 
 impl HrGeometry {
     pub fn from_i16(v: i16) -> Self {
-        if v == 0 { Self::Nested } else { Self::Symmetric }
+        if v == 0 {
+            Self::Nested
+        } else {
+            Self::Symmetric
+        }
     }
 }
 
@@ -134,19 +138,31 @@ pub fn calc_phi2_symmetric(theta2: f64) -> f64 {
 /// Compute phi2 for two-independent mode with nested geometry.
 /// Uses the perturbation formula from hrCtl.st.
 pub fn calc_phi2_independent_nested(
-    phi1: f64, theta1: f64, theta2_nom: f64,
-    lambda: f64, lambda_nom: f64, d1: f64, d2: f64,
+    phi1: f64,
+    theta1: f64,
+    theta2_nom: f64,
+    lambda: f64,
+    lambda_nom: f64,
+    d1: f64,
+    d2: f64,
 ) -> f64 {
-    let correction = R2D * (lambda - lambda_nom)
+    let correction = R2D
+        * (lambda - lambda_nom)
         * (1.0 / (d1 * (theta1 * D2R).cos()) + 1.0 / (d2 * (theta2_nom * D2R).cos()));
     (phi1 + theta1 + theta2_nom) + correction
 }
 
 /// Compute phi2 for two-independent mode with symmetric geometry.
 pub fn calc_phi2_independent_symmetric(
-    theta2_nom: f64, lambda: f64, lambda_nom: f64, d1: f64, d2: f64, theta1: f64,
+    theta2_nom: f64,
+    lambda: f64,
+    lambda_nom: f64,
+    d1: f64,
+    d2: f64,
+    theta1: f64,
 ) -> f64 {
-    let correction = R2D * (lambda - lambda_nom)
+    let correction = R2D
+        * (lambda - lambda_nom)
         * (1.0 / (d1 * (theta1 * D2R).cos()) + 1.0 / (d2 * (theta2_nom * D2R).cos()));
     theta2_nom + correction
 }
@@ -184,11 +200,15 @@ pub struct HrReadback {
 
 #[allow(clippy::too_many_arguments)]
 pub fn calc_readback(
-    phi1_mot_rdbk: f64, phi2_mot_rdbk: f64,
-    phi1_off: f64, phi2_off: f64,
+    phi1_mot_rdbk: f64,
+    phi2_mot_rdbk: f64,
+    phi1_off: f64,
+    phi2_off: f64,
     world_off: f64, // in degrees already (worldOff * uR2D applied by caller)
-    d1: f64, d2: f64,
-    op_mode: HrOpMode, geom: HrGeometry,
+    d1: f64,
+    d2: f64,
+    op_mode: HrOpMode,
+    geom: HrGeometry,
 ) -> HrReadback {
     let world_off_deg = world_off * UR2D;
 
@@ -203,7 +223,9 @@ pub fn calc_readback(
         HrOpMode::TwoLocked => {
             let phi2 = match geom {
                 HrGeometry::Nested => motor_to_phi(phi2_mot_rdbk, phi2_off, world_off_deg),
-                HrGeometry::Symmetric => motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg),
+                HrGeometry::Symmetric => {
+                    motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg)
+                }
             };
             let lambda = d1 * (theta1_rdbk_initial * D2R).sin();
             (phi2, lambda)
@@ -211,7 +233,9 @@ pub fn calc_readback(
         HrOpMode::TwoIndependent => {
             let phi2 = match geom {
                 HrGeometry::Nested => motor_to_phi(phi2_mot_rdbk, phi2_off, world_off_deg),
-                HrGeometry::Symmetric => motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg),
+                HrGeometry::Symmetric => {
+                    motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg)
+                }
             };
             let theta2_nom = (d1 * (theta1_rdbk_initial * D2R).sin() / d2).asin() * R2D;
             let lambda = match geom {
@@ -243,7 +267,11 @@ pub fn calc_readback(
     } else {
         0.0
     };
-    let e_rdbk = if lambda_rdbk > 0.0 { HC / lambda_rdbk } else { 0.0 };
+    let e_rdbk = if lambda_rdbk > 0.0 {
+        HC / lambda_rdbk
+    } else {
+        0.0
+    };
 
     HrReadback {
         phi1_rdbk,
@@ -294,7 +322,10 @@ impl HrConfig {
 // ---------------------------------------------------------------------------
 
 /// Run the HR analyzer crystal control state machine.
-pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(
+    config: HrConfig,
+    db: PvDatabase,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::time::sleep(Duration::from_secs(3)).await;
     println!("hrCtl: starting for prefix={}HR{}", config.prefix, config.n);
 
@@ -406,8 +437,14 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
         config.pv("LambdaAO"),
         config.pv("Theta1AO"),
         config.pv("Theta2AO"),
-        config.pv("H1AO"), config.pv("K1AO"), config.pv("L1AO"), config.pv("A1AO"),
-        config.pv("H2AO"), config.pv("K2AO"), config.pv("L2AO"), config.pv("A2AO"),
+        config.pv("H1AO"),
+        config.pv("K1AO"),
+        config.pv("L1AO"),
+        config.pv("A1AO"),
+        config.pv("H2AO"),
+        config.pv("K2AO"),
+        config.pv("L2AO"),
+        config.pv("A2AO"),
         config.pv("PutBO"),
         config.pv("ModeBO"),
         config.pv("OperAckBO"),
@@ -422,7 +459,11 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
         config.pv("Moving"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-    println!("hrCtl: subscribed to {} PVs, {} active", monitored_pvs.len(), monitor.sub_count());
+    println!(
+        "hrCtl: subscribed to {} PVs, {} active",
+        monitored_pvs.len(),
+        monitor.sub_count()
+    );
 
     // -- Initialize --
     let _ = ch_put_vals.put_i16(0).await;
@@ -482,11 +523,25 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
     // Compute initial lambda/E from theta1
     let mut lambda_val = d1 * (theta1_val * D2R).sin();
     let _ = ch_lambda.put_f64(lambda_val).await;
-    let mut e_val = if lambda_val > 0.0 { HC / lambda_val } else { 0.0 };
+    let mut e_val = if lambda_val > 0.0 {
+        HC / lambda_val
+    } else {
+        0.0
+    };
     let _ = ch_e.put_f64(e_val).await;
 
     // Initial readback
-    let rdbk = calc_readback(phi1_mot_rdbk, phi2_mot_rdbk, phi1_off, phi2_off, world_off, d1, d2, op_mode, geom);
+    let rdbk = calc_readback(
+        phi1_mot_rdbk,
+        phi2_mot_rdbk,
+        phi1_off,
+        phi2_off,
+        world_off,
+        d1,
+        d2,
+        op_mode,
+        geom,
+    );
     let _ = ch_phi1_rdbk.put_f64_post(rdbk.phi1_rdbk).await;
     let _ = ch_theta1_rdbk.put_f64_post(rdbk.theta1_rdbk).await;
     let _ = ch_phi2_rdbk.put_f64_post(rdbk.phi2_rdbk).await;
@@ -497,17 +552,24 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
     let _ = ch_msg1.put_string("HR Control Ready").await;
     let _ = ch_msg2.put_string(" ").await;
 
-    info!("HR controller initialized for {}HR{}", config.prefix, config.n);
+    info!(
+        "HR controller initialized for {}HR{}",
+        config.prefix, config.n
+    );
 
     // PV name constants for dispatch
     let pv_e = config.pv("EAO");
     let pv_lambda = config.pv("LambdaAO");
     let pv_theta1 = config.pv("Theta1AO");
     let pv_theta2 = config.pv("Theta2AO");
-    let pv_h1 = config.pv("H1AO"); let pv_k1 = config.pv("K1AO");
-    let pv_l1 = config.pv("L1AO"); let pv_a1 = config.pv("A1AO");
-    let pv_h2 = config.pv("H2AO"); let pv_k2 = config.pv("K2AO");
-    let pv_l2 = config.pv("L2AO"); let pv_a2 = config.pv("A2AO");
+    let pv_h1 = config.pv("H1AO");
+    let pv_k1 = config.pv("K1AO");
+    let pv_l1 = config.pv("L1AO");
+    let pv_a1 = config.pv("A1AO");
+    let pv_h2 = config.pv("H2AO");
+    let pv_k2 = config.pv("K2AO");
+    let pv_l2 = config.pv("L2AO");
+    let pv_a2 = config.pv("A2AO");
     let pv_put_vals = config.pv("PutBO");
     let pv_auto_mode = config.pv("ModeBO");
     let pv_oper_ack = config.pv("OperAckBO");
@@ -554,20 +616,38 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
         } else if changed_pv == pv_theta2 {
             theta2_val = new_val;
             proceed_to_theta_changed = true;
-        } else if changed_pv == pv_h1 || changed_pv == pv_k1 || changed_pv == pv_l1 || changed_pv == pv_a1 {
-            h1 = ch_h1.get_f64().await; k1 = ch_k1.get_f64().await;
-            l1 = ch_l1.get_f64().await; a1 = ch_a1.get_f64().await;
-            let (d, _, _) = calc_2d_spacing(a1, h1, k1, l1); d1 = d;
+        } else if changed_pv == pv_h1
+            || changed_pv == pv_k1
+            || changed_pv == pv_l1
+            || changed_pv == pv_a1
+        {
+            h1 = ch_h1.get_f64().await;
+            k1 = ch_k1.get_f64().await;
+            l1 = ch_l1.get_f64().await;
+            a1 = ch_a1.get_f64().await;
+            let (d, _, _) = calc_2d_spacing(a1, h1, k1, l1);
+            d1 = d;
             let _ = ch_d1.put_f64(d1).await;
-            auto_mode = false; let _ = ch_auto_mode.put_i16(0).await;
-        } else if changed_pv == pv_h2 || changed_pv == pv_k2 || changed_pv == pv_l2 || changed_pv == pv_a2 {
-            h2 = ch_h2.get_f64().await; k2 = ch_k2.get_f64().await;
-            l2 = ch_l2.get_f64().await; a2 = ch_a2.get_f64().await;
-            let (d, _, _) = calc_2d_spacing(a2, h2, k2, l2); d2 = d;
+            auto_mode = false;
+            let _ = ch_auto_mode.put_i16(0).await;
+        } else if changed_pv == pv_h2
+            || changed_pv == pv_k2
+            || changed_pv == pv_l2
+            || changed_pv == pv_a2
+        {
+            h2 = ch_h2.get_f64().await;
+            k2 = ch_k2.get_f64().await;
+            l2 = ch_l2.get_f64().await;
+            a2 = ch_a2.get_f64().await;
+            let (d, _, _) = calc_2d_spacing(a2, h2, k2, l2);
+            d2 = d;
             let _ = ch_d2.put_f64(d2).await;
-            auto_mode = false; let _ = ch_auto_mode.put_i16(0).await;
+            auto_mode = false;
+            let _ = ch_auto_mode.put_i16(0).await;
         } else if changed_pv == pv_put_vals {
-            if new_val as i16 != 0 { proceed_to_theta_changed = true; }
+            if new_val as i16 != 0 {
+                proceed_to_theta_changed = true;
+            }
         } else if changed_pv == pv_auto_mode {
             auto_mode = new_val as i16 != 0;
         } else if changed_pv == pv_oper_ack {
@@ -577,7 +657,17 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
                 let _ = ch_msg2.put_string(" ").await;
             }
         } else if changed_pv == pv_phi1_mot_rbv || changed_pv == pv_phi2_mot_rbv {
-            let rdbk = calc_readback(ch_phi1_mot_rbv.get_f64().await, ch_phi2_mot_rbv.get_f64().await, phi1_off, phi2_off, world_off, d1, d2, op_mode, geom);
+            let rdbk = calc_readback(
+                ch_phi1_mot_rbv.get_f64().await,
+                ch_phi2_mot_rbv.get_f64().await,
+                phi1_off,
+                phi2_off,
+                world_off,
+                d1,
+                d2,
+                op_mode,
+                geom,
+            );
             let _ = ch_phi1_rdbk.put_f64_post(rdbk.phi1_rdbk).await;
             let _ = ch_theta1_rdbk.put_f64_post(rdbk.theta1_rdbk).await;
             let _ = ch_lambda_rdbk.put_f64_post(rdbk.lambda_rdbk).await;
@@ -604,34 +694,50 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
             geom = HrGeometry::from_i16(new_val as i16);
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
-            let _ = ch_msg1.put_string("New geometry. Switch Phi 2 motor dir.").await;
+            let _ = ch_msg1
+                .put_string("New geometry. Switch Phi 2 motor dir.")
+                .await;
             let _ = ch_alert.put_i16(1).await;
         }
 
-        if !proceed_to_theta_changed { continue; }
+        if !proceed_to_theta_changed {
+            continue;
+        }
 
         // -- Lambda changed processing --
         if d1 > 0.0 && lambda_val > d1 {
-            let _ = ch_msg1.put_string("Wavelength > 2d spacing of crystal 1.").await;
+            let _ = ch_msg1
+                .put_string("Wavelength > 2d spacing of crystal 1.")
+                .await;
             let _ = ch_alert.put_i16(1).await;
         } else if d2 > 0.0 && lambda_val > d2 && op_mode != HrOpMode::Single {
-            let _ = ch_msg1.put_string("Wavelength > 2d spacing of crystal 2.").await;
+            let _ = ch_msg1
+                .put_string("Wavelength > 2d spacing of crystal 2.")
+                .await;
             let _ = ch_alert.put_i16(1).await;
         } else {
             // Compute theta from lambda
             match op_mode {
                 HrOpMode::Single => {
-                    if d1 > 0.0 { theta1_val = (lambda_val / d1).asin() * R2D; }
+                    if d1 > 0.0 {
+                        theta1_val = (lambda_val / d1).asin() * R2D;
+                    }
                     let _ = ch_theta1.put_f64(theta1_val).await;
                 }
                 HrOpMode::TwoLocked => {
-                    if d1 > 0.0 { theta1_val = (lambda_val / d1).asin() * R2D; }
-                    if d2 > 0.0 { theta2_val = (lambda_val / d2).asin() * R2D; }
+                    if d1 > 0.0 {
+                        theta1_val = (lambda_val / d1).asin() * R2D;
+                    }
+                    if d2 > 0.0 {
+                        theta2_val = (lambda_val / d2).asin() * R2D;
+                    }
                     let _ = ch_theta1.put_f64(theta1_val).await;
                     let _ = ch_theta2.put_f64(theta2_val).await;
                 }
                 HrOpMode::TwoIndependent => {
-                    if d2 > 0.0 { theta2_val = (lambda_val / d2).asin() * R2D; }
+                    if d2 > 0.0 {
+                        theta2_val = (lambda_val / d2).asin() * R2D;
+                    }
                     let _ = ch_theta2.put_f64(theta2_val).await;
                 }
             }
@@ -652,23 +758,47 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
             }
             HrOpMode::TwoIndependent => {
                 let lambda_nom = d1 * (theta1_val * D2R).sin();
-                let theta2_nom = if d2 > 0.0 { (lambda_nom / d2).asin() * R2D } else { 0.0 };
+                let theta2_nom = if d2 > 0.0 {
+                    (lambda_nom / d2).asin() * R2D
+                } else {
+                    0.0
+                };
                 lambda_val = d2 * (theta2_val * D2R).sin();
                 phi1_val = theta1_to_phi1(theta1_val);
                 phi2_val = match geom {
-                    HrGeometry::Nested => calc_phi2_independent_nested(phi1_val, theta1_val, theta2_nom, lambda_val, lambda_nom, d1, d2),
-                    HrGeometry::Symmetric => calc_phi2_independent_symmetric(theta2_nom, lambda_val, lambda_nom, d1, d2, theta1_val),
+                    HrGeometry::Nested => calc_phi2_independent_nested(
+                        phi1_val, theta1_val, theta2_nom, lambda_val, lambda_nom, d1, d2,
+                    ),
+                    HrGeometry::Symmetric => calc_phi2_independent_symmetric(
+                        theta2_nom, lambda_val, lambda_nom, d1, d2, theta1_val,
+                    ),
                 };
             }
         }
         let _ = ch_phi1.put_f64(phi1_val).await;
-        if op_mode != HrOpMode::Single { let _ = ch_phi2.put_f64(phi2_val).await; }
+        if op_mode != HrOpMode::Single {
+            let _ = ch_phi2.put_f64(phi2_val).await;
+        }
         let _ = ch_lambda.put_f64(lambda_val).await;
-        e_val = if lambda_val > 0.0 { HC / lambda_val } else { 0.0 };
+        e_val = if lambda_val > 0.0 {
+            HC / lambda_val
+        } else {
+            0.0
+        };
         let _ = ch_e.put_f64(e_val).await;
 
         // Update readbacks
-        let rdbk = calc_readback(ch_phi1_mot_rbv.get_f64().await, ch_phi2_mot_rbv.get_f64().await, phi1_off, phi2_off, world_off, d1, d2, op_mode, geom);
+        let rdbk = calc_readback(
+            ch_phi1_mot_rbv.get_f64().await,
+            ch_phi2_mot_rbv.get_f64().await,
+            phi1_off,
+            phi2_off,
+            world_off,
+            d1,
+            d2,
+            op_mode,
+            geom,
+        );
         let _ = ch_phi1_rdbk.put_f64_post(rdbk.phi1_rdbk).await;
         let _ = ch_theta1_rdbk.put_f64_post(rdbk.theta1_rdbk).await;
         let _ = ch_lambda_rdbk.put_f64_post(rdbk.lambda_rdbk).await;
@@ -721,17 +851,25 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
 
                 // Check limit switches
                 if ch_phi1_hls.get_i16().await != 0 || ch_phi1_lls.get_i16().await != 0 {
-                    let _ = ch_msg1.put_string("Theta 1 motor hit a limit switch!").await;
+                    let _ = ch_msg1
+                        .put_string("Theta 1 motor hit a limit switch!")
+                        .await;
                     let _ = ch_alert.put_i16(1).await;
                     auto_mode = false;
                     let _ = ch_auto_mode.put_i16(0).await;
                     let _ = ch_phi1_mot_stop.put_i16(1).await;
-                    if op_mode != HrOpMode::Single { let _ = ch_phi2_mot_stop.put_i16(1).await; }
+                    if op_mode != HrOpMode::Single {
+                        let _ = ch_phi2_mot_stop.put_i16(1).await;
+                    }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     break;
                 }
-                if op_mode != HrOpMode::Single && (ch_phi2_hls.get_i16().await != 0 || ch_phi2_lls.get_i16().await != 0) {
-                    let _ = ch_msg1.put_string("Theta 2 motor hit a limit switch!").await;
+                if op_mode != HrOpMode::Single
+                    && (ch_phi2_hls.get_i16().await != 0 || ch_phi2_lls.get_i16().await != 0)
+                {
+                    let _ = ch_msg1
+                        .put_string("Theta 2 motor hit a limit switch!")
+                        .await;
                     let _ = ch_alert.put_i16(1).await;
                     auto_mode = false;
                     let _ = ch_auto_mode.put_i16(0).await;
@@ -742,7 +880,17 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
                 }
 
                 // Update readbacks
-                let rdbk = calc_readback(ch_phi1_mot_rbv.get_f64().await, ch_phi2_mot_rbv.get_f64().await, phi1_off, phi2_off, world_off, d1, d2, op_mode, geom);
+                let rdbk = calc_readback(
+                    ch_phi1_mot_rbv.get_f64().await,
+                    ch_phi2_mot_rbv.get_f64().await,
+                    phi1_off,
+                    phi2_off,
+                    world_off,
+                    d1,
+                    d2,
+                    op_mode,
+                    geom,
+                );
                 let _ = ch_phi1_rdbk.put_f64_post(rdbk.phi1_rdbk).await;
                 let _ = ch_theta1_rdbk.put_f64_post(rdbk.theta1_rdbk).await;
                 let _ = ch_lambda_rdbk.put_f64_post(rdbk.lambda_rdbk).await;
@@ -753,18 +901,32 @@ pub async fn run(config: HrConfig, db: PvDatabase) -> Result<(), Box<dyn std::er
                 }
 
                 let d1_done = ch_phi1_dmov.get_i16().await != 0;
-                let d2_done = if op_mode != HrOpMode::Single { ch_phi2_dmov.get_i16().await != 0 } else { true };
-                if d1_done && d2_done { break; }
+                let d2_done = if op_mode != HrOpMode::Single {
+                    ch_phi2_dmov.get_i16().await != 0
+                } else {
+                    true
+                };
+                if d1_done && d2_done {
+                    break;
+                }
             }
             _caused_move = false;
             let _ = ch_moving.put_i16(0).await;
         }
 
         // Echo updates
-        let _ = ch_phi1_rdbk_echo.put_f64(ch_phi1_mot_rbv.get_f64().await).await;
-        let _ = ch_phi2_rdbk_echo.put_f64(ch_phi2_mot_rbv.get_f64().await).await;
-        let _ = ch_phi1_dmov_echo.put_i16(ch_phi1_dmov.get_i16().await).await;
-        let _ = ch_phi2_dmov_echo.put_i16(ch_phi2_dmov.get_i16().await).await;
+        let _ = ch_phi1_rdbk_echo
+            .put_f64(ch_phi1_mot_rbv.get_f64().await)
+            .await;
+        let _ = ch_phi2_rdbk_echo
+            .put_f64(ch_phi2_mot_rbv.get_f64().await)
+            .await;
+        let _ = ch_phi1_dmov_echo
+            .put_i16(ch_phi1_dmov.get_i16().await)
+            .await;
+        let _ = ch_phi2_dmov_echo
+            .put_i16(ch_phi2_dmov.get_i16().await)
+            .await;
     }
 }
 
@@ -807,7 +969,12 @@ mod tests {
         let world = 0.05;
         let motor = phi_to_motor(phi, phi_off, world);
         let phi2 = motor_to_phi(motor, phi_off, world);
-        assert!((phi - phi2).abs() < 1e-8, "phi roundtrip: {} vs {}", phi, phi2);
+        assert!(
+            (phi - phi2).abs() < 1e-8,
+            "phi roundtrip: {} vs {}",
+            phi,
+            phi2
+        );
     }
 
     #[test]
@@ -830,11 +997,31 @@ mod tests {
         // Motor value in micro-radians for theta1=14 deg
         let theta1_deg = 14.0;
         let phi1_mot = theta1_deg * D2UR;
-        let rdbk = calc_readback(phi1_mot, 0.0, phi1_off, phi2_off, world_off, d1, d2, HrOpMode::Single, HrGeometry::Nested);
+        let rdbk = calc_readback(
+            phi1_mot,
+            0.0,
+            phi1_off,
+            phi2_off,
+            world_off,
+            d1,
+            d2,
+            HrOpMode::Single,
+            HrGeometry::Nested,
+        );
         // lambda = d1 * sin(theta1)
         let expected_lambda = d1 * (theta1_deg * D2R).sin();
-        assert!((rdbk.lambda_rdbk - expected_lambda).abs() < 1e-6, "lambda: {} vs {}", rdbk.lambda_rdbk, expected_lambda);
-        assert!((rdbk.theta1_rdbk - theta1_deg).abs() < 0.01, "theta1: {} vs {}", rdbk.theta1_rdbk, theta1_deg);
+        assert!(
+            (rdbk.lambda_rdbk - expected_lambda).abs() < 1e-6,
+            "lambda: {} vs {}",
+            rdbk.lambda_rdbk,
+            expected_lambda
+        );
+        assert!(
+            (rdbk.theta1_rdbk - theta1_deg).abs() < 0.01,
+            "theta1: {} vs {}",
+            rdbk.theta1_rdbk,
+            theta1_deg
+        );
         assert!(rdbk.e_rdbk > 0.0);
     }
 
@@ -848,7 +1035,17 @@ mod tests {
         let phi2 = phi1 + theta1 + theta2;
         let phi1_mot = phi1 * D2UR;
         let phi2_mot = phi2 * D2UR;
-        let rdbk = calc_readback(phi1_mot, phi2_mot, 0.0, 0.0, 0.0, d1, d2, HrOpMode::TwoLocked, HrGeometry::Nested);
+        let rdbk = calc_readback(
+            phi1_mot,
+            phi2_mot,
+            0.0,
+            0.0,
+            0.0,
+            d1,
+            d2,
+            HrOpMode::TwoLocked,
+            HrGeometry::Nested,
+        );
         let expected_lambda = d1 * (theta1 * D2R).sin();
         assert!((rdbk.lambda_rdbk - expected_lambda).abs() < 1e-4);
     }

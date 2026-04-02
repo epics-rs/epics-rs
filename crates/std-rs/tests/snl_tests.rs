@@ -1,7 +1,7 @@
 #![allow(clippy::field_reassign_with_default)]
-use std_rs::snl::femto::*;
-use std_rs::snl::delay_do::*;
 use std::time::Duration;
+use std_rs::snl::delay_do::*;
+use std_rs::snl::femto::*;
 
 // ============================================================
 // Femto controller
@@ -9,13 +9,13 @@ use std::time::Duration;
 
 #[test]
 fn test_gain_lookup_table() {
-    assert_eq!(POWERS[0], 5);   // 10^5
-    assert_eq!(POWERS[1], 6);   // 10^6
-    assert_eq!(POWERS[6], 11);  // 10^11
-    assert_eq!(POWERS[7], 0);   // unused
-    assert_eq!(POWERS[8], 3);   // 10^3
-    assert_eq!(POWERS[14], 9);  // 10^9
-    assert_eq!(POWERS[15], 0);  // unused
+    assert_eq!(POWERS[0], 5); // 10^5
+    assert_eq!(POWERS[1], 6); // 10^6
+    assert_eq!(POWERS[6], 11); // 10^11
+    assert_eq!(POWERS[7], 0); // unused
+    assert_eq!(POWERS[8], 3); // 10^3
+    assert_eq!(POWERS[14], 9); // 10^9
+    assert_eq!(POWERS[15], 0); // unused
 }
 
 #[test]
@@ -49,7 +49,7 @@ fn test_roundtrip_bits() {
 fn test_is_valid_gain_index() {
     assert!(is_valid_gain_index(0));
     assert!(is_valid_gain_index(6));
-    assert!(!is_valid_gain_index(7));  // UNUSED
+    assert!(!is_valid_gain_index(7)); // UNUSED
     assert!(is_valid_gain_index(8));
     assert!(is_valid_gain_index(14));
     assert!(!is_valid_gain_index(15)); // MAX_GAIN
@@ -106,7 +106,10 @@ fn test_femto_bits_changed() {
 
     // External bit change
     ctrl.step(Some(FemtoEvent::BitsChanged {
-        g1: true, g2: false, g3: true, no: false,
+        g1: true,
+        g2: false,
+        g3: true,
+        no: false,
     }));
     assert_eq!(ctrl.state, FemtoState::UpdateGain);
 
@@ -121,14 +124,20 @@ fn test_femto_bits_changed() {
 // ============================================================
 
 fn make_inputs(
-    enable: bool, enable_changed: bool,
-    standby: bool, standby_changed: bool,
-    active: bool, active_changed: bool,
+    enable: bool,
+    enable_changed: bool,
+    standby: bool,
+    standby_changed: bool,
+    active: bool,
+    active_changed: bool,
 ) -> DelayDoInputs {
     DelayDoInputs {
-        enable, enable_changed,
-        standby, standby_changed,
-        active, active_changed,
+        enable,
+        enable_changed,
+        standby,
+        standby_changed,
+        active,
+        active_changed,
     }
 }
 
@@ -166,7 +175,7 @@ fn test_delay_do_idle_to_standby() {
 fn test_delay_do_standby_to_waiting() {
     let mut ctrl = DelayDoController::new(0.0);
     ctrl.step(&make_inputs(true, false, false, false, false, false)); // Init→Idle
-    ctrl.step(&make_inputs(true, false, true, true, false, false));   // Idle→Standby
+    ctrl.step(&make_inputs(true, false, true, true, false, false)); // Idle→Standby
 
     // Active happened during standby
     ctrl.step(&make_inputs(true, false, true, false, true, true)); // Standby (active seen)
@@ -180,7 +189,7 @@ fn test_delay_do_standby_to_waiting() {
 fn test_delay_do_action_fires() {
     let mut ctrl = DelayDoController::new(0.0); // 0 delay
     ctrl.step(&make_inputs(true, false, false, false, false, false)); // Init→Idle
-    ctrl.step(&make_inputs(true, false, false, false, true, true));   // Idle→Active
+    ctrl.step(&make_inputs(true, false, false, false, true, true)); // Idle→Active
 
     // Active goes false → Waiting
     ctrl.step(&make_inputs(true, false, false, false, false, true));

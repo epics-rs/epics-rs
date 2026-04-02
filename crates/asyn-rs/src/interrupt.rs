@@ -120,7 +120,10 @@ impl InterruptManager {
     pub fn register_interrupt_user(
         &self,
         filter: InterruptFilter,
-    ) -> (InterruptSubscription, tokio::sync::mpsc::Receiver<InterruptValue>) {
+    ) -> (
+        InterruptSubscription,
+        tokio::sync::mpsc::Receiver<InterruptValue>,
+    ) {
         let mut intr_rx = self.async_tx.subscribe();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -335,7 +338,7 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         match result {
             Ok(None) => {} // channel closed — correct
-            Err(_) => {} // timed out — also acceptable (task hasn't exited yet)
+            Err(_) => {}   // timed out — also acceptable (task hasn't exited yet)
             Ok(Some(_)) => panic!("should not receive after unsubscribe"),
         }
     }

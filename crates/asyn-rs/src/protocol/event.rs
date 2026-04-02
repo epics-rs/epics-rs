@@ -132,7 +132,10 @@ mod tests {
 
     #[test]
     fn event_filter_serde() {
-        let filter = EventFilter { reason: Some(3), addr: Some(0) };
+        let filter = EventFilter {
+            reason: Some(3),
+            addr: Some(0),
+        };
         let json = serde_json::to_string(&filter).unwrap();
         let back: EventFilter = serde_json::from_str(&json).unwrap();
         assert_eq!(filter, back);

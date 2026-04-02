@@ -76,8 +76,11 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     let mut link_part = s;
     loop {
         let trimmed = link_part.trim_end();
-        if let Some(rest) = trimmed.strip_suffix(" NMS").or_else(|| trimmed.strip_suffix(" MS"))
-            .or_else(|| trimmed.strip_suffix(" MSS")).or_else(|| trimmed.strip_suffix(" MSI"))
+        if let Some(rest) = trimmed
+            .strip_suffix(" NMS")
+            .or_else(|| trimmed.strip_suffix(" MS"))
+            .or_else(|| trimmed.strip_suffix(" MSS"))
+            .or_else(|| trimmed.strip_suffix(" MSI"))
         {
             link_part = rest;
             continue;
@@ -87,7 +90,10 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
             link_part = rest;
             continue;
         }
-        if let Some(rest) = trimmed.strip_suffix(" CP").or_else(|| trimmed.strip_suffix(" CPP")) {
+        if let Some(rest) = trimmed
+            .strip_suffix(" CP")
+            .or_else(|| trimmed.strip_suffix(" CPP"))
+        {
             policy = LinkProcessPolicy::ChannelProcess;
             link_part = rest;
             continue;
@@ -108,7 +114,7 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
 
     // Quoted string constant
     if link_part.starts_with('"') && link_part.ends_with('"') && link_part.len() >= 2 {
-        return ParsedLink::Constant(link_part[1..link_part.len()-1].to_string());
+        return ParsedLink::Constant(link_part[1..link_part.len() - 1].to_string());
     }
 
     // DB link: try rsplit on '.', validate field part is uppercase alpha 1-4 chars

@@ -20,7 +20,10 @@ mod tests {
 
     #[test]
     fn test_codec_clone() {
-        let c = Codec { name: CodecName::LZ4, compressed_size: 1024 };
+        let c = Codec {
+            name: CodecName::LZ4,
+            compressed_size: 1024,
+        };
         let c2 = c.clone();
         assert_eq!(c2.name, CodecName::LZ4);
         assert_eq!(c2.compressed_size, 1024);

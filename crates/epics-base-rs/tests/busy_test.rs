@@ -1,13 +1,13 @@
-use epics_base_rs::server::records::busy::BusyRecord;
-use epics_ca_rs::server::CaServerBuilder;
 use epics_base_rs::server::record::Record;
+use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
+use epics_ca_rs::server::CaServerBuilder;
 use std::collections::HashMap;
 
 #[test]
 fn test_register_record_type() {
-    let builder = CaServerBuilder::new()
-        .register_record_type("busy", || Box::new(BusyRecord::default()));
+    let builder =
+        CaServerBuilder::new().register_record_type("busy", || Box::new(BusyRecord::default()));
     // Registration succeeds — builder is valid
     drop(builder);
 }

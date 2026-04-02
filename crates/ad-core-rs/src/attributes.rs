@@ -2,7 +2,10 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum NDAttrSource {
     Driver,
-    Param { port_name: String, param_name: String },
+    Param {
+        port_name: String,
+        param_name: String,
+    },
     Constant,
 }
 
@@ -259,7 +262,10 @@ mod tests {
             value: NDAttrValue::Float64(25.0),
         };
         match &attr.source {
-            NDAttrSource::Param { port_name, param_name } => {
+            NDAttrSource::Param {
+                port_name,
+                param_name,
+            } => {
                 assert_eq!(port_name, "SIM1");
                 assert_eq!(param_name, "TEMPERATURE");
             }

@@ -7,10 +7,29 @@ use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 /// Shape to draw.
 #[derive(Debug, Clone)]
 pub enum OverlayShape {
-    Cross { center_x: usize, center_y: usize, size: usize },
-    Rectangle { x: usize, y: usize, width: usize, height: usize },
-    Ellipse { center_x: usize, center_y: usize, rx: usize, ry: usize },
-    Text { x: usize, y: usize, text: String, font_size: usize },
+    Cross {
+        center_x: usize,
+        center_y: usize,
+        size: usize,
+    },
+    Rectangle {
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    },
+    Ellipse {
+        center_x: usize,
+        center_y: usize,
+        rx: usize,
+        ry: usize,
+    },
+    Text {
+        x: usize,
+        y: usize,
+        text: String,
+        font_size: usize,
+    },
 }
 
 /// Draw mode.
@@ -283,7 +302,10 @@ impl NDPluginProcess for OverlayProcessor {
         "NDPluginOverlay"
     }
 
-    fn register_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
         // NDOverlay.template params
         base.create_param("MAX_SIZE_X", ParamType::Int32)?;
@@ -327,7 +349,12 @@ mod tests {
     fn test_rectangle() {
         let arr = make_8x8();
         let overlays = vec![OverlayDef {
-            shape: OverlayShape::Rectangle { x: 1, y: 1, width: 4, height: 3 },
+            shape: OverlayShape::Rectangle {
+                x: 1,
+                y: 1,
+                width: 4,
+                height: 3,
+            },
             draw_mode: DrawMode::Set,
             color: [255, 0, 0],
         }];
@@ -352,7 +379,11 @@ mod tests {
         }
 
         let overlays = vec![OverlayDef {
-            shape: OverlayShape::Cross { center_x: 0, center_y: 0, size: 2 },
+            shape: OverlayShape::Cross {
+                center_x: 0,
+                center_y: 0,
+                size: 2,
+            },
             draw_mode: DrawMode::XOR,
             color: [0xFF, 0, 0],
         }];
@@ -373,7 +404,11 @@ mod tests {
     fn test_cross() {
         let arr = make_8x8();
         let overlays = vec![OverlayDef {
-            shape: OverlayShape::Cross { center_x: 4, center_y: 4, size: 4 },
+            shape: OverlayShape::Cross {
+                center_x: 4,
+                center_y: 4,
+                size: 4,
+            },
             draw_mode: DrawMode::Set,
             color: [200, 0, 0],
         }];
@@ -431,7 +466,12 @@ mod tests {
         );
         // Fill with zeros (already done by NDArray::new)
         let overlays = vec![OverlayDef {
-            shape: OverlayShape::Rectangle { x: 1, y: 1, width: 4, height: 3 },
+            shape: OverlayShape::Rectangle {
+                x: 1,
+                y: 1,
+                width: 4,
+                height: 3,
+            },
             draw_mode: DrawMode::Set,
             color: [200, 0, 0],
         }];
@@ -453,7 +493,11 @@ mod tests {
             NDDataType::Float32,
         );
         let overlays = vec![OverlayDef {
-            shape: OverlayShape::Cross { center_x: 4, center_y: 4, size: 2 },
+            shape: OverlayShape::Cross {
+                center_x: 4,
+                center_y: 4,
+                size: 2,
+            },
             draw_mode: DrawMode::XOR, // should be treated as Set for floats
             color: [100, 0, 0],
         }];

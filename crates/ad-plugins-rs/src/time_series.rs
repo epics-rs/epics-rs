@@ -3,11 +3,10 @@ use std::time::Instant;
 
 use asyn_rs::param::ParamType;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::user::AsynUser;
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use asyn_rs::user::AsynUser;
 use parking_lot::Mutex;
-
 
 // ===== Stats-specific channel definitions =====
 
@@ -205,11 +204,15 @@ impl TimeSeriesPortDriver {
         shared: Arc<Mutex<SharedTsState>>,
     ) -> Self {
         let num_channels = channel_names.len();
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags {
-            multi_device: false,
-            can_block: false,
-            destructible: true,
-        });
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags {
+                multi_device: false,
+                can_block: false,
+                destructible: true,
+            },
+        );
 
         // NDPluginBase params (NDTimeSeries.template includes NDPluginBase.template)
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
@@ -219,18 +222,34 @@ impl TimeSeriesPortDriver {
         let ts_acquire = base.create_param("TS_ACQUIRE", ParamType::Int32).unwrap();
         let _ = base.set_int32_param(ts_acquire, 0, 0);
         let ts_read = base.create_param("TS_READ", ParamType::Int32).unwrap();
-        let ts_num_points = base.create_param("TS_NUM_POINTS", ParamType::Int32).unwrap();
+        let ts_num_points = base
+            .create_param("TS_NUM_POINTS", ParamType::Int32)
+            .unwrap();
         let _ = base.set_int32_param(ts_num_points, 0, num_points as i32);
-        let ts_current_point = base.create_param("TS_CURRENT_POINT", ParamType::Int32).unwrap();
+        let ts_current_point = base
+            .create_param("TS_CURRENT_POINT", ParamType::Int32)
+            .unwrap();
         let _ = base.set_int32_param(ts_current_point, 0, 0);
-        let ts_time_per_point = base.create_param("TS_TIME_PER_POINT", ParamType::Float64).unwrap();
-        let ts_averaging_time = base.create_param("TS_AVERAGING_TIME", ParamType::Float64).unwrap();
-        let ts_num_average = base.create_param("TS_NUM_AVERAGE", ParamType::Int32).unwrap();
+        let ts_time_per_point = base
+            .create_param("TS_TIME_PER_POINT", ParamType::Float64)
+            .unwrap();
+        let ts_averaging_time = base
+            .create_param("TS_AVERAGING_TIME", ParamType::Float64)
+            .unwrap();
+        let ts_num_average = base
+            .create_param("TS_NUM_AVERAGE", ParamType::Int32)
+            .unwrap();
         let _ = base.set_int32_param(ts_num_average, 0, 1);
-        let ts_elapsed_time = base.create_param("TS_ELAPSED_TIME", ParamType::Float64).unwrap();
-        let ts_acquire_mode = base.create_param("TS_ACQUIRE_MODE", ParamType::Int32).unwrap();
+        let ts_elapsed_time = base
+            .create_param("TS_ELAPSED_TIME", ParamType::Float64)
+            .unwrap();
+        let ts_acquire_mode = base
+            .create_param("TS_ACQUIRE_MODE", ParamType::Int32)
+            .unwrap();
         let _ = base.set_int32_param(ts_acquire_mode, 0, 0);
-        let ts_time_axis = base.create_param("TS_TIME_AXIS", ParamType::Float64Array).unwrap();
+        let ts_time_axis = base
+            .create_param("TS_TIME_AXIS", ParamType::Float64Array)
+            .unwrap();
 
         // Initialize time axis
         let time_axis: Vec<f64> = (0..num_points).map(|i| i as f64).collect();
@@ -240,7 +259,9 @@ impl TimeSeriesPortDriver {
         let mut ts_channels = Vec::with_capacity(num_channels);
         for name in channel_names {
             let param_name = format!("TS_CHAN_{name}");
-            let idx = base.create_param(&param_name, ParamType::Float64Array).unwrap();
+            let idx = base
+                .create_param(&param_name, ParamType::Float64Array)
+                .unwrap();
             let _ = base.params.set_float64_array(idx, 0, vec![0.0; num_points]);
             ts_channels.push(idx);
         }
@@ -260,7 +281,12 @@ impl TimeSeriesPortDriver {
             channel_names: channel_names.iter().map(|s| s.to_string()).collect(),
         };
 
-        Self { base, params, shared, num_channels }
+        Self {
+            base,
+            params,
+            shared,
+            num_channels,
+        }
     }
 
     /// Copy buffer data to Float64Array params and call callbacks.
@@ -272,26 +298,33 @@ impl TimeSeriesPortDriver {
         for (i, buf) in state.buffers.iter().enumerate() {
             let mut values = buf.values();
             values.resize(num_points, 0.0);
-            let _ = self.base.params.set_float64_array(
-                self.params.ts_channels[i], 0, values,
-            );
+            let _ = self
+                .base
+                .params
+                .set_float64_array(self.params.ts_channels[i], 0, values);
         }
 
         // Update current point
         let current_point = state.buffers[0].count();
-        let _ = self.base.set_int32_param(self.params.ts_current_point, 0, current_point as i32);
+        let _ = self
+            .base
+            .set_int32_param(self.params.ts_current_point, 0, current_point as i32);
 
         // Update elapsed time
         if let Some(start) = state.start_time {
             let elapsed = start.elapsed().as_secs_f64();
-            let _ = self.base.set_float64_param(self.params.ts_elapsed_time, 0, elapsed);
+            let _ = self
+                .base
+                .set_float64_param(self.params.ts_elapsed_time, 0, elapsed);
         }
 
         // Update acquire status (may have auto-stopped)
         let acquiring = state.acquiring;
         drop(state);
 
-        let _ = self.base.set_int32_param(self.params.ts_acquire, 0, if acquiring { 1 } else { 0 });
+        let _ = self
+            .base
+            .set_int32_param(self.params.ts_acquire, 0, if acquiring { 1 } else { 0 });
 
         // Notify listeners
         let _ = self.base.call_param_callbacks(0);
@@ -346,17 +379,23 @@ impl PortDriver for TimeSeriesPortDriver {
 
             // Update time axis
             let time_axis: Vec<f64> = (0..new_size).map(|i| i as f64).collect();
-            let _ = self.base.params.set_float64_array(self.params.ts_time_axis, 0, time_axis);
+            let _ = self
+                .base
+                .params
+                .set_float64_array(self.params.ts_time_axis, 0, time_axis);
 
             // Re-initialize channel waveforms
             for i in 0..self.num_channels {
                 let _ = self.base.params.set_float64_array(
-                    self.params.ts_channels[i], 0, vec![0.0; new_size],
+                    self.params.ts_channels[i],
+                    0,
+                    vec![0.0; new_size],
                 );
             }
 
             self.base.set_int32_param(reason, 0, value)?;
-            self.base.set_int32_param(self.params.ts_current_point, 0, 0)?;
+            self.base
+                .set_int32_param(self.params.ts_current_point, 0, 0)?;
             self.base.set_int32_param(self.params.ts_acquire, 0, 0)?;
             self.base.call_param_callbacks(0)?;
         } else if reason == self.params.ts_acquire_mode {
@@ -398,10 +437,7 @@ impl PortDriver for TimeSeriesPortDriver {
 }
 
 /// Background thread that receives data from a plugin and accumulates into shared buffers.
-fn ts_data_thread(
-    shared: Arc<Mutex<SharedTsState>>,
-    mut data_rx: TimeSeriesReceiver,
-) {
+fn ts_data_thread(shared: Arc<Mutex<SharedTsState>>, mut data_rx: TimeSeriesReceiver) {
     while let Some(data) = data_rx.blocking_recv() {
         let mut state = shared.lock();
         if !state.acquiring {
@@ -412,9 +448,7 @@ fn ts_data_thread(
             state.buffers[i].add_value(data.values[i]);
         }
         // Auto-stop for OneShot mode
-        if state.mode == TimeSeriesMode::OneShot
-            && state.buffers[0].count() >= state.num_points
-        {
+        if state.mode == TimeSeriesMode::OneShot && state.buffers[0].count() >= state.num_points {
             state.acquiring = false;
         }
     }
@@ -430,7 +464,12 @@ pub fn create_ts_port_runtime(
     channel_names: &[&str],
     num_points: usize,
     data_rx: TimeSeriesReceiver,
-) -> (PortRuntimeHandle, TSParams, std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+) -> (
+    PortRuntimeHandle,
+    TSParams,
+    std::thread::JoinHandle<()>,
+    std::thread::JoinHandle<()>,
+) {
     let num_channels = channel_names.len();
     let shared = Arc::new(Mutex::new(SharedTsState::new(num_channels, num_points)));
 
@@ -620,11 +659,18 @@ mod tests {
         driver.update_waveform_params();
 
         // Check current point was updated
-        let cp = driver.base.get_int32_param(driver.params.ts_current_point, 0).unwrap();
+        let cp = driver
+            .base
+            .get_int32_param(driver.params.ts_current_point, 0)
+            .unwrap();
         assert_eq!(cp, 2);
 
         // Check waveform data was written
-        let data = driver.base.params.get_float64_array(driver.params.ts_channels[0], 0).unwrap();
+        let data = driver
+            .base
+            .params
+            .get_float64_array(driver.params.ts_channels[0], 0)
+            .unwrap();
         assert_eq!(data[0], 42.0);
         assert_eq!(data[1], 43.0);
     }
@@ -653,10 +699,22 @@ mod tests {
         let jh = std::thread::spawn(move || ts_data_thread(shared_clone, rx));
 
         // Send data
-        tx.blocking_send(TimeSeriesData { values: vec![1.0, 10.0, 100.0] }).unwrap();
-        tx.blocking_send(TimeSeriesData { values: vec![2.0, 20.0, 200.0] }).unwrap();
-        tx.blocking_send(TimeSeriesData { values: vec![3.0, 30.0, 300.0] }).unwrap();
-        tx.blocking_send(TimeSeriesData { values: vec![4.0, 40.0, 400.0] }).unwrap(); // beyond capacity
+        tx.blocking_send(TimeSeriesData {
+            values: vec![1.0, 10.0, 100.0],
+        })
+        .unwrap();
+        tx.blocking_send(TimeSeriesData {
+            values: vec![2.0, 20.0, 200.0],
+        })
+        .unwrap();
+        tx.blocking_send(TimeSeriesData {
+            values: vec![3.0, 30.0, 300.0],
+        })
+        .unwrap();
+        tx.blocking_send(TimeSeriesData {
+            values: vec![4.0, 40.0, 400.0],
+        })
+        .unwrap(); // beyond capacity
 
         // Close channel and wait for thread
         drop(tx);
@@ -679,7 +737,10 @@ mod tests {
         let shared_clone = shared.clone();
         let jh = std::thread::spawn(move || ts_data_thread(shared_clone, rx));
 
-        tx.blocking_send(TimeSeriesData { values: vec![1.0, 2.0, 3.0] }).unwrap();
+        tx.blocking_send(TimeSeriesData {
+            values: vec![1.0, 2.0, 3.0],
+        })
+        .unwrap();
 
         drop(tx);
         jh.join().unwrap();

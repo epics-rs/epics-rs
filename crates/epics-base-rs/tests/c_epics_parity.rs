@@ -11,24 +11,24 @@
 
 use std::collections::HashSet;
 
-use epics_base_rs::server::record::{Record, RecordInstance, AlarmSeverity};
+use epics_base_rs::server::record::{AlarmSeverity, Record, RecordInstance};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::bi::BiRecord;
 use epics_base_rs::server::records::bo::BoRecord;
+use epics_base_rs::server::records::compress::CompressRecord;
+use epics_base_rs::server::records::dfanout::DfanoutRecord;
+use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
 use epics_base_rs::server::records::longout::LongoutRecord;
-use epics_base_rs::server::records::waveform::WaveformRecord;
-use epics_base_rs::server::records::stringin::StringinRecord;
-use epics_base_rs::server::records::stringout::StringoutRecord;
-use epics_base_rs::server::records::dfanout::DfanoutRecord;
 use epics_base_rs::server::records::mbbi::MbbiRecord;
 use epics_base_rs::server::records::mbbo::MbboRecord;
-use epics_base_rs::server::records::compress::CompressRecord;
-use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::server::records::sel::SelRecord;
 use epics_base_rs::server::records::seq::SeqRecord;
+use epics_base_rs::server::records::stringin::StringinRecord;
+use epics_base_rs::server::records::stringout::StringoutRecord;
 use epics_base_rs::server::records::sub_record::SubRecord;
+use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 const TEST_DOUBLE: f64 = 3.125;
@@ -88,7 +88,10 @@ fn ai_smoothing_filter() {
     // First process: no smoothing (init=false)
     rec.rval = 100;
     let _ = rec.process();
-    assert!((rec.val - 100.0).abs() < 1e-10, "First value should be 100.0");
+    assert!(
+        (rec.val - 100.0).abs() < 1e-10,
+        "First value should be 100.0"
+    );
 
     // Second process: smoothing applies
     rec.rval = 200;
@@ -131,7 +134,8 @@ fn ai_udf_clears_on_process() {
 #[test]
 fn ai_display_fields() {
     let mut rec = AiRecord::new(0.0);
-    rec.put_field("EGU", EpicsValue::String("mm".into())).unwrap();
+    rec.put_field("EGU", EpicsValue::String("mm".into()))
+        .unwrap();
     rec.put_field("HOPR", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LOPR", EpicsValue::Double(-50.0)).unwrap();
     rec.put_field("PREC", EpicsValue::Short(3)).unwrap();
@@ -162,7 +166,9 @@ fn ai_alarm_thresholds() {
     });
 
     // Process to clear UDF alarm first
-    inst.record.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(50.0))
+        .unwrap();
     let _ = inst.process_local();
     // Reset alarm state after UDF clear
     inst.common.sevr = AlarmSeverity::NoAlarm;
@@ -171,33 +177,43 @@ fn ai_alarm_thresholds() {
     inst.common.nsta = 0;
 
     // Normal range → no alarm
-    inst.record.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(50.0))
+        .unwrap();
     inst.evaluate_alarms();
     assert_eq!(inst.common.nsev, AlarmSeverity::NoAlarm);
 
     // Above HIGH → MINOR
-    inst.record.put_field("VAL", EpicsValue::Double(75.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(75.0))
+        .unwrap();
     inst.common.nsev = AlarmSeverity::NoAlarm;
     inst.common.nsta = 0;
     inst.evaluate_alarms();
     assert_eq!(inst.common.nsev, AlarmSeverity::Minor);
 
     // Above HIHI → MAJOR
-    inst.record.put_field("VAL", EpicsValue::Double(95.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(95.0))
+        .unwrap();
     inst.common.nsev = AlarmSeverity::NoAlarm;
     inst.common.nsta = 0;
     inst.evaluate_alarms();
     assert_eq!(inst.common.nsev, AlarmSeverity::Major);
 
     // Below LOW → MINOR
-    inst.record.put_field("VAL", EpicsValue::Double(25.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(25.0))
+        .unwrap();
     inst.common.nsev = AlarmSeverity::NoAlarm;
     inst.common.nsta = 0;
     inst.evaluate_alarms();
     assert_eq!(inst.common.nsev, AlarmSeverity::Minor);
 
     // Below LOLO → MAJOR
-    inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(5.0))
+        .unwrap();
     inst.common.nsev = AlarmSeverity::NoAlarm;
     inst.common.nsta = 0;
     inst.evaluate_alarms();
@@ -212,10 +228,15 @@ fn ai_alarm_thresholds() {
 #[test]
 fn bi_state_names() {
     let mut rec = BiRecord::new(0);
-    rec.put_field("ZNAM", EpicsValue::String("Off".into())).unwrap();
-    rec.put_field("ONAM", EpicsValue::String("On".into())).unwrap();
+    rec.put_field("ZNAM", EpicsValue::String("Off".into()))
+        .unwrap();
+    rec.put_field("ONAM", EpicsValue::String("On".into()))
+        .unwrap();
 
-    assert_eq!(rec.get_field("ZNAM"), Some(EpicsValue::String("Off".into())));
+    assert_eq!(
+        rec.get_field("ZNAM"),
+        Some(EpicsValue::String("Off".into()))
+    );
     assert_eq!(rec.get_field("ONAM"), Some(EpicsValue::String("On".into())));
 
     // VAL=0 → ZNAM
@@ -247,11 +268,19 @@ fn bo_output_value() {
 #[test]
 fn bo_state_names() {
     let mut rec = BoRecord::new(0);
-    rec.put_field("ZNAM", EpicsValue::String("Closed".into())).unwrap();
-    rec.put_field("ONAM", EpicsValue::String("Open".into())).unwrap();
+    rec.put_field("ZNAM", EpicsValue::String("Closed".into()))
+        .unwrap();
+    rec.put_field("ONAM", EpicsValue::String("Open".into()))
+        .unwrap();
 
-    assert_eq!(rec.get_field("ZNAM"), Some(EpicsValue::String("Closed".into())));
-    assert_eq!(rec.get_field("ONAM"), Some(EpicsValue::String("Open".into())));
+    assert_eq!(
+        rec.get_field("ZNAM"),
+        Some(EpicsValue::String("Closed".into()))
+    );
+    assert_eq!(
+        rec.get_field("ONAM"),
+        Some(EpicsValue::String("Open".into()))
+    );
 }
 
 // ============================================================
@@ -279,20 +308,28 @@ fn longout_field_access() {
 fn deadband_zero_updates_on_change() {
     let rec = AoRecord::new(0.0);
     let mut inst = RecordInstance::new("TEST:db0".to_string(), rec);
-    inst.record.put_field("MDEL", EpicsValue::Double(0.0)).unwrap();
+    inst.record
+        .put_field("MDEL", EpicsValue::Double(0.0))
+        .unwrap();
 
     // Set initial value
-    inst.record.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "First value should trigger");
 
     // Same value: no trigger
-    inst.record.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "Same value should not trigger with MDEL=0");
 
     // Different value: trigger
-    inst.record.put_field("VAL", EpicsValue::Double(2.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(2.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "Different value should trigger");
 }
@@ -302,22 +339,32 @@ fn deadband_zero_updates_on_change() {
 fn deadband_threshold() {
     let rec = AoRecord::new(0.0);
     let mut inst = RecordInstance::new("TEST:db15".to_string(), rec);
-    inst.record.put_field("MDEL", EpicsValue::Double(1.5)).unwrap();
+    inst.record
+        .put_field("MDEL", EpicsValue::Double(1.5))
+        .unwrap();
     // Initialize MLST so first check has a baseline
-    inst.record.put_field("MLST", EpicsValue::Double(0.0)).unwrap();
+    inst.record
+        .put_field("MLST", EpicsValue::Double(0.0))
+        .unwrap();
 
     // Same as MLST: no trigger (0.0 - 0.0 = 0 <= 1.5)
-    inst.record.put_field("VAL", EpicsValue::Double(0.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(0.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "No change should not trigger");
 
     // Change within deadband (1.0 <= 1.5): no trigger
-    inst.record.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "Change of 1.0 should not trigger with MDEL=1.5");
 
     // Change beyond deadband (2.0 > 1.5 from MLST=0): trigger
-    inst.record.put_field("VAL", EpicsValue::Double(2.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(2.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "Change of 2.0 should trigger with MDEL=1.5");
 }
@@ -327,14 +374,20 @@ fn deadband_threshold() {
 fn deadband_negative_always_updates() {
     let rec = AoRecord::new(0.0);
     let mut inst = RecordInstance::new("TEST:dbn1".to_string(), rec);
-    inst.record.put_field("MDEL", EpicsValue::Double(-1.0)).unwrap();
+    inst.record
+        .put_field("MDEL", EpicsValue::Double(-1.0))
+        .unwrap();
 
-    inst.record.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger);
 
     // Same value: still triggers with MDEL<0
-    inst.record.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "MDEL<0 should always trigger");
 }
@@ -344,17 +397,25 @@ fn deadband_negative_always_updates() {
 fn deadband_nan_handling() {
     let rec = AoRecord::new(0.0);
     let mut inst = RecordInstance::new("TEST:dbnan".to_string(), rec);
-    inst.record.put_field("MDEL", EpicsValue::Double(0.0)).unwrap();
-    inst.record.put_field("MLST", EpicsValue::Double(0.0)).unwrap();
+    inst.record
+        .put_field("MDEL", EpicsValue::Double(0.0))
+        .unwrap();
+    inst.record
+        .put_field("MLST", EpicsValue::Double(0.0))
+        .unwrap();
 
     // Set to a value first
-    inst.record.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "0→1 should trigger");
 
     // NaN → should trigger (NaN - 1.0 is NaN, abs(NaN) > 0 is false,
     // but NaN.is_nan() check should catch this)
-    inst.record.put_field("VAL", EpicsValue::Double(f64::NAN)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(f64::NAN))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     // Note: (NaN - 1.0).abs() > 0 = NaN > 0 = false in Rust
     // C EPICS also returns false here. NaN doesn't trigger with MDEL=0.
@@ -368,24 +429,34 @@ fn deadband_nan_handling() {
 fn deadband_infinity_handling() {
     let rec = AoRecord::new(0.0);
     let mut inst = RecordInstance::new("TEST:dbinf".to_string(), rec);
-    inst.record.put_field("MDEL", EpicsValue::Double(0.0)).unwrap();
+    inst.record
+        .put_field("MDEL", EpicsValue::Double(0.0))
+        .unwrap();
 
     // Initial value
-    inst.record.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
     let _ = inst.check_deadband_ext();
 
     // +Inf: should trigger
-    inst.record.put_field("VAL", EpicsValue::Double(f64::INFINITY)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(f64::INFINITY))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "Transition to +Inf should trigger");
 
     // +Inf → +Inf: same value, should NOT trigger
-    inst.record.put_field("VAL", EpicsValue::Double(f64::INFINITY)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(f64::INFINITY))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "+Inf to +Inf should not trigger");
 
     // +Inf → -Inf: should trigger
-    inst.record.put_field("VAL", EpicsValue::Double(f64::NEG_INFINITY)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(f64::NEG_INFINITY))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "+Inf to -Inf should trigger");
 }
@@ -433,7 +504,8 @@ fn waveform_put_get_array() {
     assert_eq!(rec.get_field("NORD"), Some(EpicsValue::Long(0)));
 
     // Put 3 values
-    rec.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3])).unwrap();
+    rec.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+        .unwrap();
     assert_eq!(rec.get_field("NORD"), Some(EpicsValue::Long(3)));
 
     // Verify values
@@ -476,7 +548,8 @@ async fn common_fields_access() {
     assert_eq!(inst.name, "TEST:header");
 
     // DESC
-    inst.put_common_field("DESC", EpicsValue::String("Test record".into())).unwrap();
+    inst.put_common_field("DESC", EpicsValue::String("Test record".into()))
+        .unwrap();
     assert_eq!(inst.common.desc, "Test record");
 
     // SCAN default = Passive (index 0)
@@ -533,7 +606,8 @@ async fn soft_input_reads_from_db_link() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("source", Box::new(LonginRecord::new(0))).await;
+    db.add_record("source", Box::new(LonginRecord::new(0)))
+        .await;
     db.add_record("reader", Box::new(AiRecord::new(0.0))).await;
 
     // Set source value
@@ -611,12 +685,16 @@ fn analog_monitor_mdel_zero_all_types() {
         let _ = inst.record.put_field("MLST", EpicsValue::Double(0.0));
 
         // First change: should trigger
-        inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        inst.record
+            .put_field("VAL", EpicsValue::Double(5.0))
+            .unwrap();
         let (trigger, _) = inst.check_deadband_ext();
         assert!(trigger, "{rtype}: 0→5 should trigger with MDEL=0");
 
         // Same value: should NOT trigger
-        inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        inst.record
+            .put_field("VAL", EpicsValue::Double(5.0))
+            .unwrap();
         let (trigger, _) = inst.check_deadband_ext();
         assert!(!trigger, "{rtype}: 5→5 should not trigger with MDEL=0");
     }
@@ -635,12 +713,16 @@ fn analog_monitor_mdel_negative_all_types() {
         let _ = inst.record.put_field("MDEL", EpicsValue::Double(-1.0));
         let _ = inst.record.put_field("MLST", EpicsValue::Double(0.0));
 
-        inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        inst.record
+            .put_field("VAL", EpicsValue::Double(5.0))
+            .unwrap();
         let (trigger, _) = inst.check_deadband_ext();
         assert!(trigger, "{rtype}: should trigger with MDEL=-1");
 
         // Same value still triggers
-        inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        inst.record
+            .put_field("VAL", EpicsValue::Double(5.0))
+            .unwrap();
         let (trigger, _) = inst.check_deadband_ext();
         assert!(trigger, "{rtype}: same value should trigger with MDEL=-1");
     }
@@ -670,10 +752,13 @@ fn dfanout_field_access() {
 fn dfanout_output_links() {
     let mut rec = DfanoutRecord::default();
 
-    let link_fields = ["OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH"];
+    let link_fields = [
+        "OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH",
+    ];
     for (i, field) in link_fields.iter().enumerate() {
         let target = format!("REC{i}");
-        rec.put_field(field, EpicsValue::String(target.clone())).unwrap();
+        rec.put_field(field, EpicsValue::String(target.clone()))
+            .unwrap();
         assert_eq!(rec.get_field(field), Some(EpicsValue::String(target)));
     }
 }
@@ -687,7 +772,8 @@ fn dfanout_output_links() {
 fn waveform_length_one() {
     let mut wf = WaveformRecord::new(1, DbFieldType::Double);
 
-    wf.put_field("VAL", EpicsValue::DoubleArray(vec![2.0])).unwrap();
+    wf.put_field("VAL", EpicsValue::DoubleArray(vec![2.0]))
+        .unwrap();
     assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(1)));
 
     if let Some(EpicsValue::DoubleArray(arr)) = wf.get_field("VAL") {
@@ -703,11 +789,16 @@ fn waveform_length_one() {
 fn waveform_multi_element() {
     let mut wf = WaveformRecord::new(5, DbFieldType::Double);
 
-    wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])).unwrap();
+    wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+        .unwrap();
     assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(3)));
 
     // Put exactly NELM elements
-    wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0])).unwrap();
+    wf.put_field(
+        "VAL",
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+    )
+    .unwrap();
     assert_eq!(wf.get_field("NORD"), Some(EpicsValue::Long(5)));
 }
 
@@ -737,31 +828,45 @@ fn alarm_severity_field_access() {
 fn deadband_absolute_threshold_steps() {
     let rec = AoRecord::new(0.0);
     let mut inst = RecordInstance::new("TEST:dbnd3".to_string(), rec);
-    inst.record.put_field("MDEL", EpicsValue::Double(3.0)).unwrap();
-    inst.record.put_field("MLST", EpicsValue::Double(0.0)).unwrap();
+    inst.record
+        .put_field("MDEL", EpicsValue::Double(3.0))
+        .unwrap();
+    inst.record
+        .put_field("MLST", EpicsValue::Double(0.0))
+        .unwrap();
 
     // 0→1: change=1, need >3, no trigger
-    inst.record.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "Change of 1 should not trigger with MDEL=3");
 
     // 0→3: change=3, need >3, no trigger
-    inst.record.put_field("VAL", EpicsValue::Double(3.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(3.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "Change of 3 should not trigger with MDEL=3");
 
     // 0→4: change=4 > 3, trigger!
-    inst.record.put_field("VAL", EpicsValue::Double(4.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(4.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "Change of 4 should trigger with MDEL=3");
 
     // Now MLST=4. 4→5: change=1, no trigger
-    inst.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(5.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "Change of 1 from new baseline should not trigger");
 
     // 4→8: change=4 > 3, trigger!
-    inst.record.put_field("VAL", EpicsValue::Double(8.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(8.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "Change of 4 from baseline should trigger");
 }
@@ -771,11 +876,17 @@ fn deadband_absolute_threshold_steps() {
 fn deadband_negative_zero_equals_positive_zero() {
     let rec = AoRecord::new(0.0);
     let mut inst = RecordInstance::new("TEST:zero".to_string(), rec);
-    inst.record.put_field("MDEL", EpicsValue::Double(0.0)).unwrap();
-    inst.record.put_field("MLST", EpicsValue::Double(0.0)).unwrap();
+    inst.record
+        .put_field("MDEL", EpicsValue::Double(0.0))
+        .unwrap();
+    inst.record
+        .put_field("MLST", EpicsValue::Double(0.0))
+        .unwrap();
 
     // -0.0 should equal +0.0 — no trigger
-    inst.record.put_field("VAL", EpicsValue::Double(-0.0)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(-0.0))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "-0.0 should equal +0.0, no trigger");
 }
@@ -785,26 +896,38 @@ fn deadband_negative_zero_equals_positive_zero() {
 fn deadband_inf_transition() {
     let rec = AoRecord::new(0.0);
     let mut inst = RecordInstance::new("TEST:inf".to_string(), rec);
-    inst.record.put_field("MDEL", EpicsValue::Double(0.0)).unwrap();
-    inst.record.put_field("MLST", EpicsValue::Double(0.0)).unwrap();
+    inst.record
+        .put_field("MDEL", EpicsValue::Double(0.0))
+        .unwrap();
+    inst.record
+        .put_field("MLST", EpicsValue::Double(0.0))
+        .unwrap();
 
     // 0 → +Inf: trigger
-    inst.record.put_field("VAL", EpicsValue::Double(f64::INFINITY)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(f64::INFINITY))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "0 → +Inf should trigger");
 
     // +Inf → +Inf: no trigger
-    inst.record.put_field("VAL", EpicsValue::Double(f64::INFINITY)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(f64::INFINITY))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "+Inf → +Inf should not trigger");
 
     // +Inf → -Inf: trigger
-    inst.record.put_field("VAL", EpicsValue::Double(f64::NEG_INFINITY)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(f64::NEG_INFINITY))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(trigger, "+Inf → -Inf should trigger");
 
     // -Inf → -Inf: no trigger
-    inst.record.put_field("VAL", EpicsValue::Double(f64::NEG_INFINITY)).unwrap();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(f64::NEG_INFINITY))
+        .unwrap();
     let (trigger, _) = inst.check_deadband_ext();
     assert!(!trigger, "-Inf → -Inf should not trigger");
 }
@@ -817,12 +940,20 @@ fn deadband_inf_transition() {
 #[test]
 fn stringin_stringout_field_access() {
     let mut si = StringinRecord::new("");
-    si.put_field("VAL", EpicsValue::String("hello".into())).unwrap();
-    assert_eq!(si.get_field("VAL"), Some(EpicsValue::String("hello".into())));
+    si.put_field("VAL", EpicsValue::String("hello".into()))
+        .unwrap();
+    assert_eq!(
+        si.get_field("VAL"),
+        Some(EpicsValue::String("hello".into()))
+    );
 
     let mut so = StringoutRecord::new("");
-    so.put_field("VAL", EpicsValue::String("world".into())).unwrap();
-    assert_eq!(so.get_field("VAL"), Some(EpicsValue::String("world".into())));
+    so.put_field("VAL", EpicsValue::String("world".into()))
+        .unwrap();
+    assert_eq!(
+        so.get_field("VAL"),
+        Some(EpicsValue::String("world".into()))
+    );
 }
 
 /// All 20 record types: field list and record_type
@@ -843,15 +974,26 @@ fn all_record_types_have_correct_rtype() {
     ];
 
     let expected_types = [
-        "ai", "ao", "bi", "bo", "longin", "longout",
-        "stringin", "stringout", "waveform", "dfanout", "mbbi",
+        "ai",
+        "ao",
+        "bi",
+        "bo",
+        "longin",
+        "longout",
+        "stringin",
+        "stringout",
+        "waveform",
+        "dfanout",
+        "mbbi",
     ];
 
     for (rec, expected) in records.iter().zip(expected_types.iter()) {
         assert_eq!(
-            rec.record_type(), *expected,
+            rec.record_type(),
+            *expected,
             "Expected record type '{}', got '{}'",
-            expected, rec.record_type()
+            expected,
+            rec.record_type()
         );
     }
 }
@@ -861,12 +1003,14 @@ fn all_record_types_have_correct_rtype() {
 fn waveform_ftvl_types() {
     // Double array
     let mut wf_d = WaveformRecord::new(5, DbFieldType::Double);
-    wf_d.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0])).unwrap();
+    wf_d.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0]))
+        .unwrap();
     assert_eq!(wf_d.get_field("NORD"), Some(EpicsValue::Long(2)));
 
     // Long array
     let mut wf_l = WaveformRecord::new(5, DbFieldType::Long);
-    wf_l.put_field("VAL", EpicsValue::LongArray(vec![10, 20, 30])).unwrap();
+    wf_l.put_field("VAL", EpicsValue::LongArray(vec![10, 20, 30]))
+        .unwrap();
     assert_eq!(wf_l.get_field("NORD"), Some(EpicsValue::Long(3)));
 }
 
@@ -962,13 +1106,25 @@ fn compress_n_to_1_high_value() {
 #[test]
 fn mbbi_state_strings() {
     let mut rec = MbbiRecord::default();
-    rec.put_field("ZRST", EpicsValue::String("Zero".into())).unwrap();
-    rec.put_field("ONST", EpicsValue::String("One".into())).unwrap();
-    rec.put_field("TWST", EpicsValue::String("Two".into())).unwrap();
+    rec.put_field("ZRST", EpicsValue::String("Zero".into()))
+        .unwrap();
+    rec.put_field("ONST", EpicsValue::String("One".into()))
+        .unwrap();
+    rec.put_field("TWST", EpicsValue::String("Two".into()))
+        .unwrap();
 
-    assert_eq!(rec.get_field("ZRST"), Some(EpicsValue::String("Zero".into())));
-    assert_eq!(rec.get_field("ONST"), Some(EpicsValue::String("One".into())));
-    assert_eq!(rec.get_field("TWST"), Some(EpicsValue::String("Two".into())));
+    assert_eq!(
+        rec.get_field("ZRST"),
+        Some(EpicsValue::String("Zero".into()))
+    );
+    assert_eq!(
+        rec.get_field("ONST"),
+        Some(EpicsValue::String("One".into()))
+    );
+    assert_eq!(
+        rec.get_field("TWST"),
+        Some(EpicsValue::String("Two".into()))
+    );
 
     // Set VAL to each state
     rec.put_field("VAL", EpicsValue::Enum(0)).unwrap();
@@ -981,9 +1137,12 @@ fn mbbi_state_strings() {
 #[test]
 fn mbbo_state_strings_and_values() {
     let mut rec = MbboRecord::default();
-    rec.put_field("ZRST", EpicsValue::String("Off".into())).unwrap();
-    rec.put_field("ONST", EpicsValue::String("Low".into())).unwrap();
-    rec.put_field("TWST", EpicsValue::String("High".into())).unwrap();
+    rec.put_field("ZRST", EpicsValue::String("Off".into()))
+        .unwrap();
+    rec.put_field("ONST", EpicsValue::String("Low".into()))
+        .unwrap();
+    rec.put_field("TWST", EpicsValue::String("High".into()))
+        .unwrap();
 
     // Default ZRVL=0, ONVL=1, TWVL=2
     assert_eq!(rec.get_field("ZRVL"), Some(EpicsValue::Long(0)));
@@ -1001,10 +1160,22 @@ fn mbbi_all_16_states() {
     // Default values: ZRVL=0, ONVL=1, ..., FFVL=15
     for i in 0..16u16 {
         let field = match i {
-            0 => "ZRVL", 1 => "ONVL", 2 => "TWVL", 3 => "THVL",
-            4 => "FRVL", 5 => "FVVL", 6 => "SXVL", 7 => "SVVL",
-            8 => "EIVL", 9 => "NIVL", 10 => "TEVL", 11 => "ELVL",
-            12 => "TVVL", 13 => "TTVL", 14 => "FTVL", 15 => "FFVL",
+            0 => "ZRVL",
+            1 => "ONVL",
+            2 => "TWVL",
+            3 => "THVL",
+            4 => "FRVL",
+            5 => "FVVL",
+            6 => "SXVL",
+            7 => "SVVL",
+            8 => "EIVL",
+            9 => "NIVL",
+            10 => "TEVL",
+            11 => "ELVL",
+            12 => "TVVL",
+            13 => "TTVL",
+            14 => "FTVL",
+            15 => "FFVL",
             _ => unreachable!(),
         };
         assert_eq!(
@@ -1023,7 +1194,8 @@ fn mbbi_all_16_states() {
 #[test]
 fn sel_record_field_access() {
     let mut rec = SelRecord::default();
-    rec.put_field("VAL", EpicsValue::Double(TEST_DOUBLE)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(TEST_DOUBLE))
+        .unwrap();
     assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(TEST_DOUBLE)));
     assert_eq!(rec.record_type(), "sel");
 }
@@ -1070,7 +1242,8 @@ async fn database_multiple_records() {
     db.add_record("ai1", Box::new(AiRecord::new(1.0))).await;
     db.add_record("ai2", Box::new(AiRecord::new(2.0))).await;
     db.add_record("bo1", Box::new(BoRecord::new(0))).await;
-    db.add_record("lo1", Box::new(LongoutRecord::new(100))).await;
+    db.add_record("lo1", Box::new(LongoutRecord::new(100)))
+        .await;
 
     assert_eq!(db.get_pv("ai1").await.unwrap(), EpicsValue::Double(1.0));
     assert_eq!(db.get_pv("ai2").await.unwrap(), EpicsValue::Double(2.0));
@@ -1106,13 +1279,18 @@ async fn database_put_record_field() {
     // Put to EGU field
     if let Some(rec) = db.get_record("myrec").await {
         let mut inst = rec.write().await;
-        inst.record.put_field("EGU", EpicsValue::String("degC".into())).unwrap();
+        inst.record
+            .put_field("EGU", EpicsValue::String("degC".into()))
+            .unwrap();
     }
 
     // Verify
     if let Some(rec) = db.get_record("myrec").await {
         let inst = rec.read().await;
-        assert_eq!(inst.record.get_field("EGU"), Some(EpicsValue::String("degC".into())));
+        assert_eq!(
+            inst.record.get_field("EGU"),
+            Some(EpicsValue::String("degC".into()))
+        );
     }
 }
 
@@ -1123,7 +1301,8 @@ async fn database_disp_blocks_ca_put() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("disp_rec", Box::new(AoRecord::new(0.0))).await;
+    db.add_record("disp_rec", Box::new(AoRecord::new(0.0)))
+        .await;
 
     // Set DISP=1
     if let Some(rec) = db.get_record("disp_rec").await {
@@ -1132,7 +1311,9 @@ async fn database_disp_blocks_ca_put() {
     }
 
     // CA put should be rejected
-    let result = db.put_record_field_from_ca("disp_rec", "VAL", EpicsValue::Double(42.0)).await;
+    let result = db
+        .put_record_field_from_ca("disp_rec", "VAL", EpicsValue::Double(42.0))
+        .await;
     assert!(result.is_err(), "DISP=1 should block CA puts to VAL");
 }
 
@@ -1143,10 +1324,13 @@ async fn database_proc_triggers_processing() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("proc_rec", Box::new(AoRecord::new(5.0))).await;
+    db.add_record("proc_rec", Box::new(AoRecord::new(5.0)))
+        .await;
 
     // PROC should trigger processing
-    let result = db.put_record_field_from_ca("proc_rec", "PROC", EpicsValue::Char(1)).await;
+    let result = db
+        .put_record_field_from_ca("proc_rec", "PROC", EpicsValue::Char(1))
+        .await;
     assert!(result.is_ok());
 
     // UDF should be cleared after processing
@@ -1200,10 +1384,16 @@ fn calc_constants() {
     assert!((pi - std::f64::consts::PI).abs() < 1e-8, "PI={pi}");
 
     let d2r = do_calc("D2R");
-    assert!((d2r - std::f64::consts::PI / 180.0).abs() < 1e-8, "D2R={d2r}");
+    assert!(
+        (d2r - std::f64::consts::PI / 180.0).abs() < 1e-8,
+        "D2R={d2r}"
+    );
 
     let r2d = do_calc("R2D");
-    assert!((r2d - 180.0 / std::f64::consts::PI).abs() < 1e-8, "R2D={r2d}");
+    assert!(
+        (r2d - 180.0 / std::f64::consts::PI).abs() < 1e-8,
+        "R2D={r2d}"
+    );
 }
 
 /// C EPICS: arithmetic operators
@@ -1295,9 +1485,15 @@ fn calc_nan_inf() {
     assert!(do_calc("-INF") < 0.0, "-INF should be negative");
     assert!(do_calc("ISINF(INF)") != 0.0, "ISINF(INF) should be true");
     assert!(do_calc("ISNAN(NAN)") != 0.0, "ISNAN(NAN) should be true");
-    assert!((do_calc("ISNAN(1)") - 0.0).abs() < 1e-8, "ISNAN(1) should be false");
+    assert!(
+        (do_calc("ISNAN(1)") - 0.0).abs() < 1e-8,
+        "ISNAN(1) should be false"
+    );
     assert!(do_calc("FINITE(1)") != 0.0, "FINITE(1) should be true");
-    assert!((do_calc("FINITE(INF)") - 0.0).abs() < 1e-8, "FINITE(INF) should be false");
+    assert!(
+        (do_calc("FINITE(INF)") - 0.0).abs() < 1e-8,
+        "FINITE(INF) should be false"
+    );
 }
 
 /// C EPICS: calc with input arguments
@@ -1308,10 +1504,13 @@ fn calc_with_inputs() {
     let mut inputs = NumericInputs::new();
     inputs.vars[0] = 10.0; // A
     inputs.vars[1] = 20.0; // B
-    inputs.vars[2] = 3.0;  // C
+    inputs.vars[2] = 3.0; // C
 
     let result = epics_base_rs::calc::calc("A+B*C", &mut inputs).unwrap();
-    assert!((result - 70.0).abs() < 1e-8, "A+B*C with A=10,B=20,C=3 should be 70");
+    assert!(
+        (result - 70.0).abs() < 1e-8,
+        "A+B*C with A=10,B=20,C=3 should be 70"
+    );
 
     let result = epics_base_rs::calc::calc("(A+B)*C", &mut inputs).unwrap();
     assert!((result - 90.0).abs() < 1e-8, "(A+B)*C should be 90");
@@ -1430,7 +1629,10 @@ async fn database_init_cleanup_cycle() {
     // Cycle 2: fresh database, old records gone
     {
         let db = Arc::new(PvDatabase::new());
-        assert!(db.get_pv("cycle1").await.is_err(), "Old record should not exist");
+        assert!(
+            db.get_pv("cycle1").await.is_err(),
+            "Old record should not exist"
+        );
         db.add_record("cycle2", Box::new(AoRecord::new(2.0))).await;
         assert_eq!(db.get_pv("cycle2").await.unwrap(), EpicsValue::Double(2.0));
     }
@@ -1442,7 +1644,9 @@ async fn database_process_empty() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
     let db = Arc::new(PvDatabase::new());
-    let result = db.process_record_with_links("nonexistent", &mut HashSet::new(), 0).await;
+    let result = db
+        .process_record_with_links("nonexistent", &mut HashSet::new(), 0)
+        .await;
     assert!(result.is_err(), "Processing nonexistent record should fail");
 }
 
@@ -1463,13 +1667,15 @@ async fn flnk_chain_processes_target() {
     // Set FLNK: src → dst
     if let Some(rec) = db.get_record("src").await {
         let mut inst = rec.write().await;
-        inst.put_common_field("FLNK", EpicsValue::String("dst".into())).unwrap();
+        inst.put_common_field("FLNK", EpicsValue::String("dst".into()))
+            .unwrap();
     }
 
     // Set dst INP to read from src
     if let Some(rec) = db.get_record("dst").await {
         let mut inst = rec.write().await;
-        inst.put_common_field("INP", EpicsValue::String("src".into())).unwrap();
+        inst.put_common_field("INP", EpicsValue::String("src".into()))
+            .unwrap();
     }
 
     // Write to src and process — should trigger dst via FLNK
@@ -1484,8 +1690,8 @@ async fn flnk_chain_processes_target() {
 #[tokio::test]
 async fn flnk_loop_does_not_infinite_loop() {
     use epics_base_rs::server::database::PvDatabase;
-    use std::sync::Arc;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
     db.add_record("loop_a", Box::new(AoRecord::new(0.0))).await;
@@ -1494,16 +1700,20 @@ async fn flnk_loop_does_not_infinite_loop() {
     // Create circular FLNK: loop_a → loop_b → loop_a
     if let Some(rec) = db.get_record("loop_a").await {
         let mut inst = rec.write().await;
-        inst.put_common_field("FLNK", EpicsValue::String("loop_b".into())).unwrap();
+        inst.put_common_field("FLNK", EpicsValue::String("loop_b".into()))
+            .unwrap();
     }
     if let Some(rec) = db.get_record("loop_b").await {
         let mut inst = rec.write().await;
-        inst.put_common_field("FLNK", EpicsValue::String("loop_a".into())).unwrap();
+        inst.put_common_field("FLNK", EpicsValue::String("loop_a".into()))
+            .unwrap();
     }
 
     // Process should complete without hanging (visited set breaks the loop)
     let mut visited = HashSet::new();
-    let result = db.process_record_with_links("loop_a", &mut visited, 0).await;
+    let result = db
+        .process_record_with_links("loop_a", &mut visited, 0)
+        .await;
     assert!(result.is_ok(), "Circular FLNK should not cause error");
     // Visited set should contain both records
     assert!(visited.contains("loop_a"));
@@ -1514,11 +1724,12 @@ async fn flnk_loop_does_not_infinite_loop() {
 #[tokio::test]
 async fn rpro_reprocessing() {
     use epics_base_rs::server::database::PvDatabase;
-    use std::sync::Arc;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("rpro_rec", Box::new(AoRecord::new(0.0))).await;
+    db.add_record("rpro_rec", Box::new(AoRecord::new(0.0)))
+        .await;
 
     // Set RPRO flag
     if let Some(rec) = db.get_record("rpro_rec").await {
@@ -1528,12 +1739,17 @@ async fn rpro_reprocessing() {
 
     // Process — should process, detect RPRO, reprocess once, then clear RPRO
     let mut visited = HashSet::new();
-    db.process_record_with_links("rpro_rec", &mut visited, 0).await.unwrap();
+    db.process_record_with_links("rpro_rec", &mut visited, 0)
+        .await
+        .unwrap();
 
     // RPRO should be cleared after reprocessing
     if let Some(rec) = db.get_record("rpro_rec").await {
         let inst = rec.read().await;
-        assert!(!inst.common.rpro, "RPRO should be cleared after reprocessing");
+        assert!(
+            !inst.common.rpro,
+            "RPRO should be cleared after reprocessing"
+        );
     }
 }
 
@@ -1548,11 +1764,17 @@ async fn rapid_puts_to_same_record() {
 
     // Multiple rapid puts — last value should stick
     for i in 0..10 {
-        db.put_pv("rapid", EpicsValue::Double(i as f64)).await.unwrap();
+        db.put_pv("rapid", EpicsValue::Double(i as f64))
+            .await
+            .unwrap();
     }
 
     let val = db.get_pv("rapid").await.unwrap();
-    assert_eq!(val, EpicsValue::Double(9.0), "Last put value should be retained");
+    assert_eq!(
+        val,
+        EpicsValue::Double(9.0),
+        "Last put value should be retained"
+    );
 }
 
 // ============================================================
@@ -1566,7 +1788,8 @@ async fn process_record_clears_udf() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("scan_rec", Box::new(AoRecord::new(5.0))).await;
+    db.add_record("scan_rec", Box::new(AoRecord::new(5.0)))
+        .await;
 
     // UDF should be true initially
     if let Some(rec) = db.get_record("scan_rec").await {
@@ -1591,7 +1814,8 @@ async fn pini_flag() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("pini_rec", Box::new(AoRecord::new(0.0))).await;
+    db.add_record("pini_rec", Box::new(AoRecord::new(0.0)))
+        .await;
 
     // Set PINI
     if let Some(rec) = db.get_record("pini_rec").await {
@@ -1633,29 +1857,36 @@ async fn independent_records_no_interference() {
 #[tokio::test]
 async fn process_chain_depth_limit() {
     use epics_base_rs::server::database::PvDatabase;
-    use std::sync::Arc;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
 
     // Create long chain: rec0 → rec1 → rec2 → ... → rec19
     for i in 0..20 {
-        db.add_record(&format!("chain{i}"), Box::new(AoRecord::new(i as f64))).await;
+        db.add_record(&format!("chain{i}"), Box::new(AoRecord::new(i as f64)))
+            .await;
     }
     for i in 0..19 {
         if let Some(rec) = db.get_record(&format!("chain{i}")).await {
             let mut inst = rec.write().await;
-            inst.put_common_field("FLNK", EpicsValue::String(format!("chain{}", i + 1))).unwrap();
+            inst.put_common_field("FLNK", EpicsValue::String(format!("chain{}", i + 1)))
+                .unwrap();
         }
     }
 
     // Process chain0 — should follow FLNK chain without panic
     let mut visited = HashSet::new();
-    let result = db.process_record_with_links("chain0", &mut visited, 0).await;
+    let result = db
+        .process_record_with_links("chain0", &mut visited, 0)
+        .await;
     assert!(result.is_ok(), "Long FLNK chain should not fail");
 
     // All records should have been visited
-    assert!(visited.len() >= 2, "At least some records in chain should be visited");
+    assert!(
+        visited.len() >= 2,
+        "At least some records in chain should be visited"
+    );
 }
 
 // ============================================================
@@ -1669,11 +1900,13 @@ fn epics_value_all_numeric_put_get() {
     let mut ao = AoRecord::new(0.0);
 
     // Double
-    ao.put_field("VAL", EpicsValue::Double(TEST_DOUBLE)).unwrap();
+    ao.put_field("VAL", EpicsValue::Double(TEST_DOUBLE))
+        .unwrap();
     assert_eq!(ao.get_field("VAL"), Some(EpicsValue::Double(TEST_DOUBLE)));
 
     // Via string conversion
-    ao.put_field("EGU", EpicsValue::String("mm/s".into())).unwrap();
+    ao.put_field("EGU", EpicsValue::String("mm/s".into()))
+        .unwrap();
     assert_eq!(ao.get_field("EGU"), Some(EpicsValue::String("mm/s".into())));
 
     // PREC (Short)
@@ -1699,7 +1932,10 @@ fn all_20_record_types() {
         ("longout", Box::new(LongoutRecord::new(0))),
         ("stringin", Box::new(StringinRecord::new(""))),
         ("stringout", Box::new(StringoutRecord::new(""))),
-        ("waveform", Box::new(WaveformRecord::new(1, DbFieldType::Double))),
+        (
+            "waveform",
+            Box::new(WaveformRecord::new(1, DbFieldType::Double)),
+        ),
         ("mbbi", Box::new(MbbiRecord::default())),
         ("mbbo", Box::new(MbboRecord::default())),
         ("dfanout", Box::new(DfanoutRecord::default())),

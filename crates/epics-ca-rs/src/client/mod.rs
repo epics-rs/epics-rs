@@ -7,15 +7,14 @@ mod types;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-
 use std::time::Duration;
 
 use epics_base_rs::runtime::sync::{broadcast, mpsc, oneshot};
 
-use crate::channel::{alloc_cid, alloc_ioid, alloc_subid, AccessRights, ChannelInfo};
-use epics_base_rs::error::{CaError, CaResult};
+use crate::channel::{AccessRights, ChannelInfo, alloc_cid, alloc_ioid, alloc_subid};
 use crate::protocol::*;
 use crate::repeater;
+use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DbFieldType, EpicsValue, decode_dbr};
 
@@ -163,7 +162,9 @@ impl CaClient {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
         let result = ch.get().await;
-        let _ = self.coord_tx.send(CoordRequest::DropChannel { cid: ch.cid });
+        let _ = self
+            .coord_tx
+            .send(CoordRequest::DropChannel { cid: ch.cid });
         result
     }
 
@@ -184,12 +185,19 @@ impl CaClient {
 
         let value = EpicsValue::parse(snap.native_type, value_str)?;
         ch.put_nowait(&value).await?;
-        let _ = self.coord_tx.send(CoordRequest::DropChannel { cid: ch.cid });
+        let _ = self
+            .coord_tx
+            .send(CoordRequest::DropChannel { cid: ch.cid });
         Ok(())
     }
 
     /// Write with completion callback (CA_PROTO_WRITE_NOTIFY). Matches C `caput -c`.
-    pub async fn caput_callback(&self, pv_name: &str, value_str: &str, timeout_secs: f64) -> CaResult<()> {
+    pub async fn caput_callback(
+        &self,
+        pv_name: &str,
+        value_str: &str,
+        timeout_secs: f64,
+    ) -> CaResult<()> {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
@@ -204,8 +212,11 @@ impl CaClient {
             .ok_or(CaError::Disconnected)?;
 
         let value = EpicsValue::parse(snap.native_type, value_str)?;
-        ch.put_with_timeout(&value, Duration::from_secs_f64(timeout_secs)).await?;
-        let _ = self.coord_tx.send(CoordRequest::DropChannel { cid: ch.cid });
+        ch.put_with_timeout(&value, Duration::from_secs_f64(timeout_secs))
+            .await?;
+        let _ = self
+            .coord_tx
+            .send(CoordRequest::DropChannel { cid: ch.cid });
         Ok(())
     }
 
@@ -223,7 +234,9 @@ impl CaClient {
             .map_err(|_| CaError::Shutdown)?
             .ok_or(CaError::Disconnected)?;
 
-        let _ = self.coord_tx.send(CoordRequest::DropChannel { cid: ch.cid });
+        let _ = self
+            .coord_tx
+            .send(CoordRequest::DropChannel { cid: ch.cid });
 
         Ok(ChannelInfo {
             pv_name: snap.pv_name,
@@ -513,7 +526,9 @@ impl CaChannel {
 
 impl Drop for CaChannel {
     fn drop(&mut self) {
-        let _ = self.coord_tx.send(CoordRequest::DropChannel { cid: self.cid });
+        let _ = self
+            .coord_tx
+            .send(CoordRequest::DropChannel { cid: self.cid });
     }
 }
 
@@ -532,9 +547,9 @@ impl MonitorHandle {
 
 impl Drop for MonitorHandle {
     fn drop(&mut self) {
-        let _ = self.coord_tx.send(CoordRequest::Unsubscribe {
-            subid: self.subid,
-        });
+        let _ = self
+            .coord_tx
+            .send(CoordRequest::Unsubscribe { subid: self.subid });
     }
 }
 
@@ -549,7 +564,8 @@ async fn run_coordinator(
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
     let mut subscriptions = SubscriptionRegistry::new();
-    let mut read_waiters: HashMap<u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>> = HashMap::new();
+    let mut read_waiters: HashMap<u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>> =
+        HashMap::new();
     let mut write_waiters: HashMap<u32, oneshot::Sender<CaResult<()>>> = HashMap::new();
 
     loop {

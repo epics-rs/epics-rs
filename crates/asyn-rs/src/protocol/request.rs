@@ -86,7 +86,12 @@ mod tests {
 
     #[test]
     fn priority_roundtrip() {
-        for p in [QueuePriority::Low, QueuePriority::Medium, QueuePriority::High, QueuePriority::Connect] {
+        for p in [
+            QueuePriority::Low,
+            QueuePriority::Medium,
+            QueuePriority::High,
+            QueuePriority::Connect,
+        ] {
             let proto: ProtocolPriority = p.into();
             let back: QueuePriority = proto.into();
             assert_eq!(p, back);

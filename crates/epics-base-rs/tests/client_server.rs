@@ -5,15 +5,15 @@
 //! fixed in the DBR_TIME/CTRL work (ECA error propagation, snapshot
 //! None handling, etc.).
 
-use std::sync::Arc;
 use std::f64::consts::PI;
+use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
-use serial_test::serial;
 use epics_base_rs::server::snapshot::DbrClass;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
+use serial_test::serial;
 
 /// Pick a free ephemeral port by briefly binding and releasing.
 fn free_port() -> u16 {
@@ -23,9 +23,7 @@ fn free_port() -> u16 {
 
 /// Spin up an ephemeral-port server with the given PVs, return
 /// a connected `CaClient` whose ADDR_LIST points at that server.
-async fn setup(
-    pvs: Vec<(&str, EpicsValue)>,
-) -> CaResult<epics_ca_rs::client::CaClient> {
+async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::CaClient> {
     let db = Arc::new(PvDatabase::new());
     for (name, val) in pvs {
         db.add_pv(name, val).await;
@@ -39,7 +37,9 @@ async fn setup(
     let acf_clone = acf.clone();
     tokio::spawn(async move {
         let beacon_reset = std::sync::Arc::new(tokio::sync::Notify::new());
-        let _ = epics_ca_rs::server::tcp::run_tcp_listener(db_tcp, 0, acf_clone, tcp_tx, beacon_reset).await;
+        let _ =
+            epics_ca_rs::server::tcp::run_tcp_listener(db_tcp, 0, acf_clone, tcp_tx, beacon_reset)
+                .await;
     });
     let tcp_port = tcp_rx.await.expect("TCP listener started");
 
@@ -47,7 +47,8 @@ async fn setup(
     let udp_port = free_port();
     let db_udp = db.clone();
     tokio::spawn(async move {
-        let _ = epics_ca_rs::server::udp::run_udp_search_responder(db_udp, udp_port, tcp_port).await;
+        let _ =
+            epics_ca_rs::server::udp::run_udp_search_responder(db_udp, udp_port, tcp_port).await;
     });
     // Give UDP socket a moment to bind
     tokio::time::sleep(Duration::from_millis(50)).await;

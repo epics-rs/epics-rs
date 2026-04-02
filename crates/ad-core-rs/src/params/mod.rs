@@ -1,5 +1,5 @@
-pub mod ndarray_driver;
 pub mod ad_driver;
+pub mod ndarray_driver;
 
 // Re-export for backward compatibility
 pub use ad_driver::ADDriverParams as ADBaseParams;

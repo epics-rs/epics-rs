@@ -1,14 +1,13 @@
-use std::collections::HashMap;
 use clap::Parser;
 use epics_base_rs::error::CaResult;
-use epics_ca_rs::server::CaServer;
 use epics_base_rs::server::records::{
-    ai::AiRecord, ao::AoRecord, bi::BiRecord, bo::BoRecord,
-    stringin::StringinRecord, stringout::StringoutRecord,
-    longin::LonginRecord, longout::LongoutRecord,
-    mbbi::MbbiRecord, mbbo::MbboRecord,
+    ai::AiRecord, ao::AoRecord, bi::BiRecord, bo::BoRecord, longin::LonginRecord,
+    longout::LongoutRecord, mbbi::MbbiRecord, mbbo::MbboRecord, stringin::StringinRecord,
+    stringout::StringoutRecord,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_ca_rs::server::CaServer;
+use std::collections::HashMap;
 
 /// A simple soft IOC that hosts PVs over Channel Access.
 ///
@@ -46,9 +45,20 @@ struct Args {
 fn is_type_keyword(s: &str) -> bool {
     matches!(
         s,
-        "string" | "str" | "short" | "int16" | "float" | "f32"
-            | "enum" | "u16" | "char" | "u8" | "long" | "int32"
-            | "double" | "f64"
+        "string"
+            | "str"
+            | "short"
+            | "int16"
+            | "float"
+            | "f32"
+            | "enum"
+            | "u16"
+            | "char"
+            | "u8"
+            | "long"
+            | "int32"
+            | "double"
+            | "f64"
     )
 }
 
@@ -60,7 +70,9 @@ fn parse_pv_def(def: &str) -> CaResult<(String, EpicsValue)> {
     // We need at least 3 segments (name, type, value), with the type being a known keyword.
     // Scan from the end to find the type keyword — the segment after it is the value,
     // and everything before it is the name.
-    let type_idx = segments.iter().rposition(|s| is_type_keyword(&s.to_lowercase()));
+    let type_idx = segments
+        .iter()
+        .rposition(|s| is_type_keyword(&s.to_lowercase()));
 
     let type_idx = match type_idx {
         Some(idx) if idx > 0 && idx + 1 < segments.len() => idx,
@@ -90,7 +102,9 @@ fn parse_pv_def(def: &str) -> CaResult<(String, EpicsValue)> {
     Ok((name, value))
 }
 
-fn parse_record_def(def: &str) -> CaResult<(String, Box<dyn epics_base_rs::server::record::Record>)> {
+fn parse_record_def(
+    def: &str,
+) -> CaResult<(String, Box<dyn epics_base_rs::server::record::Record>)> {
     // Split on first ':' to get record type; the remainder is NAME or NAME:...:VALUE.
     // PV names often contain colons (e.g. "SEQ:counter"), so we try to parse the
     // last ':'-separated segment as a value — if that fails, the whole remainder is the name.

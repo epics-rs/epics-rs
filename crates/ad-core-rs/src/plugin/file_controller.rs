@@ -5,7 +5,9 @@ use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataType, NDDimension};
 
 use super::file_base::{NDFileMode, NDFileWriter, NDPluginFileBase};
-use super::runtime::{ParamChangeResult, ParamChangeValue, ParamUpdate, PluginParamSnapshot, ProcessResult};
+use super::runtime::{
+    ParamChangeResult, ParamChangeValue, ParamUpdate, PluginParamSnapshot, ProcessResult,
+};
 
 /// Param indices for file plugin control (looked up once at registration time).
 #[derive(Default)]
@@ -58,7 +60,10 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 
     /// Look up all standard file param indices from the port driver base.
-    pub fn register_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+    pub fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
         self.params.file_path = base.find_param("FILE_PATH");
         self.params.file_name = base.find_param("FILE_NAME");
         self.params.file_number = base.find_param("FILE_NUMBER");
@@ -125,7 +130,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
                     let target = self.file_base.num_capture_target();
                     if r.is_ok() && target > 0 && self.file_base.num_captured() >= target {
                         if let Err(e) = self.file_base.close_stream(&mut self.writer) {
-                            return ProcessResult::sink(self.error_updates(false, false, e.to_string()));
+                            return ProcessResult::sink(self.error_updates(
+                                false,
+                                false,
+                                e.to_string(),
+                            ));
                         }
                         self.capture_active = false;
                         self.push_full_file_name_update(&mut proc_result.param_updates);
@@ -153,19 +162,25 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 
     /// Handle a control-plane param change. Returns true if the reason was handled.
-    pub fn on_param_change(&mut self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
+    pub fn on_param_change(
+        &mut self,
+        reason: usize,
+        params: &PluginParamSnapshot,
+    ) -> ParamChangeResult {
         let mut updates = Vec::new();
 
         if Some(reason) == self.params.file_path {
             if let ParamChangeValue::Octet(s) = &params.value {
                 let normalized = normalize_file_path(s);
                 self.file_base.file_path = normalized.clone();
-                let exists = std::path::Path::new(
-                    normalized.trim_end_matches(std::path::MAIN_SEPARATOR),
-                ).is_dir();
+                let exists =
+                    std::path::Path::new(normalized.trim_end_matches(std::path::MAIN_SEPARATOR))
+                        .is_dir();
                 if let Some(idx) = self.params.file_path_exists {
                     updates.push(ParamUpdate::Int32 {
-                        reason: idx, addr: 0, value: if exists { 1 } else { 0 },
+                        reason: idx,
+                        addr: 0,
+                        value: if exists { 1 } else { 0 },
                     });
                 }
             }
@@ -184,9 +199,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
         } else if Some(reason) == self.params.auto_save {
             self.auto_save = params.value.as_i32() != 0;
         } else if Some(reason) == self.params.write_mode {
-            self.file_base.set_mode(NDFileMode::from_i32(params.value.as_i32()));
+            self.file_base
+                .set_mode(NDFileMode::from_i32(params.value.as_i32()));
         } else if Some(reason) == self.params.num_capture {
-            self.file_base.set_num_capture(params.value.as_i32().max(1) as usize);
+            self.file_base
+                .set_num_capture(params.value.as_i32().max(1) as usize);
         } else if Some(reason) == self.params.create_dir {
             self.file_base.create_dir = params.value.as_i32();
         } else if Some(reason) == self.params.file_temp_suffix {
@@ -200,7 +217,9 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         if let Some(array) = self.latest_array.clone() {
                             self.write_single(array)
                         } else {
-                            Err(ADError::UnsupportedConversion("no array available for write".into()))
+                            Err(ADError::UnsupportedConversion(
+                                "no array available for write".into(),
+                            ))
                         }
                     }
                     NDFileMode::Capture => self.file_base.flush_capture(&mut self.writer),
@@ -208,7 +227,9 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         if let Some(array) = self.latest_array.clone() {
                             self.file_base.process_array(array, &mut self.writer)
                         } else {
-                            Err(ADError::UnsupportedConversion("no array available for write".into()))
+                            Err(ADError::UnsupportedConversion(
+                                "no array available for write".into(),
+                            ))
                         }
                     }
                 };
@@ -218,9 +239,13 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         self.push_num_captured_update(&mut updates);
                         self.push_full_file_name_update(&mut updates);
                     }
-                    Err(err) => return ParamChangeResult::updates(
-                        self.error_updates(false, true, err.to_string()),
-                    ),
+                    Err(err) => {
+                        return ParamChangeResult::updates(self.error_updates(
+                            false,
+                            true,
+                            err.to_string(),
+                        ));
+                    }
                 }
             }
         } else if Some(reason) == self.params.read_file {
@@ -243,9 +268,13 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         self.push_full_file_name_update(&mut updates);
                         return ParamChangeResult::combined(vec![array], updates);
                     }
-                    Err(err) => return ParamChangeResult::updates(
-                        self.error_updates(true, false, err.to_string()),
-                    ),
+                    Err(err) => {
+                        return ParamChangeResult::updates(self.error_updates(
+                            true,
+                            false,
+                            err.to_string(),
+                        ));
+                    }
                 }
             }
         } else if Some(reason) == self.params.capture {
@@ -254,7 +283,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
                     NDFileMode::Single => {
                         self.capture_active = false;
                         return ParamChangeResult::updates(self.error_updates(
-                            false, false,
+                            false,
+                            false,
                             "ERROR: capture not supported in Single mode".into(),
                         ));
                     }
@@ -271,9 +301,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
             } else {
                 if self.file_base.mode() == NDFileMode::Stream {
                     if let Err(err) = self.file_base.close_stream(&mut self.writer) {
-                        return ParamChangeResult::updates(
-                            self.error_updates(false, false, err.to_string()),
-                        );
+                        return ParamChangeResult::updates(self.error_updates(
+                            false,
+                            false,
+                            err.to_string(),
+                        ));
                     }
                 }
                 self.capture_active = false;
@@ -294,32 +326,44 @@ impl<W: NDFileWriter> FilePluginController<W> {
         let mut updates = Vec::new();
         if let Some(idx) = self.params.file_number {
             updates.push(ParamUpdate::Int32 {
-                reason: idx, addr: 0, value: self.file_base.file_number,
+                reason: idx,
+                addr: 0,
+                value: self.file_base.file_number,
             });
         }
         if let Some(idx) = self.params.write_status {
             updates.push(ParamUpdate::Int32 {
-                reason: idx, addr: 0, value: 0,
+                reason: idx,
+                addr: 0,
+                value: 0,
             });
         }
         if let Some(idx) = self.params.write_message {
             updates.push(ParamUpdate::Octet {
-                reason: idx, addr: 0, value: String::new(),
+                reason: idx,
+                addr: 0,
+                value: String::new(),
             });
         }
         if let Some(idx) = self.params.write_file {
             updates.push(ParamUpdate::Int32 {
-                reason: idx, addr: 0, value: 0,
+                reason: idx,
+                addr: 0,
+                value: 0,
             });
         }
         if let Some(idx) = self.params.capture {
             updates.push(ParamUpdate::Int32 {
-                reason: idx, addr: 0, value: if self.capture_active { 1 } else { 0 },
+                reason: idx,
+                addr: 0,
+                value: if self.capture_active { 1 } else { 0 },
             });
         }
         if let Some(idx) = self.params.read_file {
             updates.push(ParamUpdate::Int32 {
-                reason: idx, addr: 0, value: 0,
+                reason: idx,
+                addr: 0,
+                value: 0,
             });
         }
         updates
@@ -328,7 +372,9 @@ impl<W: NDFileWriter> FilePluginController<W> {
     fn push_num_captured_update(&self, updates: &mut Vec<ParamUpdate>) {
         if let Some(idx) = self.params.num_captured {
             updates.push(ParamUpdate::Int32 {
-                reason: idx, addr: 0, value: self.file_base.num_captured() as i32,
+                reason: idx,
+                addr: 0,
+                value: self.file_base.num_captured() as i32,
             });
         }
     }
@@ -336,28 +382,51 @@ impl<W: NDFileWriter> FilePluginController<W> {
     fn push_full_file_name_update(&self, updates: &mut Vec<ParamUpdate>) {
         if let Some(idx) = self.params.full_file_name {
             updates.push(ParamUpdate::Octet {
-                reason: idx, addr: 0, value: self.file_base.create_file_name(),
+                reason: idx,
+                addr: 0,
+                value: self.file_base.create_file_name(),
             });
         }
     }
 
-    fn error_updates(&self, read_reason: bool, write_reason: bool, message: String) -> Vec<ParamUpdate> {
+    fn error_updates(
+        &self,
+        read_reason: bool,
+        write_reason: bool,
+        message: String,
+    ) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
         if write_reason {
             if let Some(idx) = self.params.write_file {
-                updates.push(ParamUpdate::Int32 { reason: idx, addr: 0, value: 0 });
+                updates.push(ParamUpdate::Int32 {
+                    reason: idx,
+                    addr: 0,
+                    value: 0,
+                });
             }
         }
         if read_reason {
             if let Some(idx) = self.params.read_file {
-                updates.push(ParamUpdate::Int32 { reason: idx, addr: 0, value: 0 });
+                updates.push(ParamUpdate::Int32 {
+                    reason: idx,
+                    addr: 0,
+                    value: 0,
+                });
             }
         }
         if let Some(idx) = self.params.write_status {
-            updates.push(ParamUpdate::Int32 { reason: idx, addr: 0, value: 1 });
+            updates.push(ParamUpdate::Int32 {
+                reason: idx,
+                addr: 0,
+                value: 1,
+            });
         }
         if let Some(idx) = self.params.write_message {
-            updates.push(ParamUpdate::Octet { reason: idx, addr: 0, value: message });
+            updates.push(ParamUpdate::Octet {
+                reason: idx,
+                addr: 0,
+                value: message,
+            });
         }
         updates
     }

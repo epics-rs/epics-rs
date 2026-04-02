@@ -205,117 +205,21 @@ impl PortActor {
             return;
         }
 
-        let is_connect_op = matches!(op, RequestOp::Connect | RequestOp::Disconnect);
-
-        if !is_connect_op {
-            // Auto-connect
-            let should_auto = if self.driver.base().flags.multi_device {
-                let ds = self.driver.base().device_states.get(&user.addr);
-                !ds.map_or(true, |d| d.connected)
-                    && ds.map_or(self.driver.base().auto_connect, |d| d.auto_connect)
-            } else {
-                !self.driver.base().connected && self.driver.base().auto_connect
-            };
-            if should_auto {
-                let _ = self.driver.connect(&AsynUser::default());
-            }
-
-            // Check ready
-            if let Err(e) = self.driver.base().check_ready_addr(user.addr) {
-                let _ = reply.send(Err(e));
-                return;
-            }
+        if let Err(e) = prepare_io(&mut *self.driver, &op, user.addr) {
+            let _ = reply.send(Err(e));
+            return;
         }
 
-        // Dispatch
-        let result = self.dispatch_io(&mut user, &op);
+        let result = self.dispatch_actor(&mut user, &op);
         let _ = reply.send(result);
     }
 
-    fn dispatch_io(&mut self, user: &mut AsynUser, op: &RequestOp) -> AsynResult<RequestResult> {
-        let is_read = matches!(
-            op,
-            RequestOp::Int32Read
-                | RequestOp::Int64Read
-                | RequestOp::Float64Read
-                | RequestOp::OctetRead { .. }
-                | RequestOp::OctetWriteRead { .. }
-                | RequestOp::UInt32DigitalRead { .. }
-                | RequestOp::EnumRead
-                | RequestOp::Int32ArrayRead { .. }
-                | RequestOp::Float64ArrayRead { .. }
-                | RequestOp::Int8ArrayRead { .. }
-                | RequestOp::Int16ArrayRead { .. }
-                | RequestOp::Int64ArrayRead { .. }
-                | RequestOp::Float32ArrayRead { .. }
-        );
-
-        let result = match op {
-            RequestOp::OctetWrite { data } => {
-                self.driver.io_write_octet(user, data)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::OctetRead { buf_size } => {
-                let mut buf = vec![0u8; *buf_size];
-                let n = self.driver.io_read_octet(user, &mut buf)?;
-                buf.truncate(n);
-                Ok(RequestResult::octet_read(buf, n))
-            }
-            RequestOp::OctetWriteRead { data, buf_size } => {
-                self.driver.io_write_octet(user, data)?;
-                let mut buf = vec![0u8; *buf_size];
-                let n = self.driver.io_read_octet(user, &mut buf)?;
-                buf.truncate(n);
-                Ok(RequestResult::octet_read(buf, n))
-            }
-            RequestOp::Int32Write { value } => {
-                self.driver.io_write_int32(user, *value)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Int32Read => {
-                let v = self.driver.io_read_int32(user)?;
-                Ok(RequestResult::int32_read(v))
-            }
-            RequestOp::Int64Write { value } => {
-                self.driver.io_write_int64(user, *value)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Int64Read => {
-                let v = self.driver.io_read_int64(user)?;
-                Ok(RequestResult::int64_read(v))
-            }
-            RequestOp::Float64Write { value } => {
-                self.driver.io_write_float64(user, *value)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Float64Read => {
-                let v = self.driver.io_read_float64(user)?;
-                Ok(RequestResult::float64_read(v))
-            }
-            RequestOp::UInt32DigitalWrite { value, mask } => {
-                self.driver.io_write_uint32_digital(user, *value, *mask)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::UInt32DigitalRead { mask } => {
-                let v = self.driver.io_read_uint32_digital(user, *mask)?;
-                Ok(RequestResult::uint32_read(v))
-            }
-            RequestOp::Flush => {
-                self.driver.io_flush(user)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Connect => {
-                self.driver.connect(user)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Disconnect => {
-                self.driver.disconnect(user)?;
-                Ok(RequestResult::write_ok())
-            }
+    fn dispatch_actor(&mut self, user: &mut AsynUser, op: &RequestOp) -> AsynResult<RequestResult> {
+        match op {
             RequestOp::BlockProcess => {
                 let token = user.block_token.unwrap_or(user.reason as u64);
                 self.blocked_by = Some(token);
-                Ok(RequestResult::write_ok())
+                return Ok(RequestResult::write_ok());
             }
             RequestOp::UnblockProcess => {
                 self.blocked_by = None;
@@ -323,115 +227,229 @@ impl PortActor {
                 for msg in pending {
                     self.heap.push(msg);
                 }
-                Ok(RequestResult::write_ok())
+                return Ok(RequestResult::write_ok());
             }
-            RequestOp::DrvUserCreate { drv_info } => {
-                let reason = self.driver.drv_user_create(drv_info)?;
-                Ok(RequestResult::drv_user_create(reason))
-            }
-            RequestOp::EnumRead => {
-                let (idx, _entries) = self.driver.read_enum(user)?;
-                Ok(RequestResult::enum_read(idx))
-            }
-            RequestOp::EnumWrite { index } => {
-                self.driver.write_enum(user, *index)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Int32ArrayRead { max_elements } => {
-                let mut buf = vec![0i32; *max_elements];
-                let n = self.driver.read_int32_array(user, &mut buf)?;
-                buf.truncate(n);
-                Ok(RequestResult::int32_array_read(buf))
-            }
-            RequestOp::Int32ArrayWrite { data } => {
-                self.driver.write_int32_array(user, data)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Float64ArrayRead { max_elements } => {
-                let mut buf = vec![0f64; *max_elements];
-                let n = self.driver.read_float64_array(user, &mut buf)?;
-                buf.truncate(n);
-                Ok(RequestResult::float64_array_read(buf))
-            }
-            RequestOp::Float64ArrayWrite { data } => {
-                self.driver.write_float64_array(user, data)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Int8ArrayRead { max_elements } => {
-                let mut buf = vec![0i8; *max_elements];
-                let n = self.driver.read_int8_array(user, &mut buf)?;
-                buf.truncate(n);
-                Ok(RequestResult::int8_array_read(buf))
-            }
-            RequestOp::Int8ArrayWrite { data } => {
-                self.driver.write_int8_array(user, data)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Int16ArrayRead { max_elements } => {
-                let mut buf = vec![0i16; *max_elements];
-                let n = self.driver.read_int16_array(user, &mut buf)?;
-                buf.truncate(n);
-                Ok(RequestResult::int16_array_read(buf))
-            }
-            RequestOp::Int16ArrayWrite { data } => {
-                self.driver.write_int16_array(user, data)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Int64ArrayRead { max_elements } => {
-                let mut buf = vec![0i64; *max_elements];
-                let n = self.driver.read_int64_array(user, &mut buf)?;
-                buf.truncate(n);
-                Ok(RequestResult::int64_array_read(buf))
-            }
-            RequestOp::Int64ArrayWrite { data } => {
-                self.driver.write_int64_array(user, data)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::Float32ArrayRead { max_elements } => {
-                let mut buf = vec![0f32; *max_elements];
-                let n = self.driver.read_float32_array(user, &mut buf)?;
-                buf.truncate(n);
-                Ok(RequestResult::float32_array_read(buf))
-            }
-            RequestOp::Float32ArrayWrite { data } => {
-                self.driver.write_float32_array(user, data)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::CallParamCallbacks { addr } => {
-                self.driver.base_mut().call_param_callbacks(*addr)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::GetOption { key } => {
-                let val = self.driver.get_option(key)?;
-                Ok(RequestResult::option_read(val))
-            }
-            RequestOp::SetOption { key, value } => {
-                self.driver.set_option(key, value)?;
-                Ok(RequestResult::write_ok())
-            }
-        };
-
-        // Attach alarm/timestamp metadata on successful reads
-        if is_read {
-            if let Ok(r) = result {
-                let (_, alarm_status, alarm_severity) = self
-                    .driver
-                    .base()
-                    .params
-                    .get_param_status(user.reason, user.addr)
-                    .unwrap_or((crate::error::AsynStatus::Success, 0, 0));
-                let ts = self
-                    .driver
-                    .base()
-                    .params
-                    .get_timestamp(user.reason, user.addr)
-                    .unwrap_or(None);
-                return Ok(r.with_alarm(alarm_status, alarm_severity, ts));
-            }
+            _ => {}
         }
-
-        result
+        dispatch_io(&mut *self.driver, user, op)
     }
+}
+
+/// Dispatch an I/O operation to a port driver.
+///
+/// Shared between the actor (for `can_block=true`) and direct callers
+/// (for `can_block=false`), matching C EPICS's lockPort pattern.
+pub(crate) fn dispatch_io(
+    driver: &mut dyn PortDriver,
+    user: &mut AsynUser,
+    op: &RequestOp,
+) -> AsynResult<RequestResult> {
+    let is_read = matches!(
+        op,
+        RequestOp::Int32Read
+            | RequestOp::Int64Read
+            | RequestOp::Float64Read
+            | RequestOp::OctetRead { .. }
+            | RequestOp::OctetWriteRead { .. }
+            | RequestOp::UInt32DigitalRead { .. }
+            | RequestOp::EnumRead
+            | RequestOp::Int32ArrayRead { .. }
+            | RequestOp::Float64ArrayRead { .. }
+            | RequestOp::Int8ArrayRead { .. }
+            | RequestOp::Int16ArrayRead { .. }
+            | RequestOp::Int64ArrayRead { .. }
+            | RequestOp::Float32ArrayRead { .. }
+    );
+
+    let result = match op {
+        RequestOp::OctetWrite { data } => {
+            driver.io_write_octet(user, data)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::OctetRead { buf_size } => {
+            let mut buf = vec![0u8; *buf_size];
+            let n = driver.io_read_octet(user, &mut buf)?;
+            buf.truncate(n);
+            Ok(RequestResult::octet_read(buf, n))
+        }
+        RequestOp::OctetWriteRead { data, buf_size } => {
+            driver.io_write_octet(user, data)?;
+            let mut buf = vec![0u8; *buf_size];
+            let n = driver.io_read_octet(user, &mut buf)?;
+            buf.truncate(n);
+            Ok(RequestResult::octet_read(buf, n))
+        }
+        RequestOp::Int32Write { value } => {
+            driver.io_write_int32(user, *value)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Int32Read => {
+            let v = driver.io_read_int32(user)?;
+            Ok(RequestResult::int32_read(v))
+        }
+        RequestOp::Int64Write { value } => {
+            driver.io_write_int64(user, *value)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Int64Read => {
+            let v = driver.io_read_int64(user)?;
+            Ok(RequestResult::int64_read(v))
+        }
+        RequestOp::Float64Write { value } => {
+            driver.io_write_float64(user, *value)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Float64Read => {
+            let v = driver.io_read_float64(user)?;
+            Ok(RequestResult::float64_read(v))
+        }
+        RequestOp::UInt32DigitalWrite { value, mask } => {
+            driver.io_write_uint32_digital(user, *value, *mask)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::UInt32DigitalRead { mask } => {
+            let v = driver.io_read_uint32_digital(user, *mask)?;
+            Ok(RequestResult::uint32_read(v))
+        }
+        RequestOp::Flush => {
+            driver.io_flush(user)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Connect => {
+            driver.connect(user)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Disconnect => {
+            driver.disconnect(user)?;
+            Ok(RequestResult::write_ok())
+        }
+        // BlockProcess/UnblockProcess only meaningful in actor context; no-op for direct calls
+        RequestOp::BlockProcess | RequestOp::UnblockProcess => Ok(RequestResult::write_ok()),
+        RequestOp::DrvUserCreate { drv_info } => {
+            let reason = driver.drv_user_create(drv_info)?;
+            Ok(RequestResult::drv_user_create(reason))
+        }
+        RequestOp::EnumRead => {
+            let (idx, _entries) = driver.read_enum(user)?;
+            Ok(RequestResult::enum_read(idx))
+        }
+        RequestOp::EnumWrite { index } => {
+            driver.write_enum(user, *index)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Int32ArrayRead { max_elements } => {
+            let mut buf = vec![0i32; *max_elements];
+            let n = driver.read_int32_array(user, &mut buf)?;
+            buf.truncate(n);
+            Ok(RequestResult::int32_array_read(buf))
+        }
+        RequestOp::Int32ArrayWrite { data } => {
+            driver.write_int32_array(user, data)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Float64ArrayRead { max_elements } => {
+            let mut buf = vec![0f64; *max_elements];
+            let n = driver.read_float64_array(user, &mut buf)?;
+            buf.truncate(n);
+            Ok(RequestResult::float64_array_read(buf))
+        }
+        RequestOp::Float64ArrayWrite { data } => {
+            driver.write_float64_array(user, data)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Int8ArrayRead { max_elements } => {
+            let mut buf = vec![0i8; *max_elements];
+            let n = driver.read_int8_array(user, &mut buf)?;
+            buf.truncate(n);
+            Ok(RequestResult::int8_array_read(buf))
+        }
+        RequestOp::Int8ArrayWrite { data } => {
+            driver.write_int8_array(user, data)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Int16ArrayRead { max_elements } => {
+            let mut buf = vec![0i16; *max_elements];
+            let n = driver.read_int16_array(user, &mut buf)?;
+            buf.truncate(n);
+            Ok(RequestResult::int16_array_read(buf))
+        }
+        RequestOp::Int16ArrayWrite { data } => {
+            driver.write_int16_array(user, data)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Int64ArrayRead { max_elements } => {
+            let mut buf = vec![0i64; *max_elements];
+            let n = driver.read_int64_array(user, &mut buf)?;
+            buf.truncate(n);
+            Ok(RequestResult::int64_array_read(buf))
+        }
+        RequestOp::Int64ArrayWrite { data } => {
+            driver.write_int64_array(user, data)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::Float32ArrayRead { max_elements } => {
+            let mut buf = vec![0f32; *max_elements];
+            let n = driver.read_float32_array(user, &mut buf)?;
+            buf.truncate(n);
+            Ok(RequestResult::float32_array_read(buf))
+        }
+        RequestOp::Float32ArrayWrite { data } => {
+            driver.write_float32_array(user, data)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::CallParamCallbacks { addr } => {
+            driver.base_mut().call_param_callbacks(*addr)?;
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::GetOption { key } => {
+            let val = driver.get_option(key)?;
+            Ok(RequestResult::option_read(val))
+        }
+        RequestOp::SetOption { key, value } => {
+            driver.set_option(key, value)?;
+            Ok(RequestResult::write_ok())
+        }
+    };
+
+    // Attach alarm/timestamp metadata on successful reads
+    if is_read {
+        if let Ok(r) = result {
+            let (_, alarm_status, alarm_severity) = driver
+                .base()
+                .params
+                .get_param_status(user.reason, user.addr)
+                .unwrap_or((crate::error::AsynStatus::Success, 0, 0));
+            let ts = driver
+                .base()
+                .params
+                .get_timestamp(user.reason, user.addr)
+                .unwrap_or(None);
+            return Ok(r.with_alarm(alarm_status, alarm_severity, ts));
+        }
+    }
+
+    result
+}
+
+/// Run the same connection/readiness checks used by the actor before dispatch.
+pub(crate) fn prepare_io(driver: &mut dyn PortDriver, op: &RequestOp, addr: i32) -> AsynResult<()> {
+    let is_connect_op = matches!(op, RequestOp::Connect | RequestOp::Disconnect);
+    if is_connect_op {
+        return Ok(());
+    }
+
+    let should_auto = if driver.base().flags.multi_device {
+        let ds = driver.base().device_states.get(&addr);
+        !ds.map_or(true, |d| d.connected)
+            && ds.map_or(driver.base().auto_connect, |d| d.auto_connect)
+    } else {
+        !driver.base().connected && driver.base().auto_connect
+    };
+    if should_auto {
+        let _ = driver.connect(&AsynUser::default());
+    }
+
+    driver.base().check_ready_addr(addr)
 }
 
 #[cfg(test)]
@@ -533,12 +551,7 @@ mod tests {
         .unwrap();
 
         let user = AsynUser::new(2).with_timeout(Duration::from_secs(1));
-        let result = send_and_wait(
-            &tx,
-            RequestOp::OctetRead { buf_size: 256 },
-            user,
-        )
-        .unwrap();
+        let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 256 }, user).unwrap();
         assert_eq!(&result.data.unwrap()[..5], b"hello");
     }
 
@@ -637,8 +650,8 @@ mod tests {
 
     #[test]
     fn actor_serialization() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct CountingDriver {
             base: PortDriverBase,
@@ -653,11 +666,7 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn io_write_int32(
-                &mut self,
-                _user: &mut AsynUser,
-                value: i32,
-            ) -> AsynResult<()> {
+            fn io_write_int32(&mut self, _user: &mut AsynUser, value: i32) -> AsynResult<()> {
                 let c = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
                 let _ = self.max_concurrent.fetch_max(c, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(1));
@@ -707,7 +716,9 @@ mod tests {
     #[test]
     fn actor_uint32_digital() {
         let mut drv = TestDriver::new();
-        drv.base.create_param("BITS", ParamType::UInt32Digital).unwrap();
+        drv.base
+            .create_param("BITS", ParamType::UInt32Digital)
+            .unwrap();
         let tx = spawn_actor(drv);
 
         let user = AsynUser::new(4).with_timeout(Duration::from_secs(1));
@@ -722,12 +733,7 @@ mod tests {
         .unwrap();
 
         let user = AsynUser::new(4).with_timeout(Duration::from_secs(1));
-        let result = send_and_wait(
-            &tx,
-            RequestOp::UInt32DigitalRead { mask: 0xFF },
-            user,
-        )
-        .unwrap();
+        let result = send_and_wait(&tx, RequestOp::UInt32DigitalRead { mask: 0xFF }, user).unwrap();
         assert_eq!(result.uint_val, Some(0x0F));
     }
 

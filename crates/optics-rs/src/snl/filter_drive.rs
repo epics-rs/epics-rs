@@ -6,8 +6,8 @@
 
 use epics_base_rs::server::database::PvDatabase;
 
-use crate::db_access::{alloc_origin, DbChannel, DbMultiMonitor};
 use crate::data::chantler::{find_material, transmission};
+use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 
 /// Maximum number of filters supported.
 pub const MAX_FILTERS: usize = 32;
@@ -329,10 +329,10 @@ impl FilterDriveController {
         self.filter_mask = current_mask(&self.blades);
         self.transmission = current_transmission(&self.blades);
 
-        self.perm_table.current_idx = find_current_index(&self.perm_table.entries, self.filter_mask);
+        self.perm_table.current_idx =
+            find_current_index(&self.perm_table.entries, self.filter_mask);
 
-        let (up, tu, down, td) =
-            update_step_indices(&self.perm_table.entries, self.transmission);
+        let (up, tu, down, td) = update_step_indices(&self.perm_table.entries, self.transmission);
         self.perm_table.up_idx = up;
         self.transmission_up = tu;
         self.perm_table.down_idx = down;
@@ -424,12 +424,17 @@ pub enum FilterDriveEvent {
 }
 
 /// Async entry point — runs the filter_drive state machine against live PVs.
-pub async fn run(config: FilterDriveConfig, db: PvDatabase) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
+pub async fn run(
+    config: FilterDriveConfig,
+    db: PvDatabase,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::time::Duration;
 
     tokio::time::sleep(Duration::from_secs(3)).await;
-    println!("filterDrive: starting for prefix={}{}", config.prefix, config.record);
+    println!(
+        "filterDrive: starting for prefix={}{}",
+        config.prefix, config.record
+    );
 
     let my_origin = alloc_origin();
     let pr = format!("{}{}", config.prefix, config.record);
@@ -480,7 +485,10 @@ pub async fn run(config: FilterDriveConfig, db: PvDatabase) -> Result<(), Box<dy
 
     // Initialize
     let mut ctrl = FilterDriveController::new(n);
-    ctrl.energy_kev = { let v = ch_energy.get_f64().await; if v > 0.0 { v } else { 10.0 } };
+    ctrl.energy_kev = {
+        let v = ch_energy.get_f64().await;
+        if v > 0.0 { v } else { 10.0 }
+    };
 
     // Read initial blade configuration
     for i in 0..n {
@@ -521,9 +529,17 @@ pub async fn run(config: FilterDriveConfig, db: PvDatabase) -> Result<(), Box<dy
         } else if changed_pv == pv_setpt {
             Some(FilterDriveEvent::TransmissionSetpoint(new_val))
         } else if changed_pv == pv_step_up {
-            if new_val as i32 != 0 { Some(FilterDriveEvent::StepUp) } else { None }
+            if new_val as i32 != 0 {
+                Some(FilterDriveEvent::StepUp)
+            } else {
+                None
+            }
         } else if changed_pv == pv_step_down {
-            if new_val as i32 != 0 { Some(FilterDriveEvent::StepDown) } else { None }
+            if new_val as i32 != 0 {
+                Some(FilterDriveEvent::StepDown)
+            } else {
+                None
+            }
         } else if changed_pv == pv_mask_setpt {
             Some(FilterDriveEvent::FilterMaskSetpoint(new_val as u32))
         } else {
@@ -548,7 +564,10 @@ pub async fn run(config: FilterDriveConfig, db: PvDatabase) -> Result<(), Box<dy
                 FilterDriveEvent::TransmissionSetpoint(setpt) => {
                     let _ = ch_status.put_i16(1_i16).await;
                     let changes = ctrl.execute_action(FilterAction::SetTransmission, setpt, 0);
-                    let wait_time = { let v = ch_wait_time.get_f64().await; if v > 0.0 { v } else { 0.5 } };
+                    let wait_time = {
+                        let v = ch_wait_time.get_f64().await;
+                        if v > 0.0 { v } else { 0.5 }
+                    };
                     apply_filter_changes(&ch_set, &changes, wait_time).await;
                     ctrl.recalculate();
                     let _ = ch_status.put_i16(0_i16).await;
@@ -558,7 +577,10 @@ pub async fn run(config: FilterDriveConfig, db: PvDatabase) -> Result<(), Box<dy
                     let _ = ch_step_up.put_i16(0_i16).await;
                     let _ = ch_status.put_i16(1_i16).await;
                     let changes = ctrl.execute_action(FilterAction::StepUp, 0.0, 0);
-                    let wait_time = { let v = ch_wait_time.get_f64().await; if v > 0.0 { v } else { 0.5 } };
+                    let wait_time = {
+                        let v = ch_wait_time.get_f64().await;
+                        if v > 0.0 { v } else { 0.5 }
+                    };
                     apply_filter_changes(&ch_set, &changes, wait_time).await;
                     ctrl.recalculate();
                     let _ = ch_status.put_i16(0_i16).await;
@@ -568,7 +590,10 @@ pub async fn run(config: FilterDriveConfig, db: PvDatabase) -> Result<(), Box<dy
                     let _ = ch_step_down.put_i16(0_i16).await;
                     let _ = ch_status.put_i16(1_i16).await;
                     let changes = ctrl.execute_action(FilterAction::StepDown, 0.0, 0);
-                    let wait_time = { let v = ch_wait_time.get_f64().await; if v > 0.0 { v } else { 0.5 } };
+                    let wait_time = {
+                        let v = ch_wait_time.get_f64().await;
+                        if v > 0.0 { v } else { 0.5 }
+                    };
                     apply_filter_changes(&ch_set, &changes, wait_time).await;
                     ctrl.recalculate();
                     let _ = ch_status.put_i16(0_i16).await;
@@ -577,7 +602,10 @@ pub async fn run(config: FilterDriveConfig, db: PvDatabase) -> Result<(), Box<dy
                 FilterDriveEvent::FilterMaskSetpoint(mask) => {
                     let _ = ch_status.put_i16(1_i16).await;
                     let changes = ctrl.execute_action(FilterAction::SetFilterMask, 0.0, mask);
-                    let wait_time = { let v = ch_wait_time.get_f64().await; if v > 0.0 { v } else { 0.5 } };
+                    let wait_time = {
+                        let v = ch_wait_time.get_f64().await;
+                        if v > 0.0 { v } else { 0.5 }
+                    };
                     apply_filter_changes(&ch_set, &changes, wait_time).await;
                     ctrl.recalculate();
                     let _ = ch_status.put_i16(0_i16).await;
@@ -598,12 +626,8 @@ pub async fn run(config: FilterDriveConfig, db: PvDatabase) -> Result<(), Box<dy
 }
 
 /// Apply filter blade changes: first insert, wait, then remove.
-async fn apply_filter_changes(
-    ch_set: &[DbChannel],
-    changes: &[(usize, bool)],
-    wait_time: f64,
-) {
-    use tokio::time::{sleep, Duration};
+async fn apply_filter_changes(ch_set: &[DbChannel], changes: &[(usize, bool)], wait_time: f64) {
+    use tokio::time::{Duration, sleep};
 
     // Phase 1: insert filters
     let mut any_insert = false;
@@ -748,10 +772,22 @@ mod tests {
     #[test]
     fn test_find_best_for_setpoint() {
         let entries = vec![
-            Permutation { mask: 0, transmission: 1.0 },
-            Permutation { mask: 1, transmission: 0.5 },
-            Permutation { mask: 2, transmission: 0.3 },
-            Permutation { mask: 3, transmission: 0.15 },
+            Permutation {
+                mask: 0,
+                transmission: 1.0,
+            },
+            Permutation {
+                mask: 1,
+                transmission: 0.5,
+            },
+            Permutation {
+                mask: 2,
+                transmission: 0.3,
+            },
+            Permutation {
+                mask: 3,
+                transmission: 0.15,
+            },
         ];
 
         // Setpoint 0.4 -> should pick 0.3 (highest <= 0.4)
@@ -771,10 +807,22 @@ mod tests {
     #[test]
     fn test_update_step_indices() {
         let entries = vec![
-            Permutation { mask: 0, transmission: 1.0 },
-            Permutation { mask: 1, transmission: 0.5 },
-            Permutation { mask: 2, transmission: 0.3 },
-            Permutation { mask: 3, transmission: 0.15 },
+            Permutation {
+                mask: 0,
+                transmission: 1.0,
+            },
+            Permutation {
+                mask: 1,
+                transmission: 0.5,
+            },
+            Permutation {
+                mask: 2,
+                transmission: 0.3,
+            },
+            Permutation {
+                mask: 3,
+                transmission: 0.15,
+            },
         ];
 
         let (up, tu, down, td) = update_step_indices(&entries, 0.5);
@@ -787,8 +835,14 @@ mod tests {
     #[test]
     fn test_step_up_at_max_returns_none() {
         let entries = vec![
-            Permutation { mask: 0, transmission: 1.0 },
-            Permutation { mask: 1, transmission: 0.5 },
+            Permutation {
+                mask: 0,
+                transmission: 1.0,
+            },
+            Permutation {
+                mask: 1,
+                transmission: 0.5,
+            },
         ];
 
         let (up, tu, _, _) = update_step_indices(&entries, 1.0);
@@ -799,8 +853,14 @@ mod tests {
     #[test]
     fn test_step_down_at_min_returns_none() {
         let entries = vec![
-            Permutation { mask: 0, transmission: 1.0 },
-            Permutation { mask: 1, transmission: 0.5 },
+            Permutation {
+                mask: 0,
+                transmission: 1.0,
+            },
+            Permutation {
+                mask: 1,
+                transmission: 0.5,
+            },
         ];
 
         let (_, _, down, td) = update_step_indices(&entries, 0.5);

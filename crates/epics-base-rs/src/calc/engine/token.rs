@@ -86,8 +86,8 @@ pub enum ConstName {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Number(f64),
-    Var(u8),        // A=0..P=15
-    DoubleVar(u8),  // AA=0..LL=11
+    Var(u8),       // A=0..P=15
+    DoubleVar(u8), // AA=0..LL=11
     Rndm,
     Nrndm,
 
@@ -101,23 +101,23 @@ pub enum Token {
     Caret,
     DoubleStar,
 
-    Eq,       // == or =
-    Ne,       // != or #
+    Eq, // == or =
+    Ne, // != or #
     Lt,
     Le,
     Gt,
     Ge,
 
-    AndAnd,   // &&
-    OrOr,     // ||
-    BitAnd,   // &
-    BitOr,    // |
-    BitXor,   // XOR
-    Tilde,    // ~
-    Shl,      // <<
-    Shr,      // >>
+    AndAnd, // &&
+    OrOr,   // ||
+    BitAnd, // &
+    BitOr,  // |
+    BitXor, // XOR
+    Tilde,  // ~
+    Shl,    // <<
+    Shr,    // >>
 
-    Bang,     // !
+    Bang, // !
     Question,
     Colon,
 
@@ -136,12 +136,12 @@ pub enum Token {
     Const(ConstName),
     Assign, // :=
 
-    MaxOp,  // >?
-    MinOp,  // <?
+    MaxOp, // >?
+    MinOp, // <?
 
     // Keyword operators
-    AndKeyword,  // AND
-    OrKeyword,   // OR
+    AndKeyword, // AND
+    OrKeyword,  // OR
 
     UntilKeyword,
 }
@@ -176,7 +176,10 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn remaining_upper(&self) -> Vec<u8> {
-        self.input[self.pos..].iter().map(|b| b.to_ascii_uppercase()).collect()
+        self.input[self.pos..]
+            .iter()
+            .map(|b| b.to_ascii_uppercase())
+            .collect()
     }
 
     fn read_string_literal(&mut self, quote: u8) -> Result<String, CalcError> {
@@ -185,20 +188,18 @@ impl<'a> Tokenizer<'a> {
             match self.advance() {
                 None => return Err(CalcError::Syntax), // unterminated string
                 Some(b) if b == quote => return Ok(result),
-                Some(b'\\') => {
-                    match self.advance() {
-                        Some(b'n') => result.push('\n'),
-                        Some(b't') => result.push('\t'),
-                        Some(b'r') => result.push('\r'),
-                        Some(b'\\') => result.push('\\'),
-                        Some(b) if b == quote => result.push(b as char),
-                        Some(b) => {
-                            result.push('\\');
-                            result.push(b as char);
-                        }
-                        None => return Err(CalcError::Syntax),
+                Some(b'\\') => match self.advance() {
+                    Some(b'n') => result.push('\n'),
+                    Some(b't') => result.push('\t'),
+                    Some(b'r') => result.push('\r'),
+                    Some(b'\\') => result.push('\\'),
+                    Some(b) if b == quote => result.push(b as char),
+                    Some(b) => {
+                        result.push('\\');
+                        result.push(b as char);
                     }
-                }
+                    None => return Err(CalcError::Syntax),
+                },
                 Some(b) => result.push(b as char),
             }
         }
@@ -332,7 +333,10 @@ impl<'a> Tokenizer<'a> {
         for (kw, tok) in &keywords {
             if rem.len() >= kw.len() && rem[..kw.len()] == **kw {
                 let is_literal = matches!(tok, Token::Number(_));
-                if !is_literal && kw.len() < rem.len() && (rem[kw.len()].is_ascii_alphanumeric() || rem[kw.len()] == b'_') {
+                if !is_literal
+                    && kw.len() < rem.len()
+                    && (rem[kw.len()].is_ascii_alphanumeric() || rem[kw.len()] == b'_')
+                {
                     continue;
                 }
                 self.pos += kw.len();
@@ -351,19 +355,26 @@ impl<'a> Tokenizer<'a> {
 
     fn read_number(&mut self) -> Result<f64, CalcError> {
         let start = self.pos;
-        while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'.') {
+        while self.pos < self.input.len()
+            && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'.')
+        {
             self.pos += 1;
         }
-        if self.pos < self.input.len() && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E') {
+        if self.pos < self.input.len()
+            && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E')
+        {
             self.pos += 1;
-            if self.pos < self.input.len() && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-') {
+            if self.pos < self.input.len()
+                && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-')
+            {
                 self.pos += 1;
             }
             while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
         }
-        if self.pos == start + 1 && self.input[start] == b'0'
+        if self.pos == start + 1
+            && self.input[start] == b'0'
             && self.pos < self.input.len()
             && (self.input[self.pos] == b'x' || self.input[self.pos] == b'X')
         {
@@ -395,7 +406,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, CalcError> {
         let b = tokenizer.peek().unwrap();
 
         // Numbers
-        if b.is_ascii_digit() || (b == b'.' && tokenizer.input.get(tokenizer.pos + 1).map_or(false, |c| c.is_ascii_digit())) {
+        if b.is_ascii_digit()
+            || (b == b'.'
+                && tokenizer
+                    .input
+                    .get(tokenizer.pos + 1)
+                    .map_or(false, |c| c.is_ascii_digit()))
+        {
             let n = tokenizer.read_number()?;
             tokens.push(Token::Number(n));
             continue;
@@ -530,59 +547,95 @@ mod tests {
     #[test]
     fn test_basic_tokens() {
         let tokens = tokenize("A+B*3").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Var(0), Token::Plus, Token::Var(1), Token::Star, Token::Number(3.0)
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Var(0),
+                Token::Plus,
+                Token::Var(1),
+                Token::Star,
+                Token::Number(3.0)
+            ]
+        );
     }
 
     #[test]
     fn test_functions() {
         let tokens = tokenize("SIN(A)").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Func(FuncName::Sin), Token::LParen, Token::Var(0), Token::RParen,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Func(FuncName::Sin),
+                Token::LParen,
+                Token::Var(0),
+                Token::RParen,
+            ]
+        );
     }
 
     #[test]
     fn test_double_vars() {
         let tokens = tokenize("AA+BB").unwrap();
-        assert_eq!(tokens, vec![
-            Token::DoubleVar(0), Token::Plus, Token::DoubleVar(1),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![Token::DoubleVar(0), Token::Plus, Token::DoubleVar(1),]
+        );
     }
 
     #[test]
     fn test_constants() {
         let tokens = tokenize("PI+D2R").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Const(ConstName::Pi), Token::Plus, Token::Const(ConstName::D2R),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Const(ConstName::Pi),
+                Token::Plus,
+                Token::Const(ConstName::D2R),
+            ]
+        );
     }
 
     #[test]
     fn test_case_insensitive() {
         let tokens = tokenize("sin(a)+Cos(b)").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Func(FuncName::Sin), Token::LParen, Token::Var(0), Token::RParen,
-            Token::Plus,
-            Token::Func(FuncName::Cos), Token::LParen, Token::Var(1), Token::RParen,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Func(FuncName::Sin),
+                Token::LParen,
+                Token::Var(0),
+                Token::RParen,
+                Token::Plus,
+                Token::Func(FuncName::Cos),
+                Token::LParen,
+                Token::Var(1),
+                Token::RParen,
+            ]
+        );
     }
 
     #[test]
     fn test_assign() {
         let tokens = tokenize("A:=5").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Var(0), Token::Assign, Token::Number(5.0),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![Token::Var(0), Token::Assign, Token::Number(5.0),]
+        );
     }
 
     #[test]
     fn test_ternary() {
         let tokens = tokenize("A?B:C").unwrap();
-        assert_eq!(tokens, vec![
-            Token::Var(0), Token::Question, Token::Var(1), Token::Colon, Token::Var(2),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Var(0),
+                Token::Question,
+                Token::Var(1),
+                Token::Colon,
+                Token::Var(2),
+            ]
+        );
     }
 
     #[test]

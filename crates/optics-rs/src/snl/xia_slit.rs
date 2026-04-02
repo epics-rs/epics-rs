@@ -32,9 +32,9 @@ use tracing::{debug, error, info};
 
 // Re-use the HSC protocol layer from xiahsc.
 use super::xiahsc::{
-    self, dial_to_raw, h_center_from_blades, height_from_blades, raw_to_dial,
-    v_center_from_blades, validate_hsc_id, width_from_blades, AxisLimits,
-    ControlStatusWord, HOrient, HscCommand, VOrient,
+    self, AxisLimits, ControlStatusWord, HOrient, HscCommand, VOrient, dial_to_raw,
+    h_center_from_blades, height_from_blades, raw_to_dial, v_center_from_blades, validate_hsc_id,
+    width_from_blades,
 };
 
 // ---------------------------------------------------------------------------
@@ -192,20 +192,24 @@ pub fn classify_fifo_response(parsed: &ParsedFifoResponse) -> FifoResponseKind {
     if n == 2 && parsed.words[1] == "BUSY;" {
         return FifoResponseKind::Busy;
     }
-    if n == 4 && parsed.words[3] == "DONE;"
+    if n == 4
+        && parsed.words[3] == "DONE;"
         && let (Ok(a), Ok(b)) = (
             parsed.words[1].parse::<i32>(),
             parsed.words[2].parse::<i32>(),
-        ) {
-            return FifoResponseKind::PositionDone { pos_a: a, pos_b: b };
-        }
-    if n == 5 && parsed.words[1] == "OK"
+        )
+    {
+        return FifoResponseKind::PositionDone { pos_a: a, pos_b: b };
+    }
+    if n == 5
+        && parsed.words[1] == "OK"
         && let (Ok(a), Ok(b)) = (
             parsed.words[2].parse::<i32>(),
             parsed.words[3].parse::<i32>(),
-        ) {
-            return FifoResponseKind::PositionOk { pos_a: a, pos_b: b };
-        }
+        )
+    {
+        return FifoResponseKind::PositionOk { pos_a: a, pos_b: b };
+    }
     FifoResponseKind::Unknown
 }
 
@@ -530,12 +534,7 @@ impl XiaSlitController {
     }
 
     /// Process a DONE or OK position response for a given axis.
-    pub fn update_axis_position(
-        &mut self,
-        id: &str,
-        pos_a: i32,
-        pos_b: i32,
-    ) {
+    pub fn update_axis_position(&mut self, id: &str, pos_a: i32, pos_b: i32) {
         if id == self.h_id {
             let a_dial = raw_to_dial(pos_a, self.h_config.origin);
             let b_dial = raw_to_dial(pos_b, self.h_config.origin);
@@ -811,14 +810,14 @@ pub async fn run<R, W>(
             )),
             Ok(Ok(_)) => Ok(buf.clone()),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "timeout",
-            )),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")),
         }
     }
 
-    async fn send_and_read<R2: tokio::io::AsyncBufRead + Unpin, W2: tokio::io::AsyncWrite + Unpin>(
+    async fn send_and_read<
+        R2: tokio::io::AsyncBufRead + Unpin,
+        W2: tokio::io::AsyncWrite + Unpin,
+    >(
         writer: &mut W2,
         reader: &mut R2,
         buf: &mut String,
@@ -904,16 +903,14 @@ pub async fn run<R, W>(
                 tokio::time::sleep(Duration::from_millis(100)).await;
 
                 // Request all positions (responses go into FIFO later)
-                let _ = send_cmd(
-                    &mut writer,
-                    &HscCommand::PositionInquiry("ALL".to_string()),
-                )
-                .await;
+                let _ =
+                    send_cmd(&mut writer, &HscCommand::PositionInquiry("ALL".to_string())).await;
                 tokio::time::sleep(Duration::from_millis(100)).await;
 
                 // Drain any responses into the FIFO
-                while let Ok(line) = read_line_timeout(&mut buf_reader, &mut line_buf, Duration::from_millis(100))
-                    .await
+                while let Ok(line) =
+                    read_line_timeout(&mut buf_reader, &mut line_buf, Duration::from_millis(100))
+                        .await
                 {
                     ctrl.fifo.push(line);
                 }
@@ -953,10 +950,7 @@ pub async fn run<R, W>(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.h_id.clone(),
-                        xiahsc::register::GEAR_BACKLASH,
-                    ),
+                    &HscCommand::ReadRegister(ctrl.h_id.clone(), xiahsc::register::GEAR_BACKLASH),
                 )
                 .await
                 {
@@ -976,10 +970,7 @@ pub async fn run<R, W>(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.h_id.clone(),
-                        xiahsc::register::CONTROL_WORD,
-                    ),
+                    &HscCommand::ReadRegister(ctrl.h_id.clone(), xiahsc::register::CONTROL_WORD),
                 )
                 .await
                 {
@@ -1023,10 +1014,7 @@ pub async fn run<R, W>(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.h_id.clone(),
-                        xiahsc::register::ORIGIN_POSITION,
-                    ),
+                    &HscCommand::ReadRegister(ctrl.h_id.clone(), xiahsc::register::ORIGIN_POSITION),
                 )
                 .await
                 {
@@ -1052,10 +1040,7 @@ pub async fn run<R, W>(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.v_id.clone(),
-                        xiahsc::register::CONTROL_WORD,
-                    ),
+                    &HscCommand::ReadRegister(ctrl.v_id.clone(), xiahsc::register::CONTROL_WORD),
                 )
                 .await
                 {
@@ -1075,10 +1060,7 @@ pub async fn run<R, W>(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.v_id.clone(),
-                        xiahsc::register::GEAR_BACKLASH,
-                    ),
+                    &HscCommand::ReadRegister(ctrl.v_id.clone(), xiahsc::register::GEAR_BACKLASH),
                 )
                 .await
                 {
@@ -1141,10 +1123,7 @@ pub async fn run<R, W>(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.v_id.clone(),
-                        xiahsc::register::ORIGIN_POSITION,
-                    ),
+                    &HscCommand::ReadRegister(ctrl.v_id.clone(), xiahsc::register::ORIGIN_POSITION),
                 )
                 .await
                 {
@@ -1244,8 +1223,7 @@ pub async fn run<R, W>(
                 if ctrl.h_move_pending {
                     ctrl.h_move_pending = false;
                     if ctrl.h_busy {
-                        let _ =
-                            send_cmd(&mut writer, &HscCommand::Kill(ctrl.h_id.clone())).await;
+                        let _ = send_cmd(&mut writer, &HscCommand::Kill(ctrl.h_id.clone())).await;
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     } else {
                         ctrl.h_busy = true;
@@ -1266,8 +1244,7 @@ pub async fn run<R, W>(
                 if ctrl.v_move_pending {
                     ctrl.v_move_pending = false;
                     if ctrl.v_busy {
-                        let _ =
-                            send_cmd(&mut writer, &HscCommand::Kill(ctrl.v_id.clone())).await;
+                        let _ = send_cmd(&mut writer, &HscCommand::Kill(ctrl.v_id.clone())).await;
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     } else {
                         ctrl.v_busy = true;
@@ -1287,11 +1264,8 @@ pub async fn run<R, W>(
                 // Locate: send position inquiry, drain into FIFO
                 if ctrl.locate_requested {
                     ctrl.locate_requested = false;
-                    let _ = send_cmd(
-                        &mut writer,
-                        &HscCommand::PositionInquiry("ALL".to_string()),
-                    )
-                    .await;
+                    let _ = send_cmd(&mut writer, &HscCommand::PositionInquiry("ALL".to_string()))
+                        .await;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     while let Ok(line) = read_line_timeout(
                         &mut buf_reader,
@@ -1318,8 +1292,7 @@ pub async fn run<R, W>(
                                     xiahsc::HSC_ERROR_MESSAGES[code_val as usize].to_string();
                             } else {
                                 ctrl.error = ERROR_UNKNOWN;
-                                ctrl.error_msg =
-                                    format!("{}: unknown error", parsed.id);
+                                ctrl.error_msg = format!("{}: unknown error", parsed.id);
                             }
                             if parsed.id == ctrl.h_id {
                                 ctrl.h_is_moving = false;
@@ -1450,7 +1423,9 @@ pub async fn run<R, W>(
                 }
             }
 
-            XiaSlitState::PreMove | XiaSlitState::ProcessResponse | XiaSlitState::UpdatePositions => {
+            XiaSlitState::PreMove
+            | XiaSlitState::ProcessResponse
+            | XiaSlitState::UpdatePositions => {
                 // These states are handled inline in Idle for the async actor.
                 ctrl.state = XiaSlitState::Idle;
             }
@@ -1621,8 +1596,7 @@ mod tests {
     #[test]
     fn blade_pair_from_gap_center_horizontal_roundtrip() {
         let original = BladePairTarget::from_blades(1.5, 3.5, false);
-        let reconstructed =
-            BladePairTarget::from_gap_center(original.gap, original.center, false);
+        let reconstructed = BladePairTarget::from_gap_center(original.gap, original.center, false);
         assert!((reconstructed.blade_a - 1.5).abs() < 1e-9);
         assert!((reconstructed.blade_b - 3.5).abs() < 1e-9);
     }
@@ -1630,8 +1604,7 @@ mod tests {
     #[test]
     fn blade_pair_from_gap_center_vertical_roundtrip() {
         let original = BladePairTarget::from_blades(4.0, 2.0, true);
-        let reconstructed =
-            BladePairTarget::from_gap_center(original.gap, original.center, true);
+        let reconstructed = BladePairTarget::from_gap_center(original.gap, original.center, true);
         assert!((reconstructed.blade_a - 4.0).abs() < 1e-9);
         assert!((reconstructed.blade_b - 2.0).abs() < 1e-9);
     }

@@ -74,7 +74,10 @@ impl NDPluginFileBase {
     /// `%d` (with optional width/precision like `%3.3d`) → fileNumber.
     pub fn create_file_name(&self) -> String {
         if self.file_template.is_empty() {
-            format!("{}{}{:04}", self.file_path, self.file_name, self.file_number)
+            format!(
+                "{}{}{:04}",
+                self.file_path, self.file_name, self.file_number
+            )
         } else {
             let mut result = String::new();
             let mut chars = self.file_template.chars().peekable();
@@ -103,18 +106,28 @@ impl NDPluginFileBase {
                         Some('d') => {
                             // Parse width and precision from spec (e.g. "3.3" → width=3, precision=3)
                             let width: usize = if spec.contains('.') {
-                                spec.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0)
+                                spec.split('.')
+                                    .next()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0)
                             } else {
                                 spec.parse().unwrap_or(0)
                             };
                             let precision: usize = if spec.contains('.') {
-                                spec.split('.').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+                                spec.split('.')
+                                    .nth(1)
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0)
                             } else {
                                 0
                             };
                             let pad = width.max(precision);
                             if pad > 0 {
-                                result.push_str(&format!("{:0>width$}", self.file_number, width = pad));
+                                result.push_str(&format!(
+                                    "{:0>width$}",
+                                    self.file_number,
+                                    width = pad
+                                ));
                             } else {
                                 result.push_str(&self.file_number.to_string());
                             }
@@ -302,7 +315,12 @@ mod tests {
 
     impl MockWriter {
         fn new(multi: bool) -> Self {
-            Self { opens: Vec::new(), writes: 0, closes: 0, multi }
+            Self {
+                opens: Vec::new(),
+                writes: 0,
+                closes: 0,
+                multi,
+            }
         }
     }
 
@@ -316,7 +334,9 @@ mod tests {
             Ok(())
         }
         fn read_file(&mut self) -> ADResult<NDArray> {
-            Err(crate::error::ADError::UnsupportedConversion("not implemented".into()))
+            Err(crate::error::ADError::UnsupportedConversion(
+                "not implemented".into(),
+            ))
         }
         fn close_file(&mut self) -> ADResult<()> {
             self.closes += 1;

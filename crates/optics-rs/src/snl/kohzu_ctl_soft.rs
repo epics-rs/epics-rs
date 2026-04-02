@@ -12,16 +12,13 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 use tracing::info;
 
-use crate::db_access::{alloc_origin, DbChannel, DbMultiMonitor};
+use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 
 // Re-use physics from kohzu_ctl.
 use crate::snl::kohzu_ctl::{
-    CrystalMode, Geometry,
-    calc_2d_spacing, energy_to_lambda, lambda_to_energy,
-    lambda_to_theta, theta_to_lambda,
-    calc_y_position, calc_z_position,
-    clamp_theta, compute_theta_limits, compute_energy_lambda_limits,
-    coordinate_speeds,
+    CrystalMode, Geometry, calc_2d_spacing, calc_y_position, calc_z_position, clamp_theta,
+    compute_energy_lambda_limits, compute_theta_limits, coordinate_speeds, energy_to_lambda,
+    lambda_to_energy, lambda_to_theta, theta_to_lambda,
 };
 
 // ---------------------------------------------------------------------------
@@ -93,9 +90,15 @@ impl KohzuSoftConfig {
 // ---------------------------------------------------------------------------
 
 /// Run the soft-motor Kohzu monochromator control state machine.
-pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(
+    config: KohzuSoftConfig,
+    db: PvDatabase,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::time::sleep(Duration::from_secs(3)).await;
-    println!("kohzuCtl_soft: starting for prefix={}{}", config.prefix, config.mono);
+    println!(
+        "kohzuCtl_soft: starting for prefix={}{}",
+        config.prefix, config.mono
+    );
 
     let my_origin = alloc_origin();
 
@@ -204,14 +207,15 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
 
     // Wait for key channels
 
-
     // Build multi-monitor for all event-driving PVs
     let monitored_pvs: Vec<String> = vec![
         config.mono_pv("E"),
         config.mono_pv("Lambda"),
         config.mono_pv("Theta"),
-        config.mono_pv("H"), config.mono_pv("K"),
-        config.mono_pv("L"), config.mono_pv("A"),
+        config.mono_pv("H"),
+        config.mono_pv("K"),
+        config.mono_pv("L"),
+        config.mono_pv("A"),
         config.mono_pv("Put"),
         config.mono_pv("Mode"),
         config.mono_pv("Mode2"),
@@ -223,7 +227,11 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
         config.mono_pv("UseSet"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-    println!("kohzuCtl_soft: subscribed to {} PVs, {} active", monitored_pvs.len(), monitor.sub_count());
+    println!(
+        "kohzuCtl_soft: subscribed to {} PVs, {} active",
+        monitored_pvs.len(),
+        monitor.sub_count()
+    );
 
     let geom = config.geom;
 
@@ -262,7 +270,9 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
     let (mut two_d, forbidden, msg) = calc_2d_spacing(a, h, k, l);
     let _ = ch_d.put_f64(two_d).await;
     let _ = ch_seq_msg1.put_string(msg).await;
-    if forbidden { let _ = ch_alert.put_i16(1).await; }
+    if forbidden {
+        let _ = ch_alert.put_i16(1).await;
+    }
 
     // Theta/energy limits
     let mut theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
@@ -302,7 +312,10 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
     let _ = ch_seq_msg1.put_string("Kohzu Control Ready").await;
     let _ = ch_seq_msg2.put_string(" ").await;
 
-    info!("Kohzu soft controller initialized for {}{}", config.prefix, config.mono);
+    info!(
+        "Kohzu soft controller initialized for {}{}",
+        config.prefix, config.mono
+    );
 
     // PV name constants for dispatch
     let pv_e = config.mono_pv("E");
@@ -322,7 +335,10 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
     let pv_y_offset = config.mono_pv("yOffset");
     let pv_use_set = config.mono_pv("UseSet");
 
-    println!("kohzuCtl_soft: ready (two_d={:.4}, theta=[{:.1}..{:.1}])", two_d, theta_lo, theta_hi);
+    println!(
+        "kohzuCtl_soft: ready (two_d={:.4}, theta=[{:.1}..{:.1}])",
+        two_d, theta_lo, theta_hi
+    );
 
     let mut deferred_events: HashMap<String, f64> = HashMap::new();
     // -- Main loop --
@@ -370,9 +386,15 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
                 theta_val = new_th;
                 proceed_to_theta_changed = true;
             }
-        } else if changed_pv == pv_h || changed_pv == pv_k || changed_pv == pv_l || changed_pv == pv_a {
-            h = ch_h.get_f64().await; k = ch_k.get_f64().await;
-            l = ch_l.get_f64().await; a = ch_a.get_f64().await;
+        } else if changed_pv == pv_h
+            || changed_pv == pv_k
+            || changed_pv == pv_l
+            || changed_pv == pv_a
+        {
+            h = ch_h.get_f64().await;
+            k = ch_k.get_f64().await;
+            l = ch_l.get_f64().await;
+            a = ch_a.get_f64().await;
             let (d, _forb, msg) = calc_2d_spacing(a, h, k, l);
             two_d = d;
             let _ = ch_d.put_f64(two_d).await;
@@ -381,10 +403,14 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_seq_msg2.put_string("Set to Manual Mode").await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await; let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await; let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64(eh).await;
+            let _ = ch_e_lo.put_f64(el).await;
+            let _ = ch_lambda_hi.put_f64(lh).await;
+            let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_put_vals {
-            if new_val as i16 != 0 { proceed_to_theta_changed = true; }
+            if new_val as i16 != 0 {
+                proceed_to_theta_changed = true;
+            }
         } else if changed_pv == pv_auto_mode {
             auto_mode = new_val as i16 != 0;
         } else if changed_pv == pv_cc_mode {
@@ -408,26 +434,34 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
         } else if changed_pv == pv_theta_hilim {
             theta_mot_hi = new_val;
             let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi; theta_lo = lo;
+            theta_hi = hi;
+            theta_lo = lo;
             let _ = ch_theta_hi.put_f64(theta_hi).await;
             let _ = ch_theta_lo.put_f64(theta_lo).await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await; let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await; let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64(eh).await;
+            let _ = ch_e_lo.put_f64(el).await;
+            let _ = ch_lambda_hi.put_f64(lh).await;
+            let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_theta_lolim {
             theta_mot_lo = new_val;
             let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi; theta_lo = lo;
+            theta_hi = hi;
+            theta_lo = lo;
             let _ = ch_theta_hi.put_f64(theta_hi).await;
             let _ = ch_theta_lo.put_f64(theta_lo).await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await; let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await; let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64(eh).await;
+            let _ = ch_e_lo.put_f64(el).await;
+            let _ = ch_lambda_hi.put_f64(lh).await;
+            let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_y_offset {
             y_offset_val = new_val;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
-            let _ = ch_seq_msg1.put_string(&format!("y offset changed to {:.4}", y_offset_val)).await;
+            let _ = ch_seq_msg1
+                .put_string(&format!("y offset changed to {:.4}", y_offset_val))
+                .await;
             let _ = ch_seq_msg2.put_string("Set to Manual Mode").await;
             proceed_to_theta_changed = true;
         } else if changed_pv == pv_use_set {
@@ -438,7 +472,9 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
             let _ = ch_z_mot_set.put_i16(sv).await;
         }
 
-        if !proceed_to_theta_changed { continue; }
+        if !proceed_to_theta_changed {
+            continue;
+        }
 
         // -- Theta-changed processing --
         let (clamped_theta, was_clamped) = clamp_theta(theta_val, theta_lo, theta_hi);
@@ -510,11 +546,18 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
                     theta_val - current_rbv,
                     y_mot_desired - ch_y_mot_rbv.get_f64().await,
                     z_mot_desired - ch_z_mot_rbv.get_f64().await,
-                    th_speed, y_speed, z_speed, cc_mode,
+                    th_speed,
+                    y_speed,
+                    z_speed,
+                    cc_mode,
                 );
                 let _ = ch_theta_mot_velo.put_f64(new_th).await;
-                if !cc_mode.y_frozen() { let _ = ch_y_mot_velo.put_f64(new_y).await; }
-                if !cc_mode.z_frozen() { let _ = ch_z_mot_velo.put_f64(new_z).await; }
+                if !cc_mode.y_frozen() {
+                    let _ = ch_y_mot_velo.put_f64(new_y).await;
+                }
+                if !cc_mode.z_frozen() {
+                    let _ = ch_z_mot_velo.put_f64(new_z).await;
+                }
             }
 
             let _ = ch_theta_mot_cmd.put_f64_process(theta_mot_desired).await;
@@ -524,8 +567,12 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
                     let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
                 }
                 CrystalMode::ChannelCut => {}
-                CrystalMode::FreezeZ => { let _ = ch_y_mot_cmd.put_f64_process(y_mot_desired).await; }
-                CrystalMode::FreezeY => { let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await; }
+                CrystalMode::FreezeZ => {
+                    let _ = ch_y_mot_cmd.put_f64_process(y_mot_desired).await;
+                }
+                CrystalMode::FreezeY => {
+                    let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
+                }
             }
 
             let _ = ch_put_vals.put_i16(0).await;
@@ -539,7 +586,9 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
                 let z_dmov = ch_z_dmov.get_i16().await;
 
                 if ch_theta_hls.get_i16().await != 0 || ch_theta_lls.get_i16().await != 0 {
-                    let _ = ch_seq_msg1.put_string("Theta Motor hit a limit switch!").await;
+                    let _ = ch_seq_msg1
+                        .put_string("Theta Motor hit a limit switch!")
+                        .await;
                     let _ = ch_alert.put_i16(1).await;
                     auto_mode = false;
                     let _ = ch_auto_mode.put_i16(0).await;
@@ -549,7 +598,9 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     break;
                 }
-                if !cc_mode.y_frozen() && (ch_y_hls.get_i16().await != 0 || ch_y_lls.get_i16().await != 0) {
+                if !cc_mode.y_frozen()
+                    && (ch_y_hls.get_i16().await != 0 || ch_y_lls.get_i16().await != 0)
+                {
                     let _ = ch_seq_msg1.put_string("Y Motor hit a limit switch!").await;
                     let _ = ch_alert.put_i16(1).await;
                     auto_mode = false;
@@ -560,7 +611,9 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     break;
                 }
-                if !cc_mode.z_frozen() && (ch_z_hls.get_i16().await != 0 || ch_z_lls.get_i16().await != 0) {
+                if !cc_mode.z_frozen()
+                    && (ch_z_hls.get_i16().await != 0 || ch_z_lls.get_i16().await != 0)
+                {
                     let _ = ch_seq_msg1.put_string("Z Motor hit a limit switch!").await;
                     let _ = ch_alert.put_i16(1).await;
                     auto_mode = false;
@@ -581,7 +634,9 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
                 let _ = ch_lambda_rdbk.put_f64_post(lambda_rdbk_val).await;
                 let _ = ch_e_rdbk.put_f64_post(e_rdbk_val).await;
 
-                if th_dmov != 0 && y_dmov != 0 && z_dmov != 0 { break; }
+                if th_dmov != 0 && y_dmov != 0 && z_dmov != 0 {
+                    break;
+                }
             }
 
             _caused_move = false;
@@ -598,13 +653,19 @@ pub async fn run(config: KohzuSoftConfig, db: PvDatabase) -> Result<(), Box<dyn 
         }
 
         // Update echoes
-        let _ = ch_theta_rdbk_echo.put_f64(ch_theta_mot_rbv.get_f64().await).await;
+        let _ = ch_theta_rdbk_echo
+            .put_f64(ch_theta_mot_rbv.get_f64().await)
+            .await;
         let _ = ch_y_rdbk_echo.put_f64(ch_y_mot_rbv.get_f64().await).await;
         let _ = ch_z_rdbk_echo.put_f64(ch_z_mot_rbv.get_f64().await).await;
-        let _ = ch_theta_vel_echo.put_f64(ch_theta_mot_velo.get_f64().await).await;
+        let _ = ch_theta_vel_echo
+            .put_f64(ch_theta_mot_velo.get_f64().await)
+            .await;
         let _ = ch_y_vel_echo.put_f64(ch_y_mot_velo.get_f64().await).await;
         let _ = ch_z_vel_echo.put_f64(ch_z_mot_velo.get_f64().await).await;
-        let _ = ch_theta_dmov_echo.put_i16(ch_theta_dmov.get_i16().await).await;
+        let _ = ch_theta_dmov_echo
+            .put_i16(ch_theta_dmov.get_i16().await)
+            .await;
         let _ = ch_y_dmov_echo.put_i16(ch_y_dmov.get_i16().await).await;
         let _ = ch_z_dmov_echo.put_i16(ch_z_dmov.get_i16().await).await;
     }

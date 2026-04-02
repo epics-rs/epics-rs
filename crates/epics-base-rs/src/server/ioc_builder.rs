@@ -13,8 +13,8 @@ use crate::types::EpicsValue;
 
 use super::database::PvDatabase;
 use super::device_support;
-use super::{autosave, db_loader};
 use super::{DeviceSupportFactory, RecordFactory};
+use super::{autosave, db_loader};
 
 /// Builder that performs all IOC-level database population, record
 /// initialisation, device-support wiring, autosave restore, and I/O Intr
@@ -63,24 +63,15 @@ impl IocBuilder {
     }
 
     /// Load records from a .db file.
-    pub fn db_file(
-        mut self,
-        path: &str,
-        macros: &HashMap<String, String>,
-    ) -> CaResult<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(CaError::Io)?;
+    pub fn db_file(mut self, path: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
+        let content = std::fs::read_to_string(path).map_err(CaError::Io)?;
         let defs = db_loader::parse_db(&content, macros)?;
         self.db_defs.extend(defs);
         Ok(self)
     }
 
     /// Load records from a .db string.
-    pub fn db_string(
-        mut self,
-        content: &str,
-        macros: &HashMap<String, String>,
-    ) -> CaResult<Self> {
+    pub fn db_string(mut self, content: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
         let defs = db_loader::parse_db(content, macros)?;
         self.db_defs.extend(defs);
         Ok(self)
@@ -91,7 +82,8 @@ impl IocBuilder {
     where
         F: Fn() -> Box<dyn device_support::DeviceSupport> + Send + Sync + 'static,
     {
-        self.device_factories.insert(dtyp.to_string(), Box::new(factory));
+        self.device_factories
+            .insert(dtyp.to_string(), Box::new(factory));
         self
     }
 
@@ -100,7 +92,8 @@ impl IocBuilder {
     where
         F: Fn() -> Box<dyn Record> + Send + Sync + 'static,
     {
-        self.record_factories.insert(type_name.to_string(), Box::new(factory));
+        self.record_factories
+            .insert(type_name.to_string(), Box::new(factory));
         self
     }
 
@@ -109,7 +102,8 @@ impl IocBuilder {
     where
         F: Fn(&mut dyn Record) -> CaResult<()> + Send + Sync + 'static,
     {
-        self.subroutine_registry.insert(name.to_string(), Arc::new(Box::new(func)));
+        self.subroutine_registry
+            .insert(name.to_string(), Arc::new(Box::new(func)));
         self
     }
 
@@ -147,10 +141,8 @@ impl IocBuilder {
 
         // 3. .db definitions — create records, apply fields, init, wire device support & subs
         for def in self.db_defs {
-            let mut record = db_loader::create_record_with_factories(
-                &def.record_type,
-                &self.record_factories,
-            )?;
+            let mut record =
+                db_loader::create_record_with_factories(&def.record_type, &self.record_factories)?;
             let mut common_fields = Vec::new();
             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)?;
 
@@ -161,14 +153,24 @@ impl IocBuilder {
                 let mut instance = rec_arc.write().await;
                 for (name, value) in common_fields {
                     match instance.put_common_field(&name, value) {
-                        Ok(record::CommonFieldPutResult::ScanChanged { old_scan, new_scan, phas }) => {
+                        Ok(record::CommonFieldPutResult::ScanChanged {
+                            old_scan,
+                            new_scan,
+                            phas,
+                        }) => {
                             drop(instance);
-                            db.update_scan_index(&def.name, old_scan, new_scan, phas, phas).await;
+                            db.update_scan_index(&def.name, old_scan, new_scan, phas, phas)
+                                .await;
                             instance = rec_arc.write().await;
                         }
-                        Ok(record::CommonFieldPutResult::PhasChanged { scan, old_phas, new_phas }) => {
+                        Ok(record::CommonFieldPutResult::PhasChanged {
+                            scan,
+                            old_phas,
+                            new_phas,
+                        }) => {
                             drop(instance);
-                            db.update_scan_index(&def.name, scan, scan, old_phas, new_phas).await;
+                            db.update_scan_index(&def.name, scan, scan, old_phas, new_phas)
+                                .await;
                             instance = rec_arc.write().await;
                         }
                         Ok(record::CommonFieldPutResult::NoChange) => {}
@@ -216,7 +218,10 @@ impl IocBuilder {
 
         // 5. I/O Intr setup
         let all_names = db.all_record_names().await;
-        let io_intr_recs: Vec<(String, Arc<crate::runtime::sync::RwLock<record::RecordInstance>>)> = {
+        let io_intr_recs: Vec<(
+            String,
+            Arc<crate::runtime::sync::RwLock<record::RecordInstance>>,
+        )> = {
             let mut recs = Vec::new();
             for name in &all_names {
                 if let Some(arc) = db.get_record(name).await {
@@ -244,8 +249,9 @@ impl IocBuilder {
                                     continue;
                                 }
                                 let mut visited = std::collections::HashSet::new();
-                                let _ = db_clone.process_record_with_links(
-                                    &rec_name, &mut visited, 0).await;
+                                let _ = db_clone
+                                    .process_record_with_links(&rec_name, &mut visited, 0)
+                                    .await;
                             }
                         });
                     }

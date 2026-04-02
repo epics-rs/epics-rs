@@ -95,10 +95,7 @@ impl PvaHeader {
             )));
         }
         if buf[0] != PVA_MAGIC {
-            return Err(PvaError::Protocol(format!(
-                "bad magic: {:#04x}",
-                buf[0]
-            )));
+            return Err(PvaError::Protocol(format!("bad magic: {:#04x}", buf[0])));
         }
         let flags = buf[2];
         let big_endian = flags & FLAG_BIG_ENDIAN != 0;

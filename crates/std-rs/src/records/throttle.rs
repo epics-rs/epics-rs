@@ -1,7 +1,9 @@
 use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult};
+use epics_base_rs::server::record::{
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// Throttle record — rate-limits value changes to prevent device damage.
@@ -88,9 +90,9 @@ impl Default for ThrottleRecord {
             dprec: 0,
             dly: 0.0,
             out: String::new(),
-            ov: 3,  // Constant
+            ov: 3, // Constant
             sinp: String::new(),
-            siv: 3, // Constant
+            siv: 3,  // Constant
             sync: 0, // Idle
             limit_flag: false,
             delay_active: false,
@@ -150,27 +152,111 @@ impl ThrottleRecord {
 }
 
 static FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL",   dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "OVAL",  dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "SENT",  dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "OSENT", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "WAIT",  dbf_type: DbFieldType::Short,  read_only: true },
-    FieldDesc { name: "HOPR",  dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LOPR",  dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DRVLH", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DRVLL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DRVLS", dbf_type: DbFieldType::Short,  read_only: true },
-    FieldDesc { name: "DRVLC", dbf_type: DbFieldType::Short,  read_only: false },
-    FieldDesc { name: "VER",   dbf_type: DbFieldType::String, read_only: true },
-    FieldDesc { name: "STS",   dbf_type: DbFieldType::Short,  read_only: true },
-    FieldDesc { name: "PREC",  dbf_type: DbFieldType::Short,  read_only: false },
-    FieldDesc { name: "DPREC", dbf_type: DbFieldType::Short,  read_only: false },
-    FieldDesc { name: "DLY",   dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "OUT",   dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OV",    dbf_type: DbFieldType::Short,  read_only: true },
-    FieldDesc { name: "SINP",  dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "SIV",   dbf_type: DbFieldType::Short,  read_only: true },
-    FieldDesc { name: "SYNC",  dbf_type: DbFieldType::Short,  read_only: false },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OVAL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "SENT",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "OSENT",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "WAIT",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DRVLH",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DRVLL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DRVLS",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "DRVLC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "VER",
+        dbf_type: DbFieldType::String,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "STS",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DPREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUT",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OV",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "SINP",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIV",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "SYNC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for ThrottleRecord {
@@ -223,9 +309,11 @@ impl Record for ThrottleRecord {
             } else {
                 // Still waiting — queue the current value, reschedule
                 self.pending_value = Some(self.val);
-                let remaining = self.dly - self.last_send_time
-                    .map(|t| t.elapsed().as_secs_f64())
-                    .unwrap_or(0.0);
+                let remaining = self.dly
+                    - self
+                        .last_send_time
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
                 let delay = std::time::Duration::from_secs_f64(remaining.max(0.001));
                 actions.push(ProcessAction::ReprocessAfter(delay));
                 return Ok(ProcessOutcome {
@@ -280,9 +368,11 @@ impl Record for ThrottleRecord {
             self.pending_value = Some(self.val);
             self.wait = 1;
             self.delay_active = true;
-            let remaining = self.dly - self.last_send_time
-                .map(|t| t.elapsed().as_secs_f64())
-                .unwrap_or(0.0);
+            let remaining = self.dly
+                - self
+                    .last_send_time
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
             let delay = std::time::Duration::from_secs_f64(remaining.max(0.001));
             actions.push(ProcessAction::ReprocessAfter(delay));
             Ok(ProcessOutcome {
@@ -320,45 +410,117 @@ impl Record for ThrottleRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL"   => Some(EpicsValue::Double(self.val)),
-            "OVAL"  => Some(EpicsValue::Double(self.oval)),
-            "SENT"  => Some(EpicsValue::Double(self.sent)),
+            "VAL" => Some(EpicsValue::Double(self.val)),
+            "OVAL" => Some(EpicsValue::Double(self.oval)),
+            "SENT" => Some(EpicsValue::Double(self.sent)),
             "OSENT" => Some(EpicsValue::Double(self.osent)),
-            "WAIT"  => Some(EpicsValue::Short(self.wait)),
-            "HOPR"  => Some(EpicsValue::Double(self.hopr)),
-            "LOPR"  => Some(EpicsValue::Double(self.lopr)),
+            "WAIT" => Some(EpicsValue::Short(self.wait)),
+            "HOPR" => Some(EpicsValue::Double(self.hopr)),
+            "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "DRVLH" => Some(EpicsValue::Double(self.drvlh)),
             "DRVLL" => Some(EpicsValue::Double(self.drvll)),
             "DRVLS" => Some(EpicsValue::Short(self.drvls)),
             "DRVLC" => Some(EpicsValue::Short(self.drvlc)),
-            "VER"   => Some(EpicsValue::String(self.ver.clone())),
-            "STS"   => Some(EpicsValue::Short(self.sts)),
-            "PREC"  => Some(EpicsValue::Short(self.prec)),
+            "VER" => Some(EpicsValue::String(self.ver.clone())),
+            "STS" => Some(EpicsValue::Short(self.sts)),
+            "PREC" => Some(EpicsValue::Short(self.prec)),
             "DPREC" => Some(EpicsValue::Short(self.dprec)),
-            "DLY"   => Some(EpicsValue::Double(self.dly)),
-            "OUT"   => Some(EpicsValue::String(self.out.clone())),
-            "OV"    => Some(EpicsValue::Short(self.ov)),
-            "SINP"  => Some(EpicsValue::String(self.sinp.clone())),
-            "SIV"   => Some(EpicsValue::Short(self.siv)),
-            "SYNC"  => Some(EpicsValue::Short(self.sync)),
+            "DLY" => Some(EpicsValue::Double(self.dly)),
+            "OUT" => Some(EpicsValue::String(self.out.clone())),
+            "OV" => Some(EpicsValue::Short(self.ov)),
+            "SINP" => Some(EpicsValue::String(self.sinp.clone())),
+            "SIV" => Some(EpicsValue::Short(self.siv)),
+            "SYNC" => Some(EpicsValue::Short(self.sync)),
             _ => None,
         }
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL"   => match value { EpicsValue::Double(v) => { self.val = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "HOPR"  => match value { EpicsValue::Double(v) => { self.hopr = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "LOPR"  => match value { EpicsValue::Double(v) => { self.lopr = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "DRVLH" => match value { EpicsValue::Double(v) => { self.drvlh = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "DRVLL" => match value { EpicsValue::Double(v) => { self.drvll = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "DRVLC" => match value { EpicsValue::Short(v)  => { self.drvlc = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "PREC"  => match value { EpicsValue::Short(v)  => { self.prec = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "DPREC" => match value { EpicsValue::Short(v)  => { self.dprec = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "DLY"   => match value { EpicsValue::Double(v) => { self.dly = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "OUT"   => match value { EpicsValue::String(v) => { self.out = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "SINP"  => match value { EpicsValue::String(v) => { self.sinp = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "SYNC"  => match value { EpicsValue::Short(v)  => { self.sync = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
+            "VAL" => match value {
+                EpicsValue::Double(v) => {
+                    self.val = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "HOPR" => match value {
+                EpicsValue::Double(v) => {
+                    self.hopr = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "LOPR" => match value {
+                EpicsValue::Double(v) => {
+                    self.lopr = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DRVLH" => match value {
+                EpicsValue::Double(v) => {
+                    self.drvlh = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DRVLL" => match value {
+                EpicsValue::Double(v) => {
+                    self.drvll = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DRVLC" => match value {
+                EpicsValue::Short(v) => {
+                    self.drvlc = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "PREC" => match value {
+                EpicsValue::Short(v) => {
+                    self.prec = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DPREC" => match value {
+                EpicsValue::Short(v) => {
+                    self.dprec = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DLY" => match value {
+                EpicsValue::Double(v) => {
+                    self.dly = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "OUT" => match value {
+                EpicsValue::String(v) => {
+                    self.out = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SINP" => match value {
+                EpicsValue::String(v) => {
+                    self.sinp = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SYNC" => match value {
+                EpicsValue::Short(v) => {
+                    self.sync = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
             // Read-only fields
             "OVAL" | "SENT" | "OSENT" | "WAIT" | "DRVLS" | "VER" | "STS" | "OV" | "SIV" => {
                 Err(CaError::ReadOnlyField(name.into()))

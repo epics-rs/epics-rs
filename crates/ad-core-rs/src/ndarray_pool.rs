@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -76,10 +76,12 @@ impl NDArrayPool {
                     if current + diff as u64 > self.max_memory as u64 {
                         return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
                     }
-                    self.allocated_bytes.fetch_add(diff as u64, Ordering::Relaxed);
+                    self.allocated_bytes
+                        .fetch_add(diff as u64, Ordering::Relaxed);
                 } else {
                     let diff = old_cap - new_cap;
-                    self.allocated_bytes.fetch_sub(diff as u64, Ordering::Relaxed);
+                    self.allocated_bytes
+                        .fetch_sub(diff as u64, Ordering::Relaxed);
                 }
             } else {
                 reused.data.resize(num_elements);
@@ -94,7 +96,8 @@ impl NDArrayPool {
             if current + needed_bytes as u64 > self.max_memory as u64 {
                 return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
             }
-            self.allocated_bytes.fetch_add(needed_bytes as u64, Ordering::Relaxed);
+            self.allocated_bytes
+                .fetch_add(needed_bytes as u64, Ordering::Relaxed);
             self.num_alloc_buffers.fetch_add(1, Ordering::Relaxed);
             NDArray::new(dims, data_type)
         };
@@ -111,7 +114,8 @@ impl NDArrayPool {
         if current + bytes as u64 > self.max_memory as u64 {
             return Err(ADError::PoolExhausted(bytes, self.max_memory));
         }
-        self.allocated_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.allocated_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
         self.num_alloc_buffers.fetch_add(1, Ordering::Relaxed);
 
         let mut copy = source.clone();
@@ -136,7 +140,8 @@ impl NDArrayPool {
             while excess > 0 && !free.is_empty() {
                 let dropped = free.remove(0);
                 let dropped_cap = dropped.data.capacity_bytes();
-                self.allocated_bytes.fetch_sub(dropped_cap.min(total) as u64, Ordering::Relaxed);
+                self.allocated_bytes
+                    .fetch_sub(dropped_cap.min(total) as u64, Ordering::Relaxed);
                 self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
                 self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
                 if dropped_cap >= excess {
@@ -154,7 +159,8 @@ impl NDArrayPool {
         let count = free.len() as u32;
         for arr in free.drain(..) {
             let cap = arr.data.capacity_bytes();
-            self.allocated_bytes.fetch_sub(cap as u64, Ordering::Relaxed);
+            self.allocated_bytes
+                .fetch_sub(cap as u64, Ordering::Relaxed);
             self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
         }
         self.num_free_buffers.fetch_sub(count, Ordering::Relaxed);
@@ -275,7 +281,9 @@ mod tests {
     #[test]
     fn test_release_and_reuse() {
         let pool = NDArrayPool::new(1_000_000);
-        let arr = pool.alloc(vec![NDDimension::new(100)], NDDataType::UInt8).unwrap();
+        let arr = pool
+            .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+            .unwrap();
         let alloc_bytes_after_first = pool.allocated_bytes();
         assert_eq!(pool.num_alloc_buffers(), 1);
 
@@ -284,7 +292,9 @@ mod tests {
         assert_eq!(pool.num_free_buffers(), 1);
 
         // Alloc again — should reuse the freed buffer
-        let arr2 = pool.alloc(vec![NDDimension::new(50)], NDDataType::UInt8).unwrap();
+        let arr2 = pool
+            .alloc(vec![NDDimension::new(50)], NDDataType::UInt8)
+            .unwrap();
         assert_eq!(pool.num_free_buffers(), 0);
         // allocated_bytes should be unchanged (reused buffer)
         assert_eq!(pool.allocated_bytes(), alloc_bytes_after_first);
@@ -294,9 +304,15 @@ mod tests {
     #[test]
     fn test_free_list_prefers_smallest_sufficient() {
         let pool = NDArrayPool::new(10_000_000);
-        let small = pool.alloc(vec![NDDimension::new(100)], NDDataType::UInt8).unwrap();
-        let large = pool.alloc(vec![NDDimension::new(10000)], NDDataType::UInt8).unwrap();
-        let medium = pool.alloc(vec![NDDimension::new(1000)], NDDataType::UInt8).unwrap();
+        let small = pool
+            .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+            .unwrap();
+        let large = pool
+            .alloc(vec![NDDimension::new(10000)], NDDataType::UInt8)
+            .unwrap();
+        let medium = pool
+            .alloc(vec![NDDimension::new(1000)], NDDataType::UInt8)
+            .unwrap();
 
         pool.release(large);
         pool.release(medium);
@@ -304,7 +320,9 @@ mod tests {
         assert_eq!(pool.num_free_buffers(), 3);
 
         // Request 500 bytes — should pick medium (1000 cap), not large (10000 cap)
-        let reused = pool.alloc(vec![NDDimension::new(500)], NDDataType::UInt8).unwrap();
+        let reused = pool
+            .alloc(vec![NDDimension::new(500)], NDDataType::UInt8)
+            .unwrap();
         assert_eq!(pool.num_free_buffers(), 2);
         // The reused buffer should have capacity >= 1000 (from medium)
         assert!(reused.data.capacity_bytes() >= 1000);
@@ -313,8 +331,12 @@ mod tests {
     #[test]
     fn test_empty_free_list() {
         let pool = NDArrayPool::new(1_000_000);
-        let a1 = pool.alloc(vec![NDDimension::new(100)], NDDataType::UInt8).unwrap();
-        let a2 = pool.alloc(vec![NDDimension::new(200)], NDDataType::UInt8).unwrap();
+        let a1 = pool
+            .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+            .unwrap();
+        let a2 = pool
+            .alloc(vec![NDDimension::new(200)], NDDataType::UInt8)
+            .unwrap();
         pool.release(a1);
         pool.release(a2);
         assert_eq!(pool.num_free_buffers(), 2);
@@ -329,13 +351,17 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         assert_eq!(pool.num_free_buffers(), 0);
 
-        let a = pool.alloc(vec![NDDimension::new(10)], NDDataType::UInt8).unwrap();
+        let a = pool
+            .alloc(vec![NDDimension::new(10)], NDDataType::UInt8)
+            .unwrap();
         assert_eq!(pool.num_free_buffers(), 0);
 
         pool.release(a);
         assert_eq!(pool.num_free_buffers(), 1);
 
-        let _ = pool.alloc(vec![NDDimension::new(5)], NDDataType::UInt8).unwrap();
+        let _ = pool
+            .alloc(vec![NDDimension::new(5)], NDDataType::UInt8)
+            .unwrap();
         assert_eq!(pool.num_free_buffers(), 0);
     }
 
@@ -351,7 +377,9 @@ mod tests {
             let pool = pool.clone();
             handles.push(thread::spawn(move || {
                 for _ in 0..100 {
-                    let arr = pool.alloc(vec![NDDimension::new(100)], NDDataType::UInt8).unwrap();
+                    let arr = pool
+                        .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+                        .unwrap();
                     pool.release(arr);
                 }
             }));

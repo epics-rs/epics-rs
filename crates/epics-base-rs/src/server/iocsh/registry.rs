@@ -270,8 +270,12 @@ fn split_comma_args(s: &str) -> Vec<String> {
             if ch == '\\' {
                 if let Some(&next) = chars.peek() {
                     match next {
-                        '"' | '\\' => { current.push(chars.next().unwrap()); }
-                        _ => { current.push(ch); }
+                        '"' | '\\' => {
+                            current.push(chars.next().unwrap());
+                        }
+                        _ => {
+                            current.push(ch);
+                        }
                     }
                 } else {
                     current.push(ch);
@@ -309,8 +313,12 @@ fn split_comma_args(s: &str) -> Vec<String> {
                 if c == '\\' {
                     if let Some(&next) = chs.peek() {
                         match next {
-                            '"' | '\\' => { val.push(chs.next().unwrap()); }
-                            _ => { val.push(c); }
+                            '"' | '\\' => {
+                                val.push(chs.next().unwrap());
+                            }
+                            _ => {
+                                val.push(c);
+                            }
                         }
                     } else {
                         val.push(c);
@@ -341,8 +349,12 @@ fn split_space_args(s: &str) -> Vec<String> {
             if ch == '\\' {
                 if let Some(&next) = chars.peek() {
                     match next {
-                        '"' | '\\' => { current.push(chars.next().unwrap()); }
-                        _ => { current.push(ch); }
+                        '"' | '\\' => {
+                            current.push(chars.next().unwrap());
+                        }
+                        _ => {
+                            current.push(ch);
+                        }
                     }
                 } else {
                     current.push(ch);
@@ -417,18 +429,15 @@ pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<Arg
             let token = &tokens[i];
             let val = match desc.arg_type {
                 ArgType::String => ArgValue::String(token.clone()),
-                ArgType::Int => {
-                    token
-                        .parse::<i64>()
-                        .map(ArgValue::Int)
-                        .map_err(|_| format!("argument '{}': expected integer, got '{}'", desc.name, token))?
-                }
-                ArgType::Double => {
-                    token
-                        .parse::<f64>()
-                        .map(ArgValue::Double)
-                        .map_err(|_| format!("argument '{}': expected number, got '{}'", desc.name, token))?
-                }
+                ArgType::Int => token.parse::<i64>().map(ArgValue::Int).map_err(|_| {
+                    format!(
+                        "argument '{}': expected integer, got '{}'",
+                        desc.name, token
+                    )
+                })?,
+                ArgType::Double => token.parse::<f64>().map(ArgValue::Double).map_err(|_| {
+                    format!("argument '{}': expected number, got '{}'", desc.name, token)
+                })?,
             };
             result.push(val);
         } else if desc.optional {
@@ -455,7 +464,10 @@ mod tests {
 
     #[test]
     fn test_tokenize_quoted() {
-        assert_eq!(tokenize(r#"dbpf TEMP "42.0""#), vec!["dbpf", "TEMP", "42.0"]);
+        assert_eq!(
+            tokenize(r#"dbpf TEMP "42.0""#),
+            vec!["dbpf", "TEMP", "42.0"]
+        );
     }
 
     #[test]
@@ -552,9 +564,11 @@ mod tests {
 
     #[test]
     fn test_parse_args_required() {
-        let descs = vec![
-            ArgDesc { name: "name", arg_type: ArgType::String, optional: false },
-        ];
+        let descs = vec![ArgDesc {
+            name: "name",
+            arg_type: ArgType::String,
+            optional: false,
+        }];
         let tokens = vec!["TEMP".to_string()];
         let result = parse_args(&tokens, &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::String(s) if s == "TEMP"));
@@ -562,27 +576,33 @@ mod tests {
 
     #[test]
     fn test_parse_args_optional_missing() {
-        let descs = vec![
-            ArgDesc { name: "type", arg_type: ArgType::String, optional: true },
-        ];
+        let descs = vec![ArgDesc {
+            name: "type",
+            arg_type: ArgType::String,
+            optional: true,
+        }];
         let result = parse_args(&[], &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::Missing));
     }
 
     #[test]
     fn test_parse_args_missing_required() {
-        let descs = vec![
-            ArgDesc { name: "name", arg_type: ArgType::String, optional: false },
-        ];
+        let descs = vec![ArgDesc {
+            name: "name",
+            arg_type: ArgType::String,
+            optional: false,
+        }];
         let result = parse_args(&[], &descs);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_args_int() {
-        let descs = vec![
-            ArgDesc { name: "level", arg_type: ArgType::Int, optional: false },
-        ];
+        let descs = vec![ArgDesc {
+            name: "level",
+            arg_type: ArgType::Int,
+            optional: false,
+        }];
         let tokens = vec!["42".to_string()];
         let result = parse_args(&tokens, &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::Int(42)));
@@ -590,18 +610,22 @@ mod tests {
 
     #[test]
     fn test_parse_args_int_invalid() {
-        let descs = vec![
-            ArgDesc { name: "level", arg_type: ArgType::Int, optional: false },
-        ];
+        let descs = vec![ArgDesc {
+            name: "level",
+            arg_type: ArgType::Int,
+            optional: false,
+        }];
         let tokens = vec!["abc".to_string()];
         assert!(parse_args(&tokens, &descs).is_err());
     }
 
     #[test]
     fn test_parse_args_double() {
-        let descs = vec![
-            ArgDesc { name: "value", arg_type: ArgType::Double, optional: false },
-        ];
+        let descs = vec![ArgDesc {
+            name: "value",
+            arg_type: ArgType::Double,
+            optional: false,
+        }];
         let tokens = vec!["3.14".to_string()];
         let result = parse_args(&tokens, &descs).unwrap();
         match &result[0] {

@@ -7,8 +7,11 @@ impl MotorRecord {
 
         // SPMG, STOP, and SYNC always processed regardless of command gate
         match src {
-            CommandSource::Spmg | CommandSource::Stop | CommandSource::Sync
-            | CommandSource::Set | CommandSource::Cnen => {}
+            CommandSource::Spmg
+            | CommandSource::Stop
+            | CommandSource::Sync
+            | CommandSource::Set
+            | CommandSource::Cnen => {}
             _ => {
                 if !self.can_accept_command() {
                     return effects;
@@ -43,7 +46,8 @@ impl MotorRecord {
                             self.internal.backlash_pending = false;
                             self.retry.rcnt = 0;
                             // Re-evaluate backlash for new target
-                            let backlash = self.needs_backlash_for_move(self.pos.dval, self.pos.drbv);
+                            let backlash =
+                                self.needs_backlash_for_move(self.pos.dval, self.pos.drbv);
                             let move_target = if backlash {
                                 Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst)
                             } else {
@@ -71,8 +75,13 @@ impl MotorRecord {
                 self.pos.rlv = 0.0;
                 // Cascade from VAL
                 if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                    self.pos.val, self.conv.dir, self.pos.off,
-                    self.conv.foff, self.conv.mres, false, self.pos.dval,
+                    self.pos.val,
+                    self.conv.dir,
+                    self.pos.off,
+                    self.conv.foff,
+                    self.conv.mres,
+                    false,
+                    self.pos.dval,
                 ) {
                     self.pos.dval = dval;
                     self.pos.rval = rval;
@@ -85,7 +94,11 @@ impl MotorRecord {
             }
             CommandSource::Jogf | CommandSource::Jogr => {
                 let forward = src == CommandSource::Jogf;
-                let starting = if forward { self.ctrl.jogf } else { self.ctrl.jogr };
+                let starting = if forward {
+                    self.ctrl.jogf
+                } else {
+                    self.ctrl.jogr
+                };
                 if starting {
                     self.start_jog(forward, &mut effects);
                 } else {
@@ -112,9 +125,9 @@ impl MotorRecord {
                 self.pos.diff = self.pos.dval - self.pos.drbv;
                 self.pos.rdif = self.pos.val - self.pos.rbv;
                 let raw_pos = self.pos.dval;
-                effects.commands.push(MotorCommand::SetPosition {
-                    position: raw_pos,
-                });
+                effects
+                    .commands
+                    .push(MotorCommand::SetPosition { position: raw_pos });
             }
             CommandSource::Cnen => {
                 effects.commands.push(MotorCommand::SetClosedLoop {
@@ -133,7 +146,9 @@ impl MotorRecord {
             self.limits.lvio = true;
             tracing::warn!(
                 "limit violation: dval={:.4}, limits=[{:.4}, {:.4}]",
-                self.pos.dval, self.limits.dllm, self.limits.dhlm
+                self.pos.dval,
+                self.limits.dllm,
+                self.limits.dhlm
             );
             return;
         }
@@ -207,7 +222,11 @@ impl MotorRecord {
 
     /// Start jogging.
     fn start_jog(&mut self, forward: bool, effects: &mut ProcessEffects) {
-        let dir = if forward { MotionDirection::Positive } else { MotionDirection::Negative };
+        let dir = if forward {
+            MotionDirection::Positive
+        } else {
+            MotionDirection::Negative
+        };
         if self.is_blocked_by_hw_limit(dir) {
             return;
         }
@@ -236,7 +255,11 @@ impl MotorRecord {
         self.stat.mip.insert(MipFlags::JOG_STOP);
         self.set_phase(MotionPhase::JogStopping);
         effects.commands.push(MotorCommand::Stop {
-            acceleration: if self.vel.jar > 0.0 { self.vel.jar } else { self.vel.accl },
+            acceleration: if self.vel.jar > 0.0 {
+                self.vel.jar
+            } else {
+                self.vel.accl
+            },
         });
     }
 
@@ -271,18 +294,31 @@ impl MotorRecord {
             self.ctrl.twr = false; // pulse
         }
 
-        let dir = if forward { MotionDirection::Positive } else { MotionDirection::Negative };
+        let dir = if forward {
+            MotionDirection::Positive
+        } else {
+            MotionDirection::Negative
+        };
         if self.is_blocked_by_hw_limit(dir) {
             return;
         }
 
-        let delta = if forward { self.ctrl.twv } else { -self.ctrl.twv };
+        let delta = if forward {
+            self.ctrl.twv
+        } else {
+            -self.ctrl.twv
+        };
         self.pos.val += delta;
 
         // Cascade from VAL
         if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-            self.pos.val, self.conv.dir, self.pos.off,
-            self.conv.foff, self.conv.mres, false, self.pos.dval,
+            self.pos.val,
+            self.conv.dir,
+            self.pos.off,
+            self.conv.foff,
+            self.conv.mres,
+            false,
+            self.pos.dval,
         ) {
             self.pos.dval = dval;
             self.pos.rval = rval;
@@ -336,7 +372,9 @@ impl MotorRecord {
             }
             SpmgMode::Move => {
                 // One-shot: like Go but will restore to Pause after completion
-                if matches!(old, SpmgMode::Pause | SpmgMode::Stop) && self.stat.phase == MotionPhase::Idle {
+                if matches!(old, SpmgMode::Pause | SpmgMode::Stop)
+                    && self.stat.phase == MotionPhase::Idle
+                {
                     if (self.pos.dval - self.pos.drbv).abs() > self.retry.rdbd.max(1e-12) {
                         self.plan_absolute_move(effects);
                     }
@@ -353,8 +391,8 @@ impl MotorRecord {
 
         let _deadband = self.timing.ntmf * (self.retry.bdst.abs() + self.retry.rdbd);
         let old_dval = self.internal.ldvl;
-        let direction_changed = (new_dval - self.pos.drbv).signum()
-            != (old_dval - self.pos.drbv).signum();
+        let direction_changed =
+            (new_dval - self.pos.drbv).signum() != (old_dval - self.pos.drbv).signum();
 
         if direction_changed {
             RetargetAction::StopAndReplan
@@ -408,9 +446,7 @@ impl MotorRecord {
                 // Handled by device support init
                 ProcessEffects::default()
             }
-            Some(MotorEvent::UserWrite(cmd_src)) => {
-                self.plan_motion(cmd_src)
-            }
+            Some(MotorEvent::UserWrite(cmd_src)) => self.plan_motion(cmd_src),
             Some(MotorEvent::DeviceUpdate(status)) => {
                 self.process_motor_info(&status);
                 self.check_completion()
@@ -420,9 +456,7 @@ impl MotorRecord {
                 self.finalize_motion(&mut effects);
                 effects
             }
-            None => {
-                ProcessEffects::default()
-            }
+            None => ProcessEffects::default(),
         }
     }
 }

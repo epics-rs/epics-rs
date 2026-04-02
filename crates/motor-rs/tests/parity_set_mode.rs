@@ -32,7 +32,10 @@ fn set_mode_val_produces_set_position() {
 
     // Should produce SetPosition command
     assert_eq!(effects.commands.len(), 1);
-    assert!(matches!(effects.commands[0], MotorCommand::SetPosition { .. }));
+    assert!(matches!(
+        effects.commands[0],
+        MotorCommand::SetPosition { .. }
+    ));
 
     // No DMOV change, no phase change
     assert!(rec.stat.dmov);
@@ -55,7 +58,10 @@ fn set_mode_dval_produces_set_position() {
     let effects = rec.plan_motion(CommandSource::Set);
 
     assert_eq!(effects.commands.len(), 1);
-    assert!(matches!(effects.commands[0], MotorCommand::SetPosition { .. }));
+    assert!(matches!(
+        effects.commands[0],
+        MotorCommand::SetPosition { .. }
+    ));
     assert!(rec.stat.dmov);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
 }
@@ -129,7 +135,7 @@ fn foff_variable_val_write_changes_dval() {
     rec.put_field("VAL", EpicsValue::Double(20.0)).unwrap();
 
     assert_eq!(rec.pos.dval, 20.0); // changed
-    assert_eq!(rec.pos.off, 0.0);   // unchanged
+    assert_eq!(rec.pos.off, 0.0); // unchanged
 }
 
 #[test]
@@ -143,7 +149,7 @@ fn foff_frozen_dval_write_preserves_val() {
     // Write DVAL=20: FOFF=Frozen → VAL stays 10, OFF adjusts
     rec.put_field("DVAL", EpicsValue::Double(20.0)).unwrap();
 
-    assert_eq!(rec.pos.val, 10.0);  // preserved
+    assert_eq!(rec.pos.val, 10.0); // preserved
     assert_eq!(rec.pos.dval, 20.0);
     assert_eq!(rec.pos.off, -10.0); // 10 - 1*20
 }

@@ -220,11 +220,7 @@ mod tests {
         assert_mat_eq(&mult_mat_mat(&MATRIX1, &ZEROES_MAT), &ZEROES_MAT);
         assert_mat_eq(&mult_mat_mat(&MATRIX1, &IDENTITY_MAT), &MATRIX1);
 
-        let expected = [
-            [10.0, 26.0, 9.0],
-            [22.0, 71.0, 27.0],
-            [34.0, 116.0, 45.0],
-        ];
+        let expected = [[10.0, 26.0, 9.0], [22.0, 71.0, 27.0], [34.0, 116.0, 45.0]];
         assert_mat_eq(&mult_mat_mat(&MATRIX1, &MATRIX2), &expected);
 
         // A * A^-1 = I

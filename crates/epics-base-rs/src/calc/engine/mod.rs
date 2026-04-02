@@ -4,12 +4,12 @@ pub mod opcodes;
 pub mod postfix;
 pub mod token;
 
-pub mod value;
-pub mod string;
 pub mod checksum;
+pub mod string;
+pub mod value;
 
-pub mod array_value;
 pub mod array;
+pub mod array_value;
 
 use error::CalcError;
 use opcodes::Opcode;
@@ -53,8 +53,8 @@ impl Default for NumericInputs {
 
 #[derive(Debug, Clone)]
 pub struct StringInputs {
-    pub num_vars: [f64; 16],     // A..P
-    pub str_vars: [String; 12],  // AA..LL
+    pub num_vars: [f64; 16],    // A..P
+    pub str_vars: [String; 12], // AA..LL
 }
 
 impl StringInputs {
@@ -75,7 +75,7 @@ impl Default for StringInputs {
 #[derive(Debug, Clone)]
 pub struct ArrayInputs {
     pub num_vars: [f64; 16],
-    pub arrays: Vec<Vec<f64>>,  // len 12 (AA..LL)
+    pub arrays: Vec<Vec<f64>>, // len 12 (AA..LL)
     pub array_size: usize,
 }
 

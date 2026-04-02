@@ -1,5 +1,5 @@
-use asyn_rs::interfaces::motor::MotorStatus;
 use crate::flags::MotorCommand;
+use asyn_rs::interfaces::motor::MotorStatus;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

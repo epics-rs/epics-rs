@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
+use epics_ca_rs::EpicsValue;
 use epics_ca_rs::protocol::*;
 use epics_ca_rs::server::CaServer;
-use epics_ca_rs::EpicsValue;
 
 // ---------------------------------------------------------------------------
 // CA protocol header encoding/decoding
@@ -198,12 +198,18 @@ async fn server_builder_with_simple_pvs() {
         .unwrap();
 
     // Verify get returns the initial values
-    assert_eq!(server.get("TEST:DOUBLE").await.unwrap(), EpicsValue::Double(3.15));
+    assert_eq!(
+        server.get("TEST:DOUBLE").await.unwrap(),
+        EpicsValue::Double(3.15)
+    );
     assert_eq!(
         server.get("TEST:STRING").await.unwrap(),
         EpicsValue::String("hello".into())
     );
-    assert_eq!(server.get("TEST:SHORT").await.unwrap(), EpicsValue::Short(42));
+    assert_eq!(
+        server.get("TEST:SHORT").await.unwrap(),
+        EpicsValue::Short(42)
+    );
     assert_eq!(server.get("TEST:ENUM").await.unwrap(), EpicsValue::Enum(2));
 }
 
@@ -285,7 +291,10 @@ async fn server_put_and_get_long() {
         .await
         .unwrap();
 
-    server.put("SRV:L", EpicsValue::Long(1_000_000)).await.unwrap();
+    server
+        .put("SRV:L", EpicsValue::Long(1_000_000))
+        .await
+        .unwrap();
     assert_eq!(
         server.get("SRV:L").await.unwrap(),
         EpicsValue::Long(1_000_000)
@@ -371,8 +380,14 @@ async fn server_multiple_pv_types_coexist() {
         .await
         .unwrap();
 
-    assert_eq!(server.get("MULTI:D").await.unwrap(), EpicsValue::Double(1.1));
-    assert_eq!(server.get("MULTI:S").await.unwrap(), EpicsValue::String("abc".into()));
+    assert_eq!(
+        server.get("MULTI:D").await.unwrap(),
+        EpicsValue::Double(1.1)
+    );
+    assert_eq!(
+        server.get("MULTI:S").await.unwrap(),
+        EpicsValue::String("abc".into())
+    );
     assert_eq!(server.get("MULTI:I").await.unwrap(), EpicsValue::Short(7));
     assert_eq!(server.get("MULTI:E").await.unwrap(), EpicsValue::Enum(1));
     assert_eq!(server.get("MULTI:F").await.unwrap(), EpicsValue::Float(3.0));
@@ -535,11 +550,20 @@ record(ao, "CTRL:SP") {
         .unwrap();
 
     // Initial value
-    assert_eq!(server.get("CTRL:SP").await.unwrap(), EpicsValue::Double(0.0));
+    assert_eq!(
+        server.get("CTRL:SP").await.unwrap(),
+        EpicsValue::Double(0.0)
+    );
 
     // Put a new value
-    server.put("CTRL:SP", EpicsValue::Double(50.0)).await.unwrap();
-    assert_eq!(server.get("CTRL:SP").await.unwrap(), EpicsValue::Double(50.0));
+    server
+        .put("CTRL:SP", EpicsValue::Double(50.0))
+        .await
+        .unwrap();
+    assert_eq!(
+        server.get("CTRL:SP").await.unwrap(),
+        EpicsValue::Double(50.0)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -562,8 +586,14 @@ record(ai, "REC:AI") {
         .await
         .unwrap();
 
-    assert_eq!(server.get("SIMPLE:PV").await.unwrap(), EpicsValue::Double(20.0));
-    assert_eq!(server.get("REC:AI").await.unwrap(), EpicsValue::Double(10.0));
+    assert_eq!(
+        server.get("SIMPLE:PV").await.unwrap(),
+        EpicsValue::Double(20.0)
+    );
+    assert_eq!(
+        server.get("REC:AI").await.unwrap(),
+        EpicsValue::Double(10.0)
+    );
 }
 
 // ---------------------------------------------------------------------------

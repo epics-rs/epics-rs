@@ -55,7 +55,11 @@ pub fn fitpoly(x: &[f64], y: &[f64], mask: Option<&[f64]>) -> (f64, f64, f64) {
     }
 
     // Solve 3x3 system via Cramer's rule
-    let a = [[sx[0], sx[1], sx[2]], [sx[1], sx[2], sx[3]], [sx[2], sx[3], sx[4]]];
+    let a = [
+        [sx[0], sx[1], sx[2]],
+        [sx[1], sx[2], sx[3]],
+        [sx[2], sx[3], sx[4]],
+    ];
     let det = det3x3(&a);
     if det.abs() < 1e-30 {
         let (slope, intercept) = lfit(x, y);

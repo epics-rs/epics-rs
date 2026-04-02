@@ -116,8 +116,7 @@ pub const CSW_TEXT: i32 = 0x80;
 // ---------------------------------------------------------------------------
 
 /// Horizontal slit orientation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HOrient {
     /// Motor A = left blade, Motor B = right blade.
     #[default]
@@ -126,10 +125,8 @@ pub enum HOrient {
     RightLeft,
 }
 
-
 /// Vertical slit orientation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VOrient {
     /// Motor A = top blade, Motor B = bottom blade.
     #[default]
@@ -137,7 +134,6 @@ pub enum VOrient {
     /// Motor A = bottom blade, Motor B = top blade.
     BottomTop,
 }
-
 
 // ---------------------------------------------------------------------------
 // Serial Protocol — Commands
@@ -223,34 +219,17 @@ pub enum HscResponse {
     /// Device is busy: `%<ID> BUSY;`
     Busy(String),
     /// Position report with DONE status: `%<ID> <posA> <posB> DONE;`
-    Position {
-        id: String,
-        pos_a: i32,
-        pos_b: i32,
-    },
+    Position { id: String, pos_a: i32, pos_b: i32 },
     /// Position report with OK status: `%<ID> OK <posA> <posB>`
-    PositionOk {
-        id: String,
-        pos_a: i32,
-        pos_b: i32,
-    },
+    PositionOk { id: String, pos_a: i32, pos_b: i32 },
     /// Error report: `%<ID> ERROR; [<code>]`
-    Error {
-        id: String,
-        code: Option<i32>,
-    },
+    Error { id: String, code: Option<i32> },
     /// Register read response: `%<ID> R <value>`
     /// The actual format is `%<ID> R <reg> <value>` but typically
     /// the parsed form after skipping the first two words yields the value.
-    RegisterValue {
-        id: String,
-        value: i32,
-    },
+    RegisterValue { id: String, value: i32 },
     /// Module identity response.
-    Identity {
-        id: String,
-        info: String,
-    },
+    Identity { id: String, info: String },
     /// Unparseable response.
     Unknown(String),
 }
@@ -296,16 +275,12 @@ pub fn parse_response(line: &str) -> HscResponse {
 
     match words.len() {
         1 => HscResponse::Unknown(line.to_string()),
-        2 => {
-            match words[1] {
-                "OK;" => HscResponse::Ok(id),
-                "BUSY;" => HscResponse::Busy(id),
-                s if s.starts_with("ERROR;") => {
-                    HscResponse::Error { id, code: None }
-                }
-                _ => HscResponse::Unknown(line.to_string()),
-            }
-        }
+        2 => match words[1] {
+            "OK;" => HscResponse::Ok(id),
+            "BUSY;" => HscResponse::Busy(id),
+            s if s.starts_with("ERROR;") => HscResponse::Error { id, code: None },
+            _ => HscResponse::Unknown(line.to_string()),
+        },
         3 => {
             if words[1] == "ERROR;" {
                 let code = words[2].parse::<i32>().ok();
@@ -324,7 +299,11 @@ pub fn parse_response(line: &str) -> HscResponse {
             if words[3] == "DONE;" {
                 // Position report: %<ID> <posA> <posB> DONE;
                 if let (Ok(a), Ok(b)) = (words[1].parse::<i32>(), words[2].parse::<i32>()) {
-                    HscResponse::Position { id, pos_a: a, pos_b: b }
+                    HscResponse::Position {
+                        id,
+                        pos_a: a,
+                        pos_b: b,
+                    }
                 } else {
                     HscResponse::Unknown(line.to_string())
                 }
@@ -336,7 +315,11 @@ pub fn parse_response(line: &str) -> HscResponse {
             if words[1] == "OK" {
                 // Position with OK status: %<ID> OK <posA> <posB> DONE;
                 if let (Ok(a), Ok(b)) = (words[2].parse::<i32>(), words[3].parse::<i32>()) {
-                    HscResponse::PositionOk { id, pos_a: a, pos_b: b }
+                    HscResponse::PositionOk {
+                        id,
+                        pos_a: a,
+                        pos_b: b,
+                    }
                 } else {
                     HscResponse::Unknown(line.to_string())
                 }
@@ -460,12 +443,24 @@ impl ControlStatusWord {
     /// Encode back to a raw integer.
     pub fn to_raw(&self) -> i32 {
         let mut v = self.power_level & CSW_PWRLVL;
-        if self.limits { v |= CSW_LIMITS; }
-        if self.banner { v |= CSW_BANNER; }
-        if self.echo { v |= CSW_ECHO; }
-        if self.lock { v |= CSW_LOCK; }
-        if self.alias { v |= CSW_ALIAS; }
-        if self.text { v |= CSW_TEXT; }
+        if self.limits {
+            v |= CSW_LIMITS;
+        }
+        if self.banner {
+            v |= CSW_BANNER;
+        }
+        if self.echo {
+            v |= CSW_ECHO;
+        }
+        if self.lock {
+            v |= CSW_LOCK;
+        }
+        if self.alias {
+            v |= CSW_ALIAS;
+        }
+        if self.text {
+            v |= CSW_TEXT;
+        }
         v
     }
 }
@@ -852,12 +847,14 @@ impl HscController {
     pub fn h_raw_positions(&self) -> (i32, i32) {
         let (left, right) = self.h_target;
         match self.h_orient {
-            HOrient::LeftRight => {
-                (dial_to_raw(left, self.h_origin), dial_to_raw(right, self.h_origin))
-            }
-            HOrient::RightLeft => {
-                (dial_to_raw(right, self.h_origin), dial_to_raw(left, self.h_origin))
-            }
+            HOrient::LeftRight => (
+                dial_to_raw(left, self.h_origin),
+                dial_to_raw(right, self.h_origin),
+            ),
+            HOrient::RightLeft => (
+                dial_to_raw(right, self.h_origin),
+                dial_to_raw(left, self.h_origin),
+            ),
         }
     }
 
@@ -865,12 +862,14 @@ impl HscController {
     pub fn v_raw_positions(&self) -> (i32, i32) {
         let (top, bottom) = self.v_target;
         match self.v_orient {
-            VOrient::TopBottom => {
-                (dial_to_raw(top, self.v_origin), dial_to_raw(bottom, self.v_origin))
-            }
-            VOrient::BottomTop => {
-                (dial_to_raw(bottom, self.v_origin), dial_to_raw(top, self.v_origin))
-            }
+            VOrient::TopBottom => (
+                dial_to_raw(top, self.v_origin),
+                dial_to_raw(bottom, self.v_origin),
+            ),
+            VOrient::BottomTop => (
+                dial_to_raw(bottom, self.v_origin),
+                dial_to_raw(top, self.v_origin),
+            ),
         }
     }
 
@@ -1090,7 +1089,10 @@ pub async fn run<R, W>(
         }
     }
 
-    async fn send_and_read<R2: tokio::io::AsyncBufRead + Unpin, W2: tokio::io::AsyncWrite + Unpin>(
+    async fn send_and_read<
+        R2: tokio::io::AsyncBufRead + Unpin,
+        W2: tokio::io::AsyncWrite + Unpin,
+    >(
         writer: &mut W2,
         reader: &mut R2,
         buf: &mut String,

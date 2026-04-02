@@ -23,8 +23,14 @@ fn test_default_values() {
 fn test_process_produces_timestamp() {
     let mut rec = TimestampRecord::default();
     rec.process().unwrap();
-    assert!(!rec.val.is_empty(), "VAL should be a non-empty timestamp string");
-    assert!(rec.rval > 0, "RVAL should be positive (seconds past EPICS epoch)");
+    assert!(
+        !rec.val.is_empty(),
+        "VAL should be a non-empty timestamp string"
+    );
+    assert!(
+        rec.rval > 0,
+        "RVAL should be positive (seconds past EPICS epoch)"
+    );
 }
 
 #[test]
@@ -60,7 +66,11 @@ fn test_format_0_contains_slashes() {
     let mut rec = TimestampRecord::default();
     rec.tst = 0;
     rec.process().unwrap();
-    assert!(rec.val.contains('/'), "Format 0 should contain '/', got: {}", rec.val);
+    assert!(
+        rec.val.contains('/'),
+        "Format 0 should contain '/', got: {}",
+        rec.val
+    );
 }
 
 #[test]
@@ -69,9 +79,17 @@ fn test_format_4_time_only() {
     let mut rec = TimestampRecord::default();
     rec.tst = 4;
     rec.process().unwrap();
-    assert!(rec.val.contains(':'), "Format 4 should contain ':', got: {}", rec.val);
+    assert!(
+        rec.val.contains(':'),
+        "Format 4 should contain ':', got: {}",
+        rec.val
+    );
     // Should be short (8 chars: HH:MM:SS)
-    assert!(rec.val.len() <= 10, "Format 4 should be short, got: {}", rec.val);
+    assert!(
+        rec.val.len() <= 10,
+        "Format 4 should be short, got: {}",
+        rec.val
+    );
 }
 
 #[test]
@@ -81,7 +99,11 @@ fn test_format_5_hour_minute() {
     rec.tst = 5;
     rec.process().unwrap();
     assert!(rec.val.contains(':'), "Format 5 should contain ':'");
-    assert!(rec.val.len() <= 6, "Format 5 should be 5 chars, got: {}", rec.val);
+    assert!(
+        rec.val.len() <= 6,
+        "Format 5 should be 5 chars, got: {}",
+        rec.val
+    );
 }
 
 #[test]
@@ -90,7 +112,11 @@ fn test_format_8_vms() {
     let mut rec = TimestampRecord::default();
     rec.tst = 8;
     rec.process().unwrap();
-    assert!(rec.val.contains('-'), "VMS format should contain '-', got: {}", rec.val);
+    assert!(
+        rec.val.contains('-'),
+        "VMS format should contain '-', got: {}",
+        rec.val
+    );
 }
 
 #[test]
@@ -99,7 +125,11 @@ fn test_format_9_with_milliseconds() {
     let mut rec = TimestampRecord::default();
     rec.tst = 9;
     rec.process().unwrap();
-    assert!(rec.val.contains('.'), "Format 9 should contain '.', got: {}", rec.val);
+    assert!(
+        rec.val.contains('.'),
+        "Format 9 should contain '.', got: {}",
+        rec.val
+    );
 }
 
 #[test]
@@ -108,7 +138,11 @@ fn test_format_10_with_milliseconds() {
     let mut rec = TimestampRecord::default();
     rec.tst = 10;
     rec.process().unwrap();
-    assert!(rec.val.contains('.'), "Format 10 should contain '.', got: {}", rec.val);
+    assert!(
+        rec.val.contains('.'),
+        "Format 10 should contain '.', got: {}",
+        rec.val
+    );
 }
 
 #[test]

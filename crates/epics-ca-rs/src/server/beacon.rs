@@ -1,11 +1,11 @@
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
-use std::sync::Arc;
 
-use epics_base_rs::error::CaResult;
 use crate::protocol::*;
+use epics_base_rs::error::CaResult;
 
 /// Run the beacon emitter. Broadcasts CA_PROTO_RSRV_IS_UP at exponentially
 /// increasing intervals (starting at 20ms, doubling up to 15 seconds).

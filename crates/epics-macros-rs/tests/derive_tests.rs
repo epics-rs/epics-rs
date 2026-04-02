@@ -140,7 +140,13 @@ fn field_list_has_correct_names_upper_case() {
     let names: Vec<&str> = ai.field_list().iter().map(|f| f.name).collect();
     assert_eq!(
         names,
-        vec!["VAL", "HIGH_LIMIT", "LOW_LIMIT", "PRECISION", "ENGINEERING_UNITS"]
+        vec![
+            "VAL",
+            "HIGH_LIMIT",
+            "LOW_LIMIT",
+            "PRECISION",
+            "ENGINEERING_UNITS"
+        ]
     );
 }
 
@@ -192,10 +198,7 @@ fn get_field_double() {
     };
     assert_eq!(ai.get_field("VAL"), Some(EpicsValue::Double(3.15)));
     assert_eq!(ai.get_field("HIGH_LIMIT"), Some(EpicsValue::Double(100.0)));
-    assert_eq!(
-        ai.get_field("LOW_LIMIT"),
-        Some(EpicsValue::Double(-100.0))
-    );
+    assert_eq!(ai.get_field("LOW_LIMIT"), Some(EpicsValue::Double(-100.0)));
 }
 
 #[test]
@@ -300,11 +303,8 @@ fn put_field_string() {
         precision: 0,
         engineering_units: String::new(),
     };
-    ai.put_field(
-        "ENGINEERING_UNITS",
-        EpicsValue::String("mA".into()),
-    )
-    .unwrap();
+    ai.put_field("ENGINEERING_UNITS", EpicsValue::String("mA".into()))
+        .unwrap();
     assert_eq!(ai.engineering_units, "mA");
 }
 

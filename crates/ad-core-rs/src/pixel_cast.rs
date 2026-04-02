@@ -60,16 +60,16 @@ impl PixelCast for f64 {
 macro_rules! with_buffer {
     ($buffer:expr, |$v:ident| $body:expr) => {
         match $buffer {
-            $crate::ndarray::NDDataBuffer::I8($v) => { $body }
-            $crate::ndarray::NDDataBuffer::U8($v) => { $body }
-            $crate::ndarray::NDDataBuffer::I16($v) => { $body }
-            $crate::ndarray::NDDataBuffer::U16($v) => { $body }
-            $crate::ndarray::NDDataBuffer::I32($v) => { $body }
-            $crate::ndarray::NDDataBuffer::U32($v) => { $body }
-            $crate::ndarray::NDDataBuffer::I64($v) => { $body }
-            $crate::ndarray::NDDataBuffer::U64($v) => { $body }
-            $crate::ndarray::NDDataBuffer::F32($v) => { $body }
-            $crate::ndarray::NDDataBuffer::F64($v) => { $body }
+            $crate::ndarray::NDDataBuffer::I8($v) => $body,
+            $crate::ndarray::NDDataBuffer::U8($v) => $body,
+            $crate::ndarray::NDDataBuffer::I16($v) => $body,
+            $crate::ndarray::NDDataBuffer::U16($v) => $body,
+            $crate::ndarray::NDDataBuffer::I32($v) => $body,
+            $crate::ndarray::NDDataBuffer::U32($v) => $body,
+            $crate::ndarray::NDDataBuffer::I64($v) => $body,
+            $crate::ndarray::NDDataBuffer::U64($v) => $body,
+            $crate::ndarray::NDDataBuffer::F32($v) => $body,
+            $crate::ndarray::NDDataBuffer::F64($v) => $body,
         }
     };
 }
@@ -79,16 +79,16 @@ macro_rules! with_buffer {
 macro_rules! with_buffer_mut {
     ($buffer:expr, |$v:ident| $body:expr) => {
         match $buffer {
-            $crate::ndarray::NDDataBuffer::I8($v) => { $body }
-            $crate::ndarray::NDDataBuffer::U8($v) => { $body }
-            $crate::ndarray::NDDataBuffer::I16($v) => { $body }
-            $crate::ndarray::NDDataBuffer::U16($v) => { $body }
-            $crate::ndarray::NDDataBuffer::I32($v) => { $body }
-            $crate::ndarray::NDDataBuffer::U32($v) => { $body }
-            $crate::ndarray::NDDataBuffer::I64($v) => { $body }
-            $crate::ndarray::NDDataBuffer::U64($v) => { $body }
-            $crate::ndarray::NDDataBuffer::F32($v) => { $body }
-            $crate::ndarray::NDDataBuffer::F64($v) => { $body }
+            $crate::ndarray::NDDataBuffer::I8($v) => $body,
+            $crate::ndarray::NDDataBuffer::U8($v) => $body,
+            $crate::ndarray::NDDataBuffer::I16($v) => $body,
+            $crate::ndarray::NDDataBuffer::U16($v) => $body,
+            $crate::ndarray::NDDataBuffer::I32($v) => $body,
+            $crate::ndarray::NDDataBuffer::U32($v) => $body,
+            $crate::ndarray::NDDataBuffer::I64($v) => $body,
+            $crate::ndarray::NDDataBuffer::U64($v) => $body,
+            $crate::ndarray::NDDataBuffer::F32($v) => $body,
+            $crate::ndarray::NDDataBuffer::F64($v) => $body,
         }
     };
 }
@@ -158,9 +158,7 @@ mod tests {
     #[test]
     fn test_with_buffer_macro() {
         let buf = NDDataBuffer::U8(vec![1, 2, 3]);
-        let sum: f64 = with_buffer!(&buf, |v| {
-            v.iter().map(|x| PixelCast::to_f64(*x)).sum()
-        });
+        let sum: f64 = with_buffer!(&buf, |v| { v.iter().map(|x| PixelCast::to_f64(*x)).sum() });
         assert_eq!(sum, 6.0);
     }
 }

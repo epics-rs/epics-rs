@@ -47,6 +47,7 @@ impl PortRuntimeHandle {
     /// Closes the shutdown channel, causing the actor thread to exit after
     /// completing any in-progress request. Does not wait for the thread to stop.
     pub fn shutdown(&self) {
+        self.port_handle.mark_shutdown();
         self.shutdown_tx.lock().unwrap().take();
     }
 
@@ -99,29 +100,64 @@ pub fn create_port_runtime_boxed(
     let broadcast_sender = driver.base().interrupts.broadcast_sender();
     let handle_interrupts = Arc::new(InterruptManager::from_broadcast_sender(broadcast_sender));
 
-    // Actor channel
+    // Actor channel (needed even for can_block=false for async submit compatibility)
     let (tx, rx) = mpsc::channel(config.channel_capacity);
-    let actor = PortActor::new(driver, rx);
 
-    let event_tx_clone = event_tx.clone();
-    let name_clone = port_name.clone();
+    let mut port_handle = PortHandle::new(tx.clone(), port_name.clone(), handle_interrupts);
 
-    let join_handle = std::thread::Builder::new()
-        .name(format!("asyn-runtime-{port_name}"))
-        .spawn(move || {
-            let _ = event_tx_clone.send(RuntimeEvent::Started {
-                port_name: name_clone.clone(),
-            });
-            actor.run_with_shutdown(shutdown_rx);
-            let _ = event_tx_clone.send(RuntimeEvent::Stopped {
-                port_name: name_clone,
-            });
-            let _ = completion_tx.send(());
-        })
-        .expect("failed to spawn port runtime thread");
-
-    let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts);
-    port_handle.set_can_block(can_block);
+    let join_handle = if can_block {
+        // can_block=true: actor thread owns the driver, processes requests from channel
+        let actor = PortActor::new(driver, rx);
+        let event_tx_clone = event_tx.clone();
+        let name_clone = port_name.clone();
+        std::thread::Builder::new()
+            .name(format!("asyn-runtime-{port_name}"))
+            .spawn(move || {
+                let _ = event_tx_clone.send(RuntimeEvent::Started {
+                    port_name: name_clone.clone(),
+                });
+                actor.run_with_shutdown(shutdown_rx);
+                let _ = event_tx_clone.send(RuntimeEvent::Stopped {
+                    port_name: name_clone,
+                });
+                let _ = completion_tx.send(());
+            })
+            .expect("failed to spawn port runtime thread")
+    } else {
+        // can_block=false: no actor thread. Driver lives in Arc<Mutex> on PortHandle.
+        // All I/O goes through direct mutex lock — matching C EPICS lockPort.
+        let shared = Arc::new(parking_lot::Mutex::new(driver));
+        port_handle.set_direct_driver(shared);
+        let event_tx_clone = event_tx.clone();
+        let name_clone = port_name.clone();
+        std::thread::Builder::new()
+            .name(format!("asyn-noop-{port_name}"))
+            .spawn(move || {
+                let _ = event_tx_clone.send(RuntimeEvent::Started {
+                    port_name: name_clone.clone(),
+                });
+                // Keep rx/shutdown_rx alive so senders don't get closed errors.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    // Drain any messages that arrive (shouldn't happen in normal operation)
+                    let mut rx = rx;
+                    let mut shutdown_rx = shutdown_rx;
+                    loop {
+                        tokio::select! {
+                            msg = rx.recv() => {
+                                if msg.is_none() { break; }
+                                // Messages shouldn't arrive but drop them gracefully
+                            }
+                            _ = shutdown_rx.recv() => break,
+                        }
+                    }
+                });
+                let _ = completion_tx.send(());
+            })
+            .expect("failed to spawn noop thread")
+    };
     let client = InProcessClient::new(port_handle.clone());
 
     let handle = PortRuntimeHandle {
@@ -138,9 +174,13 @@ pub fn create_port_runtime_boxed(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::param::ParamType;
     use crate::port::{PortDriverBase, PortFlags};
+    use crate::user::AsynUser;
 
     struct TestPort {
         base: PortDriverBase,
@@ -164,21 +204,51 @@ mod tests {
         }
     }
 
+    struct NoWaitDirectPort {
+        base: PortDriverBase,
+        connect_count: Arc<AtomicUsize>,
+    }
+
+    impl NoWaitDirectPort {
+        fn new(name: &str, connect_count: Arc<AtomicUsize>) -> Self {
+            let mut base = PortDriverBase::new(
+                name,
+                1,
+                PortFlags {
+                    can_block: false,
+                    ..PortFlags::default()
+                },
+            );
+            base.connected = false;
+            base.auto_connect = true;
+            base.create_param("VAL", ParamType::Int32).unwrap();
+            Self {
+                base,
+                connect_count,
+            }
+        }
+    }
+
+    impl PortDriver for NoWaitDirectPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn connect(&mut self, _user: &AsynUser) -> crate::error::AsynResult<()> {
+            self.connect_count.fetch_add(1, Ordering::SeqCst);
+            self.base.connected = true;
+            Ok(())
+        }
+    }
+
     #[test]
     fn port_runtime_int32_roundtrip() {
-        let (handle, _jh) = create_port_runtime(
-            TestPort::new("rt_test"),
-            RuntimeConfig::default(),
-        );
+        let (handle, _jh) = create_port_runtime(TestPort::new("rt_test"), RuntimeConfig::default());
 
-        handle
-            .port_handle()
-            .write_int32_blocking(0, 0, 42)
-            .unwrap();
-        assert_eq!(
-            handle.port_handle().read_int32_blocking(0, 0).unwrap(),
-            42
-        );
+        handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
+        assert_eq!(handle.port_handle().read_int32_blocking(0, 0).unwrap(), 42);
     }
 
     #[test]
@@ -189,10 +259,8 @@ mod tests {
         use crate::protocol::value::ParamValue;
         use crate::transport::RuntimeClient;
 
-        let (handle, _jh) = create_port_runtime(
-            TestPort::new("rt_client"),
-            RuntimeConfig::default(),
-        );
+        let (handle, _jh) =
+            create_port_runtime(TestPort::new("rt_client"), RuntimeConfig::default());
 
         let client = handle.client();
 
@@ -234,10 +302,8 @@ mod tests {
 
     #[test]
     fn port_runtime_shutdown() {
-        let (handle, jh) = create_port_runtime(
-            TestPort::new("rt_shutdown"),
-            RuntimeConfig::default(),
-        );
+        let (handle, jh) =
+            create_port_runtime(TestPort::new("rt_shutdown"), RuntimeConfig::default());
 
         // Dropping the handle should cause the actor to stop
         drop(handle);
@@ -253,10 +319,7 @@ mod tests {
         );
 
         // Write a value first
-        handle
-            .port_handle()
-            .write_int32_blocking(0, 0, 42)
-            .unwrap();
+        handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
 
         // Explicit shutdown should cause the actor to stop
         handle.shutdown_and_wait();
@@ -282,10 +345,8 @@ mod tests {
 
     #[test]
     fn port_runtime_event_subscription() {
-        let (handle, _jh) = create_port_runtime(
-            TestPort::new("rt_events"),
-            RuntimeConfig::default(),
-        );
+        let (handle, _jh) =
+            create_port_runtime(TestPort::new("rt_events"), RuntimeConfig::default());
 
         let mut rx = handle.subscribe_events();
 
@@ -303,10 +364,23 @@ mod tests {
 
     #[test]
     fn port_runtime_port_name() {
+        let (handle, _jh) =
+            create_port_runtime(TestPort::new("named_port"), RuntimeConfig::default());
+        assert_eq!(handle.port_name(), "named_port");
+    }
+
+    #[test]
+    fn port_runtime_direct_no_wait_executes_immediately() {
+        let connect_count = Arc::new(AtomicUsize::new(0));
         let (handle, _jh) = create_port_runtime(
-            TestPort::new("named_port"),
+            NoWaitDirectPort::new("rt_direct_nowait", connect_count.clone()),
             RuntimeConfig::default(),
         );
-        assert_eq!(handle.port_name(), "named_port");
+
+        handle.port_handle().write_int32_no_wait(0, 0, 55);
+        handle.port_handle().call_param_callbacks_no_wait(0);
+
+        assert_eq!(handle.port_handle().read_int32_blocking(0, 0).unwrap(), 55);
+        assert_eq!(connect_count.load(Ordering::SeqCst), 1);
     }
 }

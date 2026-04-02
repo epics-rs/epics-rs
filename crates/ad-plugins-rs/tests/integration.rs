@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+use ad_core_rs::driver::ad_driver::ADDriverBase;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::driver::ad_driver::ADDriverBase;
 use ad_core_rs::plugin::runtime::NDPluginProcess;
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use ad_plugins_rs::stats::create_stats_runtime;
@@ -16,21 +16,35 @@ use ad_plugins_rs::std_arrays::create_std_arrays_runtime;
 fn test_driver_to_stats_pipeline() {
     let pool = Arc::new(ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000));
     let wiring = Arc::new(WiringRegistry::new());
-    let (stats_handle, stats_data, _params, _ts_runtime, _ts_params, _jh, _ts_actor_jh, _ts_data_jh) =
-        create_stats_runtime("STATS1", pool.clone(), 10, "SIM1", wiring);
+    let (
+        stats_handle,
+        stats_data,
+        _params,
+        _ts_runtime,
+        _ts_params,
+        _jh,
+        _ts_actor_jh,
+        _ts_data_jh,
+    ) = create_stats_runtime("STATS1", pool.clone(), 10, "SIM1", wiring);
 
     // Plugins default to disabled — enable for test
-    stats_handle.port_runtime().port_handle()
-        .write_int32_blocking(stats_handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+    stats_handle
+        .port_runtime()
+        .port_handle()
+        .write_int32_blocking(stats_handle.plugin_params.enable_callbacks, 0, 1)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     let mut driver = ADDriverBase::new("SIM1", 64, 64, 10_000_000).unwrap();
     driver.connect_downstream(stats_handle.array_sender().clone());
 
-    let mut arr = driver.pool.alloc(
-        vec![NDDimension::new(64), NDDimension::new(64)],
-        NDDataType::UInt8,
-    ).unwrap();
+    let mut arr = driver
+        .pool
+        .alloc(
+            vec![NDDimension::new(64), NDDimension::new(64)],
+            NDDataType::UInt8,
+        )
+        .unwrap();
 
     if let NDDataBuffer::U8(ref mut v) = arr.data {
         for i in 0..v.len() {
@@ -51,20 +65,27 @@ fn test_driver_to_stats_pipeline() {
 fn test_driver_to_std_arrays_pipeline() {
     let pool = Arc::new(ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000));
     let wiring = Arc::new(WiringRegistry::new());
-    let (image_handle, image_data, _jh) = create_std_arrays_runtime("IMAGE1", pool.clone(), "SIM1", wiring);
+    let (image_handle, image_data, _jh) =
+        create_std_arrays_runtime("IMAGE1", pool.clone(), "SIM1", wiring);
 
     // Plugins default to disabled — enable for test
-    image_handle.port_runtime().port_handle()
-        .write_int32_blocking(image_handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+    image_handle
+        .port_runtime()
+        .port_handle()
+        .write_int32_blocking(image_handle.plugin_params.enable_callbacks, 0, 1)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     let mut driver = ADDriverBase::new("SIM1", 32, 32, 10_000_000).unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());
 
-    let arr = driver.pool.alloc(
-        vec![NDDimension::new(32), NDDimension::new(32)],
-        NDDataType::UInt16,
-    ).unwrap();
+    let arr = driver
+        .pool
+        .alloc(
+            vec![NDDimension::new(32), NDDimension::new(32)],
+            NDDataType::UInt16,
+        )
+        .unwrap();
 
     let id = arr.unique_id;
     driver.publish_array(Arc::new(arr)).unwrap();
@@ -80,12 +101,16 @@ fn test_pool_reuse_in_pipeline() {
     let pool = Arc::new(ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000));
 
     // Allocate, use, release, reallocate
-    let arr1 = pool.alloc(vec![NDDimension::new(1000)], NDDataType::UInt8).unwrap();
+    let arr1 = pool
+        .alloc(vec![NDDimension::new(1000)], NDDataType::UInt8)
+        .unwrap();
     let bytes_after_first = pool.allocated_bytes();
     pool.release(arr1);
     assert_eq!(pool.num_free_buffers(), 1);
 
-    let _arr2 = pool.alloc(vec![NDDimension::new(500)], NDDataType::UInt8).unwrap();
+    let _arr2 = pool
+        .alloc(vec![NDDimension::new(500)], NDDataType::UInt8)
+        .unwrap();
     assert_eq!(pool.num_free_buffers(), 0);
     // Should have reused buffer, allocated_bytes unchanged
     assert_eq!(pool.allocated_bytes(), bytes_after_first);
@@ -96,7 +121,7 @@ fn test_pool_reuse_in_pipeline() {
 #[test]
 fn test_rewire_ndarray_port_at_runtime() {
     use ad_core_rs::plugin::channel::NDArrayOutput;
-    use ad_core_rs::plugin::runtime::{create_plugin_runtime, ProcessResult};
+    use ad_core_rs::plugin::runtime::{ProcessResult, create_plugin_runtime};
     use asyn_rs::request::RequestOp;
     use asyn_rs::user::AsynUser;
 
@@ -115,26 +140,35 @@ fn test_rewire_ndarray_port_at_runtime() {
         last_id: Arc<parking_lot::Mutex<i32>>,
     }
     impl NDPluginProcess for TrackingProcessor {
-        fn process_array(&mut self, array: &ad_core_rs::ndarray::NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        fn process_array(
+            &mut self,
+            array: &ad_core_rs::ndarray::NDArray,
+            _pool: &NDArrayPool,
+        ) -> ProcessResult {
             *self.last_id.lock() = array.unique_id;
             ProcessResult::empty()
         }
-        fn plugin_type(&self) -> &str { "Tracking" }
+        fn plugin_type(&self) -> &str {
+            "Tracking"
+        }
     }
 
     let last_id = Arc::new(parking_lot::Mutex::new(-1i32));
-    let proc = TrackingProcessor { last_id: last_id.clone() };
+    let proc = TrackingProcessor {
+        last_id: last_id.clone(),
+    };
 
-    let (handle, _jh) = create_plugin_runtime(
-        "STATS1", proc, pool, 10, "SIM1", wiring.clone(),
-    );
+    let (handle, _jh) = create_plugin_runtime("STATS1", proc, pool, 10, "SIM1", wiring.clone());
 
     // Wire STATS1 → SIM1
     wiring.rewire(handle.array_sender(), "", "SIM1").unwrap();
 
     // Enable callbacks
-    handle.port_runtime().port_handle()
-        .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+    handle
+        .port_runtime()
+        .port_handle()
+        .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Send array from SIM1
@@ -142,14 +176,23 @@ fn test_rewire_ndarray_port_at_runtime() {
     arr.unique_id = 100;
     sim_output.lock().publish(Arc::new(arr));
     std::thread::sleep(std::time::Duration::from_millis(50));
-    assert_eq!(*last_id.lock(), 100, "STATS1 should receive array from SIM1");
+    assert_eq!(
+        *last_id.lock(),
+        100,
+        "STATS1 should receive array from SIM1"
+    );
 
     // Now rewire STATS1 from SIM1 → ROI1 via OctetWrite
-    handle.port_runtime().port_handle()
+    handle
+        .port_runtime()
+        .port_handle()
         .submit_blocking(
-            RequestOp::OctetWrite { data: b"ROI1".to_vec() },
+            RequestOp::OctetWrite {
+                data: b"ROI1".to_vec(),
+            },
             AsynUser::new(handle.plugin_params.nd_array_port),
-        ).unwrap();
+        )
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // Send array from SIM1 — should NOT reach STATS1 anymore
@@ -157,23 +200,31 @@ fn test_rewire_ndarray_port_at_runtime() {
     arr2.unique_id = 200;
     sim_output.lock().publish(Arc::new(arr2));
     std::thread::sleep(std::time::Duration::from_millis(50));
-    assert_eq!(*last_id.lock(), 100, "STATS1 should no longer receive from SIM1 after rewire");
+    assert_eq!(
+        *last_id.lock(),
+        100,
+        "STATS1 should no longer receive from SIM1 after rewire"
+    );
 
     // Send array from ROI1 — should reach STATS1
     let mut arr3 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr3.unique_id = 300;
     roi_output.lock().publish(Arc::new(arr3));
     std::thread::sleep(std::time::Duration::from_millis(50));
-    assert_eq!(*last_id.lock(), 300, "STATS1 should receive from ROI1 after rewire");
+    assert_eq!(
+        *last_id.lock(),
+        300,
+        "STATS1 should receive from ROI1 after rewire"
+    );
 }
 
 #[test]
 fn test_rewire_through_real_roi_plugin() {
     use ad_core_rs::plugin::channel::NDArrayOutput;
-    use ad_core_rs::plugin::runtime::{create_plugin_runtime, ProcessResult};
+    use ad_core_rs::plugin::runtime::{ProcessResult, create_plugin_runtime};
+    use ad_plugins_rs::roi::{ROIConfig, ROIDimConfig, ROIProcessor};
     use asyn_rs::request::RequestOp;
     use asyn_rs::user::AsynUser;
-    use ad_plugins_rs::roi::{ROIConfig, ROIDimConfig, ROIProcessor};
 
     let pool = Arc::new(NDArrayPool::new(1_000_000));
     let wiring = Arc::new(WiringRegistry::new());
@@ -184,18 +235,41 @@ fn test_rewire_through_real_roi_plugin() {
 
     // Create ROI1 plugin wired to SIM1 (full-frame passthrough ROI)
     let mut roi_config = ROIConfig::default();
-    roi_config.dims[0] = ROIDimConfig { min: 0, size: 8, bin: 1, reverse: false, enable: true, auto_size: false };
-    roi_config.dims[1] = ROIDimConfig { min: 0, size: 8, bin: 1, reverse: false, enable: true, auto_size: false };
+    roi_config.dims[0] = ROIDimConfig {
+        min: 0,
+        size: 8,
+        bin: 1,
+        reverse: false,
+        enable: true,
+        auto_size: false,
+    };
+    roi_config.dims[1] = ROIDimConfig {
+        min: 0,
+        size: 8,
+        bin: 1,
+        reverse: false,
+        enable: true,
+        auto_size: false,
+    };
     let (roi_handle, _roi_jh) = create_plugin_runtime(
-        "ROI1", ROIProcessor::new(roi_config),
-        pool.clone(), 10, "SIM1", wiring.clone(),
+        "ROI1",
+        ROIProcessor::new(roi_config),
+        pool.clone(),
+        10,
+        "SIM1",
+        wiring.clone(),
     );
     wiring.register_output("ROI1", roi_handle.array_output().clone());
-    wiring.rewire(roi_handle.array_sender(), "", "SIM1").unwrap();
+    wiring
+        .rewire(roi_handle.array_sender(), "", "SIM1")
+        .unwrap();
 
     // Enable ROI1
-    roi_handle.port_runtime().port_handle()
-        .write_int32_blocking(roi_handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+    roi_handle
+        .port_runtime()
+        .port_handle()
+        .write_int32_blocking(roi_handle.plugin_params.enable_callbacks, 0, 1)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Create STATS1 (tracking processor) initially wired to SIM1
@@ -203,58 +277,84 @@ fn test_rewire_through_real_roi_plugin() {
         last_id: Arc<parking_lot::Mutex<i32>>,
     }
     impl NDPluginProcess for TrackingProcessor {
-        fn process_array(&mut self, array: &ad_core_rs::ndarray::NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        fn process_array(
+            &mut self,
+            array: &ad_core_rs::ndarray::NDArray,
+            _pool: &NDArrayPool,
+        ) -> ProcessResult {
             *self.last_id.lock() = array.unique_id;
             ProcessResult::empty()
         }
-        fn plugin_type(&self) -> &str { "Tracking" }
+        fn plugin_type(&self) -> &str {
+            "Tracking"
+        }
     }
 
     let last_id = Arc::new(parking_lot::Mutex::new(-1i32));
-    let proc = TrackingProcessor { last_id: last_id.clone() };
+    let proc = TrackingProcessor {
+        last_id: last_id.clone(),
+    };
 
-    let (stats_handle, _stats_jh) = create_plugin_runtime(
-        "STATS1", proc, pool.clone(), 10, "SIM1", wiring.clone(),
-    );
+    let (stats_handle, _stats_jh) =
+        create_plugin_runtime("STATS1", proc, pool.clone(), 10, "SIM1", wiring.clone());
     wiring.register_output("STATS1", stats_handle.array_output().clone());
-    wiring.rewire(stats_handle.array_sender(), "", "SIM1").unwrap();
+    wiring
+        .rewire(stats_handle.array_sender(), "", "SIM1")
+        .unwrap();
 
     // Enable STATS1
-    stats_handle.port_runtime().port_handle()
-        .write_int32_blocking(stats_handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+    stats_handle
+        .port_runtime()
+        .port_handle()
+        .write_int32_blocking(stats_handle.plugin_params.enable_callbacks, 0, 1)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Send array from SIM1 → both ROI1 and STATS1 receive directly
-    let mut arr = NDArray::new(vec![NDDimension::new(8), NDDimension::new(8)], NDDataType::UInt8);
+    let mut arr = NDArray::new(
+        vec![NDDimension::new(8), NDDimension::new(8)],
+        NDDataType::UInt8,
+    );
     arr.unique_id = 100;
     sim_output.lock().publish(Arc::new(arr));
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(*last_id.lock(), 100, "STATS1 gets array from SIM1");
 
     // Rewire STATS1 from SIM1 → ROI1
-    stats_handle.port_runtime().port_handle()
+    stats_handle
+        .port_runtime()
+        .port_handle()
         .submit_blocking(
-            RequestOp::OctetWrite { data: b"ROI1".to_vec() },
+            RequestOp::OctetWrite {
+                data: b"ROI1".to_vec(),
+            },
             AsynUser::new(stats_handle.plugin_params.nd_array_port),
-        ).unwrap();
+        )
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // Send another array from SIM1
     // ROI1 gets it from SIM1, processes it, publishes to its output
     // STATS1 (now wired to ROI1) should receive ROI1's output
-    let mut arr2 = NDArray::new(vec![NDDimension::new(8), NDDimension::new(8)], NDDataType::UInt8);
+    let mut arr2 = NDArray::new(
+        vec![NDDimension::new(8), NDDimension::new(8)],
+        NDDataType::UInt8,
+    );
     arr2.unique_id = 200;
     sim_output.lock().publish(Arc::new(arr2));
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let received_id = *last_id.lock();
-    assert!(received_id != 100, "STATS1 should receive new array through ROI1, got {received_id}");
+    assert!(
+        received_id != 100,
+        "STATS1 should receive new array through ROI1, got {received_id}"
+    );
 }
 
 #[test]
 fn test_roi_param_change_enables_output() {
     use ad_core_rs::plugin::channel::NDArrayOutput;
-    use ad_core_rs::plugin::runtime::{create_plugin_runtime, ProcessResult};
+    use ad_core_rs::plugin::runtime::{ProcessResult, create_plugin_runtime};
 
     let pool = Arc::new(NDArrayPool::new(1_000_000));
     let wiring = Arc::new(WiringRegistry::new());
@@ -264,57 +364,93 @@ fn test_roi_param_change_enables_output() {
     wiring.register_output("SIM1", sim_output.clone());
 
     // Create ROI1 with DEFAULT config (size=0) — like the real IOC
-    let (roi_handle, roi_params, _roi_jh) = ad_plugins_rs::roi::create_roi_runtime(
-        "ROI1", pool.clone(), 10, "SIM1", wiring.clone(),
-    );
+    let (roi_handle, roi_params, _roi_jh) =
+        ad_plugins_rs::roi::create_roi_runtime("ROI1", pool.clone(), 10, "SIM1", wiring.clone());
     wiring.register_output("ROI1", roi_handle.array_output().clone());
-    wiring.rewire(roi_handle.array_sender(), "", "SIM1").unwrap();
+    wiring
+        .rewire(roi_handle.array_sender(), "", "SIM1")
+        .unwrap();
 
     // Enable ROI1
-    roi_handle.port_runtime().port_handle()
-        .write_int32_blocking(roi_handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+    roi_handle
+        .port_runtime()
+        .port_handle()
+        .write_int32_blocking(roi_handle.plugin_params.enable_callbacks, 0, 1)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Tracking processor downstream of ROI1
-    struct TrackingProcessor { last_id: Arc<parking_lot::Mutex<i32>> }
+    struct TrackingProcessor {
+        last_id: Arc<parking_lot::Mutex<i32>>,
+    }
     impl NDPluginProcess for TrackingProcessor {
-        fn process_array(&mut self, array: &ad_core_rs::ndarray::NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        fn process_array(
+            &mut self,
+            array: &ad_core_rs::ndarray::NDArray,
+            _pool: &NDArrayPool,
+        ) -> ProcessResult {
             *self.last_id.lock() = array.unique_id;
             ProcessResult::empty()
         }
-        fn plugin_type(&self) -> &str { "Tracking" }
+        fn plugin_type(&self) -> &str {
+            "Tracking"
+        }
     }
 
     let last_id = Arc::new(parking_lot::Mutex::new(-1i32));
-    let proc = TrackingProcessor { last_id: last_id.clone() };
-    let (stats_handle, _jh) = create_plugin_runtime(
-        "STATS1", proc, pool.clone(), 10, "ROI1", wiring.clone(),
-    );
+    let proc = TrackingProcessor {
+        last_id: last_id.clone(),
+    };
+    let (stats_handle, _jh) =
+        create_plugin_runtime("STATS1", proc, pool.clone(), 10, "ROI1", wiring.clone());
     wiring.register_output("STATS1", stats_handle.array_output().clone());
-    wiring.rewire(stats_handle.array_sender(), "", "ROI1").unwrap();
-    stats_handle.port_runtime().port_handle()
-        .write_int32_blocking(stats_handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+    wiring
+        .rewire(stats_handle.array_sender(), "", "ROI1")
+        .unwrap();
+    stats_handle
+        .port_runtime()
+        .port_handle()
+        .write_int32_blocking(stats_handle.plugin_params.enable_callbacks, 0, 1)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Send array — ROI1 has default size=0, should produce NO output
-    let mut arr = NDArray::new(vec![NDDimension::new(8), NDDimension::new(8)], NDDataType::UInt8);
+    let mut arr = NDArray::new(
+        vec![NDDimension::new(8), NDDimension::new(8)],
+        NDDataType::UInt8,
+    );
     arr.unique_id = 100;
     sim_output.lock().publish(Arc::new(arr));
     std::thread::sleep(std::time::Duration::from_millis(100));
-    assert_eq!(*last_id.lock(), -1, "STATS1 should NOT receive with ROI size=0");
+    assert_eq!(
+        *last_id.lock(),
+        -1,
+        "STATS1 should NOT receive with ROI size=0"
+    );
 
     // Now set ROI size via param write (like PINI or user).
     let roi_ph = roi_handle.port_runtime().port_handle();
-    roi_ph.write_int32_blocking(roi_params.dims[0].size, 0, 8).unwrap();
-    roi_ph.write_int32_blocking(roi_params.dims[1].size, 0, 8).unwrap();
+    roi_ph
+        .write_int32_blocking(roi_params.dims[0].size, 0, 8)
+        .unwrap();
+    roi_ph
+        .write_int32_blocking(roi_params.dims[1].size, 0, 8)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Send another array — now ROI1 has size=8x8, should produce output
-    let mut arr2 = NDArray::new(vec![NDDimension::new(8), NDDimension::new(8)], NDDataType::UInt8);
+    let mut arr2 = NDArray::new(
+        vec![NDDimension::new(8), NDDimension::new(8)],
+        NDDataType::UInt8,
+    );
     arr2.unique_id = 200;
     sim_output.lock().publish(Arc::new(arr2));
     std::thread::sleep(std::time::Duration::from_millis(200));
-    assert_eq!(*last_id.lock(), 200, "STATS1 should receive after ROI size set to 8x8");
+    assert_eq!(
+        *last_id.lock(),
+        200,
+        "STATS1 should receive after ROI size set to 8x8"
+    );
 }
 
 // --- Phase 5: New integration tests ---
@@ -342,8 +478,22 @@ fn test_roi_then_stats_chain() {
 
     // ROI: extract 4x4 region from (2,2)
     let mut roi_config = ROIConfig::default();
-    roi_config.dims[0] = ROIDimConfig { min: 2, size: 4, bin: 1, reverse: false, enable: true, auto_size: false };
-    roi_config.dims[1] = ROIDimConfig { min: 2, size: 4, bin: 1, reverse: false, enable: true, auto_size: false };
+    roi_config.dims[0] = ROIDimConfig {
+        min: 2,
+        size: 4,
+        bin: 1,
+        reverse: false,
+        enable: true,
+        auto_size: false,
+    };
+    roi_config.dims[1] = ROIDimConfig {
+        min: 2,
+        size: 4,
+        bin: 1,
+        reverse: false,
+        enable: true,
+        auto_size: false,
+    };
 
     let mut roi_proc = ROIProcessor::new(roi_config);
     let roi_result = roi_proc.process_array(&arr, &pool);
@@ -365,9 +515,9 @@ fn test_roi_then_stats_chain() {
 
 #[test]
 fn test_process_then_file_tiff_pipeline() {
-    use ad_plugins_rs::process::{ProcessConfig, ProcessProcessor};
-    use ad_plugins_rs::file_tiff::TiffFileProcessor;
     use ad_core_rs::plugin::file_base::NDFileMode;
+    use ad_plugins_rs::file_tiff::TiffFileProcessor;
+    use ad_plugins_rs::process::{ProcessConfig, ProcessProcessor};
 
     let pool = NDArrayPool::new(1_000_000);
     let arr = make_2d_u8(8, 8);
@@ -393,7 +543,9 @@ fn test_process_then_file_tiff_pipeline() {
     use ad_core_rs::plugin::file_base::NDFileWriter;
     use ad_plugins_rs::file_tiff::TiffWriter;
     let mut writer = TiffWriter::new();
-    writer.open_file(&path, NDFileMode::Single, &proc_result.output_arrays[0]).unwrap();
+    writer
+        .open_file(&path, NDFileMode::Single, &proc_result.output_arrays[0])
+        .unwrap();
     writer.write_file(&proc_result.output_arrays[0]).unwrap();
     writer.close_file().unwrap();
 
@@ -417,13 +569,16 @@ fn test_circular_buff_trigger_flow() {
 
     // Fill pre-buffer
     let arr1 = make_2d_u8(4, 4);
-    let mut arr1c = arr1.clone(); arr1c.unique_id = 1;
+    let mut arr1c = arr1.clone();
+    arr1c.unique_id = 1;
     proc.process_array(&arr1c, &pool);
 
-    let mut arr2 = arr1.clone(); arr2.unique_id = 2;
+    let mut arr2 = arr1.clone();
+    arr2.unique_id = 2;
     proc.process_array(&arr2, &pool);
 
-    let mut arr3 = arr1.clone(); arr3.unique_id = 3;
+    let mut arr3 = arr1.clone();
+    arr3.unique_id = 3;
     proc.process_array(&arr3, &pool);
 
     // Trigger
@@ -431,7 +586,8 @@ fn test_circular_buff_trigger_flow() {
     assert!(proc.buffer().is_triggered());
 
     // Post-trigger frame
-    let mut arr4 = arr1.clone(); arr4.unique_id = 4;
+    let mut arr4 = arr1.clone();
+    arr4.unique_id = 4;
     let result = proc.process_array(&arr4, &pool);
 
     // Should have captured: 2 pre + 1 post = 3 frames
@@ -484,7 +640,7 @@ fn test_attribute_plugin_value_extraction() {
 
 #[test]
 fn test_pos_plugin_position_attachment() {
-    use ad_plugins_rs::pos_plugin::{PosPluginProcessor, PosMode};
+    use ad_plugins_rs::pos_plugin::{PosMode, PosPluginProcessor};
 
     let pool = NDArrayPool::new(1_000_000);
     let mut proc = PosPluginProcessor::new(PosMode::Discard);
@@ -502,9 +658,21 @@ fn test_pos_plugin_position_attachment() {
     assert_eq!(result.output_arrays.len(), 1);
 
     let out = &result.output_arrays[0];
-    let mx = out.attributes.get("MotorX").unwrap().value.as_f64().unwrap();
+    let mx = out
+        .attributes
+        .get("MotorX")
+        .unwrap()
+        .value
+        .as_f64()
+        .unwrap();
     assert!((mx - 42.5).abs() < 1e-10);
-    let my = out.attributes.get("MotorY").unwrap().value.as_f64().unwrap();
+    let my = out
+        .attributes
+        .get("MotorY")
+        .unwrap()
+        .value
+        .as_f64()
+        .unwrap();
     assert!((my - 13.7).abs() < 1e-10);
 }
 
@@ -513,15 +681,18 @@ fn test_process_and_publish_writes_array_size_params() {
     // Verify that process_and_publish writes ArraySizeX/Y/Z params correctly.
     let pool = Arc::new(NDArrayPool::new(1_000_000));
     let wiring = Arc::new(WiringRegistry::new());
-    let (image_handle, image_data, _jh) = create_std_arrays_runtime("IMG_SZ", pool.clone(), "DRV1", wiring);
+    let (image_handle, image_data, _jh) =
+        create_std_arrays_runtime("IMG_SZ", pool.clone(), "DRV1", wiring);
 
     // Enable callbacks
     let ph = image_handle.port_runtime().port_handle();
-    ph.write_int32_blocking(image_handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+    ph.write_int32_blocking(image_handle.plugin_params.enable_callbacks, 0, 1)
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Connect and send a 64x48 array
-    let mut driver = ad_core_rs::driver::ad_driver::ADDriverBase::new("DRV1", 64, 48, 1_000_000).unwrap();
+    let mut driver =
+        ad_core_rs::driver::ad_driver::ADDriverBase::new("DRV1", 64, 48, 1_000_000).unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());
 
     let mut arr = NDArray::new(
@@ -538,12 +709,24 @@ fn test_process_and_publish_writes_array_size_params() {
     assert!(latest.is_some(), "StdArrays should have latest data");
 
     // Read back params from the plugin's port handle
-    let size_x = ph.read_int32_blocking(image_handle.ndarray_params.array_size_x, 0).unwrap();
-    let size_y = ph.read_int32_blocking(image_handle.ndarray_params.array_size_y, 0).unwrap();
-    let size_z = ph.read_int32_blocking(image_handle.ndarray_params.array_size_z, 0).unwrap();
-    let array_size = ph.read_int32_blocking(image_handle.ndarray_params.array_size, 0).unwrap();
-    let counter = ph.read_int32_blocking(image_handle.ndarray_params.array_counter, 0).unwrap();
-    let unique_id = ph.read_int32_blocking(image_handle.ndarray_params.unique_id, 0).unwrap();
+    let size_x = ph
+        .read_int32_blocking(image_handle.ndarray_params.array_size_x, 0)
+        .unwrap();
+    let size_y = ph
+        .read_int32_blocking(image_handle.ndarray_params.array_size_y, 0)
+        .unwrap();
+    let size_z = ph
+        .read_int32_blocking(image_handle.ndarray_params.array_size_z, 0)
+        .unwrap();
+    let array_size = ph
+        .read_int32_blocking(image_handle.ndarray_params.array_size, 0)
+        .unwrap();
+    let counter = ph
+        .read_int32_blocking(image_handle.ndarray_params.array_counter, 0)
+        .unwrap();
+    let unique_id = ph
+        .read_int32_blocking(image_handle.ndarray_params.unique_id, 0)
+        .unwrap();
 
     assert_eq!(size_x, 64, "ArraySizeX should be 64");
     assert_eq!(size_y, 48, "ArraySizeY should be 48");

@@ -1,6 +1,6 @@
 #![allow(clippy::approx_constant)]
 
-use epics_base_rs::calc::{acalc, ArrayInputs, ArrayStackValue, CalcError};
+use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, CalcError, acalc};
 
 fn eval_arr(expr: &str, array_size: usize) -> ArrayStackValue {
     let mut inputs = ArrayInputs::new(array_size);
@@ -278,17 +278,24 @@ fn test_fwhm_gaussian() {
     let n = 101;
     let center = 50.0;
     let sigma = 10.0;
-    let data: Vec<f64> = (0..n).map(|i| {
-        let x = i as f64;
-        (-0.5 * ((x - center) / sigma).powi(2)).exp()
-    }).collect();
+    let data: Vec<f64> = (0..n)
+        .map(|i| {
+            let x = i as f64;
+            (-0.5 * ((x - center) / sigma).powi(2)).exp()
+        })
+        .collect();
     let mut inputs = ArrayInputs::new(n);
     inputs.arrays[0] = data;
     let result = eval_arr_with("FWHM(AA)", &mut inputs);
     match result {
         ArrayStackValue::Double(v) => {
             let expected = 2.3548 * sigma;
-            assert!((v - expected).abs() < 0.5, "FWHM={}, expected~{}", v, expected);
+            assert!(
+                (v - expected).abs() < 0.5,
+                "FWHM={}, expected~{}",
+                v,
+                expected
+            );
         }
         _ => panic!("expected Double"),
     }
@@ -299,7 +306,10 @@ fn test_fwhm_gaussian() {
 #[test]
 fn test_ix() {
     let result = eval_arr("IX", 5);
-    assert_eq!(result, ArrayStackValue::Array(vec![0.0, 1.0, 2.0, 3.0, 4.0]));
+    assert_eq!(
+        result,
+        ArrayStackValue::Array(vec![0.0, 1.0, 2.0, 3.0, 4.0])
+    );
 }
 
 #[test]

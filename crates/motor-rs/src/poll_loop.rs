@@ -61,7 +61,10 @@ impl MotorPollLoop {
         {
             match self.device_state.lock() {
                 Ok(mut ds) => {
-                    ds.latest_status = Some(StampedStatus { seq: self.status_seq, status });
+                    ds.latest_status = Some(StampedStatus {
+                        seq: self.status_seq,
+                        status,
+                    });
                 }
                 Err(e) => {
                     tracing::error!("device state lock poisoned in poll_and_notify: {e}");
@@ -128,7 +131,9 @@ impl MotorPollLoop {
                     Some(PollCommand::ScheduleDelay(delay_id, dur)) => {
                         tokio::time::sleep(dur).await;
                         match self.device_state.lock() {
-                            Ok(mut ds) => { ds.expired_delay_id = Some(delay_id); }
+                            Ok(mut ds) => {
+                                ds.expired_delay_id = Some(delay_id);
+                            }
                             Err(e) => {
                                 tracing::error!("device state lock poisoned in delay expiry: {e}");
                                 continue;

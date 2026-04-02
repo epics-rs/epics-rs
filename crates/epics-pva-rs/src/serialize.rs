@@ -20,7 +20,9 @@ pub fn write_size(buf: &mut Vec<u8>, size: i32, big_endian: bool) {
 
 pub fn read_size(buf: &[u8], pos: &mut usize, big_endian: bool) -> PvaResult<i32> {
     if *pos >= buf.len() {
-        return Err(PvaError::Protocol("unexpected end of data reading size".into()));
+        return Err(PvaError::Protocol(
+            "unexpected end of data reading size".into(),
+        ));
     }
     let b = buf[*pos];
     *pos += 1;
@@ -28,7 +30,9 @@ pub fn read_size(buf: &[u8], pos: &mut usize, big_endian: bool) -> PvaResult<i32
         0xFF => Ok(-1), // null
         0xFE => {
             if *pos + 4 > buf.len() {
-                return Err(PvaError::Protocol("unexpected end of data reading extended size".into()));
+                return Err(PvaError::Protocol(
+                    "unexpected end of data reading extended size".into(),
+                ));
             }
             let val = if big_endian {
                 u32::from_be_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]])
@@ -175,13 +179,25 @@ pub fn read_i64(buf: &[u8], pos: &mut usize, big_endian: bool) -> PvaResult<i64>
     }
     let val = if big_endian {
         i64::from_be_bytes([
-            buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3],
-            buf[*pos + 4], buf[*pos + 5], buf[*pos + 6], buf[*pos + 7],
+            buf[*pos],
+            buf[*pos + 1],
+            buf[*pos + 2],
+            buf[*pos + 3],
+            buf[*pos + 4],
+            buf[*pos + 5],
+            buf[*pos + 6],
+            buf[*pos + 7],
         ])
     } else {
         i64::from_le_bytes([
-            buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3],
-            buf[*pos + 4], buf[*pos + 5], buf[*pos + 6], buf[*pos + 7],
+            buf[*pos],
+            buf[*pos + 1],
+            buf[*pos + 2],
+            buf[*pos + 3],
+            buf[*pos + 4],
+            buf[*pos + 5],
+            buf[*pos + 6],
+            buf[*pos + 7],
         ])
     };
     *pos += 8;
@@ -194,13 +210,25 @@ pub fn read_u64(buf: &[u8], pos: &mut usize, big_endian: bool) -> PvaResult<u64>
     }
     let val = if big_endian {
         u64::from_be_bytes([
-            buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3],
-            buf[*pos + 4], buf[*pos + 5], buf[*pos + 6], buf[*pos + 7],
+            buf[*pos],
+            buf[*pos + 1],
+            buf[*pos + 2],
+            buf[*pos + 3],
+            buf[*pos + 4],
+            buf[*pos + 5],
+            buf[*pos + 6],
+            buf[*pos + 7],
         ])
     } else {
         u64::from_le_bytes([
-            buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3],
-            buf[*pos + 4], buf[*pos + 5], buf[*pos + 6], buf[*pos + 7],
+            buf[*pos],
+            buf[*pos + 1],
+            buf[*pos + 2],
+            buf[*pos + 3],
+            buf[*pos + 4],
+            buf[*pos + 5],
+            buf[*pos + 6],
+            buf[*pos + 7],
         ])
     };
     *pos += 8;
@@ -513,7 +541,9 @@ pub fn read_status(buf: &[u8], pos: &mut usize, big_endian: bool) -> PvaResult<(
     if status_type == 0 {
         Ok(()) // OK with message
     } else {
-        Err(PvaError::Protocol(format!("server error (type={status_type}): {message}")))
+        Err(PvaError::Protocol(format!(
+            "server error (type={status_type}): {message}"
+        )))
     }
 }
 
@@ -673,14 +703,17 @@ mod tests {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
-                ("alarm".into(), FieldDesc::Structure {
-                    struct_id: "alarm_t".into(),
-                    fields: vec![
-                        ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                    ],
-                }),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
             ],
         };
         for be in [false, true] {

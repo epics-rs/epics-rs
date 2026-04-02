@@ -15,11 +15,11 @@ pub const DBR_TIME_DOUBLE: u16 = 20;
 #[repr(u16)]
 pub enum DbFieldType {
     String = 0,
-    Short = 1,  // aka Int16
+    Short = 1, // aka Int16
     Float = 2,
     Enum = 3,
-    Char = 4,   // aka UInt8
-    Long = 5,   // aka Int32
+    Char = 4, // aka UInt8
+    Long = 5, // aka Int32
     Double = 6,
 }
 
@@ -82,17 +82,19 @@ impl DbFieldType {
 pub fn dbr_buffer_size(dbr_type: u16, native_type: DbFieldType, count: usize) -> usize {
     let value_size = native_type.element_size() * count;
     let meta_size = match dbr_type / 7 {
-        0 => 0,                // Plain
-        1 => 4,                // STS: status(2) + severity(2)
-        2 => 12,               // TIME: status(2) + severity(2) + stamp(8)
-        3 => {                 // GR: varies by type
+        0 => 0,  // Plain
+        1 => 4,  // STS: status(2) + severity(2)
+        2 => 12, // TIME: status(2) + severity(2) + stamp(8)
+        3 => {
+            // GR: varies by type
             match native_type {
                 DbFieldType::String => 4,
                 DbFieldType::Enum => 4 + 16 * 26, // status + enum strings
-                _ => 4 + 8 + 16 + 8 * 6, // status + precision + units + 6 limits
+                _ => 4 + 8 + 16 + 8 * 6,          // status + precision + units + 6 limits
             }
         }
-        4 => {                 // CTRL: varies by type
+        4 => {
+            // CTRL: varies by type
             match native_type {
                 DbFieldType::String => 4,
                 DbFieldType::Enum => 4 + 16 * 26,

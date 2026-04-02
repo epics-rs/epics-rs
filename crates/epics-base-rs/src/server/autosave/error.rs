@@ -9,11 +9,23 @@ pub type AutosaveResult<T> = Result<T, AutosaveError>;
 #[derive(Debug)]
 pub enum AutosaveError {
     Io(std::io::Error),
-    RequestFile { path: String, message: String },
-    IncludeCycle { chain: Vec<String> },
+    RequestFile {
+        path: String,
+        message: String,
+    },
+    IncludeCycle {
+        chain: Vec<String>,
+    },
     IncludeDepthExceeded(usize),
-    UndefinedMacro { key: String, source: String, line: usize },
-    CorruptSaveFile { path: String, message: String },
+    UndefinedMacro {
+        key: String,
+        source: String,
+        line: usize,
+    },
+    CorruptSaveFile {
+        path: String,
+        message: String,
+    },
     PvNotFound(String),
     Ca(CaError),
 }

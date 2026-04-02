@@ -222,9 +222,15 @@ pub(crate) fn resolve_include_path(
     Err(CaError::DbParseError {
         line: 0,
         column: 0,
-        message: format!("include file not found: '{filename}' (searched: {}, {})",
+        message: format!(
+            "include file not found: '{filename}' (searched: {}, {})",
             current_dir.display(),
-            include_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")),
+            include_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     })
 }
 

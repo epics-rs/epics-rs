@@ -1,7 +1,7 @@
 //! Request types for the port actor.
 
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::SystemTime;
 
 use crate::error::AsynStatus;
@@ -9,17 +9,35 @@ use crate::error::AsynStatus;
 /// Operation the worker thread will dispatch to the port driver.
 #[derive(Debug, Clone)]
 pub enum RequestOp {
-    OctetWrite { data: Vec<u8> },
-    OctetRead { buf_size: usize },
-    OctetWriteRead { data: Vec<u8>, buf_size: usize },
-    Int32Write { value: i32 },
+    OctetWrite {
+        data: Vec<u8>,
+    },
+    OctetRead {
+        buf_size: usize,
+    },
+    OctetWriteRead {
+        data: Vec<u8>,
+        buf_size: usize,
+    },
+    Int32Write {
+        value: i32,
+    },
     Int32Read,
-    Int64Write { value: i64 },
+    Int64Write {
+        value: i64,
+    },
     Int64Read,
-    Float64Write { value: f64 },
+    Float64Write {
+        value: f64,
+    },
     Float64Read,
-    UInt32DigitalWrite { value: u32, mask: u32 },
-    UInt32DigitalRead { mask: u32 },
+    UInt32DigitalWrite {
+        value: u32,
+        mask: u32,
+    },
+    UInt32DigitalRead {
+        mask: u32,
+    },
     Flush,
     /// Connect to the port (bypass enabled/connected checks).
     Connect,
@@ -30,41 +48,76 @@ pub enum RequestOp {
     /// Unblock the port.
     UnblockProcess,
     /// Resolve a driver info string to a parameter reason index.
-    DrvUserCreate { drv_info: String },
+    DrvUserCreate {
+        drv_info: String,
+    },
     /// Read an enum value (index + string choices).
     EnumRead,
     /// Write an enum index.
-    EnumWrite { index: usize },
+    EnumWrite {
+        index: usize,
+    },
     /// Read an i32 array.
-    Int32ArrayRead { max_elements: usize },
+    Int32ArrayRead {
+        max_elements: usize,
+    },
     /// Write an i32 array.
-    Int32ArrayWrite { data: Vec<i32> },
+    Int32ArrayWrite {
+        data: Vec<i32>,
+    },
     /// Read an f64 array.
-    Float64ArrayRead { max_elements: usize },
+    Float64ArrayRead {
+        max_elements: usize,
+    },
     /// Write an f64 array.
-    Float64ArrayWrite { data: Vec<f64> },
+    Float64ArrayWrite {
+        data: Vec<f64>,
+    },
     /// Read an i8 array.
-    Int8ArrayRead { max_elements: usize },
+    Int8ArrayRead {
+        max_elements: usize,
+    },
     /// Write an i8 array.
-    Int8ArrayWrite { data: Vec<i8> },
+    Int8ArrayWrite {
+        data: Vec<i8>,
+    },
     /// Read an i16 array.
-    Int16ArrayRead { max_elements: usize },
+    Int16ArrayRead {
+        max_elements: usize,
+    },
     /// Write an i16 array.
-    Int16ArrayWrite { data: Vec<i16> },
+    Int16ArrayWrite {
+        data: Vec<i16>,
+    },
     /// Read an i64 array.
-    Int64ArrayRead { max_elements: usize },
+    Int64ArrayRead {
+        max_elements: usize,
+    },
     /// Write an i64 array.
-    Int64ArrayWrite { data: Vec<i64> },
+    Int64ArrayWrite {
+        data: Vec<i64>,
+    },
     /// Read an f32 array.
-    Float32ArrayRead { max_elements: usize },
+    Float32ArrayRead {
+        max_elements: usize,
+    },
     /// Write an f32 array.
-    Float32ArrayWrite { data: Vec<f32> },
+    Float32ArrayWrite {
+        data: Vec<f32>,
+    },
     /// Flush changed parameters as interrupt notifications (callParamCallbacks).
-    CallParamCallbacks { addr: i32 },
+    CallParamCallbacks {
+        addr: i32,
+    },
     /// Get a port/driver option by key.
-    GetOption { key: String },
+    GetOption {
+        key: String,
+    },
     /// Set a port/driver option by key.
-    SetOption { key: String, value: String },
+    SetOption {
+        key: String,
+        value: String,
+    },
 }
 
 /// Result returned by the worker after executing a request.
@@ -135,63 +188,111 @@ impl RequestResult {
     }
 
     pub fn octet_read(buf: Vec<u8>, nbytes: usize) -> Self {
-        Self { nbytes, data: Some(buf), ..Self::base() }
+        Self {
+            nbytes,
+            data: Some(buf),
+            ..Self::base()
+        }
     }
 
     pub fn int32_read(value: i32) -> Self {
-        Self { int_val: Some(value), ..Self::base() }
+        Self {
+            int_val: Some(value),
+            ..Self::base()
+        }
     }
 
     pub fn int64_read(value: i64) -> Self {
-        Self { int64_val: Some(value), ..Self::base() }
+        Self {
+            int64_val: Some(value),
+            ..Self::base()
+        }
     }
 
     pub fn float64_read(value: f64) -> Self {
-        Self { float_val: Some(value), ..Self::base() }
+        Self {
+            float_val: Some(value),
+            ..Self::base()
+        }
     }
 
     pub fn uint32_read(value: u32) -> Self {
-        Self { uint_val: Some(value), ..Self::base() }
+        Self {
+            uint_val: Some(value),
+            ..Self::base()
+        }
     }
 
     pub fn drv_user_create(reason: usize) -> Self {
-        Self { reason: Some(reason), ..Self::base() }
+        Self {
+            reason: Some(reason),
+            ..Self::base()
+        }
     }
 
     pub fn enum_read(index: usize) -> Self {
-        Self { enum_index: Some(index), ..Self::base() }
+        Self {
+            enum_index: Some(index),
+            ..Self::base()
+        }
     }
 
     pub fn int32_array_read(data: Vec<i32>) -> Self {
-        Self { int32_array: Some(data), ..Self::base() }
+        Self {
+            int32_array: Some(data),
+            ..Self::base()
+        }
     }
 
     pub fn float64_array_read(data: Vec<f64>) -> Self {
-        Self { float64_array: Some(data), ..Self::base() }
+        Self {
+            float64_array: Some(data),
+            ..Self::base()
+        }
     }
 
     pub fn int8_array_read(data: Vec<i8>) -> Self {
-        Self { int8_array: Some(data), ..Self::base() }
+        Self {
+            int8_array: Some(data),
+            ..Self::base()
+        }
     }
 
     pub fn int16_array_read(data: Vec<i16>) -> Self {
-        Self { int16_array: Some(data), ..Self::base() }
+        Self {
+            int16_array: Some(data),
+            ..Self::base()
+        }
     }
 
     pub fn int64_array_read(data: Vec<i64>) -> Self {
-        Self { int64_array: Some(data), ..Self::base() }
+        Self {
+            int64_array: Some(data),
+            ..Self::base()
+        }
     }
 
     pub fn float32_array_read(data: Vec<f32>) -> Self {
-        Self { float32_array: Some(data), ..Self::base() }
+        Self {
+            float32_array: Some(data),
+            ..Self::base()
+        }
     }
 
     pub fn option_read(value: String) -> Self {
-        Self { option_value: Some(value), ..Self::base() }
+        Self {
+            option_value: Some(value),
+            ..Self::base()
+        }
     }
 
     /// Attach alarm/timestamp metadata to this result.
-    pub fn with_alarm(mut self, alarm_status: u16, alarm_severity: u16, timestamp: Option<SystemTime>) -> Self {
+    pub fn with_alarm(
+        mut self,
+        alarm_status: u16,
+        alarm_severity: u16,
+        timestamp: Option<SystemTime>,
+    ) -> Self {
         self.alarm_status = alarm_status;
         self.alarm_severity = alarm_severity;
         self.timestamp = timestamp;

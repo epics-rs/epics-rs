@@ -1,19 +1,19 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::TcpListener;
 use epics_base_rs::runtime::sync::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::net::TcpListener;
+use tokio::net::tcp::OwnedWriteHalf;
 
-use epics_base_rs::error::CaResult;
 use crate::protocol::*;
-use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
-use epics_base_rs::server::database::{parse_pv_name, PvDatabase, PvEntry};
 use crate::server::monitor::spawn_monitor_sender;
+use epics_base_rs::error::CaResult;
+use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
+use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::pv::ProcessVariable;
 use epics_base_rs::server::record::RecordInstance;
-use epics_base_rs::types::{encode_dbr, native_type_for_dbr, DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, encode_dbr, native_type_for_dbr};
 
 #[derive(Clone)]
 enum ChannelTarget {
@@ -285,7 +285,11 @@ async fn dispatch_message(
                 let (dbr_type, element_count, target) = match entry {
                     PvEntry::Simple(pv) => {
                         let value = pv.get().await;
-                        (value.dbr_type(), value.count() as u32, ChannelTarget::SimplePv(pv))
+                        (
+                            value.dbr_type(),
+                            value.count() as u32,
+                            ChannelTarget::SimplePv(pv),
+                        )
                     }
                     PvEntry::Record(rec) => {
                         let instance = rec.read().await;
@@ -362,14 +366,45 @@ async fn dispatch_message(
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
                 None => {
-                    send_cmd_error(writer, CA_PROTO_READ_NOTIFY, requested_type, ECA_BADCHID, ioid).await?;
+                    send_cmd_error(
+                        writer,
+                        CA_PROTO_READ_NOTIFY,
+                        requested_type,
+                        ECA_BADCHID,
+                        ioid,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
 
+            // Process the record before reading to ensure the value is fresh.
+            // For I/O Intr input records, the interrupt → record VAL update is async,
+            // so a CA get immediately after a write may see stale data.
+            // Processing the record calls device support read() which fetches the
+            // current value from the port driver (direct dispatch for can_block=false).
+            if let ChannelTarget::RecordField { record, .. } = &entry.target {
+                let should_process = {
+                    let inst = record.read().await;
+                    inst.common.scan == epics_base_rs::server::record::ScanType::IoIntr
+                        && inst.device.is_some()
+                };
+                if should_process {
+                    let rec_name = record.read().await.name.clone();
+                    let _ = db.process_record(&rec_name).await;
+                }
+            }
+
             let snapshot = get_full_snapshot(&entry.target).await;
             let Some(mut snapshot) = snapshot else {
-                send_cmd_error(writer, CA_PROTO_READ_NOTIFY, requested_type, ECA_BADCHID, ioid).await?;
+                send_cmd_error(
+                    writer,
+                    CA_PROTO_READ_NOTIFY,
+                    requested_type,
+                    ECA_BADCHID,
+                    ioid,
+                )
+                .await?;
                 return Ok(());
             };
             // Respect client's requested element count (e.g. caget -# 10)
@@ -379,7 +414,14 @@ async fn dispatch_message(
             let data = match encode_dbr(requested_type, &snapshot) {
                 Ok(d) => d,
                 Err(_) => {
-                    send_cmd_error(writer, CA_PROTO_READ_NOTIFY, requested_type, ECA_BADTYPE, ioid).await?;
+                    send_cmd_error(
+                        writer,
+                        CA_PROTO_READ_NOTIFY,
+                        requested_type,
+                        ECA_BADTYPE,
+                        ioid,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
@@ -409,7 +451,14 @@ async fn dispatch_message(
                 Ok(t) => t,
                 Err(_) => {
                     if is_notify {
-                        send_cmd_error(writer, CA_PROTO_WRITE_NOTIFY, hdr.data_type, ECA_BADTYPE, ioid).await?;
+                        send_cmd_error(
+                            writer,
+                            CA_PROTO_WRITE_NOTIFY,
+                            hdr.data_type,
+                            ECA_BADTYPE,
+                            ioid,
+                        )
+                        .await?;
                     }
                     return Ok(());
                 }
@@ -419,14 +468,25 @@ async fn dispatch_message(
                 Some(e) => e,
                 None => {
                     if is_notify {
-                        send_cmd_error(writer, CA_PROTO_WRITE_NOTIFY, hdr.data_type, ECA_BADCHID, ioid).await?;
+                        send_cmd_error(
+                            writer,
+                            CA_PROTO_WRITE_NOTIFY,
+                            hdr.data_type,
+                            ECA_BADCHID,
+                            ioid,
+                        )
+                        .await?;
                     }
                     return Ok(());
                 }
             };
 
             // Check access level
-            let access = state.channel_access.get(&sid).copied().unwrap_or(AccessLevel::ReadWrite);
+            let access = state
+                .channel_access
+                .get(&sid)
+                .copied()
+                .unwrap_or(AccessLevel::ReadWrite);
             if access != AccessLevel::ReadWrite {
                 if is_notify {
                     let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
@@ -446,7 +506,14 @@ async fn dispatch_message(
                 Ok(v) => v,
                 Err(_) => {
                     if is_notify {
-                        send_cmd_error(writer, CA_PROTO_WRITE_NOTIFY, hdr.data_type, ECA_BADTYPE, ioid).await?;
+                        send_cmd_error(
+                            writer,
+                            CA_PROTO_WRITE_NOTIFY,
+                            hdr.data_type,
+                            ECA_BADTYPE,
+                            ioid,
+                        )
+                        .await?;
                     }
                     return Ok(());
                 }
@@ -518,7 +585,14 @@ async fn dispatch_message(
             let native_type = match native_type_for_dbr(requested_type) {
                 Ok(t) => t,
                 Err(_) => {
-                    send_cmd_error(writer, CA_PROTO_EVENT_ADD, requested_type, ECA_BADTYPE, sub_id).await?;
+                    send_cmd_error(
+                        writer,
+                        CA_PROTO_EVENT_ADD,
+                        requested_type,
+                        ECA_BADTYPE,
+                        sub_id,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
@@ -532,7 +606,14 @@ async fn dispatch_message(
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
                 None => {
-                    send_cmd_error(writer, CA_PROTO_EVENT_ADD, requested_type, ECA_BADCHID, sub_id).await?;
+                    send_cmd_error(
+                        writer,
+                        CA_PROTO_EVENT_ADD,
+                        requested_type,
+                        ECA_BADCHID,
+                        sub_id,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
@@ -544,12 +625,7 @@ async fn dispatch_message(
 
                         // Send initial value
                         let snap = pv.snapshot().await;
-                        send_monitor_snapshot(
-                            writer,
-                            sub_id,
-                            requested_type,
-                            &snap,
-                        ).await?;
+                        send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
 
                         let task = spawn_monitor_sender(
                             pv.clone(),
@@ -571,30 +647,22 @@ async fn dispatch_message(
                     }
                     ChannelTarget::RecordField { record, field } => {
                         let mut instance = record.write().await;
-                        let rx =
-                            instance.add_subscriber(field, sub_id, native_type, mask);
+                        let rx = instance.add_subscriber(field, sub_id, native_type, mask);
 
                         // Send initial value with full metadata
                         if let Some(snap) = instance.snapshot_for_field(field) {
-                            send_monitor_snapshot(
-                                writer,
-                                sub_id,
-                                requested_type,
-                                &snap,
-                            ).await?;
+                            send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
                         }
 
                         let writer_clone = writer.clone();
                         let task = epics_base_rs::runtime::task::spawn(async move {
                             let mut rx = rx;
                             while let Some(event) = rx.recv().await {
-                                let payload_bytes = match encode_dbr(
-                                    requested_type,
-                                    &event.snapshot,
-                                ) {
-                                    Ok(bytes) => bytes,
-                                    Err(_) => break,
-                                };
+                                let payload_bytes =
+                                    match encode_dbr(requested_type, &event.snapshot) {
+                                        Ok(bytes) => bytes,
+                                        Err(_) => break,
+                                    };
                                 let element_count = event.snapshot.value.count() as u32;
                                 let mut padded = payload_bytes;
                                 padded.resize(align8(padded.len()), 0);
@@ -634,7 +702,6 @@ async fn dispatch_message(
                 }
             }
         }
-
 
         CA_PROTO_EVENT_CANCEL => {
             let sub_id = hdr.available;

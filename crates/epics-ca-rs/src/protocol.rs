@@ -18,11 +18,11 @@ pub const CA_PROTO_REPEATER_REGISTER: u16 = 24;
 pub const CA_PROTO_CLEAR_CHANNEL: u16 = 12;
 pub const CA_PROTO_RSRV_IS_UP: u16 = 13;
 pub const CA_PROTO_SERVER_DISCONN: u16 = 27;
-pub const CA_PROTO_READ: u16 = 3;          // deprecated but exists in spec
-pub const CA_PROTO_WRITE: u16 = 4;         // fire-and-forget write
+pub const CA_PROTO_READ: u16 = 3; // deprecated but exists in spec
+pub const CA_PROTO_WRITE: u16 = 4; // fire-and-forget write
 pub const CA_PROTO_EVENTS_OFF: u16 = 8;
 pub const CA_PROTO_EVENTS_ON: u16 = 9;
-pub const CA_PROTO_READ_SYNC: u16 = 10;   // legacy echo (used by older clients)
+pub const CA_PROTO_READ_SYNC: u16 = 10; // legacy echo (used by older clients)
 pub const CA_PROTO_ERROR: u16 = 11;
 pub const CA_PROTO_CREATE_CH_FAIL: u16 = 26;
 
@@ -51,15 +51,15 @@ pub const fn defmsg(sev: u32, num: u32) -> u32 {
     ((num << 3) & 0x0000FFF8) | (sev & 0x00000007)
 }
 
-pub const ECA_NORMAL: u32 = defmsg(CA_K_SUCCESS, 0);       // 1
-pub const ECA_BADTYPE: u32 = defmsg(CA_K_ERROR, 14);       // 114 (0x72)
-pub const ECA_PUTFAIL: u32 = defmsg(CA_K_WARNING, 20);     // 160 (0xA0)
-pub const ECA_TIMEOUT: u32 = defmsg(CA_K_WARNING, 10);     // 80 (0x50)
-pub const ECA_NOWTACCESS: u32 = defmsg(CA_K_WARNING, 47);  // 376 (0x178)
-pub const ECA_BADCHID: u32 = defmsg(CA_K_ERROR, 15);       // 122 (0x7A)
-pub const ECA_GETFAIL: u32 = defmsg(CA_K_WARNING, 19);     // 152 (0x98)
-pub const ECA_BADCOUNT: u32 = defmsg(CA_K_ERROR, 21);      // 170 (0xAA)
-pub const ECA_INTERNAL: u32 = defmsg(CA_K_ERROR, 11);      // 90 (0x5A)
+pub const ECA_NORMAL: u32 = defmsg(CA_K_SUCCESS, 0); // 1
+pub const ECA_BADTYPE: u32 = defmsg(CA_K_ERROR, 14); // 114 (0x72)
+pub const ECA_PUTFAIL: u32 = defmsg(CA_K_WARNING, 20); // 160 (0xA0)
+pub const ECA_TIMEOUT: u32 = defmsg(CA_K_WARNING, 10); // 80 (0x50)
+pub const ECA_NOWTACCESS: u32 = defmsg(CA_K_WARNING, 47); // 376 (0x178)
+pub const ECA_BADCHID: u32 = defmsg(CA_K_ERROR, 15); // 122 (0x7A)
+pub const ECA_GETFAIL: u32 = defmsg(CA_K_WARNING, 19); // 152 (0x98)
+pub const ECA_BADCOUNT: u32 = defmsg(CA_K_ERROR, 21); // 170 (0xAA)
+pub const ECA_INTERNAL: u32 = defmsg(CA_K_ERROR, 11); // 90 (0x5A)
 
 /// Maximum payload size for DoS prevention (16 MB).
 pub const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
@@ -195,9 +195,7 @@ impl CaHeader {
 
         if hdr.postsize == 0xFFFF && hdr.count == 0 {
             if buf.len() < 24 {
-                return Err(CaError::Protocol(
-                    "extended header incomplete".into(),
-                ));
+                return Err(CaError::Protocol("extended header incomplete".into()));
             }
             let ext_post = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
             let ext_count = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
@@ -334,8 +332,10 @@ mod tests {
     fn test_extended_payload_too_large() {
         let mut buf = vec![0u8; 24];
         // Set postsize=0xFFFF, count=0
-        buf[2] = 0xFF; buf[3] = 0xFF;
-        buf[6] = 0; buf[7] = 0;
+        buf[2] = 0xFF;
+        buf[3] = 0xFF;
+        buf[6] = 0;
+        buf[7] = 0;
         // Set extended_postsize to > MAX_PAYLOAD_SIZE
         let big: u32 = (MAX_PAYLOAD_SIZE + 1) as u32;
         buf[16..20].copy_from_slice(&big.to_be_bytes());

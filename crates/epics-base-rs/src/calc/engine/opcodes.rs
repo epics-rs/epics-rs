@@ -2,7 +2,7 @@
 pub enum CoreOp {
     // Operands
     PushConst(f64),
-    PushVar(u8),      // 0..15 = A..P
+    PushVar(u8),       // 0..15 = A..P
     PushDoubleVar(u8), // 0..11 = AA..LL (string vars, fetched as numeric)
 
     // Arithmetic
@@ -59,20 +59,20 @@ pub enum CoreOp {
     Ceil,
     Floor,
     Nint,
-    IsNan(u8),   // vararg: number of args
+    IsNan(u8), // vararg: number of args
     IsInf,
-    Finite(u8),  // vararg: number of args
+    Finite(u8), // vararg: number of args
 
     // Functions (2 arg)
     Atan2,
 
     // Vararg functions
-    Max(u8),     // number of args
-    Min(u8),     // number of args
+    Max(u8), // number of args
+    Min(u8), // number of args
 
     // Binary operators (2 arg, infix)
-    MaxVal,      // >?
-    MinVal,      // <?
+    MaxVal, // >?
+    MinVal, // <?
 
     // Constants
     Pi,
@@ -95,12 +95,12 @@ pub enum CoreOp {
 pub enum StringOp {
     // Phase 2A: Core
     PushString(String),
-    PushStringVar(u8),      // AA..LL string push
-    StoreStringVar(u8),     // AA..LL string store
-    ToString,               // STR: number→string
-    ToDouble,               // DBL: string→number
-    Len,                    // string length
-    Byte,                   // first char ASCII value
+    PushStringVar(u8),  // AA..LL string push
+    StoreStringVar(u8), // AA..LL string store
+    ToString,           // STR: number→string
+    ToDouble,           // DBL: string→number
+    Len,                // string length
+    Byte,               // first char ASCII value
     // Phase 2B: Advanced
     TrEsc,
     Esc,
@@ -109,27 +109,27 @@ pub enum StringOp {
     BinRead,
     BinWrite,
     Crc16,
-    Crc16Append,            // MODBUS
+    Crc16Append, // MODBUS
     Lrc,
-    LrcAppend,              // AMODBUS
+    LrcAppend, // AMODBUS
     Xor8,
-    Xor8Append,             // ADD_XOR8
-    Subrange,               // [i:j]
-    Replace,                // {find,replace}
-    SubLast,                // |- last substring removal
+    Xor8Append, // ADD_XOR8
+    Subrange,   // [i:j]
+    Replace,    // {find,replace}
+    SubLast,    // |- last substring removal
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlOp {
-    Until(usize),        // jump target = UntilEnd pc
-    UntilEnd(usize),     // jump target = Until pc
+    Until(usize),    // jump target = UntilEnd pc
+    UntilEnd(usize), // jump target = Until pc
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArrayOp {
-    ConstIndex,          // IX: [0,1,...,n-1]
-    ToArray,             // ARR: scalar→array
-    ToDouble,            // array→scalar (first element, empty=0.0)
+    ConstIndex, // IX: [0,1,...,n-1]
+    ToArray,    // ARR: scalar→array
+    ToDouble,   // array→scalar (first element, empty=0.0)
     Average,
     StdDev,
     Fwhm,

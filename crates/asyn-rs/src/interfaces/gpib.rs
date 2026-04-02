@@ -57,19 +57,10 @@ pub struct SrqStatus {
 /// Provides IEEE-488 bus control operations for GPIB-capable drivers.
 pub trait AsynGpib: Send + Sync {
     /// Send an addressed GPIB command.
-    fn addressed_cmd(
-        &mut self,
-        user: &AsynUser,
-        cmd: GpibCommand,
-        addr: i32,
-    ) -> AsynResult<()>;
+    fn addressed_cmd(&mut self, user: &AsynUser, cmd: GpibCommand, addr: i32) -> AsynResult<()>;
 
     /// Send a universal GPIB command.
-    fn universal_cmd(
-        &mut self,
-        user: &AsynUser,
-        cmd: GpibUniversalCommand,
-    ) -> AsynResult<()>;
+    fn universal_cmd(&mut self, user: &AsynUser, cmd: GpibUniversalCommand) -> AsynResult<()>;
 
     /// Assert Interface Clear (IFC).
     fn ifc(&mut self, user: &AsynUser) -> AsynResult<()>;

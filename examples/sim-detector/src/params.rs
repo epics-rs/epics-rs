@@ -69,7 +69,8 @@ impl SimDetectorParams {
             peak_num_y: base.create_param("SIM_PEAK_NUM_Y", ParamType::Int32)?,
             peak_step_x: base.create_param("SIM_PEAK_STEP_X", ParamType::Int32)?,
             peak_step_y: base.create_param("SIM_PEAK_STEP_Y", ParamType::Int32)?,
-            peak_height_variation: base.create_param("SIM_PEAK_HEIGHT_VARIATION", ParamType::Float64)?,
+            peak_height_variation: base
+                .create_param("SIM_PEAK_HEIGHT_VARIATION", ParamType::Float64)?,
             x_sine_operation: base.create_param("SIM_XSINE_OPERATION", ParamType::Int32)?,
             x_sine1_amplitude: base.create_param("SIM_XSINE1_AMPLITUDE", ParamType::Float64)?,
             x_sine1_frequency: base.create_param("SIM_XSINE1_FREQUENCY", ParamType::Float64)?,
@@ -189,7 +190,10 @@ impl SimConfigSnapshot {
             image_mode: ImageMode::from_i32(handle.read_int32_blocking(ad.image_mode, 0)?),
             num_images: handle.read_int32_blocking(ad.num_images, 0)?,
             array_callbacks: handle.read_int32_blocking(ad.base.array_callbacks, 0)? != 0,
-            wait_for_plugins: handle.read_int32_blocking(ad.base.wait_for_plugins, 0).unwrap_or(0) != 0,
+            wait_for_plugins: handle
+                .read_int32_blocking(ad.base.wait_for_plugins, 0)
+                .unwrap_or(0)
+                != 0,
         })
     }
 
@@ -267,7 +271,10 @@ impl SimConfigSnapshot {
             image_mode: ImageMode::from_i32(base.get_int32_param(ad.image_mode, 0)?),
             num_images: base.get_int32_param(ad.num_images, 0)?,
             array_callbacks: base.get_int32_param(ad.base.array_callbacks, 0)? != 0,
-            wait_for_plugins: base.get_int32_param(ad.base.wait_for_plugins, 0).unwrap_or(0) != 0,
+            wait_for_plugins: base
+                .get_int32_param(ad.base.wait_for_plugins, 0)
+                .unwrap_or(0)
+                != 0,
         })
     }
 }

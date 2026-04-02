@@ -5,10 +5,10 @@
     clippy::type_complexity
 )]
 
-pub mod records;
 pub mod device_support;
+pub mod records;
 
-pub use records::scaler::{ScalerRecord, MAX_SCALER_CHANNELS};
+pub use records::scaler::{MAX_SCALER_CHANNELS, ScalerRecord};
 
 /// Path to the bundled database template directory.
 pub const SCALER_DB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db");

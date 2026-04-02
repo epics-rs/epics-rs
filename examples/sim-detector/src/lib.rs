@@ -8,11 +8,11 @@
     clippy::too_many_arguments
 )]
 
-pub mod types;
-pub mod params;
 pub mod compute;
 pub mod driver;
+pub mod params;
 pub mod task;
+pub mod types;
 
 #[cfg(feature = "ioc")]
 pub mod ioc_support;

@@ -57,16 +57,13 @@ impl PluginManager {
 
     /// Register a plugin. The port is registered in the global asyn port registry
     /// so the universal asyn device support factory can find it.
-    pub fn add_plugin(
-        &self,
-        _dtyp: &str,
-        handle: &PluginRuntimeHandle,
-    ) {
+    pub fn add_plugin(&self, _dtyp: &str, handle: &PluginRuntimeHandle) {
         let port_handle = handle.port_runtime().port_handle().clone();
         let port_name = port_handle.port_name().to_string();
 
         // Register this plugin's output in the wiring registry
-        self.wiring.register_output(&port_name, handle.array_output().clone());
+        self.wiring
+            .register_output(&port_name, handle.array_output().clone());
 
         self.plugin_handles.lock().push(handle.clone());
         asyn_rs::asyn_record::register_port(&port_name, port_handle, self.trace.clone());
@@ -75,11 +72,7 @@ impl PluginManager {
     /// Register a raw port (not a plugin runtime) for auxiliary ports like TimeSeries.
     ///
     /// The `PortRuntimeHandle` is stored to keep the actor thread alive.
-    pub fn add_port(
-        &self,
-        _dtyp: &str,
-        runtime: asyn_rs::runtime::port::PortRuntimeHandle,
-    ) {
+    pub fn add_port(&self, _dtyp: &str, runtime: asyn_rs::runtime::port::PortRuntimeHandle) {
         let port_handle = runtime.port_handle().clone();
         let port_name = port_handle.port_name().to_string();
         self.port_runtimes.lock().push(runtime);

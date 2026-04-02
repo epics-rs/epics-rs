@@ -47,7 +47,7 @@ pub struct EpidFastPvt {
     pub kd: f64,
     pub drvh: f64,
     pub drvl: f64,
-    pub val: f64,  // setpoint
+    pub val: f64, // setpoint
     pub fbon: bool,
     pub fmod: i16,
 
@@ -165,8 +165,7 @@ impl EpidFastPvt {
                     } else {
                         let e = cval - pcval;
                         let sign = if self.d > 0.0 { 1.0 } else { -1.0 };
-                        let sign = if (self.kp > 0.0 && e < 0.0) || (self.kp < 0.0 && e > 0.0)
-                        {
+                        let sign = if (self.kp > 0.0 && e < 0.0) || (self.kp < 0.0 && e > 0.0) {
                             -sign
                         } else {
                             sign

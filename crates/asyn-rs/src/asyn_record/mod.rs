@@ -1,5 +1,8 @@
 pub mod registry;
-pub use registry::{register_port, register_asyn_record_type, asyn_record_factory, get_port, PortEntry, PortRegistry};
+pub use registry::{
+    PortEntry, PortRegistry, asyn_record_factory, get_port, register_asyn_record_type,
+    register_port,
+};
 
 use std::sync::Arc;
 
@@ -8,7 +11,7 @@ use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::port_handle::PortHandle;
-use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceMask, TraceManager};
+use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -109,14 +112,14 @@ pub struct AsynRecord {
     // --- Address fields ---
     pub port: String,
     pub addr: i32,
-    pub pcnct: i32,      // Port Connect/Disconnect (menu: 0=Disconnect, 1=Connect)
+    pub pcnct: i32, // Port Connect/Disconnect (menu: 0=Disconnect, 1=Connect)
     pub drvinfo: String,
     pub reason: i32,
 
     // --- I/O control ---
-    pub tmod: i32,   // Transfer mode (menu asynTMOD)
-    pub tmot: f64,   // Timeout (sec)
-    pub iface: i32,  // Interface (menu asynINTERFACE)
+    pub tmod: i32,     // Transfer mode (menu asynTMOD)
+    pub tmot: f64,     // Timeout (sec)
+    pub iface: i32,    // Interface (menu asynINTERFACE)
     pub octetiv: i32,  // asynOctet is valid
     pub optioniv: i32, // asynOption is valid
     pub gpibiv: i32,   // asynGPIB is valid
@@ -131,7 +134,7 @@ pub struct AsynRecord {
     pub omax: i32,
     pub nowt: i32,
     pub nawt: i32,
-    pub ofmt: i32,    // Output format (menu asynFMT)
+    pub ofmt: i32, // Output format (menu asynFMT)
 
     // --- asynOctet input ---
     pub ainp: String,
@@ -141,8 +144,8 @@ pub struct AsynRecord {
     pub imax: i32,
     pub nrrd: i32,
     pub nord: i32,
-    pub ifmt: i32,    // Input format (menu asynFMT)
-    pub eomr: i32,    // EOM reason
+    pub ifmt: i32, // Input format (menu asynFMT)
+    pub eomr: i32, // EOM reason
 
     // --- Int32/UInt32/Float64 data ---
     pub i32inp: i32,
@@ -195,9 +198,9 @@ pub struct AsynRecord {
     pub tfil: String,
 
     // --- Connection management ---
-    pub auct: i32,   // Autoconnect (menu: 0=noAutoConnect, 1=autoConnect)
-    pub cnct: i32,   // Connect/Disconnect (menu: 0=Disconnect, 1=Connect)
-    pub enbl: i32,   // Enable/Disable (menu: 0=Disable, 1=Enable)
+    pub auct: i32, // Autoconnect (menu: 0=noAutoConnect, 1=autoConnect)
+    pub cnct: i32, // Connect/Disconnect (menu: 0=Disconnect, 1=Connect)
+    pub enbl: i32, // Enable/Disable (menu: 0=Disable, 1=Enable)
 
     // --- Misc ---
     pub val: i32,
@@ -298,92 +301,396 @@ impl Default for AsynRecord {
 
 static FIELD_LIST: &[FieldDesc] = &[
     // Address
-    FieldDesc { name: "PORT", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "ADDR", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "PCNCT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DRVINFO", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "REASON", dbf_type: DbFieldType::Long, read_only: false },
+    FieldDesc {
+        name: "PORT",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ADDR",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PCNCT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DRVINFO",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "REASON",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
     // I/O control
-    FieldDesc { name: "TMOD", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TMOT", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "IFACE", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "OCTETIV", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "OPTIONIV", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "GPIBIV", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "I32IV", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "UI32IV", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "F64IV", dbf_type: DbFieldType::Long, read_only: true },
+    FieldDesc {
+        name: "TMOD",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TMOT",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IFACE",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OCTETIV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "OPTIONIV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "GPIBIV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "I32IV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "UI32IV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "F64IV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
     // Octet output
-    FieldDesc { name: "AOUT", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OEOS", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "BOUT", dbf_type: DbFieldType::Char, read_only: false },
-    FieldDesc { name: "OMAX", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "NOWT", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "NAWT", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "OFMT", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "AOUT",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OEOS",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BOUT",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OMAX",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "NOWT",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NAWT",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "OFMT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // Octet input
-    FieldDesc { name: "AINP", dbf_type: DbFieldType::String, read_only: true },
-    FieldDesc { name: "TINP", dbf_type: DbFieldType::String, read_only: true },
-    FieldDesc { name: "IEOS", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "BINP", dbf_type: DbFieldType::Char, read_only: true },
-    FieldDesc { name: "IMAX", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "NRRD", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "NORD", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "IFMT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "EOMR", dbf_type: DbFieldType::Short, read_only: true },
+    FieldDesc {
+        name: "AINP",
+        dbf_type: DbFieldType::String,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "TINP",
+        dbf_type: DbFieldType::String,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "IEOS",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BINP",
+        dbf_type: DbFieldType::Char,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "IMAX",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "NRRD",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NORD",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "IFMT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "EOMR",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
     // Int32/UInt32/Float64
-    FieldDesc { name: "I32INP", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "I32OUT", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "UI32INP", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "UI32OUT", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "UI32MASK", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "F64INP", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "F64OUT", dbf_type: DbFieldType::Double, read_only: false },
+    FieldDesc {
+        name: "I32INP",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "I32OUT",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "UI32INP",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "UI32OUT",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "UI32MASK",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "F64INP",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "F64OUT",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
     // Serial
-    FieldDesc { name: "BAUD", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "LBAUD", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "PRTY", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DBIT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SBIT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "MCTL", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "FCTL", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IXON", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IXOFF", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IXANY", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "BAUD",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LBAUD",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PRTY",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DBIT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SBIT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MCTL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "FCTL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IXON",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IXOFF",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IXANY",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // IP options
-    FieldDesc { name: "HOSTINFO", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DRTO", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "HOSTINFO",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DRTO",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // GPIB
-    FieldDesc { name: "UCMD", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "ACMD", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SPR", dbf_type: DbFieldType::Char, read_only: true },
+    FieldDesc {
+        name: "UCMD",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ACMD",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SPR",
+        dbf_type: DbFieldType::Char,
+        read_only: true,
+    },
     // Trace
-    FieldDesc { name: "TMSK", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "TB0", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TB1", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TB2", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TB3", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TB4", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TB5", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TIOM", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "TIB0", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TIB1", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TIB2", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TINM", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "TINB0", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TINB1", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TINB2", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TINB3", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TSIZ", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "TFIL", dbf_type: DbFieldType::String, read_only: false },
+    FieldDesc {
+        name: "TMSK",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TB0",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TB1",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TB2",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TB3",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TB4",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TB5",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TIOM",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TIB0",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TIB1",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TIB2",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TINM",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TINB0",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TINB1",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TINB2",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TINB3",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TSIZ",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TFIL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
     // Connection management
-    FieldDesc { name: "AUCT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "CNCT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "ENBL", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "AUCT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CNCT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ENBL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // Misc
-    FieldDesc { name: "VAL", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "ERRS", dbf_type: DbFieldType::String, read_only: true },
-    FieldDesc { name: "AQR", dbf_type: DbFieldType::Char, read_only: false },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ERRS",
+        dbf_type: DbFieldType::String,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "AQR",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
 ];
 
 // ===== Trace bit helpers =====
@@ -392,59 +699,137 @@ impl AsynRecord {
     /// Rebuild TB0-TB5 from the trace mask value.
     fn update_trace_bits_from_mask(&mut self) {
         let mask = self.tmsk as u32;
-        self.tb0 = if mask & TraceMask::ERROR.bits() != 0 { 1 } else { 0 };
-        self.tb1 = if mask & TraceMask::IO_DEVICE.bits() != 0 { 1 } else { 0 };
-        self.tb2 = if mask & TraceMask::IO_FILTER.bits() != 0 { 1 } else { 0 };
-        self.tb3 = if mask & TraceMask::IO_DRIVER.bits() != 0 { 1 } else { 0 };
-        self.tb4 = if mask & TraceMask::FLOW.bits() != 0 { 1 } else { 0 };
-        self.tb5 = if mask & TraceMask::WARNING.bits() != 0 { 1 } else { 0 };
+        self.tb0 = if mask & TraceMask::ERROR.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tb1 = if mask & TraceMask::IO_DEVICE.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tb2 = if mask & TraceMask::IO_FILTER.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tb3 = if mask & TraceMask::IO_DRIVER.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tb4 = if mask & TraceMask::FLOW.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tb5 = if mask & TraceMask::WARNING.bits() != 0 {
+            1
+        } else {
+            0
+        };
     }
 
     /// Rebuild TMSK from TB0-TB5 bit fields.
     fn update_mask_from_trace_bits(&mut self) {
         let mut mask: u32 = 0;
-        if self.tb0 != 0 { mask |= TraceMask::ERROR.bits(); }
-        if self.tb1 != 0 { mask |= TraceMask::IO_DEVICE.bits(); }
-        if self.tb2 != 0 { mask |= TraceMask::IO_FILTER.bits(); }
-        if self.tb3 != 0 { mask |= TraceMask::IO_DRIVER.bits(); }
-        if self.tb4 != 0 { mask |= TraceMask::FLOW.bits(); }
-        if self.tb5 != 0 { mask |= TraceMask::WARNING.bits(); }
+        if self.tb0 != 0 {
+            mask |= TraceMask::ERROR.bits();
+        }
+        if self.tb1 != 0 {
+            mask |= TraceMask::IO_DEVICE.bits();
+        }
+        if self.tb2 != 0 {
+            mask |= TraceMask::IO_FILTER.bits();
+        }
+        if self.tb3 != 0 {
+            mask |= TraceMask::IO_DRIVER.bits();
+        }
+        if self.tb4 != 0 {
+            mask |= TraceMask::FLOW.bits();
+        }
+        if self.tb5 != 0 {
+            mask |= TraceMask::WARNING.bits();
+        }
         self.tmsk = mask as i32;
     }
 
     /// Rebuild TIB0-TIB2 from trace I/O mask value.
     fn update_io_bits_from_mask(&mut self) {
         let mask = self.tiom as u32;
-        self.tib0 = if mask & TraceIoMask::ASCII.bits() != 0 { 1 } else { 0 };
-        self.tib1 = if mask & TraceIoMask::ESCAPE.bits() != 0 { 1 } else { 0 };
-        self.tib2 = if mask & TraceIoMask::HEX.bits() != 0 { 1 } else { 0 };
+        self.tib0 = if mask & TraceIoMask::ASCII.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tib1 = if mask & TraceIoMask::ESCAPE.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tib2 = if mask & TraceIoMask::HEX.bits() != 0 {
+            1
+        } else {
+            0
+        };
     }
 
     /// Rebuild TIOM from TIB0-TIB2.
     fn update_mask_from_io_bits(&mut self) {
         let mut mask: u32 = 0;
-        if self.tib0 != 0 { mask |= TraceIoMask::ASCII.bits(); }
-        if self.tib1 != 0 { mask |= TraceIoMask::ESCAPE.bits(); }
-        if self.tib2 != 0 { mask |= TraceIoMask::HEX.bits(); }
+        if self.tib0 != 0 {
+            mask |= TraceIoMask::ASCII.bits();
+        }
+        if self.tib1 != 0 {
+            mask |= TraceIoMask::ESCAPE.bits();
+        }
+        if self.tib2 != 0 {
+            mask |= TraceIoMask::HEX.bits();
+        }
         self.tiom = mask as i32;
     }
 
     /// Rebuild TINB0-TINB3 from trace info mask value.
     fn update_info_bits_from_mask(&mut self) {
         let mask = self.tinm as u32;
-        self.tinb0 = if mask & TraceInfoMask::TIME.bits() != 0 { 1 } else { 0 };
-        self.tinb1 = if mask & TraceInfoMask::PORT.bits() != 0 { 1 } else { 0 };
-        self.tinb2 = if mask & TraceInfoMask::SOURCE.bits() != 0 { 1 } else { 0 };
-        self.tinb3 = if mask & TraceInfoMask::THREAD.bits() != 0 { 1 } else { 0 };
+        self.tinb0 = if mask & TraceInfoMask::TIME.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tinb1 = if mask & TraceInfoMask::PORT.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tinb2 = if mask & TraceInfoMask::SOURCE.bits() != 0 {
+            1
+        } else {
+            0
+        };
+        self.tinb3 = if mask & TraceInfoMask::THREAD.bits() != 0 {
+            1
+        } else {
+            0
+        };
     }
 
     /// Rebuild TINM from TINB0-TINB3.
     fn update_mask_from_info_bits(&mut self) {
         let mut mask: u32 = 0;
-        if self.tinb0 != 0 { mask |= TraceInfoMask::TIME.bits(); }
-        if self.tinb1 != 0 { mask |= TraceInfoMask::PORT.bits(); }
-        if self.tinb2 != 0 { mask |= TraceInfoMask::SOURCE.bits(); }
-        if self.tinb3 != 0 { mask |= TraceInfoMask::THREAD.bits(); }
+        if self.tinb0 != 0 {
+            mask |= TraceInfoMask::TIME.bits();
+        }
+        if self.tinb1 != 0 {
+            mask |= TraceInfoMask::PORT.bits();
+        }
+        if self.tinb2 != 0 {
+            mask |= TraceInfoMask::SOURCE.bits();
+        }
+        if self.tinb3 != 0 {
+            mask |= TraceInfoMask::THREAD.bits();
+        }
         self.tinm = mask as i32;
     }
 
@@ -475,7 +860,9 @@ impl AsynRecord {
     /// Apply truncate size to TraceManager.
     fn apply_trace_truncate_size(&self) {
         if let Some(ref entry) = self.port_entry {
-            entry.trace.set_io_truncate_size(Some(&self.port), self.tsiz as usize);
+            entry
+                .trace
+                .set_io_truncate_size(Some(&self.port), self.tsiz as usize);
         }
     }
 
@@ -485,15 +872,13 @@ impl AsynRecord {
             let file = match self.tfil.as_str() {
                 "" | "stderr" => TraceFile::Stderr,
                 "stdout" => TraceFile::Stdout,
-                path => {
-                    match std::fs::File::create(path) {
-                        Ok(f) => TraceFile::File(Arc::new(std::sync::Mutex::new(f))),
-                        Err(_) => {
-                            eprintln!("asynRecord: cannot open trace file '{path}', using stderr");
-                            TraceFile::Stderr
-                        }
+                path => match std::fs::File::create(path) {
+                    Ok(f) => TraceFile::File(Arc::new(std::sync::Mutex::new(f))),
+                    Err(_) => {
+                        eprintln!("asynRecord: cannot open trace file '{path}', using stderr");
+                        TraceFile::Stderr
                     }
-                }
+                },
             };
             entry.trace.set_trace_file(Some(&self.port), file);
         }
@@ -556,7 +941,7 @@ impl AsynRecord {
         // Flow control
         if let Ok(val) = handle.get_option_blocking("crtscts") {
             self.fctl = match val.as_str() {
-                "Y" | "Yes" => 2, // Hardware
+                "Y" | "Yes" => 2,         // Hardware
                 "N" | "No" | "none" => 1, // None
                 _ => 0,
             };
@@ -693,14 +1078,24 @@ impl AsynRecord {
                         crate::request::RequestOp::OctetWrite { data: data.clone() },
                         crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
                     ) {
-                        Ok(_) => { self.nawt = data.len() as i32; }
-                        Err(e) => { self.errs = format!("write: {e}"); }
+                        Ok(_) => {
+                            self.nawt = data.len() as i32;
+                        }
+                        Err(e) => {
+                            self.errs = format!("write: {e}");
+                        }
                     }
                 }
                 InterfaceType::Int32 => {
-                    match entry.handle.write_int32_blocking(self.resolved_reason, self.addr, self.i32out) {
+                    match entry.handle.write_int32_blocking(
+                        self.resolved_reason,
+                        self.addr,
+                        self.i32out,
+                    ) {
                         Ok(_) => {}
-                        Err(e) => { self.errs = format!("write: {e}"); }
+                        Err(e) => {
+                            self.errs = format!("write: {e}");
+                        }
                     }
                 }
                 InterfaceType::UInt32Digital => {
@@ -712,13 +1107,21 @@ impl AsynRecord {
                         crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
                     ) {
                         Ok(_) => {}
-                        Err(e) => { self.errs = format!("write: {e}"); }
+                        Err(e) => {
+                            self.errs = format!("write: {e}");
+                        }
                     }
                 }
                 InterfaceType::Float64 => {
-                    match entry.handle.write_float64_blocking(self.resolved_reason, self.addr, self.f64out) {
+                    match entry.handle.write_float64_blocking(
+                        self.resolved_reason,
+                        self.addr,
+                        self.f64out,
+                    ) {
                         Ok(_) => {}
-                        Err(e) => { self.errs = format!("write: {e}"); }
+                        Err(e) => {
+                            self.errs = format!("write: {e}");
+                        }
                     }
                 }
             }
@@ -728,7 +1131,11 @@ impl AsynRecord {
         if matches!(tmod, TransferMode::Read | TransferMode::WriteRead) {
             match iface {
                 InterfaceType::Octet => {
-                    let buf_size = if self.nrrd > 0 { self.nrrd as usize } else { self.imax as usize };
+                    let buf_size = if self.nrrd > 0 {
+                        self.nrrd as usize
+                    } else {
+                        self.imax as usize
+                    };
                     match entry.handle.submit_blocking(
                         crate::request::RequestOp::OctetRead { buf_size },
                         crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
@@ -737,22 +1144,34 @@ impl AsynRecord {
                             if let Some(data) = result.data {
                                 self.nord = data.len() as i32;
                                 self.ainp = String::from_utf8_lossy(&data).to_string();
-                                self.tinp = crate::trace::format_io_data(&data, TraceIoMask::ESCAPE);
+                                self.tinp =
+                                    crate::trace::format_io_data(&data, TraceIoMask::ESCAPE);
                                 self.binp = data;
                             }
                         }
-                        Err(e) => { self.errs = format!("read: {e}"); }
+                        Err(e) => {
+                            self.errs = format!("read: {e}");
+                        }
                     }
                 }
                 InterfaceType::Int32 => {
-                    match entry.handle.read_int32_blocking(self.resolved_reason, self.addr) {
-                        Ok(v) => { self.i32inp = v; }
-                        Err(e) => { self.errs = format!("read: {e}"); }
+                    match entry
+                        .handle
+                        .read_int32_blocking(self.resolved_reason, self.addr)
+                    {
+                        Ok(v) => {
+                            self.i32inp = v;
+                        }
+                        Err(e) => {
+                            self.errs = format!("read: {e}");
+                        }
                     }
                 }
                 InterfaceType::UInt32Digital => {
                     match entry.handle.submit_blocking(
-                        crate::request::RequestOp::UInt32DigitalRead { mask: self.ui32mask },
+                        crate::request::RequestOp::UInt32DigitalRead {
+                            mask: self.ui32mask,
+                        },
                         crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
                     ) {
                         Ok(result) => {
@@ -760,13 +1179,22 @@ impl AsynRecord {
                                 self.ui32inp = v;
                             }
                         }
-                        Err(e) => { self.errs = format!("read: {e}"); }
+                        Err(e) => {
+                            self.errs = format!("read: {e}");
+                        }
                     }
                 }
                 InterfaceType::Float64 => {
-                    match entry.handle.read_float64_blocking(self.resolved_reason, self.addr) {
-                        Ok(v) => { self.f64inp = v; }
-                        Err(e) => { self.errs = format!("read: {e}"); }
+                    match entry
+                        .handle
+                        .read_float64_blocking(self.resolved_reason, self.addr)
+                    {
+                        Ok(v) => {
+                            self.f64inp = v;
+                        }
+                        Err(e) => {
+                            self.errs = format!("read: {e}");
+                        }
                     }
                 }
             }
@@ -779,7 +1207,9 @@ impl AsynRecord {
                 crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
             ) {
                 Ok(_) => {}
-                Err(e) => { self.errs = format!("flush: {e}"); }
+                Err(e) => {
+                    self.errs = format!("flush: {e}");
+                }
             }
         }
 
@@ -895,82 +1325,234 @@ impl Record for AsynRecord {
         };
 
         match name {
-            "PORT" => { self.port = to_str(&value); }
-            "ADDR" => { self.addr = to_i32(&value); }
-            "PCNCT" => { self.pcnct = to_i32(&value); }
-            "DRVINFO" => { self.drvinfo = to_str(&value); }
-            "REASON" => { self.reason = to_i32(&value); }
-            "TMOD" => { self.tmod = to_i32(&value); }
-            "TMOT" => { self.tmot = to_f64(&value); }
-            "IFACE" => { self.iface = to_i32(&value); }
-            "OCTETIV" => { self.octetiv = to_i32(&value); }
-            "OPTIONIV" => { self.optioniv = to_i32(&value); }
-            "GPIBIV" => { self.gpibiv = to_i32(&value); }
-            "I32IV" => { self.i32iv = to_i32(&value); }
-            "UI32IV" => { self.ui32iv = to_i32(&value); }
-            "F64IV" => { self.f64iv = to_i32(&value); }
-            "AOUT" => { self.aout = to_str(&value); }
-            "OEOS" => { self.oeos = to_str(&value); }
-            "BOUT" => { self.bout = to_bytes(&value); }
-            "OMAX" => { self.omax = to_i32(&value); }
-            "NOWT" => { self.nowt = to_i32(&value); }
-            "NAWT" => { self.nawt = to_i32(&value); }
-            "OFMT" => { self.ofmt = to_i32(&value); }
-            "AINP" => { self.ainp = to_str(&value); }
-            "TINP" => { self.tinp = to_str(&value); }
-            "IEOS" => { self.ieos = to_str(&value); }
-            "BINP" => { self.binp = to_bytes(&value); }
-            "IMAX" => { self.imax = to_i32(&value); }
-            "NRRD" => { self.nrrd = to_i32(&value); }
-            "NORD" => { self.nord = to_i32(&value); }
-            "IFMT" => { self.ifmt = to_i32(&value); }
-            "EOMR" => { self.eomr = to_i32(&value); }
-            "I32INP" => { self.i32inp = to_i32(&value); }
-            "I32OUT" => { self.i32out = to_i32(&value); }
-            "UI32INP" => { self.ui32inp = to_u32(&value); }
-            "UI32OUT" => { self.ui32out = to_u32(&value); }
-            "UI32MASK" => { self.ui32mask = to_u32(&value); }
-            "F64INP" => { self.f64inp = to_f64(&value); }
-            "F64OUT" => { self.f64out = to_f64(&value); }
-            "BAUD" => { self.baud = to_i32(&value); }
-            "LBAUD" => { self.lbaud = to_i32(&value); }
-            "PRTY" => { self.prty = to_i32(&value); }
-            "DBIT" => { self.dbit = to_i32(&value); }
-            "SBIT" => { self.sbit = to_i32(&value); }
-            "MCTL" => { self.mctl = to_i32(&value); }
-            "FCTL" => { self.fctl = to_i32(&value); }
-            "IXON" => { self.ixon = to_i32(&value); }
-            "IXOFF" => { self.ixoff = to_i32(&value); }
-            "IXANY" => { self.ixany = to_i32(&value); }
-            "HOSTINFO" => { self.hostinfo = to_str(&value); }
-            "DRTO" => { self.drto = to_i32(&value); }
-            "UCMD" => { self.ucmd = to_i32(&value); }
-            "ACMD" => { self.acmd = to_i32(&value); }
-            "SPR" => { self.spr = to_i32(&value); }
-            "TMSK" => { self.tmsk = to_i32(&value); }
-            "TB0" => { self.tb0 = to_i32(&value); }
-            "TB1" => { self.tb1 = to_i32(&value); }
-            "TB2" => { self.tb2 = to_i32(&value); }
-            "TB3" => { self.tb3 = to_i32(&value); }
-            "TB4" => { self.tb4 = to_i32(&value); }
-            "TB5" => { self.tb5 = to_i32(&value); }
-            "TIOM" => { self.tiom = to_i32(&value); }
-            "TIB0" => { self.tib0 = to_i32(&value); }
-            "TIB1" => { self.tib1 = to_i32(&value); }
-            "TIB2" => { self.tib2 = to_i32(&value); }
-            "TINM" => { self.tinm = to_i32(&value); }
-            "TINB0" => { self.tinb0 = to_i32(&value); }
-            "TINB1" => { self.tinb1 = to_i32(&value); }
-            "TINB2" => { self.tinb2 = to_i32(&value); }
-            "TINB3" => { self.tinb3 = to_i32(&value); }
-            "TSIZ" => { self.tsiz = to_i32(&value); }
-            "TFIL" => { self.tfil = to_str(&value); }
-            "AUCT" => { self.auct = to_i32(&value); }
-            "CNCT" => { self.cnct = to_i32(&value); }
-            "ENBL" => { self.enbl = to_i32(&value); }
-            "VAL" => { self.val = to_i32(&value); }
-            "ERRS" => { self.errs = to_str(&value); }
-            "AQR" => { self.aqr = to_i32(&value); }
+            "PORT" => {
+                self.port = to_str(&value);
+            }
+            "ADDR" => {
+                self.addr = to_i32(&value);
+            }
+            "PCNCT" => {
+                self.pcnct = to_i32(&value);
+            }
+            "DRVINFO" => {
+                self.drvinfo = to_str(&value);
+            }
+            "REASON" => {
+                self.reason = to_i32(&value);
+            }
+            "TMOD" => {
+                self.tmod = to_i32(&value);
+            }
+            "TMOT" => {
+                self.tmot = to_f64(&value);
+            }
+            "IFACE" => {
+                self.iface = to_i32(&value);
+            }
+            "OCTETIV" => {
+                self.octetiv = to_i32(&value);
+            }
+            "OPTIONIV" => {
+                self.optioniv = to_i32(&value);
+            }
+            "GPIBIV" => {
+                self.gpibiv = to_i32(&value);
+            }
+            "I32IV" => {
+                self.i32iv = to_i32(&value);
+            }
+            "UI32IV" => {
+                self.ui32iv = to_i32(&value);
+            }
+            "F64IV" => {
+                self.f64iv = to_i32(&value);
+            }
+            "AOUT" => {
+                self.aout = to_str(&value);
+            }
+            "OEOS" => {
+                self.oeos = to_str(&value);
+            }
+            "BOUT" => {
+                self.bout = to_bytes(&value);
+            }
+            "OMAX" => {
+                self.omax = to_i32(&value);
+            }
+            "NOWT" => {
+                self.nowt = to_i32(&value);
+            }
+            "NAWT" => {
+                self.nawt = to_i32(&value);
+            }
+            "OFMT" => {
+                self.ofmt = to_i32(&value);
+            }
+            "AINP" => {
+                self.ainp = to_str(&value);
+            }
+            "TINP" => {
+                self.tinp = to_str(&value);
+            }
+            "IEOS" => {
+                self.ieos = to_str(&value);
+            }
+            "BINP" => {
+                self.binp = to_bytes(&value);
+            }
+            "IMAX" => {
+                self.imax = to_i32(&value);
+            }
+            "NRRD" => {
+                self.nrrd = to_i32(&value);
+            }
+            "NORD" => {
+                self.nord = to_i32(&value);
+            }
+            "IFMT" => {
+                self.ifmt = to_i32(&value);
+            }
+            "EOMR" => {
+                self.eomr = to_i32(&value);
+            }
+            "I32INP" => {
+                self.i32inp = to_i32(&value);
+            }
+            "I32OUT" => {
+                self.i32out = to_i32(&value);
+            }
+            "UI32INP" => {
+                self.ui32inp = to_u32(&value);
+            }
+            "UI32OUT" => {
+                self.ui32out = to_u32(&value);
+            }
+            "UI32MASK" => {
+                self.ui32mask = to_u32(&value);
+            }
+            "F64INP" => {
+                self.f64inp = to_f64(&value);
+            }
+            "F64OUT" => {
+                self.f64out = to_f64(&value);
+            }
+            "BAUD" => {
+                self.baud = to_i32(&value);
+            }
+            "LBAUD" => {
+                self.lbaud = to_i32(&value);
+            }
+            "PRTY" => {
+                self.prty = to_i32(&value);
+            }
+            "DBIT" => {
+                self.dbit = to_i32(&value);
+            }
+            "SBIT" => {
+                self.sbit = to_i32(&value);
+            }
+            "MCTL" => {
+                self.mctl = to_i32(&value);
+            }
+            "FCTL" => {
+                self.fctl = to_i32(&value);
+            }
+            "IXON" => {
+                self.ixon = to_i32(&value);
+            }
+            "IXOFF" => {
+                self.ixoff = to_i32(&value);
+            }
+            "IXANY" => {
+                self.ixany = to_i32(&value);
+            }
+            "HOSTINFO" => {
+                self.hostinfo = to_str(&value);
+            }
+            "DRTO" => {
+                self.drto = to_i32(&value);
+            }
+            "UCMD" => {
+                self.ucmd = to_i32(&value);
+            }
+            "ACMD" => {
+                self.acmd = to_i32(&value);
+            }
+            "SPR" => {
+                self.spr = to_i32(&value);
+            }
+            "TMSK" => {
+                self.tmsk = to_i32(&value);
+            }
+            "TB0" => {
+                self.tb0 = to_i32(&value);
+            }
+            "TB1" => {
+                self.tb1 = to_i32(&value);
+            }
+            "TB2" => {
+                self.tb2 = to_i32(&value);
+            }
+            "TB3" => {
+                self.tb3 = to_i32(&value);
+            }
+            "TB4" => {
+                self.tb4 = to_i32(&value);
+            }
+            "TB5" => {
+                self.tb5 = to_i32(&value);
+            }
+            "TIOM" => {
+                self.tiom = to_i32(&value);
+            }
+            "TIB0" => {
+                self.tib0 = to_i32(&value);
+            }
+            "TIB1" => {
+                self.tib1 = to_i32(&value);
+            }
+            "TIB2" => {
+                self.tib2 = to_i32(&value);
+            }
+            "TINM" => {
+                self.tinm = to_i32(&value);
+            }
+            "TINB0" => {
+                self.tinb0 = to_i32(&value);
+            }
+            "TINB1" => {
+                self.tinb1 = to_i32(&value);
+            }
+            "TINB2" => {
+                self.tinb2 = to_i32(&value);
+            }
+            "TINB3" => {
+                self.tinb3 = to_i32(&value);
+            }
+            "TSIZ" => {
+                self.tsiz = to_i32(&value);
+            }
+            "TFIL" => {
+                self.tfil = to_str(&value);
+            }
+            "AUCT" => {
+                self.auct = to_i32(&value);
+            }
+            "CNCT" => {
+                self.cnct = to_i32(&value);
+            }
+            "ENBL" => {
+                self.enbl = to_i32(&value);
+            }
+            "VAL" => {
+                self.val = to_i32(&value);
+            }
+            "ERRS" => {
+                self.errs = to_str(&value);
+            }
+            "AQR" => {
+                self.aqr = to_i32(&value);
+            }
             _ => {
                 return Err(CaError::InvalidValue(format!("unknown field: {name}")));
             }
@@ -1121,8 +1703,8 @@ impl Record for AsynRecord {
             }
             "FCTL" => {
                 let val = match self.fctl {
-                    1 => "N",  // None
-                    2 => "Y",  // Hardware
+                    1 => "N", // None
+                    2 => "Y", // Hardware
                     _ => return Ok(()),
                 };
                 self.write_option("crtscts", val);
@@ -1243,8 +1825,12 @@ mod tests {
     #[test]
     fn test_get_put_roundtrip() {
         let mut rec = AsynRecord::default();
-        rec.put_field("PORT", EpicsValue::String("SIM1".into())).unwrap();
-        assert_eq!(rec.get_field("PORT"), Some(EpicsValue::String("SIM1".into())));
+        rec.put_field("PORT", EpicsValue::String("SIM1".into()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("PORT"),
+            Some(EpicsValue::String("SIM1".into()))
+        );
 
         rec.put_field("ADDR", EpicsValue::Long(3)).unwrap();
         assert_eq!(rec.get_field("ADDR"), Some(EpicsValue::Long(3)));
@@ -1354,25 +1940,36 @@ mod tests {
         rec.tb0 = 1;
         rec.tb3 = 1;
         rec.special("TB0", true).unwrap();
-        assert_eq!(rec.tmsk as u32, (TraceMask::ERROR | TraceMask::IO_DRIVER).bits());
+        assert_eq!(
+            rec.tmsk as u32,
+            (TraceMask::ERROR | TraceMask::IO_DRIVER).bits()
+        );
     }
 
     #[test]
     fn test_register_and_get_port() {
         use crate::interrupt::InterruptManager;
-        use crate::port::{PortDriverBase, PortDriver, PortFlags};
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
 
         struct TestDriver(PortDriverBase);
         impl TestDriver {
             fn new() -> Self {
-                Self(PortDriverBase::new("test_asyn_rec", 1, PortFlags::default()))
+                Self(PortDriverBase::new(
+                    "test_asyn_rec",
+                    1,
+                    PortFlags::default(),
+                ))
             }
         }
         impl PortDriver for TestDriver {
-            fn base(&self) -> &PortDriverBase { &self.0 }
-            fn base_mut(&mut self) -> &mut PortDriverBase { &mut self.0 }
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
         }
 
         let interrupts = Arc::new(InterruptManager::new(256));

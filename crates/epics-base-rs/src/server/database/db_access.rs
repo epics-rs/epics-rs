@@ -27,7 +27,7 @@ use crate::server::pv::MonitorEvent;
 use crate::server::recgbl::EventMask;
 use crate::types::{DbFieldType, EpicsValue};
 
-use super::{parse_pv_name, PvDatabase};
+use super::{PvDatabase, parse_pv_name};
 
 static NEXT_SID: AtomicU32 = AtomicU32::new(1_000_000);
 static NEXT_ORIGIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -84,14 +84,18 @@ impl DbChannel {
     }
 
     pub async fn get_f64(&self) -> f64 {
-        self.db.get_pv(&self.name).await
+        self.db
+            .get_pv(&self.name)
+            .await
             .ok()
             .and_then(|v| v.to_f64())
             .unwrap_or(0.0)
     }
 
     pub async fn get_i16(&self) -> i16 {
-        self.db.get_pv(&self.name).await
+        self.db
+            .get_pv(&self.name)
+            .await
             .ok()
             .and_then(|v| v.to_f64())
             .map(|f| f as i16)
@@ -119,7 +123,9 @@ impl DbChannel {
 
     /// Write a value without triggering record processing.
     pub async fn put_string(&self, v: &str) -> CaResult<()> {
-        self.db.put_pv(&self.name, EpicsValue::String(v.to_string())).await
+        self.db
+            .put_pv(&self.name, EpicsValue::String(v.to_string()))
+            .await
     }
 
     /// Write a value and post monitor events (without processing).
@@ -127,51 +133,71 @@ impl DbChannel {
     /// Use for readback/status mirror PVs that need to be visible to
     /// CA monitors but should NOT trigger record processing.
     pub async fn put_f64_post(&self, v: f64) -> CaResult<()> {
-        self.db.put_pv_and_post_with_origin(&self.name, EpicsValue::Double(v), self.origin).await
+        self.db
+            .put_pv_and_post_with_origin(&self.name, EpicsValue::Double(v), self.origin)
+            .await
     }
 
     /// Write an i16 value and post monitor events (without processing).
     pub async fn put_i16_post(&self, v: i16) -> CaResult<()> {
-        self.db.put_pv_and_post_with_origin(&self.name, EpicsValue::Short(v), self.origin).await
+        self.db
+            .put_pv_and_post_with_origin(&self.name, EpicsValue::Short(v), self.origin)
+            .await
     }
 
     /// Write a string value and post monitor events (without processing).
     pub async fn put_string_post(&self, v: &str) -> CaResult<()> {
-        self.db.put_pv_and_post_with_origin(&self.name, EpicsValue::String(v.to_string()), self.origin).await
+        self.db
+            .put_pv_and_post_with_origin(&self.name, EpicsValue::String(v.to_string()), self.origin)
+            .await
     }
 
     /// Write a value AND trigger record processing (like CA put).
     /// Use for motor VAL, busy records, etc. where processing drives hardware.
     pub async fn put_f64_process(&self, v: f64) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
-        let _ = self.db.put_record_field_from_ca(record_name, field, EpicsValue::Double(v)).await?;
+        let _ = self
+            .db
+            .put_record_field_from_ca(record_name, field, EpicsValue::Double(v))
+            .await?;
         Ok(())
     }
 
     /// Write i16 + trigger processing. For bo/mbbo commands.
     pub async fn put_i16_process(&self, v: i16) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
-        let _ = self.db.put_record_field_from_ca(record_name, field, EpicsValue::Short(v)).await?;
+        let _ = self
+            .db
+            .put_record_field_from_ca(record_name, field, EpicsValue::Short(v))
+            .await?;
         Ok(())
     }
 
     /// Write i32 + trigger processing. For longout commands.
     pub async fn put_i32_process(&self, v: i32) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
-        let _ = self.db.put_record_field_from_ca(record_name, field, EpicsValue::Long(v)).await?;
+        let _ = self
+            .db
+            .put_record_field_from_ca(record_name, field, EpicsValue::Long(v))
+            .await?;
         Ok(())
     }
 
     /// Write string + trigger processing. For stringout commands.
     pub async fn put_string_process(&self, v: &str) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
-        let _ = self.db.put_record_field_from_ca(record_name, field, EpicsValue::String(v.to_string())).await?;
+        let _ = self
+            .db
+            .put_record_field_from_ca(record_name, field, EpicsValue::String(v.to_string()))
+            .await?;
         Ok(())
     }
 
     /// Read i32 value. For longin/longout.
     pub async fn get_i32(&self) -> i32 {
-        self.db.get_pv(&self.name).await
+        self.db
+            .get_pv(&self.name)
+            .await
             .ok()
             .and_then(|v| match v {
                 EpicsValue::Long(i) => Some(i),
@@ -207,7 +233,11 @@ impl DbSubscription {
 
     /// Subscribe with origin filtering. Events tagged with `ignore_origin`
     /// will be silently skipped by `recv_f64`/`recv`/`try_recv_f64`.
-    pub async fn subscribe_filtered(db: &PvDatabase, pv_name: &str, ignore_origin: u64) -> Option<Self> {
+    pub async fn subscribe_filtered(
+        db: &PvDatabase,
+        pv_name: &str,
+        ignore_origin: u64,
+    ) -> Option<Self> {
         let (record_name, field) = parse_pv_name(pv_name);
         let field = field.to_ascii_uppercase();
         let rec = db.get_record(record_name).await?;

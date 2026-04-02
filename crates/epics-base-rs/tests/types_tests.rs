@@ -1,7 +1,7 @@
 #![allow(unused_imports, clippy::all)]
-use std::time::{Duration, SystemTime};
-use epics_base_rs::types::*;
 use epics_base_rs::server::snapshot::*;
+use epics_base_rs::types::*;
+use std::time::{Duration, SystemTime};
 
 const EPICS_UNIX_EPOCH_OFFSET_SECS: u64 = 631_152_000;
 
@@ -177,8 +177,7 @@ fn test_golden_sts_char() {
 
 #[test]
 fn test_golden_time_double() {
-    let ts = SystemTime::UNIX_EPOCH
-        + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + 1000);
+    let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + 1000);
     let val = EpicsValue::Double(1.23);
     let data = serialize_dbr(20, &val, 0, 0, ts).unwrap();
     assert_eq!(data.len(), 24);
@@ -327,7 +326,10 @@ fn test_encode_sts_matches_serialize() {
     let val = EpicsValue::Short(77);
     let ts = SystemTime::UNIX_EPOCH;
     let mut snap = bare_snapshot(val.clone());
-    snap.alarm = AlarmInfo { status: 5, severity: 1 };
+    snap.alarm = AlarmInfo {
+        status: 5,
+        severity: 1,
+    };
     assert_eq!(
         encode_dbr(8, &snap).unwrap(),
         serialize_dbr(8, &val, 5, 1, ts).unwrap()
@@ -340,7 +342,10 @@ fn test_encode_time_matches_serialize() {
     let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + 500);
     let mut snap = bare_snapshot(val.clone());
     snap.timestamp = ts;
-    snap.alarm = AlarmInfo { status: 1, severity: 2 };
+    snap.alarm = AlarmInfo {
+        status: 1,
+        severity: 2,
+    };
     assert_eq!(
         encode_dbr(20, &snap).unwrap(),
         serialize_dbr(20, &val, 1, 2, ts).unwrap()
@@ -508,29 +513,62 @@ fn test_encode_invalid_type() {
 
 #[test]
 fn test_parse_menu_string_alarm_sevr() {
-    assert_eq!(EpicsValue::parse(DbFieldType::Short, "NO_ALARM").unwrap(), EpicsValue::Short(0));
-    assert_eq!(EpicsValue::parse(DbFieldType::Short, "MINOR").unwrap(), EpicsValue::Short(1));
-    assert_eq!(EpicsValue::parse(DbFieldType::Short, "MAJOR").unwrap(), EpicsValue::Short(2));
-    assert_eq!(EpicsValue::parse(DbFieldType::Short, "INVALID").unwrap(), EpicsValue::Short(3));
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Short, "NO_ALARM").unwrap(),
+        EpicsValue::Short(0)
+    );
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Short, "MINOR").unwrap(),
+        EpicsValue::Short(1)
+    );
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Short, "MAJOR").unwrap(),
+        EpicsValue::Short(2)
+    );
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Short, "INVALID").unwrap(),
+        EpicsValue::Short(3)
+    );
 }
 
 #[test]
 fn test_parse_menu_string_omsl() {
-    assert_eq!(EpicsValue::parse(DbFieldType::Short, "supervisory").unwrap(), EpicsValue::Short(0));
-    assert_eq!(EpicsValue::parse(DbFieldType::Short, "closed_loop").unwrap(), EpicsValue::Short(1));
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Short, "supervisory").unwrap(),
+        EpicsValue::Short(0)
+    );
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Short, "closed_loop").unwrap(),
+        EpicsValue::Short(1)
+    );
 }
 
 #[test]
 fn test_parse_menu_string_enum_type() {
-    assert_eq!(EpicsValue::parse(DbFieldType::Enum, "NO_ALARM").unwrap(), EpicsValue::Enum(0));
-    assert_eq!(EpicsValue::parse(DbFieldType::Enum, "MAJOR").unwrap(), EpicsValue::Enum(2));
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Enum, "NO_ALARM").unwrap(),
+        EpicsValue::Enum(0)
+    );
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Enum, "MAJOR").unwrap(),
+        EpicsValue::Enum(2)
+    );
 }
 
 #[test]
 fn test_parse_menu_string_numeric_priority() {
-    assert_eq!(EpicsValue::parse(DbFieldType::Short, "0").unwrap(), EpicsValue::Short(0));
-    assert_eq!(EpicsValue::parse(DbFieldType::Short, "42").unwrap(), EpicsValue::Short(42));
-    assert_eq!(EpicsValue::parse(DbFieldType::Enum, "3").unwrap(), EpicsValue::Enum(3));
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Short, "0").unwrap(),
+        EpicsValue::Short(0)
+    );
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Short, "42").unwrap(),
+        EpicsValue::Short(42)
+    );
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Enum, "3").unwrap(),
+        EpicsValue::Enum(3)
+    );
 }
 
 #[test]
@@ -569,7 +607,11 @@ fn test_decode_time_double_roundtrip() {
     assert_eq!(snap.alarm.status, 5);
     assert_eq!(snap.alarm.severity, 1);
     let orig_secs = ts.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-    let decoded_secs = snap.timestamp.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+    let decoded_secs = snap
+        .timestamp
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     assert_eq!(orig_secs, decoded_secs);
 }
 

@@ -68,30 +68,76 @@ impl CalcExpression {
                 CalcToken::Num(n) => stack.push(*n),
                 CalcToken::VarA => stack.push(a),
                 CalcToken::VarB => stack.push(b),
-                CalcToken::Op(op) => {
-                    match op {
-                        CalcOp::Not => {
-                            let v = stack.pop().unwrap_or(0.0);
-                            stack.push(if v == 0.0 { 1.0 } else { 0.0 });
-                        }
-                        _ => {
-                            let rhs = stack.pop().unwrap_or(0.0);
-                            let lhs = stack.pop().unwrap_or(0.0);
-                            let result = match op {
-                                CalcOp::Gt => if lhs > rhs { 1.0 } else { 0.0 },
-                                CalcOp::Lt => if lhs < rhs { 1.0 } else { 0.0 },
-                                CalcOp::Ge => if lhs >= rhs { 1.0 } else { 0.0 },
-                                CalcOp::Le => if lhs <= rhs { 1.0 } else { 0.0 },
-                                CalcOp::Eq => if (lhs - rhs).abs() < f64::EPSILON { 1.0 } else { 0.0 },
-                                CalcOp::Ne => if (lhs - rhs).abs() >= f64::EPSILON { 1.0 } else { 0.0 },
-                                CalcOp::And => if lhs != 0.0 && rhs != 0.0 { 1.0 } else { 0.0 },
-                                CalcOp::Or => if lhs != 0.0 || rhs != 0.0 { 1.0 } else { 0.0 },
-                                CalcOp::Not => unreachable!(),
-                            };
-                            stack.push(result);
-                        }
+                CalcToken::Op(op) => match op {
+                    CalcOp::Not => {
+                        let v = stack.pop().unwrap_or(0.0);
+                        stack.push(if v == 0.0 { 1.0 } else { 0.0 });
                     }
-                }
+                    _ => {
+                        let rhs = stack.pop().unwrap_or(0.0);
+                        let lhs = stack.pop().unwrap_or(0.0);
+                        let result = match op {
+                            CalcOp::Gt => {
+                                if lhs > rhs {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            CalcOp::Lt => {
+                                if lhs < rhs {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            CalcOp::Ge => {
+                                if lhs >= rhs {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            CalcOp::Le => {
+                                if lhs <= rhs {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            CalcOp::Eq => {
+                                if (lhs - rhs).abs() < f64::EPSILON {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            CalcOp::Ne => {
+                                if (lhs - rhs).abs() >= f64::EPSILON {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            CalcOp::And => {
+                                if lhs != 0.0 && rhs != 0.0 {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            CalcOp::Or => {
+                                if lhs != 0.0 || rhs != 0.0 {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            CalcOp::Not => unreachable!(),
+                        };
+                        stack.push(result);
+                    }
+                },
             }
         }
         stack.pop().unwrap_or(0.0)
@@ -119,11 +165,25 @@ impl CalcExpression {
 
         while i < chars.len() {
             match chars[i] {
-                ' ' | '\t' => { i += 1; }
-                '(' => { tokens.push(RT::LParen); i += 1; }
-                ')' => { tokens.push(RT::RParen); i += 1; }
-                'A' | 'a' => { tokens.push(RT::VarA); i += 1; }
-                'B' | 'b' => { tokens.push(RT::VarB); i += 1; }
+                ' ' | '\t' => {
+                    i += 1;
+                }
+                '(' => {
+                    tokens.push(RT::LParen);
+                    i += 1;
+                }
+                ')' => {
+                    tokens.push(RT::RParen);
+                    i += 1;
+                }
+                'A' | 'a' => {
+                    tokens.push(RT::VarA);
+                    i += 1;
+                }
+                'B' | 'b' => {
+                    tokens.push(RT::VarB);
+                    i += 1;
+                }
                 '>' => {
                     if i + 1 < chars.len() && chars[i + 1] == '=' {
                         tokens.push(RT::Op(CalcOp::Ge));
@@ -188,7 +248,10 @@ impl CalcExpression {
                     // Negative number: at start, or after '(' or after an operator
                     let is_unary_minus = tokens.is_empty()
                         || matches!(tokens.last(), Some(RT::LParen) | Some(RT::Op(_)));
-                    if is_unary_minus && i + 1 < chars.len() && (chars[i + 1].is_ascii_digit() || chars[i + 1] == '.') {
+                    if is_unary_minus
+                        && i + 1 < chars.len()
+                        && (chars[i + 1].is_ascii_digit() || chars[i + 1] == '.')
+                    {
                         i += 1; // skip '-'
                         let start = i;
                         while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
@@ -360,7 +423,8 @@ impl CircularBuffer {
             if self.post_remaining == 0 {
                 self.triggered = false;
                 // Check if we've reached the preset trigger count
-                if self.preset_trigger_count > 0 && self.trigger_count >= self.preset_trigger_count {
+                if self.preset_trigger_count > 0 && self.trigger_count >= self.preset_trigger_count
+                {
                     self.status = BufferStatus::AcquisitionCompleted;
                 } else {
                     self.status = BufferStatus::BufferFilling;
@@ -372,18 +436,28 @@ impl CircularBuffer {
 
         // Check trigger condition
         let trigger = match &self.trigger_condition {
-            TriggerCondition::AttributeThreshold { name, threshold } => {
-                array.attributes.get(name)
-                    .and_then(|a| a.value.as_f64())
-                    .map(|v| v >= *threshold)
-                    .unwrap_or(false)
-            }
+            TriggerCondition::AttributeThreshold { name, threshold } => array
+                .attributes
+                .get(name)
+                .and_then(|a| a.value.as_f64())
+                .map(|v| v >= *threshold)
+                .unwrap_or(false),
             TriggerCondition::External => false,
-            TriggerCondition::Calc { attr_a, attr_b, expression } => {
-                let a = array.attributes.get(attr_a)
-                    .and_then(|a| a.value.as_f64()).unwrap_or(0.0);
-                let b = array.attributes.get(attr_b)
-                    .and_then(|a| a.value.as_f64()).unwrap_or(0.0);
+            TriggerCondition::Calc {
+                attr_a,
+                attr_b,
+                expression,
+            } => {
+                let a = array
+                    .attributes
+                    .get(attr_a)
+                    .and_then(|a| a.value.as_f64())
+                    .unwrap_or(0.0);
+                let b = array
+                    .attributes
+                    .get(attr_b)
+                    .and_then(|a| a.value.as_f64())
+                    .unwrap_or(0.0);
                 expression.evaluate(a, b) != 0.0
             }
         };
@@ -477,7 +551,10 @@ impl NDPluginProcess for CircularBuffProcessor {
         "NDPluginCircularBuff"
     }
 
-    fn register_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
         base.create_param("CIRC_BUFF_CONTROL", ParamType::Int32)?;
         base.create_param("CIRC_BUFF_STATUS", ParamType::Int32)?;
@@ -503,8 +580,8 @@ impl NDPluginProcess for CircularBuffProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
-    use ad_core_rs::attributes::{NDAttribute, NDAttrSource, NDAttrValue};
 
     fn make_array(id: i32) -> Arc<NDArray> {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -579,10 +656,14 @@ mod tests {
 
     #[test]
     fn test_attribute_trigger() {
-        let mut cb = CircularBuffer::new(1, 1, TriggerCondition::AttributeThreshold {
-            name: "trigger".into(),
-            threshold: 5.0,
-        });
+        let mut cb = CircularBuffer::new(
+            1,
+            1,
+            TriggerCondition::AttributeThreshold {
+                name: "trigger".into(),
+                threshold: 5.0,
+            },
+        );
 
         cb.push(make_array_with_attr(1, 1.0));
         cb.push(make_array_with_attr(2, 2.0));
@@ -605,11 +686,15 @@ mod tests {
     fn test_calc_trigger() {
         // Expression: "A>5" — trigger when attribute A exceeds 5
         let expr = CalcExpression::parse("A>5").unwrap();
-        let mut cb = CircularBuffer::new(1, 1, TriggerCondition::Calc {
-            attr_a: "attr_a".into(),
-            attr_b: "attr_b".into(),
-            expression: expr,
-        });
+        let mut cb = CircularBuffer::new(
+            1,
+            1,
+            TriggerCondition::Calc {
+                attr_a: "attr_a".into(),
+                attr_b: "attr_b".into(),
+                expression: expr,
+            },
+        );
 
         // A=3, should not trigger
         cb.push(make_array_with_attrs(1, 3.0, 0.0));
@@ -668,7 +753,7 @@ mod tests {
 
         // Invalid expression returns None
         assert!(CalcExpression::parse("A=5").is_none()); // single = not supported
-        assert!(CalcExpression::parse("A&B").is_none());  // single & not supported
+        assert!(CalcExpression::parse("A&B").is_none()); // single & not supported
     }
 
     #[test]

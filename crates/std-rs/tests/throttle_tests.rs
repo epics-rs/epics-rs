@@ -17,8 +17,8 @@ fn test_default_values() {
     assert_eq!(rec.drvlh, 0.0);
     assert_eq!(rec.drvll, 0.0);
     assert_eq!(rec.drvlc, 0); // Off
-    assert_eq!(rec.wait, 0);  // False
-    assert_eq!(rec.sts, 0);   // Unknown
+    assert_eq!(rec.wait, 0); // False
+    assert_eq!(rec.sts, 0); // Unknown
 }
 
 // ============================================================
@@ -56,7 +56,10 @@ fn test_read_only_fields() {
     assert!(rec.put_field("OSENT", EpicsValue::Double(1.0)).is_err());
     assert!(rec.put_field("WAIT", EpicsValue::Short(1)).is_err());
     assert!(rec.put_field("DRVLS", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("VER", EpicsValue::String("x".into())).is_err());
+    assert!(
+        rec.put_field("VER", EpicsValue::String("x".into()))
+            .is_err()
+    );
     assert!(rec.put_field("STS", EpicsValue::Short(1)).is_err());
     assert!(rec.put_field("OV", EpicsValue::Short(1)).is_err());
     assert!(rec.put_field("SIV", EpicsValue::Short(1)).is_err());
@@ -65,7 +68,10 @@ fn test_read_only_fields() {
 #[test]
 fn test_type_mismatch() {
     let mut rec = ThrottleRecord::default();
-    assert!(rec.put_field("VAL", EpicsValue::String("bad".into())).is_err());
+    assert!(
+        rec.put_field("VAL", EpicsValue::String("bad".into()))
+            .is_err()
+    );
     assert!(rec.put_field("PREC", EpicsValue::Double(1.0)).is_err());
 }
 
@@ -74,7 +80,10 @@ fn test_unknown_field() {
     let rec = ThrottleRecord::default();
     assert!(rec.get_field("NONEXISTENT").is_none());
     let mut rec = rec;
-    assert!(rec.put_field("NONEXISTENT", EpicsValue::Double(1.0)).is_err());
+    assert!(
+        rec.put_field("NONEXISTENT", EpicsValue::Double(1.0))
+            .is_err()
+    );
 }
 
 // ============================================================
@@ -101,9 +110,15 @@ fn test_process_sends_value_with_delay() {
     assert_eq!(rec.sent, 42.0);
     assert_eq!(rec.wait, 1); // Busy during delay
     // Should have ReprocessAfter action and WriteDbLink for OUT
-    let has_reprocess = outcome.actions.iter().any(|a| matches!(a, ProcessAction::ReprocessAfter(_)));
+    let has_reprocess = outcome
+        .actions
+        .iter()
+        .any(|a| matches!(a, ProcessAction::ReprocessAfter(_)));
     assert!(has_reprocess, "Should have ReprocessAfter action");
-    let has_write = outcome.actions.iter().any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
+    let has_write = outcome
+        .actions
+        .iter()
+        .any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
     assert!(has_write, "Should have WriteDbLink action for OUT");
 }
 
@@ -119,8 +134,14 @@ fn test_process_queues_during_delay() {
     // Second value during delay — should be queued
     rec.val = 99.0;
     let outcome = rec.process().unwrap();
-    let has_reprocess = outcome.actions.iter().any(|a| matches!(a, ProcessAction::ReprocessAfter(_)));
-    assert!(has_reprocess, "Should have ReprocessAfter for pending drain");
+    let has_reprocess = outcome
+        .actions
+        .iter()
+        .any(|a| matches!(a, ProcessAction::ReprocessAfter(_)));
+    assert!(
+        has_reprocess,
+        "Should have ReprocessAfter for pending drain"
+    );
     assert_eq!(rec.sent, 42.0); // Not sent yet — still in delay
 }
 
@@ -162,14 +183,14 @@ fn test_limit_clipping_on() {
     rec.drvlh = 100.0;
     rec.drvll = 0.0;
     rec.drvlc = 1; // Clipping ON
-    rec.dly = 0.0;  // No delay for immediate send
+    rec.dly = 0.0; // No delay for immediate send
     rec.init_record(1).unwrap();
 
     rec.val = 150.0;
     rec.process().unwrap();
     assert_eq!(rec.sent, 100.0);
     assert_eq!(rec.drvls, 2); // High limit
-    assert_eq!(rec.sts, 2);   // Success (clamped but sent)
+    assert_eq!(rec.sts, 2); // Success (clamped but sent)
 }
 
 #[test]
@@ -262,7 +283,10 @@ fn test_sync_pre_process_actions_and_reset() {
     // and resets sync to 0.
     let actions = rec.pre_process_actions();
     assert_eq!(actions.len(), 1, "Should have one ReadDbLink action");
-    assert_eq!(rec.sync, 0, "sync should be reset after pre_process_actions");
+    assert_eq!(
+        rec.sync, 0,
+        "sync should be reset after pre_process_actions"
+    );
 
     // Calling again with sync=0 returns empty
     let actions = rec.pre_process_actions();

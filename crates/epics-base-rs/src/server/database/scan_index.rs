@@ -28,7 +28,8 @@ impl PvDatabase {
 
     /// Get record names for a given scan type, sorted by PHAS.
     pub async fn records_for_scan(&self, scan_type: ScanType) -> Vec<String> {
-        self.inner.scan_index
+        self.inner
+            .scan_index
             .read()
             .await
             .get(&scan_type)

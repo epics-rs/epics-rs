@@ -60,7 +60,10 @@ fn backlash_positive_bdst_negative_move() {
     assert!(!rec.stat.dmov);
     assert!(rec.stat.mip.contains(MipFlags::MOVE));
     assert!(!rec.stat.tdir); // moving negative
-    if let MotorCommand::MoveAbsolute { position, velocity, .. } = &effects.commands[0] {
+    if let MotorCommand::MoveAbsolute {
+        position, velocity, ..
+    } = &effects.commands[0]
+    {
         assert!((*position - (-11.0)).abs() < 1e-10);
         assert_eq!(*velocity, 10.0); // VELO for main move
     } else {
@@ -76,9 +79,14 @@ fn backlash_positive_bdst_negative_move() {
     assert!(rec.stat.mip.contains(MipFlags::MOVE_BL));
     assert!(!rec.internal.backlash_pending);
     assert!(!rec.stat.dmov);
-    if let MotorCommand::MoveAbsolute { position, velocity, acceleration } = &effects.commands[0] {
+    if let MotorCommand::MoveAbsolute {
+        position,
+        velocity,
+        acceleration,
+    } = &effects.commands[0]
+    {
         assert!((*position - (-10.0)).abs() < 1e-10);
-        assert_eq!(*velocity, 5.0);  // BVEL
+        assert_eq!(*velocity, 5.0); // BVEL
         assert_eq!(*acceleration, 0.5); // BACC
     } else {
         panic!("expected MoveAbsolute");
@@ -226,7 +234,10 @@ fn backlash_then_retry_on_position_error() {
     assert_eq!(rec.stat.phase, MotionPhase::Retry);
     assert_eq!(rec.retry.rcnt, 1);
     assert!(rec.stat.mip.contains(MipFlags::RETRY));
-    assert!(matches!(effects.commands[0], MotorCommand::MoveAbsolute { .. }));
+    assert!(matches!(
+        effects.commands[0],
+        MotorCommand::MoveAbsolute { .. }
+    ));
 }
 
 #[test]

@@ -61,7 +61,10 @@ impl RuntimeClient for InProcessClient {
         let handle = self.handle.clone();
 
         Box::pin(async move {
-            let result = handle.submit(op, user).await.map_err(TransportError::from)?;
+            let result = handle
+                .submit(op, user)
+                .await
+                .map_err(TransportError::from)?;
             Ok(result_to_reply(&result, request_id))
         })
     }
@@ -82,9 +85,8 @@ impl RuntimeClient for InProcessClient {
         filter: EventFilter,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<tokio::sync::mpsc::Receiver<PortEvent>, TransportError>,
-                > + Send
+            dyn Future<Output = Result<tokio::sync::mpsc::Receiver<PortEvent>, TransportError>>
+                + Send
                 + '_,
         >,
     > {
@@ -273,17 +275,18 @@ mod tests {
             timestamp: SystemTime::now(),
         });
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(event.port_name, "ipc_test");
         match event.payload {
-            EventPayload::ValueChanged { reason, addr, value } => {
+            EventPayload::ValueChanged {
+                reason,
+                addr,
+                value,
+            } => {
                 assert_eq!(reason, 0);
                 assert_eq!(addr, 0);
                 assert_eq!(value, ParamValue::Int32(77));
@@ -297,7 +300,10 @@ mod tests {
         let (_mgr, client) = make_client();
 
         let mut rx = client
-            .subscribe(EventFilter { reason: Some(1), addr: None })
+            .subscribe(EventFilter {
+                reason: Some(1),
+                addr: None,
+            })
             .await
             .unwrap();
 
@@ -319,13 +325,10 @@ mod tests {
             timestamp: SystemTime::now(),
         });
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         match event.payload {
             EventPayload::ValueChanged { reason, value, .. } => {

@@ -1,8 +1,8 @@
 //! Integration tests for epics-pva-rs: PVData structures, serialization, and codec.
 
+use epics_pva_rs::protocol::*;
 use epics_pva_rs::pvdata::*;
 use epics_pva_rs::serialize::*;
-use epics_pva_rs::protocol::*;
 
 // ---------------------------------------------------------------------------
 // ScalarType type_code / from_type_code roundtrip
@@ -72,7 +72,10 @@ fn scalar_type_from_invalid_code_returns_none() {
 
 #[test]
 fn scalar_value_type_detection() {
-    assert_eq!(ScalarValue::Boolean(true).scalar_type(), ScalarType::Boolean);
+    assert_eq!(
+        ScalarValue::Boolean(true).scalar_type(),
+        ScalarType::Boolean
+    );
     assert_eq!(ScalarValue::Byte(1).scalar_type(), ScalarType::Byte);
     assert_eq!(ScalarValue::Short(2).scalar_type(), ScalarType::Short);
     assert_eq!(ScalarValue::Int(3).scalar_type(), ScalarType::Int);
@@ -166,8 +169,12 @@ fn scalar_value_parse_invalid_number() {
 #[test]
 fn pv_structure_new_and_get_field() {
     let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-    s.fields.push(("value".into(), PvField::Scalar(ScalarValue::Double(42.0))));
-    s.fields.push(("descriptor".into(), PvField::Scalar(ScalarValue::String("test".into()))));
+    s.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Double(42.0))));
+    s.fields.push((
+        "descriptor".into(),
+        PvField::Scalar(ScalarValue::String("test".into())),
+    ));
 
     assert_eq!(s.struct_id, "epics:nt/NTScalar:1.0");
 
@@ -191,7 +198,8 @@ fn pv_structure_new_and_get_field() {
 #[test]
 fn pv_structure_get_value_helper() {
     let mut s = PvStructure::new("test_t");
-    s.fields.push(("value".into(), PvField::Scalar(ScalarValue::Int(99))));
+    s.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Int(99))));
 
     let val = s.get_value().unwrap();
     assert_eq!(*val, ScalarValue::Int(99));
@@ -200,15 +208,24 @@ fn pv_structure_get_value_helper() {
 #[test]
 fn pv_structure_get_alarm_and_timestamp() {
     let mut alarm = PvStructure::new("alarm_t");
-    alarm.fields.push(("severity".into(), PvField::Scalar(ScalarValue::Int(0))));
-    alarm.fields.push(("status".into(), PvField::Scalar(ScalarValue::Int(0))));
+    alarm
+        .fields
+        .push(("severity".into(), PvField::Scalar(ScalarValue::Int(0))));
+    alarm
+        .fields
+        .push(("status".into(), PvField::Scalar(ScalarValue::Int(0))));
 
     let mut ts = PvStructure::new("time_t");
-    ts.fields.push(("secondsPastEpoch".into(), PvField::Scalar(ScalarValue::Long(1000))));
-    ts.fields.push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(500))));
+    ts.fields.push((
+        "secondsPastEpoch".into(),
+        PvField::Scalar(ScalarValue::Long(1000)),
+    ));
+    ts.fields
+        .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(500))));
 
     let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-    s.fields.push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+    s.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
     s.fields.push(("alarm".into(), PvField::Structure(alarm)));
     s.fields.push(("timeStamp".into(), PvField::Structure(ts)));
 
@@ -231,7 +248,9 @@ fn pv_structure_nested_structure() {
         fields: vec![("x".into(), PvField::Scalar(ScalarValue::Float(1.0)))],
     };
     let mut outer = PvStructure::new("outer_t");
-    outer.fields.push(("nested".into(), PvField::Structure(inner)));
+    outer
+        .fields
+        .push(("nested".into(), PvField::Structure(inner)));
 
     match outer.get_field("nested").unwrap() {
         PvField::Structure(s) => {
@@ -276,10 +295,13 @@ fn field_desc_value_scalar_type() {
         struct_id: "epics:nt/NTScalar:1.0".into(),
         fields: vec![
             ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("alarm".into(), FieldDesc::Structure {
-                struct_id: "alarm_t".into(),
-                fields: vec![],
-            }),
+            (
+                "alarm".into(),
+                FieldDesc::Structure {
+                    struct_id: "alarm_t".into(),
+                    fields: vec![],
+                },
+            ),
         ],
     };
     assert_eq!(desc.value_scalar_type(), Some(ScalarType::Double));
@@ -348,7 +370,13 @@ fn size_encoding_roundtrip_both_endians() {
 
 #[test]
 fn string_encoding_roundtrip_both_endians() {
-    let test_strings = ["", "a", "hello world", "EPICS:PV:NAME", "unicode: \u{00e9}\u{00e8}"];
+    let test_strings = [
+        "",
+        "a",
+        "hello world",
+        "EPICS:PV:NAME",
+        "unicode: \u{00e9}\u{00e8}",
+    ];
     for be in [false, true] {
         for s in &test_strings {
             let mut buf = Vec::new();
@@ -438,31 +466,43 @@ fn field_desc_serialization_roundtrip_nested_structure() {
         struct_id: "epics:nt/NTScalar:1.0".into(),
         fields: vec![
             ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("alarm".into(), FieldDesc::Structure {
-                struct_id: "alarm_t".into(),
-                fields: vec![
-                    ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
-                    ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
-                    ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                ],
-            }),
-            ("timeStamp".into(), FieldDesc::Structure {
-                struct_id: "time_t".into(),
-                fields: vec![
-                    ("secondsPastEpoch".into(), FieldDesc::Scalar(ScalarType::Long)),
-                    ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
-                    ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                ],
-            }),
-            ("display".into(), FieldDesc::Structure {
-                struct_id: "display_t".into(),
-                fields: vec![
-                    ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
-                    ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
-                    ("description".into(), FieldDesc::Scalar(ScalarType::String)),
-                    ("units".into(), FieldDesc::Scalar(ScalarType::String)),
-                ],
-            }),
+            (
+                "alarm".into(),
+                FieldDesc::Structure {
+                    struct_id: "alarm_t".into(),
+                    fields: vec![
+                        ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                    ],
+                },
+            ),
+            (
+                "timeStamp".into(),
+                FieldDesc::Structure {
+                    struct_id: "time_t".into(),
+                    fields: vec![
+                        (
+                            "secondsPastEpoch".into(),
+                            FieldDesc::Scalar(ScalarType::Long),
+                        ),
+                        ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
+                    ],
+                },
+            ),
+            (
+                "display".into(),
+                FieldDesc::Structure {
+                    struct_id: "display_t".into(),
+                    fields: vec![
+                        ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
+                        ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
+                        ("description".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ("units".into(), FieldDesc::Scalar(ScalarType::String)),
+                    ],
+                },
+            ),
         ],
     };
 
@@ -560,7 +600,10 @@ fn pv_field_structure_serialization_roundtrip() {
         struct_id: "test_t".into(),
         fields: vec![
             ("value".into(), PvField::Scalar(ScalarValue::Double(99.9))),
-            ("name".into(), PvField::Scalar(ScalarValue::String("sensor".into()))),
+            (
+                "name".into(),
+                PvField::Scalar(ScalarValue::String("sensor".into())),
+            ),
         ],
     });
 
@@ -864,7 +907,8 @@ fn scalar_value_display() {
 #[test]
 fn pv_structure_display_with_value() {
     let mut s = PvStructure::new("nt_scalar");
-    s.fields.push(("value".into(), PvField::Scalar(ScalarValue::Double(3.15))));
+    s.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.15))));
     // Display should show the value directly
     let display = format!("{s}");
     assert!(display.contains("3.15"));

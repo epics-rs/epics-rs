@@ -56,9 +56,7 @@ impl DeviceSupport for EpidSoftCallbackDeviceSupport {
                         value: EpicsValue::Double(epid.tval),
                     },
                     // Re-process after a short delay to allow triggered device to update
-                    ProcessAction::ReprocessAfter(
-                        std::time::Duration::from_millis(1),
-                    ),
+                    ProcessAction::ReprocessAfter(std::time::Duration::from_millis(1)),
                 ];
                 self.triggered = true;
                 return Ok(DeviceReadOutcome::computed_with(actions));

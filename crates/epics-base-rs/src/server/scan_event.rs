@@ -36,9 +36,7 @@ pub struct ScanSchedulerConfig {
 
 impl Default for ScanSchedulerConfig {
     fn default() -> Self {
-        Self {
-            max_concurrent: 64,
-        }
+        Self { max_concurrent: 64 }
     }
 }
 
@@ -210,8 +208,16 @@ mod tests {
     #[tokio::test]
     async fn coalesce_dedup() {
         let mut seen = HashSet::new();
-        let names = vec!["A".to_string(), "B".to_string(), "A".to_string(), "C".to_string()];
-        let unique: Vec<_> = names.into_iter().filter(|n| seen.insert(n.clone())).collect();
+        let names = vec![
+            "A".to_string(),
+            "B".to_string(),
+            "A".to_string(),
+            "C".to_string(),
+        ];
+        let unique: Vec<_> = names
+            .into_iter()
+            .filter(|n| seen.insert(n.clone()))
+            .collect();
         assert_eq!(unique, vec!["A", "B", "C"]);
     }
 }

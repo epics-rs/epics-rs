@@ -91,7 +91,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Le => {
                     let (a, b) = pop2(&mut stack)?;
-                    stack.push(if (a - b).abs() < 1e-11 || a < b { 1.0 } else { 0.0 });
+                    stack.push(if (a - b).abs() < 1e-11 || a < b {
+                        1.0
+                    } else {
+                        0.0
+                    });
                 }
                 CoreOp::Gt => {
                     let (a, b) = pop2(&mut stack)?;
@@ -99,7 +103,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Ge => {
                     let (a, b) = pop2(&mut stack)?;
-                    stack.push(if (a - b).abs() < 1e-11 || a > b { 1.0 } else { 0.0 });
+                    stack.push(if (a - b).abs() < 1e-11 || a > b {
+                        1.0
+                    } else {
+                        0.0
+                    });
                 }
 
                 // Logical
@@ -383,7 +391,9 @@ fn simple_random() -> f64 {
             .unwrap_or_default()
             .as_nanos() as u64;
     }
-    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    s = s
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     SEED.store(s, Ordering::Relaxed);
     ((s >> 11) as f64) / ((1u64 << 53) as f64) + f64::MIN_POSITIVE
 }

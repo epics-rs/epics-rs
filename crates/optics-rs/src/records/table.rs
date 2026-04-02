@@ -10,9 +10,7 @@ use std::f64::consts::PI;
 use std::sync::LazyLock;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record,
-};
+use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 // ---------------------------------------------------------------------------
@@ -124,7 +122,11 @@ pub enum AngleUnit {
 
 impl AngleUnit {
     fn from_u16(v: u16) -> Self {
-        if v == 0 { AngleUnit::Degrees } else { AngleUnit::Microradians }
+        if v == 0 {
+            AngleUnit::Degrees
+        } else {
+            AngleUnit::Microradians
+        }
     }
 
     fn torad(self) -> f64 {
@@ -167,7 +169,11 @@ struct Trajectory {
 
 impl Default for Trajectory {
     fn default() -> Self {
-        Self { user: 0.0, motor: [0.0; 6], lvio: false }
+        Self {
+            user: 0.0,
+            motor: [0.0; 6],
+            lvio: false,
+        }
     }
 }
 
@@ -421,44 +427,166 @@ impl Default for TableRecord {
         Self {
             vers: VERSION,
             val: 0.0,
-            lx: 0.0, lz: 0.0,
-            sx: 0.0, sy: 0.0, sz: 0.0,
-            rx: 0.0, ry: 0.0, rz: 0.0,
+            lx: 0.0,
+            lz: 0.0,
+            sx: 0.0,
+            sy: 0.0,
+            sz: 0.0,
+            rx: 0.0,
+            ry: 0.0,
+            rz: 0.0,
             yang: 0.0,
-            ax: 0.0, ay: 0.0, az: 0.0, x: 0.0, y: 0.0, z: 0.0,
-            ax0: 0.0, ay0: 0.0, az0: 0.0, x0: 0.0, y0: 0.0, z0: 0.0,
-            axl: 0.0, ayl: 0.0, azl: 0.0, xl: 0.0, yl: 0.0, zl: 0.0,
-            axrb: 0.0, ayrb: 0.0, azrb: 0.0, xrb: 0.0, yrb: 0.0, zrb: 0.0,
-            eax: 0.0, eay: 0.0, eaz: 0.0, ex: 0.0, ey: 0.0, ez: 0.0,
-            hlax: 0.0, hlay: 0.0, hlaz: 0.0, hlx: 0.0, hly: 0.0, hlz: 0.0,
-            llax: 0.0, llay: 0.0, llaz: 0.0, llx: 0.0, lly: 0.0, llz: 0.0,
-            uhax: 0.0, uhay: 0.0, uhaz: 0.0, uhx: 0.0, uhy: 0.0, uhz: 0.0,
-            ulax: 0.0, ulay: 0.0, ulaz: 0.0, ulx: 0.0, uly: 0.0, ulz: 0.0,
-            uhaxr: 0.0, uhayr: 0.0, uhazr: 0.0, uhxr: 0.0, uhyr: 0.0, uhzr: 0.0,
-            ulaxr: 0.0, ulayr: 0.0, ulazr: 0.0, ulxr: 0.0, ulyr: 0.0, ulzr: 0.0,
-            m0xl: String::new(), m0yl: String::new(), m1yl: String::new(),
-            m2xl: String::new(), m2yl: String::new(), m2zl: String::new(),
-            m0x: 0.0, m0y: 0.0, m1y: 0.0, m2x: 0.0, m2y: 0.0, m2z: 0.0,
-            r0xi: String::new(), r0yi: String::new(), r1yi: String::new(),
-            r2xi: String::new(), r2yi: String::new(), r2zi: String::new(),
-            r0x: 0.0, r0y: 0.0, r1y: 0.0, r2x: 0.0, r2y: 0.0, r2z: 0.0,
-            e0xi: String::new(), e0yi: String::new(), e1yi: String::new(),
-            e2xi: String::new(), e2yi: String::new(), e2zi: String::new(),
-            e0x: 0.0, e0y: 0.0, e1y: 0.0, e2x: 0.0, e2y: 0.0, e2z: 0.0,
-            v0xl: String::new(), v0yl: String::new(), v1yl: String::new(),
-            v2xl: String::new(), v2yl: String::new(), v2zl: String::new(),
-            v0x: 0.0, v0y: 0.0, v1y: 0.0, v2x: 0.0, v2y: 0.0, v2z: 0.0,
-            v0xi: String::new(), v0yi: String::new(), v1yi: String::new(),
-            v2xi: String::new(), v2yi: String::new(), v2zi: String::new(),
-            h0xl: String::new(), h0yl: String::new(), h1yl: String::new(),
-            h2xl: String::new(), h2yl: String::new(), h2zl: String::new(),
-            h0x: 0.0, h0y: 0.0, h1y: 0.0, h2x: 0.0, h2y: 0.0, h2z: 0.0,
-            l0xl: String::new(), l0yl: String::new(), l1yl: String::new(),
-            l2xl: String::new(), l2yl: String::new(), l2zl: String::new(),
-            l0x: 0.0, l0y: 0.0, l1y: 0.0, l2x: 0.0, l2y: 0.0, l2z: 0.0,
-            init: 0, zero: 0, sync: 0, read: 0,
+            ax: 0.0,
+            ay: 0.0,
+            az: 0.0,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            ax0: 0.0,
+            ay0: 0.0,
+            az0: 0.0,
+            x0: 0.0,
+            y0: 0.0,
+            z0: 0.0,
+            axl: 0.0,
+            ayl: 0.0,
+            azl: 0.0,
+            xl: 0.0,
+            yl: 0.0,
+            zl: 0.0,
+            axrb: 0.0,
+            ayrb: 0.0,
+            azrb: 0.0,
+            xrb: 0.0,
+            yrb: 0.0,
+            zrb: 0.0,
+            eax: 0.0,
+            eay: 0.0,
+            eaz: 0.0,
+            ex: 0.0,
+            ey: 0.0,
+            ez: 0.0,
+            hlax: 0.0,
+            hlay: 0.0,
+            hlaz: 0.0,
+            hlx: 0.0,
+            hly: 0.0,
+            hlz: 0.0,
+            llax: 0.0,
+            llay: 0.0,
+            llaz: 0.0,
+            llx: 0.0,
+            lly: 0.0,
+            llz: 0.0,
+            uhax: 0.0,
+            uhay: 0.0,
+            uhaz: 0.0,
+            uhx: 0.0,
+            uhy: 0.0,
+            uhz: 0.0,
+            ulax: 0.0,
+            ulay: 0.0,
+            ulaz: 0.0,
+            ulx: 0.0,
+            uly: 0.0,
+            ulz: 0.0,
+            uhaxr: 0.0,
+            uhayr: 0.0,
+            uhazr: 0.0,
+            uhxr: 0.0,
+            uhyr: 0.0,
+            uhzr: 0.0,
+            ulaxr: 0.0,
+            ulayr: 0.0,
+            ulazr: 0.0,
+            ulxr: 0.0,
+            ulyr: 0.0,
+            ulzr: 0.0,
+            m0xl: String::new(),
+            m0yl: String::new(),
+            m1yl: String::new(),
+            m2xl: String::new(),
+            m2yl: String::new(),
+            m2zl: String::new(),
+            m0x: 0.0,
+            m0y: 0.0,
+            m1y: 0.0,
+            m2x: 0.0,
+            m2y: 0.0,
+            m2z: 0.0,
+            r0xi: String::new(),
+            r0yi: String::new(),
+            r1yi: String::new(),
+            r2xi: String::new(),
+            r2yi: String::new(),
+            r2zi: String::new(),
+            r0x: 0.0,
+            r0y: 0.0,
+            r1y: 0.0,
+            r2x: 0.0,
+            r2y: 0.0,
+            r2z: 0.0,
+            e0xi: String::new(),
+            e0yi: String::new(),
+            e1yi: String::new(),
+            e2xi: String::new(),
+            e2yi: String::new(),
+            e2zi: String::new(),
+            e0x: 0.0,
+            e0y: 0.0,
+            e1y: 0.0,
+            e2x: 0.0,
+            e2y: 0.0,
+            e2z: 0.0,
+            v0xl: String::new(),
+            v0yl: String::new(),
+            v1yl: String::new(),
+            v2xl: String::new(),
+            v2yl: String::new(),
+            v2zl: String::new(),
+            v0x: 0.0,
+            v0y: 0.0,
+            v1y: 0.0,
+            v2x: 0.0,
+            v2y: 0.0,
+            v2z: 0.0,
+            v0xi: String::new(),
+            v0yi: String::new(),
+            v1yi: String::new(),
+            v2xi: String::new(),
+            v2yi: String::new(),
+            v2zi: String::new(),
+            h0xl: String::new(),
+            h0yl: String::new(),
+            h1yl: String::new(),
+            h2xl: String::new(),
+            h2yl: String::new(),
+            h2zl: String::new(),
+            h0x: 0.0,
+            h0y: 0.0,
+            h1y: 0.0,
+            h2x: 0.0,
+            h2y: 0.0,
+            h2z: 0.0,
+            l0xl: String::new(),
+            l0yl: String::new(),
+            l1yl: String::new(),
+            l2xl: String::new(),
+            l2yl: String::new(),
+            l2zl: String::new(),
+            l0x: 0.0,
+            l0y: 0.0,
+            l1y: 0.0,
+            l2x: 0.0,
+            l2y: 0.0,
+            l2z: 0.0,
+            init: 0,
+            zero: 0,
+            sync: 0,
+            read: 0,
             set: SetMode::Use,
-            sset: 0, suse: 0,
+            sset: 0,
+            suse: 0,
             lvio: 0,
             legu: String::new(),
             aegu: "degrees".into(),
@@ -467,8 +595,12 @@ impl Default for TableRecord {
             geom: Geometry::Sri,
             torad: D2R,
             aunit: AngleUnit::Degrees,
-            pp0: [0.0; 3], pp1: [0.0; 3], pp2: [0.0; 3],
-            ppo0: [0.0; 3], ppo1: [0.0; 3], ppo2: [0.0; 3],
+            pp0: [0.0; 3],
+            pp1: [0.0; 3],
+            pp2: [0.0; 3],
+            ppo0: [0.0; 3],
+            ppo1: [0.0; 3],
+            ppo2: [0.0; 3],
             a: [[0.0; 3]; 3],
             b: [[0.0; 3]; 3],
             lnk_stat: [LinkStatus::default(); 6],
@@ -489,8 +621,12 @@ impl TableRecord {
     }
 
     fn set_user_drive(&mut self, u: &[f64; 6]) {
-        self.ax = u[0]; self.ay = u[1]; self.az = u[2];
-        self.x = u[3]; self.y = u[4]; self.z = u[5];
+        self.ax = u[0];
+        self.ay = u[1];
+        self.az = u[2];
+        self.x = u[3];
+        self.y = u[4];
+        self.z = u[5];
     }
 
     fn user_offset(&self) -> [f64; 6] {
@@ -498,8 +634,12 @@ impl TableRecord {
     }
 
     fn set_user_offset(&mut self, o: &[f64; 6]) {
-        self.ax0 = o[0]; self.ay0 = o[1]; self.az0 = o[2];
-        self.x0 = o[3]; self.y0 = o[4]; self.z0 = o[5];
+        self.ax0 = o[0];
+        self.ay0 = o[1];
+        self.az0 = o[2];
+        self.x0 = o[3];
+        self.y0 = o[4];
+        self.z0 = o[5];
     }
 
     fn user_last(&self) -> [f64; 6] {
@@ -507,17 +647,27 @@ impl TableRecord {
     }
 
     fn set_user_last(&mut self, l: &[f64; 6]) {
-        self.axl = l[0]; self.ayl = l[1]; self.azl = l[2];
-        self.xl = l[3]; self.yl = l[4]; self.zl = l[5];
+        self.axl = l[0];
+        self.ayl = l[1];
+        self.azl = l[2];
+        self.xl = l[3];
+        self.yl = l[4];
+        self.zl = l[5];
     }
 
     fn user_readback(&self) -> [f64; 6] {
-        [self.axrb, self.ayrb, self.azrb, self.xrb, self.yrb, self.zrb]
+        [
+            self.axrb, self.ayrb, self.azrb, self.xrb, self.yrb, self.zrb,
+        ]
     }
 
     fn set_user_readback(&mut self, rb: &[f64; 6]) {
-        self.axrb = rb[0]; self.ayrb = rb[1]; self.azrb = rb[2];
-        self.xrb = rb[3]; self.yrb = rb[4]; self.zrb = rb[5];
+        self.axrb = rb[0];
+        self.ayrb = rb[1];
+        self.azrb = rb[2];
+        self.xrb = rb[3];
+        self.yrb = rb[4];
+        self.zrb = rb[5];
     }
 
     fn encoder_user(&self) -> [f64; 6] {
@@ -525,8 +675,12 @@ impl TableRecord {
     }
 
     fn set_encoder_user(&mut self, eu: &[f64; 6]) {
-        self.eax = eu[0]; self.eay = eu[1]; self.eaz = eu[2];
-        self.ex = eu[3]; self.ey = eu[4]; self.ez = eu[5];
+        self.eax = eu[0];
+        self.eay = eu[1];
+        self.eaz = eu[2];
+        self.ex = eu[3];
+        self.ey = eu[4];
+        self.ez = eu[5];
     }
 
     fn motor_drive(&self) -> [f64; 6] {
@@ -534,8 +688,12 @@ impl TableRecord {
     }
 
     fn set_motor_drive(&mut self, m: &[f64; 6]) {
-        self.m0x = m[0]; self.m0y = m[1]; self.m1y = m[2];
-        self.m2x = m[3]; self.m2y = m[4]; self.m2z = m[5];
+        self.m0x = m[0];
+        self.m0y = m[1];
+        self.m1y = m[2];
+        self.m2x = m[3];
+        self.m2y = m[4];
+        self.m2z = m[5];
     }
 
     fn motor_readback(&self) -> [f64; 6] {
@@ -543,8 +701,12 @@ impl TableRecord {
     }
 
     fn set_motor_readback(&mut self, r: &[f64; 6]) {
-        self.r0x = r[0]; self.r0y = r[1]; self.r1y = r[2];
-        self.r2x = r[3]; self.r2y = r[4]; self.r2z = r[5];
+        self.r0x = r[0];
+        self.r0y = r[1];
+        self.r1y = r[2];
+        self.r2x = r[3];
+        self.r2y = r[4];
+        self.r2z = r[5];
     }
 
     fn encoder_motor(&self) -> [f64; 6] {
@@ -552,8 +714,12 @@ impl TableRecord {
     }
 
     fn set_encoder_motor(&mut self, e: &[f64; 6]) {
-        self.e0x = e[0]; self.e0y = e[1]; self.e1y = e[2];
-        self.e2x = e[3]; self.e2y = e[4]; self.e2z = e[5];
+        self.e0x = e[0];
+        self.e0y = e[1];
+        self.e1y = e[2];
+        self.e2x = e[3];
+        self.e2y = e[4];
+        self.e2z = e[5];
     }
 
     fn speed_val(&self) -> [f64; 6] {
@@ -561,8 +727,12 @@ impl TableRecord {
     }
 
     fn set_speed_val(&mut self, v: &[f64; 6]) {
-        self.v0x = v[0]; self.v0y = v[1]; self.v1y = v[2];
-        self.v2x = v[3]; self.v2y = v[4]; self.v2z = v[5];
+        self.v0x = v[0];
+        self.v0y = v[1];
+        self.v1y = v[2];
+        self.v2x = v[3];
+        self.v2y = v[4];
+        self.v2z = v[5];
     }
 
     fn hi_motor_limit(&self) -> [f64; 6] {
@@ -570,8 +740,12 @@ impl TableRecord {
     }
 
     fn set_hi_motor_limit(&mut self, h: &[f64; 6]) {
-        self.h0x = h[0]; self.h0y = h[1]; self.h1y = h[2];
-        self.h2x = h[3]; self.h2y = h[4]; self.h2z = h[5];
+        self.h0x = h[0];
+        self.h0y = h[1];
+        self.h1y = h[2];
+        self.h2x = h[3];
+        self.h2y = h[4];
+        self.h2z = h[5];
     }
 
     fn lo_motor_limit(&self) -> [f64; 6] {
@@ -579,62 +753,102 @@ impl TableRecord {
     }
 
     fn set_lo_motor_limit(&mut self, l: &[f64; 6]) {
-        self.l0x = l[0]; self.l0y = l[1]; self.l1y = l[2];
-        self.l2x = l[3]; self.l2y = l[4]; self.l2z = l[5];
+        self.l0x = l[0];
+        self.l0y = l[1];
+        self.l1y = l[2];
+        self.l2x = l[3];
+        self.l2y = l[4];
+        self.l2z = l[5];
     }
 
     fn user_hi_abs(&self) -> [f64; 6] {
-        [self.uhax, self.uhay, self.uhaz, self.uhx, self.uhy, self.uhz]
+        [
+            self.uhax, self.uhay, self.uhaz, self.uhx, self.uhy, self.uhz,
+        ]
     }
 
     fn set_user_hi_abs(&mut self, u: &[f64; 6]) {
-        self.uhax = u[0]; self.uhay = u[1]; self.uhaz = u[2];
-        self.uhx = u[3]; self.uhy = u[4]; self.uhz = u[5];
+        self.uhax = u[0];
+        self.uhay = u[1];
+        self.uhaz = u[2];
+        self.uhx = u[3];
+        self.uhy = u[4];
+        self.uhz = u[5];
     }
 
     fn user_lo_abs(&self) -> [f64; 6] {
-        [self.ulax, self.ulay, self.ulaz, self.ulx, self.uly, self.ulz]
+        [
+            self.ulax, self.ulay, self.ulaz, self.ulx, self.uly, self.ulz,
+        ]
     }
 
     fn set_user_lo_abs(&mut self, u: &[f64; 6]) {
-        self.ulax = u[0]; self.ulay = u[1]; self.ulaz = u[2];
-        self.ulx = u[3]; self.uly = u[4]; self.ulz = u[5];
+        self.ulax = u[0];
+        self.ulay = u[1];
+        self.ulaz = u[2];
+        self.ulx = u[3];
+        self.uly = u[4];
+        self.ulz = u[5];
     }
 
     fn user_hi_rel(&self) -> [f64; 6] {
-        [self.uhaxr, self.uhayr, self.uhazr, self.uhxr, self.uhyr, self.uhzr]
+        [
+            self.uhaxr, self.uhayr, self.uhazr, self.uhxr, self.uhyr, self.uhzr,
+        ]
     }
 
     fn set_user_hi_rel(&mut self, u: &[f64; 6]) {
-        self.uhaxr = u[0]; self.uhayr = u[1]; self.uhazr = u[2];
-        self.uhxr = u[3]; self.uhyr = u[4]; self.uhzr = u[5];
+        self.uhaxr = u[0];
+        self.uhayr = u[1];
+        self.uhazr = u[2];
+        self.uhxr = u[3];
+        self.uhyr = u[4];
+        self.uhzr = u[5];
     }
 
     fn user_lo_rel(&self) -> [f64; 6] {
-        [self.ulaxr, self.ulayr, self.ulazr, self.ulxr, self.ulyr, self.ulzr]
+        [
+            self.ulaxr, self.ulayr, self.ulazr, self.ulxr, self.ulyr, self.ulzr,
+        ]
     }
 
     fn set_user_lo_rel(&mut self, u: &[f64; 6]) {
-        self.ulaxr = u[0]; self.ulayr = u[1]; self.ulazr = u[2];
-        self.ulxr = u[3]; self.ulyr = u[4]; self.ulzr = u[5];
+        self.ulaxr = u[0];
+        self.ulayr = u[1];
+        self.ulazr = u[2];
+        self.ulxr = u[3];
+        self.ulyr = u[4];
+        self.ulzr = u[5];
     }
 
     fn calc_hi_limit(&self) -> [f64; 6] {
-        [self.hlax, self.hlay, self.hlaz, self.hlx, self.hly, self.hlz]
+        [
+            self.hlax, self.hlay, self.hlaz, self.hlx, self.hly, self.hlz,
+        ]
     }
 
     fn set_calc_hi_limit(&mut self, h: &[f64; 6]) {
-        self.hlax = h[0]; self.hlay = h[1]; self.hlaz = h[2];
-        self.hlx = h[3]; self.hly = h[4]; self.hlz = h[5];
+        self.hlax = h[0];
+        self.hlay = h[1];
+        self.hlaz = h[2];
+        self.hlx = h[3];
+        self.hly = h[4];
+        self.hlz = h[5];
     }
 
     fn calc_lo_limit(&self) -> [f64; 6] {
-        [self.llax, self.llay, self.llaz, self.llx, self.lly, self.llz]
+        [
+            self.llax, self.llay, self.llaz, self.llx, self.lly, self.llz,
+        ]
     }
 
     fn set_calc_lo_limit(&mut self, l: &[f64; 6]) {
-        self.llax = l[0]; self.llay = l[1]; self.llaz = l[2];
-        self.llx = l[3]; self.lly = l[4]; self.llz = l[5];
+        self.llax = l[0];
+        self.llay = l[1];
+        self.llaz = l[2];
+        self.llx = l[3];
+        self.lly = l[4];
+        self.llz = l[5];
     }
 }
 
@@ -646,10 +860,23 @@ impl TableRecord {
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn init_geometry(
     geom: Geometry,
-    lx: f64, lz: f64,
-    sx: f64, sy: f64, sz: f64,
-    rx: f64, ry: f64, rz: f64,
-) -> ([f64; 3], [f64; 3], [f64; 3], [f64; 3], [f64; 3], [f64; 3], [[f64; 3]; 3]) {
+    lx: f64,
+    lz: f64,
+    sx: f64,
+    sy: f64,
+    sz: f64,
+    rx: f64,
+    ry: f64,
+    rz: f64,
+) -> (
+    [f64; 3],
+    [f64; 3],
+    [f64; 3],
+    [f64; 3],
+    [f64; 3],
+    [f64; 3],
+    [[f64; 3]; 3],
+) {
     let fx = rx + sx;
     let fy = ry + sy;
     let fz = rz + sz;
@@ -693,9 +920,7 @@ fn init_geometry(
     let iv = av * ev - bv * dv;
 
     // Inverse matrix
-    let det = av * (ev * iv - hv * fv)
-            + bv * (fv * gv - iv * dv)
-            + cv * (dv * hv - gv * ev);
+    let det = av * (ev * iv - hv * fv) + bv * (fv * gv - iv * dv) + cv * (dv * hv - gv * ev);
 
     let bb = [
         [
@@ -728,9 +953,9 @@ fn make_rotation_matrix(torad: f64, u: &[f64; 6]) -> [[f64; 3]; 3] {
     let sz = (torad * u[AZ_6]).sin();
 
     [
-        [cy * cz,              cy * sz,              -sy        ],
-        [sx * sy * cz - cx * sz, sx * sy * sz + cx * cz, sx * cy    ],
-        [cx * sy * cz + sx * sz, cx * sy * sz - sx * cz, cx * cy    ],
+        [cy * cz, cy * sz, -sy],
+        [sx * sy * cz - cx * sz, sx * sy * sz + cx * cz, sx * cy],
+        [cx * sy * cz + sx * sz, cx * sy * sz - sx * cz, cx * cy],
     ]
 }
 
@@ -739,11 +964,11 @@ fn rot_y(inp: &[f64; 6], angle: f64) -> [f64; 6] {
     let ca = angle.cos();
     let sa = angle.sin();
     let mut out = *inp;
-    out[X_6]  = inp[X_6]  * ca + inp[Z_6]  * sa;
+    out[X_6] = inp[X_6] * ca + inp[Z_6] * sa;
     out[AX_6] = inp[AX_6] * ca + inp[AZ_6] * sa;
-    out[Z_6]  = inp[X_6]  * (-sa) + inp[Z_6]  * ca;
+    out[Z_6] = inp[X_6] * (-sa) + inp[Z_6] * ca;
     out[AZ_6] = inp[AX_6] * (-sa) + inp[AZ_6] * ca;
-    out[Y_6]  = inp[Y_6];
+    out[Y_6] = inp[Y_6];
     out[AY_6] = inp[AY_6];
     out
 }
@@ -763,14 +988,24 @@ fn local_to_lab(yang: f64, local: &[f64; 6]) -> [f64; 6] {
 /// For Newport, this requires a pre-computed rotation matrix.
 fn naive_motor_to_pivot_point_vector(
     geom: Geometry,
-    ppo0: &[f64; 3], ppo1: &[f64; 3], ppo2: &[f64; 3],
+    ppo0: &[f64; 3],
+    ppo1: &[f64; 3],
+    ppo2: &[f64; 3],
     a: &[[f64; 3]; 3],
     m: &[f64; 6],
 ) -> ([f64; 3], [f64; 3], [f64; 3]) {
     match geom {
         Geometry::Sri | Geometry::Pnc | Geometry::Geocars => {
-            let q0 = [ppo0[X] + m[M0X], ppo0[Y] + m[M0Y], 0.0 /* to be solved */];
-            let q1 = [0.0 /* to be solved */, ppo1[Y] + m[M1Y], 0.0 /* to be solved */];
+            let q0 = [
+                ppo0[X] + m[M0X],
+                ppo0[Y] + m[M0Y],
+                0.0, /* to be solved */
+            ];
+            let q1 = [
+                0.0, /* to be solved */
+                ppo1[Y] + m[M1Y],
+                0.0, /* to be solved */
+            ];
             let q2 = [ppo2[X] + m[M2X], ppo2[Y] + m[M2Y], ppo2[Z] + m[M2Z]];
             (q0, q1, q2)
         }
@@ -800,12 +1035,13 @@ fn naive_motor_to_pivot_point_vector(
 /// Used for SRI, GEOCARS, PNC (not Newport).
 fn motor_to_pivot_point_vector(
     geom: Geometry,
-    ppo0: &[f64; 3], ppo1: &[f64; 3], ppo2: &[f64; 3],
+    ppo0: &[f64; 3],
+    ppo1: &[f64; 3],
+    ppo2: &[f64; 3],
     a: &[[f64; 3]; 3],
     m: &[f64; 6],
 ) -> ([f64; 3], [f64; 3], [f64; 3]) {
-    let (mut q0, mut q1, q2) =
-        naive_motor_to_pivot_point_vector(geom, ppo0, ppo1, ppo2, a, m);
+    let (mut q0, mut q1, q2) = naive_motor_to_pivot_point_vector(geom, ppo0, ppo1, ppo2, a, m);
 
     // Solve q0[Z] from |q0-q2| == |p0-p2|
     let d0x = ppo2[X] - ppo0[X];
@@ -818,8 +1054,8 @@ fn motor_to_pivot_point_vector(
     let dist = dist_sq.max(0.0).sqrt();
 
     q0[Z] = match geom {
-        Geometry::Geocars => q2[Z] + dist,  // root where q2[Z] < q0[Z]
-        _ => q2[Z] - dist,                  // root where q2[Z] > q0[Z]
+        Geometry::Geocars => q2[Z] + dist, // root where q2[Z] < q0[Z]
+        _ => q2[Z] - dist,                 // root where q2[Z] > q0[Z]
     };
 
     // Solve q1[X] and q1[Z] from:
@@ -843,10 +1079,11 @@ fn motor_to_pivot_point_vector(
     }
 
     let discriminant = (2.0 * s * t - 2.0 * s * q0[X] - 2.0 * q0[Z]).powi(2)
-        - 4.0 * (1.0 + s * s)
-            * (t * t - p10p10 - 2.0 * t * q0[X]
-                + q0[X] * q0[X] + q0[Y] * q0[Y] + q0[Z] * q0[Z]
-                - 2.0 * q0[Y] * q1[Y] + q1[Y] * q1[Y]);
+        - 4.0
+            * (1.0 + s * s)
+            * (t * t - p10p10 - 2.0 * t * q0[X] + q0[X] * q0[X] + q0[Y] * q0[Y] + q0[Z] * q0[Z]
+                - 2.0 * q0[Y] * q1[Y]
+                + q1[Y] * q1[Y]);
     let alpha = discriminant.max(0.0).sqrt();
 
     let denom = 2.0 * (1.0 + s * s);
@@ -869,7 +1106,9 @@ fn motor_to_pivot_point_vector(
 fn pivot_point_vector_to_local_user_angles(
     bb: &[[f64; 3]; 3],
     torad: f64,
-    q0: &[f64; 3], q1: &[f64; 3], q2: &[f64; 3],
+    q0: &[f64; 3],
+    q1: &[f64; 3],
+    q2: &[f64; 3],
 ) -> [f64; 6] {
     let av = q1[X] - q0[X];
     let bv = q1[Y] - q0[Y];
@@ -901,28 +1140,46 @@ fn pivot_point_vector_to_local_user_angles(
 /// Newport-specific: extract angles from motor positions using
 /// Mathematica-derived formulas.
 fn motor_to_local_user_angles(
-    ppo0: &[f64; 3], ppo1: &[f64; 3], ppo2: &[f64; 3],
+    ppo0: &[f64; 3],
+    ppo1: &[f64; 3],
+    ppo2: &[f64; 3],
     torad: f64,
     m: &[f64; 6],
 ) -> [f64; 6] {
-    let p0x = ppo0[X]; let p0y = ppo0[Y]; let p0z = ppo0[Z];
-    let p1x = ppo1[X]; let p1y = ppo1[Y]; let p1z = ppo1[Z];
-    let p2x = ppo2[X]; let p2y = ppo2[Y]; let p2z = ppo2[Z];
-    let p10x = p1x - p0x; let p10y = p1y - p0y; let p10z = p1z - p0z;
-    let p20x = p2x - p0x; let p20y = p2y - p0y; let p20z = p2z - p0z;
-    let p02x = p0x - p2x; let p02y = p0y - p2y; let p02z = p0z - p2z;
+    let p0x = ppo0[X];
+    let p0y = ppo0[Y];
+    let p0z = ppo0[Z];
+    let p1x = ppo1[X];
+    let p1y = ppo1[Y];
+    let p1z = ppo1[Z];
+    let p2x = ppo2[X];
+    let p2y = ppo2[Y];
+    let p2z = ppo2[Z];
+    let p10x = p1x - p0x;
+    let p10y = p1y - p0y;
+    let p10z = p1z - p0z;
+    let p20x = p2x - p0x;
+    let p20y = p2y - p0y;
+    let p20z = p2z - p0z;
+    let p02x = p0x - p2x;
+    let p02y = p0y - p2y;
+    let p02z = p0z - p2z;
     let p02x_2 = p02x * p02x;
     let p02y_2 = p02y * p02y;
     let p02z_2 = p02z * p02z;
 
-    let l0 = m[M0Y]; let _l1 = m[M1Y]; let _l2 = m[M2Y];
+    let l0 = m[M0Y];
+    let _l1 = m[M1Y];
+    let _l2 = m[M2Y];
     let l10 = m[M1Y] - m[M0Y];
     let l20 = m[M2Y] - m[M0Y];
     let l02 = m[M0Y] - m[M2Y];
     let l02_2 = l02 * l02;
 
-    let n0x = m[M0X]; let n2x = m[M2X];
-    let n02x = n0x - n2x; let n02x_2 = n02x * n02x;
+    let n0x = m[M0X];
+    let n2x = m[M2X];
+    let n02x = n0x - n2x;
+    let n02x_2 = n02x * n02x;
 
     // Normal vector to table
     let npx = p10y * p20z - p10z * p20y - p20z * l10 + p10z * l20;
@@ -935,15 +1192,13 @@ fn motor_to_local_user_angles(
     // Determinant for Mathematica solutions
     let det_base = p0z * (p1x - p2x) + p1z * p2x - p1x * p2z + p0x * (-p1z + p2z);
 
-    let ryx = (p1z * p2y - p1y * p2z
-        + p0y * (p1z - p2z) * (-1.0 + ryy)
+    let ryx = (p1z * p2y - p1y * p2z + p0y * (p1z - p2z) * (-1.0 + ryy)
         - (p1z * (l0 - _l2 + p2y) - (l0 - _l1 + p1y) * p2z) * ryy
         + p0z * (p1y - p2y + (_l1 - _l2 - p1y + p2y) * ryy))
         / det_base;
     let ryx_2 = ryx * ryx;
 
-    let ryz = (p1y * p2x - p1x * p2y
-        - p0y * (p1x - p2x) * (-1.0 + ryy)
+    let ryz = (p1y * p2x - p1x * p2y - p0y * (p1x - p2x) * (-1.0 + ryy)
         + (l0 * p1x - _l2 * p1x - l0 * p2x + _l1 * p2x - p1y * p2x + p1x * p2y) * ryy
         + p0x * (-p1y + p2y + (-_l1 + _l2 + p1y - p2y) * ryy))
         / det_base;
@@ -953,30 +1208,35 @@ fn motor_to_local_user_angles(
     u[Y_6] = (-(p0x * p1z * p2y) + p0x * p1y * p2z
         - p0y * (p1z * p2x - p1x * p2z) * (-1.0 + ryy)
         - _l2 * p0x * p1z * ryy
-        + l0 * p1z * p2x * ryy + p0x * p1z * p2y * ryy
+        + l0 * p1z * p2x * ryy
+        + p0x * p1z * p2y * ryy
         + _l1 * p0x * p2z * ryy
-        - l0 * p1x * p2z * ryy - p0x * p1y * p2z * ryy
-        + p0z * (p1y * p2x * (-1.0 + ryy) - (_l1 * p2x + p1x * p2y) * ryy
-            + p1x * (p2y + _l2 * ryy)))
+        - l0 * p1x * p2z * ryy
+        - p0x * p1y * p2z * ryy
+        + p0z
+            * (p1y * p2x * (-1.0 + ryy) - (_l1 * p2x + p1x * p2y) * ryy + p1x * (p2y + _l2 * ryy)))
         / det_base;
 
     // Solve for Rxx, Rxy, Rxz using rotation-matrix identities
     let a_coef = (n02x + p02x)
-        * (l02 * ryx * ryy - p02y * ryx * ryy - p02z * ryx * ryz
-            + p02x * (ryy_2 + ryz_2));
+        * (l02 * ryx * ryy - p02y * ryx * ryy - p02z * ryx * ryz + p02x * (ryy_2 + ryz_2));
 
-    let b_coef = -p02x_2 * ryx_2 + p02y_2 * ryx_2 + p02z_2 * ryx_2
-        - 2.0 * p02x * p02y * ryx * ryy + p02z_2 * ryy_2
+    let b_coef = -p02x_2 * ryx_2 + p02y_2 * ryx_2 + p02z_2 * ryx_2 - 2.0 * p02x * p02y * ryx * ryy
+        + p02z_2 * ryy_2
         - 2.0 * p02z * (p02x * ryx + p02y * ryy) * ryz
-        + p02y_2 * ryz_2 + l02_2 * (ryx_2 + ryz_2)
+        + p02y_2 * ryz_2
+        + l02_2 * (ryx_2 + ryz_2)
         - n02x_2 * (ryx_2 + ryy_2 + ryz_2)
         - 2.0 * n02x * p02x * (ryx_2 + ryy_2 + ryz_2)
         - 2.0 * l02 * (-ryy * (p02x * ryx + p02z * ryz) + p02y * (ryx_2 + ryz_2));
 
-    let c_coef = l02_2 * ryx_2 - 2.0 * l02 * p02y * ryx_2 + p02y_2 * ryx_2
+    let c_coef = l02_2 * ryx_2 - 2.0 * l02 * p02y * ryx_2
+        + p02y_2 * ryx_2
         + p02z_2 * ryx_2
-        + 2.0 * l02 * p02x * ryx * ryy - 2.0 * p02x * p02y * ryx * ryy
-        + p02x_2 * ryy_2 + p02z_2 * ryy_2
+        + 2.0 * l02 * p02x * ryx * ryy
+        - 2.0 * p02x * p02y * ryx * ryy
+        + p02x_2 * ryy_2
+        + p02z_2 * ryy_2
         - 2.0 * p02z * (p02x * ryx + (-l02 + p02y) * ryy) * ryz
         + (p02x_2 + (l02 - p02y) * (l02 - p02y)) * ryz_2;
 
@@ -984,15 +1244,17 @@ fn motor_to_local_user_angles(
 
     let rxx_1 = (a_coef - (p02z * ryy + (l02 - p02y) * ryz) * sqrt_b) / c_coef;
     let rxx_2 = (a_coef + (p02z * ryy + (l02 - p02y) * ryz) * sqrt_b) / c_coef;
-    let rxx = if (rxx_2 - 1.0).abs() < (rxx_1 - 1.0).abs() { rxx_2 } else { rxx_1 };
+    let rxx = if (rxx_2 - 1.0).abs() < (rxx_1 - 1.0).abs() {
+        rxx_2
+    } else {
+        rxx_1
+    };
 
-    let a2 = (n02x + p02x)
-        * (p02z * (ryx_2 + ryy_2) - (p02x * ryx + (-l02 + p02y) * ryy) * ryz);
+    let a2 = (n02x + p02x) * (p02z * (ryx_2 + ryy_2) - (p02x * ryx + (-l02 + p02y) * ryy) * ryz);
     let rxz = (a2 + (l02 * ryx - p02y * ryx + p02x * ryy) * sqrt_b) / c_coef;
 
     let a3 = -(n02x + p02x)
-        * (ryx * (l02 * ryx - p02y * ryx + p02x * ryy)
-            + p02z * ryy * ryz + (l02 - p02y) * ryz_2);
+        * (ryx * (l02 * ryx - p02y * ryx + p02x * ryy) + p02z * ryy * ryz + (l02 - p02y) * ryz_2);
     let rxy_1 = (a3 + (p02z * ryx - p02x * ryz) * sqrt_b) / c_coef;
     let rxy_2 = (a3 - (p02z * ryx - p02x * ryz) * sqrt_b) / c_coef;
     let tmp1 = (1.0 - (rxx * rxx + rxz * rxz)).max(0.0).sqrt();
@@ -1019,9 +1281,14 @@ fn motor_to_local_user_angles(
 #[allow(clippy::too_many_arguments)]
 fn motor_to_user(
     geom: Geometry,
-    torad: f64, yang: f64,
-    pp0: &mut [f64; 3], pp1: &mut [f64; 3], pp2: &mut [f64; 3],
-    ppo0: &[f64; 3], ppo1: &[f64; 3], ppo2: &[f64; 3],
+    torad: f64,
+    yang: f64,
+    pp0: &mut [f64; 3],
+    pp1: &mut [f64; 3],
+    pp2: &mut [f64; 3],
+    ppo0: &[f64; 3],
+    ppo1: &[f64; 3],
+    ppo2: &[f64; 3],
     a: &mut [[f64; 3]; 3],
     b: &[[f64; 3]; 3],
     lnk_stat: &[LinkStatus; 6],
@@ -1033,9 +1300,7 @@ fn motor_to_user(
             let (q0, q1, q2) = motor_to_pivot_point_vector(geom, ppo0, ppo1, ppo2, a, m);
             pivot_point_vector_to_local_user_angles(b, torad, &q0, &q1, &q2)
         }
-        Geometry::Newport => {
-            motor_to_local_user_angles(ppo0, ppo1, ppo2, torad, m)
-        }
+        Geometry::Newport => motor_to_local_user_angles(ppo0, ppo1, ppo2, torad, m),
     };
 
     // Recover rotation matrix to get translations
@@ -1099,7 +1364,9 @@ fn motor_to_user(
 /// Go from local user coordinates to rotated, translated pivot-point vectors.
 fn local_user_to_pivot_point_vector(
     _torad: f64,
-    ppo0: &[f64; 3], ppo1: &[f64; 3], ppo2: &[f64; 3],
+    ppo0: &[f64; 3],
+    ppo1: &[f64; 3],
+    ppo2: &[f64; 3],
     u: &[f64; 6],
     a: &[[f64; 3]; 3],
 ) -> ([f64; 3], [f64; 3], [f64; 3]) {
@@ -1128,10 +1395,14 @@ fn local_user_to_pivot_point_vector(
 #[allow(clippy::too_many_arguments)]
 fn pivot_point_vector_to_motor(
     geom: Geometry,
-    ppo0: &[f64; 3], ppo1: &[f64; 3], ppo2: &[f64; 3],
+    ppo0: &[f64; 3],
+    ppo1: &[f64; 3],
+    ppo2: &[f64; 3],
     a: &[[f64; 3]; 3],
     lnk_stat: &[LinkStatus; 6],
-    pp0: &[f64; 3], pp1: &[f64; 3], pp2: &[f64; 3],
+    pp0: &[f64; 3],
+    pp1: &[f64; 3],
+    pp2: &[f64; 3],
     u: &[f64; 6],
 ) -> ([f64; 6], [f64; 6]) {
     let mut m = [0.0f64; 6];
@@ -1147,8 +1418,7 @@ fn pivot_point_vector_to_motor(
             if lnk_stat[M2Z].can_rw_drive {
                 m[M2Z] = pp2[Z] - ppo2[Z];
             } else {
-                u_out[Z_6] = -(a[Z][X] * ppo2[X] + a[Z][Y] * ppo2[Y]
-                    + (a[Z][Z] - 1.0) * ppo2[Z]);
+                u_out[Z_6] = -(a[Z][X] * ppo2[X] + a[Z][Y] * ppo2[Y] + (a[Z][Z] - 1.0) * ppo2[Z]);
                 m[M2Z] = 0.0;
             }
         }
@@ -1167,13 +1437,9 @@ fn pivot_point_vector_to_motor(
                 m[M2X] = (pp2[X] - ppo2[X]) - norm[X] * m[M2Y];
             } else {
                 // 5-motor table: x is constrained by missing motor
-                u_out[X_6] = -((a[X][X] - 1.0) * ppo2[X]
-                    + a[X][Y] * ppo2[Y]
-                    + a[X][Z] * ppo2[Z]
+                u_out[X_6] = -((a[X][X] - 1.0) * ppo2[X] + a[X][Y] * ppo2[Y] + a[X][Z] * ppo2[Z]
                     - norm[X] * m[M2Y]);
-                m[M0X] = (a[X][X] - 1.0) * ppo0[X]
-                    + a[X][Y] * ppo0[Y]
-                    + a[X][Z] * ppo0[Z]
+                m[M0X] = (a[X][X] - 1.0) * ppo0[X] + a[X][Y] * ppo0[Y] + a[X][Z] * ppo0[Z]
                     - norm[X] * m[M0Y]
                     + u_out[X_6];
                 m[M2X] = 0.0;
@@ -1188,9 +1454,14 @@ fn pivot_point_vector_to_motor(
 #[allow(clippy::too_many_arguments)]
 fn user_to_motor(
     geom: Geometry,
-    torad: f64, yang: f64,
-    pp0: &mut [f64; 3], pp1: &mut [f64; 3], pp2: &mut [f64; 3],
-    ppo0: &[f64; 3], ppo1: &[f64; 3], ppo2: &[f64; 3],
+    torad: f64,
+    yang: f64,
+    pp0: &mut [f64; 3],
+    pp1: &mut [f64; 3],
+    pp2: &mut [f64; 3],
+    ppo0: &[f64; 3],
+    ppo1: &[f64; 3],
+    ppo2: &[f64; 3],
     a: &mut [[f64; 3]; 3],
     lnk_stat: &[LinkStatus; 6],
     ax0: &[f64; 6],
@@ -1209,17 +1480,20 @@ fn user_to_motor(
     *pp1 = lpp1;
     *pp2 = lpp2;
 
-    let (m, _u_out) = pivot_point_vector_to_motor(
-        geom, ppo0, ppo1, ppo2, a, lnk_stat, pp0, pp1, pp2, &u,
-    );
+    let (m, _u_out) =
+        pivot_point_vector_to_motor(geom, ppo0, ppo1, ppo2, a, lnk_stat, pp0, pp1, pp2, &u);
     m
 }
 
 /// Zero the table: make current rotation/translation appear as zero.
 fn zero_table(
-    ax: &mut [f64; 6], ax0: &mut [f64; 6], axl: &[f64; 6],
-    uhax: &[f64; 6], ulax: &[f64; 6],
-    uhaxr: &mut [f64; 6], ulaxr: &mut [f64; 6],
+    ax: &mut [f64; 6],
+    ax0: &mut [f64; 6],
+    axl: &[f64; 6],
+    uhax: &[f64; 6],
+    ulax: &[f64; 6],
+    uhaxr: &mut [f64; 6],
+    ulaxr: &mut [f64; 6],
 ) {
     for i in 0..6 {
         ax[i] = 0.0;
@@ -1306,7 +1580,8 @@ fn sort_trajectory(traj: &mut [Trajectory]) {
 
 /// Find the user-coordinate value at which a motor limit is first crossed.
 fn find_limit(
-    hm: &[f64; 6], lm: &[f64; 6],
+    hm: &[f64; 6],
+    lm: &[f64; 6],
     lnk_stat: &[LinkStatus; 6],
     traj: &mut [Trajectory],
     n: usize,
@@ -1330,21 +1605,23 @@ fn find_limit(
 
         // Check if high motor limit was crossed
         if (hm[i] > motor[0]) != (hm[i] > motor[n - 1])
-            && let Some((limit, _err)) = polint(&motor, &user, hm[i]) {
-                found = true;
-                if (limit - user[0]).abs() < (user_limit - user[0]).abs() {
-                    user_limit = limit;
-                }
+            && let Some((limit, _err)) = polint(&motor, &user, hm[i])
+        {
+            found = true;
+            if (limit - user[0]).abs() < (user_limit - user[0]).abs() {
+                user_limit = limit;
             }
+        }
 
         // Check if low motor limit was crossed
         if (lm[i] > motor[0]) != (lm[i] > motor[n - 1])
-            && let Some((limit, _err)) = polint(&motor, &user, lm[i]) {
-                found = true;
-                if (limit - user[0]).abs() < (user_limit - user[0]).abs() {
-                    user_limit = limit;
-                }
+            && let Some((limit, _err)) = polint(&motor, &user, lm[i])
+        {
+            found = true;
+            if (limit - user[0]).abs() < (user_limit - user[0]).abs() {
+                user_limit = limit;
             }
+        }
     }
 
     if found { Some(user_limit) } else { None }
@@ -1352,11 +1629,14 @@ fn find_limit(
 
 /// Check if any motor drive value violates its limits.
 fn motor_limit_viol(
-    m: &[f64; 6], hm: &[f64; 6], lm: &[f64; 6],
+    m: &[f64; 6],
+    hm: &[f64; 6],
+    lm: &[f64; 6],
     lnk_stat: &[LinkStatus; 6],
 ) -> bool {
     for i in 0..6 {
-        if lnk_stat[i].can_read_limits && lnk_stat[i].can_rw_drive
+        if lnk_stat[i].can_read_limits
+            && lnk_stat[i].can_rw_drive
             && (hm[i].abs() > SMALL || lm[i].abs() > SMALL)
             && (m[i] > hm[i] || m[i] < lm[i])
         {
@@ -1367,15 +1647,12 @@ fn motor_limit_viol(
 }
 
 /// Check if any user coordinate violates the calculated user limits.
-fn user_limit_viol(
-    ax: &[f64; 6],
-    hlax: &[f64; 6], llax: &[f64; 6],
-) -> bool {
+fn user_limit_viol(ax: &[f64; 6], hlax: &[f64; 6], llax: &[f64; 6]) -> bool {
     for i in 0..6 {
-        if (hlax[i].abs() > SMALL || llax[i].abs() > SMALL)
-            && (ax[i] < llax[i] || ax[i] > hlax[i]) {
-                return true;
-            }
+        if (hlax[i].abs() > SMALL || llax[i].abs() > SMALL) && (ax[i] < llax[i] || ax[i] > hlax[i])
+        {
+            return true;
+        }
     }
     false
 }
@@ -1384,20 +1661,28 @@ fn user_limit_viol(
 #[allow(clippy::too_many_arguments)]
 fn calc_local_user_limits(
     geom: Geometry,
-    torad: f64, yang: f64,
+    torad: f64,
+    yang: f64,
     aunit: AngleUnit,
-    pp0: &mut [f64; 3], pp1: &mut [f64; 3], pp2: &mut [f64; 3],
-    ppo0: &[f64; 3], ppo1: &[f64; 3], ppo2: &[f64; 3],
+    pp0: &mut [f64; 3],
+    pp1: &mut [f64; 3],
+    pp2: &mut [f64; 3],
+    ppo0: &[f64; 3],
+    ppo1: &[f64; 3],
+    ppo2: &[f64; 3],
     a: &mut [[f64; 3]; 3],
     _b: &[[f64; 3]; 3],
     lnk_stat: &[LinkStatus; 6],
     ax: &mut [f64; 6],
     ax0: &[f64; 6],
     m0x: &mut [f64; 6],
-    hm: &[f64; 6], lm: &[f64; 6],
+    hm: &[f64; 6],
+    lm: &[f64; 6],
 ) -> ([f64; 6], [f64; 6]) {
     // Recompute motors from current user coords
-    *m0x = user_to_motor(geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax);
+    *m0x = user_to_motor(
+        geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax,
+    );
 
     // Get naive pivot points for motor hi and lo limits
     let (pp0h, pp1h, pp2h) = naive_motor_to_pivot_point_vector(geom, ppo0, ppo1, ppo2, a, hm);
@@ -1463,12 +1748,16 @@ fn calc_local_user_limits(
         // Try to find a legal value for this coordinate
         if motor_limit_viol(m0x, hm, lm, lnk_stat) {
             ax[i] = 0.0;
-            *m0x = user_to_motor(geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax);
+            *m0x = user_to_motor(
+                geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax,
+            );
             if motor_limit_viol(m0x, hm, lm, lnk_stat) {
                 hu[i] = save;
                 lu[i] = save;
                 ax[i] = save;
-                *m0x = user_to_motor(geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax);
+                *m0x = user_to_motor(
+                    geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax,
+                );
                 continue;
             }
         }
@@ -1501,7 +1790,9 @@ fn calc_local_user_limits(
                     ax[i] = angle_max * ax[i].signum();
                 }
 
-                *m0x = user_to_motor(geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax);
+                *m0x = user_to_motor(
+                    geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax,
+                );
                 j += 1;
             }
 
@@ -1514,16 +1805,26 @@ fn calc_local_user_limits(
                     }
                 } else {
                     let val = if ii == 1 { -angle_max } else { angle_max };
-                    if ii == 0 { hu[i] = val; } else { lu[i] = val; }
+                    if ii == 0 {
+                        hu[i] = val;
+                    } else {
+                        lu[i] = val;
+                    }
                 }
             } else {
                 let val = if ii == 1 { -angle_max } else { angle_max };
-                if ii == 0 { hu[i] = val; } else { lu[i] = val; }
+                if ii == 0 {
+                    hu[i] = val;
+                } else {
+                    lu[i] = val;
+                }
             }
 
             // Restore user coordinate
             ax[i] = save;
-            *m0x = user_to_motor(geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax);
+            *m0x = user_to_motor(
+                geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax,
+            );
         }
     }
 
@@ -1532,15 +1833,12 @@ fn calc_local_user_limits(
 
 /// Convert translation limits from local user coords to lab user coords,
 /// accounting for the YANG rotation quadrant.
-fn user_limits_local_to_lab(
-    yang: f64,
-    hu: &mut [f64; 6], lu: &mut [f64; 6],
-) {
+fn user_limits_local_to_lab(yang: f64, hu: &mut [f64; 6], lu: &mut [f64; 6]) {
     let sa = (yang * D2R).sin();
     let ca = (yang * D2R).cos();
 
-    let quadrant: u8 = ((if sa >= 0.0 { 0x10 } else { 0x00 })
-        | (if ca >= 0.0 { 0x01 } else { 0x00 })) as u8;
+    let quadrant: u8 =
+        ((if sa >= 0.0 { 0x10 } else { 0x00 }) | (if ca >= 0.0 { 0x01 } else { 0x00 })) as u8;
 
     let (hi_x, lo_x, hi_z, lo_z) = match quadrant {
         0x11 => (
@@ -1580,24 +1878,31 @@ fn user_limits_local_to_lab(
 #[allow(clippy::too_many_arguments)]
 fn calc_user_limits(
     geom: Geometry,
-    torad: f64, yang: f64,
+    torad: f64,
+    yang: f64,
     aunit: AngleUnit,
-    pp0: &mut [f64; 3], pp1: &mut [f64; 3], pp2: &mut [f64; 3],
-    ppo0: &[f64; 3], ppo1: &[f64; 3], ppo2: &[f64; 3],
+    pp0: &mut [f64; 3],
+    pp1: &mut [f64; 3],
+    pp2: &mut [f64; 3],
+    ppo0: &[f64; 3],
+    ppo1: &[f64; 3],
+    ppo2: &[f64; 3],
     a: &mut [[f64; 3]; 3],
     _b: &[[f64; 3]; 3],
     lnk_stat: &[LinkStatus; 6],
     ax: &mut [f64; 6],
     ax0: &[f64; 6],
     m0x: &mut [f64; 6],
-    hm: &[f64; 6], lm: &[f64; 6],
-    uhax: &[f64; 6], ulax: &[f64; 6],
-    uhaxr: &[f64; 6], ulaxr: &[f64; 6],
+    hm: &[f64; 6],
+    lm: &[f64; 6],
+    uhax: &[f64; 6],
+    ulax: &[f64; 6],
+    uhaxr: &[f64; 6],
+    ulaxr: &[f64; 6],
 ) -> ([f64; 6], [f64; 6]) {
     let (mut hu, mut lu) = calc_local_user_limits(
-        geom, torad, yang, aunit,
-        pp0, pp1, pp2, ppo0, ppo1, ppo2,
-        a, _b, lnk_stat, ax, ax0, m0x, hm, lm,
+        geom, torad, yang, aunit, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, _b, lnk_stat, ax, ax0, m0x,
+        hm, lm,
     );
 
     user_limits_local_to_lab(yang, &mut hu, &mut lu);
@@ -1625,12 +1930,14 @@ impl TableRecord {
     /// Initialize geometry from current parameters.
     fn do_init_geometry(&mut self) {
         let (pp0, pp1, pp2, ppo0, ppo1, ppo2, bb) = init_geometry(
-            self.geom, self.lx, self.lz,
-            self.sx, self.sy, self.sz,
-            self.rx, self.ry, self.rz,
+            self.geom, self.lx, self.lz, self.sx, self.sy, self.sz, self.rx, self.ry, self.rz,
         );
-        self.pp0 = pp0; self.pp1 = pp1; self.pp2 = pp2;
-        self.ppo0 = ppo0; self.ppo1 = ppo1; self.ppo2 = ppo2;
+        self.pp0 = pp0;
+        self.pp1 = pp1;
+        self.pp2 = pp2;
+        self.ppo0 = ppo0;
+        self.ppo1 = ppo1;
+        self.ppo2 = ppo2;
         self.b = bb;
     }
 
@@ -1638,11 +1945,20 @@ impl TableRecord {
     fn do_motor_to_user(&mut self, m: &[f64; 6]) -> [f64; 6] {
         let ax0 = self.user_offset();
         motor_to_user(
-            self.geom, self.torad, self.yang,
-            &mut self.pp0, &mut self.pp1, &mut self.pp2,
-            &self.ppo0, &self.ppo1, &self.ppo2,
-            &mut self.a, &self.b,
-            &self.lnk_stat, &ax0, m,
+            self.geom,
+            self.torad,
+            self.yang,
+            &mut self.pp0,
+            &mut self.pp1,
+            &mut self.pp2,
+            &self.ppo0,
+            &self.ppo1,
+            &self.ppo2,
+            &mut self.a,
+            &self.b,
+            &self.lnk_stat,
+            &ax0,
+            m,
         )
     }
 
@@ -1650,10 +1966,19 @@ impl TableRecord {
     fn do_user_to_motor(&mut self, user: &[f64; 6]) -> [f64; 6] {
         let ax0 = self.user_offset();
         user_to_motor(
-            self.geom, self.torad, self.yang,
-            &mut self.pp0, &mut self.pp1, &mut self.pp2,
-            &self.ppo0, &self.ppo1, &self.ppo2,
-            &mut self.a, &self.lnk_stat, &ax0, user,
+            self.geom,
+            self.torad,
+            self.yang,
+            &mut self.pp0,
+            &mut self.pp1,
+            &mut self.pp2,
+            &self.ppo0,
+            &self.ppo1,
+            &self.ppo2,
+            &mut self.a,
+            &self.lnk_stat,
+            &ax0,
+            user,
         )
     }
 
@@ -1718,7 +2043,11 @@ impl TableRecord {
     }
 
     /// Build WriteDbLink actions to write speed then drive values.
-    fn build_output_actions(&self, motor_move_mask: u8, saved_speeds: &[f64; 6]) -> Vec<ProcessAction> {
+    fn build_output_actions(
+        &self,
+        motor_move_mask: u8,
+        saved_speeds: &[f64; 6],
+    ) -> Vec<ProcessAction> {
         let mut actions = Vec::new();
         let speeds = self.speed_val();
         let motors = self.motor_drive();
@@ -1758,22 +2087,33 @@ impl TableRecord {
 
     /// Determine link status by checking if link fields are non-empty.
     fn check_links(&mut self) {
-        let drive_links = [&self.m0xl, &self.m0yl, &self.m1yl, &self.m2xl, &self.m2yl, &self.m2zl];
-        let rbv_links = [&self.r0xi, &self.r0yi, &self.r1yi, &self.r2xi, &self.r2yi, &self.r2zi];
-        let enc_links = [&self.e0xi, &self.e0yi, &self.e1yi, &self.e2xi, &self.e2yi, &self.e2zi];
-        let spd_out = [&self.v0xl, &self.v0yl, &self.v1yl, &self.v2xl, &self.v2yl, &self.v2zl];
-        let spd_in = [&self.v0xi, &self.v0yi, &self.v1yi, &self.v2xi, &self.v2yi, &self.v2zi];
-        let hlm_links = [&self.h0xl, &self.h0yl, &self.h1yl, &self.h2xl, &self.h2yl, &self.h2zl];
-        let llm_links = [&self.l0xl, &self.l0yl, &self.l1yl, &self.l2xl, &self.l2yl, &self.l2zl];
+        let drive_links = [
+            &self.m0xl, &self.m0yl, &self.m1yl, &self.m2xl, &self.m2yl, &self.m2zl,
+        ];
+        let rbv_links = [
+            &self.r0xi, &self.r0yi, &self.r1yi, &self.r2xi, &self.r2yi, &self.r2zi,
+        ];
+        let enc_links = [
+            &self.e0xi, &self.e0yi, &self.e1yi, &self.e2xi, &self.e2yi, &self.e2zi,
+        ];
+        let spd_out = [
+            &self.v0xl, &self.v0yl, &self.v1yl, &self.v2xl, &self.v2yl, &self.v2zl,
+        ];
+        let spd_in = [
+            &self.v0xi, &self.v0yi, &self.v1yi, &self.v2xi, &self.v2yi, &self.v2zi,
+        ];
+        let hlm_links = [
+            &self.h0xl, &self.h0yl, &self.h1yl, &self.h2xl, &self.h2yl, &self.h2zl,
+        ];
+        let llm_links = [
+            &self.l0xl, &self.l0yl, &self.l1yl, &self.l2xl, &self.l2yl, &self.l2zl,
+        ];
 
         for i in 0..6 {
-            self.lnk_stat[i].can_rw_drive =
-                !drive_links[i].is_empty() && !rbv_links[i].is_empty();
-            self.lnk_stat[i].can_read_limits =
-                !hlm_links[i].is_empty() && !llm_links[i].is_empty();
+            self.lnk_stat[i].can_rw_drive = !drive_links[i].is_empty() && !rbv_links[i].is_empty();
+            self.lnk_stat[i].can_read_limits = !hlm_links[i].is_empty() && !llm_links[i].is_empty();
             self.lnk_stat[i].can_read_position = !enc_links[i].is_empty();
-            self.lnk_stat[i].can_rw_speed =
-                !spd_out[i].is_empty() && !spd_in[i].is_empty();
+            self.lnk_stat[i].can_rw_speed = !spd_out[i].is_empty() && !spd_in[i].is_empty();
         }
     }
 
@@ -1790,12 +2130,28 @@ impl TableRecord {
         let ulaxr = self.user_lo_rel();
 
         let (hu, lu) = calc_user_limits(
-            self.geom, self.torad, self.yang, self.aunit,
-            &mut self.pp0, &mut self.pp1, &mut self.pp2,
-            &self.ppo0, &self.ppo1, &self.ppo2,
-            &mut self.a, &self.b, &self.lnk_stat,
-            &mut ax, &ax0, &mut m0x,
-            &hm, &lm, &uhax, &ulax, &uhaxr, &ulaxr,
+            self.geom,
+            self.torad,
+            self.yang,
+            self.aunit,
+            &mut self.pp0,
+            &mut self.pp1,
+            &mut self.pp2,
+            &self.ppo0,
+            &self.ppo1,
+            &self.ppo2,
+            &mut self.a,
+            &self.b,
+            &self.lnk_stat,
+            &mut ax,
+            &ax0,
+            &mut m0x,
+            &hm,
+            &lm,
+            &uhax,
+            &ulax,
+            &uhaxr,
+            &ulaxr,
         );
 
         self.set_calc_hi_limit(&hu);
@@ -1812,200 +2168,880 @@ impl TableRecord {
 
 static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
     vec![
-        FieldDesc { name: "VERS", dbf_type: DbFieldType::Float, read_only: true },
-        FieldDesc { name: "VAL",  dbf_type: DbFieldType::Double, read_only: false },
+        FieldDesc {
+            name: "VERS",
+            dbf_type: DbFieldType::Float,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "VAL",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
         // Geometry parameters
-        FieldDesc { name: "LX",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "LZ",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "SX",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "SY",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "SZ",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "RX",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "RY",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "RZ",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "YANG", dbf_type: DbFieldType::Double, read_only: false },
+        FieldDesc {
+            name: "LX",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "LZ",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "SX",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "SY",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "SZ",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "RX",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "RY",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "RZ",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "YANG",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
         // User coordinates
-        FieldDesc { name: "AX",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "AY",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "AZ",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "X",    dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "Y",    dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "Z",    dbf_type: DbFieldType::Double, read_only: false },
+        FieldDesc {
+            name: "AX",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "AY",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "AZ",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "X",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "Y",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "Z",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
         // Offsets
-        FieldDesc { name: "AX0",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "AY0",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "AZ0",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "X0",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "Y0",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "Z0",   dbf_type: DbFieldType::Double, read_only: false },
+        FieldDesc {
+            name: "AX0",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "AY0",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "AZ0",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "X0",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "Y0",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "Z0",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
         // True values
-        FieldDesc { name: "AXL",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "AYL",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "AZL",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "XL",   dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "YL",   dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "ZL",   dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "AXL",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "AYL",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "AZL",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "XL",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "YL",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "ZL",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // Readbacks
-        FieldDesc { name: "AXRB", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "AYRB", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "AZRB", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "XRB",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "YRB",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "ZRB",  dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "AXRB",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "AYRB",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "AZRB",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "XRB",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "YRB",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "ZRB",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // Encoder user
-        FieldDesc { name: "EAX",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "EAY",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "EAZ",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "EX",   dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "EY",   dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "EZ",   dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "EAX",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "EAY",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "EAZ",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "EX",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "EY",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "EZ",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // Calculated user limits
-        FieldDesc { name: "HLAX", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "HLAY", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "HLAZ", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "HLX",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "HLY",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "HLZ",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "LLAX", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "LLAY", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "LLAZ", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "LLX",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "LLY",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "LLZ",  dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "HLAX",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "HLAY",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "HLAZ",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "HLX",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "HLY",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "HLZ",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "LLAX",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "LLAY",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "LLAZ",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "LLX",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "LLY",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "LLZ",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // User limits (absolute)
-        FieldDesc { name: "UHAX", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHAY", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHAZ", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHX",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHY",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHZ",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULAX", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULAY", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULAZ", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULX",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULY",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULZ",  dbf_type: DbFieldType::Double, read_only: false },
+        FieldDesc {
+            name: "UHAX",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHAY",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHAZ",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHX",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHY",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHZ",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULAX",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULAY",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULAZ",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULX",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULY",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULZ",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
         // User limits (relative)
-        FieldDesc { name: "UHAXR", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHAYR", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHAZR", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHXR",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHYR",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "UHZR",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULAXR", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULAYR", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULAZR", dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULXR",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULYR",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "ULZR",  dbf_type: DbFieldType::Double, read_only: false },
+        FieldDesc {
+            name: "UHAXR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHAYR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHAZR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHXR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHYR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "UHZR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULAXR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULAYR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULAZR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULXR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULYR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ULZR",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
         // Motor drive links
-        FieldDesc { name: "M0XL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "M0YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "M1YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "M2XL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "M2YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "M2ZL", dbf_type: DbFieldType::String, read_only: false },
+        FieldDesc {
+            name: "M0XL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "M0YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "M1YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "M2XL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "M2YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "M2ZL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
         // Motor drive values
-        FieldDesc { name: "M0X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "M0Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "M1Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "M2X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "M2Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "M2Z",  dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "M0X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "M0Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "M1Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "M2X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "M2Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "M2Z",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // Motor readback links
-        FieldDesc { name: "R0XI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "R0YI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "R1YI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "R2XI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "R2YI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "R2ZI", dbf_type: DbFieldType::String, read_only: false },
+        FieldDesc {
+            name: "R0XI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "R0YI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "R1YI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "R2XI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "R2YI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "R2ZI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
         // Motor readback values
-        FieldDesc { name: "R0X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "R0Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "R1Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "R2X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "R2Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "R2Z",  dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "R0X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "R0Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "R1Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "R2X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "R2Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "R2Z",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // Encoder links
-        FieldDesc { name: "E0XI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "E0YI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "E1YI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "E2XI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "E2YI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "E2ZI", dbf_type: DbFieldType::String, read_only: false },
+        FieldDesc {
+            name: "E0XI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "E0YI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "E1YI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "E2XI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "E2YI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "E2ZI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
         // Encoder motor values
-        FieldDesc { name: "E0X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "E0Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "E1Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "E2X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "E2Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "E2Z",  dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "E0X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "E0Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "E1Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "E2X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "E2Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "E2Z",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // Speed output links
-        FieldDesc { name: "V0XL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V0YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V1YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V2XL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V2YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V2ZL", dbf_type: DbFieldType::String, read_only: false },
+        FieldDesc {
+            name: "V0XL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V0YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V1YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V2XL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V2YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V2ZL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
         // Speed values
-        FieldDesc { name: "V0X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "V0Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "V1Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "V2X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "V2Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "V2Z",  dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "V0X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "V0Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "V1Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "V2X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "V2Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "V2Z",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // Speed input links
-        FieldDesc { name: "V0XI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V0YI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V1YI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V2XI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V2YI", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "V2ZI", dbf_type: DbFieldType::String, read_only: false },
+        FieldDesc {
+            name: "V0XI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V0YI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V1YI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V2XI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V2YI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "V2ZI",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
         // Motor hi limit links
-        FieldDesc { name: "H0XL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "H0YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "H1YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "H2XL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "H2YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "H2ZL", dbf_type: DbFieldType::String, read_only: false },
+        FieldDesc {
+            name: "H0XL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "H0YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "H1YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "H2XL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "H2YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "H2ZL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
         // Motor hi limit values
-        FieldDesc { name: "H0X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "H0Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "H1Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "H2X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "H2Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "H2Z",  dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "H0X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "H0Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "H1Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "H2X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "H2Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "H2Z",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // Motor lo limit links
-        FieldDesc { name: "L0XL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "L0YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "L1YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "L2XL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "L2YL", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "L2ZL", dbf_type: DbFieldType::String, read_only: false },
+        FieldDesc {
+            name: "L0XL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "L0YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "L1YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "L2XL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "L2YL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "L2ZL",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
         // Motor lo limit values
-        FieldDesc { name: "L0X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "L0Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "L1Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "L2X",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "L2Y",  dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "L2Z",  dbf_type: DbFieldType::Double, read_only: true },
+        FieldDesc {
+            name: "L0X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "L0Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "L1Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "L2X",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "L2Y",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "L2Z",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
         // Control fields
-        FieldDesc { name: "INIT", dbf_type: DbFieldType::Short, read_only: false },
-        FieldDesc { name: "ZERO", dbf_type: DbFieldType::Short, read_only: false },
-        FieldDesc { name: "SYNC", dbf_type: DbFieldType::Short, read_only: false },
-        FieldDesc { name: "READ", dbf_type: DbFieldType::Short, read_only: false },
-        FieldDesc { name: "SET",  dbf_type: DbFieldType::Enum, read_only: false },
-        FieldDesc { name: "SSET", dbf_type: DbFieldType::Short, read_only: false },
-        FieldDesc { name: "SUSE", dbf_type: DbFieldType::Short, read_only: false },
-        FieldDesc { name: "LVIO", dbf_type: DbFieldType::Short, read_only: true },
+        FieldDesc {
+            name: "INIT",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "ZERO",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "SYNC",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "READ",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "SET",
+            dbf_type: DbFieldType::Enum,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "SSET",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "SUSE",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "LVIO",
+            dbf_type: DbFieldType::Short,
+            read_only: true,
+        },
         // Display / config
-        FieldDesc { name: "LEGU", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "AEGU", dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "PREC", dbf_type: DbFieldType::Short, read_only: false },
-        FieldDesc { name: "MMAP", dbf_type: DbFieldType::Long, read_only: true },
-        FieldDesc { name: "GEOM", dbf_type: DbFieldType::Enum, read_only: false },
-        FieldDesc { name: "TORAD", dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "AUNIT", dbf_type: DbFieldType::Enum, read_only: false },
+        FieldDesc {
+            name: "LEGU",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "AEGU",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "PREC",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "MMAP",
+            dbf_type: DbFieldType::Long,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "GEOM",
+            dbf_type: DbFieldType::Enum,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "TORAD",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "AUNIT",
+            dbf_type: DbFieldType::Enum,
+            read_only: false,
+        },
     ]
 });
 
@@ -2033,18 +3069,18 @@ impl Record for TableRecord {
             let mut uhaxr = self.user_hi_rel();
             let mut ulaxr = self.user_lo_rel();
 
-            zero_table(&mut ax, &mut ax0, &axl, &uhax, &ulax, &mut uhaxr, &mut ulaxr);
+            zero_table(
+                &mut ax, &mut ax0, &axl, &uhax, &ulax, &mut uhaxr, &mut ulaxr,
+            );
 
             self.set_user_drive(&ax);
             self.set_user_offset(&ax0);
             self.set_user_hi_rel(&uhaxr);
             self.set_user_lo_rel(&ulaxr);
             self.zero = 0;
-
         } else if self.read != 0 {
             // --- Read motors (readback done below) ---
             self.read = 0;
-
         } else if self.sync != 0 {
             // --- Sync: read motor readbacks and set drive values to match ---
             let r = self.motor_readback();
@@ -2064,7 +3100,6 @@ impl Record for TableRecord {
             self.set_motor_drive(&m0x);
             self.set_user_last(&axl);
             self.sync = 0;
-
         } else if self.init != 0 {
             // --- Init: read motors, zero offsets, recalculate ---
             let ax0 = [0.0f64; 6];
@@ -2096,7 +3131,6 @@ impl Record for TableRecord {
             self.set_motor_drive(&m0x);
             self.set_user_last(&axl);
             self.init = 0;
-
         } else if self.set == SetMode::Set {
             // --- SET mode: update offsets ---
             let ax = self.user_drive();
@@ -2114,7 +3148,6 @@ impl Record for TableRecord {
             self.set_user_offset(&ax0);
             self.set_user_hi_rel(&uhaxr);
             self.set_user_lo_rel(&ulaxr);
-
         } else {
             // --- Calc & Move ---
             let sm = self.motor_drive();
@@ -2127,8 +3160,7 @@ impl Record for TableRecord {
             let hm = self.hi_motor_limit();
             let lm = self.lo_motor_limit();
 
-            if user_limit_viol(&ax, &hlax, &llax)
-                || motor_limit_viol(&m, &hm, &lm, &self.lnk_stat)
+            if user_limit_viol(&ax, &hlax, &llax) || motor_limit_viol(&m, &hm, &lm, &self.lnk_stat)
             {
                 // Limit violation: restore
                 self.lvio = 1;
@@ -2169,7 +3201,9 @@ impl Record for TableRecord {
                         }
                     }
                     if speed_ratio < 1.0 {
-                        for vi in v.iter_mut() { *vi *= speed_ratio; }
+                        for vi in v.iter_mut() {
+                            *vi *= speed_ratio;
+                        }
                     }
                     self.set_speed_val(&v);
                 } else {
@@ -2217,174 +3251,174 @@ impl Record for TableRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VERS"  => Some(EpicsValue::Float(self.vers)),
-            "VAL"   => Some(EpicsValue::Double(self.val)),
-            "LX"    => Some(EpicsValue::Double(self.lx)),
-            "LZ"    => Some(EpicsValue::Double(self.lz)),
-            "SX"    => Some(EpicsValue::Double(self.sx)),
-            "SY"    => Some(EpicsValue::Double(self.sy)),
-            "SZ"    => Some(EpicsValue::Double(self.sz)),
-            "RX"    => Some(EpicsValue::Double(self.rx)),
-            "RY"    => Some(EpicsValue::Double(self.ry)),
-            "RZ"    => Some(EpicsValue::Double(self.rz)),
-            "YANG"  => Some(EpicsValue::Double(self.yang)),
-            "AX"    => Some(EpicsValue::Double(self.ax)),
-            "AY"    => Some(EpicsValue::Double(self.ay)),
-            "AZ"    => Some(EpicsValue::Double(self.az)),
-            "X"     => Some(EpicsValue::Double(self.x)),
-            "Y"     => Some(EpicsValue::Double(self.y)),
-            "Z"     => Some(EpicsValue::Double(self.z)),
-            "AX0"   => Some(EpicsValue::Double(self.ax0)),
-            "AY0"   => Some(EpicsValue::Double(self.ay0)),
-            "AZ0"   => Some(EpicsValue::Double(self.az0)),
-            "X0"    => Some(EpicsValue::Double(self.x0)),
-            "Y0"    => Some(EpicsValue::Double(self.y0)),
-            "Z0"    => Some(EpicsValue::Double(self.z0)),
-            "AXL"   => Some(EpicsValue::Double(self.axl)),
-            "AYL"   => Some(EpicsValue::Double(self.ayl)),
-            "AZL"   => Some(EpicsValue::Double(self.azl)),
-            "XL"    => Some(EpicsValue::Double(self.xl)),
-            "YL"    => Some(EpicsValue::Double(self.yl)),
-            "ZL"    => Some(EpicsValue::Double(self.zl)),
-            "AXRB"  => Some(EpicsValue::Double(self.axrb)),
-            "AYRB"  => Some(EpicsValue::Double(self.ayrb)),
-            "AZRB"  => Some(EpicsValue::Double(self.azrb)),
-            "XRB"   => Some(EpicsValue::Double(self.xrb)),
-            "YRB"   => Some(EpicsValue::Double(self.yrb)),
-            "ZRB"   => Some(EpicsValue::Double(self.zrb)),
-            "EAX"   => Some(EpicsValue::Double(self.eax)),
-            "EAY"   => Some(EpicsValue::Double(self.eay)),
-            "EAZ"   => Some(EpicsValue::Double(self.eaz)),
-            "EX"    => Some(EpicsValue::Double(self.ex)),
-            "EY"    => Some(EpicsValue::Double(self.ey)),
-            "EZ"    => Some(EpicsValue::Double(self.ez)),
-            "HLAX"  => Some(EpicsValue::Double(self.hlax)),
-            "HLAY"  => Some(EpicsValue::Double(self.hlay)),
-            "HLAZ"  => Some(EpicsValue::Double(self.hlaz)),
-            "HLX"   => Some(EpicsValue::Double(self.hlx)),
-            "HLY"   => Some(EpicsValue::Double(self.hly)),
-            "HLZ"   => Some(EpicsValue::Double(self.hlz)),
-            "LLAX"  => Some(EpicsValue::Double(self.llax)),
-            "LLAY"  => Some(EpicsValue::Double(self.llay)),
-            "LLAZ"  => Some(EpicsValue::Double(self.llaz)),
-            "LLX"   => Some(EpicsValue::Double(self.llx)),
-            "LLY"   => Some(EpicsValue::Double(self.lly)),
-            "LLZ"   => Some(EpicsValue::Double(self.llz)),
-            "UHAX"  => Some(EpicsValue::Double(self.uhax)),
-            "UHAY"  => Some(EpicsValue::Double(self.uhay)),
-            "UHAZ"  => Some(EpicsValue::Double(self.uhaz)),
-            "UHX"   => Some(EpicsValue::Double(self.uhx)),
-            "UHY"   => Some(EpicsValue::Double(self.uhy)),
-            "UHZ"   => Some(EpicsValue::Double(self.uhz)),
-            "ULAX"  => Some(EpicsValue::Double(self.ulax)),
-            "ULAY"  => Some(EpicsValue::Double(self.ulay)),
-            "ULAZ"  => Some(EpicsValue::Double(self.ulaz)),
-            "ULX"   => Some(EpicsValue::Double(self.ulx)),
-            "ULY"   => Some(EpicsValue::Double(self.uly)),
-            "ULZ"   => Some(EpicsValue::Double(self.ulz)),
+            "VERS" => Some(EpicsValue::Float(self.vers)),
+            "VAL" => Some(EpicsValue::Double(self.val)),
+            "LX" => Some(EpicsValue::Double(self.lx)),
+            "LZ" => Some(EpicsValue::Double(self.lz)),
+            "SX" => Some(EpicsValue::Double(self.sx)),
+            "SY" => Some(EpicsValue::Double(self.sy)),
+            "SZ" => Some(EpicsValue::Double(self.sz)),
+            "RX" => Some(EpicsValue::Double(self.rx)),
+            "RY" => Some(EpicsValue::Double(self.ry)),
+            "RZ" => Some(EpicsValue::Double(self.rz)),
+            "YANG" => Some(EpicsValue::Double(self.yang)),
+            "AX" => Some(EpicsValue::Double(self.ax)),
+            "AY" => Some(EpicsValue::Double(self.ay)),
+            "AZ" => Some(EpicsValue::Double(self.az)),
+            "X" => Some(EpicsValue::Double(self.x)),
+            "Y" => Some(EpicsValue::Double(self.y)),
+            "Z" => Some(EpicsValue::Double(self.z)),
+            "AX0" => Some(EpicsValue::Double(self.ax0)),
+            "AY0" => Some(EpicsValue::Double(self.ay0)),
+            "AZ0" => Some(EpicsValue::Double(self.az0)),
+            "X0" => Some(EpicsValue::Double(self.x0)),
+            "Y0" => Some(EpicsValue::Double(self.y0)),
+            "Z0" => Some(EpicsValue::Double(self.z0)),
+            "AXL" => Some(EpicsValue::Double(self.axl)),
+            "AYL" => Some(EpicsValue::Double(self.ayl)),
+            "AZL" => Some(EpicsValue::Double(self.azl)),
+            "XL" => Some(EpicsValue::Double(self.xl)),
+            "YL" => Some(EpicsValue::Double(self.yl)),
+            "ZL" => Some(EpicsValue::Double(self.zl)),
+            "AXRB" => Some(EpicsValue::Double(self.axrb)),
+            "AYRB" => Some(EpicsValue::Double(self.ayrb)),
+            "AZRB" => Some(EpicsValue::Double(self.azrb)),
+            "XRB" => Some(EpicsValue::Double(self.xrb)),
+            "YRB" => Some(EpicsValue::Double(self.yrb)),
+            "ZRB" => Some(EpicsValue::Double(self.zrb)),
+            "EAX" => Some(EpicsValue::Double(self.eax)),
+            "EAY" => Some(EpicsValue::Double(self.eay)),
+            "EAZ" => Some(EpicsValue::Double(self.eaz)),
+            "EX" => Some(EpicsValue::Double(self.ex)),
+            "EY" => Some(EpicsValue::Double(self.ey)),
+            "EZ" => Some(EpicsValue::Double(self.ez)),
+            "HLAX" => Some(EpicsValue::Double(self.hlax)),
+            "HLAY" => Some(EpicsValue::Double(self.hlay)),
+            "HLAZ" => Some(EpicsValue::Double(self.hlaz)),
+            "HLX" => Some(EpicsValue::Double(self.hlx)),
+            "HLY" => Some(EpicsValue::Double(self.hly)),
+            "HLZ" => Some(EpicsValue::Double(self.hlz)),
+            "LLAX" => Some(EpicsValue::Double(self.llax)),
+            "LLAY" => Some(EpicsValue::Double(self.llay)),
+            "LLAZ" => Some(EpicsValue::Double(self.llaz)),
+            "LLX" => Some(EpicsValue::Double(self.llx)),
+            "LLY" => Some(EpicsValue::Double(self.lly)),
+            "LLZ" => Some(EpicsValue::Double(self.llz)),
+            "UHAX" => Some(EpicsValue::Double(self.uhax)),
+            "UHAY" => Some(EpicsValue::Double(self.uhay)),
+            "UHAZ" => Some(EpicsValue::Double(self.uhaz)),
+            "UHX" => Some(EpicsValue::Double(self.uhx)),
+            "UHY" => Some(EpicsValue::Double(self.uhy)),
+            "UHZ" => Some(EpicsValue::Double(self.uhz)),
+            "ULAX" => Some(EpicsValue::Double(self.ulax)),
+            "ULAY" => Some(EpicsValue::Double(self.ulay)),
+            "ULAZ" => Some(EpicsValue::Double(self.ulaz)),
+            "ULX" => Some(EpicsValue::Double(self.ulx)),
+            "ULY" => Some(EpicsValue::Double(self.uly)),
+            "ULZ" => Some(EpicsValue::Double(self.ulz)),
             "UHAXR" => Some(EpicsValue::Double(self.uhaxr)),
             "UHAYR" => Some(EpicsValue::Double(self.uhayr)),
             "UHAZR" => Some(EpicsValue::Double(self.uhazr)),
-            "UHXR"  => Some(EpicsValue::Double(self.uhxr)),
-            "UHYR"  => Some(EpicsValue::Double(self.uhyr)),
-            "UHZR"  => Some(EpicsValue::Double(self.uhzr)),
+            "UHXR" => Some(EpicsValue::Double(self.uhxr)),
+            "UHYR" => Some(EpicsValue::Double(self.uhyr)),
+            "UHZR" => Some(EpicsValue::Double(self.uhzr)),
             "ULAXR" => Some(EpicsValue::Double(self.ulaxr)),
             "ULAYR" => Some(EpicsValue::Double(self.ulayr)),
             "ULAZR" => Some(EpicsValue::Double(self.ulazr)),
-            "ULXR"  => Some(EpicsValue::Double(self.ulxr)),
-            "ULYR"  => Some(EpicsValue::Double(self.ulyr)),
-            "ULZR"  => Some(EpicsValue::Double(self.ulzr)),
-            "M0XL"  => Some(EpicsValue::String(self.m0xl.clone())),
-            "M0YL"  => Some(EpicsValue::String(self.m0yl.clone())),
-            "M1YL"  => Some(EpicsValue::String(self.m1yl.clone())),
-            "M2XL"  => Some(EpicsValue::String(self.m2xl.clone())),
-            "M2YL"  => Some(EpicsValue::String(self.m2yl.clone())),
-            "M2ZL"  => Some(EpicsValue::String(self.m2zl.clone())),
-            "M0X"   => Some(EpicsValue::Double(self.m0x)),
-            "M0Y"   => Some(EpicsValue::Double(self.m0y)),
-            "M1Y"   => Some(EpicsValue::Double(self.m1y)),
-            "M2X"   => Some(EpicsValue::Double(self.m2x)),
-            "M2Y"   => Some(EpicsValue::Double(self.m2y)),
-            "M2Z"   => Some(EpicsValue::Double(self.m2z)),
-            "R0XI"  => Some(EpicsValue::String(self.r0xi.clone())),
-            "R0YI"  => Some(EpicsValue::String(self.r0yi.clone())),
-            "R1YI"  => Some(EpicsValue::String(self.r1yi.clone())),
-            "R2XI"  => Some(EpicsValue::String(self.r2xi.clone())),
-            "R2YI"  => Some(EpicsValue::String(self.r2yi.clone())),
-            "R2ZI"  => Some(EpicsValue::String(self.r2zi.clone())),
-            "R0X"   => Some(EpicsValue::Double(self.r0x)),
-            "R0Y"   => Some(EpicsValue::Double(self.r0y)),
-            "R1Y"   => Some(EpicsValue::Double(self.r1y)),
-            "R2X"   => Some(EpicsValue::Double(self.r2x)),
-            "R2Y"   => Some(EpicsValue::Double(self.r2y)),
-            "R2Z"   => Some(EpicsValue::Double(self.r2z)),
-            "E0XI"  => Some(EpicsValue::String(self.e0xi.clone())),
-            "E0YI"  => Some(EpicsValue::String(self.e0yi.clone())),
-            "E1YI"  => Some(EpicsValue::String(self.e1yi.clone())),
-            "E2XI"  => Some(EpicsValue::String(self.e2xi.clone())),
-            "E2YI"  => Some(EpicsValue::String(self.e2yi.clone())),
-            "E2ZI"  => Some(EpicsValue::String(self.e2zi.clone())),
-            "E0X"   => Some(EpicsValue::Double(self.e0x)),
-            "E0Y"   => Some(EpicsValue::Double(self.e0y)),
-            "E1Y"   => Some(EpicsValue::Double(self.e1y)),
-            "E2X"   => Some(EpicsValue::Double(self.e2x)),
-            "E2Y"   => Some(EpicsValue::Double(self.e2y)),
-            "E2Z"   => Some(EpicsValue::Double(self.e2z)),
-            "V0XL"  => Some(EpicsValue::String(self.v0xl.clone())),
-            "V0YL"  => Some(EpicsValue::String(self.v0yl.clone())),
-            "V1YL"  => Some(EpicsValue::String(self.v1yl.clone())),
-            "V2XL"  => Some(EpicsValue::String(self.v2xl.clone())),
-            "V2YL"  => Some(EpicsValue::String(self.v2yl.clone())),
-            "V2ZL"  => Some(EpicsValue::String(self.v2zl.clone())),
-            "V0X"   => Some(EpicsValue::Double(self.v0x)),
-            "V0Y"   => Some(EpicsValue::Double(self.v0y)),
-            "V1Y"   => Some(EpicsValue::Double(self.v1y)),
-            "V2X"   => Some(EpicsValue::Double(self.v2x)),
-            "V2Y"   => Some(EpicsValue::Double(self.v2y)),
-            "V2Z"   => Some(EpicsValue::Double(self.v2z)),
-            "V0XI"  => Some(EpicsValue::String(self.v0xi.clone())),
-            "V0YI"  => Some(EpicsValue::String(self.v0yi.clone())),
-            "V1YI"  => Some(EpicsValue::String(self.v1yi.clone())),
-            "V2XI"  => Some(EpicsValue::String(self.v2xi.clone())),
-            "V2YI"  => Some(EpicsValue::String(self.v2yi.clone())),
-            "V2ZI"  => Some(EpicsValue::String(self.v2zi.clone())),
-            "H0XL"  => Some(EpicsValue::String(self.h0xl.clone())),
-            "H0YL"  => Some(EpicsValue::String(self.h0yl.clone())),
-            "H1YL"  => Some(EpicsValue::String(self.h1yl.clone())),
-            "H2XL"  => Some(EpicsValue::String(self.h2xl.clone())),
-            "H2YL"  => Some(EpicsValue::String(self.h2yl.clone())),
-            "H2ZL"  => Some(EpicsValue::String(self.h2zl.clone())),
-            "H0X"   => Some(EpicsValue::Double(self.h0x)),
-            "H0Y"   => Some(EpicsValue::Double(self.h0y)),
-            "H1Y"   => Some(EpicsValue::Double(self.h1y)),
-            "H2X"   => Some(EpicsValue::Double(self.h2x)),
-            "H2Y"   => Some(EpicsValue::Double(self.h2y)),
-            "H2Z"   => Some(EpicsValue::Double(self.h2z)),
-            "L0XL"  => Some(EpicsValue::String(self.l0xl.clone())),
-            "L0YL"  => Some(EpicsValue::String(self.l0yl.clone())),
-            "L1YL"  => Some(EpicsValue::String(self.l1yl.clone())),
-            "L2XL"  => Some(EpicsValue::String(self.l2xl.clone())),
-            "L2YL"  => Some(EpicsValue::String(self.l2yl.clone())),
-            "L2ZL"  => Some(EpicsValue::String(self.l2zl.clone())),
-            "L0X"   => Some(EpicsValue::Double(self.l0x)),
-            "L0Y"   => Some(EpicsValue::Double(self.l0y)),
-            "L1Y"   => Some(EpicsValue::Double(self.l1y)),
-            "L2X"   => Some(EpicsValue::Double(self.l2x)),
-            "L2Y"   => Some(EpicsValue::Double(self.l2y)),
-            "L2Z"   => Some(EpicsValue::Double(self.l2z)),
-            "INIT"  => Some(EpicsValue::Short(self.init)),
-            "ZERO"  => Some(EpicsValue::Short(self.zero)),
-            "SYNC"  => Some(EpicsValue::Short(self.sync)),
-            "READ"  => Some(EpicsValue::Short(self.read)),
-            "SET"   => Some(EpicsValue::Enum(self.set as u16)),
-            "SSET"  => Some(EpicsValue::Short(self.sset)),
-            "SUSE"  => Some(EpicsValue::Short(self.suse)),
-            "LVIO"  => Some(EpicsValue::Short(self.lvio)),
-            "LEGU"  => Some(EpicsValue::String(self.legu.clone())),
-            "AEGU"  => Some(EpicsValue::String(self.aegu.clone())),
-            "PREC"  => Some(EpicsValue::Short(self.prec)),
-            "MMAP"  => Some(EpicsValue::Long(self.mmap as i32)),
-            "GEOM"  => Some(EpicsValue::Enum(self.geom as u16)),
+            "ULXR" => Some(EpicsValue::Double(self.ulxr)),
+            "ULYR" => Some(EpicsValue::Double(self.ulyr)),
+            "ULZR" => Some(EpicsValue::Double(self.ulzr)),
+            "M0XL" => Some(EpicsValue::String(self.m0xl.clone())),
+            "M0YL" => Some(EpicsValue::String(self.m0yl.clone())),
+            "M1YL" => Some(EpicsValue::String(self.m1yl.clone())),
+            "M2XL" => Some(EpicsValue::String(self.m2xl.clone())),
+            "M2YL" => Some(EpicsValue::String(self.m2yl.clone())),
+            "M2ZL" => Some(EpicsValue::String(self.m2zl.clone())),
+            "M0X" => Some(EpicsValue::Double(self.m0x)),
+            "M0Y" => Some(EpicsValue::Double(self.m0y)),
+            "M1Y" => Some(EpicsValue::Double(self.m1y)),
+            "M2X" => Some(EpicsValue::Double(self.m2x)),
+            "M2Y" => Some(EpicsValue::Double(self.m2y)),
+            "M2Z" => Some(EpicsValue::Double(self.m2z)),
+            "R0XI" => Some(EpicsValue::String(self.r0xi.clone())),
+            "R0YI" => Some(EpicsValue::String(self.r0yi.clone())),
+            "R1YI" => Some(EpicsValue::String(self.r1yi.clone())),
+            "R2XI" => Some(EpicsValue::String(self.r2xi.clone())),
+            "R2YI" => Some(EpicsValue::String(self.r2yi.clone())),
+            "R2ZI" => Some(EpicsValue::String(self.r2zi.clone())),
+            "R0X" => Some(EpicsValue::Double(self.r0x)),
+            "R0Y" => Some(EpicsValue::Double(self.r0y)),
+            "R1Y" => Some(EpicsValue::Double(self.r1y)),
+            "R2X" => Some(EpicsValue::Double(self.r2x)),
+            "R2Y" => Some(EpicsValue::Double(self.r2y)),
+            "R2Z" => Some(EpicsValue::Double(self.r2z)),
+            "E0XI" => Some(EpicsValue::String(self.e0xi.clone())),
+            "E0YI" => Some(EpicsValue::String(self.e0yi.clone())),
+            "E1YI" => Some(EpicsValue::String(self.e1yi.clone())),
+            "E2XI" => Some(EpicsValue::String(self.e2xi.clone())),
+            "E2YI" => Some(EpicsValue::String(self.e2yi.clone())),
+            "E2ZI" => Some(EpicsValue::String(self.e2zi.clone())),
+            "E0X" => Some(EpicsValue::Double(self.e0x)),
+            "E0Y" => Some(EpicsValue::Double(self.e0y)),
+            "E1Y" => Some(EpicsValue::Double(self.e1y)),
+            "E2X" => Some(EpicsValue::Double(self.e2x)),
+            "E2Y" => Some(EpicsValue::Double(self.e2y)),
+            "E2Z" => Some(EpicsValue::Double(self.e2z)),
+            "V0XL" => Some(EpicsValue::String(self.v0xl.clone())),
+            "V0YL" => Some(EpicsValue::String(self.v0yl.clone())),
+            "V1YL" => Some(EpicsValue::String(self.v1yl.clone())),
+            "V2XL" => Some(EpicsValue::String(self.v2xl.clone())),
+            "V2YL" => Some(EpicsValue::String(self.v2yl.clone())),
+            "V2ZL" => Some(EpicsValue::String(self.v2zl.clone())),
+            "V0X" => Some(EpicsValue::Double(self.v0x)),
+            "V0Y" => Some(EpicsValue::Double(self.v0y)),
+            "V1Y" => Some(EpicsValue::Double(self.v1y)),
+            "V2X" => Some(EpicsValue::Double(self.v2x)),
+            "V2Y" => Some(EpicsValue::Double(self.v2y)),
+            "V2Z" => Some(EpicsValue::Double(self.v2z)),
+            "V0XI" => Some(EpicsValue::String(self.v0xi.clone())),
+            "V0YI" => Some(EpicsValue::String(self.v0yi.clone())),
+            "V1YI" => Some(EpicsValue::String(self.v1yi.clone())),
+            "V2XI" => Some(EpicsValue::String(self.v2xi.clone())),
+            "V2YI" => Some(EpicsValue::String(self.v2yi.clone())),
+            "V2ZI" => Some(EpicsValue::String(self.v2zi.clone())),
+            "H0XL" => Some(EpicsValue::String(self.h0xl.clone())),
+            "H0YL" => Some(EpicsValue::String(self.h0yl.clone())),
+            "H1YL" => Some(EpicsValue::String(self.h1yl.clone())),
+            "H2XL" => Some(EpicsValue::String(self.h2xl.clone())),
+            "H2YL" => Some(EpicsValue::String(self.h2yl.clone())),
+            "H2ZL" => Some(EpicsValue::String(self.h2zl.clone())),
+            "H0X" => Some(EpicsValue::Double(self.h0x)),
+            "H0Y" => Some(EpicsValue::Double(self.h0y)),
+            "H1Y" => Some(EpicsValue::Double(self.h1y)),
+            "H2X" => Some(EpicsValue::Double(self.h2x)),
+            "H2Y" => Some(EpicsValue::Double(self.h2y)),
+            "H2Z" => Some(EpicsValue::Double(self.h2z)),
+            "L0XL" => Some(EpicsValue::String(self.l0xl.clone())),
+            "L0YL" => Some(EpicsValue::String(self.l0yl.clone())),
+            "L1YL" => Some(EpicsValue::String(self.l1yl.clone())),
+            "L2XL" => Some(EpicsValue::String(self.l2xl.clone())),
+            "L2YL" => Some(EpicsValue::String(self.l2yl.clone())),
+            "L2ZL" => Some(EpicsValue::String(self.l2zl.clone())),
+            "L0X" => Some(EpicsValue::Double(self.l0x)),
+            "L0Y" => Some(EpicsValue::Double(self.l0y)),
+            "L1Y" => Some(EpicsValue::Double(self.l1y)),
+            "L2X" => Some(EpicsValue::Double(self.l2x)),
+            "L2Y" => Some(EpicsValue::Double(self.l2y)),
+            "L2Z" => Some(EpicsValue::Double(self.l2z)),
+            "INIT" => Some(EpicsValue::Short(self.init)),
+            "ZERO" => Some(EpicsValue::Short(self.zero)),
+            "SYNC" => Some(EpicsValue::Short(self.sync)),
+            "READ" => Some(EpicsValue::Short(self.read)),
+            "SET" => Some(EpicsValue::Enum(self.set as u16)),
+            "SSET" => Some(EpicsValue::Short(self.sset)),
+            "SUSE" => Some(EpicsValue::Short(self.suse)),
+            "LVIO" => Some(EpicsValue::Short(self.lvio)),
+            "LEGU" => Some(EpicsValue::String(self.legu.clone())),
+            "AEGU" => Some(EpicsValue::String(self.aegu.clone())),
+            "PREC" => Some(EpicsValue::Short(self.prec)),
+            "MMAP" => Some(EpicsValue::Long(self.mmap as i32)),
+            "GEOM" => Some(EpicsValue::Enum(self.geom as u16)),
             "TORAD" => Some(EpicsValue::Double(self.torad)),
             "AUNIT" => Some(EpicsValue::Enum(self.aunit as u16)),
             _ => None,
@@ -2394,141 +3428,163 @@ impl Record for TableRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         macro_rules! put_double {
             ($field:expr) => {
-                match value { EpicsValue::Double(v) => { $field = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) }
+                match value {
+                    EpicsValue::Double(v) => {
+                        $field = v;
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch(name.into())),
+                }
             };
         }
         macro_rules! put_short {
             ($field:expr) => {
-                match value { EpicsValue::Short(v) => { $field = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) }
+                match value {
+                    EpicsValue::Short(v) => {
+                        $field = v;
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch(name.into())),
+                }
             };
         }
         macro_rules! put_string {
             ($field:expr) => {
-                match value { EpicsValue::String(v) => { $field = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) }
+                match value {
+                    EpicsValue::String(v) => {
+                        $field = v;
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch(name.into())),
+                }
             };
         }
         macro_rules! put_enum {
             ($field:expr, $conv:expr) => {
-                match value { EpicsValue::Enum(v) => { $field = $conv(v); Ok(()) }
-                              EpicsValue::Short(v) => { $field = $conv(v as u16); Ok(()) }
-                              _ => Err(CaError::TypeMismatch(name.into())) }
+                match value {
+                    EpicsValue::Enum(v) => {
+                        $field = $conv(v);
+                        Ok(())
+                    }
+                    EpicsValue::Short(v) => {
+                        $field = $conv(v as u16);
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch(name.into())),
+                }
             };
         }
 
         match name {
             // Read-only fields
-            "VERS" | "AXL" | "AYL" | "AZL" | "XL" | "YL" | "ZL"
-            | "AXRB" | "AYRB" | "AZRB" | "XRB" | "YRB" | "ZRB"
-            | "EAX" | "EAY" | "EAZ" | "EX" | "EY" | "EZ"
-            | "HLAX" | "HLAY" | "HLAZ" | "HLX" | "HLY" | "HLZ"
-            | "LLAX" | "LLAY" | "LLAZ" | "LLX" | "LLY" | "LLZ"
-            | "M0X" | "M0Y" | "M1Y" | "M2X" | "M2Y" | "M2Z"
-            | "R0X" | "R0Y" | "R1Y" | "R2X" | "R2Y" | "R2Z"
-            | "E0X" | "E0Y" | "E1Y" | "E2X" | "E2Y" | "E2Z"
-            | "V0X" | "V0Y" | "V1Y" | "V2X" | "V2Y" | "V2Z"
-            | "H0X" | "H0Y" | "H1Y" | "H2X" | "H2Y" | "H2Z"
-            | "L0X" | "L0Y" | "L1Y" | "L2X" | "L2Y" | "L2Z"
-            | "LVIO" | "MMAP" | "TORAD" => Err(CaError::ReadOnlyField(name.into())),
+            "VERS" | "AXL" | "AYL" | "AZL" | "XL" | "YL" | "ZL" | "AXRB" | "AYRB" | "AZRB"
+            | "XRB" | "YRB" | "ZRB" | "EAX" | "EAY" | "EAZ" | "EX" | "EY" | "EZ" | "HLAX"
+            | "HLAY" | "HLAZ" | "HLX" | "HLY" | "HLZ" | "LLAX" | "LLAY" | "LLAZ" | "LLX"
+            | "LLY" | "LLZ" | "M0X" | "M0Y" | "M1Y" | "M2X" | "M2Y" | "M2Z" | "R0X" | "R0Y"
+            | "R1Y" | "R2X" | "R2Y" | "R2Z" | "E0X" | "E0Y" | "E1Y" | "E2X" | "E2Y" | "E2Z"
+            | "V0X" | "V0Y" | "V1Y" | "V2X" | "V2Y" | "V2Z" | "H0X" | "H0Y" | "H1Y" | "H2X"
+            | "H2Y" | "H2Z" | "L0X" | "L0Y" | "L1Y" | "L2X" | "L2Y" | "L2Z" | "LVIO" | "MMAP"
+            | "TORAD" => Err(CaError::ReadOnlyField(name.into())),
 
-            "VAL"   => put_double!(self.val),
-            "LX"    => put_double!(self.lx),
-            "LZ"    => put_double!(self.lz),
-            "SX"    => put_double!(self.sx),
-            "SY"    => put_double!(self.sy),
-            "SZ"    => put_double!(self.sz),
-            "RX"    => put_double!(self.rx),
-            "RY"    => put_double!(self.ry),
-            "RZ"    => put_double!(self.rz),
-            "YANG"  => put_double!(self.yang),
-            "AX"    => put_double!(self.ax),
-            "AY"    => put_double!(self.ay),
-            "AZ"    => put_double!(self.az),
-            "X"     => put_double!(self.x),
-            "Y"     => put_double!(self.y),
-            "Z"     => put_double!(self.z),
-            "AX0"   => put_double!(self.ax0),
-            "AY0"   => put_double!(self.ay0),
-            "AZ0"   => put_double!(self.az0),
-            "X0"    => put_double!(self.x0),
-            "Y0"    => put_double!(self.y0),
-            "Z0"    => put_double!(self.z0),
-            "UHAX"  => put_double!(self.uhax),
-            "UHAY"  => put_double!(self.uhay),
-            "UHAZ"  => put_double!(self.uhaz),
-            "UHX"   => put_double!(self.uhx),
-            "UHY"   => put_double!(self.uhy),
-            "UHZ"   => put_double!(self.uhz),
-            "ULAX"  => put_double!(self.ulax),
-            "ULAY"  => put_double!(self.ulay),
-            "ULAZ"  => put_double!(self.ulaz),
-            "ULX"   => put_double!(self.ulx),
-            "ULY"   => put_double!(self.uly),
-            "ULZ"   => put_double!(self.ulz),
+            "VAL" => put_double!(self.val),
+            "LX" => put_double!(self.lx),
+            "LZ" => put_double!(self.lz),
+            "SX" => put_double!(self.sx),
+            "SY" => put_double!(self.sy),
+            "SZ" => put_double!(self.sz),
+            "RX" => put_double!(self.rx),
+            "RY" => put_double!(self.ry),
+            "RZ" => put_double!(self.rz),
+            "YANG" => put_double!(self.yang),
+            "AX" => put_double!(self.ax),
+            "AY" => put_double!(self.ay),
+            "AZ" => put_double!(self.az),
+            "X" => put_double!(self.x),
+            "Y" => put_double!(self.y),
+            "Z" => put_double!(self.z),
+            "AX0" => put_double!(self.ax0),
+            "AY0" => put_double!(self.ay0),
+            "AZ0" => put_double!(self.az0),
+            "X0" => put_double!(self.x0),
+            "Y0" => put_double!(self.y0),
+            "Z0" => put_double!(self.z0),
+            "UHAX" => put_double!(self.uhax),
+            "UHAY" => put_double!(self.uhay),
+            "UHAZ" => put_double!(self.uhaz),
+            "UHX" => put_double!(self.uhx),
+            "UHY" => put_double!(self.uhy),
+            "UHZ" => put_double!(self.uhz),
+            "ULAX" => put_double!(self.ulax),
+            "ULAY" => put_double!(self.ulay),
+            "ULAZ" => put_double!(self.ulaz),
+            "ULX" => put_double!(self.ulx),
+            "ULY" => put_double!(self.uly),
+            "ULZ" => put_double!(self.ulz),
             "UHAXR" => put_double!(self.uhaxr),
             "UHAYR" => put_double!(self.uhayr),
             "UHAZR" => put_double!(self.uhazr),
-            "UHXR"  => put_double!(self.uhxr),
-            "UHYR"  => put_double!(self.uhyr),
-            "UHZR"  => put_double!(self.uhzr),
+            "UHXR" => put_double!(self.uhxr),
+            "UHYR" => put_double!(self.uhyr),
+            "UHZR" => put_double!(self.uhzr),
             "ULAXR" => put_double!(self.ulaxr),
             "ULAYR" => put_double!(self.ulayr),
             "ULAZR" => put_double!(self.ulazr),
-            "ULXR"  => put_double!(self.ulxr),
-            "ULYR"  => put_double!(self.ulyr),
-            "ULZR"  => put_double!(self.ulzr),
-            "M0XL"  => put_string!(self.m0xl),
-            "M0YL"  => put_string!(self.m0yl),
-            "M1YL"  => put_string!(self.m1yl),
-            "M2XL"  => put_string!(self.m2xl),
-            "M2YL"  => put_string!(self.m2yl),
-            "M2ZL"  => put_string!(self.m2zl),
-            "R0XI"  => put_string!(self.r0xi),
-            "R0YI"  => put_string!(self.r0yi),
-            "R1YI"  => put_string!(self.r1yi),
-            "R2XI"  => put_string!(self.r2xi),
-            "R2YI"  => put_string!(self.r2yi),
-            "R2ZI"  => put_string!(self.r2zi),
-            "E0XI"  => put_string!(self.e0xi),
-            "E0YI"  => put_string!(self.e0yi),
-            "E1YI"  => put_string!(self.e1yi),
-            "E2XI"  => put_string!(self.e2xi),
-            "E2YI"  => put_string!(self.e2yi),
-            "E2ZI"  => put_string!(self.e2zi),
-            "V0XL"  => put_string!(self.v0xl),
-            "V0YL"  => put_string!(self.v0yl),
-            "V1YL"  => put_string!(self.v1yl),
-            "V2XL"  => put_string!(self.v2xl),
-            "V2YL"  => put_string!(self.v2yl),
-            "V2ZL"  => put_string!(self.v2zl),
-            "V0XI"  => put_string!(self.v0xi),
-            "V0YI"  => put_string!(self.v0yi),
-            "V1YI"  => put_string!(self.v1yi),
-            "V2XI"  => put_string!(self.v2xi),
-            "V2YI"  => put_string!(self.v2yi),
-            "V2ZI"  => put_string!(self.v2zi),
-            "H0XL"  => put_string!(self.h0xl),
-            "H0YL"  => put_string!(self.h0yl),
-            "H1YL"  => put_string!(self.h1yl),
-            "H2XL"  => put_string!(self.h2xl),
-            "H2YL"  => put_string!(self.h2yl),
-            "H2ZL"  => put_string!(self.h2zl),
-            "L0XL"  => put_string!(self.l0xl),
-            "L0YL"  => put_string!(self.l0yl),
-            "L1YL"  => put_string!(self.l1yl),
-            "L2XL"  => put_string!(self.l2xl),
-            "L2YL"  => put_string!(self.l2yl),
-            "L2ZL"  => put_string!(self.l2zl),
-            "INIT"  => put_short!(self.init),
-            "ZERO"  => put_short!(self.zero),
-            "SYNC"  => put_short!(self.sync),
-            "READ"  => put_short!(self.read),
-            "SET"   => put_enum!(self.set, SetMode::from_u16),
-            "SSET"  => put_short!(self.sset),
-            "SUSE"  => put_short!(self.suse),
-            "LEGU"  => put_string!(self.legu),
-            "AEGU"  => put_string!(self.aegu),
-            "PREC"  => put_short!(self.prec),
-            "GEOM"  => put_enum!(self.geom, Geometry::from_u16),
+            "ULXR" => put_double!(self.ulxr),
+            "ULYR" => put_double!(self.ulyr),
+            "ULZR" => put_double!(self.ulzr),
+            "M0XL" => put_string!(self.m0xl),
+            "M0YL" => put_string!(self.m0yl),
+            "M1YL" => put_string!(self.m1yl),
+            "M2XL" => put_string!(self.m2xl),
+            "M2YL" => put_string!(self.m2yl),
+            "M2ZL" => put_string!(self.m2zl),
+            "R0XI" => put_string!(self.r0xi),
+            "R0YI" => put_string!(self.r0yi),
+            "R1YI" => put_string!(self.r1yi),
+            "R2XI" => put_string!(self.r2xi),
+            "R2YI" => put_string!(self.r2yi),
+            "R2ZI" => put_string!(self.r2zi),
+            "E0XI" => put_string!(self.e0xi),
+            "E0YI" => put_string!(self.e0yi),
+            "E1YI" => put_string!(self.e1yi),
+            "E2XI" => put_string!(self.e2xi),
+            "E2YI" => put_string!(self.e2yi),
+            "E2ZI" => put_string!(self.e2zi),
+            "V0XL" => put_string!(self.v0xl),
+            "V0YL" => put_string!(self.v0yl),
+            "V1YL" => put_string!(self.v1yl),
+            "V2XL" => put_string!(self.v2xl),
+            "V2YL" => put_string!(self.v2yl),
+            "V2ZL" => put_string!(self.v2zl),
+            "V0XI" => put_string!(self.v0xi),
+            "V0YI" => put_string!(self.v0yi),
+            "V1YI" => put_string!(self.v1yi),
+            "V2XI" => put_string!(self.v2xi),
+            "V2YI" => put_string!(self.v2yi),
+            "V2ZI" => put_string!(self.v2zi),
+            "H0XL" => put_string!(self.h0xl),
+            "H0YL" => put_string!(self.h0yl),
+            "H1YL" => put_string!(self.h1yl),
+            "H2XL" => put_string!(self.h2xl),
+            "H2YL" => put_string!(self.h2yl),
+            "H2ZL" => put_string!(self.h2zl),
+            "L0XL" => put_string!(self.l0xl),
+            "L0YL" => put_string!(self.l0yl),
+            "L1YL" => put_string!(self.l1yl),
+            "L2XL" => put_string!(self.l2xl),
+            "L2YL" => put_string!(self.l2yl),
+            "L2ZL" => put_string!(self.l2zl),
+            "INIT" => put_short!(self.init),
+            "ZERO" => put_short!(self.zero),
+            "SYNC" => put_short!(self.sync),
+            "READ" => put_short!(self.read),
+            "SET" => put_enum!(self.set, SetMode::from_u16),
+            "SSET" => put_short!(self.sset),
+            "SUSE" => put_short!(self.suse),
+            "LEGU" => put_string!(self.legu),
+            "AEGU" => put_string!(self.aegu),
+            "PREC" => put_short!(self.prec),
+            "GEOM" => put_enum!(self.geom, Geometry::from_u16),
             "AUNIT" => put_enum!(self.aunit, AngleUnit::from_u16),
             _ => Err(CaError::FieldNotFound(name.into())),
         }
@@ -2538,7 +3594,13 @@ impl Record for TableRecord {
         // Allow the framework to write read-only motor/encoder/limit/speed fields
         macro_rules! put_double_internal {
             ($field:expr) => {
-                match value { EpicsValue::Double(v) => { $field = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) }
+                match value {
+                    EpicsValue::Double(v) => {
+                        $field = v;
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch(name.into())),
+                }
             };
         }
         match name {
@@ -2601,8 +3663,8 @@ impl Record for TableRecord {
                 self.sync = 1;
             }
             // Absolute user limits -> update relative
-            "UHAX" | "UHAY" | "UHAZ" | "UHX" | "UHY" | "UHZ"
-            | "ULAX" | "ULAY" | "ULAZ" | "ULX" | "ULY" | "ULZ" => {
+            "UHAX" | "UHAY" | "UHAZ" | "UHX" | "UHY" | "UHZ" | "ULAX" | "ULAY" | "ULAZ" | "ULX"
+            | "ULY" | "ULZ" => {
                 // Map field name to index in the 12-element absolute limit space
                 let abs_hi = ["UHAX", "UHAY", "UHAZ", "UHX", "UHY", "UHZ"];
                 let abs_lo = ["ULAX", "ULAY", "ULAZ", "ULX", "ULY", "ULZ"];
@@ -2621,8 +3683,8 @@ impl Record for TableRecord {
                 }
             }
             // Relative user limits -> update absolute
-            "UHAXR" | "UHAYR" | "UHAZR" | "UHXR" | "UHYR" | "UHZR"
-            | "ULAXR" | "ULAYR" | "ULAZR" | "ULXR" | "ULYR" | "ULZR" => {
+            "UHAXR" | "UHAYR" | "UHAZR" | "UHXR" | "UHYR" | "UHZR" | "ULAXR" | "ULAYR"
+            | "ULAZR" | "ULXR" | "ULYR" | "ULZR" => {
                 let rel_hi = ["UHAXR", "UHAYR", "UHAZR", "UHXR", "UHYR", "UHZR"];
                 let rel_lo = ["ULAXR", "ULAYR", "ULAZR", "ULXR", "ULYR", "ULZR"];
                 let ax0 = self.user_offset();
@@ -2839,8 +3901,14 @@ mod tests {
         for i in 0..3 {
             for j in 0..3 {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((a[i][j] - expected).abs() < 1e-12,
-                    "a[{}][{}] = {}, expected {}", i, j, a[i][j], expected);
+                assert!(
+                    (a[i][j] - expected).abs() < 1e-12,
+                    "a[{}][{}] = {}, expected {}",
+                    i,
+                    j,
+                    a[i][j],
+                    expected
+                );
             }
         }
     }
@@ -2863,8 +3931,13 @@ mod tests {
         let local = lab_to_local(yang, &orig);
         let back = local_to_lab(yang, &local);
         for i in 0..6 {
-            assert!((back[i] - orig[i]).abs() < 1e-12,
-                "component {} mismatch: {} vs {}", i, back[i], orig[i]);
+            assert!(
+                (back[i] - orig[i]).abs() < 1e-12,
+                "component {} mismatch: {} vs {}",
+                i,
+                back[i],
+                orig[i]
+            );
         }
     }
 
@@ -2900,8 +3973,7 @@ mod tests {
         let m = [0.0; 6];
         let u = t.do_motor_to_user(&m);
         for i in 0..6 {
-            assert!(u[i].abs() < 1e-10,
-                "SRI zero motors: u[{}] = {}", i, u[i]);
+            assert!(u[i].abs() < 1e-10, "SRI zero motors: u[{}] = {}", i, u[i]);
         }
     }
 
@@ -2911,8 +3983,12 @@ mod tests {
         let m = [0.0; 6];
         let u = t.do_motor_to_user(&m);
         for i in 0..6 {
-            assert!(u[i].abs() < 1e-10,
-                "GEOCARS zero motors: u[{}] = {}", i, u[i]);
+            assert!(
+                u[i].abs() < 1e-10,
+                "GEOCARS zero motors: u[{}] = {}",
+                i,
+                u[i]
+            );
         }
     }
 
@@ -2922,8 +3998,7 @@ mod tests {
         let m = [0.0; 6];
         let u = t.do_motor_to_user(&m);
         for i in 0..6 {
-            assert!(u[i].abs() < 1e-10,
-                "PNC zero motors: u[{}] = {}", i, u[i]);
+            assert!(u[i].abs() < 1e-10, "PNC zero motors: u[{}] = {}", i, u[i]);
         }
     }
 
@@ -2933,8 +4008,12 @@ mod tests {
         let m = [0.0; 6];
         let u = t.do_motor_to_user(&m);
         for i in 0..6 {
-            assert!(u[i].abs() < 1e-10,
-                "Newport zero motors: u[{}] = {}", i, u[i]);
+            assert!(
+                u[i].abs() < 1e-10,
+                "Newport zero motors: u[{}] = {}",
+                i,
+                u[i]
+            );
         }
     }
 
@@ -2945,8 +4024,13 @@ mod tests {
         let m = t.do_user_to_motor(&user_orig);
         let user_back = t.do_motor_to_user(&m);
         for i in 0..6 {
-            assert!((user_back[i] - user_orig[i]).abs() < 1e-6,
-                "SRI roundtrip: u[{}] = {} vs {}", i, user_back[i], user_orig[i]);
+            assert!(
+                (user_back[i] - user_orig[i]).abs() < 1e-6,
+                "SRI roundtrip: u[{}] = {} vs {}",
+                i,
+                user_back[i],
+                user_orig[i]
+            );
         }
     }
 
@@ -2957,8 +4041,13 @@ mod tests {
         let m = t.do_user_to_motor(&user_orig);
         let user_back = t.do_motor_to_user(&m);
         for i in 0..6 {
-            assert!((user_back[i] - user_orig[i]).abs() < 1e-6,
-                "GEOCARS roundtrip: u[{}] = {} vs {}", i, user_back[i], user_orig[i]);
+            assert!(
+                (user_back[i] - user_orig[i]).abs() < 1e-6,
+                "GEOCARS roundtrip: u[{}] = {} vs {}",
+                i,
+                user_back[i],
+                user_orig[i]
+            );
         }
     }
 
@@ -2969,8 +4058,13 @@ mod tests {
         let m = t.do_user_to_motor(&user_orig);
         let user_back = t.do_motor_to_user(&m);
         for i in 0..6 {
-            assert!((user_back[i] - user_orig[i]).abs() < 1e-6,
-                "PNC roundtrip: u[{}] = {} vs {}", i, user_back[i], user_orig[i]);
+            assert!(
+                (user_back[i] - user_orig[i]).abs() < 1e-6,
+                "PNC roundtrip: u[{}] = {} vs {}",
+                i,
+                user_back[i],
+                user_orig[i]
+            );
         }
     }
 
@@ -2981,8 +4075,13 @@ mod tests {
         let m = t.do_user_to_motor(&user_orig);
         let user_back = t.do_motor_to_user(&m);
         for i in 0..6 {
-            assert!((user_back[i] - user_orig[i]).abs() < 1e-5,
-                "Newport roundtrip: u[{}] = {} vs {}", i, user_back[i], user_orig[i]);
+            assert!(
+                (user_back[i] - user_orig[i]).abs() < 1e-5,
+                "Newport roundtrip: u[{}] = {} vs {}",
+                i,
+                user_back[i],
+                user_orig[i]
+            );
         }
     }
 
@@ -2993,8 +4092,13 @@ mod tests {
         let u = t.do_motor_to_user(&motor_orig);
         let motor_back = t.do_user_to_motor(&u);
         for i in 0..6 {
-            assert!((motor_back[i] - motor_orig[i]).abs() < 1e-6,
-                "SRI motor roundtrip: m[{}] = {} vs {}", i, motor_back[i], motor_orig[i]);
+            assert!(
+                (motor_back[i] - motor_orig[i]).abs() < 1e-6,
+                "SRI motor roundtrip: m[{}] = {} vs {}",
+                i,
+                motor_back[i],
+                motor_orig[i]
+            );
         }
     }
 
@@ -3005,8 +4109,13 @@ mod tests {
         let u = t.do_motor_to_user(&motor_orig);
         let motor_back = t.do_user_to_motor(&u);
         for i in 0..6 {
-            assert!((motor_back[i] - motor_orig[i]).abs() < 1e-6,
-                "GEOCARS motor roundtrip: m[{}] = {} vs {}", i, motor_back[i], motor_orig[i]);
+            assert!(
+                (motor_back[i] - motor_orig[i]).abs() < 1e-6,
+                "GEOCARS motor roundtrip: m[{}] = {} vs {}",
+                i,
+                motor_back[i],
+                motor_orig[i]
+            );
         }
     }
 
@@ -3017,8 +4126,13 @@ mod tests {
         let u = t.do_motor_to_user(&motor_orig);
         let motor_back = t.do_user_to_motor(&u);
         for i in 0..6 {
-            assert!((motor_back[i] - motor_orig[i]).abs() < 1e-6,
-                "PNC motor roundtrip: m[{}] = {} vs {}", i, motor_back[i], motor_orig[i]);
+            assert!(
+                (motor_back[i] - motor_orig[i]).abs() < 1e-6,
+                "PNC motor roundtrip: m[{}] = {} vs {}",
+                i,
+                motor_back[i],
+                motor_orig[i]
+            );
         }
     }
 
@@ -3029,8 +4143,13 @@ mod tests {
         let u = t.do_motor_to_user(&motor_orig);
         let motor_back = t.do_user_to_motor(&u);
         for i in 0..6 {
-            assert!((motor_back[i] - motor_orig[i]).abs() < 1e-4,
-                "Newport motor roundtrip: m[{}] = {} vs {}", i, motor_back[i], motor_orig[i]);
+            assert!(
+                (motor_back[i] - motor_orig[i]).abs() < 1e-4,
+                "Newport motor roundtrip: m[{}] = {} vs {}",
+                i,
+                motor_back[i],
+                motor_orig[i]
+            );
         }
     }
 
@@ -3054,7 +4173,10 @@ mod tests {
         let hm = [3.0, 10.0, 10.0, 10.0, 10.0, 10.0];
         let lm = [-3.0, -10.0, -10.0, -10.0, -10.0, -10.0];
         let mut lnk = [LinkStatus::default(); 6];
-        for s in &mut lnk { s.can_rw_drive = true; s.can_read_limits = true; }
+        for s in &mut lnk {
+            s.can_rw_drive = true;
+            s.can_read_limits = true;
+        }
         assert!(motor_limit_viol(&m, &hm, &lm, &lnk));
 
         let m2 = [2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
@@ -3082,7 +4204,9 @@ mod tests {
         let mut uhaxr = [0.0; 6];
         let mut ulaxr = [0.0; 6];
 
-        zero_table(&mut ax, &mut ax0, &axl, &uhax, &ulax, &mut uhaxr, &mut ulaxr);
+        zero_table(
+            &mut ax, &mut ax0, &axl, &uhax, &ulax, &mut uhaxr, &mut ulaxr,
+        );
 
         for i in 0..6 {
             assert!(ax[i].abs() < 1e-12);
@@ -3100,8 +4224,13 @@ mod tests {
         let m = t.do_user_to_motor(&user);
         let u_back = t.do_motor_to_user(&m);
         for i in 0..6 {
-            assert!((u_back[i] - user[i]).abs() < 1e-6,
-                "YANG roundtrip: u[{}] = {} vs {}", i, u_back[i], user[i]);
+            assert!(
+                (u_back[i] - user[i]).abs() < 1e-6,
+                "YANG roundtrip: u[{}] = {} vs {}",
+                i,
+                u_back[i],
+                user[i]
+            );
         }
     }
 
@@ -3133,8 +4262,14 @@ mod tests {
                     val += t.b[i][k] * mat[k][j];
                 }
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((val - expected).abs() < 1e-10,
-                    "b*M[{}][{}] = {}, expected {}", i, j, val, expected);
+                assert!(
+                    (val - expected).abs() < 1e-10,
+                    "b*M[{}][{}] = {}, expected {}",
+                    i,
+                    j,
+                    val,
+                    expected
+                );
             }
         }
     }
@@ -3184,8 +4319,11 @@ mod tests {
         t.on_put("AUNIT");
 
         let expected_factor = 1.0e6 * D2R;
-        assert!((t.uhax - 10.0 * expected_factor).abs() < 1e-3,
-            "uhax after conversion: {}", t.uhax);
+        assert!(
+            (t.uhax - 10.0 * expected_factor).abs() < 1e-3,
+            "uhax after conversion: {}",
+            t.uhax
+        );
         assert!((t.torad - 1.0e-6).abs() < 1e-15);
         assert_eq!(t.aegu, "ur");
     }
@@ -3223,10 +4361,26 @@ mod tests {
     #[test]
     fn test_sort_trajectory() {
         let mut traj = vec![
-            Trajectory { user: 0.0, motor: [0.0; 6], lvio: false },
-            Trajectory { user: 3.0, motor: [0.0; 6], lvio: false },
-            Trajectory { user: 1.0, motor: [0.0; 6], lvio: false },
-            Trajectory { user: 2.0, motor: [0.0; 6], lvio: false },
+            Trajectory {
+                user: 0.0,
+                motor: [0.0; 6],
+                lvio: false,
+            },
+            Trajectory {
+                user: 3.0,
+                motor: [0.0; 6],
+                lvio: false,
+            },
+            Trajectory {
+                user: 1.0,
+                motor: [0.0; 6],
+                lvio: false,
+            },
+            Trajectory {
+                user: 2.0,
+                motor: [0.0; 6],
+                lvio: false,
+            },
         ];
         sort_trajectory(&mut traj);
         assert!((traj[0].user - 0.0).abs() < 1e-10);
@@ -3252,8 +4406,13 @@ mod tests {
         let u_back = t.do_motor_to_user(&m);
         for i in 0..6 {
             let tol = if i < 3 { 1.0 } else { 1e-5 };
-            assert!((u_back[i] - user[i]).abs() < tol,
-                "urad SRI roundtrip: u[{}] = {} vs {}", i, u_back[i], user[i]);
+            assert!(
+                (u_back[i] - user[i]).abs() < tol,
+                "urad SRI roundtrip: u[{}] = {} vs {}",
+                i,
+                u_back[i],
+                user[i]
+            );
         }
     }
 
@@ -3282,7 +4441,11 @@ mod tests {
             assert!(
                 (m[i] - c_motor[i]).abs() < eps,
                 "{}: motor[{}] = {:.15e}, C = {:.15e}, diff = {:.2e}",
-                label, i, m[i], c_motor[i], (m[i] - c_motor[i]).abs()
+                label,
+                i,
+                m[i],
+                c_motor[i],
+                (m[i] - c_motor[i]).abs()
             );
         }
         // Verify round-trip: motor->user should recover original user coords
@@ -3294,7 +4457,10 @@ mod tests {
                 assert!(
                     (u_back[i] - user[i]).abs() < rt_eps,
                     "{}: roundtrip[{}] = {:.15e}, expected {:.15e}",
-                    label, i, u_back[i], user[i]
+                    label,
+                    i,
+                    u_back[i],
+                    user[i]
                 );
             }
         }
@@ -3310,7 +4476,14 @@ mod tests {
         let mut t = make_sri_table();
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let c_motor = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_rt = [0.000000000000000e+00, -8.945310041616140e-16, 0.000000000000000e+00, -2.341876692568690e-15, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_rt = [
+            0.000000000000000e+00,
+            -8.945310041616140e-16,
+            0.000000000000000e+00,
+            -2.341876692568690e-15,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("SRI zeros", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3319,8 +4492,22 @@ mod tests {
         // SRI geometry, user=[2,0,0,0,0,0] — pure AX rotation
         let mut t = make_sri_table();
         let user = [2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [0.000000000000000e+00, -5.204465856329932e+00, -5.204465856329932e+00, 0.000000000000000e+00, 5.265383154420363e+00, 1.653598887989403e+00];
-        let c_rt = [2.000000000000001e+00, -8.945310041616140e-16, 0.000000000000000e+00, -2.341876692568690e-15, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            -5.204465856329932e+00,
+            -5.204465856329932e+00,
+            0.000000000000000e+00,
+            5.265383154420363e+00,
+            1.653598887989403e+00,
+        ];
+        let c_rt = [
+            2.000000000000001e+00,
+            -8.945310041616140e-16,
+            0.000000000000000e+00,
+            -2.341876692568690e-15,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("SRI AX=2", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3329,8 +4516,22 @@ mod tests {
         // SRI geometry, user=[0,1.5,0,0,0,0] — pure AY rotation
         let mut t = make_sri_table();
         let user = [0.0, 1.5, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [3.892274743736692e+00, 0.000000000000000e+00, 0.000000000000000e+00, -3.926542246180973e+00, 0.000000000000000e+00, -5.140125366639836e-02];
-        let c_rt = [0.000000000000000e+00, 1.499999999999996e+00, 0.000000000000000e+00, -1.110223024625157e-14, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            3.892274743736692e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            -3.926542246180973e+00,
+            0.000000000000000e+00,
+            -5.140125366639836e-02,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            1.499999999999996e+00,
+            0.000000000000000e+00,
+            -1.110223024625157e-14,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("SRI AY=1.5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3339,8 +4540,22 @@ mod tests {
         // SRI geometry, user=[0,0,-1,0,0,0] — pure AZ rotation
         let mut t = make_sri_table();
         let user = [0.0, 0.0, -1.0, 0.0, 0.0, 0.0];
-        let c_motor = [8.573898375033053e-01, 1.752855885908787e+00, -1.737625401547916e+00, 8.726203218641756e-01, 7.615242180435189e-03, 0.000000000000000e+00];
-        let c_rt = [1.372478793193544e-17, 1.607318644072144e-15, -1.000000000000000e+00, 4.107825191113079e-15, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            8.573898375033053e-01,
+            1.752855885908787e+00,
+            -1.737625401547916e+00,
+            8.726203218641756e-01,
+            7.615242180435189e-03,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            1.372478793193544e-17,
+            1.607318644072144e-15,
+            -1.000000000000000e+00,
+            4.107825191113079e-15,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("SRI AZ=-1", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3349,8 +4564,22 @@ mod tests {
         // SRI geometry, user=[0,0,0,3,0,0] — pure X translation
         let mut t = make_sri_table();
         let user = [0.0, 0.0, 0.0, 3.0, 0.0, 0.0];
-        let c_motor = [3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -8.945310041616140e-16, 0.000000000000000e+00, 2.999999999999998e+00, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -8.945310041616140e-16,
+            0.000000000000000e+00,
+            2.999999999999998e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("SRI X=3", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3359,8 +4588,22 @@ mod tests {
         // SRI geometry, user=[0,0,0,0,5,0] — pure Y translation
         let mut t = make_sri_table();
         let user = [0.0, 0.0, 0.0, 0.0, 5.0, 0.0];
-        let c_motor = [0.000000000000000e+00, 5.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -8.945310041616140e-16, 0.000000000000000e+00, -2.341876692568690e-15, 5.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -8.945310041616140e-16,
+            0.000000000000000e+00,
+            -2.341876692568690e-15,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("SRI Y=5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3369,8 +4612,22 @@ mod tests {
         // SRI geometry, user=[0,0,0,0,0,7] — pure Z translation
         let mut t = make_sri_table();
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 7.0];
-        let c_motor = [0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 7.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -8.945310041616140e-16, 0.000000000000000e+00, -2.341876692568690e-15, 0.000000000000000e+00, 7.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            7.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -8.945310041616140e-16,
+            0.000000000000000e+00,
+            -2.341876692568690e-15,
+            0.000000000000000e+00,
+            7.000000000000000e+00,
+        ];
         assert_golden("SRI Z=7", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3379,8 +4636,22 @@ mod tests {
         // SRI geometry, user=[1,-0.5,0.3,2,1,-1] — combined motion
         let mut t = make_sri_table();
         let user = [1.0, -0.5, 0.3, 2.0, 1.0, -1.0];
-        let c_motor = [4.240530355006058e-01, -2.148167220972560e+00, -1.070674555893262e+00, 3.047192101658052e+00, 3.626101682504157e+00, -1.536637935618046e-01];
-        let c_rt = [1.000000000000001e+00, -5.000000000000027e-01, 3.000000000000005e-01, 1.999999999999993e+00, 1.000000000000000e+00, -1.000000000000000e+00];
+        let c_motor = [
+            4.240530355006058e-01,
+            -2.148167220972560e+00,
+            -1.070674555893262e+00,
+            3.047192101658052e+00,
+            3.626101682504157e+00,
+            -1.536637935618046e-01,
+        ];
+        let c_rt = [
+            1.000000000000001e+00,
+            -5.000000000000027e-01,
+            3.000000000000005e-01,
+            1.999999999999993e+00,
+            1.000000000000000e+00,
+            -1.000000000000000e+00,
+        ];
         assert_golden("SRI combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3389,8 +4660,22 @@ mod tests {
         // SRI geometry, user=[3,2,-1,-2,3,1.5] — large combined motion
         let mut t = make_sri_table();
         let user = [3.0, 2.0, -1.0, -2.0, 3.0, 1.5];
-        let c_motor = [4.030874746064924e+00, -2.842418394250295e+00, -6.693360167962638e+00, -6.362835760233637e+00, 1.092333309663479e+01, 3.849991028658991e+00];
-        let c_rt = [3.000000000000000e+00, 2.000000000000009e+00, -1.000000000000001e+00, -1.999999999999978e+00, 3.000000000000000e+00, 1.500000000000000e+00];
+        let c_motor = [
+            4.030874746064924e+00,
+            -2.842418394250295e+00,
+            -6.693360167962638e+00,
+            -6.362835760233637e+00,
+            1.092333309663479e+01,
+            3.849991028658991e+00,
+        ];
+        let c_rt = [
+            3.000000000000000e+00,
+            2.000000000000009e+00,
+            -1.000000000000001e+00,
+            -1.999999999999978e+00,
+            3.000000000000000e+00,
+            1.500000000000000e+00,
+        ];
         assert_golden("SRI large combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3404,7 +4689,14 @@ mod tests {
         let mut t = make_geocars_table();
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let c_motor = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_rt = [0.000000000000000e+00, -0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_rt = [
+            0.000000000000000e+00,
+            -0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("GEOCARS zeros", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3413,8 +4705,22 @@ mod tests {
         // GEOCARS geometry, user=[2,0,0,0,0,0] — pure AX rotation
         let mut t = make_geocars_table();
         let user = [2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [0.000000000000000e+00, 3.045864904521522e-02, 5.265383154420363e+00, 0.000000000000000e+00, -5.204465856329932e+00, 1.836350782260695e+00];
-        let c_rt = [2.000000000000001e+00, -0.000000000000000e+00, -6.425168390553124e-17, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            3.045864904521522e-02,
+            5.265383154420363e+00,
+            0.000000000000000e+00,
+            -5.204465856329932e+00,
+            1.836350782260695e+00,
+        ];
+        let c_rt = [
+            2.000000000000001e+00,
+            -0.000000000000000e+00,
+            -6.425168390553124e-17,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("GEOCARS AX=2", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3423,8 +4729,22 @@ mod tests {
         // GEOCARS geometry, user=[0,1.5,0,0,0,0] — pure AY rotation
         let mut t = make_geocars_table();
         let user = [0.0, 1.5, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [3.426750244427978e-02, 0.000000000000000e+00, 0.000000000000000e+00, 3.892274743736692e+00, 0.000000000000000e+00, 2.669096084453713e+00];
-        let c_rt = [0.000000000000000e+00, 1.499999999999989e+00, 0.000000000000000e+00, 2.842170943040401e-14, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            3.426750244427978e-02,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            3.892274743736692e+00,
+            0.000000000000000e+00,
+            2.669096084453713e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            1.499999999999989e+00,
+            0.000000000000000e+00,
+            2.842170943040401e-14,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("GEOCARS AY=1.5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3433,8 +4753,22 @@ mod tests {
         // GEOCARS geometry, user=[0,0,-1,0,0,0] — pure AZ rotation
         let mut t = make_geocars_table();
         let user = [0.0, 0.0, -1.0, 0.0, 0.0, 0.0];
-        let c_motor = [8.878508062250461e-01, -1.737625401547916e+00, 1.752855885908787e+00, 8.573898375033053e-01, 1.752855885908787e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, 2.714073328182201e-15, -1.000000000000000e+00, -1.421085471520200e-14, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            8.878508062250461e-01,
+            -1.737625401547916e+00,
+            1.752855885908787e+00,
+            8.573898375033053e-01,
+            1.752855885908787e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            2.714073328182201e-15,
+            -1.000000000000000e+00,
+            -1.421085471520200e-14,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("GEOCARS AZ=-1", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3443,8 +4777,22 @@ mod tests {
         // GEOCARS geometry, user=[0,0,0,3,0,0] — pure X translation
         let mut t = make_geocars_table();
         let user = [0.0, 0.0, 0.0, 3.0, 0.0, 0.0];
-        let c_motor = [3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -0.000000000000000e+00, 0.000000000000000e+00, 3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -0.000000000000000e+00,
+            0.000000000000000e+00,
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("GEOCARS X=3", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3453,8 +4801,22 @@ mod tests {
         // GEOCARS geometry, user=[0,0,0,0,5,0] — pure Y translation
         let mut t = make_geocars_table();
         let user = [0.0, 0.0, 0.0, 0.0, 5.0, 0.0];
-        let c_motor = [0.000000000000000e+00, 5.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("GEOCARS Y=5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3463,8 +4825,22 @@ mod tests {
         // GEOCARS geometry, user=[0,0,0,0,0,7] — pure Z translation
         let mut t = make_geocars_table();
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 7.0];
-        let c_motor = [0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 7.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 7.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            7.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            7.000000000000000e+00,
+        ];
         assert_golden("GEOCARS Z=7", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3473,8 +4849,22 @@ mod tests {
         // GEOCARS geometry, user=[1,-0.5,0.3,2,1,-1] — combined motion
         let mut t = make_geocars_table();
         let user = [1.0, -0.5, 0.3, 2.0, 1.0, -1.0];
-        let c_motor = [1.743390193547228e+00, 1.547086729575270e+00, 3.087355349964504e+00, 4.240530355006058e-01, -2.148167220972560e+00, -9.599216628112970e-01];
-        let c_rt = [1.000000000000000e+00, -4.999999999999927e-01, 3.000000000000004e-01, 1.999999999999972e+00, 1.000000000000000e+00, -1.000000000000000e+00];
+        let c_motor = [
+            1.743390193547228e+00,
+            1.547086729575270e+00,
+            3.087355349964504e+00,
+            4.240530355006058e-01,
+            -2.148167220972560e+00,
+            -9.599216628112970e-01,
+        ];
+        let c_rt = [
+            1.000000000000000e+00,
+            -4.999999999999927e-01,
+            3.000000000000004e-01,
+            1.999999999999972e+00,
+            1.000000000000000e+00,
+            -1.000000000000000e+00,
+        ];
         assert_golden("GEOCARS combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3483,8 +4873,22 @@ mod tests {
         // GEOCARS geometry, user=[3,2,-1,-2,3,1.5] — large combined motion
         let mut t = make_geocars_table();
         let user = [3.0, 2.0, -1.0, -2.0, 3.0, 1.5];
-        let c_motor = [-1.051772750406755e+00, 1.152251020907990e+00, 1.284880398349096e+01, 4.030874746064924e+00, -2.842418394250295e+00, 7.836929211206836e+00];
-        let c_rt = [3.000000000000000e+00, 2.000000000000009e+00, -1.000000000000000e+00, -2.000000000000028e+00, 3.000000000000000e+00, 1.499999999999972e+00];
+        let c_motor = [
+            -1.051772750406755e+00,
+            1.152251020907990e+00,
+            1.284880398349096e+01,
+            4.030874746064924e+00,
+            -2.842418394250295e+00,
+            7.836929211206836e+00,
+        ];
+        let c_rt = [
+            3.000000000000000e+00,
+            2.000000000000009e+00,
+            -1.000000000000000e+00,
+            -2.000000000000028e+00,
+            3.000000000000000e+00,
+            1.499999999999972e+00,
+        ];
         assert_golden("GEOCARS large combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3498,7 +4902,14 @@ mod tests {
         let mut t = make_newport_table();
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let c_motor = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_rt = [0.000000000000000e+00, -0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_rt = [
+            0.000000000000000e+00,
+            -0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("NEWPORT zeros", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3507,8 +4918,22 @@ mod tests {
         // NEWPORT geometry, user=[2,0,0,0,0,0] — pure AX rotation
         let mut t = make_newport_table();
         let user = [2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [0.000000000000000e+00, -5.207638208821071e+00, 3.047721494109055e-02, 0.000000000000000e+00, 5.268592638703252e+00, 1.837470119410648e+00];
-        let c_rt = [2.000000000000001e+00, -1.201757375809365e-17, 3.441382859828896e-16, 3.164499123031242e-17, 3.387867764104158e-15, 0.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            -5.207638208821071e+00,
+            3.047721494109055e-02,
+            0.000000000000000e+00,
+            5.268592638703252e+00,
+            1.837470119410648e+00,
+        ];
+        let c_rt = [
+            2.000000000000001e+00,
+            -1.201757375809365e-17,
+            3.441382859828896e-16,
+            3.164499123031242e-17,
+            3.387867764104158e-15,
+            0.000000000000000e+00,
+        ];
         assert_golden("NEWPORT AX=2", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3517,8 +4942,22 @@ mod tests {
         // NEWPORT geometry, user=[0,1.5,0,0,0,0] — pure AY rotation
         let mut t = make_newport_table();
         let user = [0.0, 1.5, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [3.892274743736692e+00, 0.000000000000000e+00, 0.000000000000000e+00, -3.960809748625252e+00, 0.000000000000000e+00, 2.566293577120916e+00];
-        let c_rt = [0.000000000000000e+00, 1.500000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            3.892274743736692e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            -3.960809748625252e+00,
+            0.000000000000000e+00,
+            2.566293577120916e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            1.500000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("NEWPORT AY=1.5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3527,8 +4966,22 @@ mod tests {
         // NEWPORT geometry, user=[0,0,-1,0,0,0] — pure AZ rotation
         let mut t = make_newport_table();
         let user = [0.0, 0.0, -1.0, 0.0, 0.0, 0.0];
-        let c_motor = [8.879860508016516e-01, 1.753122895017139e+00, -1.737890090626378e+00, 8.879860508016516e-01, 1.753122895017139e+00, 0.000000000000000e+00];
-        let c_rt = [1.373999622392239e-16, -0.000000000000000e+00, -9.999999999999990e-01, 2.220446049250313e-16, -8.932380760976835e-15, -4.203491680913012e-18];
+        let c_motor = [
+            8.879860508016516e-01,
+            1.753122895017139e+00,
+            -1.737890090626378e+00,
+            8.879860508016516e-01,
+            1.753122895017139e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            1.373999622392239e-16,
+            -0.000000000000000e+00,
+            -9.999999999999990e-01,
+            2.220446049250313e-16,
+            -8.932380760976835e-15,
+            -4.203491680913012e-18,
+        ];
         assert_golden("NEWPORT AZ=-1", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3537,8 +4990,22 @@ mod tests {
         // NEWPORT geometry, user=[0,0,0,3,0,0] — pure X translation
         let mut t = make_newport_table();
         let user = [0.0, 0.0, 0.0, 3.0, 0.0, 0.0];
-        let c_motor = [3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -0.000000000000000e+00, 0.000000000000000e+00, 3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -0.000000000000000e+00,
+            0.000000000000000e+00,
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("NEWPORT X=3", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3547,8 +5014,22 @@ mod tests {
         // NEWPORT geometry, user=[0,0,0,0,5,0] — pure Y translation
         let mut t = make_newport_table();
         let user = [0.0, 0.0, 0.0, 0.0, 5.0, 0.0];
-        let c_motor = [0.000000000000000e+00, 5.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("NEWPORT Y=5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3557,8 +5038,22 @@ mod tests {
         // NEWPORT geometry, user=[0,0,0,0,0,7] — pure Z translation
         let mut t = make_newport_table();
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 7.0];
-        let c_motor = [0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 7.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 7.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            7.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            7.000000000000000e+00,
+        ];
         assert_golden("NEWPORT Z=7", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3567,8 +5062,22 @@ mod tests {
         // NEWPORT geometry, user=[1,-0.5,0.3,2,1,-1] — combined motion
         let mut t = make_newport_table();
         let user = [1.0, -0.5, 0.3, 2.0, 1.0, -1.0];
-        let c_motor = [4.353022095460802e-01, -2.148525612105483e+00, 1.547344838981432e+00, 3.025846322745595e+00, 3.087870431272331e+00, -9.630033568368596e-01];
-        let c_rt = [1.000000000000000e+00, -5.000000000000008e-01, 3.000000000000010e-01, 2.000000000000000e+00, 1.000000000000003e+00, -1.000000000000000e+00];
+        let c_motor = [
+            4.353022095460802e-01,
+            -2.148525612105483e+00,
+            1.547344838981432e+00,
+            3.025846322745595e+00,
+            3.087870431272331e+00,
+            -9.630033568368596e-01,
+        ];
+        let c_rt = [
+            1.000000000000000e+00,
+            -5.000000000000008e-01,
+            3.000000000000010e-01,
+            2.000000000000000e+00,
+            1.000000000000003e+00,
+            -1.000000000000000e+00,
+        ];
         assert_golden("NEWPORT combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3577,8 +5086,22 @@ mod tests {
         // NEWPORT geometry, user=[3,2,-1,-2,3,1.5] — large combined motion
         let mut t = make_newport_table();
         let user = [3.0, 2.0, -1.0, -2.0, 3.0, 1.5];
-        let c_motor = [3.981220740171423e+00, -2.846843636621184e+00, 1.154044912352661e+00, -6.214519416654817e+00, 1.286880774926943e+01, 7.924514374289184e+00];
-        let c_rt = [3.000000000000000e+00, 2.000000000000001e+00, -1.000000000000001e+00, -2.000000000000000e+00, 3.000000000000000e+00, 1.500000000000000e+00];
+        let c_motor = [
+            3.981220740171423e+00,
+            -2.846843636621184e+00,
+            1.154044912352661e+00,
+            -6.214519416654817e+00,
+            1.286880774926943e+01,
+            7.924514374289184e+00,
+        ];
+        let c_rt = [
+            3.000000000000000e+00,
+            2.000000000000001e+00,
+            -1.000000000000001e+00,
+            -2.000000000000000e+00,
+            3.000000000000000e+00,
+            1.500000000000000e+00,
+        ];
         assert_golden("NEWPORT large combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3592,7 +5115,14 @@ mod tests {
         let mut t = make_pnc_table();
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let c_motor = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_rt = [0.000000000000000e+00, 8.945310041616140e-16, 0.000000000000000e+00, 2.341876692568690e-15, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_rt = [
+            0.000000000000000e+00,
+            8.945310041616140e-16,
+            0.000000000000000e+00,
+            2.341876692568690e-15,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("PNC zeros", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3601,8 +5131,22 @@ mod tests {
         // PNC geometry, user=[2,0,0,0,0,0] — pure AX rotation
         let mut t = make_pnc_table();
         let user = [2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [0.000000000000000e+00, -5.204465856329932e+00, -5.204465856329932e+00, 0.000000000000000e+00, 5.265383154420363e+00, 1.653598887989403e+00];
-        let c_rt = [2.000000000000001e+00, 8.945310041616140e-16, 0.000000000000000e+00, 2.341876692568690e-15, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            -5.204465856329932e+00,
+            -5.204465856329932e+00,
+            0.000000000000000e+00,
+            5.265383154420363e+00,
+            1.653598887989403e+00,
+        ];
+        let c_rt = [
+            2.000000000000001e+00,
+            8.945310041616140e-16,
+            0.000000000000000e+00,
+            2.341876692568690e-15,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("PNC AX=2", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3611,8 +5155,22 @@ mod tests {
         // PNC geometry, user=[0,1.5,0,0,0,0] — pure AY rotation
         let mut t = make_pnc_table();
         let user = [0.0, 1.5, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [3.960809748625252e+00, 0.000000000000000e+00, 0.000000000000000e+00, -3.926542246180973e+00, 0.000000000000000e+00, -5.140125366639836e-02];
-        let c_rt = [0.000000000000000e+00, 1.499999999999992e+00, 0.000000000000000e+00, -2.131628207280301e-14, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            3.960809748625252e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            -3.926542246180973e+00,
+            0.000000000000000e+00,
+            -5.140125366639836e-02,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            1.499999999999992e+00,
+            0.000000000000000e+00,
+            -2.131628207280301e-14,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("PNC AY=1.5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3621,8 +5179,22 @@ mod tests {
         // PNC geometry, user=[0,0,-1,0,0,0] — pure AZ rotation
         let mut t = make_pnc_table();
         let user = [0.0, 0.0, -1.0, 0.0, 0.0, 0.0];
-        let c_motor = [8.878508062250461e-01, -1.737625401547916e+00, 1.752855885908787e+00, 8.726203218641756e-01, 7.615242180435189e-03, 0.000000000000000e+00];
-        let c_rt = [-1.372478793193544e-17, -1.607318644072144e-15, -1.000000000000000e+00, -4.329869796038111e-15, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            8.878508062250461e-01,
+            -1.737625401547916e+00,
+            1.752855885908787e+00,
+            8.726203218641756e-01,
+            7.615242180435189e-03,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            -1.372478793193544e-17,
+            -1.607318644072144e-15,
+            -1.000000000000000e+00,
+            -4.329869796038111e-15,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("PNC AZ=-1", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3631,8 +5203,22 @@ mod tests {
         // PNC geometry, user=[0,0,0,3,0,0] — pure X translation
         let mut t = make_pnc_table();
         let user = [0.0, 0.0, 0.0, 3.0, 0.0, 0.0];
-        let c_motor = [3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 3.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, 8.945310041616140e-16, 0.000000000000000e+00, 3.000000000000002e+00, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            3.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            8.945310041616140e-16,
+            0.000000000000000e+00,
+            3.000000000000002e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("PNC X=3", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3641,8 +5227,22 @@ mod tests {
         // PNC geometry, user=[0,0,0,0,5,0] — pure Y translation
         let mut t = make_pnc_table();
         let user = [0.0, 0.0, 0.0, 0.0, 5.0, 0.0];
-        let c_motor = [0.000000000000000e+00, 5.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, 8.945310041616140e-16, 0.000000000000000e+00, 2.341876692568690e-15, 5.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            8.945310041616140e-16,
+            0.000000000000000e+00,
+            2.341876692568690e-15,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("PNC Y=5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3651,8 +5251,22 @@ mod tests {
         // PNC geometry, user=[0,0,0,0,0,7] — pure Z translation
         let mut t = make_pnc_table();
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 7.0];
-        let c_motor = [0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 7.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, 8.945310041616140e-16, 0.000000000000000e+00, 2.341876692568690e-15, 0.000000000000000e+00, 7.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            7.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            8.945310041616140e-16,
+            0.000000000000000e+00,
+            2.341876692568690e-15,
+            0.000000000000000e+00,
+            7.000000000000000e+00,
+        ];
         assert_golden("PNC Z=7", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3661,8 +5275,22 @@ mod tests {
         // PNC geometry, user=[1,-0.5,0.3,2,1,-1] — combined motion
         let mut t = make_pnc_table();
         let user = [1.0, -0.5, 0.3, 2.0, 1.0, -1.0];
-        let c_motor = [4.344098687911355e-01, -1.070674555893262e+00, -2.148167220972560e+00, 3.047192101658052e+00, 3.626101682504157e+00, -1.536637935618046e-01];
-        let c_rt = [1.000000000000001e+00, -5.000000000000121e-01, 3.000000000000005e-01, 1.999999999999969e+00, 1.000000000000000e+00, -1.000000000000000e+00];
+        let c_motor = [
+            4.344098687911355e-01,
+            -1.070674555893262e+00,
+            -2.148167220972560e+00,
+            3.047192101658052e+00,
+            3.626101682504157e+00,
+            -1.536637935618046e-01,
+        ];
+        let c_rt = [
+            1.000000000000001e+00,
+            -5.000000000000121e-01,
+            3.000000000000005e-01,
+            1.999999999999969e+00,
+            1.000000000000000e+00,
+            -1.000000000000000e+00,
+        ];
         assert_golden("PNC combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3671,8 +5299,22 @@ mod tests {
         // PNC geometry, user=[3,2,-1,-2,3,1.5] — large combined motion
         let mut t = make_pnc_table();
         let user = [3.0, 2.0, -1.0, -2.0, 3.0, 1.5];
-        let c_motor = [4.183151754968392e+00, -6.693360167962638e+00, -2.842418394250295e+00, -6.362835760233637e+00, 1.092333309663479e+01, 3.849991028658991e+00];
-        let c_rt = [3.000000000000000e+00, 2.000000000000004e+00, -1.000000000000001e+00, -1.999999999999990e+00, 3.000000000000000e+00, 1.500000000000000e+00];
+        let c_motor = [
+            4.183151754968392e+00,
+            -6.693360167962638e+00,
+            -2.842418394250295e+00,
+            -6.362835760233637e+00,
+            1.092333309663479e+01,
+            3.849991028658991e+00,
+        ];
+        let c_rt = [
+            3.000000000000000e+00,
+            2.000000000000004e+00,
+            -1.000000000000001e+00,
+            -1.999999999999990e+00,
+            3.000000000000000e+00,
+            1.500000000000000e+00,
+        ];
         assert_golden("PNC large combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3687,7 +5329,14 @@ mod tests {
         t.yang = 30.0;
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let c_motor = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_rt = [0.000000000000000e+00, -8.945310041616140e-16, 0.000000000000000e+00, -2.028124708295165e-15, 0.000000000000000e+00, -1.170938346284345e-15];
+        let c_rt = [
+            0.000000000000000e+00,
+            -8.945310041616140e-16,
+            0.000000000000000e+00,
+            -2.028124708295165e-15,
+            0.000000000000000e+00,
+            -1.170938346284345e-15,
+        ];
         assert_golden("YANG30 zeros", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3697,8 +5346,22 @@ mod tests {
         let mut t = make_sri_table();
         t.yang = 30.0;
         let user = [2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [8.573898375033053e-01, -2.758908210602897e+00, -6.247794727408483e+00, 8.726203218641754e-01, 4.564264128072779e+00, 1.442505392476704e+00];
-        let c_rt = [1.999999999999999e+00, 4.787873325535661e-15, -1.761482671256913e-15, 1.009555410351371e-14, 0.000000000000000e+00, 5.828670879282071e-15];
+        let c_motor = [
+            8.573898375033053e-01,
+            -2.758908210602897e+00,
+            -6.247794727408483e+00,
+            8.726203218641754e-01,
+            4.564264128072779e+00,
+            1.442505392476704e+00,
+        ];
+        let c_rt = [
+            1.999999999999999e+00,
+            4.787873325535661e-15,
+            -1.761482671256913e-15,
+            1.009555410351371e-14,
+            0.000000000000000e+00,
+            5.828670879282071e-15,
+        ];
         assert_golden("YANG30 AX=2", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3708,8 +5371,22 @@ mod tests {
         let mut t = make_sri_table();
         t.yang = 30.0;
         let user = [0.0, 1.5, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [3.892274743736692e+00, 0.000000000000000e+00, 0.000000000000000e+00, -3.926542246180973e+00, 0.000000000000000e+00, -5.140125366639836e-02];
-        let c_rt = [0.000000000000000e+00, 1.499999999999996e+00, 0.000000000000000e+00, -9.614813431917821e-15, 0.000000000000000e+00, -5.551115123125782e-15];
+        let c_motor = [
+            3.892274743736692e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            -3.926542246180973e+00,
+            0.000000000000000e+00,
+            -5.140125366639836e-02,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            1.499999999999996e+00,
+            0.000000000000000e+00,
+            -9.614813431917821e-15,
+            0.000000000000000e+00,
+            -5.551115123125782e-15,
+        ];
         assert_golden("YANG30 AY=1.5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3719,8 +5396,22 @@ mod tests {
         let mut t = make_sri_table();
         t.yang = 30.0;
         let user = [0.0, 0.0, -1.0, 0.0, 0.0, 0.0];
-        let c_motor = [7.442980228465785e-01, 2.827979788095959e+00, -1.947889441883532e-01, 7.557209586095223e-01, -1.301365227558378e+00, -4.419884739657789e-01];
-        let c_rt = [6.810079829184314e-16, -5.644299355257259e-15, -1.000000000000002e+00, -1.403762761060002e-14, 0.000000000000000e+00, -8.104628079763641e-15];
+        let c_motor = [
+            7.442980228465785e-01,
+            2.827979788095959e+00,
+            -1.947889441883532e-01,
+            7.557209586095223e-01,
+            -1.301365227558378e+00,
+            -4.419884739657789e-01,
+        ];
+        let c_rt = [
+            6.810079829184314e-16,
+            -5.644299355257259e-15,
+            -1.000000000000002e+00,
+            -1.403762761060002e-14,
+            0.000000000000000e+00,
+            -8.104628079763641e-15,
+        ];
         assert_golden("YANG30 AZ=-1", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3730,8 +5421,22 @@ mod tests {
         let mut t = make_sri_table();
         t.yang = 30.0;
         let user = [0.0, 0.0, 0.0, 3.0, 0.0, 0.0];
-        let c_motor = [2.598076211353316e+00, 0.000000000000000e+00, 0.000000000000000e+00, 2.598076211353316e+00, 0.000000000000000e+00, -1.500000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -8.945310041616140e-16, 0.000000000000000e+00, 2.999999999999998e+00, 0.000000000000000e+00, -1.254445226103924e-15];
+        let c_motor = [
+            2.598076211353316e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            2.598076211353316e+00,
+            0.000000000000000e+00,
+            -1.500000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -8.945310041616140e-16,
+            0.000000000000000e+00,
+            2.999999999999998e+00,
+            0.000000000000000e+00,
+            -1.254445226103924e-15,
+        ];
         assert_golden("YANG30 X=3", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3741,8 +5446,22 @@ mod tests {
         let mut t = make_sri_table();
         t.yang = 30.0;
         let user = [0.0, 0.0, 0.0, 0.0, 5.0, 0.0];
-        let c_motor = [0.000000000000000e+00, 5.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00, 5.000000000000000e+00, 0.000000000000000e+00];
-        let c_rt = [0.000000000000000e+00, -8.945310041616140e-16, 0.000000000000000e+00, -2.028124708295165e-15, 5.000000000000000e+00, -1.170938346284345e-15];
+        let c_motor = [
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+            5.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            -8.945310041616140e-16,
+            0.000000000000000e+00,
+            -2.028124708295165e-15,
+            5.000000000000000e+00,
+            -1.170938346284345e-15,
+        ];
         assert_golden("YANG30 Y=5", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3752,8 +5471,22 @@ mod tests {
         let mut t = make_sri_table();
         t.yang = 30.0;
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 7.0];
-        let c_motor = [3.500000000000000e+00, 0.000000000000000e+00, 0.000000000000000e+00, 3.500000000000000e+00, 0.000000000000000e+00, 6.062177826491080e+00];
-        let c_rt = [0.000000000000000e+00, 2.752505030583218e-15, 0.000000000000000e+00, 1.605551716806355e-15, 0.000000000000000e+00, 7.000000000000012e+00];
+        let c_motor = [
+            3.500000000000000e+00,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+            3.500000000000000e+00,
+            0.000000000000000e+00,
+            6.062177826491080e+00,
+        ];
+        let c_rt = [
+            0.000000000000000e+00,
+            2.752505030583218e-15,
+            0.000000000000000e+00,
+            1.605551716806355e-15,
+            0.000000000000000e+00,
+            7.000000000000012e+00,
+        ];
         assert_golden("YANG30 Z=7", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3763,8 +5496,22 @@ mod tests {
         let mut t = make_sri_table();
         t.yang = 30.0;
         let user = [1.0, -0.5, 0.3, 2.0, 1.0, -1.0];
-        let c_motor = [1.279829161379098e-01, -1.247765652272335e+00, -2.055113327510050e+00, 2.750629929667285e+00, 3.667975718941413e+00, -1.010553527862072e+00];
-        let c_rt = [9.999999999999991e-01, -5.000000000000132e-01, 2.999999999999990e-01, 1.999999999999974e+00, 1.000000000000000e+00, -1.000000000000026e+00];
+        let c_motor = [
+            1.279829161379098e-01,
+            -1.247765652272335e+00,
+            -2.055113327510050e+00,
+            2.750629929667285e+00,
+            3.667975718941413e+00,
+            -1.010553527862072e+00,
+        ];
+        let c_rt = [
+            9.999999999999991e-01,
+            -5.000000000000132e-01,
+            2.999999999999990e-01,
+            1.999999999999974e+00,
+            1.000000000000000e+00,
+            -1.000000000000026e+00,
+        ];
         assert_golden("YANG30 combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3774,8 +5521,22 @@ mod tests {
         let mut t = make_sri_table();
         t.yang = 30.0;
         let user = [3.0, 2.0, -1.0, -2.0, 3.0, 1.5];
-        let c_motor = [6.169659339879800e+00, 1.843786315304051e+00, -6.662635570021543e+00, -4.154072844876737e+00, 8.566931234521761e+00, 4.008104005764238e+00];
-        let c_rt = [3.000000000000000e+00, 1.999999999999986e+00, -9.999999999999988e-01, -2.000000000000029e+00, 3.000000000000000e+00, 1.499999999999983e+00];
+        let c_motor = [
+            6.169659339879800e+00,
+            1.843786315304051e+00,
+            -6.662635570021543e+00,
+            -4.154072844876737e+00,
+            8.566931234521761e+00,
+            4.008104005764238e+00,
+        ];
+        let c_rt = [
+            3.000000000000000e+00,
+            1.999999999999986e+00,
+            -9.999999999999988e-01,
+            -2.000000000000029e+00,
+            3.000000000000000e+00,
+            1.499999999999983e+00,
+        ];
         assert_golden("YANG30 large combined", &mut t, &user, &c_motor, &c_rt);
     }
 
@@ -3790,8 +5551,22 @@ mod tests {
         let mut t = make_sri_table();
         t.ax0 = 5.0;
         let user = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let c_motor = [0.000000000000000e+00, -1.288309631673601e+01, -1.288309631673601e+01, 0.000000000000000e+00, 1.326362650756145e+01, 3.786991851144734e+00];
-        let c_rt = [1.776356839400250e-15, -8.655084426932594e-15, 0.000000000000000e+00, -2.265895804320905e-14, 0.000000000000000e+00, 0.000000000000000e+00];
+        let c_motor = [
+            0.000000000000000e+00,
+            -1.288309631673601e+01,
+            -1.288309631673601e+01,
+            0.000000000000000e+00,
+            1.326362650756145e+01,
+            3.786991851144734e+00,
+        ];
+        let c_rt = [
+            1.776356839400250e-15,
+            -8.655084426932594e-15,
+            0.000000000000000e+00,
+            -2.265895804320905e-14,
+            0.000000000000000e+00,
+            0.000000000000000e+00,
+        ];
         assert_golden("SRI offset ax0=5", &mut t, &user, &c_motor, &c_rt);
     }
 }

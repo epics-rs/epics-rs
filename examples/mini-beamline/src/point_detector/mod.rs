@@ -47,7 +47,8 @@ impl PointDetector {
 
         let value = physics::point_reading(self.mode, mtr, current, exposure, sigma, center);
 
-        self.base.set_float64_param(self.params.det_value, 0, value)?;
+        self.base
+            .set_float64_param(self.params.det_value, 0, value)?;
         Ok(())
     }
 }
@@ -122,7 +123,9 @@ mod tests {
     fn test_create_pinhole() {
         let rt = create_point_detector("PH_TEST", DetectorMode::PinHole).unwrap();
         let handle = rt.port_handle();
-        let val = handle.read_float64_blocking(rt.params.det_value, 0).unwrap();
+        let val = handle
+            .read_float64_blocking(rt.params.det_value, 0)
+            .unwrap();
         // With default motor_pos=0, center=0 for pinhole, should get max reading
         assert!(val > 0.0);
     }
@@ -133,21 +136,34 @@ mod tests {
         let handle = rt.port_handle();
 
         // At center: large value
-        handle.write_float64_blocking(rt.params.motor_pos, 0, 0.0).unwrap();
-        let val_center = handle.read_float64_blocking(rt.params.det_value, 0).unwrap();
+        handle
+            .write_float64_blocking(rt.params.motor_pos, 0, 0.0)
+            .unwrap();
+        let val_center = handle
+            .read_float64_blocking(rt.params.det_value, 0)
+            .unwrap();
 
         // Far away: small value
-        handle.write_float64_blocking(rt.params.motor_pos, 0, 50.0).unwrap();
-        let val_far = handle.read_float64_blocking(rt.params.det_value, 0).unwrap();
+        handle
+            .write_float64_blocking(rt.params.motor_pos, 0, 50.0)
+            .unwrap();
+        let val_far = handle
+            .read_float64_blocking(rt.params.det_value, 0)
+            .unwrap();
 
-        assert!(val_center > val_far * 10.0, "center={val_center}, far={val_far}");
+        assert!(
+            val_center > val_far * 10.0,
+            "center={val_center}, far={val_far}"
+        );
     }
 
     #[test]
     fn test_create_edge() {
         let rt = create_point_detector("EDGE_TEST", DetectorMode::Edge).unwrap();
         let handle = rt.port_handle();
-        let val = handle.read_float64_blocking(rt.params.det_value, 0).unwrap();
+        let val = handle
+            .read_float64_blocking(rt.params.det_value, 0)
+            .unwrap();
         assert!(val > 0.0);
     }
 
@@ -155,7 +171,9 @@ mod tests {
     fn test_create_slit() {
         let rt = create_point_detector("SLIT_TEST", DetectorMode::Slit).unwrap();
         let handle = rt.port_handle();
-        let val = handle.read_float64_blocking(rt.params.det_value, 0).unwrap();
+        let val = handle
+            .read_float64_blocking(rt.params.det_value, 0)
+            .unwrap();
         assert!(val > 0.0);
     }
 }

@@ -20,7 +20,9 @@ impl PvDatabase {
                 crate::runtime::task::RuntimeHandle::current().block_on(db.get_pv(&name))
             })
         } else {
-            Err(CaError::InvalidValue("no runtime for get_pv_blocking".into()))
+            Err(CaError::InvalidValue(
+                "no runtime for get_pv_blocking".into(),
+            ))
         }
     }
 
@@ -64,7 +66,10 @@ impl PvDatabase {
 
             // Coerce value to field's native type
             let value = {
-                let target_type = instance.record.field_list().iter()
+                let target_type = instance
+                    .record
+                    .field_list()
+                    .iter()
                     .find(|f| f.name.eq_ignore_ascii_case(&field))
                     .map(|f| f.dbf_type);
                 if let Some(target) = target_type {
@@ -94,11 +99,20 @@ impl PvDatabase {
 
             // Update scan index if SCAN or PHAS changed
             match common_result {
-                CommonFieldPutResult::ScanChanged { old_scan, new_scan, phas } => {
+                CommonFieldPutResult::ScanChanged {
+                    old_scan,
+                    new_scan,
+                    phas,
+                } => {
                     drop(instance);
-                    self.update_scan_index(base, old_scan, new_scan, phas, phas).await;
+                    self.update_scan_index(base, old_scan, new_scan, phas, phas)
+                        .await;
                 }
-                CommonFieldPutResult::PhasChanged { scan: s, old_phas, new_phas } => {
+                CommonFieldPutResult::PhasChanged {
+                    scan: s,
+                    old_phas,
+                    new_phas,
+                } => {
                     drop(instance);
                     self.update_scan_index(base, s, s, old_phas, new_phas).await;
                 }
@@ -125,7 +139,12 @@ impl PvDatabase {
     }
 
     /// Like `put_pv_and_post` but with explicit origin tag.
-    pub async fn put_pv_and_post_with_origin(&self, name: &str, value: EpicsValue, origin: u64) -> CaResult<()> {
+    pub async fn put_pv_and_post_with_origin(
+        &self,
+        name: &str,
+        value: EpicsValue,
+        origin: u64,
+    ) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
 
@@ -134,7 +153,10 @@ impl PvDatabase {
 
             // Type coercion
             let value = {
-                let target_type = instance.record.field_list().iter()
+                let target_type = instance
+                    .record
+                    .field_list()
+                    .iter()
                     .find(|f| f.name.eq_ignore_ascii_case(&field))
                     .map(|f| f.dbf_type);
                 if let Some(target) = target_type {
@@ -175,16 +197,19 @@ impl PvDatabase {
             // Post monitor events if value or alarm changed
             let new_value = instance.record.get_field(&field);
             let value_changed = old_value != new_value;
-            let alarm_changed = old_stat != instance.common.stat || old_sevr != instance.common.sevr;
+            let alarm_changed =
+                old_stat != instance.common.stat || old_sevr != instance.common.sevr;
             if value_changed || alarm_changed {
                 // Update timestamp so the snapshot carries current time
                 instance.common.time = crate::runtime::general_time::get_current();
                 instance.cleanup_subscribers();
-                instance.notify_field_with_origin(&field,
+                instance.notify_field_with_origin(
+                    &field,
                     crate::server::recgbl::EventMask::VALUE
-                    | crate::server::recgbl::EventMask::LOG
-                    | crate::server::recgbl::EventMask::ALARM,
-                    origin);
+                        | crate::server::recgbl::EventMask::LOG
+                        | crate::server::recgbl::EventMask::ALARM,
+                    origin,
+                );
             }
 
             return Ok(());
@@ -206,7 +231,9 @@ impl PvDatabase {
         // Get record Arc
         let rec = {
             let records = self.inner.records.read().await;
-            records.get(record_name).cloned()
+            records
+                .get(record_name)
+                .cloned()
                 .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?
         };
 
@@ -232,7 +259,9 @@ impl PvDatabase {
                 if is_nonzero {
                     drop(instance);
                     let mut visited = HashSet::new();
-                    let _ = self.process_record_with_links(record_name, &mut visited, 0).await;
+                    let _ = self
+                        .process_record_with_links(record_name, &mut visited, 0)
+                        .await;
                     return Ok(None);
                 }
                 return Ok(None);
@@ -253,7 +282,10 @@ impl PvDatabase {
             // This matches C EPICS db_put_field() which converts from the CA client's type
             // to the record field's native type.
             let value = {
-                let target_type = instance.record.field_list().iter()
+                let target_type = instance
+                    .record
+                    .field_list()
+                    .iter()
                     .find(|f| f.name.eq_ignore_ascii_case(&field))
                     .map(|f| f.dbf_type);
                 if let Some(target) = target_type {
@@ -295,9 +327,7 @@ impl PvDatabase {
                     let _ = instance.record.special(&field, true);
                     CommonFieldPutResult::NoChange
                 }
-                Err(CaError::FieldNotFound(_)) => {
-                    instance.put_common_field(&field, value)?
-                }
+                Err(CaError::FieldNotFound(_)) => instance.put_common_field(&field, value)?,
                 Err(e) => {
                     instance.common.putf = false;
                     return Err(e);
@@ -311,7 +341,10 @@ impl PvDatabase {
             // processing may not post events for auxiliary fields.
             // VAL is always notified via processing (deadband check + snapshot).
             if instance.common.scan != ScanType::Passive && field != "VAL" {
-                instance.notify_field(&field, crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG);
+                instance.notify_field(
+                    &field,
+                    crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+                );
             }
 
             common_result
@@ -320,11 +353,21 @@ impl PvDatabase {
 
         // Update scan index if SCAN or PHAS changed
         match common_result {
-            crate::server::record::CommonFieldPutResult::ScanChanged { old_scan, new_scan, phas } => {
-                self.update_scan_index(record_name, old_scan, new_scan, phas, phas).await;
+            crate::server::record::CommonFieldPutResult::ScanChanged {
+                old_scan,
+                new_scan,
+                phas,
+            } => {
+                self.update_scan_index(record_name, old_scan, new_scan, phas, phas)
+                    .await;
             }
-            crate::server::record::CommonFieldPutResult::PhasChanged { scan: s, old_phas, new_phas } => {
-                self.update_scan_index(record_name, s, s, old_phas, new_phas).await;
+            crate::server::record::CommonFieldPutResult::PhasChanged {
+                scan: s,
+                old_phas,
+                new_phas,
+            } => {
+                self.update_scan_index(record_name, s, s, old_phas, new_phas)
+                    .await;
             }
             crate::server::record::CommonFieldPutResult::NoChange => {}
         }
@@ -343,7 +386,9 @@ impl PvDatabase {
         // Process the record after field put.
         {
             let mut visited = HashSet::new();
-            let _ = self.process_record_with_links(record_name, &mut visited, 0).await;
+            let _ = self
+                .process_record_with_links(record_name, &mut visited, 0)
+                .await;
         }
 
         // Check if sender is still in the record (async processing pending)

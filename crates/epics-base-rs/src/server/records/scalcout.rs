@@ -4,7 +4,7 @@ use crate::types::{DbFieldType, EpicsValue};
 
 use crate::calc::StringInputs;
 use crate::calc::engine::value::StackValue;
-use crate::calc::{scalc_compile, scalc_eval, CompiledExpr};
+use crate::calc::{CompiledExpr, scalc_compile, scalc_eval};
 
 /// Scalcout record — string calc with output.
 ///
@@ -17,13 +17,13 @@ pub struct ScalcoutRecord {
     pub sval: String,
     pub calc: String,
     compiled_calc: Option<CompiledExpr>,
-    pub oopt: i16,  // 0=Every, 1=OnChange, 2=WhenZero, 3=WhenNonzero, 4=TransZero, 5=TransNonzero
-    pub dopt: i16,  // 0=Use CALC, 1=Use OCAL
+    pub oopt: i16, // 0=Every, 1=OnChange, 2=WhenZero, 3=WhenNonzero, 4=TransZero, 5=TransNonzero
+    pub dopt: i16, // 0=Use CALC, 1=Use OCAL
     pub ocal: String,
     compiled_ocal: Option<CompiledExpr>,
     pub oval: f64,
     pub osv: String,
-    pub ivoa: i16,  // 0=Continue, 1=Don't drive, 2=Set to IVOV
+    pub ivoa: i16, // 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: f64,
     pub prec: i16,
     // Input link strings (INPA..INPL)
@@ -131,70 +131,260 @@ impl ScalcoutRecord {
     }
 
     fn str_var_index(name: &str) -> Option<usize> {
-        const NAMES: [&str; 12] = ["AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL"];
+        const NAMES: [&str; 12] = [
+            "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
+        ];
         NAMES.iter().position(|&n| n == name)
     }
 
     fn inp_index(name: &str) -> Option<usize> {
         const NAMES: [&str; 12] = [
-            "INPA", "INPB", "INPC", "INPD", "INPE", "INPF",
-            "INPG", "INPH", "INPI", "INPJ", "INPK", "INPL",
+            "INPA", "INPB", "INPC", "INPD", "INPE", "INPF", "INPG", "INPH", "INPI", "INPJ", "INPK",
+            "INPL",
         ];
         NAMES.iter().position(|&n| n == name)
     }
 }
 
 static SCALCOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "SVAL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CALC", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OOPT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DOPT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "OCAL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OVAL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "OSV", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "IVOA", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IVOV", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "PREC", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SVAL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CALC",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OOPT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOPT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OCAL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OVAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OSV",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IVOA",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IVOV",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // Input links
-    FieldDesc { name: "INPA", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPB", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPC", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPD", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPE", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPF", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPG", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPH", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPI", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPJ", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPK", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPL", dbf_type: DbFieldType::String, read_only: false },
+    FieldDesc {
+        name: "INPA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPB",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPC",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPD",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPE",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPF",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPG",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPH",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPI",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPJ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPK",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
     // Numeric vars A-L
-    FieldDesc { name: "A", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "B", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "C", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "D", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "E", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "F", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "G", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "H", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "I", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "J", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "K", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "L", dbf_type: DbFieldType::Double, read_only: false },
+    FieldDesc {
+        name: "A",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "C",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "D",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "E",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "F",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "G",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "H",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "I",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "J",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "K",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "L",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
     // String vars AA-LL
-    FieldDesc { name: "AA", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "BB", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CC", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DD", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "EE", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "FF", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "GG", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "HH", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "II", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "JJ", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "KK", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "LL", dbf_type: DbFieldType::String, read_only: false },
+    FieldDesc {
+        name: "AA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BB",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CC",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DD",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "EE",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "FF",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "GG",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HH",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "II",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "JJ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "KK",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
 ];
 
 impl Record for ScalcoutRecord {
@@ -215,7 +405,9 @@ impl Record for ScalcoutRecord {
                     // Invalid calc — check IVOA
                     match self.ivoa {
                         1 => return Ok(ProcessOutcome::complete()), // Don't drive output
-                        2 => { self.val = self.ivov; }
+                        2 => {
+                            self.val = self.ivov;
+                        }
                         _ => {} // Continue
                     }
                 }
@@ -229,18 +421,16 @@ impl Record for ScalcoutRecord {
                 if let Some(ref compiled) = self.compiled_ocal {
                     let mut inputs = self.build_inputs();
                     match scalc_eval(compiled, &mut inputs) {
-                        Ok(result) => {
-                            match &result {
-                                StackValue::Double(v) => {
-                                    self.oval = *v;
-                                    self.osv = format!("{}", v);
-                                }
-                                StackValue::Str(s) => {
-                                    self.osv = s.clone();
-                                    self.oval = s.parse::<f64>().unwrap_or(0.0);
-                                }
+                        Ok(result) => match &result {
+                            StackValue::Double(v) => {
+                                self.oval = *v;
+                                self.osv = format!("{}", v);
                             }
-                        }
+                            StackValue::Str(s) => {
+                                self.osv = s.clone();
+                                self.oval = s.parse::<f64>().unwrap_or(0.0);
+                            }
+                        },
                         Err(_) => {}
                     }
                 }
@@ -283,37 +473,104 @@ impl Record for ScalcoutRecord {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL" => { self.val = value.to_f64().ok_or_else(|| CaError::TypeMismatch("VAL".into()))?; Ok(()) }
-            "SVAL" => match value { EpicsValue::String(s) => { self.sval = s; Ok(()) } _ => Err(CaError::TypeMismatch("SVAL".into())) },
+            "VAL" => {
+                self.val = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("VAL".into()))?;
+                Ok(())
+            }
+            "SVAL" => match value {
+                EpicsValue::String(s) => {
+                    self.sval = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SVAL".into())),
+            },
             "CALC" => match value {
-                EpicsValue::String(s) => { self.calc = s; self.recompile_calc(); Ok(()) }
-                _ => Err(CaError::TypeMismatch("CALC".into()))
+                EpicsValue::String(s) => {
+                    self.calc = s;
+                    self.recompile_calc();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("CALC".into())),
             },
-            "OOPT" => match value { EpicsValue::Short(v) => { self.oopt = v; Ok(()) } _ => Err(CaError::TypeMismatch("OOPT".into())) },
-            "DOPT" => match value { EpicsValue::Short(v) => { self.dopt = v; Ok(()) } _ => Err(CaError::TypeMismatch("DOPT".into())) },
+            "OOPT" => match value {
+                EpicsValue::Short(v) => {
+                    self.oopt = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("OOPT".into())),
+            },
+            "DOPT" => match value {
+                EpicsValue::Short(v) => {
+                    self.dopt = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("DOPT".into())),
+            },
             "OCAL" => match value {
-                EpicsValue::String(s) => { self.ocal = s; self.recompile_ocal(); Ok(()) }
-                _ => Err(CaError::TypeMismatch("OCAL".into()))
+                EpicsValue::String(s) => {
+                    self.ocal = s;
+                    self.recompile_ocal();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("OCAL".into())),
             },
-            "OVAL" => { self.oval = value.to_f64().ok_or_else(|| CaError::TypeMismatch("OVAL".into()))?; Ok(()) }
-            "OSV" => match value { EpicsValue::String(s) => { self.osv = s; Ok(()) } _ => Err(CaError::TypeMismatch("OSV".into())) },
-            "IVOA" => match value { EpicsValue::Short(v) => { self.ivoa = v; Ok(()) } _ => Err(CaError::TypeMismatch("IVOA".into())) },
-            "IVOV" => { self.ivov = value.to_f64().ok_or_else(|| CaError::TypeMismatch("IVOV".into()))?; Ok(()) }
-            "PREC" => match value { EpicsValue::Short(v) => { self.prec = v; Ok(()) } _ => Err(CaError::TypeMismatch("PREC".into())) },
+            "OVAL" => {
+                self.oval = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OVAL".into()))?;
+                Ok(())
+            }
+            "OSV" => match value {
+                EpicsValue::String(s) => {
+                    self.osv = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("OSV".into())),
+            },
+            "IVOA" => match value {
+                EpicsValue::Short(v) => {
+                    self.ivoa = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("IVOA".into())),
+            },
+            "IVOV" => {
+                self.ivov = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("IVOV".into()))?;
+                Ok(())
+            }
+            "PREC" => match value {
+                EpicsValue::Short(v) => {
+                    self.prec = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("PREC".into())),
+            },
             _ => {
                 if let Some(idx) = Self::var_index(name) {
-                    self.num_vals[idx] = value.to_f64().ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                    self.num_vals[idx] = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                     return Ok(());
                 }
                 if let Some(idx) = Self::str_var_index(name) {
                     match value {
-                        EpicsValue::String(s) => { self.str_vals[idx] = s; return Ok(()); }
+                        EpicsValue::String(s) => {
+                            self.str_vals[idx] = s;
+                            return Ok(());
+                        }
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     }
                 }
                 if let Some(idx) = Self::inp_index(name) {
                     match value {
-                        EpicsValue::String(s) => { self.inp_links[idx] = s; return Ok(()); }
+                        EpicsValue::String(s) => {
+                            self.inp_links[idx] = s;
+                            return Ok(());
+                        }
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     }
                 }
@@ -323,9 +580,20 @@ impl Record for ScalcoutRecord {
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
-        &[("INPA","A"),("INPB","B"),("INPC","C"),("INPD","D"),
-          ("INPE","E"),("INPF","F"),("INPG","G"),("INPH","H"),
-          ("INPI","I"),("INPJ","J"),("INPK","K"),("INPL","L")]
+        &[
+            ("INPA", "A"),
+            ("INPB", "B"),
+            ("INPC", "C"),
+            ("INPD", "D"),
+            ("INPE", "E"),
+            ("INPF", "F"),
+            ("INPG", "G"),
+            ("INPH", "H"),
+            ("INPI", "I"),
+            ("INPJ", "J"),
+            ("INPK", "K"),
+            ("INPL", "L"),
+        ]
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {
@@ -350,7 +618,8 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
-        rec.put_field("CALC", EpicsValue::String("A+B".into())).unwrap();
+        rec.put_field("CALC", EpicsValue::String("A+B".into()))
+            .unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 7.0);
     }
@@ -358,9 +627,12 @@ mod tests {
     #[test]
     fn test_scalcout_string_calc() {
         let mut rec = ScalcoutRecord::new();
-        rec.put_field("AA", EpicsValue::String("hello".into())).unwrap();
-        rec.put_field("BB", EpicsValue::String(" world".into())).unwrap();
-        rec.put_field("CALC", EpicsValue::String("AA+BB".into())).unwrap();
+        rec.put_field("AA", EpicsValue::String("hello".into()))
+            .unwrap();
+        rec.put_field("BB", EpicsValue::String(" world".into()))
+            .unwrap();
+        rec.put_field("CALC", EpicsValue::String("AA+BB".into()))
+            .unwrap();
         rec.process().unwrap();
         assert_eq!(rec.sval, "hello world");
     }
@@ -368,7 +640,8 @@ mod tests {
     #[test]
     fn test_scalcout_oopt_every() {
         let mut rec = ScalcoutRecord::new();
-        rec.put_field("CALC", EpicsValue::String("42".into())).unwrap();
+        rec.put_field("CALC", EpicsValue::String("42".into()))
+            .unwrap();
         rec.put_field("OOPT", EpicsValue::Short(0)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.oval, 42.0);
@@ -377,7 +650,8 @@ mod tests {
     #[test]
     fn test_scalcout_oopt_on_change() {
         let mut rec = ScalcoutRecord::new();
-        rec.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
 
         // First process — value changes from 0 to 5
@@ -395,20 +669,24 @@ mod tests {
     fn test_scalcout_dopt_use_ocal() {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("A", EpicsValue::Double(10.0)).unwrap();
-        rec.put_field("CALC", EpicsValue::String("A".into())).unwrap();
-        rec.put_field("OCAL", EpicsValue::String("A*2".into())).unwrap();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
+        rec.put_field("OCAL", EpicsValue::String("A*2".into()))
+            .unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
-        assert_eq!(rec.val, 10.0);  // CALC result
+        assert_eq!(rec.val, 10.0); // CALC result
         assert_eq!(rec.oval, 20.0); // OCAL result
     }
 
     #[test]
     fn test_scalcout_string_vars() {
         let mut rec = ScalcoutRecord::new();
-        rec.put_field("AA", EpicsValue::String("test".into())).unwrap();
+        rec.put_field("AA", EpicsValue::String("test".into()))
+            .unwrap();
         assert_eq!(rec.get_field("AA"), Some(EpicsValue::String("test".into())));
-        rec.put_field("LL", EpicsValue::String("last".into())).unwrap();
+        rec.put_field("LL", EpicsValue::String("last".into()))
+            .unwrap();
         assert_eq!(rec.get_field("LL"), Some(EpicsValue::String("last".into())));
     }
 
@@ -422,9 +700,12 @@ mod tests {
     #[test]
     fn test_scalcout_ocal_string() {
         let mut rec = ScalcoutRecord::new();
-        rec.put_field("AA", EpicsValue::String("hi".into())).unwrap();
-        rec.put_field("CALC", EpicsValue::String("1".into())).unwrap();
-        rec.put_field("OCAL", EpicsValue::String("AA".into())).unwrap();
+        rec.put_field("AA", EpicsValue::String("hi".into()))
+            .unwrap();
+        rec.put_field("CALC", EpicsValue::String("1".into()))
+            .unwrap();
+        rec.put_field("OCAL", EpicsValue::String("AA".into()))
+            .unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.osv, "hi");

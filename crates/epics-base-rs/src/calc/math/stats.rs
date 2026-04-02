@@ -69,9 +69,9 @@ pub fn smooth(data: &[f64]) -> Vec<f64> {
     }
     let mut result = vec![0.0; n];
     for i in 2..n - 2 {
-        result[i] = (data[i - 2] + 4.0 * data[i - 1] + 6.0 * data[i]
-            + 4.0 * data[i + 1] + data[i + 2])
-            / 16.0;
+        result[i] =
+            (data[i - 2] + 4.0 * data[i - 1] + 6.0 * data[i] + 4.0 * data[i + 1] + data[i + 2])
+                / 16.0;
     }
     result
 }

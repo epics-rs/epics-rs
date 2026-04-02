@@ -44,12 +44,18 @@ impl DeviceReadOutcome {
 
     /// Shorthand for a read that performed the record's compute step.
     pub fn computed() -> Self {
-        Self { did_compute: true, actions: Vec::new() }
+        Self {
+            did_compute: true,
+            actions: Vec::new(),
+        }
     }
 
     /// Shorthand for a computed read with actions.
     pub fn computed_with(actions: Vec<ProcessAction>) -> Self {
-        Self { did_compute: true, actions }
+        Self {
+            did_compute: true,
+            actions,
+        }
     }
 }
 
@@ -78,24 +84,33 @@ pub trait DeviceSupport: Send + Sync + 'static {
 
     /// Return the last alarm (status, severity) from the driver.
     /// None means the driver does not override alarms.
-    fn last_alarm(&self) -> Option<(u16, u16)> { None }
+    fn last_alarm(&self) -> Option<(u16, u16)> {
+        None
+    }
 
     /// Return the last timestamp from the driver.
     /// None means the driver does not override timestamps.
-    fn last_timestamp(&self) -> Option<std::time::SystemTime> { None }
+    fn last_timestamp(&self) -> Option<std::time::SystemTime> {
+        None
+    }
 
     /// Called after init() with the record name and scan type.
     fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
 
     /// Return a receiver for I/O Intr scan notifications.
     /// Only called for records with SCAN=I/O Intr.
-    fn io_intr_receiver(&mut self) -> Option<crate::runtime::sync::mpsc::Receiver<()>> { None }
+    fn io_intr_receiver(&mut self) -> Option<crate::runtime::sync::mpsc::Receiver<()>> {
+        None
+    }
 
     /// Begin an asynchronous write (submit only, no blocking).
     /// Returns `Some(handle)` if the write was submitted to a worker queue —
     /// the caller should wait on the handle outside any record lock.
     /// Returns `None` to fall back to synchronous [`write()`](DeviceSupport::write).
-    fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<Option<Box<dyn WriteCompletion>>> {
+    fn write_begin(
+        &mut self,
+        _record: &mut dyn Record,
+    ) -> CaResult<Option<Box<dyn WriteCompletion>>> {
         Ok(None)
     }
 
@@ -105,7 +120,12 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// holding a direct driver reference.
     ///
     /// Default: ignore.
-    fn handle_command(&mut self, _record: &mut dyn Record, _command: &str, _args: &[crate::types::EpicsValue]) -> CaResult<()> {
+    fn handle_command(
+        &mut self,
+        _record: &mut dyn Record,
+        _command: &str,
+        _args: &[crate::types::EpicsValue],
+    ) -> CaResult<()> {
         Ok(())
     }
 }

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
-use rayon::prelude::*;
-#[cfg(feature = "parallel")]
 use crate::par_util;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -199,7 +199,11 @@ impl ProcessState {
             || self.config.enable_high_clip;
 
         if needs_element_ops {
-            let bg = if self.config.enable_background { self.background.as_ref() } else { None };
+            let bg = if self.config.enable_background {
+                self.background.as_ref()
+            } else {
+                None
+            };
             let (ff, ff_mean) = if self.config.enable_flat_field {
                 if let Some(ref ff) = self.flat_field {
                     let mean = ff.iter().sum::<f64>() / ff.len().max(1) as f64;
@@ -402,7 +406,10 @@ impl NDPluginProcess for ProcessProcessor {
         "NDPluginProcess"
     }
 
-    fn register_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
         base.create_param("PROCESS_DATA_TYPE", ParamType::Int32)?;
         base.create_param("SAVE_BACKGROUND", ParamType::Int32)?;
@@ -450,13 +457,10 @@ impl NDPluginProcess for ProcessProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::{NDDimension, NDDataBuffer};
+    use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
 
     fn make_array(vals: &[u8]) -> NDArray {
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(vals.len())],
-            NDDataType::UInt8,
-        );
+        let mut arr = NDArray::new(vec![NDDimension::new(vals.len())], NDDataType::UInt8);
         if let NDDataBuffer::U8(ref mut v) = arr.data {
             v.copy_from_slice(vals);
         }
@@ -464,10 +468,7 @@ mod tests {
     }
 
     fn make_f64_array(vals: &[f64]) -> NDArray {
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(vals.len())],
-            NDDataType::Float64,
-        );
+        let mut arr = NDArray::new(vec![NDDimension::new(vals.len())], NDDataType::Float64);
         if let NDDataBuffer::F64(ref mut v) = arr.data {
             v.copy_from_slice(vals);
         }
@@ -526,9 +527,9 @@ mod tests {
 
         let result = state.process(&input);
         if let NDDataBuffer::U8(ref v) = result.data {
-            assert_eq!(v[0], 25);  // 10*2+5
-            assert_eq!(v[1], 45);  // 20*2+5
-            assert_eq!(v[2], 65);  // 30*2+5
+            assert_eq!(v[0], 25); // 10*2+5
+            assert_eq!(v[1], 45); // 20*2+5
+            assert_eq!(v[2], 65); // 30*2+5
         }
     }
 
@@ -545,9 +546,9 @@ mod tests {
 
         let result = state.process(&input);
         if let NDDataBuffer::U8(ref v) = result.data {
-            assert_eq!(v[0], 10);   // clipped up
-            assert_eq!(v[1], 50);   // unchanged
-            assert_eq!(v[2], 100);  // clipped down
+            assert_eq!(v[0], 10); // clipped up
+            assert_eq!(v[1], 50); // unchanged
+            assert_eq!(v[2], 100); // clipped down
         }
     }
 
@@ -697,8 +698,14 @@ mod tests {
         let input = make_array(&[10, 20, 30]);
         let _ = state.process(&input);
 
-        assert!(!state.config.save_background, "save_background should be cleared");
-        assert!(state.config.valid_background, "valid_background should be set");
+        assert!(
+            !state.config.save_background,
+            "save_background should be cleared"
+        );
+        assert!(
+            state.config.valid_background,
+            "valid_background should be set"
+        );
         assert!(state.background.is_some());
 
         let bg = state.background.as_ref().unwrap();
@@ -711,7 +718,10 @@ mod tests {
         let input2 = make_array(&[40, 50, 60]);
         let _ = state.process(&input2);
 
-        assert!(!state.config.save_background, "save_background stays cleared");
+        assert!(
+            !state.config.save_background,
+            "save_background stays cleared"
+        );
         // Background unchanged
         let bg2 = state.background.as_ref().unwrap();
         assert!((bg2[0] - 10.0).abs() < 1e-9);
@@ -730,8 +740,14 @@ mod tests {
         let input = make_array(&[50, 100, 150]);
         let _ = state.process(&input);
 
-        assert!(!state.config.save_flat_field, "save_flat_field should be cleared");
-        assert!(state.config.valid_flat_field, "valid_flat_field should be set");
+        assert!(
+            !state.config.save_flat_field,
+            "save_flat_field should be cleared"
+        );
+        assert!(
+            state.config.valid_flat_field,
+            "valid_flat_field should be set"
+        );
         assert!(state.flat_field.is_some());
 
         let ff = state.flat_field.as_ref().unwrap();
@@ -767,8 +783,14 @@ mod tests {
         // Frame 2: num_filtered would become 3, triggers auto_reset => 0
         let _ = state.process(&make_f64_array(&[100.0]));
         assert_eq!(state.num_filtered, 0, "auto_reset should have fired");
-        assert!(state.filter_state.is_none(), "filter state should be cleared");
-        assert!(state.output_state.is_none(), "output state should be cleared");
+        assert!(
+            state.filter_state.is_none(),
+            "filter state should be cleared"
+        );
+        assert!(
+            state.output_state.is_none(),
+            "output state should be cleared"
+        );
 
         // Frame 3 (after reset): acts as a new first frame
         let _ = state.process(&make_f64_array(&[200.0]));
@@ -835,7 +857,10 @@ mod tests {
         // Next frame should act as first frame (reset mode)
         let r = state.process(&make_f64_array(&[200.0]));
         let v = r.data.get_as_f64(0).unwrap();
-        assert!((v - 200.0).abs() < 1e-9, "after reset, first frame: got {v}");
+        assert!(
+            (v - 200.0).abs() < 1e-9,
+            "after reset, first frame: got {v}"
+        );
         assert_eq!(state.num_filtered, 1);
     }
 }

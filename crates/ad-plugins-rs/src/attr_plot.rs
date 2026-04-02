@@ -124,11 +124,17 @@ impl NDPluginProcess for AttrPlotProcessor {
         }
 
         // Push unique_id
-        Self::push_capped(&mut self.uid_buffer, array.unique_id as f64, self.max_points);
+        Self::push_capped(
+            &mut self.uid_buffer,
+            array.unique_id as f64,
+            self.max_points,
+        );
 
         // Push each tracked attribute's value
         for (i, name) in self.attributes.iter().enumerate() {
-            let value = array.attributes.get(name)
+            let value = array
+                .attributes
+                .get(name)
                 .and_then(|attr| attr.value.as_f64())
                 .unwrap_or(0.0);
             Self::push_capped(&mut self.buffers[i], value, self.max_points);

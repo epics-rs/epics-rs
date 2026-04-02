@@ -1,9 +1,9 @@
-pub mod ndarray_driver;
 pub mod ad_driver;
+pub mod ndarray_driver;
 
 // Re-exports for backward compatibility
-pub use ad_driver::{ADDriverBase, ADDriver};
 pub use crate::color::NDColorMode as ColorMode;
+pub use ad_driver::{ADDriver, ADDriverBase};
 
 /// Detector status states matching ADStatus_t.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

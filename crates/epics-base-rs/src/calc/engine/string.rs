@@ -3,10 +3,7 @@ use super::opcodes::{CoreOp, Opcode, StringOp};
 use super::value::StackValue;
 use super::{CompiledExpr, StringInputs};
 
-pub fn eval(
-    expr: &CompiledExpr,
-    inputs: &mut StringInputs,
-) -> Result<StackValue, CalcError> {
+pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
     let mut stack: Vec<StackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
@@ -26,9 +23,7 @@ pub fn eval(
                 }
                 CoreOp::PushDoubleVar(idx) => {
                     // In string evaluator, double vars are string vars
-                    stack.push(StackValue::Str(
-                        inputs.str_vars[*idx as usize].clone(),
-                    ));
+                    stack.push(StackValue::Str(inputs.str_vars[*idx as usize].clone()));
                 }
 
                 CoreOp::Pi => stack.push(StackValue::Double(std::f64::consts::PI)),
@@ -45,8 +40,7 @@ pub fn eval(
                 CoreOp::NormalRandom => {
                     let u1 = simple_random();
                     let u2 = simple_random();
-                    let n = (-2.0 * u1.ln()).sqrt()
-                        * (2.0 * std::f64::consts::PI * u2).cos();
+                    let n = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                     stack.push(StackValue::Double(n));
                 }
 
@@ -104,9 +98,7 @@ pub fn eval(
                     if b as i64 == 0 {
                         stack.push(StackValue::Double(f64::NAN));
                     } else {
-                        stack.push(StackValue::Double(
-                            ((a as i64) % (b as i64)) as f64,
-                        ));
+                        stack.push(StackValue::Double(((a as i64) % (b as i64)) as f64));
                     }
                 }
                 CoreOp::Neg => {
@@ -123,9 +115,7 @@ pub fn eval(
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (x - y).abs() < 1e-11
-                        }
+                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() < 1e-11,
                         (StackValue::Str(x), StackValue::Str(y)) => x == y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -135,9 +125,7 @@ pub fn eval(
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (x - y).abs() > 1e-11
-                        }
+                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() > 1e-11,
                         (StackValue::Str(x), StackValue::Str(y)) => x != y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -147,9 +135,7 @@ pub fn eval(
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (y - x) > 1e-11
-                        }
+                        (StackValue::Double(x), StackValue::Double(y)) => (y - x) > 1e-11,
                         (StackValue::Str(x), StackValue::Str(y)) => x < y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -171,9 +157,7 @@ pub fn eval(
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (x - y) > 1e-11
-                        }
+                        (StackValue::Double(x), StackValue::Double(y)) => (x - y) > 1e-11,
                         (StackValue::Str(x), StackValue::Str(y)) => x > y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -195,15 +179,19 @@ pub fn eval(
                 // Logical
                 CoreOp::And => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(
-                        if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 },
-                    ));
+                    stack.push(StackValue::Double(if a != 0.0 && b != 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }));
                 }
                 CoreOp::Or => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(
-                        if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 },
-                    ));
+                    stack.push(StackValue::Double(if a != 0.0 || b != 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }));
                 }
                 CoreOp::Not => {
                     let a = pop1_f64(&mut stack)?;
@@ -213,21 +201,15 @@ pub fn eval(
                 // Bitwise
                 CoreOp::BitAnd => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(
-                        ((a as i64) & (b as i64)) as f64,
-                    ));
+                    stack.push(StackValue::Double(((a as i64) & (b as i64)) as f64));
                 }
                 CoreOp::BitOr => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(
-                        ((a as i64) | (b as i64)) as f64,
-                    ));
+                    stack.push(StackValue::Double(((a as i64) | (b as i64)) as f64));
                 }
                 CoreOp::BitXor => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(
-                        ((a as i64) ^ (b as i64)) as f64,
-                    ));
+                    stack.push(StackValue::Double(((a as i64) ^ (b as i64)) as f64));
                 }
                 CoreOp::BitNot => {
                     let a = pop1_f64(&mut stack)?;
@@ -235,15 +217,11 @@ pub fn eval(
                 }
                 CoreOp::Shl => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(
-                        ((a as i64) << (b as i64)) as f64,
-                    ));
+                    stack.push(StackValue::Double(((a as i64) << (b as i64)) as f64));
                 }
                 CoreOp::Shr => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(
-                        ((a as i64) >> (b as i64)) as f64,
-                    ));
+                    stack.push(StackValue::Double(((a as i64) >> (b as i64)) as f64));
                 }
 
                 // Conditional
@@ -350,9 +328,7 @@ pub fn eval(
                 }
                 CoreOp::IsInf => {
                     let a = pop1_f64(&mut stack)?;
-                    stack.push(StackValue::Double(
-                        if a.is_infinite() { 1.0 } else { 0.0 },
-                    ));
+                    stack.push(StackValue::Double(if a.is_infinite() { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Finite(nargs) => {
                     let n = *nargs as usize;
@@ -463,9 +439,7 @@ pub fn eval(
                     stack.push(StackValue::Str(s.clone()));
                 }
                 StringOp::PushStringVar(idx) => {
-                    stack.push(StackValue::Str(
-                        inputs.str_vars[*idx as usize].clone(),
-                    ));
+                    stack.push(StackValue::Str(inputs.str_vars[*idx as usize].clone()));
                 }
                 StringOp::StoreStringVar(idx) => {
                     let v = pop1(&mut stack)?;
@@ -505,9 +479,7 @@ pub fn eval(
                 StringOp::Byte => {
                     let v = pop1(&mut stack)?;
                     let byte_val = match &v {
-                        StackValue::Str(s) => {
-                            s.bytes().next().map(|b| b as f64).unwrap_or(0.0)
-                        }
+                        StackValue::Str(s) => s.bytes().next().map(|b| b as f64).unwrap_or(0.0),
                         StackValue::Double(_) => 0.0,
                     };
                     stack.push(StackValue::Double(byte_val));
@@ -696,10 +668,22 @@ fn translate_escapes(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
             match bytes[i + 1] {
-                b'n' => { result.push('\n'); i += 2; }
-                b't' => { result.push('\t'); i += 2; }
-                b'r' => { result.push('\r'); i += 2; }
-                b'\\' => { result.push('\\'); i += 2; }
+                b'n' => {
+                    result.push('\n');
+                    i += 2;
+                }
+                b't' => {
+                    result.push('\t');
+                    i += 2;
+                }
+                b'r' => {
+                    result.push('\r');
+                    i += 2;
+                }
+                b'\\' => {
+                    result.push('\\');
+                    i += 2;
+                }
                 b'x' if i + 3 < bytes.len() => {
                     if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 2]), hex_val(bytes[i + 3])) {
                         result.push(((hi << 4) | lo) as char);
@@ -709,7 +693,10 @@ fn translate_escapes(s: &str) -> String {
                         i += 1;
                     }
                 }
-                _ => { result.push('\\'); i += 1; }
+                _ => {
+                    result.push('\\');
+                    i += 1;
+                }
             }
         } else {
             result.push(bytes[i] as char);
@@ -825,8 +812,10 @@ fn c_format_int(fmt: &str, val: i64) -> String {
     let spec = bytes[bytes.len() - 1];
     // Extract flags, width
     let inner = &fmt[1..fmt.len() - 1]; // between % and type
-    let width: usize = inner.trim_start_matches(|c: char| !c.is_ascii_digit())
-        .parse().unwrap_or(0);
+    let width: usize = inner
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .unwrap_or(0);
     let left_align = inner.contains('-');
     let zero_pad = inner.starts_with('0') && !left_align;
 
@@ -872,7 +861,11 @@ fn c_format_float(fmt: &str, val: f64) -> String {
             // Use shorter of %f and %e
             let f_str = format!("{:.prec$}", val, prec = precision);
             let e_str = format!("{:.prec$e}", val, prec = precision);
-            if e_str.len() < f_str.len() { e_str } else { f_str }
+            if e_str.len() < f_str.len() {
+                e_str
+            } else {
+                f_str
+            }
         }
         _ => format!("{}", val),
     }
@@ -900,7 +893,8 @@ fn simple_sscanf(input: &str, fmt: &str) -> StackValue {
                         Ok(v) => StackValue::Double(v as f64),
                         Err(_) => {
                             // Try parsing leading digits
-                            let num_str: String = trimmed.chars()
+                            let num_str: String = trimmed
+                                .chars()
                                 .take_while(|c| c.is_ascii_digit() || *c == '-')
                                 .collect();
                             StackValue::Double(num_str.parse::<i64>().unwrap_or(0) as f64)
@@ -998,7 +992,9 @@ fn simple_random() -> f64 {
             .unwrap_or_default()
             .as_nanos() as u64;
     }
-    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    s = s
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     SEED.store(s, Ordering::Relaxed);
     ((s >> 11) as f64) / ((1u64 << 53) as f64) + f64::MIN_POSITIVE
 }

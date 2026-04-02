@@ -107,7 +107,12 @@ impl Default for FemtoController {
 #[derive(Debug, Clone, Copy)]
 pub enum FemtoEvent {
     /// Gain bits changed from hardware.
-    BitsChanged { g1: bool, g2: bool, g3: bool, no: bool },
+    BitsChanged {
+        g1: bool,
+        g2: bool,
+        g3: bool,
+        no: bool,
+    },
     /// User requested a specific gain index.
     GainIndexChanged(i32),
 }
@@ -140,28 +145,24 @@ impl FemtoController {
                 self.state = FemtoState::ChangeGain;
             }
 
-            FemtoState::Idle => {
-                match event {
-                    Some(FemtoEvent::BitsChanged { g1, g2, g3, no }) => {
-                        self.g1 = g1;
-                        self.g2 = g2;
-                        self.g3 = g3;
-                        self.no = no;
-                        self.state = FemtoState::UpdateGain;
-                    }
-                    Some(FemtoEvent::GainIndexChanged(idx)) => {
-                        self.gain_index = idx;
-                        self.state = FemtoState::ChangeGain;
-                    }
-                    None => {}
+            FemtoState::Idle => match event {
+                Some(FemtoEvent::BitsChanged { g1, g2, g3, no }) => {
+                    self.g1 = g1;
+                    self.g2 = g2;
+                    self.g3 = g3;
+                    self.no = no;
+                    self.state = FemtoState::UpdateGain;
                 }
-            }
+                Some(FemtoEvent::GainIndexChanged(idx)) => {
+                    self.gain_index = idx;
+                    self.state = FemtoState::ChangeGain;
+                }
+                None => {}
+            },
 
             FemtoState::ChangeGain => {
                 // Validate requested gain
-                if self.current_gain == self.gain_index
-                    || !is_valid_gain_index(self.gain_index)
-                {
+                if self.current_gain == self.gain_index || !is_valid_gain_index(self.gain_index) {
                     // Invalid or no change: revert to current gain
                     if self.current_gain >= 0 && self.current_gain != self.gain_index {
                         self.gain_index = self.current_gain;

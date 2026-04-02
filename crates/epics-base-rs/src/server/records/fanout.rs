@@ -46,10 +46,12 @@ impl FanoutRecord {
 
     /// Get all non-empty link targets.
     pub fn links(&self) -> Vec<&str> {
-        [&self.lnk1, &self.lnk2, &self.lnk3, &self.lnk4, &self.lnk5, &self.lnk6]
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.as_str())
-            .collect()
+        [
+            &self.lnk1, &self.lnk2, &self.lnk3, &self.lnk4, &self.lnk5, &self.lnk6,
+        ]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.as_str())
+        .collect()
     }
 }

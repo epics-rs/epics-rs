@@ -47,9 +47,7 @@ impl StackEntry {
 fn binary_op(token: &Token) -> Option<(u8, u8)> {
     match token {
         Token::OrOr | Token::BitOr | Token::OrKeyword | Token::BitXor => Some((2, 2)),
-        Token::AndAnd | Token::BitAnd | Token::AndKeyword | Token::Shr | Token::Shl => {
-            Some((3, 3))
-        }
+        Token::AndAnd | Token::BitAnd | Token::AndKeyword | Token::Shr | Token::Shl => Some((3, 3)),
         Token::MaxOp | Token::MinOp => Some((4, 4)),
         Token::Eq | Token::Ne | Token::Lt | Token::Le | Token::Gt | Token::Ge => Some((5, 5)),
         Token::Plus | Token::Minus => Some((6, 6)),
@@ -279,9 +277,9 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                 }
 
                 Token::StringLiteral(s) => {
-                    output.push(Opcode::String(
-                        super::opcodes::StringOp::PushString(s.clone()),
-                    ));
+                    output.push(Opcode::String(super::opcodes::StringOp::PushString(
+                        s.clone(),
+                    )));
                     runtime_depth += 1;
                     operand_needed = false;
                     has_string_ops = true;
@@ -401,9 +399,7 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     }
                     let lparen_idx = stack.len() - 1;
                     if lparen_idx > 0 {
-                        if let StackEntry::VarargFunc { nargs, .. } =
-                            &mut stack[lparen_idx - 1]
-                        {
+                        if let StackEntry::VarargFunc { nargs, .. } = &mut stack[lparen_idx - 1] {
                             *nargs += 1;
                         }
                     }
@@ -442,13 +438,12 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     // If there's a pending UNTIL, close it
                     if let Some(until_pc) = until_stack.pop() {
                         let end_pc = output.len();
-                        output.push(Opcode::Control(
-                            super::opcodes::ControlOp::UntilEnd(until_pc),
-                        ));
+                        output.push(Opcode::Control(super::opcodes::ControlOp::UntilEnd(
+                            until_pc,
+                        )));
                         // Patch the Until opcode with the end_pc
-                        output[until_pc] = Opcode::Control(
-                            super::opcodes::ControlOp::Until(end_pc),
-                        );
+                        output[until_pc] =
+                            Opcode::Control(super::opcodes::ControlOp::Until(end_pc));
                     }
                     operand_needed = true;
                 }
@@ -530,9 +525,7 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                             }
                         }
                     }
-                    output.push(Opcode::String(
-                        super::opcodes::StringOp::Subrange,
-                    ));
+                    output.push(Opcode::String(super::opcodes::StringOp::Subrange));
                     runtime_depth -= 2; // consumes string + 2 args, pushes 1
                 }
 
@@ -555,9 +548,7 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                             }
                         }
                     }
-                    output.push(Opcode::String(
-                        super::opcodes::StringOp::Replace,
-                    ));
+                    output.push(Opcode::String(super::opcodes::StringOp::Replace));
                     runtime_depth -= 2; // consumes string + 2 args, pushes 1
                 }
 

@@ -22,5 +22,5 @@ pub mod server;
 
 // Re-export commonly used types from epics-base-rs for convenience
 pub use epics_base_rs::error::{CaError, CaResult};
-pub use epics_base_rs::types::{DbFieldType, EpicsValue};
 pub use epics_base_rs::runtime;
+pub use epics_base_rs::types::{DbFieldType, EpicsValue};

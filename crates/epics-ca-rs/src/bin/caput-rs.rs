@@ -49,7 +49,8 @@ async fn main() {
     };
 
     let result = if args.callback {
-        ch.put_with_timeout(&value, Duration::from_secs_f64(args.timeout)).await
+        ch.put_with_timeout(&value, Duration::from_secs_f64(args.timeout))
+            .await
     } else {
         ch.put_nowait(&value).await
     };

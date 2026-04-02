@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use epics_base_rs::runtime::sync::{Mutex, mpsc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use epics_base_rs::runtime::sync::{mpsc, Mutex};
 
 use crate::channel::AccessRights;
 use crate::protocol::*;
@@ -260,7 +260,12 @@ async fn connect_server(
         w.flush().await.ok()?;
     }
 
-    let read_task = epics_base_rs::runtime::task::spawn(read_loop(reader, server_addr, event_tx, writer.clone()));
+    let read_task = epics_base_rs::runtime::task::spawn(read_loop(
+        reader,
+        server_addr,
+        event_tx,
+        writer.clone(),
+    ));
 
     Some(ServerConnection {
         writer,
@@ -361,9 +366,7 @@ async fn read_loop(
                     let _ = w.flush().await;
                 }
                 CA_PROTO_CREATE_CH_FAIL => {
-                    let _ = event_tx.send(TransportEvent::ChannelCreateFailed {
-                        cid: hdr.cid,
-                    });
+                    let _ = event_tx.send(TransportEvent::ChannelCreateFailed { cid: hdr.cid });
                 }
                 CA_PROTO_ERROR => {
                     // Payload contains original request header (16 bytes) + error message string
@@ -375,7 +378,10 @@ async fn read_loop(
                     };
                     let msg = if actual_post > 16 {
                         let msg_bytes = &accumulated[data_start + 16..data_start + actual_post];
-                        let end = msg_bytes.iter().position(|&b| b == 0).unwrap_or(msg_bytes.len());
+                        let end = msg_bytes
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(msg_bytes.len());
                         String::from_utf8_lossy(&msg_bytes[..end]).to_string()
                     } else {
                         String::new()

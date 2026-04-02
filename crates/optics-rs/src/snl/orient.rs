@@ -6,10 +6,10 @@
 
 use epics_base_rs::server::database::PvDatabase;
 
-use crate::db_access::{alloc_origin, DbChannel, DbMultiMonitor};
-use crate::math::matrix3::{Mat3, Vec3, IDENTITY};
+use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
+use crate::math::matrix3::{IDENTITY, Mat3, Vec3};
 use crate::math::orient::{
-    angles_to_hkl, calc_a0, calc_omtx, check_omtx, hkl_to_angles, Constraint,
+    Constraint, angles_to_hkl, calc_a0, calc_omtx, check_omtx, hkl_to_angles,
 };
 
 /// Energy-wavelength conversion constant: E(keV) = HC / lambda(Angstroms).
@@ -247,13 +247,33 @@ pub enum OrientEvent {
     /// HKL values changed.
     HKLChanged { h: f64, k: f64, l: f64 },
     /// Trial angles changed.
-    AnglesChanged { tth: f64, th: f64, chi: f64, phi: f64 },
+    AnglesChanged {
+        tth: f64,
+        th: f64,
+        chi: f64,
+        phi: f64,
+    },
     /// Motor positions changed (external agent moved motors).
-    MotorsChanged { tth: f64, th: f64, chi: f64, phi: f64 },
+    MotorsChanged {
+        tth: f64,
+        th: f64,
+        chi: f64,
+        phi: f64,
+    },
     /// Motor move completed.
-    MotorsDone { tth: f64, th: f64, chi: f64, phi: f64 },
+    MotorsDone {
+        tth: f64,
+        th: f64,
+        chi: f64,
+        phi: f64,
+    },
     /// Motor readback values changed.
-    MotorRBVChanged { tth: f64, th: f64, chi: f64, phi: f64 },
+    MotorRBVChanged {
+        tth: f64,
+        th: f64,
+        chi: f64,
+        phi: f64,
+    },
     /// User command: calculate OMTX.
     CalcOMTX,
     /// Constraint mode changed.
@@ -326,15 +346,7 @@ impl OrientController {
             self.a0_state = CalcState::Failed;
             return false;
         }
-        match calc_a0(
-            lp.a,
-            lp.b,
-            lp.c,
-            lp.alpha,
-            lp.beta,
-            lp.gamma,
-            self.lambda,
-        ) {
+        match calc_a0(lp.a, lp.b, lp.c, lp.alpha, lp.beta, lp.gamma, self.lambda) {
             Some((a0, a0_inv)) => {
                 self.a0 = a0;
                 self.a0_inv = a0_inv;
@@ -361,7 +373,14 @@ impl OrientController {
             return false;
         }
 
-        match calc_omtx(&v1_hkl, &v1_angles, &v2_hkl, &v2_angles, &self.a0, &self.a0_inv) {
+        match calc_omtx(
+            &v1_hkl,
+            &v1_angles,
+            &v2_hkl,
+            &v2_angles,
+            &self.a0,
+            &self.a0_inv,
+        ) {
             Some((o, o_inv)) => {
                 self.omtx = o;
                 self.omtx_inv = o_inv;
@@ -502,8 +521,7 @@ impl OrientController {
                 self.h = h;
                 self.k = k;
                 self.l = l;
-                if self.a0_state != CalcState::Succeeded
-                    || self.omtx_state != CalcState::Succeeded
+                if self.a0_state != CalcState::Succeeded || self.omtx_state != CalcState::Succeeded
                 {
                     actions.message = Some("No valid A0/OMTX matrix".into());
                     return actions;
@@ -525,8 +543,7 @@ impl OrientController {
                 self.th = th;
                 self.chi = chi;
                 self.phi = phi;
-                if self.a0_state != CalcState::Succeeded
-                    || self.omtx_state != CalcState::Succeeded
+                if self.a0_state != CalcState::Succeeded || self.omtx_state != CalcState::Succeeded
                 {
                     actions.message = Some("No valid A0/OMTX matrix".into());
                     return actions;
@@ -604,8 +621,7 @@ impl OrientController {
                         actions.write_angles = Some([self.tth, self.th, self.chi, self.phi]);
                     }
                 } else {
-                    actions.message =
-                        Some("Bad OMTX calc; motPut_Auto set to Manual".into());
+                    actions.message = Some("Bad OMTX calc; motPut_Auto set to Manual".into());
                     self.mot_put_auto = false;
                 }
             }
@@ -614,13 +630,13 @@ impl OrientController {
                 self.mode = mode;
                 if self.a0_state == CalcState::Succeeded
                     && self.omtx_state == CalcState::Succeeded
-                    && self.hkl_to_trial_angles() {
-                        actions.write_angles = Some([self.tth, self.th, self.chi, self.phi]);
-                        if self.mot_put_auto {
-                            actions.drive_motors =
-                                Some([self.tth, self.th, self.chi, self.phi]);
-                        }
+                    && self.hkl_to_trial_angles()
+                {
+                    actions.write_angles = Some([self.tth, self.th, self.chi, self.phi]);
+                    if self.mot_put_auto {
+                        actions.drive_motors = Some([self.tth, self.th, self.chi, self.phi]);
                     }
+                }
             }
 
             OrientEvent::MotPut => {
@@ -635,8 +651,7 @@ impl OrientController {
                 self.th = self.mot_th;
                 self.chi = self.mot_chi;
                 self.phi = self.mot_phi;
-                actions.write_angles =
-                    Some([self.tth, self.th, self.chi, self.phi]);
+                actions.write_angles = Some([self.tth, self.th, self.chi, self.phi]);
                 if self.trial_angles_to_hkl() {
                     actions.write_hkl = Some([self.h, self.k, self.l]);
                 }
@@ -703,13 +718,7 @@ impl OrientController {
                     if self.a0_state == CalcState::Succeeded {
                         let v2_hkl = self.ref2.hkl();
                         let v2_angles = self.ref2.angles();
-                        let err = check_omtx(
-                            &v2_hkl,
-                            &v2_angles,
-                            &self.a0,
-                            &self.a0_inv,
-                            &inv,
-                        );
+                        let err = check_omtx(&v2_hkl, &v2_angles, &self.a0, &self.a0_inv, &inv);
                         match err {
                             Some(e) if e.abs() < self.err_angle_thresh => {
                                 self.err_angle = e;
@@ -727,8 +736,7 @@ impl OrientController {
                             }
                         }
                     } else {
-                        actions.message =
-                            Some("Cannot check OMTX: no valid A0".into());
+                        actions.message = Some("Cannot check OMTX: no valid A0".into());
                         self.omtx_state = CalcState::Failed;
                     }
                 } else {
@@ -746,9 +754,11 @@ impl OrientController {
 ///
 /// This monitors HKL, angle, energy, and motor PVs, dispatching events
 /// to [`OrientController::step`] and applying the resulting actions.
-pub async fn run(config: OrientConfig, db: PvDatabase) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    
-    use tokio::time::{sleep, Duration};
+pub async fn run(
+    config: OrientConfig,
+    db: PvDatabase,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::time::{Duration, sleep};
 
     tokio::time::sleep(Duration::from_secs(3)).await;
     println!("orient: starting for prefix={}", config.prefix);
@@ -806,33 +816,64 @@ pub async fn run(config: OrientConfig, db: PvDatabase) -> Result<(), Box<dyn std
 
     // Build multi-monitor
     let monitored_pvs: Vec<String> = vec![
-        format!("{p}energy"), format!("{p}lambda"),
-        format!("{p}H"), format!("{p}K"), format!("{p}L"),
-        format!("{p}TTH"), format!("{p}TH"), format!("{p}CHI"), format!("{p}PHI"),
-        config.motor_tth.clone(), config.motor_th.clone(),
-        config.motor_chi.clone(), config.motor_phi.clone(),
+        format!("{p}energy"),
+        format!("{p}lambda"),
+        format!("{p}H"),
+        format!("{p}K"),
+        format!("{p}L"),
+        format!("{p}TTH"),
+        format!("{p}TH"),
+        format!("{p}CHI"),
+        format!("{p}PHI"),
+        config.motor_tth.clone(),
+        config.motor_th.clone(),
+        config.motor_chi.clone(),
+        config.motor_phi.clone(),
         config.motor_tth_rbv(),
         format!("{p}Mode"),
-        format!("{p}motPut"), format!("{p}motGet"),
-        format!("{p}motPut_Auto"), format!("{p}motGet_Auto"),
+        format!("{p}motPut"),
+        format!("{p}motGet"),
+        format!("{p}motPut_Auto"),
+        format!("{p}motGet_Auto"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-    println!("orient: subscribed to {} PVs, {} active", monitored_pvs.len(), monitor.sub_count());
+    println!(
+        "orient: subscribed to {} PVs, {} active",
+        monitored_pvs.len(),
+        monitor.sub_count()
+    );
 
     // Initialize controller
     let mut ctrl = OrientController::default();
 
     // Read initial values
     ctrl.energy = ch_energy.get_f64().await;
-    ctrl.lambda = if ctrl.energy > SMALL { HC / ctrl.energy } else { 0.0 };
+    ctrl.lambda = if ctrl.energy > SMALL {
+        HC / ctrl.energy
+    } else {
+        0.0
+    };
     {
-        let a = ch_a.get_f64().await; let a = if a > 0.0 { a } else { 5.431 };
-        let b = ch_b.get_f64().await; let b = if b > 0.0 { b } else { 5.431 };
-        let c = ch_c.get_f64().await; let c = if c > 0.0 { c } else { 5.431 };
-        let alpha = ch_alpha.get_f64().await; let alpha = if alpha > 0.0 { alpha } else { 90.0 };
-        let beta = ch_beta.get_f64().await; let beta = if beta > 0.0 { beta } else { 90.0 };
-        let gamma = ch_gamma.get_f64().await; let gamma = if gamma > 0.0 { gamma } else { 90.0 };
-        ctrl.lattice = LatticeParams { a, b, c, alpha, beta, gamma };
+        let a = ch_a.get_f64().await;
+        let a = if a > 0.0 { a } else { 5.431 };
+        let b = ch_b.get_f64().await;
+        let b = if b > 0.0 { b } else { 5.431 };
+        let c = ch_c.get_f64().await;
+        let c = if c > 0.0 { c } else { 5.431 };
+        let alpha = ch_alpha.get_f64().await;
+        let alpha = if alpha > 0.0 { alpha } else { 90.0 };
+        let beta = ch_beta.get_f64().await;
+        let beta = if beta > 0.0 { beta } else { 90.0 };
+        let gamma = ch_gamma.get_f64().await;
+        let gamma = if gamma > 0.0 { gamma } else { 90.0 };
+        ctrl.lattice = LatticeParams {
+            a,
+            b,
+            c,
+            alpha,
+            beta,
+            gamma,
+        };
     }
     ctrl.mot_put_auto = ch_mot_put_auto.get_i16().await as i32 != 0;
     ctrl.mot_get_auto = ch_mot_get_auto.get_i16().await as i32 != 0;
@@ -875,24 +916,38 @@ pub async fn run(config: OrientConfig, db: PvDatabase) -> Result<(), Box<dyn std
             Some(OrientEvent::LambdaChanged(new_val))
         } else if changed_pv == pv_h {
             sleep(Duration::from_millis(20)).await;
-            let h = new_val; let k = ch_k.get_f64().await; let l = ch_l.get_f64().await;
+            let h = new_val;
+            let k = ch_k.get_f64().await;
+            let l = ch_l.get_f64().await;
             Some(OrientEvent::HKLChanged { h, k, l })
         } else if changed_pv == pv_k {
             sleep(Duration::from_millis(20)).await;
-            let h = ch_h.get_f64().await; let k = new_val; let l = ch_l.get_f64().await;
+            let h = ch_h.get_f64().await;
+            let k = new_val;
+            let l = ch_l.get_f64().await;
             Some(OrientEvent::HKLChanged { h, k, l })
         } else if changed_pv == pv_l {
             sleep(Duration::from_millis(20)).await;
-            let h = ch_h.get_f64().await; let k = ch_k.get_f64().await; let l = new_val;
+            let h = ch_h.get_f64().await;
+            let k = ch_k.get_f64().await;
+            let l = new_val;
             Some(OrientEvent::HKLChanged { h, k, l })
-        } else if changed_pv == pv_tth || changed_pv == pv_th || changed_pv == pv_chi || changed_pv == pv_phi {
+        } else if changed_pv == pv_tth
+            || changed_pv == pv_th
+            || changed_pv == pv_chi
+            || changed_pv == pv_phi
+        {
             sleep(Duration::from_millis(20)).await;
             let tth = ch_tth.get_f64().await;
             let th = ch_th.get_f64().await;
             let chi = ch_chi.get_f64().await;
             let phi = ch_phi.get_f64().await;
             Some(OrientEvent::AnglesChanged { tth, th, chi, phi })
-        } else if changed_pv == pv_mot_tth || changed_pv == pv_mot_th || changed_pv == pv_mot_chi || changed_pv == pv_mot_phi {
+        } else if changed_pv == pv_mot_tth
+            || changed_pv == pv_mot_th
+            || changed_pv == pv_mot_chi
+            || changed_pv == pv_mot_phi
+        {
             let tth = ch_mot_tth.get_f64().await;
             let th = ch_mot_th.get_f64().await;
             let chi = ch_mot_chi.get_f64().await;
@@ -913,9 +968,17 @@ pub async fn run(config: OrientConfig, db: PvDatabase) -> Result<(), Box<dyn std
             };
             Some(OrientEvent::ModeChanged(constraint))
         } else if changed_pv == pv_mot_put {
-            if new_val as i32 != 0 { Some(OrientEvent::MotPut) } else { None }
+            if new_val as i32 != 0 {
+                Some(OrientEvent::MotPut)
+            } else {
+                None
+            }
         } else if changed_pv == pv_mot_get {
-            if new_val as i32 != 0 { Some(OrientEvent::MotGet) } else { None }
+            if new_val as i32 != 0 {
+                Some(OrientEvent::MotGet)
+            } else {
+                None
+            }
         } else if changed_pv == pv_mot_put_auto {
             ctrl.mot_put_auto = new_val as i32 != 0;
             None

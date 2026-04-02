@@ -11,9 +11,9 @@ use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::{EomReason, OctetNext, OctetReadResult};
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
-use crate::{asyn_trace, asyn_trace_io};
 use crate::trace::TraceMask;
 use crate::user::AsynUser;
+use crate::{asyn_trace, asyn_trace_io};
 
 /// IP transport protocol.
 ///
@@ -63,7 +63,8 @@ impl IpPortConfig {
         let spec = spec.trim();
 
         // Check for unix:// prefix
-        if let Some(path) = spec.strip_prefix("unix://")
+        if let Some(path) = spec
+            .strip_prefix("unix://")
             .or_else(|| spec.strip_prefix("UNIX://"))
         {
             if path.is_empty() {
@@ -220,8 +221,9 @@ impl OctetNext for IpIoState {
                         nbytes_transferred: n,
                         eom_reason: EomReason::CNT,
                     }),
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock =>
                     {
                         Err(AsynError::Status {
                             status: AsynStatus::Timeout,
@@ -242,8 +244,9 @@ impl OctetNext for IpIoState {
                         nbytes_transferred: n,
                         eom_reason: EomReason::CNT,
                     }),
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock =>
                     {
                         Err(AsynError::Status {
                             status: AsynStatus::Timeout,
@@ -265,8 +268,9 @@ impl OctetNext for IpIoState {
                         nbytes_transferred: n,
                         eom_reason: EomReason::CNT,
                     }),
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock =>
                     {
                         Err(AsynError::Status {
                             status: AsynStatus::Timeout,
@@ -363,29 +367,32 @@ impl DrvAsynIPPort {
                 Some(socket2::Protocol::TCP),
             )?;
             socket.set_reuse_address(true)?;
-            let local_addr: std::net::SocketAddr =
-                format!("0.0.0.0:{local_port}").parse().map_err(|_| AsynError::Status {
+            let local_addr: std::net::SocketAddr = format!("0.0.0.0:{local_port}")
+                .parse()
+                .map_err(|_| AsynError::Status {
                     status: AsynStatus::Error,
                     message: format!("invalid local address: 0.0.0.0:{local_port}"),
                 })?;
             socket.bind(&local_addr.into())?;
 
-            let remote_addr: std::net::SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
-                AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("invalid remote address '{addr_str}': {e}"),
-                }
-            })?;
+            let remote_addr: std::net::SocketAddr =
+                addr_str
+                    .parse()
+                    .map_err(|e: std::net::AddrParseError| AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("invalid remote address '{addr_str}': {e}"),
+                    })?;
             socket.connect_timeout(&remote_addr.into(), self.config.connect_timeout)?;
             Ok(TcpStream::from(socket))
         } else {
             use std::net::ToSocketAddrs;
-            let addrs: Vec<std::net::SocketAddr> = addr_str.to_socket_addrs().map_err(|e| {
-                AsynError::Status {
+            let addrs: Vec<std::net::SocketAddr> = addr_str
+                .to_socket_addrs()
+                .map_err(|e| AsynError::Status {
                     status: AsynStatus::Error,
                     message: format!("failed to resolve '{addr_str}': {e}"),
-                }
-            })?.collect();
+                })?
+                .collect();
 
             let mut last_err = None;
             let mut connected_stream = None;
@@ -441,13 +448,15 @@ impl DrvAsynIPPort {
         let socket = UdpSocket::bind(&bind_addr)?;
         // Try to parse as IPv4 multicast address
         if let Ok(mcast_addr) = self.config.host.parse::<std::net::Ipv4Addr>() {
-            socket.join_multicast_v4(&mcast_addr, &std::net::Ipv4Addr::UNSPECIFIED)
+            socket
+                .join_multicast_v4(&mcast_addr, &std::net::Ipv4Addr::UNSPECIFIED)
                 .map_err(|e| AsynError::Status {
                     status: AsynStatus::Error,
                     message: format!("join multicast {}: {e}", self.config.host),
                 })?;
         } else if let Ok(mcast_addr) = self.config.host.parse::<std::net::Ipv6Addr>() {
-            socket.join_multicast_v6(&mcast_addr, 0)
+            socket
+                .join_multicast_v6(&mcast_addr, 0)
                 .map_err(|e| AsynError::Status {
                     status: AsynStatus::Error,
                     message: format!("join multicast v6 {}: {e}", self.config.host),
@@ -463,11 +472,12 @@ impl DrvAsynIPPort {
 
     #[cfg(unix)]
     fn connect_unix(&mut self) -> AsynResult<std::os::unix::net::UnixStream> {
-        let stream = std::os::unix::net::UnixStream::connect(&self.config.host)
-            .map_err(|e| AsynError::Status {
+        let stream = std::os::unix::net::UnixStream::connect(&self.config.host).map_err(|e| {
+            AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("unix connect to '{}': {e}", self.config.host),
-            })?;
+            }
+        })?;
         Ok(stream)
     }
 }
@@ -520,13 +530,25 @@ impl PortDriver for DrvAsynIPPort {
         }
         self.base.connected = true;
         self.base.announce_exception(AsynException::Connect, -1);
-        asyn_trace!(Some(self.base.trace), &self.base.port_name, TraceMask::FLOW,
-            "connected to {}:{} ({:?})", self.config.host, self.config.port, self.config.protocol);
+        asyn_trace!(
+            Some(self.base.trace),
+            &self.base.port_name,
+            TraceMask::FLOW,
+            "connected to {}:{} ({:?})",
+            self.config.host,
+            self.config.port,
+            self.config.protocol
+        );
         Ok(())
     }
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        asyn_trace!(Some(self.base.trace), &self.base.port_name, TraceMask::FLOW, "disconnect");
+        asyn_trace!(
+            Some(self.base.trace),
+            &self.base.port_name,
+            TraceMask::FLOW,
+            "disconnect"
+        );
         self.io.inner = None;
         self.base.connected = false;
         self.base.announce_exception(AsynException::Connect, -1);
@@ -535,17 +557,33 @@ impl PortDriver for DrvAsynIPPort {
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
-        let result = self.base.interpose_octet.dispatch_read(user, buf, &mut self.io);
+        let result = self
+            .base
+            .interpose_octet
+            .dispatch_read(user, buf, &mut self.io);
         match result {
             Ok(r) => {
-                asyn_trace_io!(Some(self.base.trace), &self.base.port_name, TraceMask::IO_DRIVER,
-                    &buf[..r.nbytes_transferred], "read");
+                asyn_trace_io!(
+                    Some(self.base.trace),
+                    &self.base.port_name,
+                    TraceMask::IO_DRIVER,
+                    &buf[..r.nbytes_transferred],
+                    "read"
+                );
                 Ok(r.nbytes_transferred)
             }
             Err(ref e) if self.disconnect_on_read_timeout => {
-                if let AsynError::Status { status: AsynStatus::Timeout, .. } = e {
-                    asyn_trace!(Some(self.base.trace), &self.base.port_name, TraceMask::FLOW,
-                        "disconnectOnReadTimeout triggered");
+                if let AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    ..
+                } = e
+                {
+                    asyn_trace!(
+                        Some(self.base.trace),
+                        &self.base.port_name,
+                        TraceMask::FLOW,
+                        "disconnectOnReadTimeout triggered"
+                    );
                     self.io.inner = None;
                     self.base.connected = false;
                     self.base.announce_exception(AsynException::Connect, -1);
@@ -558,8 +596,16 @@ impl PortDriver for DrvAsynIPPort {
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
         self.base.check_ready()?;
-        asyn_trace_io!(Some(self.base.trace), &self.base.port_name, TraceMask::IO_DRIVER, data, "write");
-        self.base.interpose_octet.dispatch_write(user, data, &mut self.io)?;
+        asyn_trace_io!(
+            Some(self.base.trace),
+            &self.base.port_name,
+            TraceMask::IO_DRIVER,
+            data,
+            "write"
+        );
+        self.base
+            .interpose_octet
+            .dispatch_write(user, data, &mut self.io)?;
         Ok(())
     }
 
@@ -727,7 +773,10 @@ mod tests {
         let mut buf = [0u8; 32];
         let err = drv.read_octet(&user, &mut buf).unwrap_err();
         match err {
-            AsynError::Status { status: AsynStatus::Timeout, .. } => {}
+            AsynError::Status {
+                status: AsynStatus::Timeout,
+                ..
+            } => {}
             other => panic!("expected Timeout, got {other:?}"),
         }
     }
@@ -750,7 +799,10 @@ mod tests {
         let mut buf = [0u8; 32];
         let err = drv.read_octet(&user, &mut buf).unwrap_err();
         match err {
-            AsynError::Status { status: AsynStatus::Disconnected, .. } => {}
+            AsynError::Status {
+                status: AsynStatus::Disconnected,
+                ..
+            } => {}
             other => panic!("expected Disconnected (EOF), got {other:?}"),
         }
 
@@ -845,7 +897,8 @@ mod tests {
             server.send_to(&buf[..n], src).unwrap();
         });
 
-        let mut drv = DrvAsynIPPort::new("udptest", &format!("127.0.0.1:{server_port} udp")).unwrap();
+        let mut drv =
+            DrvAsynIPPort::new("udptest", &format!("127.0.0.1:{server_port} udp")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
         assert!(drv.base().connected);
@@ -980,11 +1033,26 @@ mod tests {
 
     #[test]
     fn test_parse_case_insensitive() {
-        assert_eq!(IpPortConfig::parse("h:1 Tcp").unwrap().protocol, IpProtocol::Tcp);
-        assert_eq!(IpPortConfig::parse("h:1 Udp").unwrap().protocol, IpProtocol::Udp);
-        assert_eq!(IpPortConfig::parse("h:1 Tcp&").unwrap().protocol, IpProtocol::TcpNonBlocking);
-        assert_eq!(IpPortConfig::parse("h:1 Udp&").unwrap().protocol, IpProtocol::UdpBroadcast);
-        assert_eq!(IpPortConfig::parse("h:1 Udp*").unwrap().protocol, IpProtocol::UdpMulticast);
+        assert_eq!(
+            IpPortConfig::parse("h:1 Tcp").unwrap().protocol,
+            IpProtocol::Tcp
+        );
+        assert_eq!(
+            IpPortConfig::parse("h:1 Udp").unwrap().protocol,
+            IpProtocol::Udp
+        );
+        assert_eq!(
+            IpPortConfig::parse("h:1 Tcp&").unwrap().protocol,
+            IpProtocol::TcpNonBlocking
+        );
+        assert_eq!(
+            IpPortConfig::parse("h:1 Udp&").unwrap().protocol,
+            IpProtocol::UdpBroadcast
+        );
+        assert_eq!(
+            IpPortConfig::parse("h:1 Udp*").unwrap().protocol,
+            IpProtocol::UdpMulticast
+        );
     }
 
     // --- Unix socket integration test ---

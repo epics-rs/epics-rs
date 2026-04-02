@@ -154,8 +154,12 @@ mod tests {
         let a2 = a.clone();
         let b2 = b.clone();
 
-        mgr.add_callback(move |_| { a2.fetch_add(1, Ordering::Relaxed); });
-        mgr.add_callback(move |_| { b2.fetch_add(10, Ordering::Relaxed); });
+        mgr.add_callback(move |_| {
+            a2.fetch_add(1, Ordering::Relaxed);
+        });
+        mgr.add_callback(move |_| {
+            b2.fetch_add(10, Ordering::Relaxed);
+        });
 
         let event = ExceptionEvent {
             port_name: "p".into(),

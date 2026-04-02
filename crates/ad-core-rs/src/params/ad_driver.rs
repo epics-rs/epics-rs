@@ -82,7 +82,8 @@ impl ADDriverParams {
             num_images: port_base.create_param("NIMAGES", ParamType::Int32)?,
             num_images_counter: port_base.create_param("NIMAGES_COUNTER", ParamType::Int32)?,
             num_exposures: port_base.create_param("NEXPOSURES", ParamType::Int32)?,
-            num_exposures_counter: port_base.create_param("NEXPOSURES_COUNTER", ParamType::Int32)?,
+            num_exposures_counter: port_base
+                .create_param("NEXPOSURES_COUNTER", ParamType::Int32)?,
             acquire_time: port_base.create_param("ACQ_TIME", ParamType::Float64)?,
             acquire_period: port_base.create_param("ACQ_PERIOD", ParamType::Float64)?,
             time_remaining: port_base.create_param("TIME_REMAINING", ParamType::Float64)?,
@@ -102,12 +103,15 @@ impl ADDriverParams {
 
             // Shutter
             shutter_control: port_base.create_param("SHUTTER_CONTROL", ParamType::Int32)?,
-            shutter_control_epics: port_base.create_param("SHUTTER_CONTROL_EPICS", ParamType::Int32)?,
+            shutter_control_epics: port_base
+                .create_param("SHUTTER_CONTROL_EPICS", ParamType::Int32)?,
             shutter_status: port_base.create_param("SHUTTER_STATUS", ParamType::Int32)?,
-            shutter_status_epics: port_base.create_param("SHUTTER_STATUS_EPICS", ParamType::Int32)?,
+            shutter_status_epics: port_base
+                .create_param("SHUTTER_STATUS_EPICS", ParamType::Int32)?,
             shutter_mode: port_base.create_param("SHUTTER_MODE", ParamType::Int32)?,
             shutter_open_delay: port_base.create_param("SHUTTER_OPEN_DELAY", ParamType::Float64)?,
-            shutter_close_delay: port_base.create_param("SHUTTER_CLOSE_DELAY", ParamType::Float64)?,
+            shutter_close_delay: port_base
+                .create_param("SHUTTER_CLOSE_DELAY", ParamType::Float64)?,
 
             // Temperature
             temperature: port_base.create_param("TEMPERATURE", ParamType::Float64)?,
@@ -147,6 +151,9 @@ mod tests {
         let params = ADDriverParams::create(&mut base).unwrap();
         // Should be able to access base params through the base field
         assert!(base.find_param("ARRAY_COUNTER").is_some());
-        assert_eq!(params.base.array_counter, base.find_param("ARRAY_COUNTER").unwrap());
+        assert_eq!(
+            params.base.array_counter,
+            base.find_param("ARRAY_COUNTER").unwrap()
+        );
     }
 }

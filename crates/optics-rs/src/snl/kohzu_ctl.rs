@@ -14,7 +14,7 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 use tracing::info;
 
-use crate::db_access::{alloc_origin, DbChannel, DbMultiMonitor};
+use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -79,7 +79,11 @@ pub enum Geometry {
 
 impl Geometry {
     pub fn from_i32(v: i32) -> Self {
-        if v == 2 { Self::Alternate } else { Self::Standard }
+        if v == 2 {
+            Self::Alternate
+        } else {
+            Self::Standard
+        }
     }
 }
 
@@ -149,13 +153,17 @@ pub fn is_forbidden_reflection(h: f64, k: f64, l: f64) -> bool {
 
 /// Convert energy (keV) to wavelength (Angstrom).
 pub fn energy_to_lambda(e: f64) -> f64 {
-    if e <= 0.0 { return f64::INFINITY; }
+    if e <= 0.0 {
+        return f64::INFINITY;
+    }
     HC / e
 }
 
 /// Convert wavelength (Angstrom) to energy (keV).
 pub fn lambda_to_energy(lambda: f64) -> f64 {
-    if lambda <= 0.0 { return f64::INFINITY; }
+    if lambda <= 0.0 {
+        return f64::INFINITY;
+    }
     HC / lambda
 }
 
@@ -214,10 +222,18 @@ pub fn compute_theta_limits(motor_hi: f64, motor_lo: f64) -> (f64, f64) {
 }
 
 /// Compute energy/lambda limits from 2d spacing and theta limits.
-pub fn compute_energy_lambda_limits(two_d: f64, theta_hi: f64, theta_lo: f64) -> (f64, f64, f64, f64) {
+pub fn compute_energy_lambda_limits(
+    two_d: f64,
+    theta_hi: f64,
+    theta_lo: f64,
+) -> (f64, f64, f64, f64) {
     let lambda_hi = two_d * (theta_hi / RAD_CONV).sin();
     let lambda_lo = two_d * (theta_lo / RAD_CONV).sin();
-    let e_hi = if lambda_lo > 0.0 { HC / lambda_lo } else { f64::INFINITY };
+    let e_hi = if lambda_lo > 0.0 {
+        HC / lambda_lo
+    } else {
+        f64::INFINITY
+    };
     let e_lo = if lambda_hi > 0.0 { HC / lambda_hi } else { 0.0 };
     (e_hi, e_lo, lambda_hi, lambda_lo)
 }
@@ -225,22 +241,54 @@ pub fn compute_energy_lambda_limits(two_d: f64, theta_hi: f64, theta_lo: f64) ->
 /// Coordinate motor speeds so all motors arrive at the same time.
 /// Returns (new_th_speed, new_y_speed, new_z_speed).
 pub fn coordinate_speeds(
-    theta_delta: f64, y_delta: f64, z_delta: f64,
-    th_speed: f64, y_speed: f64, z_speed: f64,
+    theta_delta: f64,
+    y_delta: f64,
+    z_delta: f64,
+    th_speed: f64,
+    y_speed: f64,
+    z_speed: f64,
     cc_mode: CrystalMode,
 ) -> (f64, f64, f64) {
-    let th_time = if th_speed > 0.0 { theta_delta.abs() / th_speed } else { 0.0 };
-    let y_time = if cc_mode.y_frozen() { 0.0 } else if y_speed > 0.0 { y_delta.abs() / y_speed } else { 0.0 };
-    let z_time = if cc_mode.z_frozen() { 0.0 } else if z_speed > 0.0 { z_delta.abs() / z_speed } else { 0.0 };
+    let th_time = if th_speed > 0.0 {
+        theta_delta.abs() / th_speed
+    } else {
+        0.0
+    };
+    let y_time = if cc_mode.y_frozen() {
+        0.0
+    } else if y_speed > 0.0 {
+        y_delta.abs() / y_speed
+    } else {
+        0.0
+    };
+    let z_time = if cc_mode.z_frozen() {
+        0.0
+    } else if z_speed > 0.0 {
+        z_delta.abs() / z_speed
+    } else {
+        0.0
+    };
 
     let max_time = th_time.max(y_time).max(z_time);
     if max_time <= 0.0 {
         return (th_speed, y_speed, z_speed);
     }
 
-    let new_th = if max_time > 0.0 && theta_delta.abs() > 0.0 { theta_delta.abs() / max_time } else { th_speed };
-    let new_y = if max_time > 0.0 && y_delta.abs() > 0.0 { y_delta.abs() / max_time } else { y_speed };
-    let new_z = if max_time > 0.0 && z_delta.abs() > 0.0 { z_delta.abs() / max_time } else { z_speed };
+    let new_th = if max_time > 0.0 && theta_delta.abs() > 0.0 {
+        theta_delta.abs() / max_time
+    } else {
+        th_speed
+    };
+    let new_y = if max_time > 0.0 && y_delta.abs() > 0.0 {
+        y_delta.abs() / max_time
+    } else {
+        y_speed
+    };
+    let new_z = if max_time > 0.0 && z_delta.abs() > 0.0 {
+        z_delta.abs() / max_time
+    } else {
+        z_speed
+    };
     (new_th, new_y, new_z)
 }
 
@@ -308,7 +356,10 @@ impl KohzuConfig {
 ///
 /// This is the main async entry point. It accesses PVs directly through
 /// the in-process database — no CA network, no search, no port conflicts.
-pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(
+    config: KohzuConfig,
+    db: PvDatabase,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Wait for iocInit to complete — PVs are loaded during st.cmd but
     // subscriber wiring happens during iocInit which runs after st.cmd finishes.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -444,7 +495,11 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
         config.pv("KohzuUseSetBO"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-    println!("kohzuCtl: subscribed to {} PVs, {} active", monitored_pvs.len(), monitor.sub_count());
+    println!(
+        "kohzuCtl: subscribed to {} PVs, {} active",
+        monitored_pvs.len(),
+        monitor.sub_count()
+    );
 
     // -- Initialize state --
     let geom = config.geom;
@@ -495,7 +550,8 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
     let _ = ch_theta_hi.put_f64(theta_hi).await;
     let _ = ch_theta_lo.put_f64(theta_lo).await;
 
-    let (e_hi, e_lo, lambda_hi, lambda_lo) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
+    let (e_hi, e_lo, lambda_hi, lambda_lo) =
+        compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
     let _ = ch_e_hi.put_f64(e_hi).await;
     let _ = ch_e_lo.put_f64(e_lo).await;
     let _ = ch_lambda_hi.put_f64(lambda_hi).await;
@@ -514,8 +570,16 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
 
     // Update readbacks
     let mut theta_rdbk_val = theta_mot_rdbk;
-    let mut lambda_rdbk_val = if two_d > 0.0 { theta_to_lambda(theta_rdbk_val, two_d) } else { 0.0 };
-    let mut e_rdbk_val = if lambda_rdbk_val > 0.0 { lambda_to_energy(lambda_rdbk_val) } else { 0.0 };
+    let mut lambda_rdbk_val = if two_d > 0.0 {
+        theta_to_lambda(theta_rdbk_val, two_d)
+    } else {
+        0.0
+    };
+    let mut e_rdbk_val = if lambda_rdbk_val > 0.0 {
+        lambda_to_energy(lambda_rdbk_val)
+    } else {
+        0.0
+    };
     let _ = ch_theta_rdbk.put_f64_post(theta_rdbk_val).await;
     let _ = ch_lambda_rdbk.put_f64_post(lambda_rdbk_val).await;
     let _ = ch_e_rdbk.put_f64_post(e_rdbk_val).await;
@@ -560,7 +624,10 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
     let pv_y_offset = config.pv("Kohzu_yOffsetAO");
     let pv_use_set = config.pv("KohzuUseSetBO");
 
-    println!("kohzuCtl: ready (two_d={:.4}, theta=[{:.1}..{:.1}])", two_d, theta_lo, theta_hi);
+    println!(
+        "kohzuCtl: ready (two_d={:.4}, theta=[{:.1}..{:.1}])",
+        two_d, theta_lo, theta_hi
+    );
 
     let mut deferred_events: HashMap<String, f64> = HashMap::new();
     let mut pending_retarget = false;
@@ -694,7 +761,11 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
             let _ = ch_theta_rdbk_echo.put_f64(rbv).await;
             theta_rdbk_val = rbv;
             lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = if lambda_rdbk_val > 0.0 { lambda_to_energy(lambda_rdbk_val) } else { 0.0 };
+            e_rdbk_val = if lambda_rdbk_val > 0.0 {
+                lambda_to_energy(lambda_rdbk_val)
+            } else {
+                0.0
+            };
             let _ = ch_theta_rdbk.put_f64_post(theta_rdbk_val).await;
             let _ = ch_lambda_rdbk.put_f64_post(lambda_rdbk_val).await;
             let _ = ch_e_rdbk.put_f64_post(e_rdbk_val).await;
@@ -726,7 +797,9 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
             y_offset_val = new_val;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
-            let _ = ch_seq_msg1.put_string(&format!("y offset changed to {:.4}", y_offset_val)).await;
+            let _ = ch_seq_msg1
+                .put_string(&format!("y offset changed to {:.4}", y_offset_val))
+                .await;
             let _ = ch_seq_msg2.put_string("Set to Manual Mode").await;
             proceed_to_theta_changed = true;
         } else if changed_pv == pv_use_set {
@@ -830,7 +903,10 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
         }
 
         if will_violate {
-            let blocked = format!("Move blocked: E={:.3} keV theta={:.3} deg", e_val, theta_val);
+            let blocked = format!(
+                "Move blocked: E={:.3} keV theta={:.3} deg",
+                e_val, theta_val
+            );
             let _ = ch_seq_msg2.put_string(&blocked).await;
             if ch_debug.get_i16().await > 0 {
                 eprintln!("kohzuCtl: {}", blocked);
@@ -855,8 +931,7 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
                 let z_delta = z_mot_desired - ch_z_mot_rbv.get_f64().await;
 
                 let (new_th, new_y, new_z) = coordinate_speeds(
-                    th_delta, y_delta, z_delta,
-                    th_speed, y_speed, z_speed, cc_mode,
+                    th_delta, y_delta, z_delta, th_speed, y_speed, z_speed, cc_mode,
                 );
                 let _ = ch_theta_mot_velo.put_f64(new_th).await;
                 if !cc_mode.y_frozen() {
@@ -869,7 +944,10 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
 
             // Command motors — use put_f64_process to trigger motor record processing
             if ch_debug.get_i16().await > 0 {
-                eprintln!("kohzuCtl: MOVING theta={} y={} z={}", theta_mot_desired, y_mot_desired, z_mot_desired);
+                eprintln!(
+                    "kohzuCtl: MOVING theta={} y={} z={}",
+                    theta_mot_desired, y_mot_desired, z_mot_desired
+                );
             }
             let _ = ch_theta_mot_cmd.put_f64_process(theta_mot_desired).await;
             match cc_mode {
@@ -1044,13 +1122,19 @@ pub async fn run(config: KohzuConfig, db: PvDatabase) -> Result<(), Box<dyn std:
         }
 
         // Update echo PVs
-        let _ = ch_theta_rdbk_echo.put_f64(ch_theta_mot_rbv.get_f64().await).await;
+        let _ = ch_theta_rdbk_echo
+            .put_f64(ch_theta_mot_rbv.get_f64().await)
+            .await;
         let _ = ch_y_rdbk_echo.put_f64(ch_y_mot_rbv.get_f64().await).await;
         let _ = ch_z_rdbk_echo.put_f64(ch_z_mot_rbv.get_f64().await).await;
-        let _ = ch_theta_vel_echo.put_f64(ch_theta_mot_velo.get_f64().await).await;
+        let _ = ch_theta_vel_echo
+            .put_f64(ch_theta_mot_velo.get_f64().await)
+            .await;
         let _ = ch_y_vel_echo.put_f64(ch_y_mot_velo.get_f64().await).await;
         let _ = ch_z_vel_echo.put_f64(ch_z_mot_velo.get_f64().await).await;
-        let _ = ch_theta_dmov_echo.put_i16(ch_theta_dmov.get_i16().await).await;
+        let _ = ch_theta_dmov_echo
+            .put_i16(ch_theta_dmov.get_i16().await)
+            .await;
         let _ = ch_y_dmov_echo.put_i16(ch_y_dmov.get_i16().await).await;
         let _ = ch_z_dmov_echo.put_i16(ch_z_dmov.get_i16().await).await;
     }
@@ -1187,7 +1271,8 @@ mod tests {
 
     #[test]
     fn test_coordinate_speeds_frozen() {
-        let (th, _y, z) = coordinate_speeds(10.0, 5.0, 20.0, 1.0, 1.0, 1.0, CrystalMode::ChannelCut);
+        let (th, _y, z) =
+            coordinate_speeds(10.0, 5.0, 20.0, 1.0, 1.0, 1.0, CrystalMode::ChannelCut);
         // Y and Z frozen, so only theta time matters
         assert!((th - 1.0).abs() < 1e-6);
         // Z frozen means z_time = 0, so z_speed adjusted to theta time

@@ -162,10 +162,7 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
                     ArgValue::String(s) => s.clone(),
                     _ => return Err("expected string argument".to_string()),
                 };
-                if let Some((set, _)) = mgr
-                    .sets()
-                    .iter()
-                    .find(|(s, _)| s.config().name == set_name)
+                if let Some((set, _)) = mgr.sets().iter().find(|(s, _)| s.config().name == set_name)
                 {
                     let cfg = set.config();
                     eprintln!("Save set: {}", cfg.name);

@@ -5,7 +5,9 @@ use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 
-use crate::records::scaler::{ScalerRecord, MAX_SCALER_CHANNELS, CMD_RESET, CMD_ARM, CMD_WRITE_PRESET};
+use crate::records::scaler::{
+    CMD_ARM, CMD_RESET, CMD_WRITE_PRESET, MAX_SCALER_CHANNELS, ScalerRecord,
+};
 
 /// Asyn command strings for scaler drivers.
 pub const SCALER_RESET_COMMAND: &str = "SCALER_RESET";
@@ -88,24 +90,50 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
         Ok(())
     }
 
-    fn handle_command(&mut self, _record: &mut dyn Record, command: &str, args: &[EpicsValue]) -> CaResult<()> {
+    fn handle_command(
+        &mut self,
+        _record: &mut dyn Record,
+        command: &str,
+        args: &[EpicsValue],
+    ) -> CaResult<()> {
         let mut driver = self.driver.lock().unwrap();
         match command {
             CMD_RESET => {
                 driver.reset()?;
             }
             CMD_ARM => {
-                let start = args.first()
-                    .and_then(|v| if let EpicsValue::Long(i) = v { Some(*i != 0) } else { None })
+                let start = args
+                    .first()
+                    .and_then(|v| {
+                        if let EpicsValue::Long(i) = v {
+                            Some(*i != 0)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(false);
                 driver.arm(start)?;
             }
             CMD_WRITE_PRESET => {
-                let channel = args.first()
-                    .and_then(|v| if let EpicsValue::Long(i) = v { Some(*i as usize) } else { None })
+                let channel = args
+                    .first()
+                    .and_then(|v| {
+                        if let EpicsValue::Long(i) = v {
+                            Some(*i as usize)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(0);
-                let preset = args.get(1)
-                    .and_then(|v| if let EpicsValue::Long(i) = v { Some(*i as u32) } else { None })
+                let preset = args
+                    .get(1)
+                    .and_then(|v| {
+                        if let EpicsValue::Long(i) = v {
+                            Some(*i as u32)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(0);
                 driver.write_preset(channel, preset)?;
             }

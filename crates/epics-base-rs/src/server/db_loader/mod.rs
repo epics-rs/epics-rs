@@ -6,10 +6,9 @@ use crate::server::record::Record;
 use crate::types::EpicsValue;
 
 mod include;
-pub use include::{DbLoadConfig, parse_db_file, expand_includes, override_dtyp};
 #[cfg(test)]
 pub(crate) use include::parse_include_directive;
-
+pub use include::{DbLoadConfig, expand_includes, override_dtyp, parse_db_file};
 
 /// Factory function that creates a record instance.
 pub type RecordFactory = Box<dyn Fn() -> Box<dyn Record> + Send + Sync>;
@@ -124,7 +123,10 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
                         match chars[pos] {
                             '(' => depth += 1,
                             ')' => depth -= 1,
-                            '\n' => { line += 1; col = 0; }
+                            '\n' => {
+                                line += 1;
+                                col = 0;
+                            }
                             _ => {}
                         }
                         pos += 1;
@@ -162,7 +164,6 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
     Ok(records)
 }
 
-
 pub(crate) fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> String {
     let mut result = String::with_capacity(input.len());
     let chars: Vec<char> = input.chars().collect();
@@ -176,15 +177,22 @@ pub(crate) fn substitute_macros(input: &str, macros: &HashMap<String, String>) -
             let mut depth = 1usize;
             let mut j = start;
             while j < chars.len() && depth > 0 {
-                if j + 1 < chars.len() && chars[j] == '$' && (chars[j + 1] == '(' || chars[j + 1] == '{') {
+                if j + 1 < chars.len()
+                    && chars[j] == '$'
+                    && (chars[j + 1] == '(' || chars[j + 1] == '{')
+                {
                     depth += 1;
                     j += 2;
                     continue;
                 }
                 // Only match the corresponding bracket type at the outermost level
-                if (depth == 1 && chars[j] == close) || (depth > 1 && (chars[j] == ')' || chars[j] == '}')) {
+                if (depth == 1 && chars[j] == close)
+                    || (depth > 1 && (chars[j] == ')' || chars[j] == '}'))
+                {
                     depth -= 1;
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                 }
                 j += 1;
             }
@@ -225,11 +233,23 @@ pub(crate) fn substitute_macros(input: &str, macros: &HashMap<String, String>) -
     result
 }
 
-fn skip_whitespace_and_comments(chars: &[char], pos: &mut usize, line: &mut usize, col: &mut usize) {
+fn skip_whitespace_and_comments(
+    chars: &[char],
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) {
     while *pos < chars.len() {
         match chars[*pos] {
-            ' ' | '\t' | '\r' => { *pos += 1; *col += 1; }
-            '\n' => { *pos += 1; *line += 1; *col = 1; }
+            ' ' | '\t' | '\r' => {
+                *pos += 1;
+                *col += 1;
+            }
+            '\n' => {
+                *pos += 1;
+                *line += 1;
+                *col = 1;
+            }
             '#' => {
                 // Line comment
                 while *pos < chars.len() && chars[*pos] != '\n' {
@@ -251,7 +271,12 @@ fn read_word(chars: &[char], pos: &mut usize, col: &mut usize) -> String {
     word
 }
 
-fn read_quoted_string(chars: &[char], pos: &mut usize, line: &mut usize, col: &mut usize) -> CaResult<String> {
+fn read_quoted_string(
+    chars: &[char],
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) -> CaResult<String> {
     if *pos >= chars.len() || chars[*pos] != '"' {
         return Err(CaError::DbParseError {
             line: *line,
@@ -271,7 +296,10 @@ fn read_quoted_string(chars: &[char], pos: &mut usize, line: &mut usize, col: &m
                 '"' => s.push('"'),
                 '\\' => s.push('\\'),
                 'n' => s.push('\n'),
-                other => { s.push('\\'); s.push(other); }
+                other => {
+                    s.push('\\');
+                    s.push(other);
+                }
             }
         } else if chars[*pos] == '\n' {
             *line += 1;
@@ -296,7 +324,12 @@ fn read_quoted_string(chars: &[char], pos: &mut usize, line: &mut usize, col: &m
     Ok(s)
 }
 
-fn read_field_value(chars: &[char], pos: &mut usize, line: &mut usize, col: &mut usize) -> CaResult<String> {
+fn read_field_value(
+    chars: &[char],
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) -> CaResult<String> {
     if *pos < chars.len() && chars[*pos] == '"' {
         return read_quoted_string(chars, pos, line, col);
     }
@@ -315,9 +348,19 @@ fn read_field_value(chars: &[char], pos: &mut usize, line: &mut usize, col: &mut
     Ok(s.trim().to_string())
 }
 
-fn expect_char(chars: &[char], pos: &mut usize, col: &mut usize, expected: char, line: usize) -> CaResult<()> {
+fn expect_char(
+    chars: &[char],
+    pos: &mut usize,
+    col: &mut usize,
+    expected: char,
+    line: usize,
+) -> CaResult<()> {
     if *pos >= chars.len() || chars[*pos] != expected {
-        let got = if *pos < chars.len() { chars[*pos].to_string() } else { "EOF".to_string() };
+        let got = if *pos < chars.len() {
+            chars[*pos].to_string()
+        } else {
+            "EOF".to_string()
+        };
         return Err(CaError::DbParseError {
             line,
             column: *col,
@@ -404,10 +447,12 @@ pub fn apply_fields(
             .find(|f| f.name == upper_name.as_str());
 
         if let Some(desc) = field_desc {
-            let value = EpicsValue::parse(desc.dbf_type, value_str)
-                .map_err(|e| CaError::InvalidValue(
-                    format!("field {upper_name} (type {:?}): cannot parse '{}': {e}", desc.dbf_type, value_str)
-                ))?;
+            let value = EpicsValue::parse(desc.dbf_type, value_str).map_err(|e| {
+                CaError::InvalidValue(format!(
+                    "field {upper_name} (type {:?}): cannot parse '{}': {e}",
+                    desc.dbf_type, value_str
+                ))
+            })?;
             record.put_field(&upper_name, value)?;
         } else {
             // Store as common field for RecordInstance to handle
@@ -438,7 +483,7 @@ mod tests {
         assert_eq!(records[0].fields.len(), 4);
         assert_eq!(records[0].fields[0], ("DESC".into(), "Temperature".into()));
     }
-    
+
     #[test]
     fn test_macro_substitution() {
         let input = r#"
@@ -448,12 +493,12 @@ mod tests {
     "#;
         let mut macros = HashMap::new();
         macros.insert("P".to_string(), "IOC:".to_string());
-    
+
         let records = parse_db(input, &macros).unwrap();
         assert_eq!(records[0].name, "IOC:TEMP");
         assert_eq!(records[0].fields[0].1, "Default Desc");
     }
-    
+
     #[test]
     fn test_multiple_records() {
         let input = r#"
@@ -471,7 +516,7 @@ mod tests {
         assert_eq!(records[0].record_type, "ai");
         assert_eq!(records[1].record_type, "bo");
     }
-    
+
     #[test]
     fn test_comments() {
         let input = r#"
@@ -484,13 +529,13 @@ mod tests {
         let records = parse_db(input, &HashMap::new()).unwrap();
         assert_eq!(records.len(), 1);
     }
-    
+
     #[test]
     fn test_unknown_record_type() {
         let result = create_record("nonexistent");
         assert!(result.is_err());
     }
-    
+
     #[test]
     fn test_quoted_string_escape() {
         let input = r#"
@@ -501,7 +546,7 @@ mod tests {
         let records = parse_db(input, &HashMap::new()).unwrap();
         assert_eq!(records[0].fields[0].1, "hello \"world\"");
     }
-    
+
     #[test]
     fn test_macro_with_quoted_default_in_string() {
         // C EPICS macLib treats quotes inside $(...) as literal characters.
@@ -518,7 +563,7 @@ mod tests {
         let records = parse_db(input, &macros).unwrap();
         assert_eq!(records[0].fields[0].1, "SIM1:ROI1:MinX_RBV CP MS");
     }
-    
+
     #[test]
     fn test_macro_with_quoted_default_unset() {
         // When XPOS is not set, $(XPOS="") should expand to "" (literal quotes)
@@ -532,7 +577,7 @@ mod tests {
         // With undefined macro and default="", the field gets the raw default
         assert!(records[0].fields[0].1.contains("CP MS"));
     }
-    
+
     #[test]
     fn test_recursive_macro_default() {
         // $(TS_PORT=$(PORT)_TS) with PORT=ATTR1 → ATTR1_TS
@@ -546,19 +591,19 @@ mod tests {
         let records = parse_db(input, &macros).unwrap();
         assert_eq!(records[0].fields[0].1, "ATTR1_TS");
     }
-    
+
     #[test]
     fn test_substitute_directive_in_expand() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-    
+
         // Create a simple child template
         let child = dir.path().join("child.db");
         let mut f = std::fs::File::create(&child).unwrap();
         writeln!(f, r#"record(ai, "$(P)$(R)Val") {{"#).unwrap();
         writeln!(f, r#"    field(VAL, "$(ADDR)")"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
-    
+
         // Create parent with substitute + include
         let parent = dir.path().join("parent.db");
         let mut f = std::fs::File::create(&parent).unwrap();
@@ -566,10 +611,13 @@ mod tests {
         writeln!(f, r#"include "child.db""#).unwrap();
         writeln!(f, r#"substitute "R=B:,ADDR=1""#).unwrap();
         writeln!(f, r#"include "child.db""#).unwrap();
-    
+
         let mut macros = HashMap::new();
         macros.insert("P".to_string(), "IOC:".to_string());
-        let config = DbLoadConfig { include_paths: vec![], max_include_depth: 10 };
+        let config = DbLoadConfig {
+            include_paths: vec![],
+            max_include_depth: 10,
+        };
         let records = parse_db_file(&parent, &macros, &config).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].name, "IOC:A:Val");
@@ -577,7 +625,7 @@ mod tests {
         assert_eq!(records[1].name, "IOC:B:Val");
         assert_eq!(records[1].fields[0].1, "1");
     }
-    
+
     #[test]
     fn test_empty_string_numeric_parse() {
         // C EPICS treats empty VAL as 0 for numeric record types
@@ -590,14 +638,15 @@ mod tests {
         // Should parse without error — empty string → 0
         assert_eq!(records.len(), 1);
     }
-    
+
     #[test]
     fn test_calcout_process() {
-        use crate::server::records::calcout::CalcoutRecord;
         use crate::server::record::Record;
-    
+        use crate::server::records::calcout::CalcoutRecord;
+
         let mut rec = CalcoutRecord::default();
-        rec.put_field("CALC", EpicsValue::String("A+B".into())).unwrap();
+        rec.put_field("CALC", EpicsValue::String("A+B".into()))
+            .unwrap();
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.process().unwrap();
@@ -606,39 +655,42 @@ mod tests {
             other => panic!("expected Double(7.0), got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_calcout_oopt() {
-        use crate::server::records::calcout::CalcoutRecord;
         use crate::server::record::Record;
-    
+        use crate::server::records::calcout::CalcoutRecord;
+
         let mut rec = CalcoutRecord::default();
-        rec.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap(); // On Change
         rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
-    
+
         // First process — value changes from 0 to 5
         rec.process().unwrap();
         assert!((rec.oval - 5.0).abs() < 1e-10);
-    
+
         // Second process — same value, OVAL should not update (but val still computes)
         rec.process().unwrap();
         // OVAL is still 5.0 since val didn't change
     }
-    
+
     #[test]
     fn test_calcout_dopt() {
-        use crate::server::records::calcout::CalcoutRecord;
         use crate::server::record::Record;
-    
+        use crate::server::records::calcout::CalcoutRecord;
+
         let mut rec = CalcoutRecord::default();
-        rec.put_field("CALC", EpicsValue::String("A+B".into())).unwrap();
-        rec.put_field("OCAL", EpicsValue::String("A*B".into())).unwrap();
+        rec.put_field("CALC", EpicsValue::String("A+B".into()))
+            .unwrap();
+        rec.put_field("OCAL", EpicsValue::String("A*B".into()))
+            .unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.process().unwrap();
-    
+
         // VAL = A+B = 7, OVAL = A*B = 12
         match rec.get_field("VAL") {
             Some(EpicsValue::Double(v)) => assert!((v - 7.0).abs() < 1e-10),
@@ -649,12 +701,12 @@ mod tests {
             other => panic!("expected Double(12.0), got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_dfanout_basic() {
-        use crate::server::records::dfanout::DfanoutRecord;
         use crate::server::record::Record;
-    
+        use crate::server::records::dfanout::DfanoutRecord;
+
         let mut rec = DfanoutRecord::default();
         rec.put_field("VAL", EpicsValue::Double(42.0)).unwrap();
         assert_eq!(rec.record_type(), "dfanout");
@@ -663,24 +715,26 @@ mod tests {
             other => panic!("expected Double(42.0), got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_dfanout_output_links() {
-        use crate::server::records::dfanout::DfanoutRecord;
         use crate::server::record::Record;
-    
+        use crate::server::records::dfanout::DfanoutRecord;
+
         let mut rec = DfanoutRecord::default();
-        rec.put_field("OUTA", EpicsValue::String("REC_A".into())).unwrap();
-        rec.put_field("OUTB", EpicsValue::String("REC_B".into())).unwrap();
+        rec.put_field("OUTA", EpicsValue::String("REC_A".into()))
+            .unwrap();
+        rec.put_field("OUTB", EpicsValue::String("REC_B".into()))
+            .unwrap();
         let links = rec.output_links();
         assert_eq!(links.len(), 2);
     }
-    
+
     #[test]
     fn test_compress_circular_buffer() {
-        use crate::server::records::compress::CompressRecord;
         use crate::server::record::Record;
-    
+        use crate::server::records::compress::CompressRecord;
+
         let mut rec = CompressRecord::new(5, 3); // nsam=5, alg=Circular Buffer
         for i in 0..7 {
             rec.push_value(i as f64);
@@ -695,12 +749,12 @@ mod tests {
             other => panic!("expected DoubleArray, got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_compress_n_to_1_mean() {
-        use crate::server::records::compress::CompressRecord;
         use crate::server::record::Record;
-    
+        use crate::server::records::compress::CompressRecord;
+
         let mut rec = CompressRecord::new(10, 2); // alg=Mean
         rec.put_field("N", EpicsValue::Long(3)).unwrap();
         rec.push_value(3.0);
@@ -713,36 +767,36 @@ mod tests {
             other => panic!("expected DoubleArray, got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_histogram_bucket_count() {
         use crate::server::records::histogram::HistogramRecord;
-    
+
         let mut rec = HistogramRecord::new(10, 0.0, 10.0);
-        rec.add_sample(2.5);  // bucket 2
-        rec.add_sample(2.7);  // bucket 2
-        rec.add_sample(7.0);  // bucket 7
+        rec.add_sample(2.5); // bucket 2
+        rec.add_sample(2.7); // bucket 2
+        rec.add_sample(7.0); // bucket 7
         assert_eq!(rec.val[2], 2);
         assert_eq!(rec.val[7], 1);
     }
-    
+
     #[test]
     fn test_histogram_out_of_range() {
         use crate::server::records::histogram::HistogramRecord;
-    
+
         let mut rec = HistogramRecord::new(10, 0.0, 10.0);
-        rec.add_sample(-1.0);  // below range
-        rec.add_sample(10.0);  // at upper limit (excluded)
-        rec.add_sample(15.0);  // above range
+        rec.add_sample(-1.0); // below range
+        rec.add_sample(10.0); // at upper limit (excluded)
+        rec.add_sample(15.0); // above range
         let total: i32 = rec.val.iter().sum();
         assert_eq!(total, 0);
     }
-    
+
     #[test]
     fn test_sel_specified() {
-        use crate::server::records::sel::SelRecord;
         use crate::server::record::Record;
-    
+        use crate::server::records::sel::SelRecord;
+
         let mut rec = SelRecord::default();
         rec.put_field("SELM", EpicsValue::Short(0)).unwrap(); // Specified
         rec.put_field("SELN", EpicsValue::Short(2)).unwrap(); // Select C
@@ -753,17 +807,17 @@ mod tests {
             other => panic!("expected Double(99.0), got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_sel_high_low_median() {
-        use crate::server::records::sel::SelRecord;
         use crate::server::record::Record;
-    
+        use crate::server::records::sel::SelRecord;
+
         let mut rec = SelRecord::default();
         rec.put_field("A", EpicsValue::Double(10.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(30.0)).unwrap();
         rec.put_field("C", EpicsValue::Double(20.0)).unwrap();
-    
+
         // High
         rec.put_field("SELM", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
@@ -771,7 +825,7 @@ mod tests {
             Some(EpicsValue::Double(v)) => assert!((v - 30.0).abs() < 1e-10),
             other => panic!("expected Double(30.0), got {:?}", other),
         }
-    
+
         // Low
         rec.put_field("SELM", EpicsValue::Short(2)).unwrap();
         rec.process().unwrap();
@@ -780,17 +834,18 @@ mod tests {
             other => panic!("expected near 0.0, got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_sub_record_register_and_call() {
-        use crate::server::records::sub_record::SubRecord;
         use crate::server::record::{Record, RecordInstance, SubroutineFn};
+        use crate::server::records::sub_record::SubRecord;
         use std::sync::Arc;
-    
+
         let mut rec = SubRecord::default();
-        rec.put_field("SNAM", EpicsValue::String("double_val".into())).unwrap();
+        rec.put_field("SNAM", EpicsValue::String("double_val".into()))
+            .unwrap();
         rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
-    
+
         let mut instance = RecordInstance::new("TEST_SUB".into(), rec);
         let sub_fn: SubroutineFn = Box::new(|record: &mut dyn Record| {
             if let Some(EpicsValue::Double(v)) = record.get_field("VAL") {
@@ -799,15 +854,15 @@ mod tests {
             Ok(())
         });
         instance.subroutine = Some(Arc::new(sub_fn));
-    
+
         instance.process_local().unwrap();
-    
+
         match instance.record.get_field("VAL") {
             Some(EpicsValue::Double(v)) => assert!((v - 10.0).abs() < 1e-10),
             other => panic!("expected Double(10.0), got {:?}", other),
         }
     }
-    
+
     #[test]
     fn test_new_record_types_in_db() {
         let input = r#"
@@ -837,9 +892,9 @@ mod tests {
             create_record(&def.record_type).unwrap();
         }
     }
-    
+
     // ===== include / parse_db_file tests =====
-    
+
     #[test]
     fn test_parse_include_directive() {
         // Normal include
@@ -866,25 +921,25 @@ mod tests {
         // "includes" is not "include"
         assert_eq!(parse_include_directive(r#"includes "nope.db""#), None);
     }
-    
+
     #[test]
     fn test_commented_include_ignored() {
         assert_eq!(parse_include_directive(r#"# include "file.db""#), None);
         assert_eq!(parse_include_directive(r#"  # include "file.db""#), None);
     }
-    
+
     #[test]
     fn test_expand_includes() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-    
+
         // Create child.db
         let child_path = dir.path().join("child.db");
         let mut f = std::fs::File::create(&child_path).unwrap();
         writeln!(f, r#"record(ai, "CHILD") {{"#).unwrap();
         writeln!(f, r#"    field(VAL, "1.0")"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
-    
+
         // Create parent.db that includes child.db
         let parent_path = dir.path().join("parent.db");
         let mut f = std::fs::File::create(&parent_path).unwrap();
@@ -892,66 +947,66 @@ mod tests {
         writeln!(f, r#"    field(VAL, "2.0")"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
         writeln!(f, r#"include "child.db""#).unwrap();
-    
+
         let config = DbLoadConfig::default();
         let result = expand_includes(&parent_path, &HashMap::new(), &config).unwrap();
         assert!(result.contains(r#"record(ao, "PARENT")"#));
         assert!(result.contains(r#"record(ai, "CHILD")"#));
-    
+
         // Verify it parses correctly
         let records = parse_db(&result, &HashMap::new()).unwrap();
         assert_eq!(records.len(), 2);
     }
-    
+
     #[test]
     fn test_circular_include_error() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-    
+
         let a_path = dir.path().join("a.template");
         let b_path = dir.path().join("b.template");
-    
+
         let mut fa = std::fs::File::create(&a_path).unwrap();
         writeln!(fa, r#"include "b.template""#).unwrap();
-    
+
         let mut fb = std::fs::File::create(&b_path).unwrap();
         writeln!(fb, r#"include "a.template""#).unwrap();
-    
+
         let config = DbLoadConfig::default();
         let result = expand_includes(&a_path, &HashMap::new(), &config);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("circular include"), "error was: {err}");
     }
-    
+
     #[test]
     fn test_duplicate_include_allowed() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-    
+
         let shared_path = dir.path().join("shared.db");
         let mut f = std::fs::File::create(&shared_path).unwrap();
         writeln!(f, r#"record(ai, "SHARED") {{"#).unwrap();
         writeln!(f, r#"    field(VAL, "0")"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
-    
+
         // main.db includes shared.db twice (not circular, just duplicate)
         let main_path = dir.path().join("main.db");
         let mut f = std::fs::File::create(&main_path).unwrap();
         writeln!(f, r#"include "shared.db""#).unwrap();
         writeln!(f, r#"include "shared.db""#).unwrap();
-    
+
         let config = DbLoadConfig::default();
         let result = expand_includes(&main_path, &HashMap::new(), &config).unwrap();
         // shared.db content appears twice
         assert_eq!(result.matches(r#"record(ai, "SHARED")"#).count(), 2);
     }
-    
+
     #[test]
     fn test_include_depth_limit() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-    
+
         // Create a chain: file0 -> file1 -> file2 -> ... -> file33
         for i in 0..34 {
             let path = dir.path().join(format!("file{i}.db"));
@@ -964,7 +1019,7 @@ mod tests {
                 writeln!(f, r#"}}"#).unwrap();
             }
         }
-    
+
         let config = DbLoadConfig {
             include_paths: vec![],
             max_include_depth: 32,
@@ -974,84 +1029,84 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("depth limit"), "error was: {err}");
     }
-    
+
     #[test]
     fn test_include_not_found_error() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-    
+
         let path = dir.path().join("main.db");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"include "nonexistent.db""#).unwrap();
-    
+
         let config = DbLoadConfig::default();
         let result = expand_includes(&path, &HashMap::new(), &config);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not found"), "error was: {err}");
     }
-    
+
     #[test]
     fn test_include_with_macro_filename() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let subdir = dir.path().join("sub");
         std::fs::create_dir(&subdir).unwrap();
-    
+
         let child_path = subdir.join("child.db");
         let mut f = std::fs::File::create(&child_path).unwrap();
         writeln!(f, r#"record(ai, "CHILD") {{"#).unwrap();
         writeln!(f, r#"    field(VAL, "0")"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
-    
+
         let main_path = dir.path().join("main.db");
         let mut f = std::fs::File::create(&main_path).unwrap();
         writeln!(f, r#"include "$(DIR)/child.db""#).unwrap();
-    
+
         let mut macros = HashMap::new();
         macros.insert("DIR".to_string(), subdir.to_string_lossy().to_string());
-    
+
         let config = DbLoadConfig::default();
         let result = expand_includes(&main_path, &macros, &config).unwrap();
         assert!(result.contains(r#"record(ai, "CHILD")"#));
     }
-    
+
     #[test]
     fn test_include_search_order() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let inc_dir = dir.path().join("inc");
         std::fs::create_dir(&inc_dir).unwrap();
-    
+
         // Put file in include path only (not in current dir)
         let child_path = inc_dir.join("child.db");
         let mut f = std::fs::File::create(&child_path).unwrap();
         writeln!(f, r#"record(ai, "FROM_INC") {{"#).unwrap();
         writeln!(f, r#"    field(VAL, "0")"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
-    
+
         let main_path = dir.path().join("main.db");
         let mut f = std::fs::File::create(&main_path).unwrap();
         writeln!(f, r#"include "child.db""#).unwrap();
-    
+
         let config = DbLoadConfig {
             include_paths: vec![inc_dir.clone()],
             max_include_depth: 32,
         };
         let result = expand_includes(&main_path, &HashMap::new(), &config).unwrap();
         assert!(result.contains(r#"record(ai, "FROM_INC")"#));
-    
+
         // Now also put a file in current dir — it should take priority
         let local_child = dir.path().join("child.db");
         let mut f = std::fs::File::create(&local_child).unwrap();
         writeln!(f, r#"record(ai, "FROM_LOCAL") {{"#).unwrap();
         writeln!(f, r#"    field(VAL, "0")"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
-    
+
         let result = expand_includes(&main_path, &HashMap::new(), &config).unwrap();
         assert!(result.contains(r#"record(ai, "FROM_LOCAL")"#));
     }
-    
+
     #[test]
     fn test_dtyp_override_existing_only() {
         let mut records = vec![
@@ -1069,34 +1124,36 @@ mod tests {
                 fields: vec![("VAL".to_string(), "1".to_string())],
             },
         ];
-    
+
         override_dtyp(&mut records, "newDtyp");
-    
+
         // Record with DTYP: value replaced
-        assert_eq!(records[0].fields[0], ("DTYP".to_string(), "newDtyp".to_string()));
+        assert_eq!(
+            records[0].fields[0],
+            ("DTYP".to_string(), "newDtyp".to_string())
+        );
         // Record without DTYP: unchanged (no DTYP added)
         assert_eq!(records[1].fields.len(), 1);
         assert!(!records[1].fields.iter().any(|(n, _)| n == "DTYP"));
     }
-    
+
     #[test]
     fn test_parse_db_file_no_includes() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-    
+
         let path = dir.path().join("simple.db");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"record(ai, "$(P)TEMP") {{"#).unwrap();
         writeln!(f, r#"    field(VAL, "25.0")"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
-    
+
         let mut macros = HashMap::new();
         macros.insert("P".to_string(), "IOC:".to_string());
-    
+
         let config = DbLoadConfig::default();
         let records = parse_db_file(&path, &macros, &config).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "IOC:TEMP");
     }
-
 }

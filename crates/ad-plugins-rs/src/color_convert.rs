@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
-use rayon::prelude::*;
-#[cfg(feature = "parallel")]
 use crate::par_util;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
-use ad_core_rs::color::{self, NDColorMode, NDBayerPattern};
+use ad_core_rs::color::{self, NDBayerPattern, NDColorMode};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
@@ -20,7 +20,9 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
 
     // Pre-compute source values into a flat f64 vec for efficient random access
     let n = w * h;
-    let src_vals: Vec<f64> = (0..n).map(|i| src.data.get_as_f64(i).unwrap_or(0.0)).collect();
+    let src_vals: Vec<f64> = (0..n)
+        .map(|i| src.data.get_as_f64(i).unwrap_or(0.0))
+        .collect();
     let get_val = |x: usize, y: usize| -> f64 { src_vals[y * w + x] };
 
     let mut r = vec![0.0f64; n];
@@ -45,54 +47,134 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
             match (even_row, even_col) {
                 (true, true) => {
                     r_row[x] = val;
-                    let mut gsum = 0.0; let mut gc = 0;
-                    if x > 0 { gsum += get_val(x - 1, y); gc += 1; }
-                    if x < w - 1 { gsum += get_val(x + 1, y); gc += 1; }
-                    if y > 0 { gsum += get_val(x, y - 1); gc += 1; }
-                    if y < h - 1 { gsum += get_val(x, y + 1); gc += 1; }
+                    let mut gsum = 0.0;
+                    let mut gc = 0;
+                    if x > 0 {
+                        gsum += get_val(x - 1, y);
+                        gc += 1;
+                    }
+                    if x < w - 1 {
+                        gsum += get_val(x + 1, y);
+                        gc += 1;
+                    }
+                    if y > 0 {
+                        gsum += get_val(x, y - 1);
+                        gc += 1;
+                    }
+                    if y < h - 1 {
+                        gsum += get_val(x, y + 1);
+                        gc += 1;
+                    }
                     g_row[x] = if gc > 0 { gsum / gc as f64 } else { 0.0 };
-                    let mut bsum = 0.0; let mut bc = 0;
-                    if x > 0 && y > 0 { bsum += get_val(x - 1, y - 1); bc += 1; }
-                    if x < w - 1 && y > 0 { bsum += get_val(x + 1, y - 1); bc += 1; }
-                    if x > 0 && y < h - 1 { bsum += get_val(x - 1, y + 1); bc += 1; }
-                    if x < w - 1 && y < h - 1 { bsum += get_val(x + 1, y + 1); bc += 1; }
+                    let mut bsum = 0.0;
+                    let mut bc = 0;
+                    if x > 0 && y > 0 {
+                        bsum += get_val(x - 1, y - 1);
+                        bc += 1;
+                    }
+                    if x < w - 1 && y > 0 {
+                        bsum += get_val(x + 1, y - 1);
+                        bc += 1;
+                    }
+                    if x > 0 && y < h - 1 {
+                        bsum += get_val(x - 1, y + 1);
+                        bc += 1;
+                    }
+                    if x < w - 1 && y < h - 1 {
+                        bsum += get_val(x + 1, y + 1);
+                        bc += 1;
+                    }
                     b_row[x] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
                 }
                 (true, false) | (false, true) => {
                     g_row[x] = val;
                     if even_row {
-                        let mut rsum = 0.0; let mut rc = 0;
-                        if x > 0 { rsum += get_val(x - 1, y); rc += 1; }
-                        if x < w - 1 { rsum += get_val(x + 1, y); rc += 1; }
+                        let mut rsum = 0.0;
+                        let mut rc = 0;
+                        if x > 0 {
+                            rsum += get_val(x - 1, y);
+                            rc += 1;
+                        }
+                        if x < w - 1 {
+                            rsum += get_val(x + 1, y);
+                            rc += 1;
+                        }
                         r_row[x] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
-                        let mut bsum = 0.0; let mut bc = 0;
-                        if y > 0 { bsum += get_val(x, y - 1); bc += 1; }
-                        if y < h - 1 { bsum += get_val(x, y + 1); bc += 1; }
+                        let mut bsum = 0.0;
+                        let mut bc = 0;
+                        if y > 0 {
+                            bsum += get_val(x, y - 1);
+                            bc += 1;
+                        }
+                        if y < h - 1 {
+                            bsum += get_val(x, y + 1);
+                            bc += 1;
+                        }
                         b_row[x] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
                     } else {
-                        let mut bsum = 0.0; let mut bc = 0;
-                        if x > 0 { bsum += get_val(x - 1, y); bc += 1; }
-                        if x < w - 1 { bsum += get_val(x + 1, y); bc += 1; }
+                        let mut bsum = 0.0;
+                        let mut bc = 0;
+                        if x > 0 {
+                            bsum += get_val(x - 1, y);
+                            bc += 1;
+                        }
+                        if x < w - 1 {
+                            bsum += get_val(x + 1, y);
+                            bc += 1;
+                        }
                         b_row[x] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
-                        let mut rsum = 0.0; let mut rc = 0;
-                        if y > 0 { rsum += get_val(x, y - 1); rc += 1; }
-                        if y < h - 1 { rsum += get_val(x, y + 1); rc += 1; }
+                        let mut rsum = 0.0;
+                        let mut rc = 0;
+                        if y > 0 {
+                            rsum += get_val(x, y - 1);
+                            rc += 1;
+                        }
+                        if y < h - 1 {
+                            rsum += get_val(x, y + 1);
+                            rc += 1;
+                        }
                         r_row[x] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
                     }
                 }
                 (false, false) => {
                     b_row[x] = val;
-                    let mut gsum = 0.0; let mut gc = 0;
-                    if x > 0 { gsum += get_val(x - 1, y); gc += 1; }
-                    if x < w - 1 { gsum += get_val(x + 1, y); gc += 1; }
-                    if y > 0 { gsum += get_val(x, y - 1); gc += 1; }
-                    if y < h - 1 { gsum += get_val(x, y + 1); gc += 1; }
+                    let mut gsum = 0.0;
+                    let mut gc = 0;
+                    if x > 0 {
+                        gsum += get_val(x - 1, y);
+                        gc += 1;
+                    }
+                    if x < w - 1 {
+                        gsum += get_val(x + 1, y);
+                        gc += 1;
+                    }
+                    if y > 0 {
+                        gsum += get_val(x, y - 1);
+                        gc += 1;
+                    }
+                    if y < h - 1 {
+                        gsum += get_val(x, y + 1);
+                        gc += 1;
+                    }
                     g_row[x] = if gc > 0 { gsum / gc as f64 } else { 0.0 };
-                    let mut rsum = 0.0; let mut rc = 0;
-                    if x > 0 && y > 0 { rsum += get_val(x - 1, y - 1); rc += 1; }
-                    if x < w - 1 && y > 0 { rsum += get_val(x + 1, y - 1); rc += 1; }
-                    if x > 0 && y < h - 1 { rsum += get_val(x - 1, y + 1); rc += 1; }
-                    if x < w - 1 && y < h - 1 { rsum += get_val(x + 1, y + 1); rc += 1; }
+                    let mut rsum = 0.0;
+                    let mut rc = 0;
+                    if x > 0 && y > 0 {
+                        rsum += get_val(x - 1, y - 1);
+                        rc += 1;
+                    }
+                    if x < w - 1 && y > 0 {
+                        rsum += get_val(x + 1, y - 1);
+                        rc += 1;
+                    }
+                    if x > 0 && y < h - 1 {
+                        rsum += get_val(x - 1, y + 1);
+                        rc += 1;
+                    }
+                    if x < w - 1 && y < h - 1 {
+                        rsum += get_val(x + 1, y + 1);
+                        rc += 1;
+                    }
                     r_row[x] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
                 }
             }
@@ -113,7 +195,8 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
             let b_rows: Vec<&mut [f64]> = b.chunks_mut(w).collect();
 
             par_util::thread_pool().install(|| {
-                r_rows.into_par_iter()
+                r_rows
+                    .into_par_iter()
                     .zip(g_rows.into_par_iter())
                     .zip(b_rows.into_par_iter())
                     .enumerate()
@@ -158,7 +241,11 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
         _ => return None,
     };
 
-    let dims = vec![NDDimension::new(3), NDDimension::new(w), NDDimension::new(h)];
+    let dims = vec![
+        NDDimension::new(3),
+        NDDimension::new(w),
+        NDDimension::new(h),
+    ];
     let mut arr = NDArray::new(dims, src.data.data_type());
     arr.data = out_data;
     arr.unique_id = src.unique_id;
@@ -207,7 +294,11 @@ fn false_color_mono_to_rgb1(src: &NDArray) -> Option<NDArray> {
         out[i * 3 + 2] = b;
     }
 
-    let dims = vec![NDDimension::new(3), NDDimension::new(w), NDDimension::new(h)];
+    let dims = vec![
+        NDDimension::new(3),
+        NDDimension::new(w),
+        NDDimension::new(h),
+    ];
     let mut arr = NDArray::new(dims, NDDataType::UInt8);
     arr.data = NDDataBuffer::U8(out);
     arr.unique_id = src.unique_id;
@@ -265,7 +356,10 @@ impl ColorConvertProcessor {
 }
 
 impl NDPluginProcess for ColorConvertProcessor {
-    fn register_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
         base.create_param("COLOR_MODE_OUT", ParamType::Int32)?;
         base.create_param("FALSE_COLOR", ParamType::Int32)?;
@@ -286,8 +380,7 @@ impl NDPluginProcess for ColorConvertProcessor {
             NDColorMode::RGB1 => Some(array.clone()),
             NDColorMode::Mono => {
                 if self.config.false_color {
-                    false_color_mono_to_rgb1(array)
-                        .or_else(|| color::mono_to_rgb1(array).ok())
+                    false_color_mono_to_rgb1(array).or_else(|| color::mono_to_rgb1(array).ok())
                 } else {
                     color::mono_to_rgb1(array).ok()
                 }
@@ -438,7 +531,11 @@ mod tests {
 
         // Create RGB1 image: dims [3, 4, 4]
         let mut arr = NDArray::new(
-            vec![NDDimension::new(3), NDDimension::new(4), NDDimension::new(4)],
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(4),
+            ],
             NDDataType::UInt8,
         );
         if let NDDataBuffer::U8(ref mut v) = arr.data {
@@ -467,7 +564,11 @@ mod tests {
 
         // Create RGB2 image: dims [4, 3, 4]
         let mut arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(3), NDDimension::new(4)],
+            vec![
+                NDDimension::new(4),
+                NDDimension::new(3),
+                NDDimension::new(4),
+            ],
             NDDataType::UInt8,
         );
         if let NDDataBuffer::U8(ref mut v) = arr.data {
@@ -494,21 +595,33 @@ mod tests {
 
         // 3D with color dim first -> RGB1
         let arr_rgb1 = NDArray::new(
-            vec![NDDimension::new(3), NDDimension::new(4), NDDimension::new(4)],
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(4),
+            ],
             NDDataType::UInt8,
         );
         assert_eq!(detect_color_mode(&arr_rgb1), NDColorMode::RGB1);
 
         // 3D with color dim second -> RGB2
         let arr_rgb2 = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(3), NDDimension::new(4)],
+            vec![
+                NDDimension::new(4),
+                NDDimension::new(3),
+                NDDimension::new(4),
+            ],
             NDDataType::UInt8,
         );
         assert_eq!(detect_color_mode(&arr_rgb2), NDColorMode::RGB2);
 
         // 3D with color dim last -> RGB3
         let arr_rgb3 = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4), NDDimension::new(3)],
+            vec![
+                NDDimension::new(4),
+                NDDimension::new(4),
+                NDDimension::new(3),
+            ],
             NDDataType::UInt8,
         );
         assert_eq!(detect_color_mode(&arr_rgb3), NDColorMode::RGB3);
@@ -568,7 +681,9 @@ mod tests {
         );
         set_color_mode_attr(&mut arr, NDColorMode::Bayer);
         if let NDDataBuffer::U8(ref mut v) = arr.data {
-            for i in 0..16 { v[i] = 128; }
+            for i in 0..16 {
+                v[i] = 128;
+            }
         }
 
         let result = proc.process_array(&arr, &pool);
@@ -587,11 +702,17 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(
-            vec![NDDimension::new(3), NDDimension::new(4), NDDimension::new(4)],
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(4),
+            ],
             NDDataType::UInt8,
         );
         if let NDDataBuffer::U8(ref mut v) = arr.data {
-            for i in 0..v.len() { v[i] = (i % 256) as u8; }
+            for i in 0..v.len() {
+                v[i] = (i % 256) as u8;
+            }
         }
 
         let result = proc.process_array(&arr, &pool);
@@ -620,8 +741,7 @@ mod tests {
         if let NDDataBuffer::U8(ref mut v) = arr.data {
             // UYVY pattern: U Y0 V Y1
             let uyvy: [u8; 16] = [
-                128, 100, 128, 150,  128, 200, 128, 50,
-                128, 128, 128, 128,  128, 64, 128, 192,
+                128, 100, 128, 150, 128, 200, 128, 50, 128, 128, 128, 128, 128, 64, 128, 192,
             ];
             v[..16].copy_from_slice(&uyvy);
         }
@@ -649,7 +769,9 @@ mod tests {
             NDDataType::UInt8,
         );
         if let NDDataBuffer::U8(ref mut v) = arr.data {
-            for i in 0..8 { v[i] = (i * 30) as u8; }
+            for i in 0..8 {
+                v[i] = (i * 30) as u8;
+            }
         }
 
         let result = proc.process_array(&arr, &pool);
@@ -670,12 +792,18 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(
-            vec![NDDimension::new(3), NDDimension::new(4), NDDimension::new(4)],
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(4),
+            ],
             NDDataType::UInt8,
         );
         set_color_mode_attr(&mut arr, NDColorMode::YUV444);
         if let NDDataBuffer::U8(ref mut v) = arr.data {
-            for i in 0..v.len() { v[i] = 128; }
+            for i in 0..v.len() {
+                v[i] = 128;
+            }
         }
 
         let result = proc.process_array(&arr, &pool);

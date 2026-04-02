@@ -23,7 +23,12 @@ pub struct GenericDriverContext {
 }
 
 impl GenericDriverContext {
-    pub fn new(pool: Arc<NDArrayPool>, output: Arc<parking_lot::Mutex<NDArrayOutput>>, port_name: &str, wiring: &WiringRegistry) -> Self {
+    pub fn new(
+        pool: Arc<NDArrayPool>,
+        output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+        port_name: &str,
+        wiring: &WiringRegistry,
+    ) -> Self {
         wiring.register_output(port_name, output.clone());
         Self { pool, output }
     }

@@ -11,95 +11,415 @@ use super::MotorRecord;
 
 pub(crate) static FIELDS: &[FieldDesc] = &[
     // Position
-    FieldDesc { name: "VAL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "RBV", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "RLV", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "OFF", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DIFF", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "RDIF", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "DVAL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DRBV", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "RVAL", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "RRBV", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "RMP", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "REP", dbf_type: DbFieldType::Long, read_only: true },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RBV",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "RLV",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OFF",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DIFF",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "RDIF",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "DVAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DRBV",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "RVAL",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RRBV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "RMP",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "REP",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
     // Conversion
-    FieldDesc { name: "DIR", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "FOFF", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SET", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IGSET", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "MRES", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "ERES", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "SREV", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "UREV", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "UEIP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "URIP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "RRES", dbf_type: DbFieldType::Double, read_only: false },
+    FieldDesc {
+        name: "DIR",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "FOFF",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SET",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IGSET",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MRES",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ERES",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SREV",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "UREV",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "UEIP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "URIP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RRES",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
     // Velocity
-    FieldDesc { name: "VELO", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "VBAS", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "VMAX", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "S", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "SBAS", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "SMAX", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "ACCL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "BVEL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "BACC", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "HVEL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "JVEL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "JAR", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "SBAK", dbf_type: DbFieldType::Double, read_only: false },
+    FieldDesc {
+        name: "VELO",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "VBAS",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "VMAX",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "S",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SBAS",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SMAX",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ACCL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BVEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BACC",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HVEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "JVEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "JAR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SBAK",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
     // Retry
-    FieldDesc { name: "BDST", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "FRAC", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "RDBD", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "SPDB", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "RTRY", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "RMOD", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "RCNT", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "MISS", dbf_type: DbFieldType::Short, read_only: true },
+    FieldDesc {
+        name: "BDST",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "FRAC",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RDBD",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SPDB",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RTRY",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RMOD",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RCNT",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MISS",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
     // Limits
-    FieldDesc { name: "HLM", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LLM", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DHLM", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DLLM", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LVIO", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "HLS", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "LLS", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "HLSV", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "HLM",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LLM",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DHLM",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLLM",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LVIO",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "HLS",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LLS",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "HLSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // Control
-    FieldDesc { name: "SPMG", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "STOP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "HOMF", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "HOMR", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "JOGF", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "JOGR", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TWF", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TWR", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "TWV", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "CNEN", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "SPMG",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STOP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOMF",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOMR",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "JOGF",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "JOGR",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TWF",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TWR",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TWV",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CNEN",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // Status
-    FieldDesc { name: "DMOV", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "MOVN", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "MSTA", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "MIP", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "CDIR", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "TDIR", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "ATHM", dbf_type: DbFieldType::Short, read_only: true },
-    FieldDesc { name: "STUP", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "DMOV",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MOVN",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MSTA",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MIP",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "CDIR",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "TDIR",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ATHM",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "STUP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // PID
-    FieldDesc { name: "PCOF", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "ICOF", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "DCOF", dbf_type: DbFieldType::Double, read_only: false },
+    FieldDesc {
+        name: "PCOF",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ICOF",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DCOF",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
     // Display
-    FieldDesc { name: "EGU", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "PREC", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "ADEL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "MDEL", dbf_type: DbFieldType::Double, read_only: false },
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ADEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MDEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
     // Timing
-    FieldDesc { name: "DLY", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "NTM", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "NTMF", dbf_type: DbFieldType::Double, read_only: false },
+    FieldDesc {
+        name: "DLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NTM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NTMF",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValue> {
@@ -198,15 +518,28 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
     }
 }
 
-pub(crate) fn motor_put_field(rec: &mut MotorRecord, name: &str, value: EpicsValue) -> CaResult<()> {
+pub(crate) fn motor_put_field(
+    rec: &mut MotorRecord,
+    name: &str,
+    value: EpicsValue,
+) -> CaResult<()> {
     match name {
         // Position writes -- cascade and set command source
         "VAL" => {
-            let v = match value { EpicsValue::Double(v) => v, _ => return Err(CaError::TypeMismatch(name.into())) };
+            let v = match value {
+                EpicsValue::Double(v) => v,
+                _ => return Err(CaError::TypeMismatch(name.into())),
+            };
             if rec.conv.set && !rec.conv.igset {
                 // SET mode: recalculate offset, signal SetPosition
                 if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                    v, rec.conv.dir, rec.pos.off, rec.conv.foff, rec.conv.mres, true, rec.pos.dval,
+                    v,
+                    rec.conv.dir,
+                    rec.pos.off,
+                    rec.conv.foff,
+                    rec.conv.mres,
+                    true,
+                    rec.pos.dval,
                 ) {
                     rec.pos.val = v;
                     rec.pos.dval = dval;
@@ -216,7 +549,13 @@ pub(crate) fn motor_put_field(rec: &mut MotorRecord, name: &str, value: EpicsVal
                 rec.last_write = Some(CommandSource::Set);
             } else {
                 if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                    v, rec.conv.dir, rec.pos.off, rec.conv.foff, rec.conv.mres, false, rec.pos.dval,
+                    v,
+                    rec.conv.dir,
+                    rec.pos.off,
+                    rec.conv.foff,
+                    rec.conv.mres,
+                    false,
+                    rec.pos.dval,
                 ) {
                     rec.pos.val = v;
                     rec.pos.dval = dval;
@@ -228,10 +567,19 @@ pub(crate) fn motor_put_field(rec: &mut MotorRecord, name: &str, value: EpicsVal
             Ok(())
         }
         "DVAL" => {
-            let v = match value { EpicsValue::Double(v) => v, _ => return Err(CaError::TypeMismatch(name.into())) };
+            let v = match value {
+                EpicsValue::Double(v) => v,
+                _ => return Err(CaError::TypeMismatch(name.into())),
+            };
             if rec.conv.set && !rec.conv.igset {
                 if let Ok((val, rval, off)) = coordinate::cascade_from_dval(
-                    v, rec.conv.dir, rec.pos.off, rec.conv.foff, rec.conv.mres, true, rec.pos.val,
+                    v,
+                    rec.conv.dir,
+                    rec.pos.off,
+                    rec.conv.foff,
+                    rec.conv.mres,
+                    true,
+                    rec.pos.val,
                 ) {
                     rec.pos.dval = v;
                     rec.pos.val = val;
@@ -241,7 +589,13 @@ pub(crate) fn motor_put_field(rec: &mut MotorRecord, name: &str, value: EpicsVal
                 rec.last_write = Some(CommandSource::Set);
             } else {
                 if let Ok((val, rval, off)) = coordinate::cascade_from_dval(
-                    v, rec.conv.dir, rec.pos.off, rec.conv.foff, rec.conv.mres, false, rec.pos.val,
+                    v,
+                    rec.conv.dir,
+                    rec.pos.off,
+                    rec.conv.foff,
+                    rec.conv.mres,
+                    false,
+                    rec.pos.val,
                 ) {
                     rec.pos.dval = v;
                     rec.pos.val = val;
@@ -253,10 +607,19 @@ pub(crate) fn motor_put_field(rec: &mut MotorRecord, name: &str, value: EpicsVal
             Ok(())
         }
         "RVAL" => {
-            let v = match value { EpicsValue::Long(v) => v, _ => return Err(CaError::TypeMismatch(name.into())) };
+            let v = match value {
+                EpicsValue::Long(v) => v,
+                _ => return Err(CaError::TypeMismatch(name.into())),
+            };
             if rec.conv.set && !rec.conv.igset {
                 let (val, dval, off) = coordinate::cascade_from_rval(
-                    v, rec.conv.dir, rec.pos.off, rec.conv.foff, rec.conv.mres, true, rec.pos.val,
+                    v,
+                    rec.conv.dir,
+                    rec.pos.off,
+                    rec.conv.foff,
+                    rec.conv.mres,
+                    true,
+                    rec.pos.val,
                 );
                 rec.pos.rval = v;
                 rec.pos.val = val;
@@ -265,7 +628,13 @@ pub(crate) fn motor_put_field(rec: &mut MotorRecord, name: &str, value: EpicsVal
                 rec.last_write = Some(CommandSource::Set);
             } else {
                 let (val, dval, off) = coordinate::cascade_from_rval(
-                    v, rec.conv.dir, rec.pos.off, rec.conv.foff, rec.conv.mres, false, rec.pos.val,
+                    v,
+                    rec.conv.dir,
+                    rec.pos.off,
+                    rec.conv.foff,
+                    rec.conv.mres,
+                    false,
+                    rec.pos.val,
                 );
                 rec.pos.rval = v;
                 rec.pos.val = val;
@@ -276,7 +645,10 @@ pub(crate) fn motor_put_field(rec: &mut MotorRecord, name: &str, value: EpicsVal
             Ok(())
         }
         "RLV" => {
-            let v = match value { EpicsValue::Double(v) => v, _ => return Err(CaError::TypeMismatch(name.into())) };
+            let v = match value {
+                EpicsValue::Double(v) => v,
+                _ => return Err(CaError::TypeMismatch(name.into())),
+            };
             rec.pos.rlv = v;
             rec.last_write = Some(CommandSource::Rlv);
             Ok(())
@@ -289,13 +661,16 @@ pub(crate) fn motor_put_field(rec: &mut MotorRecord, name: &str, value: EpicsVal
                     rec.pos.val = coordinate::dial_to_user(rec.pos.dval, rec.conv.dir, rec.pos.off);
                     rec.pos.rbv = coordinate::dial_to_user(rec.pos.drbv, rec.conv.dir, rec.pos.off);
                     let (hlm, llm) = coordinate::dial_limits_to_user(
-                        rec.limits.dhlm, rec.limits.dllm, rec.conv.dir, rec.pos.off,
+                        rec.limits.dhlm,
+                        rec.limits.dllm,
+                        rec.conv.dir,
+                        rec.pos.off,
                     );
                     rec.limits.hlm = hlm;
                     rec.limits.llm = llm;
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch(name.into()))
+                _ => Err(CaError::TypeMismatch(name.into())),
             }
         }
         // Conversion
@@ -307,221 +682,462 @@ pub(crate) fn motor_put_field(rec: &mut MotorRecord, name: &str, value: EpicsVal
                     rec.pos.val = coordinate::dial_to_user(rec.pos.dval, rec.conv.dir, rec.pos.off);
                     rec.pos.rbv = coordinate::dial_to_user(rec.pos.drbv, rec.conv.dir, rec.pos.off);
                     let (hlm, llm) = coordinate::dial_limits_to_user(
-                        rec.limits.dhlm, rec.limits.dllm, rec.conv.dir, rec.pos.off,
+                        rec.limits.dhlm,
+                        rec.limits.dllm,
+                        rec.conv.dir,
+                        rec.pos.off,
                     );
                     rec.limits.hlm = hlm;
                     rec.limits.llm = llm;
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch(name.into()))
+                _ => Err(CaError::TypeMismatch(name.into())),
             }
         }
-        "FOFF" => { match value { EpicsValue::Short(v) => { rec.conv.foff = FreezeOffset::from_i16(v); Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "SET" => { match value { EpicsValue::Short(v) => { rec.conv.set = v != 0; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "IGSET" => { match value { EpicsValue::Short(v) => { rec.conv.igset = v != 0; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "MRES" => { match value { EpicsValue::Double(v) => { rec.conv.mres = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "ERES" => { match value { EpicsValue::Double(v) => { rec.conv.eres = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "SREV" => { match value { EpicsValue::Long(v) => { rec.conv.srev = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "UREV" => { match value { EpicsValue::Double(v) => { rec.conv.urev = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "UEIP" => { match value { EpicsValue::Short(v) => { rec.conv.ueip = v != 0; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "URIP" => { match value { EpicsValue::Short(v) => { rec.conv.urip = v != 0; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "RRES" => { match value { EpicsValue::Double(v) => { rec.conv.rres = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
+        "FOFF" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.foff = FreezeOffset::from_i16(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SET" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.set = v != 0;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "IGSET" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.igset = v != 0;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MRES" => match value {
+            EpicsValue::Double(v) => {
+                rec.conv.mres = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ERES" => match value {
+            EpicsValue::Double(v) => {
+                rec.conv.eres = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SREV" => match value {
+            EpicsValue::Long(v) => {
+                rec.conv.srev = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "UREV" => match value {
+            EpicsValue::Double(v) => {
+                rec.conv.urev = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "UEIP" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.ueip = v != 0;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "URIP" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.urip = v != 0;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RRES" => match value {
+            EpicsValue::Double(v) => {
+                rec.conv.rres = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Velocity
-        "VELO" => { match value { EpicsValue::Double(v) => { rec.vel.velo = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "VBAS" => { match value { EpicsValue::Double(v) => { rec.vel.vbas = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "VMAX" => { match value { EpicsValue::Double(v) => { rec.vel.vmax = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "S" => { match value { EpicsValue::Double(v) => { rec.vel.s = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "SBAS" => { match value { EpicsValue::Double(v) => { rec.vel.sbas = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "SMAX" => { match value { EpicsValue::Double(v) => { rec.vel.smax = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "ACCL" => { match value { EpicsValue::Double(v) => { rec.vel.accl = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "BVEL" => { match value { EpicsValue::Double(v) => { rec.vel.bvel = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "BACC" => { match value { EpicsValue::Double(v) => { rec.vel.bacc = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "HVEL" => { match value { EpicsValue::Double(v) => { rec.vel.hvel = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "JVEL" => { match value { EpicsValue::Double(v) => { rec.vel.jvel = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "JAR" => { match value { EpicsValue::Double(v) => { rec.vel.jar = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "SBAK" => { match value { EpicsValue::Double(v) => { rec.vel.sbak = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
+        "VELO" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.velo = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "VBAS" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.vbas = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "VMAX" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.vmax = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "S" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.s = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SBAS" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.sbas = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SMAX" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.smax = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ACCL" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.accl = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "BVEL" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.bvel = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "BACC" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.bacc = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "HVEL" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.hvel = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "JVEL" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.jvel = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "JAR" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.jar = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SBAK" => match value {
+            EpicsValue::Double(v) => {
+                rec.vel.sbak = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Retry
-        "BDST" => { match value { EpicsValue::Double(v) => { rec.retry.bdst = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "FRAC" => { match value { EpicsValue::Double(v) => { rec.retry.frac = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "RDBD" => { match value { EpicsValue::Double(v) => { rec.retry.rdbd = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "SPDB" => { match value { EpicsValue::Double(v) => { rec.retry.spdb = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "RTRY" => { match value { EpicsValue::Short(v) => { rec.retry.rtry = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "RMOD" => { match value { EpicsValue::Short(v) => { rec.retry.rmod = RetryMode::from_i16(v); Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
+        "BDST" => match value {
+            EpicsValue::Double(v) => {
+                rec.retry.bdst = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "FRAC" => match value {
+            EpicsValue::Double(v) => {
+                rec.retry.frac = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RDBD" => match value {
+            EpicsValue::Double(v) => {
+                rec.retry.rdbd = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SPDB" => match value {
+            EpicsValue::Double(v) => {
+                rec.retry.spdb = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RTRY" => match value {
+            EpicsValue::Short(v) => {
+                rec.retry.rtry = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RMOD" => match value {
+            EpicsValue::Short(v) => {
+                rec.retry.rmod = RetryMode::from_i16(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Limits
-        "HLM" => {
-            match value {
-                EpicsValue::Double(v) => {
-                    rec.limits.hlm = v;
-                    let (dhlm, dllm) = coordinate::user_limits_to_dial(
-                        rec.limits.hlm, rec.limits.llm, rec.conv.dir, rec.pos.off,
-                    );
-                    rec.limits.dhlm = dhlm;
-                    rec.limits.dllm = dllm;
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into()))
+        "HLM" => match value {
+            EpicsValue::Double(v) => {
+                rec.limits.hlm = v;
+                let (dhlm, dllm) = coordinate::user_limits_to_dial(
+                    rec.limits.hlm,
+                    rec.limits.llm,
+                    rec.conv.dir,
+                    rec.pos.off,
+                );
+                rec.limits.dhlm = dhlm;
+                rec.limits.dllm = dllm;
+                Ok(())
             }
-        }
-        "LLM" => {
-            match value {
-                EpicsValue::Double(v) => {
-                    rec.limits.llm = v;
-                    let (dhlm, dllm) = coordinate::user_limits_to_dial(
-                        rec.limits.hlm, rec.limits.llm, rec.conv.dir, rec.pos.off,
-                    );
-                    rec.limits.dhlm = dhlm;
-                    rec.limits.dllm = dllm;
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into()))
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LLM" => match value {
+            EpicsValue::Double(v) => {
+                rec.limits.llm = v;
+                let (dhlm, dllm) = coordinate::user_limits_to_dial(
+                    rec.limits.hlm,
+                    rec.limits.llm,
+                    rec.conv.dir,
+                    rec.pos.off,
+                );
+                rec.limits.dhlm = dhlm;
+                rec.limits.dllm = dllm;
+                Ok(())
             }
-        }
-        "DHLM" => {
-            match value {
-                EpicsValue::Double(v) => {
-                    rec.limits.dhlm = v;
-                    let (hlm, llm) = coordinate::dial_limits_to_user(
-                        rec.limits.dhlm, rec.limits.dllm, rec.conv.dir, rec.pos.off,
-                    );
-                    rec.limits.hlm = hlm;
-                    rec.limits.llm = llm;
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into()))
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "DHLM" => match value {
+            EpicsValue::Double(v) => {
+                rec.limits.dhlm = v;
+                let (hlm, llm) = coordinate::dial_limits_to_user(
+                    rec.limits.dhlm,
+                    rec.limits.dllm,
+                    rec.conv.dir,
+                    rec.pos.off,
+                );
+                rec.limits.hlm = hlm;
+                rec.limits.llm = llm;
+                Ok(())
             }
-        }
-        "DLLM" => {
-            match value {
-                EpicsValue::Double(v) => {
-                    rec.limits.dllm = v;
-                    let (hlm, llm) = coordinate::dial_limits_to_user(
-                        rec.limits.dhlm, rec.limits.dllm, rec.conv.dir, rec.pos.off,
-                    );
-                    rec.limits.hlm = hlm;
-                    rec.limits.llm = llm;
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into()))
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "DLLM" => match value {
+            EpicsValue::Double(v) => {
+                rec.limits.dllm = v;
+                let (hlm, llm) = coordinate::dial_limits_to_user(
+                    rec.limits.dhlm,
+                    rec.limits.dllm,
+                    rec.conv.dir,
+                    rec.pos.off,
+                );
+                rec.limits.hlm = hlm;
+                rec.limits.llm = llm;
+                Ok(())
             }
-        }
-        "HLSV" => { match value { EpicsValue::Short(v) => { rec.limits.hlsv = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "HLSV" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.hlsv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Control
-        "SPMG" => {
-            match value {
-                EpicsValue::Short(v) => {
-                    rec.ctrl.spmg = SpmgMode::from_i16(v);
-                    rec.last_write = Some(CommandSource::Spmg);
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into()))
+        "SPMG" => match value {
+            EpicsValue::Short(v) => {
+                rec.ctrl.spmg = SpmgMode::from_i16(v);
+                rec.last_write = Some(CommandSource::Spmg);
+                Ok(())
             }
-        }
-        "STOP" => {
-            match value {
-                EpicsValue::Short(v) => {
-                    if v != 0 {
-                        rec.ctrl.stop = true;
-                        rec.last_write = Some(CommandSource::Stop);
-                    }
-                    Ok(())
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "STOP" => match value {
+            EpicsValue::Short(v) => {
+                if v != 0 {
+                    rec.ctrl.stop = true;
+                    rec.last_write = Some(CommandSource::Stop);
                 }
-                _ => Err(CaError::TypeMismatch(name.into()))
+                Ok(())
             }
-        }
-        "HOMF" => {
-            match value {
-                EpicsValue::Short(v) => {
-                    if v != 0 {
-                        rec.ctrl.homf = true;
-                        rec.last_write = Some(CommandSource::Homf);
-                    }
-                    Ok(())
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "HOMF" => match value {
+            EpicsValue::Short(v) => {
+                if v != 0 {
+                    rec.ctrl.homf = true;
+                    rec.last_write = Some(CommandSource::Homf);
                 }
-                _ => Err(CaError::TypeMismatch(name.into()))
+                Ok(())
             }
-        }
-        "HOMR" => {
-            match value {
-                EpicsValue::Short(v) => {
-                    if v != 0 {
-                        rec.ctrl.homr = true;
-                        rec.last_write = Some(CommandSource::Homr);
-                    }
-                    Ok(())
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "HOMR" => match value {
+            EpicsValue::Short(v) => {
+                if v != 0 {
+                    rec.ctrl.homr = true;
+                    rec.last_write = Some(CommandSource::Homr);
                 }
-                _ => Err(CaError::TypeMismatch(name.into()))
+                Ok(())
             }
-        }
-        "JOGF" => {
-            match value {
-                EpicsValue::Short(v) => {
-                    rec.ctrl.jogf = v != 0;
-                    rec.last_write = Some(CommandSource::Jogf);
-                    Ok(())
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "JOGF" => match value {
+            EpicsValue::Short(v) => {
+                rec.ctrl.jogf = v != 0;
+                rec.last_write = Some(CommandSource::Jogf);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "JOGR" => match value {
+            EpicsValue::Short(v) => {
+                rec.ctrl.jogr = v != 0;
+                rec.last_write = Some(CommandSource::Jogr);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "TWF" => match value {
+            EpicsValue::Short(v) => {
+                if v != 0 {
+                    rec.ctrl.twf = true;
+                    rec.last_write = Some(CommandSource::Twf);
                 }
-                _ => Err(CaError::TypeMismatch(name.into()))
+                Ok(())
             }
-        }
-        "JOGR" => {
-            match value {
-                EpicsValue::Short(v) => {
-                    rec.ctrl.jogr = v != 0;
-                    rec.last_write = Some(CommandSource::Jogr);
-                    Ok(())
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "TWR" => match value {
+            EpicsValue::Short(v) => {
+                if v != 0 {
+                    rec.ctrl.twr = true;
+                    rec.last_write = Some(CommandSource::Twr);
                 }
-                _ => Err(CaError::TypeMismatch(name.into()))
+                Ok(())
             }
-        }
-        "TWF" => {
-            match value {
-                EpicsValue::Short(v) => {
-                    if v != 0 {
-                        rec.ctrl.twf = true;
-                        rec.last_write = Some(CommandSource::Twf);
-                    }
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into()))
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "TWV" => match value {
+            EpicsValue::Double(v) => {
+                rec.ctrl.twv = v;
+                Ok(())
             }
-        }
-        "TWR" => {
-            match value {
-                EpicsValue::Short(v) => {
-                    if v != 0 {
-                        rec.ctrl.twr = true;
-                        rec.last_write = Some(CommandSource::Twr);
-                    }
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into()))
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "CNEN" => match value {
+            EpicsValue::Short(v) => {
+                rec.ctrl.cnen = v != 0;
+                rec.last_write = Some(CommandSource::Cnen);
+                Ok(())
             }
-        }
-        "TWV" => { match value { EpicsValue::Double(v) => { rec.ctrl.twv = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "CNEN" => {
-            match value {
-                EpicsValue::Short(v) => {
-                    rec.ctrl.cnen = v != 0;
-                    rec.last_write = Some(CommandSource::Cnen);
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into()))
-            }
-        }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Status (read-only handled by validate_put)
-        "STUP" => { match value { EpicsValue::Short(v) => { rec.stat.stup = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
+        "STUP" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.stup = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // PID
-        "PCOF" => { match value { EpicsValue::Double(v) => { rec.pid.pcof = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "ICOF" => { match value { EpicsValue::Double(v) => { rec.pid.icof = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "DCOF" => { match value { EpicsValue::Double(v) => { rec.pid.dcof = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
+        "PCOF" => match value {
+            EpicsValue::Double(v) => {
+                rec.pid.pcof = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ICOF" => match value {
+            EpicsValue::Double(v) => {
+                rec.pid.icof = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "DCOF" => match value {
+            EpicsValue::Double(v) => {
+                rec.pid.dcof = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Display
-        "EGU" => { match value { EpicsValue::String(v) => { rec.disp.egu = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "PREC" => { match value { EpicsValue::Short(v) => { rec.disp.prec = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "ADEL" => { match value { EpicsValue::Double(v) => { rec.disp.adel = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "MDEL" => { match value { EpicsValue::Double(v) => { rec.disp.mdel = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
+        "EGU" => match value {
+            EpicsValue::String(v) => {
+                rec.disp.egu = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "PREC" => match value {
+            EpicsValue::Short(v) => {
+                rec.disp.prec = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ADEL" => match value {
+            EpicsValue::Double(v) => {
+                rec.disp.adel = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MDEL" => match value {
+            EpicsValue::Double(v) => {
+                rec.disp.mdel = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Timing
-        "DLY" => { match value { EpicsValue::Double(v) => { rec.timing.dly = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "NTM" => { match value { EpicsValue::Short(v) => { rec.timing.ntm = v != 0; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
-        "NTMF" => { match value { EpicsValue::Double(v) => { rec.timing.ntmf = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) } }
+        "DLY" => match value {
+            EpicsValue::Double(v) => {
+                rec.timing.dly = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "NTM" => match value {
+            EpicsValue::Short(v) => {
+                rec.timing.ntm = v != 0;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "NTMF" => match value {
+            EpicsValue::Double(v) => {
+                rec.timing.ntmf = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Sync
         "SYNC" => {
             rec.last_write = Some(CommandSource::Sync);

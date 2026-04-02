@@ -1,7 +1,9 @@
 use std::time::Duration;
 
-use epics_base_rs::server::autosave::backup::{find_best_save_file, rotate_backups, BackupConfig, BackupState};
-use epics_base_rs::server::autosave::save_file::{write_save_file, SaveEntry};
+use epics_base_rs::server::autosave::backup::{
+    BackupConfig, BackupState, find_best_save_file, rotate_backups,
+};
+use epics_base_rs::server::autosave::save_file::{SaveEntry, write_save_file};
 
 fn make_entry(name: &str, val: &str) -> SaveEntry {
     SaveEntry {
@@ -30,7 +32,9 @@ async fn test_savb_created() {
     };
     let mut state = BackupState::default();
 
-    rotate_backups(&sav_path, &config, &mut state).await.unwrap();
+    rotate_backups(&sav_path, &config, &mut state)
+        .await
+        .unwrap();
 
     let savb_path = sav_path.with_extension("savB");
     assert!(savb_path.exists());
@@ -56,7 +60,9 @@ async fn test_seq_rotation() {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        rotate_backups(&sav_path, &config, &mut state).await.unwrap();
+        rotate_backups(&sav_path, &config, &mut state)
+            .await
+            .unwrap();
     }
 
     // All 3 seq files should exist
@@ -83,7 +89,9 @@ async fn test_dated_filename() {
     };
     let mut state = BackupState::default();
 
-    rotate_backups(&sav_path, &config, &mut state).await.unwrap();
+    rotate_backups(&sav_path, &config, &mut state)
+        .await
+        .unwrap();
 
     // Check that a dated file was created (sav_YYMMDD-HHMMSS)
     let entries: Vec<_> = std::fs::read_dir(dir.path())
@@ -191,7 +199,9 @@ async fn test_rotate_preserves_existing() {
     let mut state = BackupState::default();
 
     // Rotate
-    rotate_backups(&sav_path, &config, &mut state).await.unwrap();
+    rotate_backups(&sav_path, &config, &mut state)
+        .await
+        .unwrap();
 
     // Original .sav should still exist
     assert!(sav_path.exists());

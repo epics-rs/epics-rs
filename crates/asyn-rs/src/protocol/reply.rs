@@ -44,7 +44,10 @@ mod tests {
         let reply = PortReply {
             request_id: 42,
             payload: ReplyPayload::Value(ParamValue::Int32(100)),
-            alarm: Some(AlarmMeta { status: 1, severity: 2 }),
+            alarm: Some(AlarmMeta {
+                status: 1,
+                severity: 2,
+            }),
             timestamp: Some(Timestamp(1_000_000)),
         };
         let json = serde_json::to_string(&reply).unwrap();
@@ -88,7 +91,9 @@ mod tests {
     fn serde_roundtrip_subscribed() {
         let reply = PortReply {
             request_id: 7,
-            payload: ReplyPayload::Subscribed { subscription_id: 42 },
+            payload: ReplyPayload::Subscribed {
+                subscription_id: 42,
+            },
             alarm: None,
             timestamp: None,
         };
@@ -102,9 +107,15 @@ mod tests {
         let payloads = vec![
             ReplyPayload::Ack,
             ReplyPayload::Value(ParamValue::Float64(2.718)),
-            ReplyPayload::OctetData { data: vec![1], nbytes: 1 },
+            ReplyPayload::OctetData {
+                data: vec![1],
+                nbytes: 1,
+            },
             ReplyPayload::Subscribed { subscription_id: 0 },
-            ReplyPayload::Error { code: ReplyStatus::Error, detail: "fail".into() },
+            ReplyPayload::Error {
+                code: ReplyStatus::Error,
+                detail: "fail".into(),
+            },
         ];
         for payload in payloads {
             let json = serde_json::to_string(&payload).unwrap();

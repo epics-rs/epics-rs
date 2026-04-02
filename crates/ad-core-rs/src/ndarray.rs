@@ -151,9 +151,7 @@ impl NDDataBuffer {
     /// View the underlying data as a byte slice.
     pub fn as_u8_slice(&self) -> &[u8] {
         match self {
-            Self::I8(v) => unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len())
-            },
+            Self::I8(v) => unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) },
             Self::U8(v) => v.as_slice(),
             Self::I16(v) => unsafe {
                 std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
@@ -201,16 +199,56 @@ impl NDDataBuffer {
     /// Set element at index from f64 value.
     pub fn set_from_f64(&mut self, index: usize, value: f64) {
         match self {
-            Self::I8(v) => { if let Some(e) = v.get_mut(index) { *e = value as i8; } }
-            Self::U8(v) => { if let Some(e) = v.get_mut(index) { *e = value as u8; } }
-            Self::I16(v) => { if let Some(e) = v.get_mut(index) { *e = value as i16; } }
-            Self::U16(v) => { if let Some(e) = v.get_mut(index) { *e = value as u16; } }
-            Self::I32(v) => { if let Some(e) = v.get_mut(index) { *e = value as i32; } }
-            Self::U32(v) => { if let Some(e) = v.get_mut(index) { *e = value as u32; } }
-            Self::I64(v) => { if let Some(e) = v.get_mut(index) { *e = value as i64; } }
-            Self::U64(v) => { if let Some(e) = v.get_mut(index) { *e = value as u64; } }
-            Self::F32(v) => { if let Some(e) = v.get_mut(index) { *e = value as f32; } }
-            Self::F64(v) => { if let Some(e) = v.get_mut(index) { *e = value; } }
+            Self::I8(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value as i8;
+                }
+            }
+            Self::U8(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value as u8;
+                }
+            }
+            Self::I16(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value as i16;
+                }
+            }
+            Self::U16(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value as u16;
+                }
+            }
+            Self::I32(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value as i32;
+                }
+            }
+            Self::U32(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value as u32;
+                }
+            }
+            Self::I64(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value as i64;
+                }
+            }
+            Self::U64(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value as u64;
+                }
+            }
+            Self::F32(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value as f32;
+                }
+            }
+            Self::F64(v) => {
+                if let Some(e) = v.get_mut(index) {
+                    *e = value;
+                }
+            }
         }
     }
 }
@@ -442,7 +480,10 @@ mod tests {
     #[test]
     fn test_codec_field_preserved() {
         let mut arr = NDArray::new(vec![NDDimension::new(10)], NDDataType::UInt8);
-        arr.codec = Some(Codec { name: crate::codec::CodecName::JPEG, compressed_size: 42 });
+        arr.codec = Some(Codec {
+            name: crate::codec::CodecName::JPEG,
+            compressed_size: 42,
+        });
         let cloned = arr.clone();
         assert_eq!(cloned.codec.as_ref().unwrap().compressed_size, 42);
     }

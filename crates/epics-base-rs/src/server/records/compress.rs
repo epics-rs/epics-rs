@@ -5,10 +5,10 @@ use crate::types::{DbFieldType, EpicsValue};
 /// Compress record — circular buffer with compression algorithms.
 pub struct CompressRecord {
     pub val: Vec<f64>,
-    pub nsam: i32,   // Number of samples (buffer size)
-    pub alg: i16,    // 0=N to 1 Low, 1=N to 1 High, 2=N to 1 Mean, 3=Circular Buffer
-    pub n: i32,      // Number of values to compress
-    pub off: i32,    // Current write offset
+    pub nsam: i32, // Number of samples (buffer size)
+    pub alg: i16,  // 0=N to 1 Low, 1=N to 1 High, 2=N to 1 Mean, 3=Circular Buffer
+    pub n: i32,    // Number of values to compress
+    pub off: i32,  // Current write offset
     // Internal accumulator for N-to-1 algorithms
     accum: Vec<f64>,
 }
@@ -66,15 +66,37 @@ impl CompressRecord {
 }
 
 static COMPRESS_FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "NSAM", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "ALG", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "N", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "OFF", dbf_type: DbFieldType::Long, read_only: true },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NSAM",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ALG",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "N",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OFF",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
 ];
 
 impl Record for CompressRecord {
-    fn record_type(&self) -> &'static str { "compress" }
+    fn record_type(&self) -> &'static str {
+        "compress"
+    }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::complete())
@@ -94,18 +116,40 @@ impl Record for CompressRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
-                EpicsValue::DoubleArray(arr) => { self.val = arr; Ok(()) }
-                EpicsValue::Double(v) => { self.push_value(v); Ok(()) }
+                EpicsValue::DoubleArray(arr) => {
+                    self.val = arr;
+                    Ok(())
+                }
+                EpicsValue::Double(v) => {
+                    self.push_value(v);
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
-            "ALG" => match value { EpicsValue::Short(v) => { self.alg = v; Ok(()) } _ => Err(CaError::TypeMismatch("ALG".into())) },
-            "N" => match value { EpicsValue::Long(v) => { self.n = v; Ok(()) } _ => Err(CaError::TypeMismatch("N".into())) },
+            "ALG" => match value {
+                EpicsValue::Short(v) => {
+                    self.alg = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("ALG".into())),
+            },
+            "N" => match value {
+                EpicsValue::Long(v) => {
+                    self.n = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("N".into())),
+            },
             "NSAM" | "OFF" => Err(CaError::ReadOnlyField(name.to_string())),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] { COMPRESS_FIELDS }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        COMPRESS_FIELDS
+    }
 
-    fn primary_field(&self) -> &'static str { "VAL" }
+    fn primary_field(&self) -> &'static str {
+        "VAL"
+    }
 }

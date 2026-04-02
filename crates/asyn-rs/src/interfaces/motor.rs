@@ -56,12 +56,7 @@ pub trait AsynMotor: Send + Sync {
     ) -> AsynResult<()>;
 
     /// Start a homing sequence.
-    fn home(
-        &mut self,
-        user: &AsynUser,
-        velocity: f64,
-        forward: bool,
-    ) -> AsynResult<()>;
+    fn home(&mut self, user: &AsynUser, velocity: f64, forward: bool) -> AsynResult<()>;
 
     /// Stop motion.
     fn stop(&mut self, user: &AsynUser, acceleration: f64) -> AsynResult<()>;

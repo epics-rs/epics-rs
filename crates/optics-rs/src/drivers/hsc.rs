@@ -16,8 +16,8 @@ use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
 use crate::snl::xiahsc::{
-    blades_from_height_center, blades_from_width_center, h_center_from_blades,
-    height_from_blades, v_center_from_blades, width_from_blades,
+    blades_from_height_center, blades_from_width_center, h_center_from_blades, height_from_blades,
+    v_center_from_blades, width_from_blades,
 };
 
 // ---------------------------------------------------------------------------
@@ -111,7 +111,10 @@ impl SimBlade {
         if !self.moving {
             return;
         }
-        let elapsed = self.move_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let elapsed = self
+            .move_start
+            .map(|s| s.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
         let distance = (self.target - self.start_position).abs();
         let travel_time = if self.velocity > 0.0 {
             distance / self.velocity
@@ -276,22 +279,30 @@ impl HscDriver {
         };
 
         self.base.set_float64_param(self.params.top_rbv, 0, top)?;
-        self.base.set_float64_param(self.params.bottom_rbv, 0, bottom)?;
+        self.base
+            .set_float64_param(self.params.bottom_rbv, 0, bottom)?;
         self.base.set_float64_param(self.params.left_rbv, 0, left)?;
-        self.base.set_float64_param(self.params.right_rbv, 0, right)?;
+        self.base
+            .set_float64_param(self.params.right_rbv, 0, right)?;
 
         let h_gap = width_from_blades(left, right);
         let h_center = h_center_from_blades(left, right);
         let v_gap = height_from_blades(top, bottom);
         let v_center = v_center_from_blades(top, bottom);
 
-        self.base.set_float64_param(self.params.h_gap_rbv, 0, h_gap)?;
-        self.base.set_float64_param(self.params.h_center_rbv, 0, h_center)?;
-        self.base.set_float64_param(self.params.v_gap_rbv, 0, v_gap)?;
-        self.base.set_float64_param(self.params.v_center_rbv, 0, v_center)?;
+        self.base
+            .set_float64_param(self.params.h_gap_rbv, 0, h_gap)?;
+        self.base
+            .set_float64_param(self.params.h_center_rbv, 0, h_center)?;
+        self.base
+            .set_float64_param(self.params.v_gap_rbv, 0, v_gap)?;
+        self.base
+            .set_float64_param(self.params.v_center_rbv, 0, v_center)?;
 
-        self.base.set_int32_param(self.params.busy, 0, if moving { 1 } else { 0 })?;
-        self.base.set_int32_param(self.params.power_level, 0, power_level)?;
+        self.base
+            .set_int32_param(self.params.busy, 0, if moving { 1 } else { 0 })?;
+        self.base
+            .set_int32_param(self.params.power_level, 0, power_level)?;
 
         self.base.call_param_callbacks(0)?;
         Ok(())
@@ -359,7 +370,9 @@ impl asyn_rs::port::PortDriver for HscDriver {
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         self.base().check_ready()?;
         let reason = user.reason;
-        self.base_mut().params.set_float64(reason, user.addr, value)?;
+        self.base_mut()
+            .params
+            .set_float64(reason, user.addr, value)?;
         self.handle_float64_write(reason, value)?;
         self.base_mut().call_param_callbacks(user.addr)
     }
@@ -449,15 +462,25 @@ impl HscHolder {
     ///
     /// Creates a SimHsc-backed HscDriver with the given port name and poll interval,
     /// spawns the poll loop on the tokio runtime.
-    pub fn sim_hsc_create_command(self: &Arc<Self>) -> epics_base_rs::server::iocsh::registry::CommandDef {
+    pub fn sim_hsc_create_command(
+        self: &Arc<Self>,
+    ) -> epics_base_rs::server::iocsh::registry::CommandDef {
         use epics_base_rs::server::iocsh::registry::*;
 
         let holder = self.clone();
         CommandDef::new(
             "simHscCreate",
             vec![
-                ArgDesc { name: "port", arg_type: ArgType::String, optional: false },
-                ArgDesc { name: "pollMs", arg_type: ArgType::Int, optional: true },
+                ArgDesc {
+                    name: "port",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "pollMs",
+                    arg_type: ArgType::Int,
+                    optional: true,
+                },
             ],
             "simHscCreate(port, [pollMs]) - Create a simulated HSC-1 slit controller",
             move |args: &[ArgValue], ctx: &CommandContext| {
@@ -478,11 +501,8 @@ impl HscHolder {
                 };
 
                 let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-                let poll_loop = HscPollLoop::new(
-                    cmd_rx,
-                    driver.clone(),
-                    Duration::from_millis(poll_ms),
-                );
+                let poll_loop =
+                    HscPollLoop::new(cmd_rx, driver.clone(), Duration::from_millis(poll_ms));
 
                 ctx.runtime_handle().spawn(poll_loop.run());
                 let _ = cmd_tx; // kept alive by poll loop's cmd_rx
@@ -690,7 +710,10 @@ mod tests {
 
         // Initially not moving
         driver.poll().unwrap();
-        assert_eq!(driver.base.get_int32_param(driver.params.busy, 0).unwrap(), 0);
+        assert_eq!(
+            driver.base.get_int32_param(driver.params.busy, 0).unwrap(),
+            0
+        );
 
         // Start a slow move
         {
@@ -700,7 +723,10 @@ mod tests {
         }
 
         driver.poll().unwrap();
-        assert_eq!(driver.base.get_int32_param(driver.params.busy, 0).unwrap(), 1);
+        assert_eq!(
+            driver.base.get_int32_param(driver.params.busy, 0).unwrap(),
+            1
+        );
     }
 
     #[test]

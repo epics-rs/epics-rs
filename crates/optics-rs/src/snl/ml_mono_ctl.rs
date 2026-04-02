@@ -16,7 +16,7 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 use tracing::info;
 
-use crate::db_access::{alloc_origin, DbChannel, DbMultiMonitor};
+use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 use crate::snl::kohzu_ctl::HC;
 
 // ---------------------------------------------------------------------------
@@ -87,22 +87,30 @@ pub fn calc_2d_spacing(d: f64, order: f64) -> (f64, bool, &'static str) {
 
 /// Convert energy (keV) to wavelength (Angstrom).
 pub fn energy_to_lambda(e: f64) -> f64 {
-    if e <= 0.0 { return f64::INFINITY; }
+    if e <= 0.0 {
+        return f64::INFINITY;
+    }
     HC / e
 }
 
 /// Convert wavelength to energy.
 pub fn lambda_to_energy(lambda: f64) -> f64 {
-    if lambda <= 0.0 { return f64::INFINITY; }
+    if lambda <= 0.0 {
+        return f64::INFINITY;
+    }
     HC / lambda
 }
 
 /// Convert wavelength to theta (degrees) given 2d spacing.
 /// Returns None if impossible.
 pub fn lambda_to_theta(lambda: f64, two_d: f64) -> Option<f64> {
-    if two_d <= 0.0 || lambda <= 0.0 { return None; }
+    if two_d <= 0.0 || lambda <= 0.0 {
+        return None;
+    }
     let sin_theta = lambda / two_d;
-    if !(-1.0..=1.0).contains(&sin_theta) { return None; }
+    if !(-1.0..=1.0).contains(&sin_theta) {
+        return None;
+    }
     Some(sin_theta.asin() * RAD_CONV)
 }
 
@@ -130,10 +138,18 @@ pub fn compute_theta_limits(motor_hi: f64, motor_lo: f64) -> (f64, f64) {
 }
 
 /// Compute energy/lambda limits from 2d spacing and theta limits.
-pub fn compute_energy_lambda_limits(two_d: f64, theta_hi: f64, theta_lo: f64) -> (f64, f64, f64, f64) {
+pub fn compute_energy_lambda_limits(
+    two_d: f64,
+    theta_hi: f64,
+    theta_lo: f64,
+) -> (f64, f64, f64, f64) {
     let lambda_hi = two_d * (theta_hi / RAD_CONV).sin();
     let lambda_lo = two_d * (theta_lo / RAD_CONV).sin();
-    let e_hi = if lambda_lo > 0.0 { HC / lambda_lo } else { f64::INFINITY };
+    let e_hi = if lambda_lo > 0.0 {
+        HC / lambda_lo
+    } else {
+        f64::INFINITY
+    };
     let e_lo = if lambda_hi > 0.0 { HC / lambda_hi } else { 0.0 };
     (e_hi, e_lo, lambda_hi, lambda_lo)
 }
@@ -141,20 +157,40 @@ pub fn compute_energy_lambda_limits(two_d: f64, theta_hi: f64, theta_lo: f64) ->
 /// Coordinate speeds for theta and Z motors.
 /// Returns (new_th_speed, new_z_speed).
 pub fn coordinate_speeds(
-    theta_delta: f64, z_delta: f64,
-    th_speed: f64, z_speed: f64,
+    theta_delta: f64,
+    z_delta: f64,
+    th_speed: f64,
+    z_speed: f64,
     cc_mode: MlMonoMode,
 ) -> (f64, f64) {
-    let th_time = if th_speed > 0.0 { theta_delta.abs() / th_speed } else { 0.0 };
-    let z_time = if cc_mode.z_frozen() { 0.0 } else if z_speed > 0.0 { z_delta.abs() / z_speed } else { 0.0 };
+    let th_time = if th_speed > 0.0 {
+        theta_delta.abs() / th_speed
+    } else {
+        0.0
+    };
+    let z_time = if cc_mode.z_frozen() {
+        0.0
+    } else if z_speed > 0.0 {
+        z_delta.abs() / z_speed
+    } else {
+        0.0
+    };
 
     let max_time = th_time.max(z_time);
     if max_time <= 0.0 {
         return (th_speed, z_speed);
     }
 
-    let new_th = if theta_delta.abs() > 0.0 { theta_delta.abs() / max_time } else { th_speed };
-    let new_z = if z_delta.abs() > 0.0 { z_delta.abs() / max_time } else { z_speed };
+    let new_th = if theta_delta.abs() > 0.0 {
+        theta_delta.abs() / max_time
+    } else {
+        th_speed
+    };
+    let new_z = if z_delta.abs() > 0.0 {
+        z_delta.abs() / max_time
+    } else {
+        z_speed
+    };
     (new_th, new_z)
 }
 
@@ -174,10 +210,19 @@ pub struct MlMonoConfig {
 
 impl MlMonoConfig {
     pub fn new(
-        prefix: &str, m_theta: &str, m_theta2: &str,
-        m_y: &str, m_z: &str, y_offset: f64, geom: i32,
+        prefix: &str,
+        m_theta: &str,
+        m_theta2: &str,
+        m_y: &str,
+        m_z: &str,
+        y_offset: f64,
+        geom: i32,
     ) -> Self {
-        let y_off = if !(1.0..=60.0).contains(&y_offset) { 35.0 } else { y_offset };
+        let y_off = if !(1.0..=60.0).contains(&y_offset) {
+            35.0
+        } else {
+            y_offset
+        };
         Self {
             prefix: prefix.to_string(),
             m_theta: m_theta.to_string(),
@@ -203,7 +248,10 @@ impl MlMonoConfig {
 // ---------------------------------------------------------------------------
 
 /// Run the multi-layer monochromator control state machine.
-pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(
+    config: MlMonoConfig,
+    db: PvDatabase,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::time::sleep(Duration::from_secs(3)).await;
     println!("ml_monoCtl: starting for prefix={}", config.prefix);
 
@@ -306,12 +354,16 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
 
     // Wait for key channels
 
-
     // Build multi-monitor
     let monitored_pvs: Vec<String> = vec![
-        config.pv("E"), config.pv("Lambda"), config.pv("Theta"),
-        config.pv("Order"), config.pv("D"),
-        config.pv("Put"), config.pv("Mode"), config.pv("Mode2"),
+        config.pv("E"),
+        config.pv("Lambda"),
+        config.pv("Theta"),
+        config.pv("Order"),
+        config.pv("D"),
+        config.pv("Put"),
+        config.pv("Mode"),
+        config.pv("Mode2"),
         config.pv("OperAck"),
         config.motor_pv(&config.m_theta, ".RBV"),
         config.motor_pv(&config.m_theta2, ".RBV"),
@@ -321,7 +373,11 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
         config.pv("UseSet"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-    println!("ml_monoCtl: subscribed to {} PVs, {} active", monitored_pvs.len(), monitor.sub_count());
+    println!(
+        "ml_monoCtl: subscribed to {} PVs, {} active",
+        monitored_pvs.len(),
+        monitor.sub_count()
+    );
 
     // -- Initialize --
     let theta_name = format!("{}{}", config.prefix, config.m_theta);
@@ -343,7 +399,9 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
     let mut d_val = ch_d.get_f64().await;
     let (mut two_d, err, msg) = calc_2d_spacing(d_val, order_val);
     let _ = ch_msg1.put_string(msg).await;
-    if err { let _ = ch_alert.put_i16(1).await; }
+    if err {
+        let _ = ch_alert.put_i16(1).await;
+    }
 
     // Theta limits
     let mut theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
@@ -401,9 +459,13 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
     let pv_y_offset = config.pv("_yOffset");
     let pv_use_set = config.pv("UseSet");
 
-    println!("ml_monoCtl: ready (two_d={:.4}, theta=[{:.1}..{:.1}])", two_d, theta_lo, theta_hi);
+    println!(
+        "ml_monoCtl: ready (two_d={:.4}, theta=[{:.1}..{:.1}])",
+        two_d, theta_lo, theta_hi
+    );
 
-    let mut deferred_events: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut deferred_events: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
     // -- Main loop --
     loop {
         let mut proceed_to_theta_changed = false;
@@ -454,27 +516,37 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
             let (td, err, msg) = calc_2d_spacing(d_val, order_val);
             two_d = td;
             let _ = ch_msg1.put_string(msg).await;
-            if err { let _ = ch_alert.put_i16(1).await; }
+            if err {
+                let _ = ch_alert.put_i16(1).await;
+            }
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_msg2.put_string("Set to Manual Mode").await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await; let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await; let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64(eh).await;
+            let _ = ch_e_lo.put_f64(el).await;
+            let _ = ch_lambda_hi.put_f64(lh).await;
+            let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_d {
             d_val = ch_d.get_f64().await;
             let (td, err, msg) = calc_2d_spacing(d_val, order_val);
             two_d = td;
             let _ = ch_msg1.put_string(msg).await;
-            if err { let _ = ch_alert.put_i16(1).await; }
+            if err {
+                let _ = ch_alert.put_i16(1).await;
+            }
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_msg2.put_string("Set to Manual Mode").await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await; let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await; let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64(eh).await;
+            let _ = ch_e_lo.put_f64(el).await;
+            let _ = ch_lambda_hi.put_f64(lh).await;
+            let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_put_vals {
-            if new_val as i16 != 0 { proceed_to_theta_changed = true; }
+            if new_val as i16 != 0 {
+                proceed_to_theta_changed = true;
+            }
         } else if changed_pv == pv_auto_mode {
             auto_mode = new_val as i16 != 0;
         } else if changed_pv == pv_cc_mode {
@@ -500,26 +572,34 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
         } else if changed_pv == pv_theta_hilim {
             theta_mot_hi = new_val;
             let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi; theta_lo = lo;
+            theta_hi = hi;
+            theta_lo = lo;
             let _ = ch_theta_hi.put_f64(theta_hi).await;
             let _ = ch_theta_lo.put_f64(theta_lo).await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await; let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await; let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64(eh).await;
+            let _ = ch_e_lo.put_f64(el).await;
+            let _ = ch_lambda_hi.put_f64(lh).await;
+            let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_theta_lolim {
             theta_mot_lo = new_val;
             let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi; theta_lo = lo;
+            theta_hi = hi;
+            theta_lo = lo;
             let _ = ch_theta_hi.put_f64(theta_hi).await;
             let _ = ch_theta_lo.put_f64(theta_lo).await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await; let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await; let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64(eh).await;
+            let _ = ch_e_lo.put_f64(el).await;
+            let _ = ch_lambda_hi.put_f64(lh).await;
+            let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_y_offset {
             y_offset_val = new_val;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
-            let _ = ch_msg1.put_string(&format!("y offset changed to {:.4}", y_offset_val)).await;
+            let _ = ch_msg1
+                .put_string(&format!("y offset changed to {:.4}", y_offset_val))
+                .await;
             let _ = ch_msg2.put_string("Set to Manual Mode").await;
             proceed_to_theta_changed = true;
         } else if changed_pv == pv_use_set {
@@ -530,7 +610,9 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
             let _ = ch_z_mot_set_flag.put_i16(sv).await;
         }
 
-        if !proceed_to_theta_changed { continue; }
+        if !proceed_to_theta_changed {
+            continue;
+        }
 
         // -- Theta changed --
         if theta_val <= theta_lo || theta_val >= theta_hi {
@@ -584,15 +666,21 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
             let (new_th, new_z) = coordinate_speeds(
                 theta_val - current_rbv,
                 z_mot_desired - ch_z_mot_rbv.get_f64().await,
-                th_speed, z_speed, cc_mode,
+                th_speed,
+                z_speed,
+                cc_mode,
             );
             let _ = ch_theta_mot_velo.put_f64(new_th).await;
             let _ = ch_theta2_mot_velo.put_f64(new_th).await;
-            if !cc_mode.z_frozen() { let _ = ch_z_mot_velo.put_f64(new_z).await; }
+            if !cc_mode.z_frozen() {
+                let _ = ch_z_mot_velo.put_f64(new_z).await;
+            }
 
             let _ = ch_theta_mot_cmd.put_f64_process(theta_mot_desired).await;
             let _ = ch_theta2_mot_cmd.put_f64_process(theta2_mot_desired).await;
-            if !cc_mode.z_frozen() { let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await; }
+            if !cc_mode.z_frozen() {
+                let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
+            }
             let _ = ch_put_vals.put_i16(0).await;
             _caused_move = true;
 
@@ -603,8 +691,10 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
                 let th2_dmov = ch_theta2_dmov.get_i16().await;
                 let z_dmov = ch_z_dmov.get_i16().await;
 
-                if ch_theta_hls.get_i16().await != 0 || ch_theta_lls.get_i16().await != 0
-                    || ch_theta2_hls.get_i16().await != 0 || ch_theta2_lls.get_i16().await != 0
+                if ch_theta_hls.get_i16().await != 0
+                    || ch_theta_lls.get_i16().await != 0
+                    || ch_theta2_hls.get_i16().await != 0
+                    || ch_theta2_lls.get_i16().await != 0
                 {
                     let _ = ch_msg1.put_string("Theta Motor hit a limit switch!").await;
                     let _ = ch_alert.put_i16(1).await;
@@ -616,7 +706,9 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     break;
                 }
-                if !cc_mode.z_frozen() && (ch_z_hls.get_i16().await != 0 || ch_z_lls.get_i16().await != 0) {
+                if !cc_mode.z_frozen()
+                    && (ch_z_hls.get_i16().await != 0 || ch_z_lls.get_i16().await != 0)
+                {
                     let _ = ch_msg1.put_string("Z Motor hit a limit switch!").await;
                     let _ = ch_alert.put_i16(1).await;
                     auto_mode = false;
@@ -636,12 +728,18 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
                 let _ = ch_lambda_rdbk.put_f64_post(lambda_rdbk_val).await;
                 let _ = ch_e_rdbk.put_f64_post(e_rdbk_val).await;
                 let _ = ch_theta_rdbk_echo.put_f64(rbv).await;
-                let _ = ch_theta2_rdbk_echo.put_f64(ch_theta2_mot_rbv.get_f64().await).await;
+                let _ = ch_theta2_rdbk_echo
+                    .put_f64(ch_theta2_mot_rbv.get_f64().await)
+                    .await;
 
-                if th_dmov != 0 && th2_dmov != 0 && z_dmov != 0 { break; }
+                if th_dmov != 0 && th2_dmov != 0 && z_dmov != 0 {
+                    break;
+                }
             }
 
-            if _caused_move { _caused_move = false; }
+            if _caused_move {
+                _caused_move = false;
+            }
 
             // Final readback
             let rbv = ch_theta_mot_rbv.get_f64().await;
@@ -655,14 +753,26 @@ pub async fn run(config: MlMonoConfig, db: PvDatabase) -> Result<(), Box<dyn std
         }
 
         // Update echoes
-        let _ = ch_theta_rdbk_echo.put_f64(ch_theta_mot_rbv.get_f64().await).await;
-        let _ = ch_theta2_rdbk_echo.put_f64(ch_theta2_mot_rbv.get_f64().await).await;
+        let _ = ch_theta_rdbk_echo
+            .put_f64(ch_theta_mot_rbv.get_f64().await)
+            .await;
+        let _ = ch_theta2_rdbk_echo
+            .put_f64(ch_theta2_mot_rbv.get_f64().await)
+            .await;
         let _ = ch_z_rdbk_echo.put_f64(ch_z_mot_rbv.get_f64().await).await;
-        let _ = ch_theta_vel_echo.put_f64(ch_theta_mot_velo.get_f64().await).await;
-        let _ = ch_theta2_vel_echo.put_f64(ch_theta2_mot_velo.get_f64().await).await;
+        let _ = ch_theta_vel_echo
+            .put_f64(ch_theta_mot_velo.get_f64().await)
+            .await;
+        let _ = ch_theta2_vel_echo
+            .put_f64(ch_theta2_mot_velo.get_f64().await)
+            .await;
         let _ = ch_z_vel_echo.put_f64(ch_z_mot_velo.get_f64().await).await;
-        let _ = ch_theta_dmov_echo.put_i16(ch_theta_dmov.get_i16().await).await;
-        let _ = ch_theta2_dmov_echo.put_i16(ch_theta2_dmov.get_i16().await).await;
+        let _ = ch_theta_dmov_echo
+            .put_i16(ch_theta_dmov.get_i16().await)
+            .await;
+        let _ = ch_theta2_dmov_echo
+            .put_i16(ch_theta2_dmov.get_i16().await)
+            .await;
         let _ = ch_z_dmov_echo.put_i16(ch_z_dmov.get_i16().await).await;
 
         // Update y offset from readback

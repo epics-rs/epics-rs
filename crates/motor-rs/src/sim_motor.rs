@@ -61,7 +61,10 @@ impl SimMotor {
             return;
         }
 
-        let elapsed = self.move_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let elapsed = self
+            .move_start
+            .map(|s| s.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
 
         if self.velocity_mode {
             let dir = if self.velocity_direction { 1.0 } else { -1.0 };
@@ -80,7 +83,11 @@ impl SimMotor {
             }
         } else {
             let distance = (self.target - self.start_position).abs();
-            let travel_time = if self.velocity > 0.0 { distance / self.velocity } else { 0.0 };
+            let travel_time = if self.velocity > 0.0 {
+                distance / self.velocity
+            } else {
+                0.0
+            };
 
             if elapsed >= travel_time {
                 self.position = self.target;
@@ -88,7 +95,8 @@ impl SimMotor {
                 self.moving = false;
             } else {
                 let fraction = elapsed / travel_time;
-                self.position = self.start_position + (self.target - self.start_position) * fraction;
+                self.position =
+                    self.start_position + (self.target - self.start_position) * fraction;
                 self.encoder_position = self.position;
             }
         }
@@ -118,12 +126,7 @@ impl AsynMotor for SimMotor {
         Ok(())
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        velocity: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, velocity: f64, forward: bool) -> AsynResult<()> {
         // Simulate homing by moving to 0
         self.target = 0.0;
         self.velocity = velocity.abs().max(0.001);

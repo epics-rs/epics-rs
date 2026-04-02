@@ -374,10 +374,7 @@ fn encode_units_limits_u8(
 }
 
 /// no_str(2) + strs(16x26)
-fn encode_enum_metadata(
-    buf: &mut Vec<u8>,
-    snapshot: &crate::server::snapshot::Snapshot,
-) {
+fn encode_enum_metadata(buf: &mut Vec<u8>, snapshot: &crate::server::snapshot::Snapshot) {
     if let Some(ref ei) = snapshot.enums {
         let no_str = ei.strings.len().min(MAX_ENUM_STATES) as u16;
         buf.extend_from_slice(&no_str.to_be_bytes());
@@ -421,21 +418,36 @@ fn read_u32(data: &[u8], off: usize) -> CaResult<u32> {
     if off + 4 > data.len() {
         return Err(CaError::Protocol("buffer too short for u32".into()));
     }
-    Ok(u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]))
+    Ok(u32::from_be_bytes([
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+    ]))
 }
 
 fn read_i32(data: &[u8], off: usize) -> CaResult<i32> {
     if off + 4 > data.len() {
         return Err(CaError::Protocol("buffer too short for i32".into()));
     }
-    Ok(i32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]))
+    Ok(i32::from_be_bytes([
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+    ]))
 }
 
 fn read_f32(data: &[u8], off: usize) -> CaResult<f32> {
     if off + 4 > data.len() {
         return Err(CaError::Protocol("buffer too short for f32".into()));
     }
-    Ok(f32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]))
+    Ok(f32::from_be_bytes([
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+    ]))
 }
 
 fn read_f64(data: &[u8], off: usize) -> CaResult<f64> {
@@ -443,8 +455,14 @@ fn read_f64(data: &[u8], off: usize) -> CaResult<f64> {
         return Err(CaError::Protocol("buffer too short for f64".into()));
     }
     Ok(f64::from_be_bytes([
-        data[off], data[off + 1], data[off + 2], data[off + 3],
-        data[off + 4], data[off + 5], data[off + 6], data[off + 7],
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+        data[off + 4],
+        data[off + 5],
+        data[off + 6],
+        data[off + 7],
     ]))
 }
 
@@ -488,7 +506,12 @@ fn decode_sts(native: DbFieldType, data: &[u8], count: usize) -> CaResult<Snapsh
     let pad_len = sts_pad(native).len();
     let val_off = 4 + pad_len;
     let value = EpicsValue::from_bytes_array(native, &data[val_off..], count)?;
-    Ok(Snapshot::new(value, status, severity, SystemTime::UNIX_EPOCH))
+    Ok(Snapshot::new(
+        value,
+        status,
+        severity,
+        SystemTime::UNIX_EPOCH,
+    ))
 }
 
 fn decode_time(native: DbFieldType, data: &[u8], count: usize) -> CaResult<Snapshot> {
@@ -503,7 +526,12 @@ fn decode_time(native: DbFieldType, data: &[u8], count: usize) -> CaResult<Snaps
     Ok(Snapshot::new(value, status, severity, timestamp))
 }
 
-fn decode_gr_ctrl(native: DbFieldType, data: &[u8], count: usize, ctrl: bool) -> CaResult<Snapshot> {
+fn decode_gr_ctrl(
+    native: DbFieldType,
+    data: &[u8],
+    count: usize,
+    ctrl: bool,
+) -> CaResult<Snapshot> {
     let status = read_u16(data, 0)?;
     let severity = read_u16(data, 2)?;
     let mut off = 4;

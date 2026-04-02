@@ -77,7 +77,10 @@ fn test_i_is_writable() {
 #[test]
 fn test_type_mismatch() {
     let mut rec = EpidRecord::default();
-    assert!(rec.put_field("KP", EpicsValue::String("bad".into())).is_err());
+    assert!(
+        rec.put_field("KP", EpicsValue::String("bad".into()))
+            .is_err()
+    );
     assert!(rec.put_field("FMOD", EpicsValue::Double(1.0)).is_err());
 }
 
@@ -86,18 +89,25 @@ fn test_unknown_field() {
     let rec = EpidRecord::default();
     assert!(rec.get_field("NONEXISTENT").is_none());
     let mut rec = rec;
-    assert!(rec.put_field("NONEXISTENT", EpicsValue::Double(1.0)).is_err());
+    assert!(
+        rec.put_field("NONEXISTENT", EpicsValue::Double(1.0))
+            .is_err()
+    );
 }
 
 #[test]
 fn test_display_fields() {
     let mut rec = EpidRecord::default();
     rec.put_field("PREC", EpicsValue::Short(3)).unwrap();
-    rec.put_field("EGU", EpicsValue::String("degC".into())).unwrap();
+    rec.put_field("EGU", EpicsValue::String("degC".into()))
+        .unwrap();
     rec.put_field("HOPR", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LOPR", EpicsValue::Double(0.0)).unwrap();
     assert_eq!(rec.get_field("PREC"), Some(EpicsValue::Short(3)));
-    assert_eq!(rec.get_field("EGU"), Some(EpicsValue::String("degC".into())));
+    assert_eq!(
+        rec.get_field("EGU"),
+        Some(EpicsValue::String("degC".into()))
+    );
 }
 
 #[test]
@@ -127,7 +137,7 @@ fn test_check_alarms_hihi() {
     let alarm = rec.check_alarms();
     assert!(alarm.is_some());
     let (status, severity) = alarm.unwrap();
-    assert_eq!(status, 3);  // HIHI_ALARM
+    assert_eq!(status, 3); // HIHI_ALARM
     assert_eq!(severity, 2);
 }
 
@@ -140,7 +150,7 @@ fn test_check_alarms_lolo() {
     let alarm = rec.check_alarms();
     assert!(alarm.is_some());
     let (status, severity) = alarm.unwrap();
-    assert_eq!(status, 4);  // LOLO_ALARM
+    assert_eq!(status, 4); // LOLO_ALARM
     assert_eq!(severity, 2);
 }
 
@@ -195,11 +205,11 @@ fn test_pid_p_only() {
     rec.kd = 0.0;
     rec.val = 100.0; // setpoint
     rec.cval = 90.0; // controlled value
-    rec.fbon = 1;     // feedback on
-    rec.fbop = 1;     // was already on
+    rec.fbon = 1; // feedback on
+    rec.fbop = 1; // was already on
     rec.drvh = 200.0;
     rec.drvl = -200.0;
-    rec.mdt = 0.0;    // no minimum dt
+    rec.mdt = 0.0; // no minimum dt
 
     // Need a small time delta for dt > mdt check
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -207,10 +217,22 @@ fn test_pid_p_only() {
     EpidSoftDeviceSupport::do_pid(&mut rec);
 
     // P = KP * (setpoint - cval) = 2.0 * 10.0 = 20.0
-    assert!((rec.p - 20.0).abs() < 1e-6, "P should be ~20.0, got {}", rec.p);
-    assert!(rec.i.abs() < 1e-6, "I should be ~0 with KI=0, got {}", rec.i);
+    assert!(
+        (rec.p - 20.0).abs() < 1e-6,
+        "P should be ~20.0, got {}",
+        rec.p
+    );
+    assert!(
+        rec.i.abs() < 1e-6,
+        "I should be ~0 with KI=0, got {}",
+        rec.i
+    );
     // Output = P + I + D = 20.0
-    assert!((rec.oval - 20.0).abs() < 1.0, "OVAL should be ~20.0, got {}", rec.oval);
+    assert!(
+        (rec.oval - 20.0).abs() < 1.0,
+        "OVAL should be ~20.0, got {}",
+        rec.oval
+    );
 }
 
 #[test]
@@ -220,7 +242,7 @@ fn test_pid_output_clamping() {
     rec.ki = 0.0;
     rec.kd = 0.0;
     rec.val = 100.0;
-    rec.cval = 0.0;  // huge error
+    rec.cval = 0.0; // huge error
     rec.fbon = 1;
     rec.fbop = 1;
     rec.drvh = 50.0;
@@ -231,7 +253,11 @@ fn test_pid_output_clamping() {
     EpidSoftDeviceSupport::do_pid(&mut rec);
 
     // Output should be clamped to DRVH=50
-    assert!(rec.oval <= 50.0, "Output should be clamped to DRVH, got {}", rec.oval);
+    assert!(
+        rec.oval <= 50.0,
+        "Output should be clamped to DRVH, got {}",
+        rec.oval
+    );
 }
 
 #[test]
@@ -286,14 +312,14 @@ fn test_pid_output_deadband() {
     rec.ki = 0.0;
     rec.kd = 0.0;
     rec.val = 100.0;
-    rec.cval = 95.0;  // error = 5.0, P = 5.0
+    rec.cval = 95.0; // error = 5.0, P = 5.0
     rec.fbon = 1;
     rec.fbop = 1;
     rec.drvh = 200.0;
     rec.drvl = -200.0;
     rec.mdt = 0.0;
-    rec.odel = 10.0;  // Deadband = 10
-    rec.oval = 7.0;   // Current output is 7.0
+    rec.odel = 10.0; // Deadband = 10
+    rec.oval = 7.0; // Current output is 7.0
 
     std::thread::sleep(std::time::Duration::from_millis(5));
     EpidSoftDeviceSupport::do_pid(&mut rec);
@@ -301,7 +327,11 @@ fn test_pid_output_deadband() {
     // New computed output: P = 1.0 * 5.0 = 5.0
     // Change from 7.0 to 5.0 = |2.0| < ODEL=10.0
     // So OVAL should NOT change
-    assert_eq!(rec.oval, 7.0, "OVAL should not change within deadband, got {}", rec.oval);
+    assert_eq!(
+        rec.oval, 7.0,
+        "OVAL should not change within deadband, got {}",
+        rec.oval
+    );
 }
 
 #[test]
@@ -336,9 +366,9 @@ fn test_pid_bumpless_turn_on() {
     rec.kd = 0.0;
     rec.val = 100.0;
     rec.cval = 50.0;
-    rec.fbon = 1;     // Feedback ON
-    rec.fbop = 0;     // Was OFF → bumpless transition
-    rec.oval = 42.0;  // Current output before turn-on
+    rec.fbon = 1; // Feedback ON
+    rec.fbop = 0; // Was OFF → bumpless transition
+    rec.oval = 42.0; // Current output before turn-on
     rec.drvh = 200.0;
     rec.drvl = -200.0;
     rec.mdt = 0.0;
@@ -347,7 +377,11 @@ fn test_pid_bumpless_turn_on() {
     EpidSoftDeviceSupport::do_pid(&mut rec);
 
     // On bumpless turn-on, I is set to current OVAL (42.0)
-    assert!((rec.i - 42.0).abs() < 1e-6, "I should be set to OVAL on bumpless turn-on, got {}", rec.i);
+    assert!(
+        (rec.i - 42.0).abs() < 1e-6,
+        "I should be set to OVAL on bumpless turn-on, got {}",
+        rec.i
+    );
 }
 
 #[test]

@@ -41,7 +41,11 @@ impl SimDetector {
         base.set_string_param(ad.params.base.model, 0, "Basic simulator".into())?;
         base.set_string_param(ad.params.base.serial_number, 0, "No serial number".into())?;
         base.set_string_param(ad.params.base.firmware_version, 0, "No firmware".into())?;
-        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION").into())?;
+        base.set_string_param(
+            ad.params.base.sdk_version,
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+        )?;
 
         base.set_int32_param(ad.params.min_x, 0, 0)?;
         base.set_int32_param(ad.params.min_y, 0, 0)?;
@@ -173,20 +177,33 @@ impl PortDriver for SimDetector {
         let status_msg_idx = self.ad.params.status_message;
 
         if reason == acquire_idx {
-            let acquiring = self.ad.port_base.get_int32_param(acquire_idx, 0).unwrap_or(0);
+            let acquiring = self
+                .ad
+                .port_base
+                .get_int32_param(acquire_idx, 0)
+                .unwrap_or(0);
             if value != 0 && acquiring == 0 {
-                self.ad.port_base.set_string_param(status_msg_idx, 0, "Acquiring data".into())?;
+                self.ad
+                    .port_base
+                    .set_string_param(status_msg_idx, 0, "Acquiring data".into())?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 let _ = self.acq_tx.send(AcqCommand::Start);
             } else if value == 0 && acquiring != 0 {
-                self.ad.port_base.set_string_param(status_msg_idx, 0, "Acquisition stopped".into())?;
+                self.ad.port_base.set_string_param(
+                    status_msg_idx,
+                    0,
+                    "Acquisition stopped".into(),
+                )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 let _ = self.acq_tx.send(AcqCommand::Stop);
             } else {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
             }
         } else {
-            self.ad.port_base.params.set_int32(reason, user.addr, value)?;
+            self.ad
+                .port_base
+                .params
+                .set_int32(reason, user.addr, value)?;
             self.set_dirty_for_int32(reason);
             self.ad.port_base.call_param_callback(0, reason)?;
             return Ok(());
@@ -198,7 +215,10 @@ impl PortDriver for SimDetector {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad.port_base.params.set_float64(reason, user.addr, value)?;
+        self.ad
+            .port_base
+            .params
+            .set_float64(reason, user.addr, value)?;
         self.set_dirty_for_float64(reason);
         self.ad.port_base.call_param_callback(0, reason)?;
         Ok(())
@@ -264,7 +284,14 @@ pub fn create_sim_detector(
     let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
     dirty.lock().set_all();
 
-    let det = SimDetector::new(port_name, max_size_x, max_size_y, max_memory, acq_tx, dirty.clone())?;
+    let det = SimDetector::new(
+        port_name,
+        max_size_x,
+        max_size_y,
+        max_memory,
+        acq_tx,
+        dirty.clone(),
+    )?;
 
     // Capture param indices before driver is moved into PortActor
     let ad_params = det.ad.params;
@@ -306,14 +333,49 @@ mod tests {
     fn test_new_default_values() {
         let rt = create_sim_detector("SIM1", 256, 256, 10_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
-        assert_eq!(handle.read_int32_blocking(rt.ad_params.max_size_x, 0).unwrap(), 256);
-        assert_eq!(handle.read_int32_blocking(rt.ad_params.max_size_y, 0).unwrap(), 256);
-        assert_eq!(handle.read_float64_blocking(rt.sim_params.gain_x, 0).unwrap(), 1.0);
-        assert_eq!(handle.read_float64_blocking(rt.sim_params.gain_y, 0).unwrap(), 1.0);
-        assert_eq!(handle.read_int32_blocking(rt.sim_params.peak_width_x, 0).unwrap(), 10);
-        assert_eq!(handle.read_int32_blocking(rt.sim_params.peak_width_y, 0).unwrap(), 20);
+        assert_eq!(
+            handle
+                .read_int32_blocking(rt.ad_params.max_size_x, 0)
+                .unwrap(),
+            256
+        );
+        assert_eq!(
+            handle
+                .read_int32_blocking(rt.ad_params.max_size_y, 0)
+                .unwrap(),
+            256
+        );
+        assert_eq!(
+            handle
+                .read_float64_blocking(rt.sim_params.gain_x, 0)
+                .unwrap(),
+            1.0
+        );
+        assert_eq!(
+            handle
+                .read_float64_blocking(rt.sim_params.gain_y, 0)
+                .unwrap(),
+            1.0
+        );
+        assert_eq!(
+            handle
+                .read_int32_blocking(rt.sim_params.peak_width_x, 0)
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            handle
+                .read_int32_blocking(rt.sim_params.peak_width_y, 0)
+                .unwrap(),
+            20
+        );
         assert!(
-            (handle.read_float64_blocking(rt.ad_params.acquire_time, 0).unwrap() - 0.001).abs() < 1e-10
+            (handle
+                .read_float64_blocking(rt.ad_params.acquire_time, 0)
+                .unwrap()
+                - 0.001)
+                .abs()
+                < 1e-10
         );
     }
 
@@ -322,7 +384,9 @@ mod tests {
         let rt = create_sim_detector("SIM2", 64, 64, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
         // Write data_type via PortHandle (triggers write_int32 -> set_dirty)
-        handle.write_int32_blocking(rt.ad_params.base.data_type, 0, 3).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.base.data_type, 0, 3)
+            .unwrap();
         // Can't directly check dirty flags from outside since driver is owned by actor,
         // but the write succeeds without error.
     }
@@ -331,7 +395,9 @@ mod tests {
     fn test_dirty_flags_on_gain_change() {
         let rt = create_sim_detector("SIM3", 64, 64, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
-        handle.write_float64_blocking(rt.sim_params.gain, 0, 2.0).unwrap();
+        handle
+            .write_float64_blocking(rt.sim_params.gain, 0, 2.0)
+            .unwrap();
         // Verify write took effect
         assert!((handle.read_float64_blocking(rt.sim_params.gain, 0).unwrap() - 2.0).abs() < 1e-10);
     }
@@ -340,17 +406,33 @@ mod tests {
     fn test_dirty_flags_on_offset_change() {
         let rt = create_sim_detector("SIM4", 64, 64, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
-        handle.write_float64_blocking(rt.sim_params.offset, 0, 5.0).unwrap();
-        assert!((handle.read_float64_blocking(rt.sim_params.offset, 0).unwrap() - 5.0).abs() < 1e-10);
+        handle
+            .write_float64_blocking(rt.sim_params.offset, 0, 5.0)
+            .unwrap();
+        assert!(
+            (handle
+                .read_float64_blocking(rt.sim_params.offset, 0)
+                .unwrap()
+                - 5.0)
+                .abs()
+                < 1e-10
+        );
     }
 
     #[test]
     fn test_dirty_flags_on_sine_param_change() {
         let rt = create_sim_detector("SIM5", 64, 64, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
-        handle.write_float64_blocking(rt.sim_params.x_sine1_amplitude, 0, 100.0).unwrap();
+        handle
+            .write_float64_blocking(rt.sim_params.x_sine1_amplitude, 0, 100.0)
+            .unwrap();
         assert!(
-            (handle.read_float64_blocking(rt.sim_params.x_sine1_amplitude, 0).unwrap() - 100.0).abs() < 1e-10
+            (handle
+                .read_float64_blocking(rt.sim_params.x_sine1_amplitude, 0)
+                .unwrap()
+                - 100.0)
+                .abs()
+                < 1e-10
         );
     }
 
@@ -358,7 +440,14 @@ mod tests {
     fn test_dirty_flags_on_mode_change() {
         let rt = create_sim_detector("SIM6", 64, 64, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
-        handle.write_int32_blocking(rt.sim_params.sim_mode, 0, 2).unwrap();
-        assert_eq!(handle.read_int32_blocking(rt.sim_params.sim_mode, 0).unwrap(), 2);
+        handle
+            .write_int32_blocking(rt.sim_params.sim_mode, 0, 2)
+            .unwrap();
+        assert_eq!(
+            handle
+                .read_int32_blocking(rt.sim_params.sim_mode, 0)
+                .unwrap(),
+            2
+        );
     }
 }

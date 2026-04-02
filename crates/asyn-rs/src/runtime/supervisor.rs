@@ -63,18 +63,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[tokio::test]
     async fn normal_completion() {
-        let outcome = supervise(
-            "test",
-            SupervisionPolicy::default(),
-            || async {},
-        )
-        .await;
+        let outcome = supervise("test", SupervisionPolicy::default(), || async {}).await;
         assert_eq!(outcome, SupervisionOutcome::Normal);
     }
 
@@ -103,6 +98,9 @@ mod tests {
         .await;
 
         // Should exceed max_restarts (2) because we panic 3 times
-        assert_eq!(outcome, SupervisionOutcome::MaxRestartsExceeded { count: 3 });
+        assert_eq!(
+            outcome,
+            SupervisionOutcome::MaxRestartsExceeded { count: 3 }
+        );
     }
 }

@@ -211,11 +211,7 @@ impl OctetInterpose for EosInterpose {
         next.write(user, &buf)
     }
 
-    fn flush(
-        &mut self,
-        user: &mut AsynUser,
-        next: &mut dyn OctetNext,
-    ) -> AsynResult<()> {
+    fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
         self.read_buffer.clear();
         self.read_pos = 0;
         next.flush(user)

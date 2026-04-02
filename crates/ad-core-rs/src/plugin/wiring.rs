@@ -4,7 +4,7 @@
 //! change their upstream data source by writing to the NDArrayPort PV.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc, Mutex};
 
 use super::channel::{NDArrayOutput, NDArraySender};
 
@@ -42,15 +42,17 @@ impl WiringRegistry {
     ///
     /// Self-wiring (sender's port_name == new_upstream) is rejected.
     /// Empty `old_upstream` is allowed (initial wiring).
-    pub fn rewire(&self, sender: &NDArraySender, old_upstream: &str, new_upstream: &str) -> Result<(), String> {
+    pub fn rewire(
+        &self,
+        sender: &NDArraySender,
+        old_upstream: &str,
+        new_upstream: &str,
+    ) -> Result<(), String> {
         let sender_port = sender.port_name();
 
         // Prevent self-wiring
         if sender_port == new_upstream {
-            return Err(format!(
-                "cannot wire port '{}' to itself",
-                sender_port
-            ));
+            return Err(format!("cannot wire port '{}' to itself", sender_port));
         }
 
         let reg = self.inner.lock().unwrap();
@@ -67,9 +69,12 @@ impl WiringRegistry {
         if new_upstream.is_empty() {
             return Ok(());
         }
-        let new_output = reg
-            .get(new_upstream)
-            .ok_or_else(|| format!("upstream port '{}' not found in wiring registry", new_upstream))?;
+        let new_output = reg.get(new_upstream).ok_or_else(|| {
+            format!(
+                "upstream port '{}' not found in wiring registry",
+                new_upstream
+            )
+        })?;
         new_output.lock().add(sender.clone());
 
         Ok(())
@@ -80,7 +85,12 @@ impl WiringRegistry {
     /// Extracts the sender from the old upstream's output and adds it to the new upstream's output.
     /// This avoids holding an `NDArraySender` clone inside the data loop, which would prevent
     /// channel shutdown.
-    pub fn rewire_by_name(&self, sender_port: &str, old_upstream: &str, new_upstream: &str) -> Result<(), String> {
+    pub fn rewire_by_name(
+        &self,
+        sender_port: &str,
+        old_upstream: &str,
+        new_upstream: &str,
+    ) -> Result<(), String> {
         // Prevent self-wiring
         if sender_port == new_upstream {
             return Err(format!("cannot wire port '{}' to itself", sender_port));
@@ -104,9 +114,12 @@ impl WiringRegistry {
             return Ok(());
         }
 
-        let new_output = reg
-            .get(new_upstream)
-            .ok_or_else(|| format!("upstream port '{}' not found in wiring registry", new_upstream))?;
+        let new_output = reg.get(new_upstream).ok_or_else(|| {
+            format!(
+                "upstream port '{}' not found in wiring registry",
+                new_upstream
+            )
+        })?;
 
         match sender {
             Some(s) => {

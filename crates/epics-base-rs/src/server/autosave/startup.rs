@@ -148,8 +148,16 @@ impl AutosaveStartupConfig {
             commands.push(CommandDef::new(
                 "set_requestfile_path",
                 vec![
-                    ArgDesc { name: "path", arg_type: ArgType::String, optional: false },
-                    ArgDesc { name: "pathsub", arg_type: ArgType::String, optional: true },
+                    ArgDesc {
+                        name: "path",
+                        arg_type: ArgType::String,
+                        optional: false,
+                    },
+                    ArgDesc {
+                        name: "pathsub",
+                        arg_type: ArgType::String,
+                        optional: true,
+                    },
                 ],
                 "set_requestfile_path(path, pathsub) - Add request file search path",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
@@ -176,8 +184,16 @@ impl AutosaveStartupConfig {
             commands.push(CommandDef::new(
                 "set_savefile_path",
                 vec![
-                    ArgDesc { name: "path", arg_type: ArgType::String, optional: false },
-                    ArgDesc { name: "pathsub", arg_type: ArgType::String, optional: true },
+                    ArgDesc {
+                        name: "path",
+                        arg_type: ArgType::String,
+                        optional: false,
+                    },
+                    ArgDesc {
+                        name: "pathsub",
+                        arg_type: ArgType::String,
+                        optional: true,
+                    },
                 ],
                 "set_savefile_path(path, pathsub) - Set save file directory",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
@@ -207,9 +223,21 @@ impl AutosaveStartupConfig {
             commands.push(CommandDef::new(
                 "create_monitor_set",
                 vec![
-                    ArgDesc { name: "filename", arg_type: ArgType::String, optional: false },
-                    ArgDesc { name: "period", arg_type: ArgType::Int, optional: false },
-                    ArgDesc { name: "macrostring", arg_type: ArgType::String, optional: true },
+                    ArgDesc {
+                        name: "filename",
+                        arg_type: ArgType::String,
+                        optional: false,
+                    },
+                    ArgDesc {
+                        name: "period",
+                        arg_type: ArgType::Int,
+                        optional: false,
+                    },
+                    ArgDesc {
+                        name: "macrostring",
+                        arg_type: ArgType::String,
+                        optional: true,
+                    },
                 ],
                 "create_monitor_set(filename, period, macrostring) - Create periodic save set",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
@@ -242,9 +270,21 @@ impl AutosaveStartupConfig {
             commands.push(CommandDef::new(
                 "create_triggered_set",
                 vec![
-                    ArgDesc { name: "filename", arg_type: ArgType::String, optional: false },
-                    ArgDesc { name: "period", arg_type: ArgType::Int, optional: false },
-                    ArgDesc { name: "macrostring", arg_type: ArgType::String, optional: true },
+                    ArgDesc {
+                        name: "filename",
+                        arg_type: ArgType::String,
+                        optional: false,
+                    },
+                    ArgDesc {
+                        name: "period",
+                        arg_type: ArgType::Int,
+                        optional: false,
+                    },
+                    ArgDesc {
+                        name: "macrostring",
+                        arg_type: ArgType::String,
+                        optional: true,
+                    },
                 ],
                 "create_triggered_set(filename, period, macrostring) - Create triggered save set",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
@@ -277,8 +317,16 @@ impl AutosaveStartupConfig {
             commands.push(CommandDef::new(
                 "set_pass0_restoreFile",
                 vec![
-                    ArgDesc { name: "filename", arg_type: ArgType::String, optional: false },
-                    ArgDesc { name: "macrostring", arg_type: ArgType::String, optional: true },
+                    ArgDesc {
+                        name: "filename",
+                        arg_type: ArgType::String,
+                        optional: false,
+                    },
+                    ArgDesc {
+                        name: "macrostring",
+                        arg_type: ArgType::String,
+                        optional: true,
+                    },
                 ],
                 "set_pass0_restoreFile(filename, macrostring) - Restore before device support init",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
@@ -291,7 +339,10 @@ impl AutosaveStartupConfig {
                         _ => String::new(),
                     };
                     eprintln!("set_pass0_restoreFile: {filename}");
-                    h.lock().unwrap().pass0_restores.push(RestoreDef { filename, macros });
+                    h.lock()
+                        .unwrap()
+                        .pass0_restores
+                        .push(RestoreDef { filename, macros });
                     Ok(CommandOutcome::Continue)
                 },
             ));
@@ -303,8 +354,16 @@ impl AutosaveStartupConfig {
             commands.push(CommandDef::new(
                 "set_pass1_restoreFile",
                 vec![
-                    ArgDesc { name: "filename", arg_type: ArgType::String, optional: false },
-                    ArgDesc { name: "macrostring", arg_type: ArgType::String, optional: true },
+                    ArgDesc {
+                        name: "filename",
+                        arg_type: ArgType::String,
+                        optional: false,
+                    },
+                    ArgDesc {
+                        name: "macrostring",
+                        arg_type: ArgType::String,
+                        optional: true,
+                    },
                 ],
                 "set_pass1_restoreFile(filename, macrostring) - Restore after device support init",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
@@ -317,7 +376,10 @@ impl AutosaveStartupConfig {
                         _ => String::new(),
                     };
                     eprintln!("set_pass1_restoreFile: {filename}");
-                    h.lock().unwrap().pass1_restores.push(RestoreDef { filename, macros });
+                    h.lock()
+                        .unwrap()
+                        .pass1_restores
+                        .push(RestoreDef { filename, macros });
                     Ok(CommandOutcome::Continue)
                 },
             ));
@@ -328,9 +390,11 @@ impl AutosaveStartupConfig {
             let h = holder.clone();
             commands.push(CommandDef::new(
                 "save_restoreSet_status_prefix",
-                vec![
-                    ArgDesc { name: "prefix", arg_type: ArgType::String, optional: false },
-                ],
+                vec![ArgDesc {
+                    name: "prefix",
+                    arg_type: ArgType::String,
+                    optional: false,
+                }],
                 "save_restoreSet_status_prefix(prefix) - Set status PV prefix",
                 move |args: &[ArgValue], _ctx: &CommandContext| {
                     let prefix = match &args[0] {

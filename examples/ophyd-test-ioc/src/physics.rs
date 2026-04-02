@@ -1,5 +1,5 @@
-use rand::rngs::StdRng;
 use rand::Rng;
+use rand::rngs::StdRng;
 
 const N_PER_I_PER_S: f64 = 200.0;
 
@@ -13,7 +13,11 @@ pub struct BeamCurrentConfig {
 
 impl Default for BeamCurrentConfig {
     fn default() -> Self {
-        Self { offset: 500.0, amplitude: 25.0, period: 4.0 }
+        Self {
+            offset: 500.0,
+            amplitude: 25.0,
+            period: 4.0,
+        }
     }
 }
 
@@ -28,7 +32,12 @@ pub struct MovingDotImageConfig {
 
 impl Default for MovingDotImageConfig {
     fn default() -> Self {
-        Self { sigma_x: 50.0, sigma_y: 25.0, background: 1000.0, n_per_i_per_s: N_PER_I_PER_S }
+        Self {
+            sigma_x: 50.0,
+            sigma_y: 25.0,
+            background: 1000.0,
+            n_per_i_per_s: N_PER_I_PER_S,
+        }
     }
 }
 
@@ -119,10 +128,18 @@ pub fn poisson_sample(rng: &mut StdRng, lambda: f64) -> f64 {
         }
     } else {
         // Normal approximation for large lambda
-        let normal: f64 = rng.random::<f64>() + rng.random::<f64>() + rng.random::<f64>()
-            + rng.random::<f64>() + rng.random::<f64>() + rng.random::<f64>()
-            + rng.random::<f64>() + rng.random::<f64>() + rng.random::<f64>()
-            + rng.random::<f64>() + rng.random::<f64>() + rng.random::<f64>()
+        let normal: f64 = rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
+            + rng.random::<f64>()
             - 6.0;
         (lambda + lambda.sqrt() * normal).max(0.0)
     }
@@ -186,7 +203,17 @@ pub fn moving_dot_image(
     shutter_open: bool,
     rng: &mut StdRng,
 ) -> Vec<f64> {
-    moving_dot_image_with_config(width, height, mtrx, mtry, current, exposure, shutter_open, rng, &MovingDotImageConfig::default())
+    moving_dot_image_with_config(
+        width,
+        height,
+        mtrx,
+        mtry,
+        current,
+        exposure,
+        shutter_open,
+        rng,
+        &MovingDotImageConfig::default(),
+    )
 }
 
 #[cfg(test)]
@@ -216,7 +243,10 @@ mod tests {
     fn test_pinhole_peak_at_center() {
         let val_center = point_reading(DetectorMode::PinHole, 0.0, 500.0, 1.0, 5.0, 0.0);
         let val_offset = point_reading(DetectorMode::PinHole, 20.0, 500.0, 1.0, 5.0, 0.0);
-        assert!(val_center > val_offset * 10.0, "peak should be much larger at center");
+        assert!(
+            val_center > val_offset * 10.0,
+            "peak should be much larger at center"
+        );
     }
 
     #[test]
@@ -226,7 +256,10 @@ mod tests {
         let v_sigma = point_reading(DetectorMode::PinHole, sigma, 500.0, 1.0, sigma, 0.0);
         let expected_ratio = (-0.5_f64).exp(); // e^(-1/2)
         let ratio = v_sigma / v0;
-        assert!((ratio - expected_ratio).abs() < 1e-10, "ratio={ratio}, expected={expected_ratio}");
+        assert!(
+            (ratio - expected_ratio).abs() < 1e-10,
+            "ratio={ratio}, expected={expected_ratio}"
+        );
     }
 
     #[test]
@@ -236,7 +269,10 @@ mod tests {
         for i in 0..20 {
             let mtr = i as f64;
             let val = point_reading(DetectorMode::Edge, mtr, 500.0, 1.0, 2.5, 5.0);
-            assert!(val >= prev, "edge not monotonic at mtr={mtr}: {val} < {prev}");
+            assert!(
+                val >= prev,
+                "edge not monotonic at mtr={mtr}: {val} < {prev}"
+            );
             prev = val;
         }
     }
@@ -248,7 +284,10 @@ mod tests {
         let center = 7.5;
         let val_pos = point_reading(DetectorMode::Slit, 2.0, 500.0, 1.0, 2.5, center);
         let val_neg = point_reading(DetectorMode::Slit, -2.0, 500.0, 1.0, 2.5, center);
-        assert!((val_pos - val_neg).abs() / val_pos.max(1e-10) < 0.01, "pos={val_pos}, neg={val_neg}");
+        assert!(
+            (val_pos - val_neg).abs() / val_pos.max(1e-10) < 0.01,
+            "pos={val_pos}, neg={val_neg}"
+        );
     }
 
     #[test]
@@ -266,7 +305,10 @@ mod tests {
         let n = 10_000;
         let sum: f64 = (0..n).map(|_| poisson_sample(&mut rng, lambda)).sum();
         let mean = sum / n as f64;
-        assert!((mean - lambda).abs() < 5.0, "poisson mean={mean}, expected ~{lambda}");
+        assert!(
+            (mean - lambda).abs() < 5.0,
+            "poisson mean={mean}, expected ~{lambda}"
+        );
     }
 
     #[test]

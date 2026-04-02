@@ -6,8 +6,8 @@
 
 use epics_base_rs::server::database::PvDatabase;
 
-use crate::db_access::{alloc_origin, DbChannel, DbMultiMonitor};
 use crate::data::chantler::{find_material, transmission};
+use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 
 /// Number of filter combinations per bank (4 bits = 16).
 pub const NUM_COMBINATIONS: usize = 16;
@@ -50,12 +50,7 @@ impl Default for Pf4BankConfig {
         Self {
             thicknesses: [0.0; 4],
             material_indices: [0; 4],
-            other_materials: [
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ],
+            other_materials: [String::new(), String::new(), String::new(), String::new()],
         }
     }
 }
@@ -399,9 +394,8 @@ impl Pf4Controller {
         match event {
             Pf4Event::BitsChanged(new_bits) => {
                 self.bit_states = new_bits;
-                let current_pattern = bits_to_pattern(
-                    new_bits[0], new_bits[1], new_bits[2], new_bits[3],
-                );
+                let current_pattern =
+                    bits_to_pattern(new_bits[0], new_bits[1], new_bits[2], new_bits[3]);
                 self.filter_pos = find_position(&self.bits, current_pattern);
                 let mut actions = Pf4Actions::default();
                 self.transmission = self.xmit[self.filter_pos];
@@ -478,7 +472,10 @@ impl Pf4Controller {
                     let new_bits = pattern_to_bits(pattern);
 
                     // Insert first, then remove
-                    let mut actions = Pf4Actions { set_bits: Some(new_bits), ..Default::default() };
+                    let mut actions = Pf4Actions {
+                        set_bits: Some(new_bits),
+                        ..Default::default()
+                    };
                     self.bit_states = new_bits;
                     self.transmission = self.xmit[pos];
                     self.inv_transmission = if self.transmission > 0.0 {
@@ -498,11 +495,17 @@ impl Pf4Controller {
 }
 
 /// Async entry point — runs the PF4 bank state machine against live PVs.
-pub async fn run(config: Pf4Config, db: PvDatabase) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::time::{sleep, Duration};
+pub async fn run(
+    config: Pf4Config,
+    db: PvDatabase,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::time::{Duration, sleep};
 
     tokio::time::sleep(Duration::from_secs(3)).await;
-    println!("pf4: starting for prefix={}{} bank {}", config.prefix, config.hardware, config.bank);
+    println!(
+        "pf4: starting for prefix={}{} bank {}",
+        config.prefix, config.hardware, config.bank
+    );
 
     let my_origin = alloc_origin();
     let ph = format!("{}{}", config.prefix, config.hardware);
@@ -548,7 +551,10 @@ pub async fn run(config: Pf4Config, db: PvDatabase) -> Result<(), Box<dyn std::e
     let mut ctrl = Pf4Controller::default();
 
     // Read initial values
-    ctrl.mono_energy = { let v = ch_local_energy.get_f64().await; if v > 0.0 { v } else { 10.0 } };
+    ctrl.mono_energy = {
+        let v = ch_local_energy.get_f64().await;
+        if v > 0.0 { v } else { 10.0 }
+    };
     ctrl.local_energy = ctrl.mono_energy;
     ctrl.bank_config.thicknesses = [
         ch_f1.get_f64().await,
@@ -572,7 +578,15 @@ pub async fn run(config: Pf4Config, db: PvDatabase) -> Result<(), Box<dyn std::e
     ctrl.use_mono = ch_select_energy.get_i16().await as i32 != 0;
 
     let init_actions = ctrl.recalculate();
-    apply_pf4_actions(&init_actions, &ch_trans, &ch_inv_trans, &ch_filter_al, &ch_filter_ti, &ch_filter_glass).await;
+    apply_pf4_actions(
+        &init_actions,
+        &ch_trans,
+        &ch_inv_trans,
+        &ch_filter_al,
+        &ch_filter_ti,
+        &ch_filter_glass,
+    )
+    .await;
 
     tracing::info!("pf4 state machine running for {ph} bank {b}");
 
@@ -625,19 +639,43 @@ pub async fn run(config: Pf4Config, db: PvDatabase) -> Result<(), Box<dyn std::e
 
         if let Some(ev) = event {
             let actions = ctrl.step(ev);
-            apply_pf4_actions(&actions, &ch_trans, &ch_inv_trans, &ch_filter_al, &ch_filter_ti, &ch_filter_glass).await;
+            apply_pf4_actions(
+                &actions,
+                &ch_trans,
+                &ch_inv_trans,
+                &ch_filter_al,
+                &ch_filter_ti,
+                &ch_filter_glass,
+            )
+            .await;
 
             if let Some(bits) = actions.set_bits {
                 // Insert first, then remove (as per original SNL)
-                if bits[0] { let _ = ch_b1.put_i16(1_i16).await; }
-                if bits[1] { let _ = ch_b2.put_i16(1_i16).await; }
-                if bits[2] { let _ = ch_b3.put_i16(1_i16).await; }
-                if bits[3] { let _ = ch_b4.put_i16(1_i16).await; }
+                if bits[0] {
+                    let _ = ch_b1.put_i16(1_i16).await;
+                }
+                if bits[1] {
+                    let _ = ch_b2.put_i16(1_i16).await;
+                }
+                if bits[2] {
+                    let _ = ch_b3.put_i16(1_i16).await;
+                }
+                if bits[3] {
+                    let _ = ch_b4.put_i16(1_i16).await;
+                }
                 sleep(Duration::from_millis(200)).await;
-                if !bits[0] { let _ = ch_b1.put_i16(0_i16).await; }
-                if !bits[1] { let _ = ch_b2.put_i16(0_i16).await; }
-                if !bits[2] { let _ = ch_b3.put_i16(0_i16).await; }
-                if !bits[3] { let _ = ch_b4.put_i16(0_i16).await; }
+                if !bits[0] {
+                    let _ = ch_b1.put_i16(0_i16).await;
+                }
+                if !bits[1] {
+                    let _ = ch_b2.put_i16(0_i16).await;
+                }
+                if !bits[2] {
+                    let _ = ch_b3.put_i16(0_i16).await;
+                }
+                if !bits[3] {
+                    let _ = ch_b4.put_i16(0_i16).await;
+                }
             }
         }
     }

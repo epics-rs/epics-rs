@@ -73,7 +73,10 @@ impl MovingDotConfigSnapshot {
             image_mode: ImageMode::from_i32(handle.read_int32_blocking(ad.image_mode, 0)?),
             num_images: handle.read_int32_blocking(ad.num_images, 0)?,
             array_callbacks: handle.read_int32_blocking(ad.base.array_callbacks, 0)? != 0,
-            wait_for_plugins: handle.read_int32_blocking(ad.base.wait_for_plugins, 0).unwrap_or(0) != 0,
+            wait_for_plugins: handle
+                .read_int32_blocking(ad.base.wait_for_plugins, 0)
+                .unwrap_or(0)
+                != 0,
             size_x: handle.read_int32_blocking(ad.size_x, 0)? as usize,
             size_y: handle.read_int32_blocking(ad.size_y, 0)? as usize,
             bin_x: (handle.read_int32_blocking(ad.bin_x, 0)?).max(1) as usize,

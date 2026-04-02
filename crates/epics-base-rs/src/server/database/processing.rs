@@ -6,7 +6,7 @@ use crate::runtime::sync::RwLock;
 use crate::server::record::RecordInstance;
 use crate::types::EpicsValue;
 
-use super::{apply_timestamp, PvDatabase};
+use super::{PvDatabase, apply_timestamp};
 
 impl PvDatabase {
     /// Process a record by name (process_local + notify).
@@ -38,7 +38,10 @@ impl PvDatabase {
         visited: &'a mut HashSet<String>,
         depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
-        Box::pin(async move { self.process_record_with_links_inner(name, visited, depth).await })
+        Box::pin(async move {
+            self.process_record_with_links_inner(name, visited, depth)
+                .await
+        })
     }
 
     async fn process_record_with_links_inner(
@@ -76,7 +79,11 @@ impl PvDatabase {
         {
             let (sdis_link, disv, diss) = {
                 let instance = rec.read().await;
-                (instance.parsed_sdis.clone(), instance.common.disv, instance.common.diss)
+                (
+                    instance.parsed_sdis.clone(),
+                    instance.common.disv,
+                    instance.common.diss,
+                )
             };
 
             if let crate::server::record::ParsedLink::Db(ref link) = sdis_link {
@@ -101,8 +108,14 @@ impl PvDatabase {
                 instance.common.stat = crate::server::recgbl::alarm_status::DISABLE_ALARM;
                 if instance.common.sevr != prev_sevr || instance.common.stat != prev_stat {
                     let mut changed_fields = Vec::new();
-                    changed_fields.push(("SEVR".to_string(), EpicsValue::Short(instance.common.sevr as i16)));
-                    changed_fields.push(("STAT".to_string(), EpicsValue::Short(instance.common.stat as i16)));
+                    changed_fields.push((
+                        "SEVR".to_string(),
+                        EpicsValue::Short(instance.common.sevr as i16),
+                    ));
+                    changed_fields.push((
+                        "STAT".to_string(),
+                        EpicsValue::Short(instance.common.stat as i16),
+                    ));
                     if let Some(val) = instance.record.val() {
                         changed_fields.push(("VAL".to_string(), val));
                     }
@@ -153,19 +166,45 @@ impl PvDatabase {
             // DOL link info for output records with OMSL=CLOSED_LOOP
             let dol = match rtype {
                 "ao" | "longout" | "bo" | "mbbo" | "stringout" => {
-                    let omsl = instance.record.get_field("OMSL")
-                        .and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None })
+                    let omsl = instance
+                        .record
+                        .get_field("OMSL")
+                        .and_then(|v| {
+                            if let EpicsValue::Short(s) = v {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
-                    let oif = instance.record.get_field("OIF")
-                        .and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None })
+                    let oif = instance
+                        .record
+                        .get_field("OIF")
+                        .and_then(|v| {
+                            if let EpicsValue::Short(s) = v {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
                     if omsl == 1 {
-                        let dol_parsed = instance.record.get_field("DOL")
-                            .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                        let dol_parsed = instance
+                            .record
+                            .get_field("DOL")
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
                             .map(|s| crate::server::record::parse_link_v2(&s))
                             .unwrap_or(crate::server::record::ParsedLink::None);
                         Some((dol_parsed, oif))
-                    } else { None }
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };
@@ -187,12 +226,25 @@ impl PvDatabase {
         let multi_input_values: Vec<(String, EpicsValue)> = {
             let link_info: Vec<(String, String)> = {
                 let instance = rec.read().await;
-                instance.record.multi_input_links().iter().map(|(lf, vf)| {
-                    let link_str = instance.record.get_field(lf)
-                        .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
-                        .unwrap_or_default();
-                    (link_str, vf.to_string())
-                }).collect()
+                instance
+                    .record
+                    .multi_input_links()
+                    .iter()
+                    .map(|(lf, vf)| {
+                        let link_str = instance
+                            .record
+                            .get_field(lf)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        (link_str, vf.to_string())
+                    })
+                    .collect()
             }; // read lock dropped
             let mut results = Vec::new();
             for (link_str, val_field) in &link_info {
@@ -210,8 +262,16 @@ impl PvDatabase {
         let sel_nvl_value: Option<EpicsValue> = {
             let instance = rec.read().await;
             if instance.record.record_type() == "sel" {
-                let nvl_str = instance.record.get_field("NVL")
-                    .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                let nvl_str = instance
+                    .record
+                    .get_field("NVL")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_default();
                 if !nvl_str.is_empty() {
                     drop(instance); // release read lock before async read
@@ -226,7 +286,7 @@ impl PvDatabase {
         };
 
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
-        let (snapshot, out_info, flnk_name, process_actions) = {
+        let (snapshot, out_info, flnk_name, process_actions, put_notify_tx) = {
             let mut instance = rec.write().await;
 
             // Apply DOL value for output records (OMSL=CLOSED_LOOP)
@@ -261,13 +321,14 @@ impl PvDatabase {
             // Apply sel NVL -> SELN
             if let Some(nvl_val) = sel_nvl_value {
                 if let Some(f) = nvl_val.to_f64() {
-                    let _ = instance.record.put_field("SELN", EpicsValue::Short(f as i16));
+                    let _ = instance
+                        .record
+                        .put_field("SELN", EpicsValue::Short(f as i16));
                 }
             }
 
             // Device support read (input records only, not output records)
-            let is_soft = instance.common.dtyp.is_empty()
-                || instance.common.dtyp == "Soft Channel";
+            let is_soft = instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
             let is_output = instance.record.can_device_write();
             let mut device_actions: Vec<crate::server::record::ProcessAction> = Vec::new();
             let mut device_did_compute = false;
@@ -280,8 +341,12 @@ impl PvDatabase {
                         }
                         Err(e) => {
                             eprintln!("device read error on {}: {e}", instance.name);
-                            use crate::server::recgbl::{rec_gbl_set_sevr, alarm_status};
-                            rec_gbl_set_sevr(&mut instance.common, alarm_status::READ_ALARM, crate::server::record::AlarmSeverity::Invalid);
+                            use crate::server::recgbl::{alarm_status, rec_gbl_set_sevr};
+                            rec_gbl_set_sevr(
+                                &mut instance.common,
+                                alarm_status::READ_ALARM,
+                                crate::server::record::AlarmSeverity::Invalid,
+                            );
                         }
                     }
                     instance.device = Some(dev);
@@ -295,7 +360,10 @@ impl PvDatabase {
             // Also collect ReadDbLink from device actions
             let mut deferred_device_actions = Vec::new();
             for action in device_actions {
-                if matches!(action, crate::server::record::ProcessAction::ReadDbLink { .. }) {
+                if matches!(
+                    action,
+                    crate::server::record::ProcessAction::ReadDbLink { .. }
+                ) {
                     pre_actions.push(action);
                 } else {
                     deferred_device_actions.push(action);
@@ -304,7 +372,8 @@ impl PvDatabase {
             if !pre_actions.is_empty() {
                 let rec_name = instance.name.clone();
                 drop(instance);
-                self.execute_read_db_links(&rec_name, &rec, &pre_actions).await;
+                self.execute_read_db_links(&rec_name, &rec, &pre_actions)
+                    .await;
                 instance = rec.write().await;
             }
 
@@ -328,7 +397,9 @@ impl PvDatabase {
                     "[TPRO] {}: process (SCAN={:?}, PACT={})",
                     instance.name,
                     instance.common.scan,
-                    instance.processing.load(std::sync::atomic::Ordering::Relaxed)
+                    instance
+                        .processing
+                        .load(std::sync::atomic::Ordering::Relaxed)
                 );
             }
 
@@ -344,10 +415,13 @@ impl PvDatabase {
                 // But still execute any actions (e.g., ReprocessAfter for delayed re-entry).
                 let rec_name = instance.name.clone();
                 drop(instance);
-                self.execute_process_actions(&rec_name, &rec, process_actions, visited, depth).await;
+                self.execute_process_actions(&rec_name, &rec, process_actions, visited, depth)
+                    .await;
                 return Ok(());
             }
-            if let crate::server::record::RecordProcessResult::AsyncPendingNotify(fields) = process_result {
+            if let crate::server::record::RecordProcessResult::AsyncPendingNotify(fields) =
+                process_result
+            {
                 // Intermediate notification (e.g. DMOV=0 at move start).
                 // Execute device write first so the move command reaches the driver,
                 // then flush DMOV=0 etc. to monitors.
@@ -368,7 +442,11 @@ impl PvDatabase {
                     if changed {
                         if name == "VAL" {
                             if let Some(f) = val.to_f64() {
-                                if instance.record.put_field("MLST", EpicsValue::Double(f)).is_err() {
+                                if instance
+                                    .record
+                                    .put_field("MLST", EpicsValue::Double(f))
+                                    .is_err()
+                                {
                                     instance.common.mlst = Some(f);
                                 }
                             }
@@ -380,7 +458,8 @@ impl PvDatabase {
                 let event_mask = if changed_fields.is_empty() {
                     crate::server::recgbl::EventMask::NONE
                 } else {
-                    crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::ALARM
+                    crate::server::recgbl::EventMask::VALUE
+                        | crate::server::recgbl::EventMask::ALARM
                 };
                 let snapshot = crate::server::record::ProcessSnapshot {
                     changed_fields,
@@ -407,7 +486,11 @@ impl PvDatabase {
                 };
                 if let Some((stat, sevr)) = dev_alarm {
                     use crate::server::recgbl::rec_gbl_set_sevr;
-                    rec_gbl_set_sevr(&mut instance.common, stat, crate::server::record::AlarmSeverity::from_u16(sevr));
+                    rec_gbl_set_sevr(
+                        &mut instance.common,
+                        stat,
+                        crate::server::record::AlarmSeverity::from_u16(sevr),
+                    );
                 }
                 if let Some(ts) = dev_ts {
                     instance.common.time = ts;
@@ -424,9 +507,18 @@ impl PvDatabase {
             }
 
             // IVOA check for output records with INVALID alarm
-            let skip_out = if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid {
-                let ivoa = instance.record.get_field("IVOA")
-                    .and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None })
+            let skip_out = if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid
+            {
+                let ivoa = instance
+                    .record
+                    .get_field("IVOA")
+                    .and_then(|v| {
+                        if let EpicsValue::Short(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(0);
                 match ivoa {
                     1 => true, // Don't drive outputs
@@ -447,8 +539,8 @@ impl PvDatabase {
             // Must run BEFORE check_deadband_ext so MLST is not prematurely
             // updated for async writes that return early.
             let can_dev_write = instance.record.can_device_write();
-            let is_soft_out = instance.common.dtyp.is_empty()
-                || instance.common.dtyp == "Soft Channel";
+            let is_soft_out =
+                instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
             let record_should_output = instance.record.should_output();
             let out_info = if skip_out {
                 None
@@ -457,7 +549,9 @@ impl PvDatabase {
                 // Write OVAL to OUT when the record says should_output().
                 if record_should_output {
                     if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out {
-                        let out_val = instance.record.get_field("OVAL")
+                        let out_val = instance
+                            .record
+                            .get_field("OVAL")
                             .or_else(|| instance.record.val());
                         out_val.map(|v| (link.clone(), v))
                     } else {
@@ -468,7 +562,9 @@ impl PvDatabase {
                 }
             } else if is_soft_out {
                 if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out {
-                    let out_val = instance.record.get_field("OVAL")
+                    let out_val = instance
+                        .record
+                        .get_field("OVAL")
                         .or_else(|| instance.record.val());
                     out_val.map(|v| (link.clone(), v))
                 } else {
@@ -482,15 +578,17 @@ impl PvDatabase {
                             // Async write submitted -- set PACT, return early.
                             // complete_async_record will handle deadband, snapshot,
                             // notification, and FLNK when the write completes.
-                            instance.processing.store(true, std::sync::atomic::Ordering::Release);
+                            instance
+                                .processing
+                                .store(true, std::sync::atomic::Ordering::Release);
                             instance.device = Some(dev);
                             let rec_name = instance.name.clone();
                             let timeout = std::time::Duration::from_secs(5);
                             let db = self.clone();
                             tokio::spawn(async move {
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    completion.wait(timeout)
-                                }).await;
+                                let _ =
+                                    tokio::task::spawn_blocking(move || completion.wait(timeout))
+                                        .await;
                                 let _ = db.complete_async_record(&rec_name).await;
                             });
                             return Ok(());
@@ -499,8 +597,10 @@ impl PvDatabase {
                             // No async support -- fall back to synchronous write
                             if let Err(e) = dev.write(&mut *instance.record) {
                                 eprintln!("device write error on {}: {e}", instance.name);
-                                instance.common.stat = crate::server::recgbl::alarm_status::WRITE_ALARM;
-                                instance.common.sevr = crate::server::record::AlarmSeverity::Invalid;
+                                instance.common.stat =
+                                    crate::server::recgbl::alarm_status::WRITE_ALARM;
+                                instance.common.sevr =
+                                    crate::server::record::AlarmSeverity::Invalid;
                             }
                         }
                         Err(e) => {
@@ -540,7 +640,12 @@ impl PvDatabase {
             // Add subscribed fields that actually changed since last notification.
             let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
             for (field, subs) in &instance.subscribers {
-                if !subs.is_empty() && field != "VAL" && field != "SEVR" && field != "STAT" && field != "UDF" {
+                if !subs.is_empty()
+                    && field != "VAL"
+                    && field != "SEVR"
+                    && field != "STAT"
+                    && field != "UDF"
+                {
                     if let Some(val) = instance.resolve_field(field) {
                         let changed = match instance.last_posted.get(field) {
                             Some(prev) => prev != &val,
@@ -560,13 +665,25 @@ impl PvDatabase {
                 event_mask |= crate::server::recgbl::EventMask::VALUE;
             }
             if alarm_result.alarm_changed {
-                changed_fields.push(("SEVR".to_string(), EpicsValue::Short(instance.common.sevr as i16)));
-                changed_fields.push(("STAT".to_string(), EpicsValue::Short(instance.common.stat as i16)));
+                changed_fields.push((
+                    "SEVR".to_string(),
+                    EpicsValue::Short(instance.common.sevr as i16),
+                ));
+                changed_fields.push((
+                    "STAT".to_string(),
+                    EpicsValue::Short(instance.common.stat as i16),
+                ));
             }
             if !event_mask.is_empty() {
-                changed_fields.push(("UDF".to_string(), EpicsValue::Char(if instance.common.udf { 1 } else { 0 })));
+                changed_fields.push((
+                    "UDF".to_string(),
+                    EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
+                ));
             }
-            let snapshot = crate::server::record::ProcessSnapshot { changed_fields, event_mask };
+            let snapshot = crate::server::record::ProcessSnapshot {
+                changed_fields,
+                event_mask,
+            };
 
             let flnk_name = if instance.record.should_fire_forward_link() {
                 if let crate::server::record::ParsedLink::Db(ref l) = instance.parsed_flnk {
@@ -578,15 +695,19 @@ impl PvDatabase {
                 None
             };
 
-            // Fire deferred put_notify completion when the record reports
-            // that async work is done (e.g. motor: DMOV=1).
-            if instance.put_notify_tx.is_some() && instance.record.is_put_complete() {
-                if let Some(tx) = instance.put_notify_tx.take() {
-                    let _ = tx.send(());
-                }
-            }
+            let put_notify_tx = if instance.record.is_put_complete() {
+                instance.put_notify_tx.take()
+            } else {
+                None
+            };
 
-            (snapshot, out_info, flnk_name, process_actions)
+            (
+                snapshot,
+                out_info,
+                flnk_name,
+                process_actions,
+                put_notify_tx,
+            )
         };
 
         // 3. Notify subscribers (outside lock)
@@ -597,7 +718,8 @@ impl PvDatabase {
 
         // 4. OUT link
         if let Some((link, out_val)) = out_info {
-            self.write_db_link_value(&link, out_val, visited, depth).await;
+            self.write_db_link_value(&link, out_val, visited, depth)
+                .await;
         }
 
         // 4.5. Multi-output dispatch (fanout/dfanout/seq)
@@ -613,10 +735,20 @@ impl PvDatabase {
                 } else {
                     let mut pairs = Vec::new();
                     for &(link_field, val_field) in links {
-                        let link_str = instance.record.get_field(link_field)
-                            .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                        let link_str = instance
+                            .record
+                            .get_field(link_field)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
                             .unwrap_or_default();
-                        if link_str.is_empty() { continue; }
+                        if link_str.is_empty() {
+                            continue;
+                        }
                         if let Some(val) = instance.record.get_field(val_field) {
                             pairs.push((link_str, val));
                         }
@@ -636,7 +768,9 @@ impl PvDatabase {
 
         // 5. FLNK
         if let Some(flnk) = flnk_name {
-            let _ = self.process_record_with_links(&flnk, visited, depth + 1).await;
+            let _ = self
+                .process_record_with_links(&flnk, visited, depth + 1)
+                .await;
         }
 
         // 6. CP link targets -- process records that have CP input links from this record
@@ -644,9 +778,18 @@ impl PvDatabase {
             let cp_targets = self.get_cp_targets(name).await;
             for target in cp_targets {
                 if !visited.contains(&target) {
-                    let _ = self.process_record_with_links(&target, visited, depth + 1).await;
+                    let _ = self
+                        .process_record_with_links(&target, visited, depth + 1)
+                        .await;
                 }
             }
+        }
+
+        if let Some(tx) = put_notify_tx {
+            // Let any immediately-triggered I/O Intr tasks run before
+            // completing WRITE_NOTIFY, so dependent reads observe fresh state.
+            tokio::task::yield_now().await;
+            let _ = tx.send(());
         }
 
         // 7. RPRO: if reprocess requested, clear flag and reprocess
@@ -662,13 +805,16 @@ impl PvDatabase {
             };
             if needs_rpro {
                 visited.remove(name);
-                let _ = self.process_record_with_links(name, visited, depth + 1).await;
+                let _ = self
+                    .process_record_with_links(name, visited, depth + 1)
+                    .await;
             }
         }
 
         // 8. Execute ProcessActions from the record's process() outcome.
         // This handles WriteDbLink, ReadDbLink, and ReprocessAfter actions.
-        self.execute_process_actions(name, &rec, process_actions, visited, depth).await;
+        self.execute_process_actions(name, &rec, process_actions, visited, depth)
+            .await;
 
         Ok(())
     }
@@ -683,14 +829,28 @@ impl PvDatabase {
     ) {
         use crate::server::record::ProcessAction;
         for action in actions {
-            if let ProcessAction::ReadDbLink { link_field, target_field } = action {
+            if let ProcessAction::ReadDbLink {
+                link_field,
+                target_field,
+            } = action
+            {
                 let link_str = {
                     let instance = rec.read().await;
-                    instance.record.get_field(link_field)
-                        .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                    instance
+                        .record
+                        .get_field(link_field)
+                        .and_then(|v| {
+                            if let EpicsValue::String(s) = v {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default()
                 };
-                if link_str.is_empty() { continue; }
+                if link_str.is_empty() {
+                    continue;
+                }
                 let parsed = crate::server::record::parse_link_v2(&link_str);
                 if let Some(value) = self.read_link_value(&parsed).await {
                     let mut instance = rec.write().await;
@@ -719,15 +879,28 @@ impl PvDatabase {
 
         for action in actions {
             match action {
-                ProcessAction::ReadDbLink { link_field, target_field } => {
+                ProcessAction::ReadDbLink {
+                    link_field,
+                    target_field,
+                } => {
                     // 1. Get the link string from the record
                     let link_str = {
                         let instance = rec.read().await;
-                        instance.record.get_field(link_field)
-                            .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                        instance
+                            .record
+                            .get_field(link_field)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
                             .unwrap_or_default()
                     };
-                    if link_str.is_empty() { continue; }
+                    if link_str.is_empty() {
+                        continue;
+                    }
                     // 2. Parse and read the linked PV
                     let parsed = crate::server::record::parse_link_v2(&link_str);
                     if let Some(value) = self.read_link_value(&parsed).await {
@@ -740,15 +913,26 @@ impl PvDatabase {
                     // 1. Get the link string from the record
                     let link_str = {
                         let instance = rec.read().await;
-                        instance.record.get_field(link_field)
-                            .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                        instance
+                            .record
+                            .get_field(link_field)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
                             .unwrap_or_default()
                     };
-                    if link_str.is_empty() { continue; }
+                    if link_str.is_empty() {
+                        continue;
+                    }
                     // 2. Parse and write to the linked PV
                     let parsed = crate::server::record::parse_link_v2(&link_str);
                     if let crate::server::record::ParsedLink::Db(ref db_link) = parsed {
-                        self.write_db_link_value(db_link, value, visited, depth).await;
+                        self.write_db_link_value(db_link, value, visited, depth)
+                            .await;
                     }
                 }
                 ProcessAction::DeviceCommand { command, ref args } => {
@@ -765,7 +949,10 @@ impl PvDatabase {
                     // timer replaced this one).
                     let (gen_counter, gen_val) = {
                         let instance = rec.read().await;
-                        let val = instance.reprocess_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let val = instance
+                            .reprocess_generation
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
                         (instance.reprocess_generation.clone(), val)
                     };
                     let db = self.clone();
@@ -776,7 +963,9 @@ impl PvDatabase {
                         let current = gen_counter.load(std::sync::atomic::Ordering::Relaxed);
                         if current == gen_val {
                             let mut visited = HashSet::new();
-                            let _ = db.process_record_with_links(&rec_name, &mut visited, 0).await;
+                            let _ = db
+                                .process_record_with_links(&rec_name, &mut visited, 0)
+                                .await;
                         }
                     });
                 }
@@ -792,7 +981,8 @@ impl PvDatabase {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
             let mut visited = HashSet::new();
-            self.complete_async_record_inner(name, &mut visited, 0).await
+            self.complete_async_record_inner(name, &mut visited, 0)
+                .await
         })
     }
 
@@ -804,18 +994,19 @@ impl PvDatabase {
     ) -> CaResult<()> {
         let rec = {
             let records = self.inner.records.read().await;
-            records.get(name).cloned()
+            records
+                .get(name)
+                .cloned()
                 .ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?
         };
 
-        let (snapshot, out_info, flnk_name) = {
+        let (snapshot, out_info, flnk_name, put_notify_tx) = {
             let mut instance = rec.write().await;
 
             // Evaluate alarms
             instance.evaluate_alarms();
 
-            let is_soft = instance.common.dtyp.is_empty()
-                || instance.common.dtyp == "Soft Channel";
+            let is_soft = instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
 
             // Device support alarm/timestamp override
             if !is_soft {
@@ -826,7 +1017,8 @@ impl PvDatabase {
                 };
                 if let Some((stat, sevr)) = dev_alarm {
                     crate::server::recgbl::rec_gbl_set_sevr(
-                        &mut instance.common, stat,
+                        &mut instance.common,
+                        stat,
                         crate::server::record::AlarmSeverity::from_u16(sevr),
                     );
                 }
@@ -843,19 +1035,24 @@ impl PvDatabase {
             }
 
             // Clear PACT
-            instance.processing.store(false, std::sync::atomic::Ordering::Release);
+            instance
+                .processing
+                .store(false, std::sync::atomic::Ordering::Release);
 
-            // Fire put_notify completion (CA WRITE_NOTIFY response)
-            if let Some(tx) = instance.put_notify_tx.take() {
-                let _ = tx.send(());
-            }
+            let put_notify_tx = instance.put_notify_tx.take();
 
             use crate::server::recgbl::EventMask;
             let mut event_mask = EventMask::NONE;
             let (include_val, include_archive) = instance.check_deadband_ext();
-            if include_val { event_mask |= EventMask::VALUE; }
-            if include_archive { event_mask |= EventMask::LOG; }
-            if alarm_result.alarm_changed { event_mask |= EventMask::ALARM; }
+            if include_val {
+                event_mask |= EventMask::VALUE;
+            }
+            if include_archive {
+                event_mask |= EventMask::LOG;
+            }
+            if alarm_result.alarm_changed {
+                event_mask |= EventMask::ALARM;
+            }
 
             let mut changed_fields = Vec::new();
             if include_val {
@@ -863,22 +1060,48 @@ impl PvDatabase {
                     changed_fields.push(("VAL".to_string(), val));
                 }
             }
-            changed_fields.push(("SEVR".to_string(), EpicsValue::Short(instance.common.sevr as i16)));
-            changed_fields.push(("STAT".to_string(), EpicsValue::Short(instance.common.stat as i16)));
-            changed_fields.push(("UDF".to_string(), EpicsValue::Char(if instance.common.udf { 1 } else { 0 })));
+            changed_fields.push((
+                "SEVR".to_string(),
+                EpicsValue::Short(instance.common.sevr as i16),
+            ));
+            changed_fields.push((
+                "STAT".to_string(),
+                EpicsValue::Short(instance.common.stat as i16),
+            ));
+            changed_fields.push((
+                "UDF".to_string(),
+                EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
+            ));
             for (field, subs) in &instance.subscribers {
-                if !subs.is_empty() && field != "VAL" && field != "SEVR" && field != "STAT" && field != "UDF" {
+                if !subs.is_empty()
+                    && field != "VAL"
+                    && field != "SEVR"
+                    && field != "STAT"
+                    && field != "UDF"
+                {
                     if let Some(val) = instance.resolve_field(field) {
                         changed_fields.push((field.clone(), val));
                     }
                 }
             }
-            let snapshot = crate::server::record::ProcessSnapshot { changed_fields, event_mask };
+            let snapshot = crate::server::record::ProcessSnapshot {
+                changed_fields,
+                event_mask,
+            };
 
             // IVOA check
-            let skip_out = if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid {
-                let ivoa = instance.record.get_field("IVOA")
-                    .and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None })
+            let skip_out = if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid
+            {
+                let ivoa = instance
+                    .record
+                    .get_field("IVOA")
+                    .and_then(|v| {
+                        if let EpicsValue::Short(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(0);
                 match ivoa {
                     1 => true,
@@ -895,8 +1118,8 @@ impl PvDatabase {
             };
 
             let can_dev_write = instance.record.can_device_write();
-            let is_soft_out = instance.common.dtyp.is_empty()
-                || instance.common.dtyp == "Soft Channel";
+            let is_soft_out =
+                instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
             let record_should_output = instance.record.should_output();
             let out_info = if skip_out {
                 None
@@ -904,7 +1127,9 @@ impl PvDatabase {
                 // Non-output records (calcout, etc.) with soft OUT link
                 if record_should_output {
                     if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out {
-                        let out_val = instance.record.get_field("OVAL")
+                        let out_val = instance
+                            .record
+                            .get_field("OVAL")
                             .or_else(|| instance.record.val());
                         out_val.map(|v| (link.clone(), v))
                     } else {
@@ -915,7 +1140,9 @@ impl PvDatabase {
                 }
             } else if is_soft_out {
                 if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out {
-                    let out_val = instance.record.get_field("OVAL")
+                    let out_val = instance
+                        .record
+                        .get_field("OVAL")
                         .or_else(|| instance.record.val());
                     out_val.map(|v| (link.clone(), v))
                 } else {
@@ -938,7 +1165,7 @@ impl PvDatabase {
                 None
             };
 
-            (snapshot, out_info, flnk_name)
+            (snapshot, out_info, flnk_name, put_notify_tx)
         };
 
         // Notify subscribers
@@ -949,7 +1176,8 @@ impl PvDatabase {
 
         // OUT link
         if let Some((link, out_val)) = out_info {
-            self.write_db_link_value(&link, out_val, visited, depth).await;
+            self.write_db_link_value(&link, out_val, visited, depth)
+                .await;
         }
 
         // Multi-output dispatch (fanout/dfanout/seq/sseq)
@@ -965,10 +1193,20 @@ impl PvDatabase {
                 } else {
                     let mut pairs = Vec::new();
                     for &(link_field, val_field) in links {
-                        let link_str = instance.record.get_field(link_field)
-                            .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                        let link_str = instance
+                            .record
+                            .get_field(link_field)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
                             .unwrap_or_default();
-                        if link_str.is_empty() { continue; }
+                        if link_str.is_empty() {
+                            continue;
+                        }
                         if let Some(val) = instance.record.get_field(val_field) {
                             pairs.push((link_str, val));
                         }
@@ -988,7 +1226,9 @@ impl PvDatabase {
 
         // FLNK
         if let Some(flnk) = flnk_name {
-            let _ = self.process_record_with_links(&flnk, visited, depth + 1).await;
+            let _ = self
+                .process_record_with_links(&flnk, visited, depth + 1)
+                .await;
         }
 
         // CP link targets
@@ -996,9 +1236,18 @@ impl PvDatabase {
             let cp_targets = self.get_cp_targets(name).await;
             for target in cp_targets {
                 if !visited.contains(&target) {
-                    let _ = self.process_record_with_links(&target, visited, depth + 1).await;
+                    let _ = self
+                        .process_record_with_links(&target, visited, depth + 1)
+                        .await;
                 }
             }
+        }
+
+        if let Some(tx) = put_notify_tx {
+            // Let any immediately-triggered I/O Intr tasks run before
+            // completing WRITE_NOTIFY, so dependent reads observe fresh state.
+            tokio::task::yield_now().await;
+            let _ = tx.send(());
         }
 
         Ok(())
@@ -1016,14 +1265,38 @@ impl PvDatabase {
             let rtype = instance.record.record_type().to_string();
             let is_input = matches!(rtype.as_str(), "ai" | "bi" | "longin" | "stringin");
 
-            let siml = instance.record.get_field("SIML")
-                .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+            let siml = instance
+                .record
+                .get_field("SIML")
+                .and_then(|v| {
+                    if let EpicsValue::String(s) = v {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_default();
-            let siol = instance.record.get_field("SIOL")
-                .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+            let siol = instance
+                .record
+                .get_field("SIOL")
+                .and_then(|v| {
+                    if let EpicsValue::String(s) = v {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_default();
-            let sims = instance.record.get_field("SIMS")
-                .and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None })
+            let sims = instance
+                .record
+                .get_field("SIMS")
+                .and_then(|v| {
+                    if let EpicsValue::Short(s) = v {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(0);
 
             if siml.is_empty() && siol.is_empty() {
@@ -1046,15 +1319,25 @@ impl PvDatabase {
             if let Ok(val) = self.get_pv(&pv_name).await {
                 let simm_val = val.to_f64().unwrap_or(0.0) as i16;
                 let mut instance = rec.write().await;
-                let _ = instance.record.put_field("SIMM", EpicsValue::Short(simm_val));
+                let _ = instance
+                    .record
+                    .put_field("SIMM", EpicsValue::Short(simm_val));
             }
         }
 
         // Check SIMM
         let simm = {
             let instance = rec.read().await;
-            instance.record.get_field("SIMM")
-                .and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None })
+            instance
+                .record
+                .get_field("SIMM")
+                .and_then(|v| {
+                    if let EpicsValue::Short(s) = v {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(0)
         };
 
@@ -1090,11 +1373,18 @@ impl PvDatabase {
                     if let Some(val) = instance.record.val() {
                         changed_fields.push(("VAL".to_string(), val));
                     }
-                    changed_fields.push(("SEVR".to_string(), EpicsValue::Short(instance.common.sevr as i16)));
-                    changed_fields.push(("STAT".to_string(), EpicsValue::Short(instance.common.stat as i16)));
+                    changed_fields.push((
+                        "SEVR".to_string(),
+                        EpicsValue::Short(instance.common.sevr as i16),
+                    ));
+                    changed_fields.push((
+                        "STAT".to_string(),
+                        EpicsValue::Short(instance.common.stat as i16),
+                    ));
                     let snapshot = crate::server::record::ProcessSnapshot {
                         changed_fields,
-                        event_mask: crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::ALARM,
+                        event_mask: crate::server::recgbl::EventMask::VALUE
+                            | crate::server::recgbl::EventMask::ALARM,
                     };
                     instance.notify_from_snapshot(&snapshot);
                 }
@@ -1123,11 +1413,18 @@ impl PvDatabase {
                 if let Some(val) = instance.record.val() {
                     changed_fields.push(("VAL".to_string(), val));
                 }
-                changed_fields.push(("SEVR".to_string(), EpicsValue::Short(instance.common.sevr as i16)));
-                changed_fields.push(("STAT".to_string(), EpicsValue::Short(instance.common.stat as i16)));
+                changed_fields.push((
+                    "SEVR".to_string(),
+                    EpicsValue::Short(instance.common.sevr as i16),
+                ));
+                changed_fields.push((
+                    "STAT".to_string(),
+                    EpicsValue::Short(instance.common.stat as i16),
+                ));
                 let snapshot = crate::server::record::ProcessSnapshot {
                     changed_fields,
-                    event_mask: crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::ALARM,
+                    event_mask: crate::server::recgbl::EventMask::VALUE
+                        | crate::server::recgbl::EventMask::ALARM,
                 };
                 instance.notify_from_snapshot(&snapshot);
             }

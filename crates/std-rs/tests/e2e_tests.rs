@@ -37,7 +37,9 @@ record(throttle, "THR") {
 
     // Write to throttle and process
     server.put("THR", EpicsValue::Double(42.0)).await.unwrap();
-    db.put_record_field_from_ca("THR", "PROC", EpicsValue::Short(1)).await.unwrap();
+    db.put_record_field_from_ca("THR", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // SENT should be 42.0
@@ -46,8 +48,11 @@ record(throttle, "THR") {
 
     // TARGET should have received the value via OUT link WriteDbLink
     let target_val = server.get("TARGET").await.unwrap();
-    assert_eq!(target_val, EpicsValue::Double(42.0),
-        "OUT link should write SENT to TARGET PV");
+    assert_eq!(
+        target_val,
+        EpicsValue::Double(42.0),
+        "OUT link should write SENT to TARGET PV"
+    );
 }
 
 #[tokio::test]
@@ -74,26 +79,41 @@ record(throttle, "THR2") {
 
     // First value — sent immediately
     server.put("THR2", EpicsValue::Double(10.0)).await.unwrap();
-    db.put_record_field_from_ca("THR2", "PROC", EpicsValue::Short(1)).await.unwrap();
+    db.put_record_field_from_ca("THR2", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let target = server.get("TARGET2").await.unwrap();
-    assert_eq!(target, EpicsValue::Double(10.0), "First value sent immediately");
+    assert_eq!(
+        target,
+        EpicsValue::Double(10.0),
+        "First value sent immediately"
+    );
 
     // Second value during delay — queued
     server.put("THR2", EpicsValue::Double(20.0)).await.unwrap();
-    db.put_record_field_from_ca("THR2", "PROC", EpicsValue::Short(1)).await.unwrap();
+    db.put_record_field_from_ca("THR2", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let target = server.get("TARGET2").await.unwrap();
-    assert_eq!(target, EpicsValue::Double(10.0), "Second value should NOT arrive during delay");
+    assert_eq!(
+        target,
+        EpicsValue::Double(10.0),
+        "Second value should NOT arrive during delay"
+    );
 
     // Wait for delay + reprocess
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let target = server.get("TARGET2").await.unwrap();
-    assert_eq!(target, EpicsValue::Double(20.0),
-        "After delay, pending value should arrive at TARGET via OUT link");
+    assert_eq!(
+        target,
+        EpicsValue::Double(20.0),
+        "After delay, pending value should arrive at TARGET via OUT link"
+    );
 }
 
 // ============================================================
@@ -125,13 +145,18 @@ record(scaler, "SC") {
 
     // Start counting
     server.put("SC.CNT", EpicsValue::Short(1)).await.unwrap();
-    db.put_record_field_from_ca("SC", "PROC", EpicsValue::Short(1)).await.unwrap();
+    db.put_record_field_from_ca("SC", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // COUT_TARGET should have received CNT value (1 = counting)
     let cout_val = server.get("COUT_TARGET").await.unwrap();
-    assert_eq!(cout_val, EpicsValue::Double(1.0),
-        "COUT should fire CNT=1 to target on count start");
+    assert_eq!(
+        cout_val,
+        EpicsValue::Double(1.0),
+        "COUT should fire CNT=1 to target on count start"
+    );
 }
 
 // ============================================================
@@ -207,16 +232,23 @@ async fn test_epid_fast_output_clamping() {
     let (tx, rx) = tokio::sync::mpsc::channel(10);
     let outputs: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let out_clone = outputs.clone();
-    dev.start_callback_loop(rx, Arc::new(Mutex::new(move |v| {
-        out_clone.lock().unwrap().push(v);
-    })));
+    dev.start_callback_loop(
+        rx,
+        Arc::new(Mutex::new(move |v| {
+            out_clone.lock().unwrap().push(v);
+        })),
+    );
 
     tx.send(0.0).await.unwrap(); // Error = 100, P = 10000 → clamped to 50
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let outs = outputs.lock().unwrap();
     assert!(!outs.is_empty());
-    assert!(outs[0] <= 50.0, "Output should be clamped to DRVH=50, got {}", outs[0]);
+    assert!(
+        outs[0] <= 50.0,
+        "Output should be clamped to DRVH=50, got {}",
+        outs[0]
+    );
 }
 
 // ============================================================
@@ -307,10 +339,15 @@ record(epid, "TEST:PID") {
     let db = server.database().clone();
 
     // Set a value
-    server.put("TEST:PID.VAL", EpicsValue::Double(50.0)).await.unwrap();
+    server
+        .put("TEST:PID.VAL", EpicsValue::Double(50.0))
+        .await
+        .unwrap();
 
     // Save using AutosaveBuilder
-    use epics_base_rs::server::autosave::{AutosaveBuilder, SaveSetConfig, SaveStrategy, BackupConfig};
+    use epics_base_rs::server::autosave::{
+        AutosaveBuilder, BackupConfig, SaveSetConfig, SaveStrategy,
+    };
 
     let mgr = AutosaveBuilder::new()
         .add_set(SaveSetConfig {
@@ -338,10 +375,16 @@ record(epid, "TEST:PID") {
     assert!(saved > 0, "Should save at least one PV");
 
     // Verify save file exists
-    assert!(dir.path().join("epid.sav").exists(), "Save file should exist");
+    assert!(
+        dir.path().join("epid.sav").exists(),
+        "Save file should exist"
+    );
 
     // Change the value
-    server.put("TEST:PID.VAL", EpicsValue::Double(0.0)).await.unwrap();
+    server
+        .put("TEST:PID.VAL", EpicsValue::Double(0.0))
+        .await
+        .unwrap();
 
     // Restore
     let results = mgr.restore_all(&db).await;
@@ -352,8 +395,10 @@ record(epid, "TEST:PID") {
     // Value should be restored to 50.0
     let val = server.get("TEST:PID.VAL").await.unwrap();
     match val {
-        EpicsValue::Double(v) => assert!((v - 50.0).abs() < 1e-6,
-            "VAL should be restored to 50.0, got {v}"),
+        EpicsValue::Double(v) => assert!(
+            (v - 50.0).abs() < 1e-6,
+            "VAL should be restored to 50.0, got {v}"
+        ),
         other => panic!("expected Double, got {:?}", other),
     }
 }

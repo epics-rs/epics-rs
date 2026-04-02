@@ -1,4 +1,4 @@
-use epics_base_rs::calc::{calc, compile, eval, NumericInputs};
+use epics_base_rs::calc::{NumericInputs, calc, compile, eval};
 
 fn make_inputs(vals: &[(u8, f64)]) -> NumericInputs {
     let mut inputs = NumericInputs::new();
@@ -23,7 +23,12 @@ fn assert_calc(expr: &str, inputs: &[(u8, f64)], expected: f64) {
 fn assert_calc_nan(expr: &str, inputs: &[(u8, f64)]) {
     let mut inp = make_inputs(inputs);
     let result = calc(expr, &mut inp).unwrap();
-    assert!(result.is_nan(), "Expression '{}': expected NaN, got {}", expr, result);
+    assert!(
+        result.is_nan(),
+        "Expression '{}': expected NaN, got {}",
+        expr,
+        result
+    );
 }
 
 // ===== Basic Arithmetic =====
@@ -398,7 +403,11 @@ fn test_case_insensitive() {
 #[test]
 fn test_complex_1() {
     // (A + B) * (C - D) / E
-    assert_calc("(A+B)*(C-D)/E", &[(0, 2.0), (1, 3.0), (2, 10.0), (3, 4.0), (4, 2.0)], 15.0);
+    assert_calc(
+        "(A+B)*(C-D)/E",
+        &[(0, 2.0), (1, 3.0), (2, 10.0), (3, 4.0), (4, 2.0)],
+        15.0,
+    );
 }
 
 #[test]

@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use epics_base_rs::server::iocsh::registry::*;
 
+use crate::driver::{SimDetectorRuntime, create_sim_detector};
 use ad_core_rs::ioc::GenericDriverContext;
 use ad_core_rs::plugin::channel::NDArrayOutput;
-use crate::driver::{SimDetectorRuntime, create_sim_detector};
 
 /// Register the SimDetector configure command on an `AdIoc`.
 ///

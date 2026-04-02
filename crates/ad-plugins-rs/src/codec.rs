@@ -335,10 +335,14 @@ impl NDPluginProcess for CodecProcessor {
         let original_bytes = array.data.as_u8_slice().len();
 
         let result = match self.mode {
-            CodecMode::Compress { codec: CodecName::LZ4, .. } => Some(compress_lz4(array)),
-            CodecMode::Compress { codec: CodecName::JPEG, quality } => {
-                compress_jpeg(array, quality)
-            }
+            CodecMode::Compress {
+                codec: CodecName::LZ4,
+                ..
+            } => Some(compress_lz4(array)),
+            CodecMode::Compress {
+                codec: CodecName::JPEG,
+                quality,
+            } => compress_jpeg(array, quality),
             CodecMode::Compress { .. } => None,
             CodecMode::Decompress => {
                 // Auto-detect codec from the array
@@ -356,13 +360,11 @@ impl NDPluginProcess for CodecProcessor {
                 match self.mode {
                     CodecMode::Compress { .. } => {
                         // ratio = original / compressed
-                        self.compression_ratio =
-                            original_bytes as f64 / output_bytes.max(1) as f64;
+                        self.compression_ratio = original_bytes as f64 / output_bytes.max(1) as f64;
                     }
                     CodecMode::Decompress => {
                         // ratio = decompressed / compressed
-                        self.compression_ratio =
-                            output_bytes as f64 / original_bytes.max(1) as f64;
+                        self.compression_ratio = output_bytes as f64 / original_bytes.max(1) as f64;
                     }
                 }
                 ProcessResult::arrays(vec![Arc::new(out.clone())])
@@ -378,7 +380,10 @@ impl NDPluginProcess for CodecProcessor {
         "NDPluginCodec"
     }
 
-    fn register_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
         base.create_param("MODE", ParamType::Int32)?;
         base.create_param("COMPRESSOR", ParamType::Int32)?;
@@ -470,15 +475,17 @@ mod tests {
         assert_eq!(decompressed.data.data_type(), NDDataType::UInt16);
         assert_eq!(decompressed.data.as_u8_slice(), original_bytes.as_slice());
         // Attribute should be cleaned up
-        assert!(decompressed.attributes.get(ATTR_ORIGINAL_DATA_TYPE).is_none());
+        assert!(
+            decompressed
+                .attributes
+                .get(ATTR_ORIGINAL_DATA_TYPE)
+                .is_none()
+        );
     }
 
     #[test]
     fn test_lz4_roundtrip_f64() {
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(16)],
-            NDDataType::Float64,
-        );
+        let mut arr = NDArray::new(vec![NDDimension::new(16)], NDDataType::Float64);
         if let NDDataBuffer::F64(ref mut v) = arr.data {
             for i in 0..v.len() {
                 v[i] = i as f64 * 1.5;
@@ -571,7 +578,7 @@ mod tests {
         let decompressed = decompress_jpeg(&compressed).unwrap();
         assert!(decompressed.codec.is_none());
         assert_eq!(decompressed.dims.len(), 3);
-        assert_eq!(decompressed.dims[0].size, 3);  // color
+        assert_eq!(decompressed.dims[0].size, 3); // color
         assert_eq!(decompressed.dims[1].size, 16); // width
         assert_eq!(decompressed.dims[2].size, 16); // height
         assert_eq!(decompressed.data.len(), 3 * 16 * 16);
@@ -737,10 +744,7 @@ mod tests {
     #[test]
     fn test_buffer_from_bytes_u16() {
         let original = vec![1000u16, 2000, 3000];
-        let bytes: Vec<u8> = original
-            .iter()
-            .flat_map(|v| v.to_ne_bytes())
-            .collect();
+        let bytes: Vec<u8> = original.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let buf = buffer_from_bytes(&bytes, NDDataType::UInt16).unwrap();
         assert_eq!(buf.data_type(), NDDataType::UInt16);
         assert_eq!(buf.len(), 3);
@@ -761,10 +765,7 @@ mod tests {
     #[test]
     fn test_buffer_from_bytes_f64_roundtrip() {
         let original = vec![1.5f64, -2.7, 3.14159];
-        let bytes: Vec<u8> = original
-            .iter()
-            .flat_map(|v| v.to_ne_bytes())
-            .collect();
+        let bytes: Vec<u8> = original.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let buf = buffer_from_bytes(&bytes, NDDataType::Float64).unwrap();
         if let NDDataBuffer::F64(v) = buf {
             assert_eq!(v, original);

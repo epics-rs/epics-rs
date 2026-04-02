@@ -1,7 +1,7 @@
 use crate::ndarray::{NDArray, NDDataBuffer};
 
 use crate::color_layout::ColorLayout;
-use crate::pixel_cast::{with_buffer, PixelCast};
+use crate::pixel_cast::{PixelCast, with_buffer};
 
 /// Crop a region of interest from the source array.
 /// v1: no binning or reverse. Data type and color mode are preserved.

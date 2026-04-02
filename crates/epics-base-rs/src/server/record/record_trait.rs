@@ -97,17 +97,29 @@ pub struct ProcessOutcome {
 impl ProcessOutcome {
     /// Shorthand for a simple Complete with no actions.
     pub fn complete() -> Self {
-        Self { result: RecordProcessResult::Complete, actions: Vec::new(), device_did_compute: false }
+        Self {
+            result: RecordProcessResult::Complete,
+            actions: Vec::new(),
+            device_did_compute: false,
+        }
     }
 
     /// Shorthand for Complete with actions.
     pub fn complete_with(actions: Vec<ProcessAction>) -> Self {
-        Self { result: RecordProcessResult::Complete, actions, device_did_compute: false }
+        Self {
+            result: RecordProcessResult::Complete,
+            actions,
+            device_did_compute: false,
+        }
     }
 
     /// Shorthand for AsyncPending with no actions.
     pub fn async_pending() -> Self {
-        Self { result: RecordProcessResult::AsyncPending, actions: Vec::new(), device_did_compute: false }
+        Self {
+            result: RecordProcessResult::AsyncPending,
+            actions: Vec::new(),
+            device_did_compute: false,
+        }
     }
 }
 
@@ -121,8 +133,16 @@ impl Default for ProcessOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommonFieldPutResult {
     NoChange,
-    ScanChanged { old_scan: ScanType, new_scan: ScanType, phas: i16 },
-    PhasChanged { scan: ScanType, old_phas: i16, new_phas: i16 },
+    ScanChanged {
+        old_scan: ScanType,
+        new_scan: ScanType,
+        phas: i16,
+    },
+    PhasChanged {
+        scan: ScanType,
+        old_phas: i16,
+        new_phas: i16,
+    },
 }
 
 /// Snapshot of changes from a process cycle, used for notify outside lock.
@@ -179,7 +199,10 @@ pub trait Record: Send + Sync + 'static {
 
     /// Whether this record type supports device write (output records only).
     fn can_device_write(&self) -> bool {
-        matches!(self.record_type(), "ao" | "bo" | "longout" | "mbbo" | "stringout")
+        matches!(
+            self.record_type(),
+            "ao" | "bo" | "longout" | "mbbo" | "stringout"
+        )
     }
 
     /// Whether async processing has completed and put_notify can respond.

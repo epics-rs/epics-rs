@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::tcp::OwnedWriteHalf;
 
-use epics_base_rs::runtime::sync::{mpsc, Mutex};
+use epics_base_rs::runtime::sync::{Mutex, mpsc};
 
 use crate::protocol::*;
 use epics_base_rs::server::pv::{MonitorEvent, ProcessVariable};

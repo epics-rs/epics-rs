@@ -56,10 +56,10 @@ pub enum CaError {
 }
 
 // ECA status constants (originally from protocol.rs, now in epics-ca-rs)
-const ECA_TIMEOUT: u32 = 80;       // defmsg(CA_K_WARNING, 10)
-const ECA_NOWTACCESS: u32 = 376;   // defmsg(CA_K_WARNING, 47)
-const ECA_PUTFAIL: u32 = 160;      // defmsg(CA_K_WARNING, 20)
-const ECA_BADTYPE: u32 = 114;      // defmsg(CA_K_ERROR, 14)
+const ECA_TIMEOUT: u32 = 80; // defmsg(CA_K_WARNING, 10)
+const ECA_NOWTACCESS: u32 = 376; // defmsg(CA_K_WARNING, 47)
+const ECA_PUTFAIL: u32 = 160; // defmsg(CA_K_WARNING, 20)
+const ECA_BADTYPE: u32 = 114; // defmsg(CA_K_ERROR, 14)
 
 impl CaError {
     pub fn to_eca_status(&self) -> u32 {

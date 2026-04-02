@@ -30,19 +30,33 @@ record(scaler, "TEST:SC") {
     assert_eq!(ss, EpicsValue::Short(0), "SS should be IDLE initially");
 
     // Start counting: put CNT=1 then process
-    server.put("TEST:SC.CNT", EpicsValue::Short(1)).await.unwrap();
-    db.put_record_field_from_ca("TEST:SC", "PROC", EpicsValue::Short(1)).await.unwrap();
+    server
+        .put("TEST:SC.CNT", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("TEST:SC", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let ss = server.get("TEST:SC.SS").await.unwrap();
-    assert_eq!(ss, EpicsValue::Short(2), "SS should be COUNTING after CNT=1 + process");
+    assert_eq!(
+        ss,
+        EpicsValue::Short(2),
+        "SS should be COUNTING after CNT=1 + process"
+    );
 
     let us = server.get("TEST:SC.US").await.unwrap();
     assert_eq!(us, EpicsValue::Short(3), "US should be USER_COUNTING");
 
     // Stop: put CNT=0 then process
-    server.put("TEST:SC.CNT", EpicsValue::Short(0)).await.unwrap();
-    db.put_record_field_from_ca("TEST:SC", "PROC", EpicsValue::Short(1)).await.unwrap();
+    server
+        .put("TEST:SC.CNT", EpicsValue::Short(0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("TEST:SC", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let ss = server.get("TEST:SC.SS").await.unwrap();
@@ -99,8 +113,13 @@ record(scaler, "TEST:SC3") {
 
     // Start counting with DLY=0.2s
     // special("CNT") sets US=WAITING, then process returns AsyncPendingReprocess
-    server.put("TEST:SC3.CNT", EpicsValue::Short(1)).await.unwrap();
-    db.put_record_field_from_ca("TEST:SC3", "PROC", EpicsValue::Short(1)).await.unwrap();
+    server
+        .put("TEST:SC3.CNT", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("TEST:SC3", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // During DLY wait
@@ -111,10 +130,18 @@ record(scaler, "TEST:SC3") {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let ss = server.get("TEST:SC3.SS").await.unwrap();
-    assert_eq!(ss, EpicsValue::Short(2), "SS should be COUNTING after DLY expires");
+    assert_eq!(
+        ss,
+        EpicsValue::Short(2),
+        "SS should be COUNTING after DLY expires"
+    );
 
     let us = server.get("TEST:SC3.US").await.unwrap();
-    assert_eq!(us, EpicsValue::Short(3), "US should be USER_COUNTING after DLY");
+    assert_eq!(
+        us,
+        EpicsValue::Short(3),
+        "US should be USER_COUNTING after DLY"
+    );
 }
 
 // ============================================================
@@ -138,7 +165,10 @@ record(scaler, "TEST:SC4") {
         .unwrap();
 
     // Set PR5 via framework — triggers special
-    server.put("TEST:SC4.PR5", EpicsValue::Long(5000)).await.unwrap();
+    server
+        .put("TEST:SC4.PR5", EpicsValue::Long(5000))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let g5 = server.get("TEST:SC4.G5").await.unwrap();

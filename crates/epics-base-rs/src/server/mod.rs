@@ -17,7 +17,8 @@ pub mod snapshot;
 use crate::server::record::Record;
 
 /// Factory function type for creating device support instances.
-pub type DeviceSupportFactory = Box<dyn Fn() -> Box<dyn device_support::DeviceSupport> + Send + Sync>;
+pub type DeviceSupportFactory =
+    Box<dyn Fn() -> Box<dyn device_support::DeviceSupport> + Send + Sync>;
 
 /// Factory function type for creating record instances.
 pub type RecordFactory = Box<dyn Fn() -> Box<dyn Record> + Send + Sync>;

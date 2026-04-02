@@ -109,10 +109,7 @@ pub async fn rotate_backups(
 
 /// Find the best available save file for restore.
 /// Priority: .sav → .savB → .sav0 → .sav1 → ...
-pub async fn find_best_save_file(
-    base_path: &Path,
-    config: &BackupConfig,
-) -> Option<PathBuf> {
+pub async fn find_best_save_file(base_path: &Path, config: &BackupConfig) -> Option<PathBuf> {
     // Try .sav first
     if let Ok(true) = validate_save_file(base_path).await {
         return Some(base_path.to_path_buf());

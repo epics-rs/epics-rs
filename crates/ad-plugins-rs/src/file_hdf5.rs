@@ -53,7 +53,9 @@ mod hdf5_real {
         }
 
         fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
-            let h5file = self.file.as_ref()
+            let h5file = self
+                .file
+                .as_ref()
                 .ok_or_else(|| ADError::UnsupportedConversion("no HDF5 file open".into()))?;
 
             let dataset_name = if self.frame_count == 0 {
@@ -67,54 +69,78 @@ mod hdf5_real {
 
             match &array.data {
                 NDDataBuffer::U8(v) => {
-                    let ds = h5file.new_dataset::<u8>()
+                    let ds = h5file
+                        .new_dataset::<u8>()
                         .shape(&shape[..])
                         .create(dataset_name.as_str())
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
-                    ds.write_raw(v)
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
+                        })?;
+                    ds.write_raw(v).map_err(|e| {
+                        ADError::UnsupportedConversion(format!("HDF5 write error: {}", e))
+                    })?;
                 }
                 NDDataBuffer::U16(v) => {
-                    let ds = h5file.new_dataset::<u16>()
+                    let ds = h5file
+                        .new_dataset::<u16>()
                         .shape(&shape[..])
                         .create(dataset_name.as_str())
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
-                    ds.write_raw(v)
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
+                        })?;
+                    ds.write_raw(v).map_err(|e| {
+                        ADError::UnsupportedConversion(format!("HDF5 write error: {}", e))
+                    })?;
                 }
                 NDDataBuffer::I32(v) => {
-                    let ds = h5file.new_dataset::<i32>()
+                    let ds = h5file
+                        .new_dataset::<i32>()
                         .shape(&shape[..])
                         .create(dataset_name.as_str())
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
-                    ds.write_raw(v)
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
+                        })?;
+                    ds.write_raw(v).map_err(|e| {
+                        ADError::UnsupportedConversion(format!("HDF5 write error: {}", e))
+                    })?;
                 }
                 NDDataBuffer::F32(v) => {
-                    let ds = h5file.new_dataset::<f32>()
+                    let ds = h5file
+                        .new_dataset::<f32>()
                         .shape(&shape[..])
                         .create(dataset_name.as_str())
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
-                    ds.write_raw(v)
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
+                        })?;
+                    ds.write_raw(v).map_err(|e| {
+                        ADError::UnsupportedConversion(format!("HDF5 write error: {}", e))
+                    })?;
                 }
                 NDDataBuffer::F64(v) => {
-                    let ds = h5file.new_dataset::<f64>()
+                    let ds = h5file
+                        .new_dataset::<f64>()
                         .shape(&shape[..])
                         .create(dataset_name.as_str())
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
-                    ds.write_raw(v)
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
+                        })?;
+                    ds.write_raw(v).map_err(|e| {
+                        ADError::UnsupportedConversion(format!("HDF5 write error: {}", e))
+                    })?;
                 }
                 _ => {
                     // Fallback: write as raw bytes
                     let raw = array.data.as_u8_slice();
-                    let ds = h5file.new_dataset::<u8>()
+                    let ds = h5file
+                        .new_dataset::<u8>()
                         .shape([raw.len()])
                         .create(dataset_name.as_str())
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
-                    ds.write_raw(raw)
-                        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write error: {}", e)))?;
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
+                        })?;
+                    ds.write_raw(raw).map_err(|e| {
+                        ADError::UnsupportedConversion(format!("HDF5 write error: {}", e))
+                    })?;
                 }
             }
 
@@ -123,11 +149,13 @@ mod hdf5_real {
                 let val_str = attr.value.as_string();
                 // HDF5 string attributes on the dataset
                 if let Ok(ds) = h5file.dataset(&dataset_name) {
-                    let _ = ds.new_attr::<hdf5_metno::types::VarLenUnicode>()
+                    let _ = ds
+                        .new_attr::<hdf5_metno::types::VarLenUnicode>()
                         .shape(())
                         .create(attr.name.as_str())
                         .and_then(|a| {
-                            let s: hdf5_metno::types::VarLenUnicode = val_str.parse().unwrap_or_default();
+                            let s: hdf5_metno::types::VarLenUnicode =
+                                val_str.parse().unwrap_or_default();
                             a.write_scalar(&s)
                         });
                 }
@@ -138,14 +166,17 @@ mod hdf5_real {
         }
 
         fn read_file(&mut self) -> ADResult<NDArray> {
-            let path = self.current_path.as_ref()
+            let path = self
+                .current_path
+                .as_ref()
                 .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
 
             let h5file = H5File::open(path)
                 .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 open error: {}", e)))?;
 
-            let ds = h5file.dataset(&self.dataset_name)
-                .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
+            let ds = h5file.dataset(&self.dataset_name).map_err(|e| {
+                ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
+            })?;
 
             let shape = ds.shape();
             let dims: Vec<NDDimension> = shape.iter().rev().map(|&s| NDDimension::new(s)).collect();
@@ -167,7 +198,9 @@ mod hdf5_real {
                 return Ok(arr);
             }
 
-            Err(ADError::UnsupportedConversion("unsupported HDF5 data type".into()))
+            Err(ADError::UnsupportedConversion(
+                "unsupported HDF5 data type".into(),
+            ))
         }
 
         fn close_file(&mut self) -> ADResult<()> {
@@ -232,7 +265,9 @@ impl NDFileWriter for Hdf5Writer {
     fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
         use std::io::Write;
 
-        let file = self.file.as_mut()
+        let file = self
+            .file
+            .as_mut()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
 
         let info = array.info();
@@ -268,7 +303,9 @@ impl NDFileWriter for Hdf5Writer {
     }
 
     fn read_file(&mut self) -> ADResult<NDArray> {
-        let path = self.current_path.as_ref()
+        let path = self
+            .current_path
+            .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
 
         let data = std::fs::read(path)?;
@@ -331,56 +368,60 @@ impl NDFileWriter for Hdf5Writer {
 /// Reconstruct a typed NDDataBuffer from raw bytes.
 fn reconstruct_buffer(dtype: NDDataType, raw: &[u8]) -> NDDataBuffer {
     match dtype {
-        NDDataType::Int8 => {
-            NDDataBuffer::I8(raw.iter().map(|&b| b as i8).collect())
-        }
-        NDDataType::UInt8 => {
-            NDDataBuffer::U8(raw.to_vec())
-        }
+        NDDataType::Int8 => NDDataBuffer::I8(raw.iter().map(|&b| b as i8).collect()),
+        NDDataType::UInt8 => NDDataBuffer::U8(raw.to_vec()),
         NDDataType::Int16 => {
-            let v: Vec<i16> = raw.chunks_exact(2)
+            let v: Vec<i16> = raw
+                .chunks_exact(2)
                 .map(|c| i16::from_ne_bytes([c[0], c[1]]))
                 .collect();
             NDDataBuffer::I16(v)
         }
         NDDataType::UInt16 => {
-            let v: Vec<u16> = raw.chunks_exact(2)
+            let v: Vec<u16> = raw
+                .chunks_exact(2)
                 .map(|c| u16::from_ne_bytes([c[0], c[1]]))
                 .collect();
             NDDataBuffer::U16(v)
         }
         NDDataType::Int32 => {
-            let v: Vec<i32> = raw.chunks_exact(4)
+            let v: Vec<i32> = raw
+                .chunks_exact(4)
                 .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             NDDataBuffer::I32(v)
         }
         NDDataType::UInt32 => {
-            let v: Vec<u32> = raw.chunks_exact(4)
+            let v: Vec<u32> = raw
+                .chunks_exact(4)
                 .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             NDDataBuffer::U32(v)
         }
         NDDataType::Int64 => {
-            let v: Vec<i64> = raw.chunks_exact(8)
+            let v: Vec<i64> = raw
+                .chunks_exact(8)
                 .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
                 .collect();
             NDDataBuffer::I64(v)
         }
         NDDataType::UInt64 => {
-            let v: Vec<u64> = raw.chunks_exact(8)
+            let v: Vec<u64> = raw
+                .chunks_exact(8)
                 .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
                 .collect();
             NDDataBuffer::U64(v)
         }
         NDDataType::Float32 => {
-            let v: Vec<f32> = raw.chunks_exact(4)
+            let v: Vec<f32> = raw
+                .chunks_exact(4)
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             NDDataBuffer::F32(v)
         }
         NDDataType::Float64 => {
-            let v: Vec<f64> = raw.chunks_exact(8)
+            let v: Vec<f64> = raw
+                .chunks_exact(8)
                 .map(|c| f64::from_ne_bytes(c.try_into().unwrap()))
                 .collect();
             NDDataBuffer::F64(v)
@@ -407,7 +448,9 @@ impl Hdf5FileProcessor {
 }
 
 /// Register all HDF5-specific params (shared by both stub and real processors).
-fn register_hdf5_params(base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+fn register_hdf5_params(
+    base: &mut asyn_rs::port::PortDriverBase,
+) -> asyn_rs::error::AsynResult<()> {
     use asyn_rs::param::ParamType;
     base.create_param("HDF5_SWMRFlushNow", ParamType::Int32)?;
     base.create_param("HDF5_chunkSizeAuto", ParamType::Int32)?;
@@ -517,12 +560,19 @@ impl NDPluginProcess for Hdf5FileProcessor {
         "NDFileHDF5"
     }
 
-    fn register_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
         self.ctrl.register_params(base)?;
         register_hdf5_params(base)
     }
 
-    fn on_param_change(&mut self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
+    fn on_param_change(
+        &mut self,
+        reason: usize,
+        params: &PluginParamSnapshot,
+    ) -> ParamChangeResult {
         self.ctrl.on_param_change(reason, params)
     }
 }
@@ -567,12 +617,19 @@ impl NDPluginProcess for Hdf5RealFileProcessor {
         "NDFileHDF5"
     }
 
-    fn register_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
         self.ctrl.register_params(base)?;
         register_hdf5_params(base)
     }
 
-    fn on_param_change(&mut self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
+    fn on_param_change(
+        &mut self,
+        reason: usize,
+        params: &PluginParamSnapshot,
+    ) -> ParamChangeResult {
         self.ctrl.on_param_change(reason, params)
     }
 }
@@ -580,7 +637,7 @@ impl NDPluginProcess for Hdf5RealFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::attributes::{NDAttribute, NDAttrSource, NDAttrValue};
+    use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -600,7 +657,9 @@ mod tests {
             NDDataType::UInt8,
         );
         if let NDDataBuffer::U8(ref mut v) = arr.data {
-            for i in 0..16 { v[i] = i as u8; }
+            for i in 0..16 {
+                v[i] = i as u8;
+            }
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
@@ -647,10 +706,7 @@ mod tests {
         let path = temp_path("hdf5_attrs");
         let mut writer = Hdf5Writer::new();
 
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(4)],
-            NDDataType::UInt8,
-        );
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.attributes.add(NDAttribute {
             name: "exposure".into(),
             description: "".into(),
@@ -681,7 +737,9 @@ mod tests {
             NDDataType::UInt16,
         );
         if let NDDataBuffer::U16(ref mut v) = arr.data {
-            for i in 0..16 { v[i] = (i * 100) as u16; }
+            for i in 0..16 {
+                v[i] = (i * 100) as u16;
+            }
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
@@ -708,12 +766,12 @@ mod tests {
         let path = temp_path("hdf5_f64");
         let mut writer = Hdf5Writer::new();
 
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(4)],
-            NDDataType::Float64,
-        );
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::Float64);
         if let NDDataBuffer::F64(ref mut v) = arr.data {
-            v[0] = 1.5; v[1] = 2.5; v[2] = 3.5; v[3] = 4.5;
+            v[0] = 1.5;
+            v[1] = 2.5;
+            v[2] = 3.5;
+            v[3] = 4.5;
         }
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();

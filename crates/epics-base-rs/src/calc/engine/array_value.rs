@@ -39,9 +39,7 @@ impl ArrayStackValue {
     pub fn map<F: Fn(f64) -> f64>(self, f: F) -> ArrayStackValue {
         match self {
             ArrayStackValue::Double(v) => ArrayStackValue::Double(f(v)),
-            ArrayStackValue::Array(arr) => {
-                ArrayStackValue::Array(arr.into_iter().map(f).collect())
-            }
+            ArrayStackValue::Array(arr) => ArrayStackValue::Array(arr.into_iter().map(f).collect()),
         }
     }
 }
@@ -60,18 +58,17 @@ pub fn zip_map<F: Fn(f64, f64) -> f64>(
                 return Err(CalcError::LengthMismatch);
             }
             Ok(ArrayStackValue::Array(
-                a.into_iter().zip(b.into_iter()).map(|(x, y)| f(x, y)).collect(),
+                a.into_iter()
+                    .zip(b.into_iter())
+                    .map(|(x, y)| f(x, y))
+                    .collect(),
             ))
         }
-        (ArrayStackValue::Array(arr), ArrayStackValue::Double(scalar)) => {
-            Ok(ArrayStackValue::Array(
-                arr.into_iter().map(|x| f(x, scalar)).collect(),
-            ))
-        }
-        (ArrayStackValue::Double(scalar), ArrayStackValue::Array(arr)) => {
-            Ok(ArrayStackValue::Array(
-                arr.into_iter().map(|y| f(scalar, y)).collect(),
-            ))
-        }
+        (ArrayStackValue::Array(arr), ArrayStackValue::Double(scalar)) => Ok(
+            ArrayStackValue::Array(arr.into_iter().map(|x| f(x, scalar)).collect()),
+        ),
+        (ArrayStackValue::Double(scalar), ArrayStackValue::Array(arr)) => Ok(
+            ArrayStackValue::Array(arr.into_iter().map(|y| f(scalar, y)).collect()),
+        ),
     }
 }

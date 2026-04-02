@@ -70,11 +70,7 @@ pub trait OctetInterpose: Send + Sync {
         next: &mut dyn OctetNext,
     ) -> AsynResult<usize>;
 
-    fn flush(
-        &mut self,
-        user: &mut AsynUser,
-        next: &mut dyn OctetNext,
-    ) -> AsynResult<()>;
+    fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()>;
 }
 
 /// A stack of octet interpose layers.
@@ -84,9 +80,7 @@ pub struct OctetInterposeStack {
 
 impl OctetInterposeStack {
     pub fn new() -> Self {
-        Self {
-            layers: Vec::new(),
-        }
+        Self { layers: Vec::new() }
     }
 
     /// Push a layer onto the top of the stack (outermost = called first).
@@ -267,11 +261,7 @@ mod tests {
         ) -> AsynResult<usize> {
             next.write(user, data)
         }
-        fn flush(
-            &mut self,
-            user: &mut AsynUser,
-            next: &mut dyn OctetNext,
-        ) -> AsynResult<()> {
+        fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
             next.flush(user)
         }
     }
@@ -297,11 +287,7 @@ mod tests {
             let upper: Vec<u8> = data.iter().map(|b| b.to_ascii_uppercase()).collect();
             next.write(user, &upper)
         }
-        fn flush(
-            &mut self,
-            user: &mut AsynUser,
-            next: &mut dyn OctetNext,
-        ) -> AsynResult<()> {
+        fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
             next.flush(user)
         }
     }
@@ -340,7 +326,9 @@ mod tests {
         let mut base = MockBase::new(b"");
         let mut user = AsynUser::default();
 
-        let n = stack.dispatch_write(&mut user, b"hello", &mut base).unwrap();
+        let n = stack
+            .dispatch_write(&mut user, b"hello", &mut base)
+            .unwrap();
         assert_eq!(n, 5);
         assert_eq!(&base.written, b"HELLO");
     }

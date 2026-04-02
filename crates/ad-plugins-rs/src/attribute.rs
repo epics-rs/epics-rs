@@ -69,10 +69,10 @@ impl AttributeProcessor {
         match self.attr_name.as_str() {
             "NDArrayUniqueId" => Some(array.unique_id as f64),
             "NDArrayTimeStamp" => Some(array.timestamp.as_f64()),
-            _ => {
-                array.attributes.get(&self.attr_name)
-                    .and_then(|attr| attr.value.as_f64())
-            }
+            _ => array
+                .attributes
+                .get(&self.attr_name)
+                .and_then(|attr| attr.value.as_f64()),
         }
     }
 }
@@ -131,7 +131,10 @@ mod tests {
         let arr = make_array_with_attr("Temperature", 25.5, 1);
         let result = proc.process_array(&arr, &pool);
 
-        assert!(result.output_arrays.is_empty(), "attribute plugin is a sink");
+        assert!(
+            result.output_arrays.is_empty(),
+            "attribute plugin is a sink"
+        );
         assert!((proc.value() - 25.5).abs() < 1e-10);
         assert!((proc.value_sum() - 25.5).abs() < 1e-10);
     }
@@ -193,7 +196,10 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp { sec: 100, nsec: 500_000_000 };
+        arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp {
+            sec: 100,
+            nsec: 500_000_000,
+        };
 
         proc.process_array(&arr, &pool);
         assert!((proc.value() - 100.5).abs() < 1e-9);

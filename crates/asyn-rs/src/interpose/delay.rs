@@ -18,10 +18,12 @@ impl DelayInterpose {
 
     /// Set delay from a string value (seconds, e.g. "0.001").
     pub fn set_delay(&mut self, secs_str: &str) -> AsynResult<()> {
-        let secs: f64 = secs_str.parse().map_err(|_| crate::error::AsynError::Status {
-            status: crate::error::AsynStatus::Error,
-            message: format!("invalid delay value: '{secs_str}'"),
-        })?;
+        let secs: f64 = secs_str
+            .parse()
+            .map_err(|_| crate::error::AsynError::Status {
+                status: crate::error::AsynStatus::Error,
+                message: format!("invalid delay value: '{secs_str}'"),
+            })?;
         self.delay = Duration::from_secs_f64(secs);
         Ok(())
     }
@@ -57,11 +59,7 @@ impl OctetInterpose for DelayInterpose {
         Ok(total)
     }
 
-    fn flush(
-        &mut self,
-        user: &mut AsynUser,
-        next: &mut dyn OctetNext,
-    ) -> AsynResult<()> {
+    fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
         next.flush(user)
     }
 }
@@ -78,19 +76,26 @@ mod tests {
 
     impl RecordingBase {
         fn new() -> Self {
-            Self { written: Vec::new() }
+            Self {
+                written: Vec::new(),
+            }
         }
     }
 
     impl OctetNext for RecordingBase {
         fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-            Ok(OctetReadResult { nbytes_transferred: 0, eom_reason: EomReason::CNT })
+            Ok(OctetReadResult {
+                nbytes_transferred: 0,
+                eom_reason: EomReason::CNT,
+            })
         }
         fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             self.written.push(data.to_vec());
             Ok(data.len())
         }
-        fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> { Ok(()) }
+        fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+            Ok(())
+        }
     }
 
     #[test]

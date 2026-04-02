@@ -52,7 +52,11 @@ pub fn create_std_arrays_runtime(
     pool: Arc<NDArrayPool>,
     ndarray_port: &str,
     wiring: Arc<WiringRegistry>,
-) -> (PluginRuntimeHandle, Arc<Mutex<Option<Arc<NDArray>>>>, std::thread::JoinHandle<()>) {
+) -> (
+    PluginRuntimeHandle,
+    Arc<Mutex<Option<Arc<NDArray>>>>,
+    std::thread::JoinHandle<()>,
+) {
     let processor = StdArraysProcessor::new();
     let data_handle = processor.data_handle();
 
@@ -99,8 +103,11 @@ mod tests {
         let (handle, data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
 
         // Plugins default to disabled — enable for test
-        handle.port_runtime().port_handle()
-            .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1).unwrap();
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         handle.array_sender().send(make_array(42));

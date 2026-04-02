@@ -25,7 +25,10 @@ pub enum AxisCommand {
     },
     StartPolling,
     StopPolling,
-    ScheduleDelay { id: u64, duration: Duration },
+    ScheduleDelay {
+        id: u64,
+        duration: Duration,
+    },
     Shutdown,
 }
 
@@ -41,12 +44,30 @@ pub struct AxisActions {
 /// Motor commands for the axis runtime.
 #[derive(Debug, Clone)]
 pub enum AxisMotorCommand {
-    MoveAbsolute { position: f64, velocity: f64, acceleration: f64 },
-    MoveVelocity { direction: bool, velocity: f64, acceleration: f64 },
-    Home { forward: bool, velocity: f64, acceleration: f64 },
-    Stop { acceleration: f64 },
-    SetPosition { position: f64 },
-    SetClosedLoop { enable: bool },
+    MoveAbsolute {
+        position: f64,
+        velocity: f64,
+        acceleration: f64,
+    },
+    MoveVelocity {
+        direction: bool,
+        velocity: f64,
+        acceleration: f64,
+    },
+    Home {
+        forward: bool,
+        velocity: f64,
+        acceleration: f64,
+    },
+    Stop {
+        acceleration: f64,
+    },
+    SetPosition {
+        position: f64,
+    },
+    SetClosedLoop {
+        enable: bool,
+    },
     Poll,
 }
 
@@ -78,13 +99,22 @@ pub struct AxisRuntimeHandle {
 impl AxisRuntimeHandle {
     pub async fn execute(&self, actions: AxisActions) {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.tx.send(AxisCommand::Execute { actions, reply: reply_tx }).await;
+        let _ = self
+            .tx
+            .send(AxisCommand::Execute {
+                actions,
+                reply: reply_tx,
+            })
+            .await;
         let _ = reply_rx.await;
     }
 
     pub async fn get_status(&self) -> Option<MotorStatus> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.tx.send(AxisCommand::GetStatus { reply: reply_tx }).await;
+        let _ = self
+            .tx
+            .send(AxisCommand::GetStatus { reply: reply_tx })
+            .await;
         reply_rx.await.ok().flatten()
     }
 
@@ -97,7 +127,10 @@ impl AxisRuntimeHandle {
     }
 
     pub async fn schedule_delay(&self, id: u64, duration: Duration) {
-        let _ = self.tx.send(AxisCommand::ScheduleDelay { id, duration }).await;
+        let _ = self
+            .tx
+            .send(AxisCommand::ScheduleDelay { id, duration })
+            .await;
     }
 
     pub fn take_io_intr_receiver(&self) -> Option<mpsc::Receiver<()>> {
@@ -250,19 +283,28 @@ impl AxisRuntime {
         let user = AsynUser::new(0);
         for cmd in &actions.commands {
             let result = match cmd {
-                AxisMotorCommand::MoveAbsolute { position, velocity, acceleration } => {
-                    self.motor.move_absolute(&user, *position, *velocity, *acceleration)
-                }
-                AxisMotorCommand::MoveVelocity { direction, velocity, acceleration } => {
+                AxisMotorCommand::MoveAbsolute {
+                    position,
+                    velocity,
+                    acceleration,
+                } => self
+                    .motor
+                    .move_absolute(&user, *position, *velocity, *acceleration),
+                AxisMotorCommand::MoveVelocity {
+                    direction,
+                    velocity,
+                    acceleration,
+                } => {
                     let target = if *direction { 1e9 } else { -1e9 };
-                    self.motor.move_absolute(&user, target, *velocity, *acceleration)
+                    self.motor
+                        .move_absolute(&user, target, *velocity, *acceleration)
                 }
-                AxisMotorCommand::Home { forward, velocity, acceleration: _ } => {
-                    self.motor.home(&user, *velocity, *forward)
-                }
-                AxisMotorCommand::Stop { acceleration } => {
-                    self.motor.stop(&user, *acceleration)
-                }
+                AxisMotorCommand::Home {
+                    forward,
+                    velocity,
+                    acceleration: _,
+                } => self.motor.home(&user, *velocity, *forward),
+                AxisMotorCommand::Stop { acceleration } => self.motor.stop(&user, *acceleration),
                 AxisMotorCommand::SetPosition { position } => {
                     self.motor.set_position(&user, *position)
                 }
@@ -319,12 +361,22 @@ mod tests {
 
     impl SimMotor {
         fn new() -> Self {
-            Self { position: 0.0, target: 0.0, moving: false }
+            Self {
+                position: 0.0,
+                target: 0.0,
+                moving: false,
+            }
         }
     }
 
     impl AsynMotor for SimMotor {
-        fn move_absolute(&mut self, _user: &AsynUser, pos: f64, _vel: f64, _acc: f64) -> AsynResult<()> {
+        fn move_absolute(
+            &mut self,
+            _user: &AsynUser,
+            pos: f64,
+            _vel: f64,
+            _acc: f64,
+        ) -> AsynResult<()> {
             self.target = pos;
             self.moving = true;
             Ok(())
@@ -361,11 +413,8 @@ mod tests {
 
     #[tokio::test]
     async fn axis_runtime_basic() {
-        let (runtime, handle) = create_axis_runtime(
-            Box::new(SimMotor::new()),
-            Duration::from_millis(50),
-            0,
-        );
+        let (runtime, handle) =
+            create_axis_runtime(Box::new(SimMotor::new()), Duration::from_millis(50), 0);
         let rt_handle = tokio::spawn(runtime.run());
 
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -394,11 +443,8 @@ mod tests {
 
     #[tokio::test]
     async fn axis_runtime_events() {
-        let (runtime, handle) = create_axis_runtime(
-            Box::new(SimMotor::new()),
-            Duration::from_millis(50),
-            1,
-        );
+        let (runtime, handle) =
+            create_axis_runtime(Box::new(SimMotor::new()), Duration::from_millis(50), 1);
         let mut event_rx = handle.subscribe_events();
         let rt_handle = tokio::spawn(runtime.run());
 
@@ -420,11 +466,8 @@ mod tests {
 
     #[tokio::test]
     async fn axis_runtime_io_intr() {
-        let (runtime, handle) = create_axis_runtime(
-            Box::new(SimMotor::new()),
-            Duration::from_millis(50),
-            0,
-        );
+        let (runtime, handle) =
+            create_axis_runtime(Box::new(SimMotor::new()), Duration::from_millis(50), 0);
         let mut io_intr_rx = handle.take_io_intr_receiver().unwrap();
         let rt_handle = tokio::spawn(runtime.run());
 
@@ -438,11 +481,8 @@ mod tests {
 
     #[tokio::test]
     async fn axis_handle_clone_works() {
-        let (runtime, handle) = create_axis_runtime(
-            Box::new(SimMotor::new()),
-            Duration::from_millis(50),
-            0,
-        );
+        let (runtime, handle) =
+            create_axis_runtime(Box::new(SimMotor::new()), Duration::from_millis(50), 0);
         let handle2 = handle.clone();
         let rt_handle = tokio::spawn(runtime.run());
 

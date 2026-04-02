@@ -61,7 +61,8 @@ impl AccessSecurityConfig {
                 true // No UAG restriction = all users
             } else {
                 rule.uag.iter().any(|uag_name| {
-                    self.uag.get(uag_name)
+                    self.uag
+                        .get(uag_name)
                         .map(|members| members.iter().any(|m| m == user))
                         .unwrap_or(false)
                 })
@@ -71,7 +72,8 @@ impl AccessSecurityConfig {
                 true // No HAG restriction = all hosts
             } else {
                 rule.hag.iter().any(|hag_name| {
-                    self.hag.get(hag_name)
+                    self.hag
+                        .get(hag_name)
                         .map(|members| members.iter().any(|m| m == host))
                         .unwrap_or(false)
                 })
@@ -137,7 +139,9 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
             }
             "" => break,
             other => {
-                return Err(CaError::Protocol(format!("ACF: unexpected keyword '{other}'")));
+                return Err(CaError::Protocol(format!(
+                    "ACF: unexpected keyword '{other}'"
+                )));
             }
         }
     }
@@ -153,7 +157,9 @@ fn skip_ws_comments(chars: &mut std::iter::Peekable<std::str::Chars>) {
             // Skip line comment
             while let Some(&c) = chars.peek() {
                 chars.next();
-                if c == '\n' { break; }
+                if c == '\n' {
+                    break;
+                }
             }
         } else {
             break;
@@ -180,8 +186,13 @@ fn read_paren_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
     skip_ws_comments(chars);
     let mut name = String::new();
     while let Some(&c) = chars.peek() {
-        if c == ')' { chars.next(); break; }
-        if !c.is_whitespace() { name.push(c); }
+        if c == ')' {
+            chars.next();
+            break;
+        }
+        if !c.is_whitespace() {
+            name.push(c);
+        }
         chars.next();
     }
     Ok(name)
@@ -198,24 +209,36 @@ fn read_brace_list(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
     loop {
         skip_ws_comments(chars);
         match chars.peek() {
-            Some(&'}') => { chars.next(); break; }
+            Some(&'}') => {
+                chars.next();
+                break;
+            }
             Some(&',') => {
                 chars.next();
-                if !current.is_empty() { items.push(current.clone()); current.clear(); }
+                if !current.is_empty() {
+                    items.push(current.clone());
+                    current.clear();
+                }
             }
             Some(&c) if c.is_alphanumeric() || c == '_' || c == '.' || c == '-' => {
                 current.push(c);
                 chars.next();
             }
-            Some(_) => { chars.next(); }
+            Some(_) => {
+                chars.next();
+            }
             None => return Err(CaError::Protocol("ACF: unterminated '{'".into())),
         }
     }
-    if !current.is_empty() { items.push(current); }
+    if !current.is_empty() {
+        items.push(current);
+    }
     Ok(items)
 }
 
-fn parse_asg_body(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<AccessSecurityGroup> {
+fn parse_asg_body(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> CaResult<AccessSecurityGroup> {
     skip_ws_comments(chars);
     if chars.next() != Some('{') {
         return Err(CaError::Protocol("ACF: expected '{' after ASG name".into()));
@@ -226,7 +249,10 @@ fn parse_asg_body(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<
     loop {
         skip_ws_comments(chars);
         match chars.peek() {
-            Some(&'}') => { chars.next(); break; }
+            Some(&'}') => {
+                chars.next();
+                break;
+            }
             Some(_) => {
                 let mut kw = String::new();
                 read_word(chars, &mut kw);
@@ -254,13 +280,19 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     skip_ws_comments(chars);
     let mut level_str = String::new();
     while let Some(&c) = chars.peek() {
-        if c.is_ascii_digit() { level_str.push(c); chars.next(); }
-        else { break; }
+        if c.is_ascii_digit() {
+            level_str.push(c);
+            chars.next();
+        } else {
+            break;
+        }
     }
     let level: u8 = level_str.parse().unwrap_or(1);
 
     skip_ws_comments(chars);
-    if chars.peek() == Some(&',') { chars.next(); }
+    if chars.peek() == Some(&',') {
+        chars.next();
+    }
 
     // Read access type
     skip_ws_comments(chars);
@@ -269,7 +301,9 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     let write = access_str.eq_ignore_ascii_case("WRITE");
 
     skip_ws_comments(chars);
-    if chars.peek() == Some(&')') { chars.next(); }
+    if chars.peek() == Some(&')') {
+        chars.next();
+    }
 
     // Optional body with UAG/HAG
     let mut uag = Vec::new();
@@ -281,7 +315,10 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         loop {
             skip_ws_comments(chars);
             match chars.peek() {
-                Some(&'}') => { chars.next(); break; }
+                Some(&'}') => {
+                    chars.next();
+                    break;
+                }
                 Some(_) => {
                     let mut kw = String::new();
                     read_word(chars, &mut kw);
@@ -298,7 +335,12 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         }
     }
 
-    Ok(AccessRule { level, write, uag, hag })
+    Ok(AccessRule {
+        level,
+        write,
+        uag,
+        hag,
+    })
 }
 
 #[cfg(test)]
@@ -341,7 +383,10 @@ ASG(SECURE) {
     fn test_check_access_default_rw() {
         let acf = "ASG(DEFAULT) { RULE(1, WRITE) RULE(1, READ) }";
         let config = parse_acf(acf).unwrap();
-        assert_eq!(config.check_access("DEFAULT", "host1", "user1"), AccessLevel::ReadWrite);
+        assert_eq!(
+            config.check_access("DEFAULT", "host1", "user1"),
+            AccessLevel::ReadWrite
+        );
     }
 
     #[test]
@@ -355,9 +400,15 @@ ASG(READONLY) {
 "#;
         let config = parse_acf(acf).unwrap();
         // admin1 gets RW
-        assert_eq!(config.check_access("READONLY", "host1", "admin1"), AccessLevel::ReadWrite);
+        assert_eq!(
+            config.check_access("READONLY", "host1", "admin1"),
+            AccessLevel::ReadWrite
+        );
         // Other users get read only
-        assert_eq!(config.check_access("READONLY", "host1", "regular"), AccessLevel::Read);
+        assert_eq!(
+            config.check_access("READONLY", "host1", "regular"),
+            AccessLevel::Read
+        );
     }
 
     #[test]
@@ -372,11 +423,20 @@ ASG(CONTROLLED) {
 "#;
         let config = parse_acf(acf).unwrap();
         // Alice on lab-pc1 gets RW
-        assert_eq!(config.check_access("CONTROLLED", "lab-pc1", "alice"), AccessLevel::ReadWrite);
+        assert_eq!(
+            config.check_access("CONTROLLED", "lab-pc1", "alice"),
+            AccessLevel::ReadWrite
+        );
         // Alice on wrong host gets READ
-        assert_eq!(config.check_access("CONTROLLED", "other-host", "alice"), AccessLevel::Read);
+        assert_eq!(
+            config.check_access("CONTROLLED", "other-host", "alice"),
+            AccessLevel::Read
+        );
         // Wrong user on lab-pc1 gets READ
-        assert_eq!(config.check_access("CONTROLLED", "lab-pc1", "bob"), AccessLevel::Read);
+        assert_eq!(
+            config.check_access("CONTROLLED", "lab-pc1", "bob"),
+            AccessLevel::Read
+        );
     }
 
     #[test]

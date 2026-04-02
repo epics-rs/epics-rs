@@ -49,7 +49,8 @@ impl PluginBaseParams {
             sort_size: port_base.create_param("SORT_SIZE", ParamType::Int32)?,
             sort_free: port_base.create_param("SORT_FREE", ParamType::Int32)?,
             disordered_arrays: port_base.create_param("DISORDERED_ARRAYS", ParamType::Int32)?,
-            dropped_output_arrays: port_base.create_param("DROPPED_OUTPUT_ARRAYS", ParamType::Int32)?,
+            dropped_output_arrays: port_base
+                .create_param("DROPPED_OUTPUT_ARRAYS", ParamType::Int32)?,
             process_plugin: port_base.create_param("PROCESS_PLUGIN", ParamType::Int32)?,
             min_callback_time: port_base.create_param("MIN_CALLBACK_TIME", ParamType::Float64)?,
             max_byte_rate: port_base.create_param("MAX_BYTE_RATE", ParamType::Float64)?,

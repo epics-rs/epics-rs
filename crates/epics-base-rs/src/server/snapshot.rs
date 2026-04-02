@@ -90,12 +90,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_construction() {
-        let snap = Snapshot::new(
-            EpicsValue::Double(42.0),
-            0,
-            0,
-            SystemTime::UNIX_EPOCH,
-        );
+        let snap = Snapshot::new(EpicsValue::Double(42.0), 0, 0, SystemTime::UNIX_EPOCH);
         assert_eq!(snap.alarm.status, 0);
         assert_eq!(snap.alarm.severity, 0);
         assert!(snap.display.is_none());
@@ -105,12 +100,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_with_metadata() {
-        let mut snap = Snapshot::new(
-            EpicsValue::Double(3.14),
-            1,
-            2,
-            SystemTime::UNIX_EPOCH,
-        );
+        let mut snap = Snapshot::new(EpicsValue::Double(3.14), 1, 2, SystemTime::UNIX_EPOCH);
         snap.display = Some(DisplayInfo {
             units: "degC".to_string(),
             precision: 3,

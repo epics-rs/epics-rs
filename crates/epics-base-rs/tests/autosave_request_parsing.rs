@@ -9,7 +9,10 @@ fn test_simple_pvs() {
     let content = "TEMP.VAL\nPRESS.VAL\nSWITCH.VAL\n";
     let ctx = MacroContext::new();
     let entries = request::parse_request_string(content, &ctx, "test.req").unwrap();
-    assert_eq!(pv_names(&entries), vec!["TEMP.VAL", "PRESS.VAL", "SWITCH.VAL"]);
+    assert_eq!(
+        pv_names(&entries),
+        vec!["TEMP.VAL", "PRESS.VAL", "SWITCH.VAL"]
+    );
 }
 
 #[test]
@@ -37,7 +40,10 @@ async fn test_file_include_relative_path() {
     let ctx = MacroContext::new();
     let entries = load_request_file(&main_req, &ctx).await.unwrap();
     let names = pv_names(&entries);
-    assert_eq!(names, vec!["OUTER_PV", "INNER_PV1", "INNER_PV2", "OUTER_PV2"]);
+    assert_eq!(
+        names,
+        vec!["OUTER_PV", "INNER_PV1", "INNER_PV2", "OUTER_PV2"]
+    );
 }
 
 #[tokio::test]
@@ -50,11 +56,7 @@ async fn test_nested_include() {
         "LEVEL1_PV\nfile level2.req\n",
     )
     .unwrap();
-    std::fs::write(
-        dir.path().join("main.req"),
-        "MAIN_PV\nfile level1.req\n",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("main.req"), "MAIN_PV\nfile level1.req\n").unwrap();
 
     let ctx = MacroContext::new();
     let entries = load_request_file(&dir.path().join("main.req"), &ctx)
@@ -80,7 +82,10 @@ async fn test_depth_limit() {
 
     let ctx = MacroContext::new();
     let result = load_request_file(&dir.path().join("level0.req"), &ctx).await;
-    assert!(matches!(result, Err(AutosaveError::IncludeDepthExceeded(_))));
+    assert!(matches!(
+        result,
+        Err(AutosaveError::IncludeDepthExceeded(_))
+    ));
 }
 
 #[tokio::test]
@@ -130,11 +135,7 @@ async fn test_include_with_macros() {
     let dir = tempfile::tempdir().unwrap();
 
     std::fs::write(dir.path().join("inner.req"), "$(P)pv1\n$(P)pv2\n").unwrap();
-    std::fs::write(
-        dir.path().join("main.req"),
-        "file inner.req P=TEST:\n",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("main.req"), "file inner.req P=TEST:\n").unwrap();
 
     let ctx = MacroContext::new();
     let entries = load_request_file(&dir.path().join("main.req"), &ctx)

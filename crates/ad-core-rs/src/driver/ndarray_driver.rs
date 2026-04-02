@@ -58,7 +58,10 @@ impl NDArrayDriverBase {
 
     /// Publish an array: update counters, push to plugins and channel outputs.
     pub fn publish_array(&mut self, array: Arc<NDArray>) -> AsynResult<()> {
-        let counter = self.port_base.get_int32_param(self.params.array_counter, 0)? + 1;
+        let counter = self
+            .port_base
+            .get_int32_param(self.params.array_counter, 0)?
+            + 1;
         self.port_base
             .set_int32_param(self.params.array_counter, 0, counter)?;
 
@@ -91,10 +94,10 @@ impl NDArrayDriverBase {
             self.pool.num_alloc_buffers() as i32,
         )?;
 
-        let callbacks_enabled =
-            self.port_base
-                .get_int32_param(self.params.array_callbacks, 0)?
-                != 0;
+        let callbacks_enabled = self
+            .port_base
+            .get_int32_param(self.params.array_callbacks, 0)?
+            != 0;
 
         if callbacks_enabled {
             self.port_base.set_generic_pointer_param(
@@ -116,7 +119,9 @@ impl NDArrayDriverBase {
         let path = self.port_base.get_string_param(self.params.file_path, 0)?;
         let name = self.port_base.get_string_param(self.params.file_name, 0)?;
         let number = self.port_base.get_int32_param(self.params.file_number, 0)?;
-        let template = self.port_base.get_string_param(self.params.file_template, 0)?;
+        let template = self
+            .port_base
+            .get_string_param(self.params.file_template, 0)?;
 
         let full = if template.is_empty() {
             format!("{}{}{:04}", path, name, number)
@@ -152,7 +157,9 @@ mod tests {
     fn test_new_sets_callbacks_enabled() {
         let drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
         assert_eq!(
-            drv.port_base.get_int32_param(drv.params.array_callbacks, 0).unwrap(),
+            drv.port_base
+                .get_int32_param(drv.params.array_callbacks, 0)
+                .unwrap(),
             1,
         );
     }
@@ -160,13 +167,21 @@ mod tests {
     #[test]
     fn test_publish_array() {
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
-        let arr = drv.pool.alloc(
-            vec![crate::ndarray::NDDimension::new(64), crate::ndarray::NDDimension::new(64)],
-            crate::ndarray::NDDataType::UInt8,
-        ).unwrap();
+        let arr = drv
+            .pool
+            .alloc(
+                vec![
+                    crate::ndarray::NDDimension::new(64),
+                    crate::ndarray::NDDimension::new(64),
+                ],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap();
         drv.publish_array(Arc::new(arr)).unwrap();
         assert_eq!(
-            drv.port_base.get_int32_param(drv.params.array_counter, 0).unwrap(),
+            drv.port_base
+                .get_int32_param(drv.params.array_counter, 0)
+                .unwrap(),
             1,
         );
     }
@@ -174,17 +189,27 @@ mod tests {
     #[test]
     fn test_publish_updates_size_info() {
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
-        let arr = drv.pool.alloc(
-            vec![crate::ndarray::NDDimension::new(320), crate::ndarray::NDDimension::new(240)],
-            crate::ndarray::NDDataType::UInt16,
-        ).unwrap();
+        let arr = drv
+            .pool
+            .alloc(
+                vec![
+                    crate::ndarray::NDDimension::new(320),
+                    crate::ndarray::NDDimension::new(240),
+                ],
+                crate::ndarray::NDDataType::UInt16,
+            )
+            .unwrap();
         drv.publish_array(Arc::new(arr)).unwrap();
         assert_eq!(
-            drv.port_base.get_int32_param(drv.params.array_size_x, 0).unwrap(),
+            drv.port_base
+                .get_int32_param(drv.params.array_size_x, 0)
+                .unwrap(),
             320,
         );
         assert_eq!(
-            drv.port_base.get_int32_param(drv.params.array_size_y, 0).unwrap(),
+            drv.port_base
+                .get_int32_param(drv.params.array_size_y, 0)
+                .unwrap(),
             240,
         );
     }
@@ -192,10 +217,18 @@ mod tests {
     #[test]
     fn test_create_file_name_default() {
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
-        drv.port_base.set_string_param(drv.params.file_path, 0, "/tmp/".into()).unwrap();
-        drv.port_base.set_string_param(drv.params.file_name, 0, "test_".into()).unwrap();
-        drv.port_base.set_int32_param(drv.params.file_number, 0, 42).unwrap();
-        drv.port_base.set_string_param(drv.params.file_template, 0, "".into()).unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_path, 0, "/tmp/".into())
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_name, 0, "test_".into())
+            .unwrap();
+        drv.port_base
+            .set_int32_param(drv.params.file_number, 0, 42)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_template, 0, "".into())
+            .unwrap();
 
         let name = drv.create_file_name().unwrap();
         assert_eq!(name, "/tmp/test_0042");
@@ -204,14 +237,18 @@ mod tests {
     #[test]
     fn test_check_path_exists() {
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
-        drv.port_base.set_string_param(drv.params.file_path, 0, "/tmp".into()).unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_path, 0, "/tmp".into())
+            .unwrap();
         assert!(drv.check_path().unwrap());
     }
 
     #[test]
     fn test_check_path_not_exists() {
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
-        drv.port_base.set_string_param(drv.params.file_path, 0, "/nonexistent_path_xyz".into()).unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_path, 0, "/nonexistent_path_xyz".into())
+            .unwrap();
         assert!(!drv.check_path().unwrap());
     }
 
@@ -222,10 +259,13 @@ mod tests {
         drv.connect_downstream(sender);
         assert_eq!(drv.num_plugins(), 1);
 
-        let arr = drv.pool.alloc(
-            vec![crate::ndarray::NDDimension::new(8)],
-            crate::ndarray::NDDataType::UInt8,
-        ).unwrap();
+        let arr = drv
+            .pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(8)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap();
         let id = arr.unique_id;
         drv.publish_array(Arc::new(arr)).unwrap();
 

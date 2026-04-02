@@ -79,11 +79,7 @@ impl OctetInterpose for FlushTimeoutInterpose {
         next.write(user, data)
     }
 
-    fn flush(
-        &mut self,
-        user: &mut AsynUser,
-        next: &mut dyn OctetNext,
-    ) -> AsynResult<()> {
+    fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
         next.flush(user)
     }
 }
@@ -91,8 +87,8 @@ impl OctetInterpose for FlushTimeoutInterpose {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::interpose::EomReason;
 

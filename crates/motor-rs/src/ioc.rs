@@ -37,10 +37,26 @@ impl SimMotorHolder {
         CommandDef::new(
             "simMotorCreate",
             vec![
-                ArgDesc { name: "port", arg_type: ArgType::String, optional: false },
-                ArgDesc { name: "lowLimit", arg_type: ArgType::Double, optional: false },
-                ArgDesc { name: "highLimit", arg_type: ArgType::Double, optional: false },
-                ArgDesc { name: "pollMs", arg_type: ArgType::Int, optional: true },
+                ArgDesc {
+                    name: "port",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "lowLimit",
+                    arg_type: ArgType::Double,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "highLimit",
+                    arg_type: ArgType::Double,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "pollMs",
+                    arg_type: ArgType::Int,
+                    optional: true,
+                },
             ],
             "simMotorCreate(port, lowLimit, highLimit, [pollMs]) - Create a simulated motor",
             move |args: &[ArgValue], ctx: &CommandContext| {
@@ -64,8 +80,9 @@ impl SimMotorHolder {
 
                 let dtyp_key = format!("simMotor_{port}");
 
-                let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
-                    Arc::new(Mutex::new(SimMotor::new().with_limits(low_limit, high_limit)));
+                let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> = Arc::new(
+                    Mutex::new(SimMotor::new().with_limits(low_limit, high_limit)),
+                );
 
                 let setup = MotorBuilder::new(motor)
                     .poll_interval(Duration::from_millis(poll_ms))
@@ -83,8 +100,14 @@ impl SimMotorHolder {
                 // Spawn poll loop on the tokio runtime
                 ctx.runtime_handle().spawn(poll_loop.run());
 
-                holder.motors.lock().unwrap().insert(dtyp_key.clone(), Some(device_support));
-                println!("simMotorCreate: port={port} limits=[{low_limit}, {high_limit}] poll={poll_ms}ms (DTYP={dtyp_key})");
+                holder
+                    .motors
+                    .lock()
+                    .unwrap()
+                    .insert(dtyp_key.clone(), Some(device_support));
+                println!(
+                    "simMotorCreate: port={port} limits=[{low_limit}, {high_limit}] poll={poll_ms}ms (DTYP={dtyp_key})"
+                );
                 Ok(CommandOutcome::Continue)
             },
         )
@@ -95,19 +118,19 @@ impl SimMotorHolder {
     /// Each device support is consumed once (take semantics).
     pub fn device_support_factory(
         self: &Arc<Self>,
-    ) -> impl Fn(&epics_ca_rs::server::ioc_app::DeviceSupportContext) -> Option<Box<dyn epics_base_rs::server::device_support::DeviceSupport>>
-           + Send
-           + Sync
-           + 'static {
+    ) -> impl Fn(
+        &epics_ca_rs::server::ioc_app::DeviceSupportContext,
+    ) -> Option<Box<dyn epics_base_rs::server::device_support::DeviceSupport>>
+    + Send
+    + Sync
+    + 'static {
         let holder = self.clone();
         move |ctx: &epics_ca_rs::server::ioc_app::DeviceSupportContext| {
             let mut motors = holder.motors.lock().unwrap();
             if let Some(slot) = motors.get_mut(ctx.dtyp) {
                 if let Some(ds) = slot.take() {
-                    return Some(
-                        Box::new(ds)
-                            as Box<dyn epics_base_rs::server::device_support::DeviceSupport>,
-                    );
+                    return Some(Box::new(ds)
+                        as Box<dyn epics_base_rs::server::device_support::DeviceSupport>);
                 }
             }
             None

@@ -1,4 +1,4 @@
-use crate::flags::{MotorDir, FreezeOffset, MotorError};
+use crate::flags::{FreezeOffset, MotorDir, MotorError};
 
 /// Convert dial position to user position.
 /// user = dir.sign() * dial + off
@@ -248,9 +248,16 @@ mod tests {
 
     #[test]
     fn test_cascade_val_normal() {
-        let (dval, rval, off) =
-            cascade_from_val(10.0, MotorDir::Pos, 0.0, FreezeOffset::Variable, 0.01, false, 0.0)
-                .unwrap();
+        let (dval, rval, off) = cascade_from_val(
+            10.0,
+            MotorDir::Pos,
+            0.0,
+            FreezeOffset::Variable,
+            0.01,
+            false,
+            0.0,
+        )
+        .unwrap();
         assert_eq!(dval, 10.0);
         assert_eq!(rval, 1000);
         assert_eq!(off, 0.0);
@@ -258,9 +265,16 @@ mod tests {
 
     #[test]
     fn test_cascade_val_set_mode() {
-        let (dval, rval, off) =
-            cascade_from_val(20.0, MotorDir::Pos, 0.0, FreezeOffset::Variable, 0.01, true, 10.0)
-                .unwrap();
+        let (dval, rval, off) = cascade_from_val(
+            20.0,
+            MotorDir::Pos,
+            0.0,
+            FreezeOffset::Variable,
+            0.01,
+            true,
+            10.0,
+        )
+        .unwrap();
         assert_eq!(dval, 10.0); // unchanged
         assert_eq!(rval, 1000);
         assert_eq!(off, 10.0); // 20 - 1*10
@@ -268,9 +282,16 @@ mod tests {
 
     #[test]
     fn test_cascade_dval_frozen_off() {
-        let (val, rval, off) =
-            cascade_from_dval(5.0, MotorDir::Pos, 0.0, FreezeOffset::Frozen, 0.01, false, 10.0)
-                .unwrap();
+        let (val, rval, off) = cascade_from_dval(
+            5.0,
+            MotorDir::Pos,
+            0.0,
+            FreezeOffset::Frozen,
+            0.01,
+            false,
+            10.0,
+        )
+        .unwrap();
         assert_eq!(val, 10.0); // unchanged
         assert_eq!(rval, 500);
         assert_eq!(off, 5.0); // 10 - 1*5
@@ -278,8 +299,15 @@ mod tests {
 
     #[test]
     fn test_cascade_rval_normal() {
-        let (val, dval, off) =
-            cascade_from_rval(1000, MotorDir::Pos, 0.0, FreezeOffset::Variable, 0.01, false, 0.0);
+        let (val, dval, off) = cascade_from_rval(
+            1000,
+            MotorDir::Pos,
+            0.0,
+            FreezeOffset::Variable,
+            0.01,
+            false,
+            0.0,
+        );
         assert_eq!(dval, 10.0);
         assert_eq!(val, 10.0);
         assert_eq!(off, 0.0);
@@ -287,8 +315,15 @@ mod tests {
 
     #[test]
     fn test_cascade_rval_neg_dir() {
-        let (val, dval, off) =
-            cascade_from_rval(1000, MotorDir::Neg, 5.0, FreezeOffset::Variable, 0.01, false, 0.0);
+        let (val, dval, off) = cascade_from_rval(
+            1000,
+            MotorDir::Neg,
+            5.0,
+            FreezeOffset::Variable,
+            0.01,
+            false,
+            0.0,
+        );
         assert_eq!(dval, 10.0);
         assert_eq!(val, -5.0); // -1*10 + 5
         assert_eq!(off, 5.0);
@@ -308,9 +343,16 @@ mod tests {
     #[test]
     fn test_set_mode_val_write_updates_off() {
         // SET=1, writing VAL changes OFF but not DVAL
-        let (dval, _rval, off) =
-            cascade_from_val(100.0, MotorDir::Pos, 50.0, FreezeOffset::Variable, 0.01, true, 25.0)
-                .unwrap();
+        let (dval, _rval, off) = cascade_from_val(
+            100.0,
+            MotorDir::Pos,
+            50.0,
+            FreezeOffset::Variable,
+            0.01,
+            true,
+            25.0,
+        )
+        .unwrap();
         assert_eq!(dval, 25.0); // DVAL unchanged (= current_dval)
         assert_eq!(off, 75.0); // 100 - 1*25
     }
@@ -318,9 +360,16 @@ mod tests {
     #[test]
     fn test_frozen_offset_preserves_off() {
         // FOFF=Frozen, writing DVAL changes OFF to keep VAL constant
-        let (val, _rval, off) =
-            cascade_from_dval(20.0, MotorDir::Pos, 5.0, FreezeOffset::Frozen, 0.01, false, 30.0)
-                .unwrap();
+        let (val, _rval, off) = cascade_from_dval(
+            20.0,
+            MotorDir::Pos,
+            5.0,
+            FreezeOffset::Frozen,
+            0.01,
+            false,
+            30.0,
+        )
+        .unwrap();
         assert_eq!(val, 30.0); // VAL preserved
         assert_eq!(off, 10.0); // 30 - 1*20
     }

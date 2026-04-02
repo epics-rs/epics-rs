@@ -90,12 +90,9 @@ mod tests {
     #[test]
     fn test_alloc_handle_via_pool() {
         let pool = Arc::new(NDArrayPool::new(1_000_000));
-        let handle = NDArrayPool::alloc_handle(
-            &pool,
-            vec![NDDimension::new(64)],
-            NDDataType::UInt16,
-        )
-        .unwrap();
+        let handle =
+            NDArrayPool::alloc_handle(&pool, vec![NDDimension::new(64)], NDDataType::UInt16)
+                .unwrap();
         assert_eq!(handle.data.len(), 64);
         let alloc_before = pool.num_alloc_buffers();
 

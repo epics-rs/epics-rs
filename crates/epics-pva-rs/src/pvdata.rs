@@ -157,11 +157,17 @@ impl ScalarValue {
             ScalarType::Int => s.parse::<i32>().map(Self::Int).map_err(|e| e.to_string()),
             ScalarType::Long => s.parse::<i64>().map(Self::Long).map_err(|e| e.to_string()),
             ScalarType::UByte => s.parse::<u8>().map(Self::UByte).map_err(|e| e.to_string()),
-            ScalarType::UShort => s.parse::<u16>().map(Self::UShort).map_err(|e| e.to_string()),
+            ScalarType::UShort => s
+                .parse::<u16>()
+                .map(Self::UShort)
+                .map_err(|e| e.to_string()),
             ScalarType::UInt => s.parse::<u32>().map(Self::UInt).map_err(|e| e.to_string()),
             ScalarType::ULong => s.parse::<u64>().map(Self::ULong).map_err(|e| e.to_string()),
             ScalarType::Float => s.parse::<f32>().map(Self::Float).map_err(|e| e.to_string()),
-            ScalarType::Double => s.parse::<f64>().map(Self::Double).map_err(|e| e.to_string()),
+            ScalarType::Double => s
+                .parse::<f64>()
+                .map(Self::Double)
+                .map_err(|e| e.to_string()),
             ScalarType::String => Ok(Self::String(s.to_string())),
         }
     }

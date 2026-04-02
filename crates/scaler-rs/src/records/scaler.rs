@@ -2,7 +2,9 @@ use std::any::Any;
 use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult};
+use epics_base_rs::server::record::{
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// Maximum number of scaler channels.
@@ -159,9 +161,10 @@ impl ScalerRecord {
             return true;
         }
         // Fallback: check if any gated channel reached preset
-        self.g.iter().enumerate().any(|(i, &gate)| {
-            gate != 0 && self.pr[i] > 0 && self.s[i] >= self.pr[i]
-        })
+        self.g
+            .iter()
+            .enumerate()
+            .any(|(i, &gate)| gate != 0 && self.pr[i] > 0 && self.s[i] >= self.pr[i])
     }
 
     /// Build DeviceCommand actions for a count start sequence:
@@ -180,7 +183,10 @@ impl ScalerRecord {
             if self.g[i] != 0 {
                 actions.push(ProcessAction::DeviceCommand {
                     command: CMD_WRITE_PRESET,
-                    args: vec![EpicsValue::Long(i as i32), EpicsValue::Long(self.pr[i] as i32)],
+                    args: vec![
+                        EpicsValue::Long(i as i32),
+                        EpicsValue::Long(self.pr[i] as i32),
+                    ],
                 });
             }
         }
@@ -220,7 +226,10 @@ impl ScalerRecord {
                 if self.g[i] != 0 {
                     actions.push(ProcessAction::DeviceCommand {
                         command: CMD_WRITE_PRESET,
-                        args: vec![EpicsValue::Long(i as i32), EpicsValue::Long(self.pr[i] as i32)],
+                        args: vec![
+                            EpicsValue::Long(i as i32),
+                            EpicsValue::Long(self.pr[i] as i32),
+                        ],
                     });
                 }
             }
@@ -238,47 +247,151 @@ use std::sync::LazyLock;
 
 static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
     let mut fields = vec![
-        FieldDesc { name: "VAL",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "FREQ",  dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "CNT",   dbf_type: DbFieldType::Short,  read_only: false },
-        FieldDesc { name: "PCNT",  dbf_type: DbFieldType::Short,  read_only: true },
-        FieldDesc { name: "SS",    dbf_type: DbFieldType::Short,  read_only: true },
-        FieldDesc { name: "US",    dbf_type: DbFieldType::Short,  read_only: true },
-        FieldDesc { name: "CONT",  dbf_type: DbFieldType::Short,  read_only: false },
-        FieldDesc { name: "RATE",  dbf_type: DbFieldType::Float,  read_only: false },
-        FieldDesc { name: "RAT1",  dbf_type: DbFieldType::Float,  read_only: false },
-        FieldDesc { name: "DLY",   dbf_type: DbFieldType::Float,  read_only: false },
-        FieldDesc { name: "DLY1",  dbf_type: DbFieldType::Float,  read_only: false },
-        FieldDesc { name: "NCH",   dbf_type: DbFieldType::Short,  read_only: true },
-        FieldDesc { name: "TP",    dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "TP1",   dbf_type: DbFieldType::Double, read_only: false },
-        FieldDesc { name: "T",     dbf_type: DbFieldType::Double, read_only: true },
-        FieldDesc { name: "VERS",  dbf_type: DbFieldType::Float,  read_only: true },
-        FieldDesc { name: "PREC",  dbf_type: DbFieldType::Short,  read_only: false },
-        FieldDesc { name: "EGU",   dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "OUT",   dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "COUT",  dbf_type: DbFieldType::String, read_only: false },
-        FieldDesc { name: "COUTP", dbf_type: DbFieldType::String, read_only: false },
+        FieldDesc {
+            name: "VAL",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "FREQ",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "CNT",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "PCNT",
+            dbf_type: DbFieldType::Short,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "SS",
+            dbf_type: DbFieldType::Short,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "US",
+            dbf_type: DbFieldType::Short,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "CONT",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "RATE",
+            dbf_type: DbFieldType::Float,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "RAT1",
+            dbf_type: DbFieldType::Float,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "DLY",
+            dbf_type: DbFieldType::Float,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "DLY1",
+            dbf_type: DbFieldType::Float,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "NCH",
+            dbf_type: DbFieldType::Short,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "TP",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "TP1",
+            dbf_type: DbFieldType::Double,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "T",
+            dbf_type: DbFieldType::Double,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "VERS",
+            dbf_type: DbFieldType::Float,
+            read_only: true,
+        },
+        FieldDesc {
+            name: "PREC",
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "EGU",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "OUT",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "COUT",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
+        FieldDesc {
+            name: "COUTP",
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        },
     ];
     for i in 1..=MAX_SCALER_CHANNELS {
         let s: &'static str = Box::leak(format!("S{}", i).into_boxed_str());
-        fields.push(FieldDesc { name: s, dbf_type: DbFieldType::Long, read_only: true });
+        fields.push(FieldDesc {
+            name: s,
+            dbf_type: DbFieldType::Long,
+            read_only: true,
+        });
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let pr: &'static str = Box::leak(format!("PR{}", i).into_boxed_str());
-        fields.push(FieldDesc { name: pr, dbf_type: DbFieldType::Long, read_only: false });
+        fields.push(FieldDesc {
+            name: pr,
+            dbf_type: DbFieldType::Long,
+            read_only: false,
+        });
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let g: &'static str = Box::leak(format!("G{}", i).into_boxed_str());
-        fields.push(FieldDesc { name: g, dbf_type: DbFieldType::Short, read_only: false });
+        fields.push(FieldDesc {
+            name: g,
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        });
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let d: &'static str = Box::leak(format!("D{}", i).into_boxed_str());
-        fields.push(FieldDesc { name: d, dbf_type: DbFieldType::Short, read_only: false });
+        fields.push(FieldDesc {
+            name: d,
+            dbf_type: DbFieldType::Short,
+            read_only: false,
+        });
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let nm: &'static str = Box::leak(format!("NM{}", i).into_boxed_str());
-        fields.push(FieldDesc { name: nm, dbf_type: DbFieldType::String, read_only: false });
+        fields.push(FieldDesc {
+            name: nm,
+            dbf_type: DbFieldType::String,
+            read_only: false,
+        });
     }
     fields
 });
@@ -329,9 +442,7 @@ impl Record for ScalerRecord {
         // Handle CNT state change
         if self.cnt != self.pcnt {
             let mut handled = false;
-            if self.cnt != 0
-                && (self.us == USER_STATE_REQSTART || self.us == USER_STATE_WAITING)
-            {
+            if self.cnt != 0 && (self.us == USER_STATE_REQSTART || self.us == USER_STATE_WAITING) {
                 // Stop any existing auto-count via DeviceCommand
                 if self.ss == SCALER_STATE_COUNTING {
                     actions.push(Self::build_disarm_action());
@@ -376,7 +487,11 @@ impl Record for ScalerRecord {
 
         // Periodic display update during counting
         if self.ss == SCALER_STATE_COUNTING {
-            let rate = if self.us == USER_STATE_COUNTING { self.rate } else { self.rat1 };
+            let rate = if self.us == USER_STATE_COUNTING {
+                self.rate
+            } else {
+                self.rat1
+            };
             if rate > 0.1 {
                 let interval = std::time::Duration::from_secs_f64(1.0 / rate as f64);
                 actions.push(ProcessAction::ReprocessAfter(interval));
@@ -425,7 +540,8 @@ impl Record for ScalerRecord {
                     self.ss = SCALER_STATE_COUNTING;
                 }
             } else {
-                let elapsed = self.delay_start
+                let elapsed = self
+                    .delay_start
                     .map(|s| s.elapsed().as_secs_f64())
                     .unwrap_or(f64::MAX);
                 if elapsed >= self.dly1.max(0.0) as f64 {
@@ -450,10 +566,14 @@ impl Record for ScalerRecord {
     }
 
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
-        if !after { return Ok(()); }
+        if !after {
+            return Ok(());
+        }
         match field {
             "CNT" => {
-                if self.cnt != 0 && self.us != USER_STATE_IDLE { return Ok(()); }
+                if self.cnt != 0 && self.us != USER_STATE_IDLE {
+                    return Ok(());
+                }
                 if self.cnt != 0 {
                     let dly = self.dly.max(0.0);
                     if dly == 0.0 {
@@ -464,24 +584,40 @@ impl Record for ScalerRecord {
                     }
                 } else {
                     match self.us {
-                        USER_STATE_WAITING | USER_STATE_REQSTART => { self.us = USER_STATE_IDLE; }
+                        USER_STATE_WAITING | USER_STATE_REQSTART => {
+                            self.us = USER_STATE_IDLE;
+                        }
                         _ => {}
                     }
                 }
             }
             "CONT" => {}
-            "TP" => { self.tp_to_pr1(); }
+            "TP" => {
+                self.tp_to_pr1();
+            }
             "TP1" => {}
-            "RATE" => { self.rate = self.rate.clamp(0.0, 60.0); }
-            "RAT1" => { self.rat1 = self.rat1.clamp(0.0, 60.0); }
+            "RATE" => {
+                self.rate = self.rate.clamp(0.0, 60.0);
+            }
+            "RAT1" => {
+                self.rat1 = self.rat1.clamp(0.0, 60.0);
+            }
             _ => {
                 if field == "PR1" {
                     self.pr1_to_tp();
-                    if self.tp > 0.0 { self.d[0] = 1; self.g[0] = 1; }
+                    if self.tp > 0.0 {
+                        self.d[0] = 1;
+                        self.g[0] = 1;
+                    }
                 } else if let Some(i) = parse_indexed_field(field, "PR") {
-                    if self.pr[i] > 0 { self.d[i] = 1; self.g[i] = 1; }
+                    if self.pr[i] > 0 {
+                        self.d[i] = 1;
+                        self.g[i] = 1;
+                    }
                 } else if let Some(i) = parse_indexed_field(field, "G") {
-                    if self.g[i] != 0 && self.pr[i] == 0 { self.pr[i] = 1000; }
+                    if self.g[i] != 0 && self.pr[i] == 0 {
+                        self.pr[i] = 1000;
+                    }
                 }
             }
         }
@@ -494,64 +630,188 @@ impl Record for ScalerRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL"   => return Some(EpicsValue::Double(self.val)),
-            "FREQ"  => return Some(EpicsValue::Double(self.freq)),
-            "CNT"   => return Some(EpicsValue::Short(self.cnt)),
-            "PCNT"  => return Some(EpicsValue::Short(self.pcnt)),
-            "SS"    => return Some(EpicsValue::Short(self.ss)),
-            "US"    => return Some(EpicsValue::Short(self.us)),
-            "CONT"  => return Some(EpicsValue::Short(self.cont)),
-            "RATE"  => return Some(EpicsValue::Float(self.rate)),
-            "RAT1"  => return Some(EpicsValue::Float(self.rat1)),
-            "DLY"   => return Some(EpicsValue::Float(self.dly)),
-            "DLY1"  => return Some(EpicsValue::Float(self.dly1)),
-            "NCH"   => return Some(EpicsValue::Short(self.nch)),
-            "TP"    => return Some(EpicsValue::Double(self.tp)),
-            "TP1"   => return Some(EpicsValue::Double(self.tp1)),
-            "T"     => return Some(EpicsValue::Double(self.t)),
-            "VERS"  => return Some(EpicsValue::Float(self.vers)),
-            "PREC"  => return Some(EpicsValue::Short(self.prec)),
-            "EGU"   => return Some(EpicsValue::String(self.egu.clone())),
-            "OUT"   => return Some(EpicsValue::String(self.out.clone())),
-            "COUT"  => return Some(EpicsValue::String(self.cout.clone())),
+            "VAL" => return Some(EpicsValue::Double(self.val)),
+            "FREQ" => return Some(EpicsValue::Double(self.freq)),
+            "CNT" => return Some(EpicsValue::Short(self.cnt)),
+            "PCNT" => return Some(EpicsValue::Short(self.pcnt)),
+            "SS" => return Some(EpicsValue::Short(self.ss)),
+            "US" => return Some(EpicsValue::Short(self.us)),
+            "CONT" => return Some(EpicsValue::Short(self.cont)),
+            "RATE" => return Some(EpicsValue::Float(self.rate)),
+            "RAT1" => return Some(EpicsValue::Float(self.rat1)),
+            "DLY" => return Some(EpicsValue::Float(self.dly)),
+            "DLY1" => return Some(EpicsValue::Float(self.dly1)),
+            "NCH" => return Some(EpicsValue::Short(self.nch)),
+            "TP" => return Some(EpicsValue::Double(self.tp)),
+            "TP1" => return Some(EpicsValue::Double(self.tp1)),
+            "T" => return Some(EpicsValue::Double(self.t)),
+            "VERS" => return Some(EpicsValue::Float(self.vers)),
+            "PREC" => return Some(EpicsValue::Short(self.prec)),
+            "EGU" => return Some(EpicsValue::String(self.egu.clone())),
+            "OUT" => return Some(EpicsValue::String(self.out.clone())),
+            "COUT" => return Some(EpicsValue::String(self.cout.clone())),
             "COUTP" => return Some(EpicsValue::String(self.coutp.clone())),
             _ => {}
         }
-        if let Some(i) = parse_indexed_field(name, "NM") { return Some(EpicsValue::String(self.nm[i].clone())); }
-        if let Some(i) = parse_indexed_field(name, "PR") { return Some(EpicsValue::Long(self.pr[i] as i32)); }
-        if let Some(i) = parse_indexed_field(name, "S") { return Some(EpicsValue::Long(self.s[i] as i32)); }
-        if let Some(i) = parse_indexed_field(name, "G") { return Some(EpicsValue::Short(self.g[i])); }
-        if let Some(i) = parse_indexed_field(name, "D") { return Some(EpicsValue::Short(self.d[i])); }
+        if let Some(i) = parse_indexed_field(name, "NM") {
+            return Some(EpicsValue::String(self.nm[i].clone()));
+        }
+        if let Some(i) = parse_indexed_field(name, "PR") {
+            return Some(EpicsValue::Long(self.pr[i] as i32));
+        }
+        if let Some(i) = parse_indexed_field(name, "S") {
+            return Some(EpicsValue::Long(self.s[i] as i32));
+        }
+        if let Some(i) = parse_indexed_field(name, "G") {
+            return Some(EpicsValue::Short(self.g[i]));
+        }
+        if let Some(i) = parse_indexed_field(name, "D") {
+            return Some(EpicsValue::Short(self.d[i]));
+        }
         None
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL"   => match value { EpicsValue::Double(v) => { self.val = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "FREQ"  => match value { EpicsValue::Double(v) => { self.freq = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "CNT"   => match value { EpicsValue::Short(v)  => { self.cnt = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "CONT"  => match value { EpicsValue::Short(v)  => { self.cont = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "RATE"  => match value { EpicsValue::Float(v)  => { self.rate = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "RAT1"  => match value { EpicsValue::Float(v)  => { self.rat1 = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "DLY"   => match value { EpicsValue::Float(v)  => { self.dly = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "DLY1"  => match value { EpicsValue::Float(v)  => { self.dly1 = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "TP"    => match value { EpicsValue::Double(v) => { self.tp = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "TP1"   => match value { EpicsValue::Double(v) => { self.tp1 = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "PREC"  => match value { EpicsValue::Short(v)  => { self.prec = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "EGU"   => match value { EpicsValue::String(v) => { self.egu = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "OUT"   => match value { EpicsValue::String(v) => { self.out = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "COUT"  => match value { EpicsValue::String(v) => { self.cout = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
-            "COUTP" => match value { EpicsValue::String(v) => { self.coutp = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) },
+            "VAL" => match value {
+                EpicsValue::Double(v) => {
+                    self.val = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "FREQ" => match value {
+                EpicsValue::Double(v) => {
+                    self.freq = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "CNT" => match value {
+                EpicsValue::Short(v) => {
+                    self.cnt = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "CONT" => match value {
+                EpicsValue::Short(v) => {
+                    self.cont = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "RATE" => match value {
+                EpicsValue::Float(v) => {
+                    self.rate = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "RAT1" => match value {
+                EpicsValue::Float(v) => {
+                    self.rat1 = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DLY" => match value {
+                EpicsValue::Float(v) => {
+                    self.dly = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DLY1" => match value {
+                EpicsValue::Float(v) => {
+                    self.dly1 = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "TP" => match value {
+                EpicsValue::Double(v) => {
+                    self.tp = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "TP1" => match value {
+                EpicsValue::Double(v) => {
+                    self.tp1 = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "PREC" => match value {
+                EpicsValue::Short(v) => {
+                    self.prec = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "EGU" => match value {
+                EpicsValue::String(v) => {
+                    self.egu = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "OUT" => match value {
+                EpicsValue::String(v) => {
+                    self.out = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "COUT" => match value {
+                EpicsValue::String(v) => {
+                    self.cout = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "COUTP" => match value {
+                EpicsValue::String(v) => {
+                    self.coutp = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
             "PCNT" | "SS" | "US" | "NCH" | "T" | "VERS" => Err(CaError::ReadOnlyField(name.into())),
             _ => {
                 if let Some(i) = parse_indexed_field(name, "NM") {
-                    match value { EpicsValue::String(v) => { self.nm[i] = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) }
+                    match value {
+                        EpicsValue::String(v) => {
+                            self.nm[i] = v;
+                            Ok(())
+                        }
+                        _ => Err(CaError::TypeMismatch(name.into())),
+                    }
                 } else if let Some(i) = parse_indexed_field(name, "PR") {
-                    match value { EpicsValue::Long(v) => { self.pr[i] = v as u32; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) }
+                    match value {
+                        EpicsValue::Long(v) => {
+                            self.pr[i] = v as u32;
+                            Ok(())
+                        }
+                        _ => Err(CaError::TypeMismatch(name.into())),
+                    }
                 } else if let Some(i) = parse_indexed_field(name, "G") {
-                    match value { EpicsValue::Short(v) => { self.g[i] = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) }
+                    match value {
+                        EpicsValue::Short(v) => {
+                            self.g[i] = v;
+                            Ok(())
+                        }
+                        _ => Err(CaError::TypeMismatch(name.into())),
+                    }
                 } else if let Some(i) = parse_indexed_field(name, "D") {
-                    match value { EpicsValue::Short(v) => { self.d[i] = v; Ok(()) } _ => Err(CaError::TypeMismatch(name.into())) }
+                    match value {
+                        EpicsValue::Short(v) => {
+                            self.d[i] = v;
+                            Ok(())
+                        }
+                        _ => Err(CaError::TypeMismatch(name.into())),
+                    }
                 } else if parse_indexed_field(name, "S").is_some() {
                     Err(CaError::ReadOnlyField(name.into()))
                 } else {
@@ -565,7 +825,10 @@ impl Record for ScalerRecord {
         // Allow framework to write S1-S64 (read-only) from device support read
         if let Some(i) = parse_indexed_field(name, "S") {
             match value {
-                EpicsValue::Long(v) => { self.s[i] = v as u32; Ok(()) }
+                EpicsValue::Long(v) => {
+                    self.s[i] = v as u32;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             }
         } else {
@@ -583,8 +846,13 @@ impl Record for ScalerRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 { self.vers = VERSION; return Ok(()); }
-        if self.freq == 0.0 { self.freq = 1.0e7; }
+        if pass == 0 {
+            self.vers = VERSION;
+            return Ok(());
+        }
+        if self.freq == 0.0 {
+            self.freq = 1.0e7;
+        }
         if self.tp > 0.0 {
             self.pr[0] = (self.tp * self.freq) as u32;
         } else if self.pr[0] > 0 && self.freq > 0.0 {

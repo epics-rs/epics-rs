@@ -46,7 +46,10 @@ pub enum ParamValue {
     Int64Array(Vec<i64>),
     Float32Array(Vec<f32>),
     Float64Array(Vec<f64>),
-    Enum { index: usize, choices: Vec<EnumEntry> },
+    Enum {
+        index: usize,
+        choices: Vec<EnumEntry>,
+    },
     Undefined,
 }
 
@@ -97,7 +100,10 @@ impl From<&ParamValue> for param::ParamValue {
             ParamValue::Enum { index, choices } => Self::Enum {
                 index: *index,
                 choices: Arc::from(
-                    choices.iter().map(param::EnumEntry::from).collect::<Vec<_>>(),
+                    choices
+                        .iter()
+                        .map(param::EnumEntry::from)
+                        .collect::<Vec<_>>(),
                 ),
             },
             ParamValue::Undefined => Self::Undefined,
@@ -124,9 +130,7 @@ pub struct Timestamp(pub i64);
 
 impl From<std::time::SystemTime> for Timestamp {
     fn from(t: std::time::SystemTime) -> Self {
-        let dur = t
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
+        let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         Self(dur.as_micros() as i64)
     }
 }
@@ -167,8 +171,16 @@ mod tests {
             ParamValue::Enum {
                 index: 1,
                 choices: vec![
-                    EnumEntry { string: "Off".into(), value: 0, severity: 0 },
-                    EnumEntry { string: "On".into(), value: 1, severity: 0 },
+                    EnumEntry {
+                        string: "Off".into(),
+                        value: 0,
+                        severity: 0,
+                    },
+                    EnumEntry {
+                        string: "On".into(),
+                        value: 1,
+                        severity: 0,
+                    },
                 ],
             },
             ParamValue::Undefined,
@@ -215,10 +227,21 @@ mod tests {
     #[test]
     fn param_value_enum_roundtrip() {
         let entries: Arc<[param::EnumEntry]> = Arc::from(vec![
-            param::EnumEntry { string: "A".into(), value: 0, severity: 0 },
-            param::EnumEntry { string: "B".into(), value: 1, severity: 1 },
+            param::EnumEntry {
+                string: "A".into(),
+                value: 0,
+                severity: 0,
+            },
+            param::EnumEntry {
+                string: "B".into(),
+                value: 1,
+                severity: 1,
+            },
         ]);
-        let internal = param::ParamValue::Enum { index: 1, choices: entries };
+        let internal = param::ParamValue::Enum {
+            index: 1,
+            choices: entries,
+        };
         let proto = ParamValue::from(&internal);
         if let ParamValue::Enum { index, choices } = &proto {
             assert_eq!(*index, 1);
@@ -258,7 +281,10 @@ mod tests {
 
     #[test]
     fn alarm_meta_serde() {
-        let am = AlarmMeta { status: 1, severity: 2 };
+        let am = AlarmMeta {
+            status: 1,
+            severity: 2,
+        };
         let json = serde_json::to_string(&am).unwrap();
         let back: AlarmMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(am, back);

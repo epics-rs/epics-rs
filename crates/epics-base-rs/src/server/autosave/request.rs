@@ -20,11 +20,7 @@ pub async fn load_request_file(
     path: &Path,
     macros: &MacroContext,
 ) -> AutosaveResult<Vec<RequestEntry>> {
-    load_request_file_with_search_paths(
-        &path.to_string_lossy(),
-        &[],
-        macros,
-    ).await
+    load_request_file_with_search_paths(&path.to_string_lossy(), &[], macros).await
 }
 
 /// Load a .req file by searching multiple directories.
@@ -53,8 +49,8 @@ pub async fn load_request_file_with_search_paths(
             message: "file not found".to_string(),
         });
     } else {
-        resolve_in_search_paths(filename, search_paths)
-            .ok_or_else(|| AutosaveError::RequestFile {
+        resolve_in_search_paths(filename, search_paths).ok_or_else(|| {
+            AutosaveError::RequestFile {
                 path: filename.to_string(),
                 message: format!(
                     "file not found in search paths: {}",
@@ -64,24 +60,35 @@ pub async fn load_request_file_with_search_paths(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-            })?
+            }
+        })?
     };
 
-    let canonical = tokio::fs::canonicalize(&resolved).await.map_err(|e| {
-        AutosaveError::RequestFile {
-            path: resolved.display().to_string(),
-            message: format!("cannot resolve path: {e}"),
-        }
-    })?;
-    let content = tokio::fs::read_to_string(&canonical).await.map_err(|e| {
-        AutosaveError::RequestFile {
-            path: resolved.display().to_string(),
-            message: e.to_string(),
-        }
-    })?;
+    let canonical =
+        tokio::fs::canonicalize(&resolved)
+            .await
+            .map_err(|e| AutosaveError::RequestFile {
+                path: resolved.display().to_string(),
+                message: format!("cannot resolve path: {e}"),
+            })?;
+    let content =
+        tokio::fs::read_to_string(&canonical)
+            .await
+            .map_err(|e| AutosaveError::RequestFile {
+                path: resolved.display().to_string(),
+                message: e.to_string(),
+            })?;
     let base_dir = canonical.parent().unwrap_or(Path::new("."));
     let mut include_stack = vec![canonical.clone()];
-    parse_request_inner(&content, base_dir, macros, 0, &mut include_stack, &canonical, search_paths)
+    parse_request_inner(
+        &content,
+        base_dir,
+        macros,
+        0,
+        &mut include_stack,
+        &canonical,
+        search_paths,
+    )
 }
 
 /// Resolve a filename by searching directories, then current directory.
@@ -119,7 +126,9 @@ pub fn parse_request_string(
             // file includes not supported in string mode
             return Err(AutosaveError::RequestFile {
                 path: source_name.to_string(),
-                message: format!("file include not supported in parse_request_string at line {line_no}"),
+                message: format!(
+                    "file include not supported in parse_request_string at line {line_no}"
+                ),
             });
         }
 
@@ -190,17 +199,15 @@ fn parse_request_inner(
                     relative
                 } else {
                     // Fall back to search paths
-                    resolve_in_search_paths(&expanded_path, search_paths)
-                        .unwrap_or(relative) // use original for error message
+                    resolve_in_search_paths(&expanded_path, search_paths).unwrap_or(relative) // use original for error message
                 }
             };
 
-            let canonical = std::fs::canonicalize(&include_path).map_err(|e| {
-                AutosaveError::RequestFile {
+            let canonical =
+                std::fs::canonicalize(&include_path).map_err(|e| AutosaveError::RequestFile {
                     path: include_path.display().to_string(),
                     message: format!("cannot resolve include: {e}"),
-                }
-            })?;
+                })?;
 
             // Cycle detection
             if include_stack.contains(&canonical) {
@@ -213,12 +220,11 @@ fn parse_request_inner(
             }
 
             include_stack.push(canonical.clone());
-            let inc_content = std::fs::read_to_string(&canonical).map_err(|e| {
-                AutosaveError::RequestFile {
+            let inc_content =
+                std::fs::read_to_string(&canonical).map_err(|e| AutosaveError::RequestFile {
                     path: canonical.display().to_string(),
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             let inc_dir = canonical.parent().unwrap_or(Path::new("."));
             let sub_entries = parse_request_inner(
                 &inc_content,
@@ -271,7 +277,9 @@ fn parse_file_directive(rest: &str) -> (String, String) {
         }
     } else {
         // Unquoted: filename ends at first comma or whitespace
-        let end = rest.find(|c: char| c == ',' || c.is_whitespace()).unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| c == ',' || c.is_whitespace())
+            .unwrap_or(rest.len());
         let path = rest[..end].to_string();
         let after = rest[end..].trim();
         // Strip leading comma between path and macros

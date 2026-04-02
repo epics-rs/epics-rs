@@ -3,7 +3,7 @@ use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 use crate::calc::NumericInputs;
-use crate::calc::{compile, eval, CompiledExpr};
+use crate::calc::{CompiledExpr, compile, eval};
 
 const NUM_CHANNELS: usize = 16; // A-P
 
@@ -95,78 +95,350 @@ impl TransformRecord {
 }
 
 static TRANSFORM_FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "COPT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IVLA", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "PREC", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "COPT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IVLA",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // CLCA-CLCP
-    FieldDesc { name: "CLCA", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCB", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCC", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCD", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCE", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCF", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCG", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCH", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCI", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCJ", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCK", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCM", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCO", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "CLCP", dbf_type: DbFieldType::String, read_only: false },
+    FieldDesc {
+        name: "CLCA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCB",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCC",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCD",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCE",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCF",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCG",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCH",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCI",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCJ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCK",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCM",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCO",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CLCP",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
     // INPA-INPP
-    FieldDesc { name: "INPA", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPB", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPC", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPD", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPE", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPF", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPG", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPH", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPI", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPJ", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPK", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPM", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPO", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INPP", dbf_type: DbFieldType::String, read_only: false },
+    FieldDesc {
+        name: "INPA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPB",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPC",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPD",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPE",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPF",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPG",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPH",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPI",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPJ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPK",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPM",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPO",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPP",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
     // OUTA-OUTP
-    FieldDesc { name: "OUTA", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTB", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTC", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTD", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTE", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTF", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTG", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTH", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTI", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTJ", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTK", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTM", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTO", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTP", dbf_type: DbFieldType::String, read_only: false },
+    FieldDesc {
+        name: "OUTA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTB",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTC",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTD",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTE",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTF",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTG",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTH",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTI",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTJ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTK",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTM",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTO",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTP",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
     // A-P values
-    FieldDesc { name: "A", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "B", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "C", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "D", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "E", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "F", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "G", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "H", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "I", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "J", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "K", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "L", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "M", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "N", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "O", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "P", dbf_type: DbFieldType::Double, read_only: false },
+    FieldDesc {
+        name: "A",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "C",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "D",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "E",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "F",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "G",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "H",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "I",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "J",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "K",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "L",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "M",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "N",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "O",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "P",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 impl Record for TransformRecord {
@@ -230,29 +502,42 @@ impl Record for TransformRecord {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         if name == "VAL" {
-            self.vals[0] = value.to_f64().ok_or_else(|| CaError::TypeMismatch("VAL".into()))?;
+            self.vals[0] = value
+                .to_f64()
+                .ok_or_else(|| CaError::TypeMismatch("VAL".into()))?;
             return Ok(());
         }
         if name == "COPT" {
             match value {
-                EpicsValue::Short(v) => { self.copt = v; return Ok(()); }
+                EpicsValue::Short(v) => {
+                    self.copt = v;
+                    return Ok(());
+                }
                 _ => return Err(CaError::TypeMismatch("COPT".into())),
             }
         }
         if name == "IVLA" {
             match value {
-                EpicsValue::Short(v) => { self.ivla = v; return Ok(()); }
+                EpicsValue::Short(v) => {
+                    self.ivla = v;
+                    return Ok(());
+                }
                 _ => return Err(CaError::TypeMismatch("IVLA".into())),
             }
         }
         if name == "PREC" {
             match value {
-                EpicsValue::Short(v) => { self.prec = v; return Ok(()); }
+                EpicsValue::Short(v) => {
+                    self.prec = v;
+                    return Ok(());
+                }
                 _ => return Err(CaError::TypeMismatch("PREC".into())),
             }
         }
         if let Some(idx) = Self::channel_index(name) {
-            self.vals[idx] = value.to_f64().ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+            self.vals[idx] = value
+                .to_f64()
+                .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
             return Ok(());
         }
         if let Some(idx) = Self::calc_field_index(name) {
@@ -267,13 +552,19 @@ impl Record for TransformRecord {
         }
         if let Some(idx) = Self::inp_field_index(name) {
             match value {
-                EpicsValue::String(s) => { self.inp_links[idx] = s; return Ok(()); }
+                EpicsValue::String(s) => {
+                    self.inp_links[idx] = s;
+                    return Ok(());
+                }
                 _ => return Err(CaError::TypeMismatch(name.into())),
             }
         }
         if let Some(idx) = Self::out_field_index(name) {
             match value {
-                EpicsValue::String(s) => { self.out_links[idx] = s; return Ok(()); }
+                EpicsValue::String(s) => {
+                    self.out_links[idx] = s;
+                    return Ok(());
+                }
                 _ => return Err(CaError::TypeMismatch(name.into())),
             }
         }
@@ -281,17 +572,45 @@ impl Record for TransformRecord {
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
-        &[("INPA","A"),("INPB","B"),("INPC","C"),("INPD","D"),
-          ("INPE","E"),("INPF","F"),("INPG","G"),("INPH","H"),
-          ("INPI","I"),("INPJ","J"),("INPK","K"),("INPL","L"),
-          ("INPM","M"),("INPN","N"),("INPO","O"),("INPP","P")]
+        &[
+            ("INPA", "A"),
+            ("INPB", "B"),
+            ("INPC", "C"),
+            ("INPD", "D"),
+            ("INPE", "E"),
+            ("INPF", "F"),
+            ("INPG", "G"),
+            ("INPH", "H"),
+            ("INPI", "I"),
+            ("INPJ", "J"),
+            ("INPK", "K"),
+            ("INPL", "L"),
+            ("INPM", "M"),
+            ("INPN", "N"),
+            ("INPO", "O"),
+            ("INPP", "P"),
+        ]
     }
 
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
-        &[("OUTA","A"),("OUTB","B"),("OUTC","C"),("OUTD","D"),
-          ("OUTE","E"),("OUTF","F"),("OUTG","G"),("OUTH","H"),
-          ("OUTI","I"),("OUTJ","J"),("OUTK","K"),("OUTL","L"),
-          ("OUTM","M"),("OUTN","N"),("OUTO","O"),("OUTP","P")]
+        &[
+            ("OUTA", "A"),
+            ("OUTB", "B"),
+            ("OUTC", "C"),
+            ("OUTD", "D"),
+            ("OUTE", "E"),
+            ("OUTF", "F"),
+            ("OUTG", "G"),
+            ("OUTH", "H"),
+            ("OUTI", "I"),
+            ("OUTJ", "J"),
+            ("OUTK", "K"),
+            ("OUTL", "L"),
+            ("OUTM", "M"),
+            ("OUTN", "N"),
+            ("OUTO", "O"),
+            ("OUTP", "P"),
+        ]
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {
@@ -323,17 +642,29 @@ mod tests {
     #[test]
     fn test_transform_put_get_calc() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String("B+C".into())).unwrap();
-        assert_eq!(rec.get_field("CLCA"), Some(EpicsValue::String("B+C".into())));
+        rec.put_field("CLCA", EpicsValue::String("B+C".into()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("CLCA"),
+            Some(EpicsValue::String("B+C".into()))
+        );
     }
 
     #[test]
     fn test_transform_put_get_links() {
         let mut rec = TransformRecord::new();
-        rec.put_field("INPA", EpicsValue::String("pv1".into())).unwrap();
-        rec.put_field("OUTA", EpicsValue::String("pv2".into())).unwrap();
-        assert_eq!(rec.get_field("INPA"), Some(EpicsValue::String("pv1".into())));
-        assert_eq!(rec.get_field("OUTA"), Some(EpicsValue::String("pv2".into())));
+        rec.put_field("INPA", EpicsValue::String("pv1".into()))
+            .unwrap();
+        rec.put_field("OUTA", EpicsValue::String("pv2".into()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("INPA"),
+            Some(EpicsValue::String("pv1".into()))
+        );
+        assert_eq!(
+            rec.get_field("OUTA"),
+            Some(EpicsValue::String("pv2".into()))
+        );
     }
 
     #[test]
@@ -341,7 +672,8 @@ mod tests {
         let mut rec = TransformRecord::new();
         rec.put_field("B", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("C", EpicsValue::Double(4.0)).unwrap();
-        rec.put_field("CLCA", EpicsValue::String("B+C".into())).unwrap();
+        rec.put_field("CLCA", EpicsValue::String("B+C".into()))
+            .unwrap();
         rec.process().unwrap();
         assert_eq!(rec.vals[0], 7.0); // A = B+C = 3+4 = 7
     }
@@ -350,8 +682,10 @@ mod tests {
     fn test_transform_process_chain() {
         let mut rec = TransformRecord::new();
         rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
-        rec.put_field("CLCB", EpicsValue::String("A*3".into())).unwrap();
-        rec.put_field("CLCC", EpicsValue::String("B+1".into())).unwrap();
+        rec.put_field("CLCB", EpicsValue::String("A*3".into()))
+            .unwrap();
+        rec.put_field("CLCC", EpicsValue::String("B+1".into()))
+            .unwrap();
         rec.process().unwrap();
         assert_eq!(rec.vals[1], 6.0); // B = A*3 = 6
         assert_eq!(rec.vals[2], 7.0); // C = B+1 = 7 (uses updated B)
@@ -384,7 +718,8 @@ mod tests {
         rec.put_field("B", EpicsValue::Double(5.0)).unwrap();
         rec.put_field("IVLA", EpicsValue::Short(0)).unwrap();
         // CLCA has no valid calc (empty), CLCB evaluates
-        rec.put_field("CLCB", EpicsValue::String("A+1".into())).unwrap();
+        rec.put_field("CLCB", EpicsValue::String("A+1".into()))
+            .unwrap();
         rec.process().unwrap();
         assert_eq!(rec.vals[0], 10.0); // A unchanged
         assert_eq!(rec.vals[1], 11.0); // B = A+1 = 10+1 = 11
@@ -419,19 +754,24 @@ mod tests {
     fn test_transform_type_mismatch() {
         let mut rec = TransformRecord::new();
         assert!(rec.put_field("CLCA", EpicsValue::Double(1.0)).is_err());
-        assert!(rec.put_field("COPT", EpicsValue::String("x".into())).is_err());
+        assert!(
+            rec.put_field("COPT", EpicsValue::String("x".into()))
+                .is_err()
+        );
     }
 
     #[test]
     fn test_transform_recompile_on_calc_change() {
         let mut rec = TransformRecord::new();
         rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
-        rec.put_field("CLCB", EpicsValue::String("A*2".into())).unwrap();
+        rec.put_field("CLCB", EpicsValue::String("A*2".into()))
+            .unwrap();
         rec.process().unwrap();
         assert_eq!(rec.vals[1], 4.0);
 
         // Change calc expression
-        rec.put_field("CLCB", EpicsValue::String("A*3".into())).unwrap();
+        rec.put_field("CLCB", EpicsValue::String("A*3".into()))
+            .unwrap();
         rec.process().unwrap();
         assert_eq!(rec.vals[1], 6.0);
     }
@@ -439,7 +779,8 @@ mod tests {
     #[test]
     fn test_transform_val_is_a() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String("42".into())).unwrap();
+        rec.put_field("CLCA", EpicsValue::String("42".into()))
+            .unwrap();
         rec.process().unwrap();
         // VAL returns vals[0] which is A
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(42.0)));

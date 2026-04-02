@@ -399,36 +399,71 @@ pub fn eval_flux(params: &IoParams, scaler_counts: &[f64], ticks: f64) -> IoResu
     let mut flux = 0.0;
     flux += params.x_he
         * photon(
-            cps, WORK_HE, params.v2f, params.v_per_a, aln, dln1, params.kapton_front,
-            GasId::Helium, energy,
+            cps,
+            WORK_HE,
+            params.v2f,
+            params.v_per_a,
+            aln,
+            dln1,
+            params.kapton_front,
+            GasId::Helium,
+            energy,
         );
     flux += params.x_n2
         * photon(
-            cps, WORK_N2, params.v2f, params.v_per_a, aln, dln1, params.kapton_front,
-            GasId::Nitrogen, energy,
+            cps,
+            WORK_N2,
+            params.v2f,
+            params.v_per_a,
+            aln,
+            dln1,
+            params.kapton_front,
+            GasId::Nitrogen,
+            energy,
         );
     flux += params.x_ar
         * photon(
-            cps, WORK_AR, params.v2f, params.v_per_a, aln, dln1, params.kapton_front,
-            GasId::Argon, energy,
+            cps,
+            WORK_AR,
+            params.v2f,
+            params.v_per_a,
+            aln,
+            dln1,
+            params.kapton_front,
+            GasId::Argon,
+            energy,
         );
     flux += params.x_air
         * photon(
-            cps, WORK_AIR, params.v2f, params.v_per_a, aln, dln1, params.kapton_front,
-            GasId::Air, energy,
+            cps,
+            WORK_AIR,
+            params.v2f,
+            params.v_per_a,
+            aln,
+            dln1,
+            params.kapton_front,
+            GasId::Air,
+            energy,
         );
     flux += params.x_co2
         * photon(
-            cps, WORK_CO2, params.v2f, params.v_per_a, aln, dln1, params.kapton_front,
-            GasId::CO2, energy,
+            cps,
+            WORK_CO2,
+            params.v2f,
+            params.v_per_a,
+            aln,
+            dln1,
+            params.kapton_front,
+            GasId::CO2,
+            energy,
         );
 
     // Absorption from front of ion chamber to detector
     let air_abs = (-d_air * absorb(GasId::Air, energy)).exp();
     let he_abs = (-d_he * absorb(GasId::Helium, energy)).exp();
-    let kap_abs = (-(params.kapton_rear + params.kapton_front) * CM_PER_INCH
-        * absorb(GasId::Kapton, energy))
-        .exp();
+    let kap_abs =
+        (-(params.kapton_rear + params.kapton_front) * CM_PER_INCH * absorb(GasId::Kapton, energy))
+            .exp();
     let be_abs = (-d_be * absorb(GasId::Beryllium, energy)).exp();
 
     let fill_absorb = absorb(GasId::Helium, energy) * params.x_he
@@ -465,7 +500,7 @@ pub async fn run(config: IoConfig) -> Result<(), Box<dyn std::error::Error + Sen
     use epics_base_rs::types::EpicsValue;
     use epics_ca_rs::client::{CaChannel, CaClient};
     use tokio::select;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     /// Helper: read f64 from channel.
     async fn get_f64(ch: &CaChannel) -> f64 {
@@ -540,8 +575,13 @@ pub async fn run(config: IoConfig) -> Result<(), Box<dyn std::error::Error + Sen
     let mut sub_d_eff = ch_d_eff.subscribe().await?;
 
     // Initialize parameters
-    let mut params = IoParams { energy: get_f64(&ch_emono).await, ..Default::default() };
-    if params.energy == 0.0 { params.energy = 10.0; }
+    let mut params = IoParams {
+        energy: get_f64(&ch_emono).await,
+        ..Default::default()
+    };
+    if params.energy == 0.0 {
+        params.energy = 10.0;
+    }
     put_f64(&ch_e_using, params.energy).await;
 
     tracing::info!("Io state machine running for {p}");
@@ -752,7 +792,17 @@ mod tests {
         let energy = 10.0;
 
         let flux_he = photon(cps, WORK_HE, v2f, vpa, aln, dln, kap, GasId::Helium, energy);
-        let flux_n2 = photon(cps, WORK_N2, v2f, vpa, aln, dln, kap, GasId::Nitrogen, energy);
+        let flux_n2 = photon(
+            cps,
+            WORK_N2,
+            v2f,
+            vpa,
+            aln,
+            dln,
+            kap,
+            GasId::Nitrogen,
+            energy,
+        );
         let flux_ar = photon(cps, WORK_AR, v2f, vpa, aln, dln, kap, GasId::Argon, energy);
 
         // All should be positive

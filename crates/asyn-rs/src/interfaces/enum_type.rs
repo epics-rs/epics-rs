@@ -8,5 +8,9 @@ use crate::user::AsynUser;
 pub trait AsynEnum: Send + Sync {
     fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)>;
     fn write_enum(&mut self, user: &mut AsynUser, index: usize) -> AsynResult<()>;
-    fn write_enum_choices(&mut self, user: &mut AsynUser, choices: Arc<[EnumEntry]>) -> AsynResult<()>;
+    fn write_enum_choices(
+        &mut self,
+        user: &mut AsynUser,
+        choices: Arc<[EnumEntry]>,
+    ) -> AsynResult<()>;
 }

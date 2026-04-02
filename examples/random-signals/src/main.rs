@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_ca_rs::server::CaServer;
 use epics_base_rs::types::EpicsValue;
+use epics_ca_rs::server::CaServer;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -39,7 +39,10 @@ async fn main() -> CaResult<()> {
 
     let db = server.database().clone();
 
-    eprintln!("Random signals IOC started — {} @ 100 Hz", PV_NAMES.join(", "));
+    eprintln!(
+        "Random signals IOC started — {} @ 100 Hz",
+        PV_NAMES.join(", ")
+    );
 
     // Spawn 10ms update task
     epics_base_rs::runtime::task::spawn(async move {

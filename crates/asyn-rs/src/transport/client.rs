@@ -28,9 +28,8 @@ pub trait RuntimeClient: Send + Sync + 'static {
         filter: EventFilter,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<tokio::sync::mpsc::Receiver<PortEvent>, TransportError>,
-                > + Send
+            dyn Future<Output = Result<tokio::sync::mpsc::Receiver<PortEvent>, TransportError>>
+                + Send
                 + '_,
         >,
     >;

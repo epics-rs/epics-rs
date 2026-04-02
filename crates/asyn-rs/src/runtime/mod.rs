@@ -11,8 +11,8 @@ pub mod supervisor;
 
 /// Async sync primitives (channels, Notify, Mutex, etc.)
 pub mod sync {
-    pub use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock};
     pub use std::sync::Arc;
+    pub use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot};
 }
 
 /// Async task utilities (spawn, sleep, interval, etc.)

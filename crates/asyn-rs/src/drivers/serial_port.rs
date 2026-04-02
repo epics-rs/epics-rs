@@ -211,8 +211,8 @@ fn speed_to_baud(speed: libc::speed_t) -> u32 {
 /// or falls back to B9600 for unsupported values. Use `is_supported_baud()` to
 /// check before setting.
 const SUPPORTED_BAUDS: &[u32] = &[
-    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600,
-    19200, 38400, 57600, 115200, 230400,
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
+    115200, 230400,
 ];
 
 fn is_supported_baud(baud: u32) -> bool {
@@ -230,7 +230,9 @@ fn parse_bool_option(value: &str) -> AsynResult<bool> {
         "n" | "no" | "0" | "false" => Ok(false),
         _ => Err(AsynError::Status {
             status: AsynStatus::Error,
-            message: format!("invalid boolean value: '{value}' (expected y/yes/1/true or n/no/0/false)"),
+            message: format!(
+                "invalid boolean value: '{value}' (expected y/yes/1/true or n/no/0/false)"
+            ),
         }),
     }
 }
@@ -419,12 +421,11 @@ impl PortDriver for DrvAsynSerialPort {
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // 1. Open device
-        let c_path = std::ffi::CString::new(self.config.device.as_str()).map_err(|_| {
-            AsynError::Status {
+        let c_path =
+            std::ffi::CString::new(self.config.device.as_str()).map_err(|_| AsynError::Status {
                 status: AsynStatus::Error,
                 message: "invalid device path (contains NUL)".into(),
-            }
-        })?;
+            })?;
 
         let fd = unsafe {
             libc::open(
@@ -460,13 +461,24 @@ impl PortDriver for DrvAsynSerialPort {
 
         self.base.connected = true;
         self.base.announce_exception(AsynException::Connect, -1);
-        asyn_trace!(Some(self.base.trace), &self.base.port_name, TraceMask::FLOW,
-            "connected to {} at {} baud", self.config.device, self.config.baud);
+        asyn_trace!(
+            Some(self.base.trace),
+            &self.base.port_name,
+            TraceMask::FLOW,
+            "connected to {} at {} baud",
+            self.config.device,
+            self.config.baud
+        );
         Ok(())
     }
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        asyn_trace!(Some(self.base.trace), &self.base.port_name, TraceMask::FLOW, "disconnect");
+        asyn_trace!(
+            Some(self.base.trace),
+            &self.base.port_name,
+            TraceMask::FLOW,
+            "disconnect"
+        );
 
         // Restore original termios if available
         if let (Some(fd), Some(saved)) = (self.io.fd, &self.saved_termios) {
@@ -486,16 +498,32 @@ impl PortDriver for DrvAsynSerialPort {
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
-        let result = self.base.interpose_octet.dispatch_read(user, buf, &mut self.io)?;
-        asyn_trace_io!(Some(self.base.trace), &self.base.port_name, TraceMask::IO_DRIVER,
-            &buf[..result.nbytes_transferred], "read");
+        let result = self
+            .base
+            .interpose_octet
+            .dispatch_read(user, buf, &mut self.io)?;
+        asyn_trace_io!(
+            Some(self.base.trace),
+            &self.base.port_name,
+            TraceMask::IO_DRIVER,
+            &buf[..result.nbytes_transferred],
+            "read"
+        );
         Ok(result.nbytes_transferred)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
         self.base.check_ready()?;
-        asyn_trace_io!(Some(self.base.trace), &self.base.port_name, TraceMask::IO_DRIVER, data, "write");
-        self.base.interpose_octet.dispatch_write(user, data, &mut self.io)?;
+        asyn_trace_io!(
+            Some(self.base.trace),
+            &self.base.port_name,
+            TraceMask::IO_DRIVER,
+            data,
+            "write"
+        );
+        self.base
+            .interpose_octet
+            .dispatch_write(user, data, &mut self.io)?;
         Ok(())
     }
 
@@ -543,7 +571,7 @@ impl PortDriver for DrvAsynSerialPort {
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
                             message: format!("invalid data bits: '{value}' (expected 5/6/7/8)"),
-                        })
+                        });
                     }
                 };
                 self.config.data_bits = bits;
@@ -571,7 +599,7 @@ impl PortDriver for DrvAsynSerialPort {
                             message: format!(
                                 "invalid parity: '{value}' (expected none/odd/even; mark/space not supported)"
                             ),
-                        })
+                        });
                     }
                 };
                 self.config.parity = parity;
@@ -599,7 +627,7 @@ impl PortDriver for DrvAsynSerialPort {
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
                             message: format!("invalid stop bits: '{value}' (expected 1/2)"),
-                        })
+                        });
                     }
                 };
                 self.config.stop_bits = stop;
@@ -666,9 +694,7 @@ impl PortDriver for DrvAsynSerialPort {
                 }
             }
             _ => {
-                self.base
-                    .options
-                    .insert(key.to_string(), value.to_string());
+                self.base.options.insert(key.to_string(), value.to_string());
             }
         }
         Ok(())
@@ -834,7 +860,9 @@ mod tests {
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
         let err = drv.set_option("parity", "mark").unwrap_err();
         match err {
-            AsynError::Status { message, .. } => assert!(message.contains("mark/space not supported")),
+            AsynError::Status { message, .. } => {
+                assert!(message.contains("mark/space not supported"))
+            }
             _ => panic!("expected mark/space unsupported error"),
         }
     }
@@ -880,11 +908,15 @@ mod tests {
     #[test]
     fn test_baud_speed_roundtrip() {
         for baud in [
-            0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200,
-            38400, 57600, 115200, 230400,
+            0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400,
+            57600, 115200, 230400,
         ] {
             let speed = baud_to_speed(baud);
-            assert_eq!(speed_to_baud(speed), baud, "roundtrip failed for baud={baud}");
+            assert_eq!(
+                speed_to_baud(speed),
+                baud,
+                "roundtrip failed for baud={baud}"
+            );
         }
     }
 
@@ -942,10 +974,7 @@ mod tests {
         };
         // Close slave — driver will reopen it
         unsafe { libc::close(slave) };
-        let _guard = PtyGuard {
-            master,
-            slave: -1,
-        };
+        let _guard = PtyGuard { master, slave: -1 };
 
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
         let user = AsynUser::default();
@@ -968,10 +997,7 @@ mod tests {
             }
         };
         unsafe { libc::close(slave) };
-        let _guard = PtyGuard {
-            master,
-            slave: -1,
-        };
+        let _guard = PtyGuard { master, slave: -1 };
 
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
         let user = AsynUser::default();
@@ -1006,10 +1032,7 @@ mod tests {
             }
         };
         unsafe { libc::close(slave) };
-        let _guard = PtyGuard {
-            master,
-            slave: -1,
-        };
+        let _guard = PtyGuard { master, slave: -1 };
 
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
         let user = AsynUser::default();
@@ -1040,10 +1063,7 @@ mod tests {
             }
         };
         unsafe { libc::close(slave) };
-        let _guard = PtyGuard {
-            master,
-            slave: -1,
-        };
+        let _guard = PtyGuard { master, slave: -1 };
 
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
         let eos = EosInterpose::new(EosConfig {
@@ -1076,10 +1096,7 @@ mod tests {
             }
         };
         unsafe { libc::close(slave) };
-        let _guard = PtyGuard {
-            master,
-            slave: -1,
-        };
+        let _guard = PtyGuard { master, slave: -1 };
 
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
         let user = AsynUser::default();
@@ -1106,10 +1123,7 @@ mod tests {
             }
         };
         unsafe { libc::close(slave) };
-        let _guard = PtyGuard {
-            master,
-            slave: -1,
-        };
+        let _guard = PtyGuard { master, slave: -1 };
 
         let drv = DrvAsynSerialPort::new("pty_rt", &slave_name).unwrap();
         let (runtime_handle, _jh) = create_port_runtime(drv, RuntimeConfig::default());
@@ -1118,9 +1132,12 @@ mod tests {
         // Write via PortHandle
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         ph.submit_blocking(
-            crate::request::RequestOp::OctetWrite { data: b"ping".to_vec() },
+            crate::request::RequestOp::OctetWrite {
+                data: b"ping".to_vec(),
+            },
             user,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Read from master
         let mut buf = [0u8; 32];
@@ -1134,10 +1151,9 @@ mod tests {
 
         // Read via PortHandle
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
-        let result = ph.submit_blocking(
-            crate::request::RequestOp::OctetRead { buf_size: 32 },
-            user,
-        ).unwrap();
+        let result = ph
+            .submit_blocking(crate::request::RequestOp::OctetRead { buf_size: 32 }, user)
+            .unwrap();
         assert_eq!(result.data.as_deref(), Some(b"pong".as_slice()));
 
         runtime_handle.shutdown_and_wait();
@@ -1153,10 +1169,7 @@ mod tests {
             }
         };
         unsafe { libc::close(slave) };
-        let _guard = PtyGuard {
-            master,
-            slave: -1,
-        };
+        let _guard = PtyGuard { master, slave: -1 };
 
         // Read original termios before the driver touches it
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
@@ -1170,8 +1183,11 @@ mod tests {
         // cfmakeraw changes key flags; verify they differ now
         let current = drv.get_current_termios().unwrap();
         // Raw mode typically clears ECHO, ICANON in c_lflag
-        assert_ne!(current.c_lflag & libc::ECHO, saved.c_lflag & libc::ECHO,
-            "raw mode should have changed ECHO flag");
+        assert_ne!(
+            current.c_lflag & libc::ECHO,
+            saved.c_lflag & libc::ECHO,
+            "raw mode should have changed ECHO flag"
+        );
 
         // Re-set saved_termios (disconnect reads from it)
         drv.saved_termios = Some(saved);
@@ -1183,7 +1199,10 @@ mod tests {
         // from the same PTY slave path. Re-open to read the restored state.
         let c_path = std::ffi::CString::new(slave_name.as_str()).unwrap();
         let fd2 = unsafe {
-            libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK)
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
+            )
         };
         if fd2 >= 0 {
             let mut restored: libc::termios = unsafe { std::mem::zeroed() };

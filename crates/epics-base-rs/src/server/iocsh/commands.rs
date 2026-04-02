@@ -166,7 +166,9 @@ fn cmd_dbpf() -> CommandDef {
             let put_result: CaResult<()> = ctx.block_on(async {
                 let db = ctx.db();
                 if db.get_record(base).await.is_some() {
-                    db.put_record_field_from_ca(base, &field, value).await.map(|_| ())
+                    db.put_record_field_from_ca(base, &field, value)
+                        .await
+                        .map(|_| ())
                 } else {
                     db.put_pv(name, value).await
                 }
@@ -360,8 +362,8 @@ fn cmd_db_load_records() -> CommandDef {
             let count = defs.len();
 
             for def in defs {
-                let mut record = db_loader::create_record(&def.record_type)
-                    .map_err(|e| format!("{e}"))?;
+                let mut record =
+                    db_loader::create_record(&def.record_type).map_err(|e| format!("{e}"))?;
                 let mut common_fields = Vec::new();
                 db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
                     .map_err(|e| format!("{e}"))?;
@@ -374,19 +376,38 @@ fn cmd_db_load_records() -> CommandDef {
                         for (name, value) in common_fields {
                             use crate::server::record::CommonFieldPutResult;
                             match instance.put_common_field(&name, value) {
-                                Ok(CommonFieldPutResult::ScanChanged { old_scan, new_scan, phas }) => {
+                                Ok(CommonFieldPutResult::ScanChanged {
+                                    old_scan,
+                                    new_scan,
+                                    phas,
+                                }) => {
                                     drop(instance);
-                                    ctx.db().update_scan_index(&def.name, old_scan, new_scan, phas, phas).await;
+                                    ctx.db()
+                                        .update_scan_index(
+                                            &def.name, old_scan, new_scan, phas, phas,
+                                        )
+                                        .await;
                                     instance = rec_arc.write().await;
                                 }
-                                Ok(CommonFieldPutResult::PhasChanged { scan, old_phas, new_phas }) => {
+                                Ok(CommonFieldPutResult::PhasChanged {
+                                    scan,
+                                    old_phas,
+                                    new_phas,
+                                }) => {
                                     drop(instance);
-                                    ctx.db().update_scan_index(&def.name, scan, scan, old_phas, new_phas).await;
+                                    ctx.db()
+                                        .update_scan_index(
+                                            &def.name, scan, scan, old_phas, new_phas,
+                                        )
+                                        .await;
                                     instance = rec_arc.write().await;
                                 }
                                 Ok(CommonFieldPutResult::NoChange) => {}
                                 Err(e) => {
-                                    eprintln!("put_common_field({name}) failed for {}: {e}", def.name);
+                                    eprintln!(
+                                        "put_common_field({name}) failed for {}: {e}",
+                                        def.name
+                                    );
                                 }
                             }
                         }
@@ -470,12 +491,14 @@ fn parse_macro_string(s: &str) -> HashMap<String, String> {
     }
     for pair in s.split(',') {
         if let Some((k, v)) = pair.split_once('=') {
-            macros.insert(k.trim().to_string(), super::registry::substitute_env_vars(v.trim()));
+            macros.insert(
+                k.trim().to_string(),
+                super::registry::substitute_env_vars(v.trim()),
+            );
         }
     }
     macros
 }
-
 
 /// Get a display name for the DBF type of a value.
 fn dbf_type_name(val: &EpicsValue) -> &'static str {
@@ -623,7 +646,11 @@ mod tests {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
             db.add_record("AI_REC", Box::new(AiRecord::new(1.0))).await;
-            db.add_record("BO_REC", Box::new(crate::server::records::bo::BoRecord::new(0))).await;
+            db.add_record(
+                "BO_REC",
+                Box::new(crate::server::records::bo::BoRecord::new(0)),
+            )
+            .await;
         });
 
         let mut registry = CommandRegistry::new();

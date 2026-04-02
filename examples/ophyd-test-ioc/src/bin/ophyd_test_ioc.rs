@@ -16,10 +16,7 @@ use motor_rs::ioc::SimMotorHolder;
 
 #[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
-    epics_base_rs::runtime::env::set_default(
-        "OPHYD_TEST_IOC",
-        env!("CARGO_MANIFEST_DIR"),
-    );
+    epics_base_rs::runtime::env::set_default("OPHYD_TEST_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let mut ioc = AdIoc::new();
 

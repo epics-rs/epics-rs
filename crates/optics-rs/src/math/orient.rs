@@ -45,11 +45,7 @@ pub fn calc_rot_y(a: f64) -> Mat3 {
 /// Calculate HKL from diffraction angles (in degrees).
 ///
 /// Returns `None` if the rotation matrix cannot be inverted.
-pub fn angles_to_hkl(
-    angles_deg: &[f64; 4],
-    omtx_inv: &Mat3,
-    a0_inv: &Mat3,
-) -> Option<Vec3> {
+pub fn angles_to_hkl(angles_deg: &[f64; 4], omtx_inv: &Mat3, a0_inv: &Mat3) -> Option<Vec3> {
     let angles: Vec<f64> = angles_deg.iter().map(|a| a * D2R).collect();
 
     let vec = [(angles[TTH] / 2.0).sin(), 0.0, 0.0];
@@ -88,9 +84,7 @@ pub fn hkl_to_angles(
 
     match constraint {
         Constraint::MinChiPhiMinus90 => {
-            angles[PHI] = (-hklp[0] * hklp[1]
-                / (hklp[2] * hklp[2] + hklp[1] * hklp[1]))
-                .atan();
+            angles[PHI] = (-hklp[0] * hklp[1] / (hklp[2] * hklp[2] + hklp[1] * hklp[1])).atan();
             // fall through to PhiConst logic
             let xx = check_small(hklp[2]);
             angles[CHI] = PI / 2.0
@@ -284,17 +278,105 @@ mod tests {
 
     // --- Si cubic: a=b=c=5.431, α=β=γ=90° ---
     const SI_CASES: &[TestCase] = &[
-        TestCase { h: 4.0, k: 0.0, l: 0.0, tth: 24.3414, th: 12.1707, chi: 0.0, phi: 0.0 },
-        TestCase { h: 0.0, k: 4.0, l: 0.0, tth: 24.3414, th: 12.1707, chi: 0.0, phi: 90.0 },
-        TestCase { h: 0.0, k: 0.0, l: 4.0, tth: 24.3414, th: 12.1707, chi: 90.0, phi: 0.0 },
-        TestCase { h: -4.0, k: 0.0, l: 0.0, tth: 24.3414, th: 12.1707, chi: 0.0, phi: 180.0 },
-        TestCase { h: 0.0, k: -4.0, l: 0.0, tth: 24.3414, th: 12.1707, chi: 0.0, phi: -90.0 },
-        TestCase { h: 0.0, k: 0.0, l: -4.0, tth: 24.3414, th: 12.1707, chi: -90.0, phi: 0.0 },
-        TestCase { h: 1.0, k: 2.0, l: 3.0, tth: 22.7475, th: 11.3738, chi: 53.3008, phi: 63.4349 },
-        TestCase { h: -1.0, k: 2.0, l: 3.0, tth: 22.7475, th: 11.3738, chi: 53.3008, phi: 116.5651 },
-        TestCase { h: 1.0, k: -2.0, l: 3.0, tth: 22.7475, th: 11.3738, chi: 53.3008, phi: -63.4349 },
-        TestCase { h: 1.0, k: 2.0, l: -3.0, tth: 22.7475, th: 11.3738, chi: -53.3008, phi: 63.4349 },
-        TestCase { h: -1.0, k: -2.0, l: -3.0, tth: 22.7475, th: 11.3738, chi: -53.3008, phi: -116.5651 },
+        TestCase {
+            h: 4.0,
+            k: 0.0,
+            l: 0.0,
+            tth: 24.3414,
+            th: 12.1707,
+            chi: 0.0,
+            phi: 0.0,
+        },
+        TestCase {
+            h: 0.0,
+            k: 4.0,
+            l: 0.0,
+            tth: 24.3414,
+            th: 12.1707,
+            chi: 0.0,
+            phi: 90.0,
+        },
+        TestCase {
+            h: 0.0,
+            k: 0.0,
+            l: 4.0,
+            tth: 24.3414,
+            th: 12.1707,
+            chi: 90.0,
+            phi: 0.0,
+        },
+        TestCase {
+            h: -4.0,
+            k: 0.0,
+            l: 0.0,
+            tth: 24.3414,
+            th: 12.1707,
+            chi: 0.0,
+            phi: 180.0,
+        },
+        TestCase {
+            h: 0.0,
+            k: -4.0,
+            l: 0.0,
+            tth: 24.3414,
+            th: 12.1707,
+            chi: 0.0,
+            phi: -90.0,
+        },
+        TestCase {
+            h: 0.0,
+            k: 0.0,
+            l: -4.0,
+            tth: 24.3414,
+            th: 12.1707,
+            chi: -90.0,
+            phi: 0.0,
+        },
+        TestCase {
+            h: 1.0,
+            k: 2.0,
+            l: 3.0,
+            tth: 22.7475,
+            th: 11.3738,
+            chi: 53.3008,
+            phi: 63.4349,
+        },
+        TestCase {
+            h: -1.0,
+            k: 2.0,
+            l: 3.0,
+            tth: 22.7475,
+            th: 11.3738,
+            chi: 53.3008,
+            phi: 116.5651,
+        },
+        TestCase {
+            h: 1.0,
+            k: -2.0,
+            l: 3.0,
+            tth: 22.7475,
+            th: 11.3738,
+            chi: 53.3008,
+            phi: -63.4349,
+        },
+        TestCase {
+            h: 1.0,
+            k: 2.0,
+            l: -3.0,
+            tth: 22.7475,
+            th: 11.3738,
+            chi: -53.3008,
+            phi: 63.4349,
+        },
+        TestCase {
+            h: -1.0,
+            k: -2.0,
+            l: -3.0,
+            tth: 22.7475,
+            th: 11.3738,
+            chi: -53.3008,
+            phi: -116.5651,
+        },
     ];
 
     #[test]
@@ -329,9 +411,33 @@ mod tests {
 
     // --- Be hcp: a=2.2858, b=2.2858, c=3.5843, γ=120° ---
     const BE_CASES: &[TestCase] = &[
-        TestCase { h: 4.0, k: 0.0, l: 0.0, tth: 70.6770, th: 35.3385, chi: 0.0, phi: 30.0 },
-        TestCase { h: 0.0, k: 4.0, l: 0.0, tth: 70.6770, th: 35.3385, chi: 0.0, phi: 90.0 },
-        TestCase { h: 0.0, k: 0.0, l: 4.0, tth: 37.2588, th: 18.6294, chi: 90.0, phi: 0.0 },
+        TestCase {
+            h: 4.0,
+            k: 0.0,
+            l: 0.0,
+            tth: 70.6770,
+            th: 35.3385,
+            chi: 0.0,
+            phi: 30.0,
+        },
+        TestCase {
+            h: 0.0,
+            k: 4.0,
+            l: 0.0,
+            tth: 70.6770,
+            th: 35.3385,
+            chi: 0.0,
+            phi: 90.0,
+        },
+        TestCase {
+            h: 0.0,
+            k: 0.0,
+            l: 4.0,
+            tth: 37.2588,
+            th: 18.6294,
+            chi: 90.0,
+            phi: 0.0,
+        },
     ];
 
     #[test]
@@ -347,9 +453,33 @@ mod tests {
 
     // --- VO2 monoclinic: a=5.743, b=4.517, c=5.375, β=122.6° ---
     const VO2_CASES: &[TestCase] = &[
-        TestCase { h: 4.0, k: 0.0, l: 0.0, tth: 27.3785, th: 13.6893, chi: 32.6, phi: 0.0 },
-        TestCase { h: 0.0, k: 4.0, l: 0.0, tth: 29.3676, th: 14.6838, chi: 0.0, phi: 90.0 },
-        TestCase { h: 0.0, k: 0.0, l: 4.0, tth: 29.2935, th: 14.6467, chi: 90.0, phi: 0.0 },
+        TestCase {
+            h: 4.0,
+            k: 0.0,
+            l: 0.0,
+            tth: 27.3785,
+            th: 13.6893,
+            chi: 32.6,
+            phi: 0.0,
+        },
+        TestCase {
+            h: 0.0,
+            k: 4.0,
+            l: 0.0,
+            tth: 29.3676,
+            th: 14.6838,
+            chi: 0.0,
+            phi: 90.0,
+        },
+        TestCase {
+            h: 0.0,
+            k: 0.0,
+            l: 4.0,
+            tth: 29.2935,
+            th: 14.6467,
+            chi: 90.0,
+            phi: 0.0,
+        },
     ];
 
     #[test]

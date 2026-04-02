@@ -75,16 +75,28 @@ impl MotorDeviceSupport {
 
         for cmd in &actions.commands {
             let result = match cmd {
-                MotorCommand::MoveAbsolute { position, velocity, acceleration } => {
+                MotorCommand::MoveAbsolute {
+                    position,
+                    velocity,
+                    acceleration,
+                } => {
                     tracing::info!("motor command: MoveAbsolute pos={position}, vel={velocity}");
                     motor.move_absolute(&user, *position, *velocity, *acceleration)
                 }
-                MotorCommand::MoveVelocity { direction, velocity, acceleration } => {
+                MotorCommand::MoveVelocity {
+                    direction,
+                    velocity,
+                    acceleration,
+                } => {
                     let target = if *direction { 1e9 } else { -1e9 };
                     tracing::info!("motor command: MoveVelocity dir={direction}, vel={velocity}");
                     motor.move_absolute(&user, target, *velocity, *acceleration)
                 }
-                MotorCommand::Home { forward, velocity, acceleration: _ } => {
+                MotorCommand::Home {
+                    forward,
+                    velocity,
+                    acceleration: _,
+                } => {
                     tracing::info!("motor command: Home forward={forward}");
                     motor.home(&user, *velocity, *forward)
                 }
@@ -100,9 +112,7 @@ impl MotorDeviceSupport {
                     tracing::info!("motor command: SetClosedLoop enable={enable}");
                     motor.set_closed_loop(&user, *enable)
                 }
-                MotorCommand::Poll => {
-                    Ok(())
-                }
+                MotorCommand::Poll => Ok(()),
             };
 
             if let Err(e) = result {
@@ -113,12 +123,18 @@ impl MotorDeviceSupport {
 
         // Manage poll loop
         match actions.poll {
-            PollDirective::Start => { let _ = self.poll_cmd_tx.try_send(PollCommand::StartPolling); }
-            PollDirective::Stop => { let _ = self.poll_cmd_tx.try_send(PollCommand::StopPolling); }
+            PollDirective::Start => {
+                let _ = self.poll_cmd_tx.try_send(PollCommand::StartPolling);
+            }
+            PollDirective::Stop => {
+                let _ = self.poll_cmd_tx.try_send(PollCommand::StopPolling);
+            }
             PollDirective::None => {}
         }
         if let Some(ref delay) = actions.schedule_delay {
-            let _ = self.poll_cmd_tx.try_send(PollCommand::ScheduleDelay(delay.id, delay.duration));
+            let _ = self
+                .poll_cmd_tx
+                .try_send(PollCommand::ScheduleDelay(delay.id, delay.duration));
         }
     }
 }
@@ -126,7 +142,8 @@ impl MotorDeviceSupport {
 impl DeviceSupport for MotorDeviceSupport {
     fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
         // Inject device_state into MotorRecord (for template-created records)
-        let motor_rec = record.as_any_mut()
+        let motor_rec = record
+            .as_any_mut()
             .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>());
 
         if let Some(motor_rec) = motor_rec {
@@ -146,11 +163,15 @@ impl DeviceSupport for MotorDeviceSupport {
         let mut ds = self.device_state.lock().map_err(|e| {
             epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"))
         })?;
-        ds.latest_status = Some(StampedStatus { seq: 1, status: status.clone() });
+        ds.latest_status = Some(StampedStatus {
+            seq: 1,
+            status: status.clone(),
+        });
         drop(ds);
 
         // Apply initial status to record (sets RBV, clears LVIO, etc.)
-        if let Some(motor_rec) = record.as_any_mut()
+        if let Some(motor_rec) = record
+            .as_any_mut()
             .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
         {
             motor_rec.process_motor_info(&status);

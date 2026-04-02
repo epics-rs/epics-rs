@@ -46,7 +46,9 @@ impl OctetInterpose for EchoInterpose {
             // Read back echo
             let mut echo_buf = [0u8; 1];
             let echo_result = next.read(
-                &AsynUser::new(user.reason).with_addr(user.addr).with_timeout(user.timeout),
+                &AsynUser::new(user.reason)
+                    .with_addr(user.addr)
+                    .with_timeout(user.timeout),
                 &mut echo_buf,
             )?;
             if echo_result.nbytes_transferred != 1 {
@@ -68,11 +70,7 @@ impl OctetInterpose for EchoInterpose {
         Ok(total)
     }
 
-    fn flush(
-        &mut self,
-        user: &mut AsynUser,
-        next: &mut dyn OctetNext,
-    ) -> AsynResult<()> {
+    fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
         next.flush(user)
     }
 }
@@ -92,7 +90,10 @@ mod tests {
 
     impl EchoBase {
         fn new() -> Self {
-            Self { echo_queue: VecDeque::new(), written: Vec::new() }
+            Self {
+                echo_queue: VecDeque::new(),
+                written: Vec::new(),
+            }
         }
     }
 
@@ -100,7 +101,10 @@ mod tests {
         fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
             if let Some(b) = self.echo_queue.pop_front() {
                 buf[0] = b;
-                Ok(OctetReadResult { nbytes_transferred: 1, eom_reason: EomReason::CNT })
+                Ok(OctetReadResult {
+                    nbytes_transferred: 1,
+                    eom_reason: EomReason::CNT,
+                })
             } else {
                 Err(AsynError::Status {
                     status: AsynStatus::Timeout,
@@ -117,7 +121,9 @@ mod tests {
             Ok(data.len())
         }
 
-        fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> { Ok(()) }
+        fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -139,12 +145,17 @@ mod tests {
         impl OctetNext for BadEchoBase {
             fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
                 buf[0] = b'X'; // Always echoes wrong char
-                Ok(OctetReadResult { nbytes_transferred: 1, eom_reason: EomReason::CNT })
+                Ok(OctetReadResult {
+                    nbytes_transferred: 1,
+                    eom_reason: EomReason::CNT,
+                })
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 Ok(data.len())
             }
-            fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> { Ok(()) }
+            fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
         }
 
         let mut stack = OctetInterposeStack::new();
@@ -153,7 +164,9 @@ mod tests {
         let mut base = BadEchoBase;
         let mut user = AsynUser::default();
 
-        let err = stack.dispatch_write(&mut user, b"A", &mut base).unwrap_err();
+        let err = stack
+            .dispatch_write(&mut user, b"A", &mut base)
+            .unwrap_err();
         match err {
             AsynError::Status { message, .. } => {
                 assert!(message.contains("echo mismatch"));
@@ -175,7 +188,9 @@ mod tests {
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 Ok(data.len())
             }
-            fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> { Ok(()) }
+            fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
         }
 
         let mut stack = OctetInterposeStack::new();
@@ -184,7 +199,15 @@ mod tests {
         let mut base = NoEchoBase;
         let mut user = AsynUser::default();
 
-        let err = stack.dispatch_write(&mut user, b"A", &mut base).unwrap_err();
-        assert!(matches!(err, AsynError::Status { status: AsynStatus::Timeout, .. }));
+        let err = stack
+            .dispatch_write(&mut user, b"A", &mut base)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AsynError::Status {
+                status: AsynStatus::Timeout,
+                ..
+            }
+        ));
     }
 }

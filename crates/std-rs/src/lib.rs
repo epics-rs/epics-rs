@@ -5,8 +5,8 @@
     clippy::type_complexity
 )]
 
-pub mod records;
 pub mod device_support;
+pub mod records;
 pub mod snl;
 
 pub use records::epid::EpidRecord;
@@ -28,7 +28,10 @@ pub fn throttle_record_factory() -> (&'static str, epics_base_rs::server::Record
 
 /// Return the timestamp record type factory for injection into IocBuilder.
 pub fn timestamp_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
-    ("timestamp", Box::new(|| Box::new(TimestampRecord::default())))
+    (
+        "timestamp",
+        Box::new(|| Box::new(TimestampRecord::default())),
+    )
 }
 
 /// Return all std record type factories for bulk registration.

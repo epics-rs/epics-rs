@@ -69,7 +69,10 @@ mod tests {
 
     #[test]
     fn test_get_or_default() {
-        assert_eq!(get_or("_EPICS_RT_NONEXISTENT_VAR_12345", "fallback"), "fallback");
+        assert_eq!(
+            get_or("_EPICS_RT_NONEXISTENT_VAR_12345", "fallback"),
+            "fallback"
+        );
     }
 
     #[test]
@@ -95,7 +98,10 @@ mod tests {
     fn test_get_bool_true_values() {
         for val in &["1", "true", "TRUE", "yes", "YES"] {
             unsafe { std::env::set_var("_EPICS_RT_TEST_BOOL", val) };
-            assert!(get_bool("_EPICS_RT_TEST_BOOL", false), "failed for value: {val}");
+            assert!(
+                get_bool("_EPICS_RT_TEST_BOOL", false),
+                "failed for value: {val}"
+            );
         }
         unsafe { std::env::remove_var("_EPICS_RT_TEST_BOOL") };
     }

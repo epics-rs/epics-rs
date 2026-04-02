@@ -9,15 +9,15 @@ const EPICS_EPOCH_OFFSET: i64 = 631152000;
 
 /// Timestamp format strings indexed by TST field value.
 const TIMESTAMP_FORMATS: &[&str] = &[
-    "%y/%m/%d %H:%M:%S",       // 0
-    "%m/%d/%y %H:%M:%S",       // 1
-    "%b %d %H:%M:%S %y",       // 2
-    "%b %d %H:%M:%S",          // 3
-    "%H:%M:%S",                // 4
-    "%H:%M",                   // 5
-    "%d/%m/%y %H:%M:%S",       // 6
-    "%d %b %H:%M:%S %y",       // 7
-    "%d-%b-%Y %H:%M:%S",       // 8: VMS format
+    "%y/%m/%d %H:%M:%S", // 0
+    "%m/%d/%y %H:%M:%S", // 1
+    "%b %d %H:%M:%S %y", // 2
+    "%b %d %H:%M:%S",    // 3
+    "%H:%M:%S",          // 4
+    "%H:%M",             // 5
+    "%d/%m/%y %H:%M:%S", // 6
+    "%d %b %H:%M:%S %y", // 7
+    "%d-%b-%Y %H:%M:%S", // 8: VMS format
 ];
 
 /// Timestamp record — generates formatted timestamp strings.
@@ -46,10 +46,26 @@ impl Default for TimestampRecord {
 }
 
 static FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL",  dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OVAL", dbf_type: DbFieldType::String, read_only: true },
-    FieldDesc { name: "RVAL", dbf_type: DbFieldType::Long,   read_only: false },
-    FieldDesc { name: "TST",  dbf_type: DbFieldType::Short,  read_only: false },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OVAL",
+        dbf_type: DbFieldType::String,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "RVAL",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "TST",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl TimestampRecord {
@@ -96,10 +112,10 @@ impl Record for TimestampRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL"  => Some(EpicsValue::String(self.val.clone())),
+            "VAL" => Some(EpicsValue::String(self.val.clone())),
             "OVAL" => Some(EpicsValue::String(self.oval.clone())),
             "RVAL" => Some(EpicsValue::Long(self.rval)),
-            "TST"  => Some(EpicsValue::Short(self.tst)),
+            "TST" => Some(EpicsValue::Short(self.tst)),
             _ => None,
         }
     }
@@ -107,15 +123,24 @@ impl Record for TimestampRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
-                EpicsValue::String(v) => { self.val = v; Ok(()) }
+                EpicsValue::String(v) => {
+                    self.val = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "RVAL" => match value {
-                EpicsValue::Long(v) => { self.rval = v; Ok(()) }
+                EpicsValue::Long(v) => {
+                    self.rval = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "TST" => match value {
-                EpicsValue::Short(v) => { self.tst = v; Ok(()) }
+                EpicsValue::Short(v) => {
+                    self.tst = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "OVAL" => Err(CaError::ReadOnlyField(name.into())),

@@ -25,13 +25,26 @@ pub struct SyncIOHandle {
 impl SyncIOHandle {
     /// Create from a PortHandle.
     pub fn from_handle(handle: PortHandle, addr: i32, timeout: Duration) -> Self {
-        Self { handle, addr, timeout }
+        Self {
+            handle,
+            addr,
+            timeout,
+        }
     }
 
     /// Connect to a named port via the PortManager (actor path).
-    pub fn connect(manager: &PortManager, port_name: &str, addr: i32, timeout: Duration) -> AsynResult<Self> {
+    pub fn connect(
+        manager: &PortManager,
+        port_name: &str,
+        addr: i32,
+        timeout: Duration,
+    ) -> AsynResult<Self> {
         let handle = manager.find_port_handle(port_name)?;
-        Ok(Self { handle, addr, timeout })
+        Ok(Self {
+            handle,
+            addr,
+            timeout,
+        })
     }
 
     fn user(&self, reason: usize) -> AsynUser {
@@ -58,7 +71,9 @@ impl SyncIOHandle {
 
     pub fn read_octet(&self, reason: usize, buf_size: usize) -> AsynResult<Vec<u8>> {
         let user = self.user(reason);
-        let result = self.handle.submit_blocking(RequestOp::OctetRead { buf_size }, user)?;
+        let result = self
+            .handle
+            .submit_blocking(RequestOp::OctetRead { buf_size }, user)?;
         result.data.ok_or_else(|| crate::error::AsynError::Status {
             status: crate::error::AsynStatus::Error,
             message: "octet read returned no data".into(),
@@ -67,52 +82,68 @@ impl SyncIOHandle {
 
     pub fn write_octet(&self, reason: usize, data: &[u8]) -> AsynResult<()> {
         let user = self.user(reason);
-        self.handle.submit_blocking(RequestOp::OctetWrite { data: data.to_vec() }, user)?;
+        self.handle.submit_blocking(
+            RequestOp::OctetWrite {
+                data: data.to_vec(),
+            },
+            user,
+        )?;
         Ok(())
     }
 
     pub fn read_uint32_digital(&self, reason: usize, mask: u32) -> AsynResult<u32> {
         let user = self.user(reason);
-        let result = self.handle.submit_blocking(RequestOp::UInt32DigitalRead { mask }, user)?;
-        result.uint_val.ok_or_else(|| crate::error::AsynError::Status {
-            status: crate::error::AsynStatus::Error,
-            message: "uint32 read returned no value".into(),
-        })
+        let result = self
+            .handle
+            .submit_blocking(RequestOp::UInt32DigitalRead { mask }, user)?;
+        result
+            .uint_val
+            .ok_or_else(|| crate::error::AsynError::Status {
+                status: crate::error::AsynStatus::Error,
+                message: "uint32 read returned no value".into(),
+            })
     }
 
     pub fn write_uint32_digital(&self, reason: usize, value: u32, mask: u32) -> AsynResult<()> {
         let user = self.user(reason);
-        self.handle.submit_blocking(RequestOp::UInt32DigitalWrite { value, mask }, user)?;
+        self.handle
+            .submit_blocking(RequestOp::UInt32DigitalWrite { value, mask }, user)?;
         Ok(())
     }
 
     pub fn read_int64(&self, reason: usize) -> AsynResult<i64> {
         let user = self.user(reason);
         let result = self.handle.submit_blocking(RequestOp::Int64Read, user)?;
-        result.int64_val.ok_or_else(|| crate::error::AsynError::Status {
-            status: crate::error::AsynStatus::Error,
-            message: "int64 read returned no value".into(),
-        })
+        result
+            .int64_val
+            .ok_or_else(|| crate::error::AsynError::Status {
+                status: crate::error::AsynStatus::Error,
+                message: "int64 read returned no value".into(),
+            })
     }
 
     pub fn write_int64(&self, reason: usize, value: i64) -> AsynResult<()> {
         let user = self.user(reason);
-        self.handle.submit_blocking(RequestOp::Int64Write { value }, user)?;
+        self.handle
+            .submit_blocking(RequestOp::Int64Write { value }, user)?;
         Ok(())
     }
 
     pub fn read_enum(&self, reason: usize) -> AsynResult<usize> {
         let user = self.user(reason);
         let result = self.handle.submit_blocking(RequestOp::EnumRead, user)?;
-        result.enum_index.ok_or_else(|| crate::error::AsynError::Status {
-            status: crate::error::AsynStatus::Error,
-            message: "enum read returned no index".into(),
-        })
+        result
+            .enum_index
+            .ok_or_else(|| crate::error::AsynError::Status {
+                status: crate::error::AsynStatus::Error,
+                message: "enum read returned no index".into(),
+            })
     }
 
     pub fn write_enum(&self, reason: usize, index: usize) -> AsynResult<()> {
         let user = self.user(reason);
-        self.handle.submit_blocking(RequestOp::EnumWrite { index }, user)?;
+        self.handle
+            .submit_blocking(RequestOp::EnumWrite { index }, user)?;
         Ok(())
     }
 
@@ -154,15 +185,20 @@ mod tests {
     }
 
     impl PortDriver for TestPort {
-        fn base(&self) -> &PortDriverBase { &self.base }
-        fn base_mut(&mut self) -> &mut PortDriverBase { &mut self.base }
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
     }
 
     use crate::runtime::PortRuntimeHandle;
 
     fn make_sync_io() -> (SyncIOHandle, PortRuntimeHandle) {
         let (handle, _jh) = create_port_runtime(TestPort::new(), RuntimeConfig::default());
-        let sio = SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
+        let sio =
+            SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
         (sio, handle)
     }
 

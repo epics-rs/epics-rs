@@ -52,12 +52,10 @@ impl fmt::Display for EpicsValue {
                 let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
                 write!(f, "[{}]", parts.join(", "))
             }
-            Self::CharArray(arr) => {
-                match std::str::from_utf8(arr) {
-                    Ok(s) => write!(f, "{s}"),
-                    Err(_) => write!(f, "{arr:?}"),
-                }
-            }
+            Self::CharArray(arr) => match std::str::from_utf8(arr) {
+                Ok(s) => write!(f, "{s}"),
+                Err(_) => write!(f, "{arr:?}"),
+            },
         }
     }
 }
@@ -67,7 +65,10 @@ impl EpicsValue {
     pub fn from_bytes(dbr_type: DbFieldType, data: &[u8]) -> CaResult<Self> {
         match dbr_type {
             DbFieldType::String => {
-                let end = data.iter().position(|&b| b == 0).unwrap_or(data.len().min(40));
+                let end = data
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(data.len().min(40));
                 let s = std::str::from_utf8(&data[..end])
                     .map_err(|e| CaError::Protocol(format!("invalid UTF-8: {e}")))?;
                 Ok(Self::String(s.to_string()))
@@ -182,8 +183,10 @@ impl EpicsValue {
                 let mut arr = Vec::with_capacity(count);
                 for i in 0..count {
                     let offset = i * 2;
-                    if offset + 2 > data.len() { break; }
-                    arr.push(i16::from_be_bytes([data[offset], data[offset+1]]));
+                    if offset + 2 > data.len() {
+                        break;
+                    }
+                    arr.push(i16::from_be_bytes([data[offset], data[offset + 1]]));
                 }
                 Ok(Self::ShortArray(arr))
             }
@@ -191,9 +194,14 @@ impl EpicsValue {
                 let mut arr = Vec::with_capacity(count);
                 for i in 0..count {
                     let offset = i * 4;
-                    if offset + 4 > data.len() { break; }
+                    if offset + 4 > data.len() {
+                        break;
+                    }
                     arr.push(f32::from_be_bytes([
-                        data[offset], data[offset+1], data[offset+2], data[offset+3],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]));
                 }
                 Ok(Self::FloatArray(arr))
@@ -202,8 +210,10 @@ impl EpicsValue {
                 let mut arr = Vec::with_capacity(count);
                 for i in 0..count {
                     let offset = i * 2;
-                    if offset + 2 > data.len() { break; }
-                    arr.push(u16::from_be_bytes([data[offset], data[offset+1]]));
+                    if offset + 2 > data.len() {
+                        break;
+                    }
+                    arr.push(u16::from_be_bytes([data[offset], data[offset + 1]]));
                 }
                 Ok(Self::EnumArray(arr))
             }
@@ -211,10 +221,18 @@ impl EpicsValue {
                 let mut arr = Vec::with_capacity(count);
                 for i in 0..count {
                     let offset = i * 8;
-                    if offset + 8 > data.len() { break; }
+                    if offset + 8 > data.len() {
+                        break;
+                    }
                     arr.push(f64::from_be_bytes([
-                        data[offset], data[offset+1], data[offset+2], data[offset+3],
-                        data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
                     ]));
                 }
                 Ok(Self::DoubleArray(arr))
@@ -223,9 +241,14 @@ impl EpicsValue {
                 let mut arr = Vec::with_capacity(count);
                 for i in 0..count {
                     let offset = i * 4;
-                    if offset + 4 > data.len() { break; }
+                    if offset + 4 > data.len() {
+                        break;
+                    }
                     arr.push(i32::from_be_bytes([
-                        data[offset], data[offset+1], data[offset+2], data[offset+3],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]));
                 }
                 Ok(Self::LongArray(arr))
@@ -423,7 +446,9 @@ impl EpicsValue {
                 .or_else(|_| {
                     Self::resolve_menu_string(s)
                         .map(Self::Short)
-                        .ok_or_else(|| CaError::InvalidValue(format!("invalid short or menu string: {s}")))
+                        .ok_or_else(|| {
+                            CaError::InvalidValue(format!("invalid short or menu string: {s}"))
+                        })
                 }),
             DbFieldType::Float => s
                 .parse::<f32>()
@@ -434,7 +459,9 @@ impl EpicsValue {
                 .or_else(|_| {
                     Self::resolve_menu_string(s)
                         .map(|v| Self::Enum(v as u16))
-                        .ok_or_else(|| CaError::InvalidValue(format!("invalid enum or menu string: {s}")))
+                        .ok_or_else(|| {
+                            CaError::InvalidValue(format!("invalid enum or menu string: {s}"))
+                        })
                 }),
             DbFieldType::Char => Self::parse_int(s)
                 .map(|v| Self::Char(v as u8))
@@ -453,11 +480,12 @@ impl EpicsValue {
     fn parse_int(s: &str) -> CaResult<i64> {
         let s = s.trim();
         if s.starts_with("0x") || s.starts_with("0X") {
-            i64::from_str_radix(&s[2..], 16)
-                .map_err(|e| CaError::InvalidValue(e.to_string()))
-        } else if s.starts_with('0') && s.len() > 1 && s.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
-            i64::from_str_radix(&s[1..], 8)
-                .map_err(|e| CaError::InvalidValue(e.to_string()))
+            i64::from_str_radix(&s[2..], 16).map_err(|e| CaError::InvalidValue(e.to_string()))
+        } else if s.starts_with('0')
+            && s.len() > 1
+            && s.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+        {
+            i64::from_str_radix(&s[1..], 8).map_err(|e| CaError::InvalidValue(e.to_string()))
         } else {
             s.parse::<i64>()
                 .map_err(|e| CaError::InvalidValue(e.to_string()))

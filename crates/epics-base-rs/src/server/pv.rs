@@ -1,4 +1,4 @@
-use crate::runtime::sync::{mpsc, Mutex, RwLock};
+use crate::runtime::sync::{Mutex, RwLock, mpsc};
 
 use crate::server::snapshot::Snapshot;
 use crate::types::{DbFieldType, EpicsValue};
@@ -68,12 +68,13 @@ impl ProcessVariable {
     async fn notify_subscribers(&self, value: EpicsValue) {
         let mut subs = self.subscribers.lock().await;
         // Remove subscribers whose channel has been dropped
-        subs.retain(|sub| {
-            !sub.tx.is_closed()
-        });
+        subs.retain(|sub| !sub.tx.is_closed());
         for sub in subs.iter() {
             let snapshot = Snapshot::new(value.clone(), 0, 0, crate::runtime::time::now_wall());
-            let _ = sub.tx.try_send(MonitorEvent { snapshot, origin: 0 });
+            let _ = sub.tx.try_send(MonitorEvent {
+                snapshot,
+                origin: 0,
+            });
         }
     }
 

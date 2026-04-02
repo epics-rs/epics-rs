@@ -25,29 +25,55 @@ record(throttle, "TEST:THR") {
     let db = server.database().clone();
 
     // First put + process: should send immediately
-    server.put("TEST:THR", EpicsValue::Double(10.0)).await.unwrap();
-    db.put_record_field_from_ca("TEST:THR", "PROC", EpicsValue::Short(1)).await.unwrap();
+    server
+        .put("TEST:THR", EpicsValue::Double(10.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("TEST:THR", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let sent = server.get("TEST:THR.SENT").await.unwrap();
-    assert_eq!(sent, EpicsValue::Double(10.0), "First value should be sent immediately");
+    assert_eq!(
+        sent,
+        EpicsValue::Double(10.0),
+        "First value should be sent immediately"
+    );
 
     let wait = server.get("TEST:THR.WAIT").await.unwrap();
-    assert_eq!(wait, EpicsValue::Short(1), "WAIT should be 1 during delay period");
+    assert_eq!(
+        wait,
+        EpicsValue::Short(1),
+        "WAIT should be 1 during delay period"
+    );
 
     // Second put during delay period — must process to queue the value
-    server.put("TEST:THR", EpicsValue::Double(20.0)).await.unwrap();
-    db.put_record_field_from_ca("TEST:THR", "PROC", EpicsValue::Short(1)).await.unwrap();
+    server
+        .put("TEST:THR", EpicsValue::Double(20.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("TEST:THR", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let sent = server.get("TEST:THR.SENT").await.unwrap();
-    assert_eq!(sent, EpicsValue::Double(10.0), "Second value should NOT be sent yet");
+    assert_eq!(
+        sent,
+        EpicsValue::Double(10.0),
+        "Second value should NOT be sent yet"
+    );
 
     // Wait for DLY to expire — framework's ReprocessAfter will drain the pending value
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let sent = server.get("TEST:THR.SENT").await.unwrap();
-    assert_eq!(sent, EpicsValue::Double(20.0), "After delay, pending value should be sent");
+    assert_eq!(
+        sent,
+        EpicsValue::Double(20.0),
+        "After delay, pending value should be sent"
+    );
 }
 
 #[tokio::test]
@@ -67,15 +93,24 @@ record(throttle, "TEST:THR2") {
         .unwrap();
     let db = server.database().clone();
 
-    server.put("TEST:THR2", EpicsValue::Double(42.0)).await.unwrap();
-    db.put_record_field_from_ca("TEST:THR2", "PROC", EpicsValue::Short(1)).await.unwrap();
+    server
+        .put("TEST:THR2", EpicsValue::Double(42.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("TEST:THR2", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let sent = server.get("TEST:THR2.SENT").await.unwrap();
     assert_eq!(sent, EpicsValue::Double(42.0));
 
     let wait = server.get("TEST:THR2.WAIT").await.unwrap();
-    assert_eq!(wait, EpicsValue::Short(0), "No delay means WAIT should be 0");
+    assert_eq!(
+        wait,
+        EpicsValue::Short(0),
+        "No delay means WAIT should be 0"
+    );
 }
 
 #[tokio::test]
@@ -98,15 +133,28 @@ record(throttle, "TEST:THR3") {
         .unwrap();
     let db = server.database().clone();
 
-    server.put("TEST:THR3", EpicsValue::Double(150.0)).await.unwrap();
-    db.put_record_field_from_ca("TEST:THR3", "PROC", EpicsValue::Short(1)).await.unwrap();
+    server
+        .put("TEST:THR3", EpicsValue::Double(150.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("TEST:THR3", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let sent = server.get("TEST:THR3.SENT").await.unwrap();
-    assert_eq!(sent, EpicsValue::Double(100.0), "Should be clipped to DRVLH");
+    assert_eq!(
+        sent,
+        EpicsValue::Double(100.0),
+        "Should be clipped to DRVLH"
+    );
 
     let drvls = server.get("TEST:THR3.DRVLS").await.unwrap();
-    assert_eq!(drvls, EpicsValue::Short(2), "DRVLS should indicate high limit");
+    assert_eq!(
+        drvls,
+        EpicsValue::Short(2),
+        "DRVLS should indicate high limit"
+    );
 }
 
 // ============================================================
@@ -136,12 +184,19 @@ record(epid, "TEST:PID") {
     let db = server.database().clone();
 
     // Set setpoint
-    server.put("TEST:PID.VAL", EpicsValue::Double(100.0)).await.unwrap();
+    server
+        .put("TEST:PID.VAL", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
 
     // Process twice with a small gap so dt > 0
-    db.put_record_field_from_ca("TEST:PID", "PROC", EpicsValue::Short(1)).await.unwrap();
+    db.put_record_field_from_ca("TEST:PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    db.put_record_field_from_ca("TEST:PID", "PROC", EpicsValue::Short(1)).await.unwrap();
+    db.put_record_field_from_ca("TEST:PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // P = KP * (VAL - CVAL) = 2.0 * (100 - 0) = 200.0
@@ -185,7 +240,9 @@ record(timestamp, "TEST:TS") {
     let db = server.database().clone();
 
     // Trigger process
-    db.put_record_field_from_ca("TEST:TS", "PROC", EpicsValue::Short(1)).await.unwrap();
+    db.put_record_field_from_ca("TEST:TS", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let val = server.get("TEST:TS").await.unwrap();

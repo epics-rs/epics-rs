@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::runtime::sync::mpsc;
 
@@ -112,16 +112,30 @@ impl RecordInstance {
         let rtype = self.record.record_type();
         match rtype {
             "ai" | "ao" | "calc" | "calcout" => {
-                let egu = self.record.get_field("EGU")
-                    .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                let egu = self
+                    .record
+                    .get_field("EGU")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_default();
-                let prec = self.record.get_field("PREC")
+                let prec = self
+                    .record
+                    .get_field("PREC")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0) as i16;
-                let hopr = self.record.get_field("HOPR")
+                let hopr = self
+                    .record
+                    .get_field("HOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                let lopr = self.record.get_field("LOPR")
+                let lopr = self
+                    .record
+                    .get_field("LOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 let (hihi, high, low, lolo) = self.alarm_limits();
@@ -137,13 +151,25 @@ impl RecordInstance {
                 });
             }
             "longin" | "longout" => {
-                let egu = self.record.get_field("EGU")
-                    .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                let egu = self
+                    .record
+                    .get_field("EGU")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_default();
-                let hopr = self.record.get_field("HOPR")
+                let hopr = self
+                    .record
+                    .get_field("HOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                let lopr = self.record.get_field("LOPR")
+                let lopr = self
+                    .record
+                    .get_field("LOPR")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 let (hihi, high, low, lolo) = self.alarm_limits();
@@ -159,16 +185,30 @@ impl RecordInstance {
                 });
             }
             "motor" => {
-                let egu = self.record.get_field("EGU")
-                    .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                let egu = self
+                    .record
+                    .get_field("EGU")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_default();
-                let prec = self.record.get_field("PREC")
+                let prec = self
+                    .record
+                    .get_field("PREC")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0) as i16;
-                let hlm = self.record.get_field("HLM")
+                let hlm = self
+                    .record
+                    .get_field("HLM")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
-                let llm = self.record.get_field("LLM")
+                let llm = self
+                    .record
+                    .get_field("LLM")
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 snap.display = Some(super::super::snapshot::DisplayInfo {
@@ -194,8 +234,16 @@ impl RecordInstance {
                 // Output records use DRVH/DRVL, fallback to HOPR/LOPR
                 let drvh = self.record.get_field("DRVH").and_then(|v| v.to_f64());
                 let drvl = self.record.get_field("DRVL").and_then(|v| v.to_f64());
-                let hopr = self.record.get_field("HOPR").and_then(|v| v.to_f64()).unwrap_or(0.0);
-                let lopr = self.record.get_field("LOPR").and_then(|v| v.to_f64()).unwrap_or(0.0);
+                let hopr = self
+                    .record
+                    .get_field("HOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let lopr = self
+                    .record
+                    .get_field("LOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
                 snap.control = Some(super::super::snapshot::ControlInfo {
                     upper_ctrl_limit: drvh.unwrap_or(hopr),
                     lower_ctrl_limit: drvl.unwrap_or(lopr),
@@ -203,8 +251,16 @@ impl RecordInstance {
             }
             "motor" => {
                 // Motor records use HLM/LLM as control limits
-                let hlm = self.record.get_field("HLM").and_then(|v| v.to_f64()).unwrap_or(0.0);
-                let llm = self.record.get_field("LLM").and_then(|v| v.to_f64()).unwrap_or(0.0);
+                let hlm = self
+                    .record
+                    .get_field("HLM")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let llm = self
+                    .record
+                    .get_field("LLM")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
                 snap.control = Some(super::super::snapshot::ControlInfo {
                     upper_ctrl_limit: hlm,
                     lower_ctrl_limit: llm,
@@ -212,8 +268,16 @@ impl RecordInstance {
             }
             "ai" | "longin" | "calc" | "calcout" => {
                 // Input records use HOPR/LOPR as control limits
-                let hopr = self.record.get_field("HOPR").and_then(|v| v.to_f64()).unwrap_or(0.0);
-                let lopr = self.record.get_field("LOPR").and_then(|v| v.to_f64()).unwrap_or(0.0);
+                let hopr = self
+                    .record
+                    .get_field("HOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let lopr = self
+                    .record
+                    .get_field("LOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
                 snap.control = Some(super::super::snapshot::ControlInfo {
                     upper_ctrl_limit: hopr,
                     lower_ctrl_limit: lopr,
@@ -228,11 +292,27 @@ impl RecordInstance {
         let rtype = self.record.record_type();
         match rtype {
             "bi" | "bo" | "busy" => {
-                let znam = self.record.get_field("ZNAM")
-                    .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                let znam = self
+                    .record
+                    .get_field("ZNAM")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_default();
-                let onam = self.record.get_field("ONAM")
-                    .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                let onam = self
+                    .record
+                    .get_field("ONAM")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_default();
                 snap.enums = Some(super::super::snapshot::EnumInfo {
                     strings: vec![znam, onam],
@@ -240,14 +320,21 @@ impl RecordInstance {
             }
             "mbbi" | "mbbo" => {
                 let state_fields = [
-                    "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST",
-                    "EIST", "NIST", "TEST", "ELST", "TVST", "TTST", "FTST", "FFST",
+                    "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST",
+                    "TEST", "ELST", "TVST", "TTST", "FTST", "FFST",
                 ];
                 let strings: Vec<String> = state_fields
                     .iter()
                     .map(|f| {
-                        self.record.get_field(f)
-                            .and_then(|v| if let EpicsValue::String(s) = v { Some(s) } else { None })
+                        self.record
+                            .get_field(f)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
                             .unwrap_or_default()
                     })
                     .collect();
@@ -326,24 +413,64 @@ impl RecordInstance {
             "PUTF" => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
             "RPRO" => Some(EpicsValue::Char(if self.common.rpro { 1 } else { 0 })),
             "PACT" => Some(EpicsValue::Char(
-                if self.processing.load(std::sync::atomic::Ordering::Acquire) { 1 } else { 0 }
+                if self.processing.load(std::sync::atomic::Ordering::Acquire) {
+                    1
+                } else {
+                    0
+                },
             )),
             "PROC" => Some(EpicsValue::Char(0)), // Always 0 (trigger-only)
             // Analog alarm fields
-            "HIHI" => self.common.analog_alarm.as_ref().map(|a| EpicsValue::Double(a.hihi)),
-            "HIGH" => self.common.analog_alarm.as_ref().map(|a| EpicsValue::Double(a.high)),
-            "LOW" => self.common.analog_alarm.as_ref().map(|a| EpicsValue::Double(a.low)),
-            "LOLO" => self.common.analog_alarm.as_ref().map(|a| EpicsValue::Double(a.lolo)),
-            "HHSV" => self.common.analog_alarm.as_ref().map(|a| EpicsValue::Short(a.hhsv as i16)),
-            "HSV" => self.common.analog_alarm.as_ref().map(|a| EpicsValue::Short(a.hsv as i16)),
-            "LSV" => self.common.analog_alarm.as_ref().map(|a| EpicsValue::Short(a.lsv as i16)),
-            "LLSV" => self.common.analog_alarm.as_ref().map(|a| EpicsValue::Short(a.llsv as i16)),
+            "HIHI" => self
+                .common
+                .analog_alarm
+                .as_ref()
+                .map(|a| EpicsValue::Double(a.hihi)),
+            "HIGH" => self
+                .common
+                .analog_alarm
+                .as_ref()
+                .map(|a| EpicsValue::Double(a.high)),
+            "LOW" => self
+                .common
+                .analog_alarm
+                .as_ref()
+                .map(|a| EpicsValue::Double(a.low)),
+            "LOLO" => self
+                .common
+                .analog_alarm
+                .as_ref()
+                .map(|a| EpicsValue::Double(a.lolo)),
+            "HHSV" => self
+                .common
+                .analog_alarm
+                .as_ref()
+                .map(|a| EpicsValue::Short(a.hhsv as i16)),
+            "HSV" => self
+                .common
+                .analog_alarm
+                .as_ref()
+                .map(|a| EpicsValue::Short(a.hsv as i16)),
+            "LSV" => self
+                .common
+                .analog_alarm
+                .as_ref()
+                .map(|a| EpicsValue::Short(a.lsv as i16)),
+            "LLSV" => self
+                .common
+                .analog_alarm
+                .as_ref()
+                .map(|a| EpicsValue::Short(a.llsv as i16)),
             _ => None,
         }
     }
 
     /// Set a common field value. Returns what scan index changes are needed.
-    pub fn put_common_field(&mut self, name: &str, value: EpicsValue) -> CaResult<CommonFieldPutResult> {
+    pub fn put_common_field(
+        &mut self,
+        name: &str,
+        value: EpicsValue,
+    ) -> CaResult<CommonFieldPutResult> {
         let name = name.to_ascii_uppercase();
         self.record.validate_put(&name, &value)?;
         self.record.special(&name, false)?;
@@ -377,13 +504,11 @@ impl RecordInstance {
                     }
                 }
             }
-            "ACKT" => {
-                match value {
-                    EpicsValue::Char(v) => self.common.ackt = v != 0,
-                    EpicsValue::Short(v) => self.common.ackt = v != 0,
-                    _ => {}
-                }
-            }
+            "ACKT" => match value {
+                EpicsValue::Char(v) => self.common.ackt = v != 0,
+                EpicsValue::Short(v) => self.common.ackt = v != 0,
+                _ => {}
+            },
             "UDF" => {
                 if let EpicsValue::Char(v) = value {
                     self.common.udf = v != 0;
@@ -407,7 +532,11 @@ impl RecordInstance {
                     let phas = self.common.phas;
                     self.record.on_put(&name);
                     let _ = self.record.special(&name, true);
-                    return Ok(CommonFieldPutResult::ScanChanged { old_scan, new_scan, phas });
+                    return Ok(CommonFieldPutResult::ScanChanged {
+                        old_scan,
+                        new_scan,
+                        phas,
+                    });
                 }
             }
             "SSCN" => {
@@ -488,7 +617,11 @@ impl RecordInstance {
                         let scan = self.common.scan;
                         self.record.on_put(&name);
                         let _ = self.record.special(&name, true);
-                        return Ok(CommonFieldPutResult::PhasChanged { scan, old_phas, new_phas: v });
+                        return Ok(CommonFieldPutResult::PhasChanged {
+                            scan,
+                            old_phas,
+                            new_phas: v,
+                        });
                     }
                 }
             }
@@ -529,15 +662,15 @@ impl RecordInstance {
                 }
             }
             "LCNT" => {
-                if let EpicsValue::Short(v) = value { self.common.lcnt = v; }
-            }
-            "DISP" => {
-                match value {
-                    EpicsValue::Char(v) => self.common.disp = v != 0,
-                    EpicsValue::Short(v) => self.common.disp = v != 0,
-                    _ => {}
+                if let EpicsValue::Short(v) = value {
+                    self.common.lcnt = v;
                 }
             }
+            "DISP" => match value {
+                EpicsValue::Char(v) => self.common.disp = v != 0,
+                EpicsValue::Short(v) => self.common.disp = v != 0,
+                _ => {}
+            },
             "PUTF" => return Err(CaError::ReadOnlyField("PUTF".into())),
             "RPRO" => {
                 if let EpicsValue::Char(v) = value {
@@ -628,17 +761,55 @@ impl RecordInstance {
                     Some(EpicsValue::Enum(v)) => v,
                     _ => return,
                 };
-                let zsv = self.record.get_field("ZSV").and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None }).unwrap_or(0);
-                let osv = self.record.get_field("OSV").and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None }).unwrap_or(0);
-                let cosv = self.record.get_field("COSV").and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None }).unwrap_or(0);
+                let zsv = self
+                    .record
+                    .get_field("ZSV")
+                    .and_then(|v| {
+                        if let EpicsValue::Short(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let osv = self
+                    .record
+                    .get_field("OSV")
+                    .and_then(|v| {
+                        if let EpicsValue::Short(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let cosv = self
+                    .record
+                    .get_field("COSV")
+                    .and_then(|v| {
+                        if let EpicsValue::Short(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
 
                 let state_sev = if val == 0 { zsv } else { osv };
                 let sev = AlarmSeverity::from_u16(state_sev as u16);
                 let cos_sev = AlarmSeverity::from_u16(cosv as u16);
-                let final_sev = if cos_sev as u16 > sev as u16 { cos_sev } else { sev };
+                let final_sev = if cos_sev as u16 > sev as u16 {
+                    cos_sev
+                } else {
+                    sev
+                };
 
                 if final_sev != AlarmSeverity::NoAlarm {
-                    recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::STATE_ALARM, final_sev);
+                    recgbl::rec_gbl_set_sevr(
+                        &mut self.common,
+                        alarm_status::STATE_ALARM,
+                        final_sev,
+                    );
                 }
             }
             "mbbi" | "mbbo" => {
@@ -646,15 +817,43 @@ impl RecordInstance {
                     Some(EpicsValue::Enum(v)) => v as usize,
                     _ => return,
                 };
-                let sv_fields = ["ZRSV", "ONSV", "TWSV", "THSV", "FRSV", "FVSV",
-                    "SXSV", "SVSV", "EISV", "NISV", "TESV", "ELSV",
-                    "TVSV", "TTSV", "FTSV", "FFSV"];
-                let unsv = self.record.get_field("UNSV").and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None }).unwrap_or(0);
-                let cosv = self.record.get_field("COSV").and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None }).unwrap_or(0);
+                let sv_fields = [
+                    "ZRSV", "ONSV", "TWSV", "THSV", "FRSV", "FVSV", "SXSV", "SVSV", "EISV", "NISV",
+                    "TESV", "ELSV", "TVSV", "TTSV", "FTSV", "FFSV",
+                ];
+                let unsv = self
+                    .record
+                    .get_field("UNSV")
+                    .and_then(|v| {
+                        if let EpicsValue::Short(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let cosv = self
+                    .record
+                    .get_field("COSV")
+                    .and_then(|v| {
+                        if let EpicsValue::Short(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
 
                 let state_sev = if val < 16 {
-                    self.record.get_field(sv_fields[val])
-                        .and_then(|v| if let EpicsValue::Short(s) = v { Some(s) } else { None })
+                    self.record
+                        .get_field(sv_fields[val])
+                        .and_then(|v| {
+                            if let EpicsValue::Short(s) = v {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(unsv)
                 } else {
                     unsv
@@ -662,10 +861,18 @@ impl RecordInstance {
 
                 let sev = AlarmSeverity::from_u16(state_sev as u16);
                 let cos_sev = AlarmSeverity::from_u16(cosv as u16);
-                let final_sev = if cos_sev as u16 > sev as u16 { cos_sev } else { sev };
+                let final_sev = if cos_sev as u16 > sev as u16 {
+                    cos_sev
+                } else {
+                    sev
+                };
 
                 if final_sev != AlarmSeverity::NoAlarm {
-                    recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::STATE_ALARM, final_sev);
+                    recgbl::rec_gbl_set_sevr(
+                        &mut self.common,
+                        alarm_status::STATE_ALARM,
+                        final_sev,
+                    );
                 }
             }
             _ => {} // no-op for other types
@@ -676,21 +883,24 @@ impl RecordInstance {
         use crate::server::recgbl::{self, alarm_status};
 
         let hyst = self.common.hyst;
-        let lalm = self.record.get_field("LALM")
+        let lalm = self
+            .record
+            .get_field("LALM")
             .and_then(|v| v.to_f64())
             .unwrap_or(val);
 
-        let (new_sevr, new_stat) = if cfg.hhsv != AlarmSeverity::NoAlarm && val >= cfg.hihi && cfg.hihi != 0.0 {
-            (cfg.hhsv, alarm_status::HIHI_ALARM)
-        } else if cfg.llsv != AlarmSeverity::NoAlarm && val <= cfg.lolo && cfg.lolo != 0.0 {
-            (cfg.llsv, alarm_status::LOLO_ALARM)
-        } else if cfg.hsv != AlarmSeverity::NoAlarm && val >= cfg.high && cfg.high != 0.0 {
-            (cfg.hsv, alarm_status::HIGH_ALARM)
-        } else if cfg.lsv != AlarmSeverity::NoAlarm && val <= cfg.low && cfg.low != 0.0 {
-            (cfg.lsv, alarm_status::LOW_ALARM)
-        } else {
-            (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM)
-        };
+        let (new_sevr, new_stat) =
+            if cfg.hhsv != AlarmSeverity::NoAlarm && val >= cfg.hihi && cfg.hihi != 0.0 {
+                (cfg.hhsv, alarm_status::HIHI_ALARM)
+            } else if cfg.llsv != AlarmSeverity::NoAlarm && val <= cfg.lolo && cfg.lolo != 0.0 {
+                (cfg.llsv, alarm_status::LOLO_ALARM)
+            } else if cfg.hsv != AlarmSeverity::NoAlarm && val >= cfg.high && cfg.high != 0.0 {
+                (cfg.hsv, alarm_status::HIGH_ALARM)
+            } else if cfg.lsv != AlarmSeverity::NoAlarm && val <= cfg.low && cfg.low != 0.0 {
+                (cfg.lsv, alarm_status::LOW_ALARM)
+            } else {
+                (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM)
+            };
 
         // Apply hysteresis: only change alarm if value moved enough from LALM
         if hyst > 0.0 && self.common.sevr != AlarmSeverity::NoAlarm {
@@ -716,7 +926,10 @@ impl RecordInstance {
         use crate::server::recgbl::{self, EventMask};
         const LCNT_ALARM_THRESHOLD: i16 = 10;
 
-        if self.processing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        if self
+            .processing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
             self.common.lcnt = self.common.lcnt.saturating_add(1);
             if self.common.lcnt >= LCNT_ALARM_THRESHOLD {
                 self.common.sevr = AlarmSeverity::Invalid;
@@ -771,7 +984,11 @@ impl RecordInstance {
                 if changed {
                     if name == "VAL" {
                         if let Some(f) = val.to_f64() {
-                            if self.record.put_field("MLST", EpicsValue::Double(f)).is_err() {
+                            if self
+                                .record
+                                .put_field("MLST", EpicsValue::Double(f))
+                                .is_err()
+                            {
                                 self.common.mlst = Some(f);
                             }
                         }
@@ -826,8 +1043,14 @@ impl RecordInstance {
             }
         }
         if alarm_result.alarm_changed {
-            changed_fields.push(("SEVR".to_string(), EpicsValue::Short(self.common.sevr as i16)));
-            changed_fields.push(("STAT".to_string(), EpicsValue::Short(self.common.stat as i16)));
+            changed_fields.push((
+                "SEVR".to_string(),
+                EpicsValue::Short(self.common.sevr as i16),
+            ));
+            changed_fields.push((
+                "STAT".to_string(),
+                EpicsValue::Short(self.common.stat as i16),
+            ));
         }
 
         // Add subscribed fields that actually changed since last notification.
@@ -853,7 +1076,10 @@ impl RecordInstance {
             event_mask |= EventMask::VALUE;
         }
 
-        Ok(ProcessSnapshot { changed_fields, event_mask })
+        Ok(ProcessSnapshot {
+            changed_fields,
+            event_mask,
+        })
     }
 
     /// Check deadband (MDEL/ADEL) for VAL monitor/archive filtering.
@@ -867,14 +1093,28 @@ impl RecordInstance {
             None => return (true, true),
         };
 
-        let mdel = self.record.get_field("MDEL").and_then(|v| v.to_f64()).unwrap_or(0.0);
-        let adel = self.record.get_field("ADEL").and_then(|v| v.to_f64()).unwrap_or(0.0);
+        let mdel = self
+            .record
+            .get_field("MDEL")
+            .and_then(|v| v.to_f64())
+            .unwrap_or(0.0);
+        let adel = self
+            .record
+            .get_field("ADEL")
+            .and_then(|v| v.to_f64())
+            .unwrap_or(0.0);
 
         // Use record's MLST/ALST fields if available, otherwise fall back to CommonFields
-        let mlst = self.record.get_field("MLST").and_then(|v| v.to_f64())
+        let mlst = self
+            .record
+            .get_field("MLST")
+            .and_then(|v| v.to_f64())
             .or(self.common.mlst)
             .unwrap_or(f64::NAN);
-        let alst = self.record.get_field("ALST").and_then(|v| v.to_f64())
+        let alst = self
+            .record
+            .get_field("ALST")
+            .and_then(|v| v.to_f64())
             .or(self.common.alst)
             .unwrap_or(f64::NAN);
 
@@ -882,12 +1122,20 @@ impl RecordInstance {
         let archive_trigger = adel < 0.0 || alst.is_nan() || (val - alst).abs() > adel;
 
         if archive_trigger {
-            if self.record.put_field("ALST", EpicsValue::Double(val)).is_err() {
+            if self
+                .record
+                .put_field("ALST", EpicsValue::Double(val))
+                .is_err()
+            {
                 self.common.alst = Some(val);
             }
         }
         if monitor_trigger {
-            if self.record.put_field("MLST", EpicsValue::Double(val)).is_err() {
+            if self
+                .record
+                .put_field("MLST", EpicsValue::Double(val))
+                .is_err()
+            {
                 self.common.mlst = Some(val);
             }
         }
@@ -940,7 +1188,12 @@ impl RecordInstance {
     }
 
     /// Notify subscribers with an origin tag for self-write filtering.
-    pub fn notify_field_with_origin(&self, field: &str, mask: crate::server::recgbl::EventMask, origin: u64) {
+    pub fn notify_field_with_origin(
+        &self,
+        field: &str,
+        mask: crate::server::recgbl::EventMask,
+        origin: u64,
+    ) {
         if let Some(subs) = self.subscribers.get(field) {
             if let Some(value) = self.resolve_field(field) {
                 let mon_snap = self.make_monitor_snapshot(value);

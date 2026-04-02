@@ -665,7 +665,10 @@ pub async fn run<R, W>(
         Ok(())
     }
 
-    async fn send_and_read<R2: tokio::io::AsyncBufRead + Unpin, W2: tokio::io::AsyncWrite + Unpin>(
+    async fn send_and_read<
+        R2: tokio::io::AsyncBufRead + Unpin,
+        W2: tokio::io::AsyncWrite + Unpin,
+    >(
         writer: &mut W2,
         reader: &mut R2,
         buf: &mut String,
@@ -680,10 +683,7 @@ pub async fn run<R, W>(
             )),
             Ok(Ok(_)) => Ok(buf.clone()),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "timeout",
-            )),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")),
         }
     }
 
@@ -1425,17 +1425,11 @@ mod tests {
 
         ctrl.signal_mode = SignalMode::Average;
         ctrl.buflen = 20;
-        assert_eq!(
-            ctrl.signal_mode_command().to_serial(),
-            ":CONF1:AVGCURR 20"
-        );
+        assert_eq!(ctrl.signal_mode_command().to_serial(), ":CONF1:AVGCURR 20");
 
         ctrl.signal_mode = SignalMode::Window;
         ctrl.buflen = 30;
-        assert_eq!(
-            ctrl.signal_mode_command().to_serial(),
-            ":CONF1:WDWCURR 30"
-        );
+        assert_eq!(ctrl.signal_mode_command().to_serial(), ":CONF1:WDWCURR 30");
     }
 
     // -- Default gain trim values test --

@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use chrono::Local;
 use crate::types::EpicsValue;
+use chrono::Local;
 
 use super::error::{AutosaveError, AutosaveResult};
 use super::format::{ARRAY_MARKER, END_MARKER, VERSION};
@@ -20,7 +20,11 @@ pub async fn write_save_file(path: &Path, entries: &[SaveEntry]) -> AutosaveResu
 
     // Header
     let now = Local::now();
-    content.push_str(&format!("# {}\t{}\n", VERSION, now.format("%Y-%m-%d %H:%M:%S")));
+    content.push_str(&format!(
+        "# {}\t{}\n",
+        VERSION,
+        now.format("%Y-%m-%d %H:%M:%S")
+    ));
 
     for entry in entries {
         if entry.connected {

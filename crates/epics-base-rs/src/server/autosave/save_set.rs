@@ -6,18 +6,18 @@ use std::time::Duration;
 use crate::server::database::PvDatabase;
 use tokio::sync::RwLock;
 
-use super::backup::{find_best_save_file, rotate_backups, BackupConfig, BackupState};
+use super::backup::{BackupConfig, BackupState, find_best_save_file, rotate_backups};
 use super::error::{AutosaveError, AutosaveResult};
 use super::macros::MacroContext;
 use super::request::{self, RequestEntry};
-use super::save_file::{
-    self, read_save_file, write_save_file, SaveEntry,
-};
+use super::save_file::{self, SaveEntry, read_save_file, write_save_file};
 
 /// Save strategy for a save set.
 #[derive(Debug, Clone)]
 pub enum SaveStrategy {
-    Periodic { interval: Duration },
+    Periodic {
+        interval: Duration,
+    },
     Triggered {
         trigger_pv: String,
         mode: TriggerMode,
@@ -129,7 +129,8 @@ impl SaveSet {
                 &req_file.to_string_lossy(),
                 &config.search_paths,
                 &macros,
-            ).await?;
+            )
+            .await?;
             entries.extend(req_entries);
         }
 
@@ -247,12 +248,12 @@ pub async fn restore_from_entries(
     db: &PvDatabase,
     path: &std::path::Path,
 ) -> AutosaveResult<RestoreResult> {
-    let entries = read_save_file(path).await?.ok_or_else(|| {
-        AutosaveError::CorruptSaveFile {
+    let entries = read_save_file(path)
+        .await?
+        .ok_or_else(|| AutosaveError::CorruptSaveFile {
             path: path.display().to_string(),
             message: "missing <END> marker".to_string(),
-        }
-    })?;
+        })?;
 
     let mut result = RestoreResult {
         source_file: path.to_path_buf(),

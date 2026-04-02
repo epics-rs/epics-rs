@@ -20,9 +20,18 @@ pub struct PositionFields {
 impl Default for PositionFields {
     fn default() -> Self {
         Self {
-            val: 0.0, rbv: 0.0, rlv: 0.0, off: 0.0,
-            diff: 0.0, rdif: 0.0, dval: 0.0, drbv: 0.0,
-            rval: 0, rrbv: 0, rmp: 0, rep: 0,
+            val: 0.0,
+            rbv: 0.0,
+            rlv: 0.0,
+            off: 0.0,
+            diff: 0.0,
+            rdif: 0.0,
+            dval: 0.0,
+            drbv: 0.0,
+            rval: 0,
+            rrbv: 0,
+            rmp: 0,
+            rep: 0,
         }
     }
 }
@@ -48,10 +57,14 @@ impl Default for ConversionFields {
         Self {
             dir: MotorDir::Pos,
             foff: FreezeOffset::Variable,
-            set: false, igset: false,
-            mres: 1.0, eres: 0.0,
-            srev: 200, urev: 1.0,
-            ueip: false, urip: false,
+            set: false,
+            igset: false,
+            mres: 1.0,
+            eres: 0.0,
+            srev: 200,
+            urev: 1.0,
+            ueip: false,
+            urip: false,
             rres: 0.0,
         }
     }
@@ -78,12 +91,18 @@ pub struct VelocityFields {
 impl Default for VelocityFields {
     fn default() -> Self {
         Self {
-            velo: 1.0, vbas: 0.0, vmax: 0.0,
-            s: 0.0, sbas: 0.0, smax: 0.0,
+            velo: 1.0,
+            vbas: 0.0,
+            vmax: 0.0,
+            s: 0.0,
+            sbas: 0.0,
+            smax: 0.0,
             accl: 0.5,
-            bvel: 1.0, bacc: 0.5,
+            bvel: 1.0,
+            bacc: 0.5,
             hvel: 1.0,
-            jvel: 1.0, jar: 0.0,
+            jvel: 1.0,
+            jar: 0.0,
             sbak: 0.0,
         }
     }
@@ -105,11 +124,14 @@ pub struct RetryFields {
 impl Default for RetryFields {
     fn default() -> Self {
         Self {
-            bdst: 0.0, frac: 1.0,
-            rdbd: 0.0, spdb: 0.0,
+            bdst: 0.0,
+            frac: 1.0,
+            rdbd: 0.0,
+            spdb: 0.0,
             rtry: 10,
             rmod: RetryMode::Arithmetic,
-            rcnt: 0, miss: false,
+            rcnt: 0,
+            miss: false,
         }
     }
 }
@@ -130,10 +152,13 @@ pub struct LimitFields {
 impl Default for LimitFields {
     fn default() -> Self {
         Self {
-            hlm: 0.0, llm: 0.0,
-            dhlm: 0.0, dllm: 0.0,
+            hlm: 0.0,
+            llm: 0.0,
+            dhlm: 0.0,
+            dllm: 0.0,
             lvio: true,
-            hls: false, lls: false,
+            hls: false,
+            lls: false,
             hlsv: 0,
         }
     }
@@ -159,9 +184,12 @@ impl Default for ControlFields {
         Self {
             spmg: SpmgMode::Go,
             stop: false,
-            homf: false, homr: false,
-            jogf: false, jogr: false,
-            twf: false, twr: false,
+            homf: false,
+            homr: false,
+            jogf: false,
+            jogr: false,
+            twf: false,
+            twr: false,
             twv: 1.0,
             cnen: false,
         }
@@ -222,8 +250,10 @@ impl Default for DisplayFields {
         Self {
             egu: String::new(),
             prec: 0,
-            adel: 0.0, mdel: 0.0,
-            alst: 0.0, mlst: 0.0,
+            adel: 0.0,
+            mdel: 0.0,
+            alst: 0.0,
+            mlst: 0.0,
         }
     }
 }

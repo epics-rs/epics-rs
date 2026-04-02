@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::physics::{self, BeamCurrentConfig};
@@ -53,7 +53,9 @@ pub fn start_beam_current_thread(
 pub mod ioc_support {
     use super::*;
     use epics_base_rs::error::CaResult;
-    use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, WriteCompletion};
+    use epics_base_rs::server::device_support::{
+        DeviceReadOutcome, DeviceSupport, WriteCompletion,
+    };
     use epics_base_rs::server::record::{Record, ScanType};
 
     /// Device support for the beam current AI record.

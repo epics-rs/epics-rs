@@ -12,30 +12,30 @@
     clippy::too_many_arguments
 )]
 
-pub mod par_util;
-pub mod std_arrays;
-pub mod stats;
-pub mod roi;
-pub mod process;
-pub mod transform;
-pub mod color_convert;
-pub mod overlay;
-pub mod fft;
-pub mod time_series;
+pub mod attr_plot;
+pub mod attribute;
+pub mod bad_pixel;
 pub mod circular_buff;
 pub mod codec;
-pub mod gather;
-pub mod scatter;
-pub mod file_tiff;
-pub mod file_jpeg;
+pub mod color_convert;
+pub mod fft;
 pub mod file_hdf5;
+pub mod file_jpeg;
 pub mod file_netcdf;
+pub mod file_tiff;
+pub mod gather;
+pub mod overlay;
+pub mod par_util;
 pub mod passthrough;
-pub mod attribute;
-pub mod roi_stat;
-pub mod bad_pixel;
-pub mod attr_plot;
 pub mod pos_plugin;
+pub mod process;
+pub mod roi;
+pub mod roi_stat;
+pub mod scatter;
+pub mod stats;
+pub mod std_arrays;
+pub mod time_series;
+pub mod transform;
 
 #[cfg(feature = "ioc")]
 pub mod ioc;

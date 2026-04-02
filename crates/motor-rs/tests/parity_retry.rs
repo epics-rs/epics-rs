@@ -193,7 +193,7 @@ fn spdb_allows_larger_move() {
 #[test]
 fn spdb_vs_rdbd_are_independent() {
     let mut rec = make_record();
-    rec.retry.spdb = 0.5;  // move initiation deadband
+    rec.retry.spdb = 0.5; // move initiation deadband
     rec.retry.rdbd = 0.01; // completion deadband
     rec.retry.rtry = 3;
     rec.retry.rmod = RetryMode::Geometric;

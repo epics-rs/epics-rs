@@ -10,14 +10,14 @@ use std::sync::Arc;
 
 use epics_base_rs::runtime::sync::Notify;
 
-use scope_ioc::driver::*;
-use asyn_rs::runtime::port::{create_port_runtime, PortRuntimeHandle};
 use asyn_rs::runtime::config::RuntimeConfig;
+use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::trace::TraceManager;
+use scope_ioc::driver::*;
 
 use epics_base_rs::error::CaResult;
-use epics_ca_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::iocsh::registry::*;
+use epics_ca_rs::server::ioc_app::IocApplication;
 
 // ========== DriverHolder + Command Handlers ==========
 
@@ -92,21 +92,43 @@ impl CommandHandler for ReportHandler {
             }
         };
 
-        let indices = self.holder.indices.lock().unwrap()
+        let indices = self
+            .holder
+            .indices
+            .lock()
+            .unwrap()
             .expect("indices not set");
 
         let handle = runtime.port_handle();
 
         let run = handle.read_int32_blocking(indices.p_run, 0).unwrap_or(0);
-        let max_pts = handle.read_int32_blocking(indices.p_max_points, 0).unwrap_or(0);
-        let update_t = handle.read_float64_blocking(indices.p_update_time, 0).unwrap_or(0.0);
-        let vpd = handle.read_float64_blocking(indices.p_volts_per_div, 0).unwrap_or(0.0);
-        let tpd = handle.read_float64_blocking(indices.p_time_per_div, 0).unwrap_or(0.0);
-        let noise = handle.read_float64_blocking(indices.p_noise_amplitude, 0).unwrap_or(0.0);
-        let offset = handle.read_float64_blocking(indices.p_volt_offset, 0).unwrap_or(0.0);
-        let min_v = handle.read_float64_blocking(indices.p_min_value, 0).unwrap_or(0.0);
-        let max_v = handle.read_float64_blocking(indices.p_max_value, 0).unwrap_or(0.0);
-        let mean_v = handle.read_float64_blocking(indices.p_mean_value, 0).unwrap_or(0.0);
+        let max_pts = handle
+            .read_int32_blocking(indices.p_max_points, 0)
+            .unwrap_or(0);
+        let update_t = handle
+            .read_float64_blocking(indices.p_update_time, 0)
+            .unwrap_or(0.0);
+        let vpd = handle
+            .read_float64_blocking(indices.p_volts_per_div, 0)
+            .unwrap_or(0.0);
+        let tpd = handle
+            .read_float64_blocking(indices.p_time_per_div, 0)
+            .unwrap_or(0.0);
+        let noise = handle
+            .read_float64_blocking(indices.p_noise_amplitude, 0)
+            .unwrap_or(0.0);
+        let offset = handle
+            .read_float64_blocking(indices.p_volt_offset, 0)
+            .unwrap_or(0.0);
+        let min_v = handle
+            .read_float64_blocking(indices.p_min_value, 0)
+            .unwrap_or(0.0);
+        let max_v = handle
+            .read_float64_blocking(indices.p_max_value, 0)
+            .unwrap_or(0.0);
+        let mean_v = handle
+            .read_float64_blocking(indices.p_mean_value, 0)
+            .unwrap_or(0.0);
 
         println!("ScopeSimulator Report");
         println!("  Run:            {}", if run != 0 { "Yes" } else { "No" });
@@ -159,16 +181,30 @@ async fn main() -> CaResult<()> {
 
     app = app.register_startup_command(CommandDef::new(
         "scopeSimulatorConfig",
-        vec![ArgDesc { name: "portName", arg_type: ArgType::String, optional: false }],
+        vec![ArgDesc {
+            name: "portName",
+            arg_type: ArgType::String,
+            optional: false,
+        }],
         "scopeSimulatorConfig portName - Configure scope simulator driver",
-        ConfigHandler { holder: holder_for_config, handle, trace },
+        ConfigHandler {
+            holder: holder_for_config,
+            handle,
+            trace,
+        },
     ));
 
     app = app.register_shell_command(CommandDef::new(
         "scopeSimulatorReport",
-        vec![ArgDesc { name: "level", arg_type: ArgType::Int, optional: true }],
+        vec![ArgDesc {
+            name: "level",
+            arg_type: ArgType::Int,
+            optional: true,
+        }],
         "scopeSimulatorReport [level] - Report scope simulator status",
-        ReportHandler { holder: holder_for_report },
+        ReportHandler {
+            holder: holder_for_report,
+        },
     ));
 
     app.startup_script(&script)

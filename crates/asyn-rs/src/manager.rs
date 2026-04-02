@@ -54,9 +54,7 @@ impl PortManager {
         self.port_handles
             .lock()
             .insert(name.clone(), handle.port_handle().clone());
-        self.runtime_handles
-            .lock()
-            .insert(name, handle.clone());
+        self.runtime_handles.lock().insert(name, handle.clone());
 
         handle
     }
@@ -218,7 +216,10 @@ mod tests {
         drv.base.create_param("TEMP", ParamType::Float64).unwrap();
         let handle = mgr.register_port(drv);
 
-        handle.port_handle().write_float64_blocking(0, 0, 98.6).unwrap();
+        handle
+            .port_handle()
+            .write_float64_blocking(0, 0, 98.6)
+            .unwrap();
         assert!((handle.port_handle().read_float64_blocking(0, 0).unwrap() - 98.6).abs() < 1e-10);
     }
 

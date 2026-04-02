@@ -103,12 +103,7 @@ impl PvaCodec {
     // ─── GET ─────────────────────────────────────────────────────────────
 
     /// Build GET INIT request
-    pub fn build_get_init(
-        &self,
-        server_channel_id: u32,
-        ioid: u32,
-        pv_request: &[u8],
-    ) -> Vec<u8> {
+    pub fn build_get_init(&self, server_channel_id: u32, ioid: u32, pv_request: &[u8]) -> Vec<u8> {
         let be = self.big_endian;
         let mut payload = Vec::new();
         write_u32(&mut payload, server_channel_id, be);
@@ -131,12 +126,7 @@ impl PvaCodec {
     // ─── PUT ─────────────────────────────────────────────────────────────
 
     /// Build PUT INIT request
-    pub fn build_put_init(
-        &self,
-        server_channel_id: u32,
-        ioid: u32,
-        pv_request: &[u8],
-    ) -> Vec<u8> {
+    pub fn build_put_init(&self, server_channel_id: u32, ioid: u32, pv_request: &[u8]) -> Vec<u8> {
         let be = self.big_endian;
         let mut payload = Vec::new();
         write_u32(&mut payload, server_channel_id, be);
@@ -147,12 +137,7 @@ impl PvaCodec {
     }
 
     /// Build PUT (write data) request with bitset + value
-    pub fn build_put(
-        &self,
-        server_channel_id: u32,
-        ioid: u32,
-        value_data: &[u8],
-    ) -> Vec<u8> {
+    pub fn build_put(&self, server_channel_id: u32, ioid: u32, value_data: &[u8]) -> Vec<u8> {
         let be = self.big_endian;
         let mut payload = Vec::new();
         write_u32(&mut payload, server_channel_id, be);
@@ -198,12 +183,7 @@ impl PvaCodec {
 
     // ─── GET_FIELD (info) ────────────────────────────────────────────────
 
-    pub fn build_get_field(
-        &self,
-        server_channel_id: u32,
-        ioid: u32,
-        subfield: &str,
-    ) -> Vec<u8> {
+    pub fn build_get_field(&self, server_channel_id: u32, ioid: u32, subfield: &str) -> Vec<u8> {
         let be = self.big_endian;
         let mut payload = Vec::new();
         write_u32(&mut payload, server_channel_id, be);
@@ -214,11 +194,7 @@ impl PvaCodec {
 
     // ─── DESTROY_REQUEST ─────────────────────────────────────────────────
 
-    pub fn build_destroy_request(
-        &self,
-        server_channel_id: u32,
-        ioid: u32,
-    ) -> Vec<u8> {
+    pub fn build_destroy_request(&self, server_channel_id: u32, ioid: u32) -> Vec<u8> {
         let be = self.big_endian;
         let mut payload = Vec::new();
         write_u32(&mut payload, server_channel_id, be);

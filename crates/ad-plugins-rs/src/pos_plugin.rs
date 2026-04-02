@@ -113,8 +113,12 @@ impl PosPluginProcessor {
 
     fn advance(&mut self) {
         match self.mode {
-            PosMode::Discard => { self.positions.pop_front(); }
-            PosMode::Keep => { self.index += 1; }
+            PosMode::Discard => {
+                self.positions.pop_front();
+            }
+            PosMode::Keep => {
+                self.index += 1;
+            }
         }
     }
 }
@@ -218,11 +222,23 @@ mod tests {
 
         let result = proc.process_array(&make_array(1), &pool);
         assert_eq!(result.output_arrays.len(), 1);
-        let x = result.output_arrays[0].attributes.get("X").unwrap().value.as_f64().unwrap();
+        let x = result.output_arrays[0]
+            .attributes
+            .get("X")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap();
         assert!((x - 1.5).abs() < 1e-10);
 
         let result = proc.process_array(&make_array(2), &pool);
-        let x = result.output_arrays[0].attributes.get("X").unwrap().value.as_f64().unwrap();
+        let x = result.output_arrays[0]
+            .attributes
+            .get("X")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap();
         assert!((x - 3.1).abs() < 1e-10);
 
         assert_eq!(proc.remaining_positions(), 0);
@@ -242,16 +258,34 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let result = proc.process_array(&make_array(1), &pool);
-        let x = result.output_arrays[0].attributes.get("X").unwrap().value.as_f64().unwrap();
+        let x = result.output_arrays[0]
+            .attributes
+            .get("X")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap();
         assert!((x - 10.0).abs() < 1e-10);
 
         let result = proc.process_array(&make_array(2), &pool);
-        let x = result.output_arrays[0].attributes.get("X").unwrap().value.as_f64().unwrap();
+        let x = result.output_arrays[0]
+            .attributes
+            .get("X")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap();
         assert!((x - 20.0).abs() < 1e-10);
 
         // Wraps around
         let result = proc.process_array(&make_array(3), &pool);
-        let x = result.output_arrays[0].attributes.get("X").unwrap().value.as_f64().unwrap();
+        let x = result.output_arrays[0]
+            .attributes
+            .get("X")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap();
         assert!((x - 10.0).abs() < 1e-10);
     }
 
@@ -275,7 +309,13 @@ mod tests {
         // Frame 3 (skip frame 2)
         let result = proc.process_array(&make_array(3), &pool);
         assert_eq!(proc.missing_frames(), 1);
-        let x = result.output_arrays[0].attributes.get("X").unwrap().value.as_f64().unwrap();
+        let x = result.output_arrays[0]
+            .attributes
+            .get("X")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap();
         assert!((x - 3.0).abs() < 1e-10);
     }
 

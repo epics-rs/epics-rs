@@ -1,15 +1,15 @@
+pub mod arrays;
 pub mod common;
+pub mod enum_type;
+pub mod float64;
+pub mod generic_pointer;
+pub mod gpib;
 pub mod int32;
 pub mod int64;
-pub mod float64;
-pub mod octet;
-pub mod uint32_digital;
-pub mod arrays;
-pub mod option;
-pub mod gpib;
 pub mod motor;
-pub mod enum_type;
-pub mod generic_pointer;
+pub mod octet;
+pub mod option;
+pub mod uint32_digital;
 
 /// Type-safe interface type enum replacing string-based dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -216,11 +216,23 @@ mod interface_type_tests {
     #[test]
     fn from_asyn_name_roundtrip() {
         let names = [
-            "asynInt32", "asynInt64", "asynFloat64", "asynOctet",
-            "asynUInt32Digital", "asynEnum", "asynGenericPointer",
-            "asynInt8Array", "asynInt16Array", "asynInt32Array",
-            "asynInt64Array", "asynFloat32Array", "asynFloat64Array",
-            "asynMotor", "asynGpib", "asynOption", "asynCommon",
+            "asynInt32",
+            "asynInt64",
+            "asynFloat64",
+            "asynOctet",
+            "asynUInt32Digital",
+            "asynEnum",
+            "asynGenericPointer",
+            "asynInt8Array",
+            "asynInt16Array",
+            "asynInt32Array",
+            "asynInt64Array",
+            "asynFloat32Array",
+            "asynFloat64Array",
+            "asynMotor",
+            "asynGpib",
+            "asynOption",
+            "asynCommon",
         ];
         for name in &names {
             let iface = InterfaceType::from_asyn_name(name)
@@ -238,13 +250,19 @@ mod interface_type_tests {
     #[test]
     fn display_format() {
         assert_eq!(format!("{}", InterfaceType::Int32), "asynInt32");
-        assert_eq!(format!("{}", InterfaceType::Float64Array), "asynFloat64Array");
+        assert_eq!(
+            format!("{}", InterfaceType::Float64Array),
+            "asynFloat64Array"
+        );
     }
 
     #[test]
     fn capability_interface_type() {
         assert_eq!(Capability::Int32Read.interface_type(), InterfaceType::Int32);
-        assert_eq!(Capability::Float64Write.interface_type(), InterfaceType::Float64);
+        assert_eq!(
+            Capability::Float64Write.interface_type(),
+            InterfaceType::Float64
+        );
         assert_eq!(Capability::Motor.interface_type(), InterfaceType::Motor);
     }
 
@@ -269,12 +287,23 @@ mod interface_type_tests {
     #[test]
     fn all_variants_have_asyn_name() {
         let all = [
-            InterfaceType::Int32, InterfaceType::Int64, InterfaceType::Float64,
-            InterfaceType::Octet, InterfaceType::UInt32Digital, InterfaceType::Enum,
-            InterfaceType::GenericPointer, InterfaceType::Int8Array, InterfaceType::Int16Array,
-            InterfaceType::Int32Array, InterfaceType::Int64Array, InterfaceType::Float32Array,
-            InterfaceType::Float64Array, InterfaceType::Motor, InterfaceType::Gpib,
-            InterfaceType::Option, InterfaceType::Common,
+            InterfaceType::Int32,
+            InterfaceType::Int64,
+            InterfaceType::Float64,
+            InterfaceType::Octet,
+            InterfaceType::UInt32Digital,
+            InterfaceType::Enum,
+            InterfaceType::GenericPointer,
+            InterfaceType::Int8Array,
+            InterfaceType::Int16Array,
+            InterfaceType::Int32Array,
+            InterfaceType::Int64Array,
+            InterfaceType::Float32Array,
+            InterfaceType::Float64Array,
+            InterfaceType::Motor,
+            InterfaceType::Gpib,
+            InterfaceType::Option,
+            InterfaceType::Common,
         ];
         for iface in &all {
             let name = iface.asyn_name();
@@ -284,4 +313,3 @@ mod interface_type_tests {
         }
     }
 }
-

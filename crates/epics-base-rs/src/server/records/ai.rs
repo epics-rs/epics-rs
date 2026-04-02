@@ -12,14 +12,14 @@ pub struct AiRecord {
     pub prec: i16,
     // Conversion
     pub rval: i32,
-    pub linr: i16,      // 0=NO_CONVERSION, 1=LINEAR
+    pub linr: i16, // 0=NO_CONVERSION, 1=LINEAR
     pub eguf: f64,
     pub egul: f64,
-    pub eslo: f64,      // default 1.0
+    pub eslo: f64, // default 1.0
     pub roff: i32,
-    pub aslo: f64,      // default 1.0
+    pub aslo: f64, // default 1.0
     pub aoff: f64,
-    pub smoo: f64,      // smoothing 0~1
+    pub smoo: f64, // smoothing 0~1
     // Deadband
     pub adel: f64,
     pub mdel: f64,
@@ -76,30 +76,126 @@ impl AiRecord {
 }
 
 static FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "EGU", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "HOPR", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LOPR", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "PREC", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "RVAL", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "LINR", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "EGUF", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "EGUL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "ESLO", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "ROFF", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "ASLO", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "AOFF", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "SMOO", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "ADEL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "MDEL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LALM", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "ALST", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "MLST", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "INIT", dbf_type: DbFieldType::Char, read_only: true },
-    FieldDesc { name: "SIMM", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SIML", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "SIOL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "SIMS", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RVAL",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LINR",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "EGUF",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "EGUL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ESLO",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ROFF",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ASLO",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "AOFF",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SMOO",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ADEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MDEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LALM",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ALST",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MLST",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INIT",
+        dbf_type: DbFieldType::Char,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "SIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIML",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMS",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for AiRecord {
@@ -158,96 +254,165 @@ impl Record for AiRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
-                EpicsValue::Double(v) => { self.val = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.val = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "EGU" => match value {
-                EpicsValue::String(v) => { self.egu = v; Ok(()) }
+                EpicsValue::String(v) => {
+                    self.egu = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "HOPR" => match value {
-                EpicsValue::Double(v) => { self.hopr = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.hopr = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "LOPR" => match value {
-                EpicsValue::Double(v) => { self.lopr = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.lopr = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "PREC" => match value {
-                EpicsValue::Short(v) => { self.prec = v; Ok(()) }
+                EpicsValue::Short(v) => {
+                    self.prec = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "RVAL" => match value {
-                EpicsValue::Long(v) => { self.rval = v; Ok(()) }
+                EpicsValue::Long(v) => {
+                    self.rval = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "LINR" => match value {
-                EpicsValue::Short(v) => { self.linr = v; Ok(()) }
+                EpicsValue::Short(v) => {
+                    self.linr = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "EGUF" => match value {
-                EpicsValue::Double(v) => { self.eguf = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.eguf = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "EGUL" => match value {
-                EpicsValue::Double(v) => { self.egul = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.egul = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "ESLO" => match value {
-                EpicsValue::Double(v) => { self.eslo = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.eslo = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "ROFF" => match value {
-                EpicsValue::Long(v) => { self.roff = v; Ok(()) }
+                EpicsValue::Long(v) => {
+                    self.roff = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "ASLO" => match value {
-                EpicsValue::Double(v) => { self.aslo = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.aslo = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "AOFF" => match value {
-                EpicsValue::Double(v) => { self.aoff = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.aoff = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SMOO" => match value {
-                EpicsValue::Double(v) => { self.smoo = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.smoo = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "ADEL" => match value {
-                EpicsValue::Double(v) => { self.adel = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.adel = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "MDEL" => match value {
-                EpicsValue::Double(v) => { self.mdel = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.mdel = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             // Runtime fields (writable internally)
             "LALM" => match value {
-                EpicsValue::Double(v) => { self.lalm = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.lalm = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "ALST" => match value {
-                EpicsValue::Double(v) => { self.alst = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.alst = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "MLST" => match value {
-                EpicsValue::Double(v) => { self.mlst = v; Ok(()) }
+                EpicsValue::Double(v) => {
+                    self.mlst = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIMM" => match value {
-                EpicsValue::Short(v) => { self.simm = v; Ok(()) }
+                EpicsValue::Short(v) => {
+                    self.simm = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIML" => match value {
-                EpicsValue::String(v) => { self.siml = v; Ok(()) }
+                EpicsValue::String(v) => {
+                    self.siml = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIOL" => match value {
-                EpicsValue::String(v) => { self.siol = v; Ok(()) }
+                EpicsValue::String(v) => {
+                    self.siol = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIMS" => match value {
-                EpicsValue::Short(v) => { self.sims = v; Ok(()) }
+                EpicsValue::Short(v) => {
+                    self.sims = v;
+                    Ok(())
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             _ => Err(CaError::FieldNotFound(name.into())),

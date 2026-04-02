@@ -71,9 +71,7 @@ impl PvaClient {
             )));
         }
 
-        Ok(Self {
-            addr_list: addrs,
-        })
+        Ok(Self { addr_list: addrs })
     }
 
     // ─── UDP Search ──────────────────────────────────────────────────────
@@ -193,7 +191,9 @@ impl PvaClient {
             loop {
                 let n = stream.read(&mut buf).await?;
                 if n == 0 {
-                    return Err(PvaError::Protocol("connection closed during handshake".into()));
+                    return Err(PvaError::Protocol(
+                        "connection closed during handshake".into(),
+                    ));
                 }
                 accumulated.extend_from_slice(&buf[..n]);
 
@@ -232,11 +232,7 @@ impl PvaClient {
 
     // ─── Create Channel ──────────────────────────────────────────────────
 
-    async fn create_channel(
-        &self,
-        conn: &mut PvaConnection,
-        pv_name: &str,
-    ) -> PvaResult<u32> {
+    async fn create_channel(&self, conn: &mut PvaConnection, pv_name: &str) -> PvaResult<u32> {
         let client_channel_id = alloc_id();
         let msg = conn.codec.build_create_channel(client_channel_id, pv_name);
         conn.stream.write_all(&msg).await?;
@@ -349,7 +345,10 @@ impl PvaClient {
 
         // GET INIT
         let pv_request = build_pv_request(be);
-        let msg = ch.conn.codec.build_get_init(ch.server_channel_id, ioid, &pv_request);
+        let msg = ch
+            .conn
+            .codec
+            .build_get_init(ch.server_channel_id, ioid, &pv_request);
         ch.conn.stream.write_all(&msg).await?;
         ch.conn.stream.flush().await?;
 
@@ -400,7 +399,10 @@ impl PvaClient {
 
         // PUT INIT
         let pv_request = build_pv_request_value_only(be);
-        let msg = ch.conn.codec.build_put_init(ch.server_channel_id, ioid, &pv_request);
+        let msg = ch
+            .conn
+            .codec
+            .build_put_init(ch.server_channel_id, ioid, &pv_request);
         ch.conn.stream.write_all(&msg).await?;
         ch.conn.stream.flush().await?;
 
@@ -423,8 +425,8 @@ impl PvaClient {
             .ok_or_else(|| PvaError::Protocol("no scalar 'value' field in structure".into()))?;
 
         // Parse the value
-        let scalar_val = ScalarValue::parse(scalar_type, value_str)
-            .map_err(|e| PvaError::InvalidValue(e))?;
+        let scalar_val =
+            ScalarValue::parse(scalar_type, value_str).map_err(|e| PvaError::InvalidValue(e))?;
 
         // Build put data: bitset (bit 0 set = whole structure) + value field data
         let mut value_data = Vec::new();
@@ -433,7 +435,10 @@ impl PvaClient {
         // Write value field inside the structure
         write_scalar_value(&mut value_data, &scalar_val, be);
 
-        let msg = ch.conn.codec.build_put(ch.server_channel_id, ioid, &value_data);
+        let msg = ch
+            .conn
+            .codec
+            .build_put(ch.server_channel_id, ioid, &value_data);
         ch.conn.stream.write_all(&msg).await?;
         ch.conn.stream.flush().await?;
 
@@ -464,7 +469,10 @@ impl PvaClient {
 
         // MONITOR INIT
         let pv_request = build_pv_request(be);
-        let msg = ch.conn.codec.build_monitor_init(ch.server_channel_id, ioid, &pv_request);
+        let msg = ch
+            .conn
+            .codec
+            .build_monitor_init(ch.server_channel_id, ioid, &pv_request);
         ch.conn.stream.write_all(&msg).await?;
         ch.conn.stream.flush().await?;
 
@@ -482,7 +490,10 @@ impl PvaClient {
         let field_desc = read_field_desc(&init_payload, &mut pos, be)?;
 
         // Send pipeline start
-        let msg = ch.conn.codec.build_monitor_start(ch.server_channel_id, ioid, 16);
+        let msg = ch
+            .conn
+            .codec
+            .build_monitor_start(ch.server_channel_id, ioid, 16);
         ch.conn.stream.write_all(&msg).await?;
         ch.conn.stream.flush().await?;
 
@@ -523,11 +534,10 @@ impl PvaClient {
                         pipeline_credits -= 1;
                         if pipeline_credits <= 4 {
                             // Replenish
-                            let msg = ch.conn.codec.build_monitor_start(
-                                ch.server_channel_id,
-                                ioid,
-                                16,
-                            );
+                            let msg =
+                                ch.conn
+                                    .codec
+                                    .build_monitor_start(ch.server_channel_id, ioid, 16);
                             ch.conn.stream.write_all(&msg).await?;
                             ch.conn.stream.flush().await?;
                             pipeline_credits += 16;
@@ -548,7 +558,10 @@ impl PvaClient {
         let ioid = alloc_id();
 
         // GET_FIELD
-        let msg = ch.conn.codec.build_get_field(ch.server_channel_id, ioid, "");
+        let msg = ch
+            .conn
+            .codec
+            .build_get_field(ch.server_channel_id, ioid, "");
         ch.conn.stream.write_all(&msg).await?;
         ch.conn.stream.flush().await?;
 

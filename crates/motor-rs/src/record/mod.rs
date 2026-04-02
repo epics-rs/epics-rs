@@ -1,7 +1,7 @@
-mod state_machine;
 mod command_planner;
-mod status_update;
 mod field_access;
+mod state_machine;
+mod status_update;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, RecordProcessResult};
@@ -96,7 +96,6 @@ impl MotorRecord {
     }
 }
 
-
 impl Record for MotorRecord {
     fn record_type(&self) -> &'static str {
         "motor"
@@ -130,8 +129,12 @@ impl Record for MotorRecord {
             self.suppress_flnk = effects.suppress_forward_link;
             let actions = self.effects_to_actions(&effects);
             match state.lock() {
-                Ok(mut ds) => { ds.pending_actions = Some(actions); }
-                Err(e) => { tracing::error!("device state lock poisoned in process: {e}"); }
+                Ok(mut ds) => {
+                    ds.pending_actions = Some(actions);
+                }
+                Err(e) => {
+                    tracing::error!("device state lock poisoned in process: {e}");
+                }
             }
         }
 
@@ -147,7 +150,11 @@ impl Record for MotorRecord {
                 ("DVAL".to_string(), EpicsValue::Double(self.pos.dval)),
                 ("RVAL".to_string(), EpicsValue::Long(self.pos.rval)),
             ];
-            Ok(ProcessOutcome { result: RecordProcessResult::AsyncPendingNotify(fields), actions: Vec::new(), device_did_compute: false })
+            Ok(ProcessOutcome {
+                result: RecordProcessResult::AsyncPendingNotify(fields),
+                actions: Vec::new(),
+                device_did_compute: false,
+            })
         } else {
             Ok(ProcessOutcome::complete())
         }
@@ -172,7 +179,6 @@ impl Record for MotorRecord {
     fn primary_field(&self) -> &'static str {
         "VAL"
     }
-
 }
 
 #[cfg(test)]

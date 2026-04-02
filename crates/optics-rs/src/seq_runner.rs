@@ -29,15 +29,23 @@ pub fn parse_macros(input: &str) -> HashMap<String, String> {
 }
 
 /// Helper to get a macro value or return an error.
-fn require_macro(macros: &HashMap<String, String>, key: &str, program: &str) -> Result<String, String> {
-    macros.get(key)
+fn require_macro(
+    macros: &HashMap<String, String>,
+    key: &str,
+    program: &str,
+) -> Result<String, String> {
+    macros
+        .get(key)
         .cloned()
         .ok_or_else(|| format!("{program}: required macro '{key}' not specified"))
 }
 
 /// Helper to get a macro value with a default.
 fn macro_or(macros: &HashMap<String, String>, key: &str, default: &str) -> String {
-    macros.get(key).cloned().unwrap_or_else(|| default.to_string())
+    macros
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Start an optics SNL program by name.
@@ -124,7 +132,9 @@ pub fn seq_start(
                 &macro_or(&macros, "M_THETA2", ""),
                 &macro_or(&macros, "M_Y", ""),
                 &macro_or(&macros, "M_Z", ""),
-                macro_or(&macros, "Y_OFFSET", "35.0").parse::<f64>().unwrap_or(35.0),
+                macro_or(&macros, "Y_OFFSET", "35.0")
+                    .parse::<f64>()
+                    .unwrap_or(35.0),
                 macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
             );
             let db = db.clone();
@@ -203,7 +213,9 @@ pub fn seq_start(
             });
         }
         _ => {
-            return Err(format!("unknown program '{program}'. Available: kohzuCtl, kohzuCtl_soft, hrCtl, ml_monoCtl, orient, filterDrive, pf4, Io, flexCombinedMotion"));
+            return Err(format!(
+                "unknown program '{program}'. Available: kohzuCtl, kohzuCtl_soft, hrCtl, ml_monoCtl, orient, filterDrive, pf4, Io, flexCombinedMotion"
+            ));
         }
     }
 

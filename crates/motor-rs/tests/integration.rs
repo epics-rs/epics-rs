@@ -61,7 +61,10 @@ async fn test_full_move_via_mailbox() {
     setup.device_support.write(&mut setup.record).unwrap();
 
     // Write VAL to start move
-    setup.record.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(10.0))
+        .unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
@@ -88,8 +91,7 @@ async fn test_full_move_via_mailbox() {
 
 #[tokio::test]
 async fn test_stop_during_move() {
-    let motor: Arc<Mutex<dyn AsynMotor>> =
-        Arc::new(Mutex::new(SimMotor::new()));
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
     let mut setup = make_builder(motor).build();
 
     setup.device_support.init(&mut setup.record).unwrap();
@@ -101,7 +103,10 @@ async fn test_stop_during_move() {
 
     // Start a slow move (velocity=1, target=50 → 50s)
     setup.record.vel.velo = 1.0;
-    setup.record.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(50.0))
+        .unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
@@ -113,7 +118,10 @@ async fn test_stop_during_move() {
     setup.device_support.write(&mut setup.record).unwrap();
 
     // Issue STOP
-    setup.record.put_field("STOP", EpicsValue::Short(1)).unwrap();
+    setup
+        .record
+        .put_field("STOP", EpicsValue::Short(1))
+        .unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
@@ -128,7 +136,10 @@ async fn test_stop_during_move() {
     .await;
 
     assert!(reached, "DMOV should become true after stop");
-    assert!(setup.record.pos.rbv < 50.0, "motor should not have reached target");
+    assert!(
+        setup.record.pos.rbv < 50.0,
+        "motor should not have reached target"
+    );
 
     let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
     let _ = poll_handle.await;
@@ -162,7 +173,10 @@ async fn test_delay_via_poll_loop() {
     setup.device_support.write(&mut setup.record).unwrap();
 
     // Start move
-    setup.record.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(5.0))
+        .unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
@@ -217,7 +231,10 @@ async fn test_backlash_via_mailbox() {
     setup.device_support.write(&mut setup.record).unwrap();
 
     // Move in negative direction to trigger backlash
-    setup.record.put_field("VAL", EpicsValue::Double(-10.0)).unwrap();
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(-10.0))
+        .unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
@@ -265,12 +282,12 @@ async fn test_poll_loop_lifecycle() {
     poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
 
     // Wait for at least one io_intr notification
-    let got_notification = tokio::time::timeout(
-        Duration::from_millis(500),
-        io_intr_rx.recv(),
-    )
-    .await;
-    assert!(got_notification.is_ok(), "should receive io_intr from poll loop");
+    let got_notification =
+        tokio::time::timeout(Duration::from_millis(500), io_intr_rx.recv()).await;
+    assert!(
+        got_notification.is_ok(),
+        "should receive io_intr from poll loop"
+    );
 
     // Verify status was written
     {
@@ -286,12 +303,11 @@ async fn test_poll_loop_lifecycle() {
     while io_intr_rx.try_recv().is_ok() {}
 
     // Verify no more notifications arrive
-    let no_notification = tokio::time::timeout(
-        Duration::from_millis(50),
-        io_intr_rx.recv(),
-    )
-    .await;
-    assert!(no_notification.is_err(), "should not receive notifications after StopPolling");
+    let no_notification = tokio::time::timeout(Duration::from_millis(50), io_intr_rx.recv()).await;
+    assert!(
+        no_notification.is_err(),
+        "should not receive notifications after StopPolling"
+    );
 
     // Shutdown
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();

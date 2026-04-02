@@ -1,8 +1,8 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;
-use std::any::Any;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 
@@ -47,7 +47,10 @@ pub enum ParamValue {
     Int64Array(Arc<[i64]>),
     Float32Array(Arc<[f32]>),
     Float64Array(Arc<[f64]>),
-    Enum { index: usize, choices: Arc<[EnumEntry]> },
+    Enum {
+        index: usize,
+        choices: Arc<[EnumEntry]>,
+    },
     GenericPointer(Arc<dyn Any + Send + Sync>),
     Undefined,
 }
@@ -122,7 +125,11 @@ impl ParamEntry {
             ParamType::Float64Array => ParamValue::Float64Array(Arc::from([] as [f64; 0])),
             ParamType::Enum => ParamValue::Enum {
                 index: 0,
-                choices: Arc::from([EnumEntry { string: String::new(), value: 0, severity: 0 }]),
+                choices: Arc::from([EnumEntry {
+                    string: String::new(),
+                    value: 0,
+                    severity: 0,
+                }]),
             },
             ParamType::GenericPointer => ParamValue::GenericPointer(Arc::new(())),
         };
@@ -249,12 +256,18 @@ impl ParamList {
                 }
             }
             // C EPICS asyn: asynInt32 interface writes enum index transparently
-            ParamValue::Enum { ref choices, ref mut index } => {
+            ParamValue::Enum {
+                ref choices,
+                ref mut index,
+            } => {
                 let new_idx = value as usize;
                 if new_idx >= choices.len() {
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
-                        message: format!("enum index {new_idx} out of range (0..{})", choices.len()),
+                        message: format!(
+                            "enum index {new_idx} out of range (0..{})",
+                            choices.len()
+                        ),
                     });
                 }
                 if *index != new_idx {
@@ -527,7 +540,10 @@ impl ParamList {
 
     pub fn get_enum(&self, index: usize, addr: i32) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
         match &self.get_entry(index, addr)?.value {
-            ParamValue::Enum { index: idx, choices } => Ok((*idx, choices.clone())),
+            ParamValue::Enum {
+                index: idx,
+                choices,
+            } => Ok((*idx, choices.clone())),
             other => Err(AsynError::TypeMismatch {
                 expected: "Enum",
                 actual: other.type_name(),
@@ -537,7 +553,11 @@ impl ParamList {
 
     pub fn set_enum_index(&mut self, index: usize, addr: i32, value: usize) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
-        if let ParamValue::Enum { ref choices, index: ref mut idx } = entry.value {
+        if let ParamValue::Enum {
+            ref choices,
+            index: ref mut idx,
+        } = entry.value
+        {
             if value >= choices.len() {
                 return Err(AsynError::Status {
                     status: AsynStatus::Error,
@@ -557,9 +577,18 @@ impl ParamList {
         Ok(())
     }
 
-    pub fn set_enum_choices(&mut self, index: usize, addr: i32, choices: Arc<[EnumEntry]>) -> AsynResult<()> {
+    pub fn set_enum_choices(
+        &mut self,
+        index: usize,
+        addr: i32,
+        choices: Arc<[EnumEntry]>,
+    ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
-        if let ParamValue::Enum { index: ref mut idx, choices: ref mut ch } = entry.value {
+        if let ParamValue::Enum {
+            index: ref mut idx,
+            choices: ref mut ch,
+        } = entry.value
+        {
             *ch = choices;
             // Reset index if out of range
             if *idx >= ch.len() {
@@ -577,7 +606,11 @@ impl ParamList {
 
     // --- GenericPointer getters/setters ---
 
-    pub fn get_generic_pointer(&self, index: usize, addr: i32) -> AsynResult<Arc<dyn Any + Send + Sync>> {
+    pub fn get_generic_pointer(
+        &self,
+        index: usize,
+        addr: i32,
+    ) -> AsynResult<Arc<dyn Any + Send + Sync>> {
         match &self.get_entry(index, addr)?.value {
             ParamValue::GenericPointer(v) => Ok(v.clone()),
             other => Err(AsynError::TypeMismatch {
@@ -587,7 +620,12 @@ impl ParamList {
         }
     }
 
-    pub fn set_generic_pointer(&mut self, index: usize, addr: i32, value: Arc<dyn Any + Send + Sync>) -> AsynResult<()> {
+    pub fn set_generic_pointer(
+        &mut self,
+        index: usize,
+        addr: i32,
+        value: Arc<dyn Any + Send + Sync>,
+    ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
         if matches!(entry.value, ParamValue::GenericPointer(_)) {
             entry.value = ParamValue::GenericPointer(value);
@@ -818,7 +856,8 @@ mod tests {
     fn test_param_status() {
         let mut pl = ParamList::new(1, false);
         let idx = pl.create_param("V", ParamType::Int32).unwrap();
-        pl.set_param_status(idx, 0, AsynStatus::Timeout, 1, 2).unwrap();
+        pl.set_param_status(idx, 0, AsynStatus::Timeout, 1, 2)
+            .unwrap();
         let (st, as_, sev) = pl.get_param_status(idx, 0).unwrap();
         assert_eq!(st, AsynStatus::Timeout);
         assert_eq!(as_, 1);
@@ -883,8 +922,16 @@ mod tests {
         let mut pl = ParamList::new(1, false);
         let idx = pl.create_param("MODE", ParamType::Enum).unwrap();
         let choices: Arc<[EnumEntry]> = Arc::from(vec![
-            EnumEntry { string: "Off".into(), value: 0, severity: 0 },
-            EnumEntry { string: "On".into(), value: 1, severity: 0 },
+            EnumEntry {
+                string: "Off".into(),
+                value: 0,
+                severity: 0,
+            },
+            EnumEntry {
+                string: "On".into(),
+                value: 1,
+                severity: 0,
+            },
         ]);
         pl.set_enum_choices(idx, 0, choices).unwrap();
         pl.set_enum_index(idx, 0, 1).unwrap();
@@ -912,16 +959,30 @@ mod tests {
         let mut pl = ParamList::new(1, false);
         let idx = pl.create_param("MODE", ParamType::Enum).unwrap();
         let choices: Arc<[EnumEntry]> = Arc::from(vec![
-            EnumEntry { string: "A".into(), value: 0, severity: 0 },
-            EnumEntry { string: "B".into(), value: 1, severity: 0 },
-            EnumEntry { string: "C".into(), value: 2, severity: 0 },
+            EnumEntry {
+                string: "A".into(),
+                value: 0,
+                severity: 0,
+            },
+            EnumEntry {
+                string: "B".into(),
+                value: 1,
+                severity: 0,
+            },
+            EnumEntry {
+                string: "C".into(),
+                value: 2,
+                severity: 0,
+            },
         ]);
         pl.set_enum_choices(idx, 0, choices).unwrap();
         pl.set_enum_index(idx, 0, 2).unwrap();
         // Now shrink choices — index 2 is out of range, should reset to 0
-        let new_choices: Arc<[EnumEntry]> = Arc::from(vec![
-            EnumEntry { string: "X".into(), value: 0, severity: 0 },
-        ]);
+        let new_choices: Arc<[EnumEntry]> = Arc::from(vec![EnumEntry {
+            string: "X".into(),
+            value: 0,
+            severity: 0,
+        }]);
         pl.set_enum_choices(idx, 0, new_choices).unwrap();
         let (index, choices) = pl.get_enum(idx, 0).unwrap();
         assert_eq!(index, 0);
@@ -933,9 +994,11 @@ mod tests {
         let mut pl = ParamList::new(1, false);
         let idx = pl.create_param("MODE", ParamType::Enum).unwrap();
         let _ = pl.take_changed(0).unwrap(); // clear initial
-        let choices: Arc<[EnumEntry]> = Arc::from(vec![
-            EnumEntry { string: "A".into(), value: 0, severity: 0 },
-        ]);
+        let choices: Arc<[EnumEntry]> = Arc::from(vec![EnumEntry {
+            string: "A".into(),
+            value: 0,
+            severity: 0,
+        }]);
         pl.set_enum_choices(idx, 0, choices).unwrap();
         let changed = pl.take_changed(0).unwrap();
         assert!(changed.contains(&idx));

@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use asyn_rs::runtime::sync::Notify;
 
-use scope_ioc::driver::*;
-use asyn_rs::runtime::port::create_port_runtime;
 use asyn_rs::runtime::config::RuntimeConfig;
+use asyn_rs::runtime::port::create_port_runtime;
+use scope_ioc::driver::*;
 
 #[epics_base_rs::epics_main]
 async fn main() {
@@ -37,8 +37,14 @@ async fn main() {
     });
 
     // 5. Set update time to 0.2s and start running
-    port_handle.write_float64(indices.p_update_time, 0, 0.2).await.unwrap();
-    port_handle.write_float64(indices.p_noise_amplitude, 0, 0.1).await.unwrap();
+    port_handle
+        .write_float64(indices.p_update_time, 0, 0.2)
+        .await
+        .unwrap();
+    port_handle
+        .write_float64(indices.p_noise_amplitude, 0, 0.1)
+        .await
+        .unwrap();
     port_handle.write_int32(indices.p_run, 0, 1).await.unwrap();
 
     println!("Simulation running (1kHz sine, noise=0.1V, update=0.2s)");
@@ -51,10 +57,22 @@ async fn main() {
             Ok(iv) => {
                 if iv.reason == indices.p_mean_value {
                     update_count += 1;
-                    let min_v = port_handle.read_float64(indices.p_min_value, 0).await.unwrap_or(0.0);
-                    let max_v = port_handle.read_float64(indices.p_max_value, 0).await.unwrap_or(0.0);
-                    let mean_v = port_handle.read_float64(indices.p_mean_value, 0).await.unwrap_or(0.0);
-                    let wf = port_handle.read_float64_array(indices.p_waveform, 0, 10000).await.unwrap_or_default();
+                    let min_v = port_handle
+                        .read_float64(indices.p_min_value, 0)
+                        .await
+                        .unwrap_or(0.0);
+                    let max_v = port_handle
+                        .read_float64(indices.p_max_value, 0)
+                        .await
+                        .unwrap_or(0.0);
+                    let mean_v = port_handle
+                        .read_float64(indices.p_mean_value, 0)
+                        .await
+                        .unwrap_or(0.0);
+                    let wf = port_handle
+                        .read_float64_array(indices.p_waveform, 0, 10000)
+                        .await
+                        .unwrap_or_default();
                     let wf_len = wf.len();
                     println!(
                         "  Update {update_count}: waveform={wf_len} pts, \
@@ -71,7 +89,10 @@ async fn main() {
 
     // 7. Change vertical gain to x10
     println!("\nSwitching vertical gain to x10...");
-    let vgs_idx = port_handle.drv_user_create("P_VertGainSelect").await.unwrap();
+    let vgs_idx = port_handle
+        .drv_user_create("P_VertGainSelect")
+        .await
+        .unwrap();
     port_handle.write_int32(vgs_idx, 0, 3).await.unwrap(); // x10
 
     // Receive 2 more updates
@@ -81,9 +102,18 @@ async fn main() {
             Ok(iv) => {
                 if iv.reason == indices.p_mean_value {
                     update_count += 1;
-                    let min_v = port_handle.read_float64(indices.p_min_value, 0).await.unwrap_or(0.0);
-                    let max_v = port_handle.read_float64(indices.p_max_value, 0).await.unwrap_or(0.0);
-                    let mean_v = port_handle.read_float64(indices.p_mean_value, 0).await.unwrap_or(0.0);
+                    let min_v = port_handle
+                        .read_float64(indices.p_min_value, 0)
+                        .await
+                        .unwrap_or(0.0);
+                    let max_v = port_handle
+                        .read_float64(indices.p_max_value, 0)
+                        .await
+                        .unwrap_or(0.0);
+                    let mean_v = port_handle
+                        .read_float64(indices.p_mean_value, 0)
+                        .await
+                        .unwrap_or(0.0);
                     println!(
                         "  Update (x10 gain): min={min_v:.3}, max={max_v:.3}, mean={mean_v:.3}"
                     );

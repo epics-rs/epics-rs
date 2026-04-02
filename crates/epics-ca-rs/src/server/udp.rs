@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 
-use epics_base_rs::error::CaResult;
 use crate::protocol::*;
+use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
 
 /// Run the UDP search responder on the given port.
@@ -49,7 +49,10 @@ pub async fn run_udp_search_responder(
                 let payload = &buf[payload_start..payload_end];
 
                 // Extract PV name (null-terminated)
-                let pv_name_end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+                let pv_name_end = payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(payload.len());
                 if let Ok(pv_name) = std::str::from_utf8(&payload[..pv_name_end]) {
                     // Check both simple PVs and record base names
                     if db.has_name(pv_name).await {

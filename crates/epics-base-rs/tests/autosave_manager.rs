@@ -10,7 +10,7 @@ use epics_base_rs::types::EpicsValue;
 
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveBuilder;
-use epics_base_rs::server::autosave::save_file::{read_save_file, write_save_file, SaveEntry};
+use epics_base_rs::server::autosave::save_file::{SaveEntry, read_save_file, write_save_file};
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
 
 fn quick_backup() -> BackupConfig {
@@ -26,8 +26,10 @@ fn quick_backup() -> BackupConfig {
 async fn setup_db() -> Arc<PvDatabase> {
     let db = Arc::new(PvDatabase::new());
     db.add_record("TEMP", Box::new(AoRecord::new(25.5))).await;
-    db.add_record("PRESS", Box::new(AoRecord::new(1013.0))).await;
-    db.add_record("MSG", Box::new(StringinRecord::new("hello"))).await;
+    db.add_record("PRESS", Box::new(AoRecord::new(1013.0)))
+        .await;
+    db.add_record("MSG", Box::new(StringinRecord::new("hello")))
+        .await;
     db
 }
 
@@ -140,13 +142,11 @@ async fn test_restore_all() {
     // Write a save file to restore from
     write_save_file(
         &sav_path,
-        &[
-            SaveEntry {
-                pv_name: "TEMP".into(),
-                value: "99.9".into(),
-                connected: true,
-            },
-        ],
+        &[SaveEntry {
+            pv_name: "TEMP".into(),
+            value: "99.9".into(),
+            connected: true,
+        }],
     )
     .await
     .unwrap();

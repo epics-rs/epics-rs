@@ -13,7 +13,9 @@ pub mod verify;
 pub use backup::BackupConfig;
 pub use error::{AutosaveError, AutosaveResult};
 pub use manager::{AutosaveBuilder, AutosaveManager};
-pub use save_set::{RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy, TriggerMode};
+pub use save_set::{
+    RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy, TriggerMode,
+};
 pub use startup::AutosaveStartupConfig;
 
 use std::path::Path;

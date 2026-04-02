@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use asyn_rs::port_handle::PortHandle;
 
@@ -43,8 +43,12 @@ impl AcquisitionContext {
         if wait_for_plugins {
             self.queued_counter.wait_until_zero(Duration::from_secs(5));
         }
-        let _ = self.port_handle.write_int32_blocking(self.ad.acquire_busy, 0, 0);
-        let _ = self.port_handle.write_int32_blocking(self.ad.status, 0, ADStatus::Idle as i32);
+        let _ = self
+            .port_handle
+            .write_int32_blocking(self.ad.acquire_busy, 0, 0);
+        let _ = self
+            .port_handle
+            .write_int32_blocking(self.ad.status, 0, ADStatus::Idle as i32);
         let _ = self.port_handle.write_int32_blocking(self.ad.acquire, 0, 0);
         let _ = self.port_handle.call_param_callbacks_blocking(0);
     }
@@ -178,18 +182,28 @@ fn acquisition_loop(ctx: AcquisitionContext) {
         }
 
         // Initialize counters via PortHandle
-        let _ = ctx.port_handle.write_int32_blocking(ctx.ad.num_images_counter, 0, 0);
-        let _ = ctx.port_handle.write_int32_blocking(ctx.ad.status, 0, ADStatus::Acquire as i32);
-        let _ = ctx.port_handle.write_int32_blocking(ctx.ad.acquire_busy, 0, 1);
+        let _ = ctx
+            .port_handle
+            .write_int32_blocking(ctx.ad.num_images_counter, 0, 0);
+        let _ = ctx
+            .port_handle
+            .write_int32_blocking(ctx.ad.status, 0, ADStatus::Acquire as i32);
+        let _ = ctx
+            .port_handle
+            .write_int32_blocking(ctx.ad.acquire_busy, 0, 1);
 
         let mut num_counter = 0;
-        let mut array_counter = ctx.port_handle.read_int32_blocking(ctx.ad.base.array_counter, 0).unwrap_or(0);
+        let mut array_counter = ctx
+            .port_handle
+            .read_int32_blocking(ctx.ad.base.array_counter, 0)
+            .unwrap_or(0);
 
         // Read initial config
-        let mut config = match SimConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.sim) {
-            Ok(cfg) => cfg,
-            Err(_) => continue,
-        };
+        let mut config =
+            match SimConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.sim) {
+                Ok(cfg) => cfg,
+                Err(_) => continue,
+            };
 
         loop {
             let start_time = Instant::now();
@@ -200,10 +214,11 @@ fn acquisition_loop(ctx: AcquisitionContext) {
 
             // Only re-read config when parameters changed
             if reset {
-                config = match SimConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.sim) {
-                    Ok(cfg) => cfg,
-                    Err(_) => break,
-                };
+                config =
+                    match SimConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.sim) {
+                        Ok(cfg) => cfg,
+                        Err(_) => break,
+                    };
             }
             task_state.apply_dirty(&dirty_flags, &config);
 
@@ -226,11 +241,25 @@ fn acquisition_loop(ctx: AcquisitionContext) {
 
             // Counter updates + callParamCallbacks always run (like C EPICS).
             // Only doCallbacksGenericPointer (publish) is gated by array_callbacks.
-            ctx.port_handle.write_int32_no_wait(ctx.ad.base.array_counter, 0, array_counter);
-            ctx.port_handle.write_int32_no_wait(ctx.ad.num_images_counter, 0, num_counter);
-            ctx.port_handle.write_float64_no_wait(ctx.ad.base.timestamp_rbv, 0, frame.timestamp.as_f64());
-            ctx.port_handle.write_int32_no_wait(ctx.ad.base.epics_ts_sec, 0, frame.timestamp.sec as i32);
-            ctx.port_handle.write_int32_no_wait(ctx.ad.base.epics_ts_nsec, 0, frame.timestamp.nsec as i32);
+            ctx.port_handle
+                .write_int32_no_wait(ctx.ad.base.array_counter, 0, array_counter);
+            ctx.port_handle
+                .write_int32_no_wait(ctx.ad.num_images_counter, 0, num_counter);
+            ctx.port_handle.write_float64_no_wait(
+                ctx.ad.base.timestamp_rbv,
+                0,
+                frame.timestamp.as_f64(),
+            );
+            ctx.port_handle.write_int32_no_wait(
+                ctx.ad.base.epics_ts_sec,
+                0,
+                frame.timestamp.sec as i32,
+            );
+            ctx.port_handle.write_int32_no_wait(
+                ctx.ad.base.epics_ts_nsec,
+                0,
+                frame.timestamp.nsec as i32,
+            );
             let _ = ctx.port_handle.call_param_callbacks_blocking(0);
 
             if config.array_callbacks {
@@ -271,18 +300,31 @@ mod tests {
         let rt = create_sim_detector("SIM_TEST", 32, 32, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
 
-        handle.write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Single as i32).unwrap();
-        handle.write_float64_blocking(rt.ad_params.acquire_time, 0, 0.001).unwrap();
-        handle.write_float64_blocking(rt.ad_params.acquire_period, 0, 0.001).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Single as i32)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_time, 0, 0.001)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_period, 0, 0.001)
+            .unwrap();
 
         // Start acquisition
-        handle.write_int32_blocking(rt.ad_params.acquire, 0, 1).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.acquire, 0, 1)
+            .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let acquire = handle.read_int32_blocking(rt.ad_params.acquire, 0).unwrap();
-        assert_eq!(acquire, 0, "acquire should be 0 after Single mode completes");
-        let counter = handle.read_int32_blocking(rt.ad_params.base.array_counter, 0).unwrap();
+        assert_eq!(
+            acquire, 0,
+            "acquire should be 0 after Single mode completes"
+        );
+        let counter = handle
+            .read_int32_blocking(rt.ad_params.base.array_counter, 0)
+            .unwrap();
         assert!(counter >= 1, "should have produced at least 1 frame");
     }
 
@@ -291,22 +333,38 @@ mod tests {
         let rt = create_sim_detector("SIM_CONT", 16, 16, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
 
-        handle.write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Continuous as i32).unwrap();
-        handle.write_float64_blocking(rt.ad_params.acquire_time, 0, 0.001).unwrap();
-        handle.write_float64_blocking(rt.ad_params.acquire_period, 0, 0.002).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Continuous as i32)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_time, 0, 0.001)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_period, 0, 0.002)
+            .unwrap();
 
         // Start acquisition
-        handle.write_int32_blocking(rt.ad_params.acquire, 0, 1).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.acquire, 0, 1)
+            .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Stop acquisition
-        handle.write_int32_blocking(rt.ad_params.acquire, 0, 0).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.acquire, 0, 0)
+            .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        let counter = handle.read_int32_blocking(rt.ad_params.base.array_counter, 0).unwrap();
-        assert!(counter >= 2, "should have produced multiple frames, got {}", counter);
+        let counter = handle
+            .read_int32_blocking(rt.ad_params.base.array_counter, 0)
+            .unwrap();
+        assert!(
+            counter >= 2,
+            "should have produced multiple frames, got {}",
+            counter
+        );
     }
 
     #[test]
@@ -314,17 +372,27 @@ mod tests {
         let rt = create_sim_detector("SIM_STOP", 8, 8, 1_000_000, NDArrayOutput::new()).unwrap();
         let handle = rt.port_handle();
 
-        handle.write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Continuous as i32).unwrap();
-        handle.write_float64_blocking(rt.ad_params.acquire_time, 0, 0.5).unwrap();
-        handle.write_float64_blocking(rt.ad_params.acquire_period, 0, 1.0).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.image_mode, 0, ImageMode::Continuous as i32)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_time, 0, 0.5)
+            .unwrap();
+        handle
+            .write_float64_blocking(rt.ad_params.acquire_period, 0, 1.0)
+            .unwrap();
 
         // Start acquisition
-        handle.write_int32_blocking(rt.ad_params.acquire, 0, 1).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.acquire, 0, 1)
+            .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Stop during long exposure
-        handle.write_int32_blocking(rt.ad_params.acquire, 0, 0).unwrap();
+        handle
+            .write_int32_blocking(rt.ad_params.acquire, 0, 0)
+            .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 

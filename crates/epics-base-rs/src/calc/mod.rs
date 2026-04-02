@@ -5,13 +5,13 @@ pub use engine::error::CalcError;
 pub use engine::opcodes::{CoreOp, Opcode};
 pub use engine::{CalcResult, CompiledExpr, ExprKind, NumericInputs};
 
+pub use engine::StringInputs;
 pub use engine::opcodes::StringOp;
 pub use engine::value::StackValue;
-pub use engine::StringInputs;
 
-pub use engine::opcodes::ArrayOp;
-pub use engine::array_value::ArrayStackValue;
 pub use engine::ArrayInputs;
+pub use engine::array_value::ArrayStackValue;
+pub use engine::opcodes::ArrayOp;
 
 /// Compile an infix expression string into a postfix `CompiledExpr`.
 pub fn compile(expr: &str) -> CalcResult<CompiledExpr> {
@@ -35,10 +35,7 @@ pub fn scalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
     engine::postfix::compile(&tokens)
 }
 
-pub fn scalc_eval(
-    expr: &CompiledExpr,
-    inputs: &mut StringInputs,
-) -> CalcResult<StackValue> {
+pub fn scalc_eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> CalcResult<StackValue> {
     engine::string::eval(expr, inputs)
 }
 
@@ -52,10 +49,7 @@ pub fn acalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
     engine::postfix::compile(&tokens)
 }
 
-pub fn acalc_eval(
-    expr: &CompiledExpr,
-    inputs: &mut ArrayInputs,
-) -> CalcResult<ArrayStackValue> {
+pub fn acalc_eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> CalcResult<ArrayStackValue> {
     engine::array::eval(expr, inputs)
 }
 

@@ -205,25 +205,101 @@ impl BusyRecord {
 }
 
 static FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL", dbf_type: DbFieldType::Enum, read_only: false },
-    FieldDesc { name: "OVAL", dbf_type: DbFieldType::Enum, read_only: true },
-    FieldDesc { name: "ZNAM", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "ONAM", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "HIGH", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "ZSV", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "OSV", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "COSV", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "LALM", dbf_type: DbFieldType::Enum, read_only: true },
-    FieldDesc { name: "IVOA", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IVOV", dbf_type: DbFieldType::Enum, read_only: false },
-    FieldDesc { name: "OMSL", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DOL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "MLST", dbf_type: DbFieldType::Enum, read_only: true },
-    FieldDesc { name: "RVAL", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "ORAW", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "MASK", dbf_type: DbFieldType::Long, read_only: false },
-    FieldDesc { name: "RBV", dbf_type: DbFieldType::Long, read_only: true },
-    FieldDesc { name: "ORBV", dbf_type: DbFieldType::Long, read_only: true },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Enum,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OVAL",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ZNAM",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ONAM",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HIGH",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ZSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "COSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LALM",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "IVOA",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IVOV",
+        dbf_type: DbFieldType::Enum,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OMSL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MLST",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "RVAL",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ORAW",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MASK",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RBV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ORBV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
 ];
 
 impl Record for BusyRecord {
@@ -480,11 +556,19 @@ mod tests {
         let mut rec = BusyRecord::new();
 
         // String fields
-        rec.put_field("ZNAM", EpicsValue::String("Idle".to_string())).unwrap();
-        assert_eq!(rec.get_field("ZNAM"), Some(EpicsValue::String("Idle".to_string())));
+        rec.put_field("ZNAM", EpicsValue::String("Idle".to_string()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("ZNAM"),
+            Some(EpicsValue::String("Idle".to_string()))
+        );
 
-        rec.put_field("ONAM", EpicsValue::String("Active".to_string())).unwrap();
-        assert_eq!(rec.get_field("ONAM"), Some(EpicsValue::String("Active".to_string())));
+        rec.put_field("ONAM", EpicsValue::String("Active".to_string()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("ONAM"),
+            Some(EpicsValue::String("Active".to_string()))
+        );
 
         // Double field
         rec.put_field("HIGH", EpicsValue::Double(2.5)).unwrap();
@@ -509,8 +593,12 @@ mod tests {
         rec.put_field("OMSL", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(1)));
 
-        rec.put_field("DOL", EpicsValue::String("some:link".to_string())).unwrap();
-        assert_eq!(rec.get_field("DOL"), Some(EpicsValue::String("some:link".to_string())));
+        rec.put_field("DOL", EpicsValue::String("some:link".to_string()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("DOL"),
+            Some(EpicsValue::String("some:link".to_string()))
+        );
 
         rec.put_field("MASK", EpicsValue::Long(0xFF)).unwrap();
         assert_eq!(rec.get_field("MASK"), Some(EpicsValue::Long(0xFF)));
@@ -521,26 +609,32 @@ mod tests {
         let mut rec = BusyRecord::new();
 
         // String "Done" → val=0
-        rec.put_field("VAL", EpicsValue::String("Done".to_string())).unwrap();
+        rec.put_field("VAL", EpicsValue::String("Done".to_string()))
+            .unwrap();
         assert_eq!(rec.val, 0);
 
         // String "Busy" → val=1
-        rec.put_field("VAL", EpicsValue::String("Busy".to_string())).unwrap();
+        rec.put_field("VAL", EpicsValue::String("Busy".to_string()))
+            .unwrap();
         assert_eq!(rec.val, 1);
 
         // Case insensitive
-        rec.put_field("VAL", EpicsValue::String("done".to_string())).unwrap();
+        rec.put_field("VAL", EpicsValue::String("done".to_string()))
+            .unwrap();
         assert_eq!(rec.val, 0);
 
-        rec.put_field("VAL", EpicsValue::String("busy".to_string())).unwrap();
+        rec.put_field("VAL", EpicsValue::String("busy".to_string()))
+            .unwrap();
         assert_eq!(rec.val, 1);
 
         // Custom ZNAM/ONAM
         rec.znam = "Off".to_string();
         rec.onam = "On".to_string();
-        rec.put_field("VAL", EpicsValue::String("Off".to_string())).unwrap();
+        rec.put_field("VAL", EpicsValue::String("Off".to_string()))
+            .unwrap();
         assert_eq!(rec.val, 0);
-        rec.put_field("VAL", EpicsValue::String("On".to_string())).unwrap();
+        rec.put_field("VAL", EpicsValue::String("On".to_string()))
+            .unwrap();
         assert_eq!(rec.val, 1);
     }
 

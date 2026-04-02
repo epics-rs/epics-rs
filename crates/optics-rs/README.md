@@ -37,7 +37,7 @@ separates them:
 records/     Pure EPICS record types (table)
 math/        Physics calculations (matrix3, orient)
 data/        Reference data tables (chantler X-ray absorption)
-snl/         Control logic as async state machines (tokio + epics-ca-rs)
+snl/         Control logic as async state machines (epics-ca-rs)
 drivers/     Device I/O as asyn port drivers (SimHsc, SimQxbpm)
 db/          36 database templates from the original module
 ```

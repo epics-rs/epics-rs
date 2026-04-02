@@ -95,7 +95,7 @@ Not parallelized: FFT (rustfft internal SIMD), recursive filter (IIR dependency 
 
 **Thread pool management:**
 
-All plugins share a single rayon `ThreadPool` to avoid over-subscription when multiple plugins process data concurrently. The pool is sized to `available_cores - 2` (minimum 1), reserving headroom for port driver data threads, autoconnect tasks, and the tokio runtime.
+All plugins share a single rayon `ThreadPool` to avoid over-subscription when multiple plugins process data concurrently. The pool is sized to `available_cores - 2` (minimum 1), reserving headroom for port driver data threads, autoconnect tasks, and the async runtime.
 
 To override the thread count, call `set_num_threads()` before the first array is processed:
 

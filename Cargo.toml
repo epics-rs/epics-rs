@@ -18,20 +18,20 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.7.4"
+version = "0.7.6"
 authors = ["Sang Woo Kim <sngwkim915@gmail.com>"]
 license = "EPICS Open License"
 repository = "https://github.com/epics-rs/epics-rs"
 
 [workspace.dependencies]
-ad-core-rs = { path = "crates/ad-core-rs", version = "0.7.4" }
-ad-plugins-rs = { path = "crates/ad-plugins-rs", version = "0.7.4" }
-asyn-rs = { path = "crates/asyn-rs", version = "0.7.4" }
-epics-base-rs = { path = "crates/epics-base-rs", version = "0.7.4" }
-epics-ca-rs = { path = "crates/epics-ca-rs", version = "0.7.4" }
-epics-macros-rs = { path = "crates/epics-macros-rs", version = "0.7.4" }
-epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.7.4" }
-motor-rs = { path = "crates/motor-rs", version = "0.7.4" }
-std-rs = { path = "crates/std-rs", version = "0.7.4" }
-scaler-rs = { path = "crates/scaler-rs", version = "0.7.4" }
-optics-rs = { path = "crates/optics-rs", version = "0.7.4" }
+ad-core-rs = { path = "crates/ad-core-rs", version = "0.7.6" }
+ad-plugins-rs = { path = "crates/ad-plugins-rs", version = "0.7.6" }
+asyn-rs = { path = "crates/asyn-rs", version = "0.7.6" }
+epics-base-rs = { path = "crates/epics-base-rs", version = "0.7.6" }
+epics-ca-rs = { path = "crates/epics-ca-rs", version = "0.7.6" }
+epics-macros-rs = { path = "crates/epics-macros-rs", version = "0.7.6" }
+epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.7.6" }
+motor-rs = { path = "crates/motor-rs", version = "0.7.6" }
+std-rs = { path = "crates/std-rs", version = "0.7.6" }
+scaler-rs = { path = "crates/scaler-rs", version = "0.7.6" }
+optics-rs = { path = "crates/optics-rs", version = "0.7.6" }

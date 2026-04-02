@@ -136,8 +136,7 @@ areadetector-rs/
 
 ## Requirements
 
-- Rust 1.70+
-- tokio runtime
+- Rust 1.85+ (edition 2024)
 
 ## License
 

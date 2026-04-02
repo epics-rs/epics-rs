@@ -370,7 +370,7 @@ Swapping the driver changes the hardware; swapping the device support changes ho
 
 ### Phase bridge (BeamlineHolder)
 
-Drivers are created during Phase 1 (st.cmd thread), but device support factories run during Phase 2 (tokio thread). `BeamlineHolder` bridges this gap — the config command stores driver handles into it, and the factories read them back out. This is the Rust equivalent of the global variables that C EPICS IOCs use to pass driver handles from `xxxConfigure()` to device support `init()`.
+Drivers are created during Phase 1 (st.cmd thread), but device support factories run during Phase 2 (async runtime thread). `BeamlineHolder` bridges this gap — the config command stores driver handles into it, and the factories read them back out. This is the Rust equivalent of the global variables that C EPICS IOCs use to pass driver handles from `xxxConfigure()` to device support `init()`.
 
 ### Template-based motors
 

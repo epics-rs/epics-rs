@@ -130,7 +130,7 @@ epics-rs (umbrella — feature-gated re-exports)
 
 | Aspect | C EPICS | epics-rs |
 |--------|---------|----------|
-| **Concurrency model** | POSIX threads + mutex pool + event queue | tokio async + per-driver actor (exclusive ownership) |
+| **Concurrency model** | POSIX threads + mutex pool + event queue | Async runtime + per-driver actor (exclusive ownership) |
 | **Record internals** | C struct fields, `dbAddr` pointer arithmetic | Rust trait system, on-demand `Snapshot` assembly |
 | **Device drivers** | C functions + `void*` pointers | Rust traits + impl blocks (type-safe) |
 | **Metadata storage** | Stored directly in record C struct (flat memory) | Assembled on-demand into `Snapshot` (Display/Control/EnumInfo) |
@@ -142,13 +142,13 @@ epics-rs (umbrella — feature-gated re-exports)
 
 ### 1. Actor-Based Concurrency
 
-C EPICS uses a global shared state with mutex pools. In epics-rs, each driver has a tokio actor with exclusive ownership — no `Arc<Mutex>` on the hot path:
+C EPICS uses a global shared state with mutex pools. In epics-rs, each driver has an async actor with exclusive ownership — no `Arc<Mutex>` on the hot path:
 
 ```
 C EPICS:                          epics-rs:
 ┌──────────────────┐              ┌──────────────────┐
 │  Global State    │              │   PortActor      │ ← exclusive ownership
-│  + Mutex Pool    │              │   (tokio task)   │
+│  + Mutex Pool    │              │   (async task)   │
 │  + Event Queue   │              ├──────────────────┤
 │                  │              │   PortHandle     │ ← cloneable interface
 │  Thread 1 ──lock─┤              │   (mpsc channel) │
@@ -338,7 +338,7 @@ The protocol runner is pluggable — future pvAccess support uses the same patte
 app.run(|config| async {
     let ca = CaServer::from_parts(config.db.clone(), config.port, ...);
     let pva = PvaServer::new(config.db.clone(), 5075);
-    tokio::select! { _ = ca.run() => {}, _ = pva.run() => {} }
+    epics_base_rs::runtime::select! { _ = ca.run() => {}, _ = pva.run() => {} }
 }).await
 ```
 
@@ -359,6 +359,31 @@ let client = CaClient::new().await?;
 let (_type, value) = client.caget("TEMP").await?;
 client.caput("TEMP", "42.0").await?;
 ```
+
+### Runtime Interface
+
+Driver authors should use the runtime facade instead of depending on tokio directly. Both `asyn-rs` and `epics-base-rs` provide the same re-exports:
+
+```rust
+// Sync primitives (channels, Notify, etc.)
+use asyn_rs::runtime::sync::{mpsc, Notify, Arc};
+
+// Task utilities (spawn, sleep, timers)
+use asyn_rs::runtime::task::{spawn, sleep, interval};
+
+// Async multiplexing
+use asyn_rs::runtime::select;
+
+// IOC entry point (replaces #[tokio::main])
+#[epics_base_rs::epics_main]
+async fn main() -> CaResult<()> { /* ... */ }
+
+// Async tests (replaces #[tokio::test])
+#[epics_base_rs::epics_test]
+async fn test_something() { /* ... */ }
+```
+
+IOC binaries and device support implementations should use `epics_base_rs::runtime::` or `asyn_rs::runtime::`. See the [scope-ioc](examples/scope-ioc/) and [mini-beamline](examples/mini-beamline/) examples for complete driver implementations using this pattern.
 
 ## Crate Details
 
@@ -390,7 +415,7 @@ Rust port of C EPICS asyn. Actor-based port driver model:
 
 - **PortDriver trait** — `read_int32`, `write_float64`, `read_octet_array`, etc.
 - **ParamList** — change tracking, timestamps, alarm propagation
-- **PortActor** — exclusive driver ownership (tokio task)
+- **PortActor** — exclusive driver ownership (async task)
 - **PortHandle** — cloneable async interface
 - **RuntimeClient** — transport abstraction (InProcessClient, future UnixSocketClient)
 
@@ -402,7 +427,7 @@ Complete motor record implementation:
 - **Coordinate transforms** — User <-> Dial <-> Raw (steps)
 - **Backlash compensation** — approach + final move
 - **4 retry modes** — Default, Arithmetic, Geometric, InPosition
-- **AxisRuntime** — per-axis tokio actor, poll loop
+- **AxisRuntime** — per-axis async actor, poll loop
 - **SimMotor** — time-based linear interpolation motor for testing
 
 ### ad-core & ad-plugins
@@ -413,7 +438,7 @@ areaDetector framework:
 - **NDArrayPool** — free-list buffer reuse
 - **ADDriverBase** — detector driver base (Single/Multiple/Continuous modes)
 - **23 plugins** — Stats, ROI, ROIStat, Process, Transform, ColorConvert, Overlay, FFT, TimeSeries, CircularBuff, Codec, Gather, Scatter, StdArrays, FileTIFF, FileJPEG, FileHDF5, Attribute, AttrPlot, BadPixel, PosPlugin, Passthrough
-- **Parallel processing** — rayon data-parallelism for CPU-heavy plugins (Stats, ROIStat, ColorConvert, Process). Shared thread pool sized to `available_cores - 2` to leave headroom for driver threads and tokio runtime. Enabled by default; see [ad-plugins README](crates/ad-plugins-rs/README.md#parallel-processing)
+- **Parallel processing** — rayon data-parallelism for CPU-heavy plugins (Stats, ROIStat, ColorConvert, Process). Shared thread pool sized to `available_cores - 2` to leave headroom for driver threads and the async runtime. Enabled by default; see [ad-plugins README](crates/ad-plugins-rs/README.md#parallel-processing)
 
 ### Calc Engine (in epics-base-rs)
 
@@ -726,7 +751,7 @@ Test coverage: protocol encoding, wire format golden packets, snapshot generatio
 ## Requirements
 
 - Rust 1.85+ (edition 2024)
-- tokio runtime
+- Async runtime (provided by `epics-base-rs` — no direct tokio dependency needed)
 
 ### Optional System Dependencies
 

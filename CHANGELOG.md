@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.7.6
+
+### Runtime Facade
+- **asyn-rs**: add `runtime::sync` (mpsc, oneshot, broadcast, Notify, Mutex, RwLock), `runtime::task` (spawn, sleep, interval, RuntimeHandle), and `runtime::select!` re-exports — driver authors no longer need to depend on tokio directly
+- **epics-base-rs**: add matching re-exports in `runtime::sync` and `runtime::task`, plus `select!` macro re-export and hidden `__tokio` re-export for macro hygiene
+
+### Proc Macros
+- **`#[epics_main]`**: attribute macro replacing `#[tokio::main]` — validates `async fn main()`, no args, no generics, no attribute arguments; builds multi-thread runtime via `epics_base_rs::__tokio`
+- **`#[epics_test]`**: attribute macro replacing `#[tokio::test]` — validates async fn with no args/generics, rejects duplicate `#[test]`; builds current-thread runtime (matching `#[tokio::test]` default)
+
+### Examples Modernized
+- All examples (`mini-beamline`, `scope-ioc`, `sim-detector`, `ophyd-test-ioc`, `random-signals`) now use the runtime facade instead of tokio directly
+- `scope-ioc`: `epics-base-rs` promoted from optional to required dependency
+- Zero `tokio::` references remain in example code (except `#[tokio::main]` → `#[epics_main]`)
+
+### Docs
+- Quick Start: add binary location (`target/release/`) and PATH setup
+- Quick Start: fix build command to use `--release`
+- Update copyright name in LICENSE
+
 ## v0.7.5
 
 ### areaDetector PV Convention

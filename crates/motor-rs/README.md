@@ -30,9 +30,9 @@ No C dependencies. Just `cargo build`.
 
 **AxisRuntime** — unified per-axis actor that replaces the shared-state poll loop:
 
-- **AxisRuntime** — single tokio task per axis, owns motor driver exclusively (no `Arc<Mutex>`)
+- **AxisRuntime** — single async task per axis, owns motor driver exclusively (no `Arc<Mutex>`)
 - **AxisHandle** — cloneable async interface (`execute()`, `get_status()`, polling, delay)
-- `tokio::select!` multiplexes commands and poll timer (no `SharedDeviceState` mutex)
+- `select!` multiplexes commands and poll timer (no `SharedDeviceState` mutex)
 - I/O Intr notification channel for scan integration
 
 ```rust
@@ -94,14 +94,12 @@ cargo bench         # Criterion benchmarks
 ## Dependencies
 
 - epics-base-rs — Record trait, DeviceSupport trait
-- asyn-rs — AsynMotor interface
-- tokio — async runtime
+- asyn-rs — AsynMotor interface, async runtime facade
 - bitflags — MipFlags, MstaFlags
 
 ## Requirements
 
-- Rust 1.70+
-- tokio runtime
+- Rust 1.85+ (edition 2024)
 
 ## License
 

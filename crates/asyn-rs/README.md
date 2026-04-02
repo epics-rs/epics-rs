@@ -8,7 +8,7 @@ No C dependencies. Pure Rust. Integrates with [epics-ca](https://github.com/phys
 
 ## Overview
 
-asyn-rs provides the same driver model as C asyn, but uses Rust's type system and tokio for safety and concurrency:
+asyn-rs provides the same driver model as C asyn, but uses Rust's type system and async concurrency for safety and performance:
 
 - **PortDriver trait** — implement `read_*`/`write_*` for your hardware
 - **ParamList** — named parameter cache with change tracking, timestamps, and alarm status
@@ -115,7 +115,7 @@ pub trait RuntimeClient: Send + Sync + Clone + 'static {
               ↕
 ┌─────────────────────────────────────────────┐
 │  Your Hardware Driver                        │
-│  - Background tokio task polls device        │
+│  - Background async task polls device         │
 │  - set_*_param() + call_param_callbacks()    │
 │  - Default read_* returns cached values      │
 └─────────────────────────────────────────────┘
@@ -213,14 +213,26 @@ The adapter handles:
 | `port_handle` | `PortHandle` — cloneable async handle with typed convenience methods |
 | `protocol` | Pure-data message types: `PortCommand`, `PortReply`, `ParamValue`, `PortEvent` |
 | `transport` | `RuntimeClient` trait, `InProcessClient` (zero-cost fast path) |
-| `runtime` | `PortRuntime`, `AxisRuntime`, supervision, `RuntimeEvent` lifecycle |
+| `runtime` | `PortRuntime`, `AxisRuntime`, supervision, `RuntimeEvent` lifecycle, async runtime facade (`sync`, `task`, `select!`) |
 | `adapter` | `AsynDeviceSupport` — epics-ca bridge *(requires `epics` feature)* |
+
+## Runtime Facade
+
+asyn-rs re-exports async runtime primitives so driver authors never depend on tokio directly:
+
+```rust
+use asyn_rs::runtime::sync::{mpsc, Notify, Arc};    // channels, sync primitives
+use asyn_rs::runtime::task::{spawn, sleep, interval}; // task utilities
+use asyn_rs::runtime::select;                         // async multiplexing
+```
+
+For IOC binaries, use `#[epics_base_rs::epics_main]` instead of `#[tokio::main]`, and `#[epics_base_rs::epics_test]` instead of `#[tokio::test]`.
 
 ## I/O Model
 
 asyn-rs uses a **cache-based** model instead of C asyn's queue/block model:
 
-1. A background task (e.g., tokio::spawn) polls the hardware
+1. A background task polls the hardware
 2. Driver calls `set_*_param()` to update cached values
 3. Driver calls `call_param_callbacks()` to notify subscribers
 4. Default `read_*` methods return the cached value immediately

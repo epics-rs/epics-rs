@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.7.5
+
+### areaDetector PV Convention
+- Adopt standard areaDetector PV convention (`P=mini:dot:`, `R=cam1:`) in mini-beamline
+- Add NDStdArrays `image1` plugin to `commonPlugins.cmd`
+- Include `ADBase.template` for full ADBase PV set (TriggerMode, Gain, etc.)
+- Add missing param registry entries for NDArrayBase PVs
+- Fix param name mismatches with C ADCore templates
+
+### CA Server
+- Non-blocking WRITE_NOTIFY: spawn background task for completion instead of blocking `dispatch_message`, matching C EPICS rsrv behavior
+- Remove arbitrary 30s timeout — wait indefinitely for record completion
+
+### MovingDot Driver
+- Non-blocking port writes in device support and acquisition task to prevent tokio thread starvation
+- Remove `call_param_callbacks` from driver write methods to prevent re-entrant message storms
+- Add slit aperture simulation (SlitLeft/Right/Top/Bottom in pixels)
+- Output UInt16 image data (realistic photon counts)
+- Tolerate read failures during config refresh instead of aborting acquisition
+
+### Waveform Record
+- Add SHORT/USHORT and FLOAT FTVL support (was falling through to DOUBLE)
+- Fix `DbFieldType`-to-`menuFtype` mapping in `new()`
+- `PluginDeviceSupport`: native `EpicsValue` types for NDArray data
+
+### AsynDeviceSupport
+- Add public accessors (`reason`, `addr`, `handle`, `write_op_pub`)
+
+### Docs
+- Quick Start: add binary location (`target/release/`) and PATH setup
+- Quick Start: fix build command to use `--release`
+- Update copyright name in LICENSE
+
 ## v0.7.4
 
 ### New Crate

@@ -2,6 +2,7 @@ pub mod registry;
 mod commands;
 
 use std::sync::{Arc, RwLock};
+use std::fs::File;
 
 use registry::*;
 use crate::server::database::PvDatabase;
@@ -29,6 +30,10 @@ impl IocShell {
     }
 
     /// Execute a single line of input.
+    ///
+    /// Supports C EPICS iocsh output redirection:
+    /// - `command > file` — redirect stdout to file (overwrite)
+    /// - `command >> file` — redirect stdout to file (append)
     pub fn execute_line(&self, line: &str) -> CommandResult {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -41,6 +46,40 @@ impl IocShell {
             return self.execute_script(&filename).map(|_| CommandOutcome::Continue);
         }
 
+        // Handle `> filename` / `>> filename` output redirection
+        let (cmd_line, redirect) = parse_redirect(line);
+
+        if let Some(redir) = redirect {
+            let result = self.execute_command(cmd_line, Some(&redir));
+            return result;
+        }
+
+        self.execute_command(cmd_line, None)
+    }
+
+    /// Execute a command, optionally redirecting output to a file.
+    fn execute_command(&self, line: &str, redirect: Option<&Redirect>) -> CommandResult {
+        if let Some(redir) = redirect {
+            let file_result = if redir.append {
+                std::fs::OpenOptions::new().create(true).append(true).open(&redir.path)
+            } else {
+                File::create(&redir.path)
+            };
+            match file_result {
+                Ok(file) => {
+                    self.ctx.with_output(file, || self.execute_command_inner(line))
+                }
+                Err(e) => {
+                    eprintln!("cannot open '{}': {}", redir.path, e);
+                    Ok(CommandOutcome::Continue)
+                }
+            }
+        } else {
+            self.execute_command_inner(line)
+        }
+    }
+
+    fn execute_command_inner(&self, line: &str) -> CommandResult {
         let tokens = tokenize(line);
         if tokens.is_empty() {
             return Ok(CommandOutcome::Continue);
@@ -118,17 +157,62 @@ impl IocShell {
     fn execute_help(&self, arg_tokens: &[String], registry: &CommandRegistry) -> CommandResult {
         if let Some(name) = arg_tokens.first() {
             if let Some(def) = registry.get(name) {
-                println!("{}", def.usage);
+                self.ctx.println(&def.usage);
             } else {
-                println!("unknown command: '{name}'");
+                self.ctx.println(&format!("unknown command: '{name}'"));
             }
         } else {
-            println!("Available commands:");
+            self.ctx.println("Available commands:");
             for name in registry.list() {
-                println!("  {name}");
+                self.ctx.println(&format!("  {name}"));
             }
         }
         Ok(CommandOutcome::Continue)
+    }
+}
+
+struct Redirect {
+    path: String,
+    append: bool,
+}
+
+/// Parse `>` / `>>` redirect from end of line.
+/// Returns (command_part, optional redirect).
+fn parse_redirect(line: &str) -> (&str, Option<Redirect>) {
+    let bytes = line.as_bytes();
+    let mut in_quote = false;
+    let mut redir_pos = None;
+    let mut is_append = false;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => in_quote = !in_quote,
+            b'>' if !in_quote => {
+                redir_pos = Some(i);
+                is_append = i + 1 < bytes.len() && bytes[i + 1] == b'>';
+                break; // use first unquoted > position
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    match redir_pos {
+        Some(pos) => {
+            let cmd = line[..pos].trim();
+            let skip = if is_append { 2 } else { 1 };
+            let path = line[pos + skip..].trim();
+            if path.is_empty() {
+                (line, None)
+            } else {
+                (cmd, Some(Redirect {
+                    path: registry::substitute_env_vars(path),
+                    append: is_append,
+                }))
+            }
+        }
+        None => (line, None),
     }
 }
 
@@ -216,5 +300,49 @@ mod tests {
         ));
         let result = shell.execute_line("myCmd");
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
+    }
+
+    #[test]
+    fn test_redirect_dbl_to_file() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_test_dbl_redirect.txt");
+        let _ = std::fs::remove_file(&tmp);
+        let line = format!("dbl > {}", tmp.display());
+        let result = shell.execute_line(&line);
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        assert!(content.contains("TEST_REC"), "dbl output should contain TEST_REC, got: {content}");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_redirect_append() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_test_append.txt");
+        std::fs::write(&tmp, "existing\n").unwrap();
+        let line = format!("dbl >> {}", tmp.display());
+        let result = shell.execute_line(&line);
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        assert!(content.starts_with("existing\n"));
+        assert!(content.contains("TEST_REC"));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_parse_redirect() {
+        let (cmd, redir) = parse_redirect("dbl > /tmp/out.txt");
+        assert_eq!(cmd, "dbl");
+        let r = redir.unwrap();
+        assert_eq!(r.path, "/tmp/out.txt");
+        assert!(!r.append);
+
+        let (cmd, redir) = parse_redirect("dbl >> /tmp/out.txt");
+        assert_eq!(cmd, "dbl");
+        assert!(redir.unwrap().append);
+
+        let (cmd, redir) = parse_redirect("dbl");
+        assert_eq!(cmd, "dbl");
+        assert!(redir.is_none());
     }
 }

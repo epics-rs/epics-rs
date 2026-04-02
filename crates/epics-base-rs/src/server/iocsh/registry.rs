@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 
 use crate::server::database::PvDatabase;
@@ -79,11 +80,17 @@ impl CommandDef {
 pub struct CommandContext {
     db: Arc<PvDatabase>,
     handle: tokio::runtime::Handle,
+    /// Output writer — defaults to stdout, redirected to a file by `>` / `>>`.
+    output: std::cell::RefCell<Box<dyn std::io::Write>>,
 }
 
 impl CommandContext {
     pub fn new(db: Arc<PvDatabase>, handle: tokio::runtime::Handle) -> Self {
-        Self { db, handle }
+        Self {
+            db,
+            handle,
+            output: std::cell::RefCell::new(Box::new(std::io::stdout())),
+        }
     }
 
     /// Access the PV database.
@@ -94,6 +101,32 @@ impl CommandContext {
     /// Access the tokio runtime handle (e.g., for spawning tasks from iocsh commands).
     pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
         &self.handle
+    }
+
+    /// Print a line to the current output (stdout or redirected file).
+    pub fn println(&self, msg: &str) {
+        let mut out = self.output.borrow_mut();
+        let _ = writeln!(out, "{msg}");
+    }
+
+    /// Print a formatted string to the current output.
+    pub fn print_fmt(&self, args: std::fmt::Arguments<'_>) {
+        let mut out = self.output.borrow_mut();
+        let _ = out.write_fmt(args);
+        let _ = writeln!(out);
+    }
+
+    /// Temporarily redirect output to a writer, run a closure, then restore.
+    pub(crate) fn with_output<W: std::io::Write + 'static, R>(
+        &self,
+        writer: W,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let prev = self.output.replace(Box::new(writer));
+        let result = f();
+        let _ = self.output.borrow_mut().flush();
+        self.output.replace(prev);
+        result
     }
 
     /// Run an async future from the blocking REPL thread.

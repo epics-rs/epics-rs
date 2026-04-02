@@ -33,11 +33,11 @@ fn cmd_help() -> CommandDef {
             // This handler is a placeholder; the real logic is in IocShell::execute_line
             match &args[0] {
                 ArgValue::String(name) => {
-                    println!("Use 'help' without arguments to list all commands, or 'help <command>' for details.");
-                    println!("(Looking for help on '{name}')");
+                    _ctx.println("Use 'help' without arguments to list all commands, or 'help <command>' for details.");
+                    _ctx.println(&format!("(Looking for help on '{name}')"));
                 }
                 ArgValue::Missing => {
-                    println!("Use 'help' to list all commands.");
+                    _ctx.println("Use 'help' to list all commands.");
                 }
                 _ => {}
             }
@@ -75,7 +75,7 @@ fn cmd_dbl() -> CommandDef {
                         }
                     }
                 }
-                println!("{name}");
+                ctx.println(name);
             }
 
             Ok(CommandOutcome::Continue)
@@ -101,7 +101,7 @@ fn cmd_dbgf() -> CommandDef {
             match ctx.block_on(ctx.db().get_pv(name)) {
                 Ok(val) => {
                     let type_name = dbf_type_name(&val);
-                    println!("{type_name}: {val}");
+                    ctx.println(&format!("{type_name}: {val}"));
                     Ok(CommandOutcome::Continue)
                 }
                 Err(e) => Err(format!("{e}")),
@@ -177,7 +177,7 @@ fn cmd_dbpf() -> CommandDef {
             match ctx.block_on(ctx.db().get_pv(name)) {
                 Ok(val) => {
                     let type_name = dbf_type_name(&val);
-                    println!("{type_name}: {val}");
+                    ctx.println(&format!("{type_name}: {val}"));
                 }
                 Err(_) => {}
             }
@@ -280,7 +280,7 @@ fn cmd_dbpr() -> CommandDef {
 
             // Format outside lock
             for (name, value) in &fields {
-                println!("{name:>8}: {value}");
+                ctx.println(&format!("{name:>8}: {value}"));
             }
 
             Ok(CommandOutcome::Continue)
@@ -401,7 +401,7 @@ fn cmd_db_load_records() -> CommandDef {
                 });
             }
 
-            println!("Loaded {count} record(s) from {path}");
+            ctx.println(&format!("Loaded {count} record(s) from {path}"));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -445,8 +445,8 @@ fn cmd_ioc_init() -> CommandDef {
         "iocInit",
         vec![],
         "iocInit - Initialize the IOC (handled automatically by IocApplication)",
-        |_args: &[ArgValue], _ctx: &CommandContext| {
-            println!("iocInit: skipped (handled automatically after script execution)");
+        |_args: &[ArgValue], ctx: &CommandContext| {
+            ctx.println("iocInit: skipped (handled automatically after script execution)");
             Ok(CommandOutcome::Continue)
         },
     )

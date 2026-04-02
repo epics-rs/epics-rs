@@ -5,3 +5,6 @@ pub mod net;
 pub mod sync;
 pub mod task;
 pub mod time;
+
+// Re-export tokio::select! macro through the runtime facade.
+pub use tokio::select;

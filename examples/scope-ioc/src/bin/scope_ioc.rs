@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use epics_base_rs::runtime::sync::Notify;
 
 use scope_ioc::driver::*;
 use asyn_rs::interrupt::{InterruptFilter, InterruptSubscription};
@@ -143,7 +143,7 @@ impl DeviceSupport for ScopeDeviceSupport {
         Ok(())
     }
 
-    fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
+    fn io_intr_receiver(&mut self) -> Option<epics_base_rs::runtime::sync::mpsc::Receiver<()>> {
         if self.scan != ScanType::IoIntr {
             return None;
         }
@@ -157,8 +157,8 @@ impl DeviceSupport for ScopeDeviceSupport {
             drv.base.interrupts.register_interrupt_user(filter)
         };
         self._interrupt_sub = Some(sub);
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(async move {
+        let (tx, rx) = epics_base_rs::runtime::sync::mpsc::channel(16);
+        epics_base_rs::runtime::task::spawn(async move {
             while intr_rx.recv().await.is_some() {
                 if tx.send(()).await.is_err() {
                     break;
@@ -259,7 +259,7 @@ impl DriverHolder {
 
 struct ConfigHandler {
     holder: Arc<DriverHolder>,
-    handle: tokio::runtime::Handle,
+    handle: epics_base_rs::runtime::task::RuntimeHandle,
 }
 
 impl CommandHandler for ConfigHandler {
@@ -338,7 +338,7 @@ impl CommandHandler for ReportHandler {
 
 // ========== Main ==========
 
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -355,7 +355,7 @@ async fn main() -> CaResult<()> {
     let holder_for_config = holder.clone();
     let holder_for_factory = holder.clone();
     let holder_for_report = holder.clone();
-    let handle = tokio::runtime::Handle::current();
+    let handle = epics_base_rs::runtime::task::runtime_handle();
 
     IocApplication::new()
         .port(

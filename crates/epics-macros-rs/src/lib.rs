@@ -1,6 +1,149 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, Data, Fields, Lit};
+use syn::{parse_macro_input, DeriveInput, Data, Fields, Lit, ItemFn};
+
+/// Marks an `async fn main()` as an EPICS IOC entry point.
+///
+/// Builds a multi-threaded tokio runtime (via `epics_base_rs::__tokio`)
+/// without requiring the downstream crate to depend on tokio directly.
+///
+/// # Restrictions
+/// - Must be applied to `async fn main()` — no generics, no arguments.
+/// - Does not accept attribute arguments (e.g., `#[epics_main(flavor = ...)]` is a compile error).
+///
+/// # Example
+/// ```ignore
+/// #[epics_main]
+/// async fn main() -> CaResult<()> {
+///     // ...
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn epics_main(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[epics_main] does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let input = parse_macro_input!(item as ItemFn);
+    let sig = &input.sig;
+
+    if sig.asyncness.is_none() {
+        return syn::Error::new_spanned(sig.fn_token, "#[epics_main] requires `async fn`")
+            .to_compile_error()
+            .into();
+    }
+    if sig.ident != "main" {
+        return syn::Error::new_spanned(&sig.ident, "#[epics_main] must be applied to `main`")
+            .to_compile_error()
+            .into();
+    }
+    if !sig.inputs.is_empty() {
+        return syn::Error::new_spanned(&sig.inputs, "`main` must not take arguments")
+            .to_compile_error()
+            .into();
+    }
+    if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
+        return syn::Error::new_spanned(&sig.generics, "`main` must not be generic")
+            .to_compile_error()
+            .into();
+    }
+
+    let attrs = &input.attrs;
+    let vis = &input.vis;
+    let ret = &sig.output;
+    let body = &input.block;
+
+    quote! {
+        #(#attrs)*
+        #vis fn main() #ret {
+            ::epics_base_rs::__tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime")
+                .block_on(async move #body)
+        }
+    }
+    .into()
+}
+
+/// Marks an async function as an EPICS test.
+///
+/// Builds a current-thread tokio runtime (via `epics_base_rs::__tokio`),
+/// matching the default behavior of `#[tokio::test]`.
+///
+/// # Restrictions
+/// - Must be applied to an `async fn` with no arguments and no generics.
+/// - Does not accept attribute arguments.
+///
+/// # Example
+/// ```ignore
+/// #[epics_test]
+/// async fn test_something() {
+///     // ...
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[epics_test] does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let input = parse_macro_input!(item as ItemFn);
+    let sig = &input.sig;
+
+    if sig.asyncness.is_none() {
+        return syn::Error::new_spanned(sig.fn_token, "#[epics_test] requires `async fn`")
+            .to_compile_error()
+            .into();
+    }
+    if !sig.inputs.is_empty() {
+        return syn::Error::new_spanned(&sig.inputs, "test functions must not take arguments")
+            .to_compile_error()
+            .into();
+    }
+    if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
+        return syn::Error::new_spanned(&sig.generics, "test functions must not be generic")
+            .to_compile_error()
+            .into();
+    }
+    if input.attrs.iter().any(|a| a.path().is_ident("test")) {
+        return syn::Error::new_spanned(
+            input.attrs.iter().find(|a| a.path().is_ident("test")).unwrap(),
+            "#[epics_test] already adds #[test]; remove the duplicate",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let attrs = &input.attrs;
+    let vis = &input.vis;
+    let name = &sig.ident;
+    let ret = &sig.output;
+    let body = &input.block;
+
+    quote! {
+        #[test]
+        #(#attrs)*
+        #vis fn #name() #ret {
+            ::epics_base_rs::__tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime")
+                .block_on(async move #body)
+        }
+    }
+    .into()
+}
 
 /// Derive macro that implements the `Record` trait for a struct.
 ///

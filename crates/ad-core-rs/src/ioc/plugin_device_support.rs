@@ -148,7 +148,7 @@ impl DeviceSupport for PluginDeviceSupport {
         if self.mapped { self.inner.last_timestamp() } else { None }
     }
 
-    fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
+    fn io_intr_receiver(&mut self) -> Option<epics_base_rs::runtime::sync::mpsc::Receiver<()>> {
         if self.mapped { self.inner.io_intr_receiver() } else { None }
     }
 }

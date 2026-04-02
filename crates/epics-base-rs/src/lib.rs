@@ -27,3 +27,9 @@ pub mod error;
 pub mod runtime;
 pub mod server;
 pub mod types;
+
+pub use epics_macros_rs::epics_main;
+pub use epics_macros_rs::epics_test;
+
+#[doc(hidden)]
+pub use tokio as __tokio;

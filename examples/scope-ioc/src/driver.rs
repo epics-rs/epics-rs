@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use asyn_rs::runtime::sync::Notify;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::{EnumEntry, ParamType};
@@ -355,8 +355,8 @@ pub async fn sim_task(
         }
 
         let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
-        tokio::select! {
-            _ = tokio::time::sleep(sleep_dur) => {}
+        asyn_rs::runtime::select! {
+            _ = asyn_rs::runtime::task::sleep(sleep_dur) => {}
             _ = notify.notified() => {}
         }
     }
@@ -397,8 +397,8 @@ pub async fn sim_task_dyn(
         }
 
         let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
-        tokio::select! {
-            _ = tokio::time::sleep(sleep_dur) => {}
+        asyn_rs::runtime::select! {
+            _ = asyn_rs::runtime::task::sleep(sleep_dur) => {}
             _ = notify.notified() => {}
         }
     }
@@ -432,8 +432,8 @@ pub async fn sim_task_handle(
         let _ = handle.call_param_callbacks(0).await;
 
         let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
-        tokio::select! {
-            _ = tokio::time::sleep(sleep_dur) => {}
+        asyn_rs::runtime::select! {
+            _ = asyn_rs::runtime::task::sleep(sleep_dur) => {}
             _ = notify.notified() => {}
         }
     }

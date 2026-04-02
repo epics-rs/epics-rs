@@ -21,7 +21,7 @@ const PV_NAMES: [&str; 4] = [
     "BLM:001:SA:D",
 ];
 
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
     let port: u16 = std::env::var("EPICS_CA_SERVER_PORT")
         .ok()
@@ -42,8 +42,8 @@ async fn main() -> CaResult<()> {
     eprintln!("Random signals IOC started — {} @ 100 Hz", PV_NAMES.join(", "));
 
     // Spawn 10ms update task
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
+    epics_base_rs::runtime::task::spawn(async move {
+        let mut interval = epics_base_rs::runtime::task::interval(Duration::from_millis(10));
         let mut rng = SmallRng::from_os_rng();
         loop {
             interval.tick().await;

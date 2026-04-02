@@ -2,6 +2,9 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
+pub use tokio::runtime::Handle as RuntimeHandle;
+pub use tokio::time::interval;
+
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -24,6 +27,10 @@ pub async fn sleep(duration: Duration) {
 
 pub async fn sleep_until(deadline: std::time::Instant) {
     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+}
+
+pub fn runtime_handle() -> tokio::runtime::Handle {
+    tokio::runtime::Handle::current()
 }
 
 #[cfg(test)]

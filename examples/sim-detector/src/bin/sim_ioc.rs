@@ -6,7 +6,7 @@
 use ad_plugins_rs::ioc::AdIoc;
 use epics_base_rs::error::CaResult;
 
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
     let mut ioc = AdIoc::new();
     sim_detector::ioc_support::register(&mut ioc);

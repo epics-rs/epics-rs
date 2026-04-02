@@ -60,14 +60,14 @@ pub mod ioc_support {
     /// Reads the latest beam current from the shared atomic value.
     pub struct BeamCurrentDeviceSupport {
         value: Arc<BeamCurrentValue>,
-        io_intr_rx: Option<tokio::sync::mpsc::Receiver<()>>,
-        /// Bridge from std::sync::mpsc to tokio::sync::mpsc
+        io_intr_rx: Option<epics_base_rs::runtime::sync::mpsc::Receiver<()>>,
+        /// Bridge from std::sync::mpsc to epics runtime mpsc
         _bridge_handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl BeamCurrentDeviceSupport {
         pub fn new(value: Arc<BeamCurrentValue>, std_rx: std::sync::mpsc::Receiver<()>) -> Self {
-            let (tokio_tx, tokio_rx) = tokio::sync::mpsc::channel(4);
+            let (tokio_tx, tokio_rx) = epics_base_rs::runtime::sync::mpsc::channel(4);
             let bridge = std::thread::Builder::new()
                 .name("BeamCurrentBridge".into())
                 .spawn(move || {
@@ -125,7 +125,7 @@ pub mod ioc_support {
             None
         }
 
-        fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
+        fn io_intr_receiver(&mut self) -> Option<epics_base_rs::runtime::sync::mpsc::Receiver<()>> {
             self.io_intr_rx.take()
         }
     }

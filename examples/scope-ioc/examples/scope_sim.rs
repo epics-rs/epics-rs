@@ -6,13 +6,13 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Notify;
+use asyn_rs::runtime::sync::Notify;
 
 use scope_ioc::driver::*;
 use asyn_rs::runtime::port::create_port_runtime;
 use asyn_rs::runtime::config::RuntimeConfig;
 
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() {
     println!("=== asyn-rs Scope Simulator ===");
     println!("Port of EPICS testAsynPortDriver (digital oscilloscope simulator)\n");
@@ -32,7 +32,7 @@ async fn main() {
     // 4. Spawn background simulation task
     let sim_handle = port_handle.clone();
     let sim_notify = notify.clone();
-    tokio::spawn(async move {
+    asyn_rs::runtime::task::spawn(async move {
         sim_task_handle(sim_handle, sim_notify, indices).await;
     });
 

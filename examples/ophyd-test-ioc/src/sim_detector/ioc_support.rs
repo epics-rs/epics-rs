@@ -269,7 +269,7 @@ impl DeviceSupport for MovingDotDeviceSupport {
         self.inner.last_timestamp()
     }
 
-    fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
+    fn io_intr_receiver(&mut self) -> Option<epics_base_rs::runtime::sync::mpsc::Receiver<()>> {
         self.inner.io_intr_receiver()
     }
 }

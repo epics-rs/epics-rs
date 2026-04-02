@@ -1433,7 +1433,6 @@ dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
  "parking_lot",
- "tokio",
 ]
 
 [[package]]

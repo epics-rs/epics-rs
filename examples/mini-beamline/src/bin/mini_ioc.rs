@@ -103,7 +103,7 @@ impl BeamlineHolder {
 // Main
 // ============================================================================
 
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 

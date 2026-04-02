@@ -268,7 +268,13 @@ Adding a new record type requires only a new file in `records/` — no changes t
 ### Build
 
 ```bash
-cargo build --workspace
+cargo build --release --workspace
+```
+
+The command-line tools (`softioc-rs`, `caget-rs`, `caput-rs`, `camonitor-rs`, `cainfo-rs`) are located in `target/release/`. Add it to your `PATH` for convenience:
+
+```bash
+export PATH="$PWD/target/release:$PATH"
 ```
 
 ### Run a Soft IOC

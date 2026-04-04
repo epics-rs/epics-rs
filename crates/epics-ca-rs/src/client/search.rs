@@ -261,6 +261,13 @@ pub(crate) async fn run_search_engine(
             req = request_rx.recv() => {
                 let Some(req) = req else { return };
                 handle_request(&mut state, req);
+                // Drain any additional queued requests before sending,
+                // so a burst of Schedule messages gets batched together.
+                while let Ok(req) = request_rx.try_recv() {
+                    handle_request(&mut state, req);
+                }
+                // Immediately send any due searches (deadline = now).
+                send_due_searches(&mut state, &addr_list, &socket).await;
             }
 
             result = socket.recv_from(&mut recv_buf) => {

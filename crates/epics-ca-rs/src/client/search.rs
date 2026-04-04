@@ -13,8 +13,8 @@ use crate::protocol::*;
 
 use super::types::{SearchRequest, SearchResponse};
 
-const MIN_RETRY: Duration = Duration::from_millis(30);
-const MAX_RETRY: Duration = Duration::from_secs(30);
+const MIN_RETRY: Duration = Duration::from_millis(100);
+const MAX_RETRY: Duration = Duration::from_secs(2);
 
 #[allow(dead_code)]
 struct PendingSearch {

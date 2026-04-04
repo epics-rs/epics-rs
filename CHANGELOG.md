@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.7.10
+
+### CA Client Search Engine Rewrite (libca++ level)
+- **Adaptive deadline scheduler**: BTreeSet-based global scheduler replaces per-PV exponential backoff — lane-indexed retry with `period = (1 << lane) * RTT estimate`, max 5 min (configurable via `EPICS_CA_MAX_SEARCH_PERIOD`, floor 60s)
+- **Per-path RTT estimation**: Jacobson/Karels algorithm (RFC 6298) per server address, 32ms floor — backoff adapts to actual network conditions instead of fixed 100ms→2s
+- **Batch UDP search**: multiple SEARCH commands packed into single datagrams (≤1024 bytes), reducing packet count by ~30-50x for large PV sets
+- **AIMD congestion control**: `frames_per_try` with additive increase (+1 on >50% response rate) / multiplicative decrease (reset to 1 on <10%) — prevents network flooding during mass PV search
+- **Beacon anomaly detection**: dedicated `BeaconMonitor` task registers with CA repeater, tracks per-server beacon sequence/period, detects IOC restart (ID gap or period drop) and triggers selective rescan with 5s fast-rescan window
+- **Connect-feedback penalty box**: servers that fail TCP create are deprioritized for 30s — prevents repeated connection attempts to unreachable servers
+- **Selective rescan**: coordinator maintains server→channel reverse index, beacon anomaly rescans only affected channels (not global storm)
+- **Immediate search on Schedule**: drain queued requests and send in same event loop iteration — fixes starvation where burst `create_channel` calls could delay first UDP search indefinitely
+
+### CA Client Connection Improvements
+- **Keep connect waiters on ChannelCreateFailed**: waiters stay pending so immediate re-search can still resolve before caller timeout (was: drain waiters on first failure)
+- **AccessRightsChanged on channel create and reconnect**: fire event immediately after channel becomes connected
+- **DBE_LOG in monitor mask**: match pyepics default (DBE_VALUE | DBE_LOG | DBE_ALARM)
+- **Search recv buffer**: 256KB SO_RCVBUF for burst search response handling
+- **Internal CA timeouts**: read/subscribe raised from 5s to 30s
+
+### CA Client API
+- **`CaChannel::info()`**: get channel metadata (native type, element count, host, access rights) without performing a CA read
+- **`Snapshot` monitors**: `CaChannel::subscribe()` returns `Snapshot` with EPICS timestamp and alarm status
+
+### IOC Shell
+- **Output redirection**: `> file` and `>> file` support in iocsh without libc dependency
+
+### Asyn
+- **Synchronous write**: `can_block=false` ports use direct write instead of async channel, fixing write_op type coercion
+
 ## v0.7.9
 
 ### File Plugin Architecture (C ADCore NDPluginFile pattern)

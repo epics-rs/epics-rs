@@ -331,7 +331,7 @@ impl CaChannel {
             server_addr: snap.server_addr,
         });
 
-        let (data_type, count, data) = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+        let (data_type, count, data) = tokio::time::timeout(Duration::from_secs(30), reply_rx)
             .await
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)??;
@@ -392,7 +392,7 @@ impl CaChannel {
             server_addr: snap.server_addr,
         });
 
-        let (data_type, resp_count, data) = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+        let (data_type, resp_count, data) = tokio::time::timeout(Duration::from_secs(30), reply_rx)
             .await
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)??;
@@ -435,7 +435,7 @@ impl CaChannel {
             server_addr: snap.server_addr,
         });
 
-        tokio::time::timeout(Duration::from_secs(5), reply_rx)
+        tokio::time::timeout(Duration::from_secs(30), reply_rx)
             .await
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)?
@@ -516,7 +516,7 @@ impl CaChannel {
 
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {
         // Wait for connection first
-        self.wait_connected(Duration::from_secs(5)).await?;
+        self.wait_connected(Duration::from_secs(30)).await?;
 
         let subid = alloc_subid();
         let (callback_tx, callback_rx) = mpsc::unbounded_channel();

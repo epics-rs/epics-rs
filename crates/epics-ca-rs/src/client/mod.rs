@@ -1,10 +1,11 @@
+mod beacon_monitor;
 mod search;
 mod state;
 mod subscription;
 mod transport;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 
@@ -33,6 +34,7 @@ pub struct CaClient {
     _coordinator: tokio::task::JoinHandle<()>,
     _search_task: tokio::task::JoinHandle<()>,
     _transport_task: tokio::task::JoinHandle<()>,
+    _beacon_task: tokio::task::JoinHandle<()>,
 }
 
 /// Internal coordinator requests from CaChannel / public API
@@ -74,6 +76,10 @@ enum CoordRequest {
         ioid: u32,
         value: EpicsValue,
         reply: oneshot::Sender<CaResult<()>>,
+    },
+    /// Beacon anomaly detected — rescan channels for this server.
+    ForceRescanServer {
+        server_addr: SocketAddr,
     },
 }
 
@@ -122,6 +128,10 @@ impl CaClient {
             transport_tx.clone(),
         ));
 
+        let beacon_task = epics_base_rs::runtime::task::spawn(
+            beacon_monitor::run_beacon_monitor(coord_tx.clone()),
+        );
+
         Ok(Self {
             search_tx,
             transport_tx,
@@ -129,6 +139,7 @@ impl CaClient {
             _coordinator: coordinator,
             _search_task: search_task,
             _transport_task: transport_task,
+            _beacon_task: beacon_task,
         })
     }
 
@@ -143,9 +154,10 @@ impl CaClient {
             conn_tx: conn_tx.clone(),
         });
 
-        let _ = self.search_tx.send(SearchRequest::Search {
+        let _ = self.search_tx.send(SearchRequest::Schedule {
             cid,
             pv_name: name.to_string(),
+            reason: SearchReason::Initial,
         });
 
         CaChannel {
@@ -584,6 +596,10 @@ async fn run_coordinator(
     let mut subscriptions = SubscriptionRegistry::new();
     let mut read_waiters: HashMap<u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>> = HashMap::new();
     let mut write_waiters: HashMap<u32, oneshot::Sender<CaResult<()>>> = HashMap::new();
+    // Reverse index: server_addr -> set of cids last seen on that server.
+    // Keep disconnected channels indexed so beacon anomalies can trigger
+    // immediate re-search for the affected IOC.
+    let mut server_channels: HashMap<SocketAddr, HashSet<u32>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -692,7 +708,7 @@ async fn run_coordinator(
                             subscriptions.remove(subid);
                         }
 
-                        // Clear channel on server
+                        // Clear channel on server + clean reverse index
                         if let Some(ch) = channels.get(&cid) {
                             if ch.state == ChannelState::Connected {
                                 let _ = transport_tx.send(TransportCommand::ClearChannel {
@@ -705,6 +721,9 @@ async fn run_coordinator(
                             if ch.state == ChannelState::Searching {
                                 let _ = search_tx.send(SearchRequest::Cancel { cid });
                             }
+                            if let Some(addr) = ch.server_addr {
+                                remove_server_channel(&mut server_channels, addr, cid);
+                            }
                         }
                         channels.remove(&cid);
                     }
@@ -714,6 +733,26 @@ async fn run_coordinator(
                     CoordRequest::WriteNotify { cid: _, ioid, value: _, reply } => {
                         write_waiters.insert(ioid, reply);
                     }
+                    CoordRequest::ForceRescanServer { server_addr } => {
+                        // Beacon anomaly: rescan Disconnected/Searching channels
+                        // for this server. Connected channels are left alone —
+                        // if the IOC truly restarted, TCP will break on its own.
+                        if let Some(cids) = server_channels.get(&server_addr) {
+                            for &cid in cids {
+                                if let Some(ch) = channels.get(&cid) {
+                                    if ch.state == ChannelState::Disconnected
+                                        || ch.state == ChannelState::Searching
+                                    {
+                                        let _ = search_tx.send(SearchRequest::Schedule {
+                                            cid,
+                                            pv_name: ch.pv_name.clone(),
+                                            reason: SearchReason::BeaconAnomaly,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             resp = search_rx.recv() => {
@@ -722,8 +761,12 @@ async fn run_coordinator(
                     SearchResponse::Found { cid, server_addr } => {
                         if let Some(ch) = channels.get_mut(&cid) {
                             if ch.state == ChannelState::Searching || ch.state == ChannelState::Disconnected {
+                                if let Some(old_addr) = ch.server_addr {
+                                    remove_server_channel(&mut server_channels, old_addr, cid);
+                                }
                                 ch.state = ChannelState::Connecting;
                                 ch.server_addr = Some(server_addr);
+                                server_channels.entry(server_addr).or_default().insert(cid);
                                 let _ = transport_tx.send(TransportCommand::CreateChannel {
                                     cid,
                                     pv_name: ch.pv_name.clone(),
@@ -761,6 +804,13 @@ async fn run_coordinator(
 
                             // Restore subscriptions
                             subscriptions.restore_for_channel(cid, sid, server_addr, &transport_tx);
+
+                            // Notify search engine of successful connect (clears penalty).
+                            let _ = search_tx.send(SearchRequest::ConnectResult {
+                                cid,
+                                success: true,
+                                server_addr,
+                            });
                         }
                     }
                     TransportEvent::ReadResponse { ioid, data_type, count, data } => {
@@ -798,6 +848,7 @@ async fn run_coordinator(
                     }
                     TransportEvent::ChannelCreateFailed { cid } => {
                         if let Some(ch) = channels.get_mut(&cid) {
+                            let server_addr = ch.server_addr;
                             // Fail all connect waiters
                             for waiter in ch.connect_waiters.drain(..) {
                                 let _ = waiter.send(());
@@ -805,10 +856,19 @@ async fn run_coordinator(
                             // Transition to Disconnected and re-search
                             ch.state = ChannelState::Disconnected;
                             let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
-                            let _ = search_tx.send(SearchRequest::Search {
+                            let _ = search_tx.send(SearchRequest::Schedule {
                                 cid,
                                 pv_name: ch.pv_name.clone(),
+                                reason: SearchReason::Reconnect,
                             });
+                            // Notify search engine of failed connect (penalty box).
+                            if let Some(addr) = server_addr {
+                                let _ = search_tx.send(SearchRequest::ConnectResult {
+                                    cid,
+                                    success: false,
+                                    server_addr: addr,
+                                });
+                            }
                         }
                     }
                     TransportEvent::ServerError { .. } => {
@@ -828,9 +888,10 @@ async fn run_coordinator(
                                 subscriptions.mark_disconnected(&cids);
 
                                 // Re-search
-                                let _ = search_tx.send(SearchRequest::Search {
+                                let _ = search_tx.send(SearchRequest::Schedule {
                                     cid,
                                     pv_name: ch.pv_name.clone(),
+                                    reason: SearchReason::Reconnect,
                                 });
                             }
                         }
@@ -858,14 +919,27 @@ fn handle_disconnect(
             let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
 
             // Re-search
-            let _ = search_tx.send(SearchRequest::Search {
+            let _ = search_tx.send(SearchRequest::Schedule {
                 cid: ch.cid,
                 pv_name: ch.pv_name.clone(),
+                reason: SearchReason::Reconnect,
             });
         }
     }
-
     subscriptions.mark_disconnected(&affected_cids);
+}
+
+fn remove_server_channel(
+    server_channels: &mut HashMap<SocketAddr, HashSet<u32>>,
+    server_addr: SocketAddr,
+    cid: u32,
+) {
+    if let Some(set) = server_channels.get_mut(&server_addr) {
+        set.remove(&cid);
+        if set.is_empty() {
+            server_channels.remove(&server_addr);
+        }
+    }
 }
 
 fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {

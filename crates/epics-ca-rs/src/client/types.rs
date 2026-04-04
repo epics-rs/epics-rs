@@ -1,11 +1,36 @@
 use std::net::SocketAddr;
 
 use crate::channel::AccessRights;
+
 // --- Search Engine messages ---
 
+/// Why a search is being initiated — affects initial lane assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchReason {
+    /// Fresh channel creation.
+    Initial,
+    /// Re-search after TCP disconnect / server disconnect.
+    Reconnect,
+    /// Beacon anomaly detected for the server this channel was on.
+    BeaconAnomaly,
+}
+
 pub(crate) enum SearchRequest {
-    Search { cid: u32, pv_name: String },
+    /// Schedule a PV for searching (replaces old Search variant).
+    Schedule {
+        cid: u32,
+        pv_name: String,
+        #[allow(dead_code)]
+        reason: SearchReason,
+    },
+    /// Cancel searching for a PV (channel dropped or connected).
     Cancel { cid: u32 },
+    /// Feedback from coordinator about TCP connection outcome.
+    ConnectResult {
+        cid: u32,
+        success: bool,
+        server_addr: SocketAddr,
+    },
 }
 
 pub(crate) enum SearchResponse {

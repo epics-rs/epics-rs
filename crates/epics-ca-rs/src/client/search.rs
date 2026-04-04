@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -31,9 +35,18 @@ pub(crate) async fn run_search_engine(
         Err(_) => return,
     };
     let _ = socket.set_broadcast(true);
+    // Increase OS socket receive buffer for search response bursts.
+    // Matches C EPICS libca which also sets SO_RCVBUF.
+    #[cfg(unix)]
+    {
+        use std::os::fd::BorrowedFd;
+        let fd = unsafe { BorrowedFd::borrow_raw(socket.as_raw_fd()) };
+        let sock_ref = socket2::SockRef::from(&fd);
+        let _ = sock_ref.set_recv_buffer_size(256 * 1024);
+    }
 
     let mut pending: HashMap<u32, PendingSearch> = HashMap::new();
-    let mut recv_buf = [0u8; 1024];
+    let mut recv_buf = [0u8; 65536];
 
     loop {
         // Compute next retry deadline

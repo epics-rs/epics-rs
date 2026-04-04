@@ -849,11 +849,10 @@ async fn run_coordinator(
                     TransportEvent::ChannelCreateFailed { cid } => {
                         if let Some(ch) = channels.get_mut(&cid) {
                             let server_addr = ch.server_addr;
-                            // Fail all connect waiters
-                            for waiter in ch.connect_waiters.drain(..) {
-                                let _ = waiter.send(());
-                            }
-                            // Transition to Disconnected and re-search
+                            // Keep connect waiters pending. ChannelCreateFailed
+                            // only means this specific attempt/server failed;
+                            // the channel will immediately re-search and may
+                            // still connect before the caller's timeout.
                             ch.state = ChannelState::Disconnected;
                             let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
                             let _ = search_tx.send(SearchRequest::Schedule {

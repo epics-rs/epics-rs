@@ -9,13 +9,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::net::AsyncUdpV4;
+use epics_base_rs::net::{AsyncUdpV4, bind_loopback_mcast};
 use tracing::debug;
 
+use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
     ByteOrder, Command, PvaHeader, ReadExt, WriteExt, decode_size, decode_string,
-    encode_string_into, ip_to_bytes,
+    encode_string_into, ip_from_bytes, ip_to_bytes,
 };
 
 use super::source::DynSource;
@@ -217,6 +218,23 @@ pub async fn run_udp_responder_with_config(
     });
     let _beacon_guard = AbortOnDrop(beacon_join.abort_handle());
 
+    // pvxs `udp_collector.cpp:127, :140-167`: a dedicated socket
+    // bound wildcard, joined to 224.0.0.128 via 127.0.0.1, sits
+    // alongside the per-NIC SEARCH responder so other PVA peers on
+    // this host can forward SEARCHes (CMD_ORIGIN_TAG-prefixed) into
+    // every local listener. Optional — if the bind fails (most
+    // commonly a sandboxed test environment that prohibits multicast
+    // joins, or a kernel without IP_ADD_MEMBERSHIP for the
+    // requested group), we log at debug and run without ORIGIN_TAG
+    // delivery rather than aborting startup.
+    let lo_mcast = match bind_loopback_mcast(udp_port) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            debug!("loopback ORIGIN_TAG socket bind failed, running without: {e}");
+            None
+        }
+    };
+
     // 64 KB receive buffer — IPv4 maximum. The previous 1500-byte
     // (Ethernet MTU) cap silently truncated large multi-PV searches:
     // pvxs clients pack many SEARCH messages into one datagram and a
@@ -225,113 +243,87 @@ pub async fn run_udp_responder_with_config(
     // because 64 KB on the per-task stack is large; one allocation
     // amortized across the listener's lifetime.
     let mut buf = vec![0u8; 64 * 1024];
+    let mut lo_buf = vec![0u8; 64 * 1024];
     loop {
-        // pvxs 57f9468 (2025-11): receive metadata tells us which NIC
-        // the SEARCH arrived on, so the corresponding SEARCH_RESPONSE
-        // can be sent from a socket bound to that same NIC. Without
-        // this, replies to multicast/broadcast SEARCHes go via the OS
-        // default route — wrong NIC on multi-homed hosts.
-        let meta = match socket.recv_with_meta(&mut buf).await {
-            Ok(m) => m,
-            Err(e) => {
-                debug!("udp recv error: {e}");
-                continue;
+        // Receive on whichever path is ready first. The per-NIC bundle
+        // handles regular SEARCH/beacon traffic; the loopback mcast
+        // socket (if bound) catches CMD_ORIGIN_TAG forwards from local
+        // PVA peers. Both paths feed `process_search_datagram` with a
+        // tagged origin so anti-loop and reply-routing rules apply.
+        let recv_direct = socket.recv_with_meta(&mut buf);
+        let recv_lo = async {
+            match lo_mcast.as_ref() {
+                Some(s) => s.recv_from(&mut lo_buf).await.map(Some),
+                // No loopback socket: never resolve.
+                None => {
+                    std::future::pending::<std::io::Result<Option<(usize, SocketAddr)>>>().await
+                }
             }
         };
-        let n = meta.n;
-        let peer = meta.src;
-        let reply_iface_ip = meta.iface_ip;
-        // pvxs `udp_collector.cpp::handle_one`: silently drop UDP
-        // datagrams whose source IP is itself a multicast group. Such
-        // packets are necessarily forged (mcast is dest-only) and
-        // replying to one would amplify a DDoS.
-        if let std::net::IpAddr::V4(v4) = peer.ip() {
-            if v4.is_multicast() {
-                debug!("ignoring UDP with mcast source {peer}");
-                continue;
-            }
-        }
-        // ignore_addrs: drop search packets from blocklisted peers
-        // *before* we spend time decoding. Mirrors pvxs serverconn.cpp
-        // ignoreAddrs check on inbound search.
-        let ignored = ignore_addrs
-            .iter()
-            .any(|(ip, port)| peer.ip() == *ip && (*port == 0 || peer.port() == *port));
-        if ignored {
-            continue;
-        }
-        // pvxs `udp_collector.cpp::process_one` (L329) loops over a
-        // single datagram parsing PVA messages until the buffer is
-        // drained — clients pack many SEARCH messages per datagram
-        // when many channels are searching concurrently. Without the
-        // drain loop we'd silently miss N-1 of N searches.
-        let frame = &buf[..n];
-        let mut pos = 0usize;
-        while pos + PvaHeader::SIZE <= frame.len() {
-            let chunk = &frame[pos..];
-            // Consume one message + advance pos. Bail out of the
-            // drain loop if the next message header doesn't decode
-            // (truncation / non-PVA padding) — what we have is what
-            // we got.
-            let consumed = match parse_search_request(chunk) {
-                Some(req) => {
-                    let consumed = req.consumed;
-                    // Pack ALL matches for this single search into
-                    // ONE response datagram. pvxs udp_collector.cpp:570
-                    // `reply()` does the same; without it the gateway
-                    // amplifies an N-cid search into N reply datagrams.
-                    let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
-                    for (cid, name) in &req.queries {
-                        if source.has_pv(name).await {
-                            matched_cids.push(*cid);
-                        }
-                    }
-                    if !matched_cids.is_empty() {
-                        let resp = build_search_response_proto(
-                            guid,
-                            req.seq,
-                            tcp_port,
-                            &matched_cids,
-                            req.byte_order,
-                            protocol,
-                        );
-                        // pvxs 57f9468: send the reply from the socket
-                        // bound to the NIC the request arrived on, so
-                        // the source IP on the wire matches the
-                        // interface that received the multicast /
-                        // broadcast SEARCH. Falls back to plain
-                        // routing-decided send if that NIC is no
-                        // longer in the bundle (rare).
-                        let send = socket.send_via(&resp, peer, reply_iface_ip).await;
-                        let send = match send {
-                            Ok(n) => Ok(n),
-                            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
-                                socket.send_to(&resp, peer).await
-                            }
-                            Err(e) => Err(e),
-                        };
-                        if let Err(e) = send {
-                            debug!("udp send to {peer} via {reply_iface_ip}: {e}");
-                        }
-                    }
-                    consumed
+        tokio::select! {
+            biased;
+            r = recv_direct => {
+                let meta = match r {
+                    Ok(m) => m,
+                    Err(e) => { debug!("udp recv error: {e}"); continue; }
+                };
+                let frame_len = meta.n;
+                if !filter_inbound(meta.src, &ignore_addrs) {
+                    continue;
                 }
-                None => {
-                    // Header didn't decode as a SEARCH request — try
-                    // to advance past it so a later beacon/etc. in the
-                    // same datagram can still be parsed. We use the
-                    // header's payload_length when we can read the
-                    // header at all; otherwise stop.
-                    match PvaHeader::decode(&mut Cursor::new(chunk)) {
-                        Ok(h) => PvaHeader::SIZE + h.payload_length as usize,
-                        Err(_) => break,
-                    }
-                }
-            };
-            if consumed == 0 {
-                break;
+                process_search_datagram(
+                    &source,
+                    &socket,
+                    &buf[..frame_len],
+                    meta.src,
+                    meta.iface_ip,
+                    Origin::Direct,
+                    tcp_port,
+                    guid,
+                    protocol,
+                )
+                .await;
             }
-            pos = pos.saturating_add(consumed);
+            r = recv_lo => {
+                let r = match r {
+                    Ok(Some(v)) => v,
+                    Ok(None) => continue,
+                    Err(e) => { debug!("loopback udp recv error: {e}"); continue; }
+                };
+                let (n, src) = r;
+                if !filter_inbound(src, &ignore_addrs) {
+                    continue;
+                }
+                let raw = &lo_buf[..n];
+                // Peel the CMD_ORIGIN_TAG prefix; if it isn't one,
+                // pvxs `udp_collector.cpp:402-405` allows processing
+                // an unprefixed forward from peers that don't
+                // implement ORIGIN_TAG. We're stricter for now: drop
+                // the packet rather than risk reply amplification on
+                // unprefixed mcast.
+                let Some((peeled_dest, inner)) = PvaCodec::try_peel_origin_tag(raw) else {
+                    debug!("loopback mcast missing/invalid ORIGIN_TAG prefix; dropping");
+                    continue;
+                };
+                // peeled_dest = None means the forwarder set 0.0.0.0
+                // (no NIC info). Fall through to OS routing — pick
+                // the loopback iface_ip as a sentinel that
+                // `send_via` will fail on, triggering the
+                // OS-routed fallback path inside the helper.
+                let reply_iface_ip = peeled_dest.unwrap_or(Ipv4Addr::UNSPECIFIED);
+                process_search_datagram(
+                    &source,
+                    &socket,
+                    inner,
+                    src,
+                    reply_iface_ip,
+                    Origin::FromOriginTag,
+                    tcp_port,
+                    guid,
+                    protocol,
+                )
+                .await;
+            }
         }
     }
 
@@ -339,6 +331,122 @@ pub async fn run_udp_responder_with_config(
     // when this function unwinds.
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Inbound source filter: drop UDP packets whose source IP is itself
+/// a multicast group (forged — mcast is dest-only — replying would
+/// amplify a DDoS) and any peer in the configured `ignore_addrs`
+/// blocklist. Mirrors pvxs `udp_collector.cpp::handle_one` mcast-source
+/// drop and `serverconn.cpp` ignoreAddrs check.
+///
+/// Returns `true` if the packet should be processed.
+fn filter_inbound(peer: SocketAddr, ignore_addrs: &[(IpAddr, u16)]) -> bool {
+    if let std::net::IpAddr::V4(v4) = peer.ip() {
+        if v4.is_multicast() {
+            debug!("ignoring UDP with mcast source {peer}");
+            return false;
+        }
+    }
+    let ignored = ignore_addrs
+        .iter()
+        .any(|(ip, port)| peer.ip() == *ip && (*port == 0 || peer.port() == *port));
+    !ignored
+}
+
+/// Process one fully-received UDP datagram: drain it for chained PVA
+/// messages (pvxs `udp_collector.cpp::process_one` L329) and reply to
+/// each SEARCH that matches a hosted PV. Replies route via the NIC
+/// matched by `reply_iface_ip` (with OS fallback), or to the SEARCH
+/// payload's announced reply addr when present.
+///
+/// `origin` controls forwarding-related semantics:
+/// - [`Origin::Direct`]: no special handling; reply to the UDP source
+///   when the SEARCH announced no specific addr.
+/// - [`Origin::FromOriginTag`]: the SEARCH came in via the loopback
+///   ORIGIN_TAG channel. Drop SEARCHes that announced
+///   `server.isAny()` since they would route the reply back to the
+///   forwarder, not the original requester (pvxs warning at
+///   `udp_collector.cpp:367-371`).
+#[allow(clippy::too_many_arguments)]
+async fn process_search_datagram(
+    source: &DynSource,
+    socket: &AsyncUdpV4,
+    frame: &[u8],
+    udp_src: SocketAddr,
+    reply_iface_ip: Ipv4Addr,
+    origin: Origin,
+    tcp_port: u16,
+    guid: [u8; 12],
+    protocol: &'static str,
+) {
+    let mut pos = 0usize;
+    while pos + PvaHeader::SIZE <= frame.len() {
+        let chunk = &frame[pos..];
+        let consumed = match parse_search_request(chunk) {
+            Some(req) => {
+                let consumed = req.consumed;
+                // Resolve reply destination per pvxs
+                // `udp_collector.cpp:351-371`: prefer the SEARCH
+                // payload's announced (addr, port); fall back to the
+                // UDP source when the address was the unspecified
+                // sentinel; reject the SEARCH outright when the
+                // sentinel arrives via ORIGIN_TAG (the forwarder is
+                // not the original requester).
+                let reply_dest = match req.reply_addr {
+                    Some(ip) => SocketAddr::V4(std::net::SocketAddrV4::new(ip, req.reply_port)),
+                    None => {
+                        if origin == Origin::FromOriginTag {
+                            debug!(
+                                "ORIGIN_TAG SEARCH announced isAny() reply addr; dropping per pvxs"
+                            );
+                            return;
+                        }
+                        // Direct origin: keep the UDP source's IP
+                        // but use the announced reply port (pvxs
+                        // `replyDest.setPort(port)`).
+                        SocketAddr::new(udp_src.ip(), req.reply_port)
+                    }
+                };
+
+                let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
+                for (cid, name) in &req.queries {
+                    if source.has_pv(name).await {
+                        matched_cids.push(*cid);
+                    }
+                }
+                if !matched_cids.is_empty() {
+                    let resp = build_search_response_proto(
+                        guid,
+                        req.seq,
+                        tcp_port,
+                        &matched_cids,
+                        req.byte_order,
+                        protocol,
+                    );
+                    let send = socket.send_via(&resp, reply_dest, reply_iface_ip).await;
+                    let send = match send {
+                        Ok(n) => Ok(n),
+                        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                            socket.send_to(&resp, reply_dest).await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = send {
+                        debug!("udp send to {reply_dest} via {reply_iface_ip}: {e}");
+                    }
+                }
+                consumed
+            }
+            None => match PvaHeader::decode(&mut Cursor::new(chunk)) {
+                Ok(h) => PvaHeader::SIZE + h.payload_length as usize,
+                Err(_) => break,
+            },
+        };
+        if consumed == 0 {
+            break;
+        }
+        pos = pos.saturating_add(consumed);
+    }
 }
 
 /// Build a (one-PV) SEARCH_RESPONSE frame with explicit protocol name.
@@ -414,10 +522,35 @@ struct SearchRequest {
     seq: u32,
     byte_order: ByteOrder,
     queries: Vec<(u32, String)>,
+    /// Reply destination announced inside the SEARCH payload (the
+    /// 16-byte address + 2-byte port fields). `None` means the address
+    /// was the unspecified sentinel (`0.0.0.0` / `::`), in which case
+    /// pvxs falls back to the UDP source address. The port is always
+    /// populated, even when `reply_addr` is `None`.
+    reply_addr: Option<Ipv4Addr>,
+    reply_port: u16,
     /// Total bytes consumed from the input slice (header + payload),
     /// used by the multi-message drain loop to advance to the next
     /// chained message in the same datagram.
     consumed: usize,
+}
+
+/// How a SEARCH packet reached us. Mirrors pvxs `udp_collector.cpp`'s
+/// `origin_t` (Broadcast / Forwarding / Forwarded / OriginTag), but we
+/// only distinguish the cases that change processing rules:
+///
+/// - [`Origin::Direct`]: arrived on a per-NIC socket. Reply via the
+///   same NIC the packet came in on. Treat unicast-flagged SEARCHes
+///   as candidates for re-forwarding (sub-phase d).
+/// - [`Origin::FromOriginTag`]: arrived on the loopback mcast socket
+///   wrapped in CMD_ORIGIN_TAG. Reply via the NIC matching the peeled
+///   destination. Do NOT re-forward (anti-loop) and reject SEARCHes
+///   with `server.isAny()` per pvxs `udp_collector.cpp:367-371`
+///   ("Forwarded SEARCH with reply to sender never works").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Direct,
+    FromOriginTag,
 }
 
 fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
@@ -440,8 +573,17 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     let seq = p.get_u32(order).ok()?;
     let _flags = p.get_u8().ok()?;
     let _ = p.get_bytes(3).ok()?;
-    let _addr = p.get_bytes(16).ok()?;
-    let _port = p.get_u16(order).ok()?;
+    let addr_bytes = p.get_bytes(16).ok()?;
+    let mut addr16 = [0u8; 16];
+    addr16.copy_from_slice(&addr_bytes);
+    // pvxs `udp_collector.cpp:351-360`: `server.isAny()` means "reply
+    // to UDP source"; otherwise the SEARCH carries a specific reply
+    // destination. Filter to IPv4 since this stack is IPv4-only.
+    let reply_addr = match ip_from_bytes(&addr16) {
+        Some(IpAddr::V4(v4)) if !v4.is_unspecified() => Some(v4),
+        _ => None,
+    };
+    let reply_port = p.get_u16(order).ok()?;
     let n_proto = decode_size(&mut p, order).ok().flatten()? as usize;
     for _ in 0..n_proto {
         let _ = decode_string(&mut p, order).ok()?;
@@ -463,6 +605,8 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
         seq,
         byte_order: order,
         queries,
+        reply_addr,
+        reply_port,
         consumed: PvaHeader::SIZE + payload_len,
     })
 }
@@ -470,6 +614,49 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `parse_search_request` extracts the reply addr + port from the
+    /// SEARCH payload's 16-byte address field. Specific IPv4 → `Some`,
+    /// `0.0.0.0` (and IPv6/zeros) → `None` (caller falls back to UDP
+    /// source per pvxs `udp_collector.cpp:351-360`).
+    #[test]
+    fn parse_search_request_extracts_reply_addr() {
+        let codec = PvaCodec { big_endian: false };
+        // Specific reply addr 192.168.5.10:9999.
+        let frame = codec.build_search(7, 42, "MY:PV", [192, 168, 5, 10], 9999, false);
+        let req = parse_search_request(&frame).expect("parse ok");
+        assert_eq!(req.reply_addr, Some(Ipv4Addr::new(192, 168, 5, 10)));
+        assert_eq!(req.reply_port, 9999);
+
+        // Unspecified addr → None (sentinel for "use UDP source").
+        let frame_any = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], 5076, false);
+        let req_any = parse_search_request(&frame_any).expect("parse ok");
+        assert_eq!(req_any.reply_addr, None);
+        assert_eq!(req_any.reply_port, 5076);
+    }
+
+    /// `filter_inbound`: mcast-source packets and blocklisted peers
+    /// are dropped; everything else passes. Mirrors pvxs anti-amp +
+    /// `serverconn.cpp` ignoreAddrs semantics.
+    #[test]
+    fn filter_inbound_drops_mcast_source_and_blocklist() {
+        let blocklist = vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)), 5076)];
+        // Plain unicast peer passes.
+        let ok = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5076);
+        assert!(filter_inbound(ok, &blocklist));
+        // Multicast source dropped.
+        let mcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 128)), 5076);
+        assert!(!filter_inbound(mcast, &blocklist));
+        // Blocklisted peer dropped on matching port.
+        let blocked = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)), 5076);
+        assert!(!filter_inbound(blocked, &blocklist));
+        // Same IP on a different port still passes (blocklist port-scoped).
+        let blocked_other_port = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)), 6000);
+        assert!(filter_inbound(blocked_other_port, &blocklist));
+        // Wildcard-port (0) entry blocks all ports for the IP.
+        let any_port = vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)), 0u16)];
+        assert!(!filter_inbound(blocked_other_port, &any_port));
+    }
 
     /// build_beacon writes the supplied sequence + change_count into
     /// the payload at the documented offsets (after the 12-byte GUID +

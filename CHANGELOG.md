@@ -1,5 +1,83 @@
 # Changelog
 
+## v0.13.0 — 2026-05-01
+
+Operational fixes for the local-IOC zero-config workflow + CLI tool
+output parity with the C counterparts. Two SEARCH-path bugs that
+left `pvget-rs PV` hanging against a local pva-rs server are fixed
+at root cause; the four CA / four PVA tools now match `caget` /
+`pvget` byte-for-byte on the legacy `-M nt` path. New ORIGIN_TAG
+forwarding port lands the pvxs UDP-collector mechanism for
+multi-server-on-one-host topologies.
+
+### Breaking
+- CLI tool default output (caget-rs / camonitor-rs / caput-rs /
+  cainfo-rs / pvget-rs / pvmonitor-rs / pvput-rs) now matches the
+  legacy C tools byte-for-byte (PV name padded to 30 chars, `%g`
+  6-digit precision, double-space ts↔value, `Old :` / `New :` echo
+  with timestamps). Scripts that parsed the previous shape need
+  updating.
+
+### epics-pva-rs
+- **perf**: `pvget-rs <PV>` first-response latency 1 s → 5–10 ms
+  (legacy `pvget` parity). Two root causes: search-engine
+  `Multi`/FindAll deadline check was tied to the 1 Hz tick — a
+  `SEARCH_RESPONSE` arriving in 5 ms still sat in `accumulated`
+  until the next tick; `channel.ensure_active` used `find_all()`
+  (always 200 ms) for the initial resolve. Added a
+  `tokio::time::sleep_until(earliest_deadline)` arm to the engine
+  select; switched ensure_active to `find()` (delivers on first
+  response) wrapped in a `MULTI_SERVER_WINDOW` timeout.
+- **fix**: `EPICS_PVA_AUTO_ADDR_LIST=YES` (the default) now adds
+  per-NIC IPv4 broadcast addresses + `127.0.0.1` to SEARCH
+  destinations. Previously only `255.255.255.255` was sent — macOS
+  doesn't reliably translate that into per-subnet broadcast, so
+  local IOCs bound to `192.168.X.255:5076` never saw the SEARCH.
+- **fix**: client beacon socket no longer binds the loopback NIC.
+  SO_REUSEPORT load-balanced inbound packets between the client
+  beacon socket and any local pva-rs server's UDP responder,
+  randomly losing SEARCH traffic.
+- **fix**: `EPICS_PVA_ADDR_LIST` DNS hostnames (`localhost`,
+  `ioc01.lab.local`, etc.) now resolve. Spawn-time resolve via
+  `parse_addr_list_with_port`; IPv4 preferred over IPv6 since
+  macOS's `localhost` → `::1` ordering broke
+  `EPICS_PVA_ADDR_LIST=localhost`.
+- **feat**: ORIGIN_TAG forwarding port (server-side). UDP responder
+  receives `CMD_ORIGIN_TAG` packets on `224.0.0.128` loopback
+  multicast and forwards unicast SEARCHes via the same channel for
+  multi-server-on-one-host topologies. `Origin` enum
+  (Direct / FromOriginTag) tags how a SEARCH reached the responder;
+  anti-loop guard prevents re-forwarding.
+- **feat**: `PvaCodec::build_origin_tag_prefix` /
+  `try_peel_origin_tag` codec helpers (24-byte prefix shape, BE PVA
+  header `cmd=22 len=16` + IPv4-mapped IPv6 dest).
+- **feat**: legacy `pv*` flag set on every PVA tool (`-V`, `-w`,
+  `-r`, `-p`, `-M`, `-v`, `-q`, `-d`).
+
+### epics-ca-rs
+- **fix**: `EPICS_CA_ADDR_LIST` with an unresolvable hostname token
+  now drops the bad entry and continues. Previously the first bad
+  token propagated via `?` and panicked main() (caget / camonitor /
+  caput).
+- **feat**: full C-tool flag set on every CA tool — `-V`, `-t`,
+  `-a`, `-d`, `-c`, `-p`, `-n`, `-#`, `-S`, `-e`/`-f`/`-g`, `-s`,
+  `-lx`/`-lo`/`-lb`, `-0x`/`-0o`/`-0b`, `-F`. `-a`/`-l` echo real
+  DBR_TIME server timestamps + alarm pairs.
+
+### epics-base-rs
+- **feat**: `IfaceMap::spawn_refresh(period)` — periodic
+  `getifaddrs()` poller (pvxs `IfMapDaemon` parity, 15 s default).
+  Refreshes the shared interface snapshot so dynamic-NIC scenarios
+  (DHCP / hot-plug / VM live-migration) update SEARCH/beacon
+  destinations without a process restart.
+- **feat**: `AsyncUdpV4::bind_non_loopback(port, broadcast)` —
+  bind one socket per IPv4 NIC except loopback. Used by the PVA
+  client beacon socket to avoid SO_REUSEPORT races with co-located
+  servers.
+- **feat**: `bind_loopback_mcast(port)` — wildcard-bound UDP
+  socket joined to `224.0.0.128` via `127.0.0.1` for the
+  ORIGIN_TAG forwarding channel.
+
 ## v0.12.0 — 2026-04-30
 
 PVA/CA stability sweep. A cold-eye cross-review across pva-rs / ca-rs

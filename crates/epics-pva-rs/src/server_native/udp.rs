@@ -261,8 +261,11 @@ pub async fn run_udp_responder_with_config(
                 }
             }
         };
+        // No `biased;` ordering — under SEARCH bursts on the wire the
+        // per-NIC path can dominate the loopback path arbitrarily long
+        // and we want fair round-robin between the two so a co-resident
+        // PVA peer's ORIGIN_TAG forwards aren't starved of recv slots.
         tokio::select! {
-            biased;
             r = recv_direct => {
                 let meta = match r {
                     Ok(m) => m,
@@ -309,10 +312,9 @@ pub async fn run_udp_responder_with_config(
                     continue;
                 };
                 // peeled_dest = None means the forwarder set 0.0.0.0
-                // (no NIC info). Fall through to OS routing — pick
-                // the loopback iface_ip as a sentinel that
-                // `send_via` will fail on, triggering the
-                // OS-routed fallback path inside the helper.
+                // (no NIC info). Use UNSPECIFIED as a sentinel — the
+                // reply path checks for it and skips the per-NIC pin,
+                // letting OS routing pick a source NIC.
                 let reply_iface_ip = peeled_dest.unwrap_or(Ipv4Addr::UNSPECIFIED);
                 process_search_datagram(
                     &source,
@@ -443,6 +445,20 @@ async fn process_search_datagram(
     // as origin=FromOriginTag and is processed locally.
     if origin == Origin::Direct {
         if let Some(lo) = lo_mcast {
+            // Forwarding rule deviation from pvxs: pvxs classifies
+            // by *destination address* (`udp_collector.cpp:286-318`)
+            // because it has IP_PKTINFO cmsg telling it the original
+            // dest. We only have the receiving socket's bound iface
+            // IP (which equals the dest IP for unicast packets to the
+            // unicast bind) and use the SEARCH header's Unicast flag
+            // as the trigger instead. They coincide for the common
+            // case (pvxs-style senders set Unicast for unicast
+            // SEARCHes). A sender that targets us unicast without
+            // setting Unicast won't be re-forwarded under our rule;
+            // the gap is acceptable since the sender already reached
+            // us directly. The prefix carries `reply_iface_ip` which
+            // by construction equals origDest in this branch.
+            //
             // Resolve the concrete reply destination for the forwarded
             // message: the SEARCH-payload addr if specified, else
             // (UDP source IP, announced port). Fold into a SocketAddrV4
@@ -515,13 +531,21 @@ async fn process_search_datagram(
                         req.byte_order,
                         protocol,
                     );
-                    let send = socket.send_via(&resp, reply_dest, reply_iface_ip).await;
-                    let send = match send {
-                        Ok(n) => Ok(n),
-                        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
-                            socket.send_to(&resp, reply_dest).await
+                    // `reply_iface_ip = UNSPECIFIED` is the sentinel
+                    // we set on FromOriginTag packets whose peeled
+                    // origDest was the all-zeros isAny() — there's no
+                    // useful NIC pin so go straight to OS routing
+                    // instead of paying the AddrNotAvailable round-trip.
+                    let send = if reply_iface_ip.is_unspecified() {
+                        socket.send_to(&resp, reply_dest).await
+                    } else {
+                        match socket.send_via(&resp, reply_dest, reply_iface_ip).await {
+                            Ok(n) => Ok(n),
+                            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                                socket.send_to(&resp, reply_dest).await
+                            }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
                     };
                     if let Err(e) = send {
                         debug!("udp send to {reply_dest} via {reply_iface_ip}: {e}");
@@ -927,6 +951,102 @@ mod tests {
         assert!(
             r.is_err(),
             "FromOriginTag origin must NOT trigger re-forward, but observer got {r:?}"
+        );
+    }
+
+    /// `FromOriginTag` origin + isAny() reply addr in the SEARCH
+    /// payload must drop the SEARCH without sending a response —
+    /// pvxs `udp_collector.cpp:367-371` warning ("Forwarded SEARCH
+    /// with reply to sender never works"). Verify by hosting a PV
+    /// the SEARCH names and asserting the per-NIC socket emits no
+    /// reply within the timeout window.
+    #[tokio::test]
+    async fn from_origin_tag_search_with_isany_reply_addr_is_dropped() {
+        use crate::pvdata::{FieldDesc, PvField, ScalarType};
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        // Source that DOES claim to host "MY:PV" — proves the drop is
+        // because of the isAny() rule, not because the PV was unknown.
+        struct PresentSource;
+        #[allow(clippy::manual_async_fn)]
+        impl ChannelSource for PresentSource {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { vec!["MY:PV".into()] }
+            }
+            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == "MY:PV";
+                async move { m }
+            }
+            fn get_introspection(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { Some(FieldDesc::Scalar(ScalarType::Double)) }
+            }
+            fn get_value(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _name: &str,
+                _value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                async { Err("read-only".into()) }
+            }
+            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let source: DynSource = Arc::new(PresentSource);
+        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        // Bind a sniffer socket to the loopback NIC's own port so it
+        // would catch any reply the responder tries to send back.
+        // We use the NIC bundle's own addr as the simulated requester.
+        let sniffer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("sniffer bind");
+        let sniffer_addr = sniffer.local_addr().unwrap();
+
+        // SEARCH for "MY:PV" with reply addr 0.0.0.0 (isAny).
+        let codec = PvaCodec { big_endian: false };
+        let frame = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], sniffer_addr.port(), false);
+
+        process_search_datagram(
+            &source,
+            &socket,
+            None, // no lo_mcast — irrelevant for this code path
+            5076,
+            &frame,
+            sniffer_addr, // simulated requester
+            Ipv4Addr::LOCALHOST,
+            Origin::FromOriginTag,
+            5076,
+            [0u8; 12],
+            "tcp",
+        )
+        .await;
+
+        // Sniffer must NOT receive any reply within a short window —
+        // proves the isAny() drop fires.
+        let mut buf = [0u8; 4096];
+        let r = tokio::time::timeout(Duration::from_millis(150), sniffer.recv_from(&mut buf)).await;
+        assert!(
+            r.is_err(),
+            "isAny() reply addr on FromOriginTag must drop SEARCH; got {r:?}"
         );
     }
 

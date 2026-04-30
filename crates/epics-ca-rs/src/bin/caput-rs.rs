@@ -1,46 +1,133 @@
 use clap::Parser;
 use epics_ca_rs::CaError;
+use epics_ca_rs::cli::{PV_NAME_WIDTH, ValueFormat, format_value};
 use epics_ca_rs::client::CaClient;
 use std::time::Duration;
 
-#[derive(Parser)]
-#[command(name = "caput", about = "Write a value to an EPICS PV")]
-struct Args {
-    /// Wait for completion callback (ca_put_callback)
-    #[arg(short = 'c', long = "callback")]
-    callback: bool,
+const VERSION_INFO: &str = concat!(
+    "\nEPICS Version epics-rs ",
+    env!("CARGO_PKG_VERSION"),
+    ", CA Protocol version 4.13"
+);
 
-    /// CA timeout in seconds (default: $EPICS_CLI_TIMEOUT or 1.0).
-    /// C ref: modules/ca/src/tools/tool_lib.c:use_ca_timeout_env (commit 1d056c6).
+/// Mirror of C `caput` flag set.
+///
+/// Note: positional grammar differs in array mode (`-a`):
+///
+/// * scalar (default):  `caput-rs <PV name> <value> [more values]`
+/// * array (`-a`):      `caput-rs -a <PV name> <count> <v0> <v1> ...`
+///
+/// `value_count` is the parsed `<count>` token that prefixes the
+/// values when `-a` is present.
+#[derive(Parser)]
+#[command(
+    name = "caput-rs",
+    about = "Write a value to an EPICS PV",
+    disable_version_flag = true
+)]
+struct Args {
+    #[arg(short = 'V', long, hide = true)]
+    version: bool,
+
+    /// CA timeout in seconds. Mirrors C `tool_lib.c:use_ca_timeout_env`.
     #[arg(short = 'w', long = "timeout")]
     timeout: Option<f64>,
 
-    /// PV name to write to
-    pv_name: String,
+    /// Wait for completion callback (`ca_put_callback`).
+    #[arg(short = 'c', long = "callback")]
+    callback: bool,
 
-    /// Value to write
-    #[arg(allow_hyphen_values = true)]
-    value: String,
+    /// CA priority (0-99). Accepted for parity.
+    #[arg(short = 'p', long)]
+    priority: Option<u8>,
+
+    /// Terse output: print only the new value (no `Old :`/`New :`
+    /// prefix, no PV name).
+    #[arg(short = 't', long)]
+    terse: bool,
+
+    /// Long mode: post-write read prints `name timestamp value stat
+    /// sevr` like `caget -a`.
+    #[arg(short = 'l', long = "long")]
+    long_mode: bool,
+
+    /// Force interpretation of values as numbers (overrides ENUM
+    /// auto-string-resolution).
+    #[arg(short = 'n', long = "num-enum")]
+    force_numeric: bool,
+
+    /// Force interpretation of values as strings (overrides numeric
+    /// parse for ENUM).
+    #[arg(short = 's', long = "string-enum", conflicts_with = "force_numeric")]
+    force_string: bool,
+
+    /// Put long string as an array of chars (long-string convention).
+    #[arg(short = 'S', long = "long-string")]
+    long_string: bool,
+
+    /// Put as array. The remaining positionals are
+    /// `<count> <v0> <v1> ...`.
+    #[arg(short = 'a', long = "array")]
+    array_mode: bool,
+
+    /// Alternate output field separator.
+    #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
+    field_separator: Option<char>,
+
+    /// Positional PV name.
+    #[arg(required_unless_present_any = ["version"])]
+    pv_name: Option<String>,
+
+    /// Positional values. In `-a` mode the first element is the
+    /// count, the rest are the values. Negative numeric values are
+    /// allowed via `--`.
+    #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+    values: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    if args.version {
+        println!("{VERSION_INFO}");
+        return;
+    }
+
+    if args.priority.is_some() {
+        eprintln!("caput-rs: -p (priority) is accepted for parity but not yet honoured");
+    }
+    if args.long_string {
+        eprintln!("caput-rs: -S (long-string put) is accepted for parity but not yet honoured");
+    }
+    if args.force_numeric || args.force_string {
+        // Today the channel's native type drives parse(); -n/-s have
+        // no observable effect until a typed-write API is exposed.
+        // No-op silently to avoid noisy stderr in scripts.
+    }
+
+    let pv_name = args.pv_name.expect("clap enforces required");
+
+    if args.values.is_empty() {
+        eprintln!("caput-rs: missing value");
+        std::process::exit(1);
+    }
+
     let client = CaClient::new().await.expect("failed to create CA client");
     let timeout = Duration::from_secs_f64(
         args.timeout
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );
 
-    let ch = client.create_channel(&args.pv_name);
+    let ch = client.create_channel(&pv_name);
     if let Err(e) = ch.wait_connected(timeout).await {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 
-    // Read old value with timeout
+    // Determine the channel's native type.
     let (native_type, old_value) = match ch.get_with_timeout(timeout).await {
-        Ok((t, val)) => (t, val.to_string()),
+        Ok(pair) => pair,
         Err(CaError::Timeout) => {
             eprintln!("Read operation timed out: PV data was not read.");
             std::process::exit(1);
@@ -51,32 +138,168 @@ async fn main() {
         }
     };
 
-    let value = match epics_ca_rs::EpicsValue::parse(native_type, &args.value) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: {e}");
+    // Parse the value(s) according to the array/scalar mode.
+    let parsed_value = if args.array_mode {
+        let want = match args.values[0].parse::<usize>() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("caput-rs: -a count must be a non-negative integer ({e})");
+                std::process::exit(1);
+            }
+        };
+        if args.values.len() < 1 + want {
+            eprintln!(
+                "caput-rs: -a count {} but only {} values provided",
+                want,
+                args.values.len() - 1
+            );
             std::process::exit(1);
+        }
+        let tokens = &args.values[1..1 + want];
+        match parse_array(native_type, tokens) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Scalar: C `caput` joins extra positionals with single
+        // spaces (legacy convention). Modern usage is one value but
+        // operators occasionally write `caput PV "alpha beta"`.
+        let joined = args.values.join(" ");
+        match epics_ca_rs::EpicsValue::parse(native_type, &joined) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
-    // Write value
     let result = if args.callback {
-        ch.put_with_timeout(&value, timeout).await
+        ch.put_with_timeout(&parsed_value, timeout).await
     } else {
-        ch.put_nowait(&value).await
+        ch.put_nowait(&parsed_value).await
     };
-
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 
-    // Re-read new value from server with timeout (C: caget after put)
+    // Re-read for echoing to stdout (matches C caput which always
+    // reads the PV back after the put).
     let new_value = match ch.get_with_timeout(timeout).await {
-        Ok((_, val)) => val.to_string(),
-        _ => args.value.clone(),
+        Ok((_, val)) => val,
+        Err(_) => parsed_value,
     };
 
-    println!("Old : {} {}", args.pv_name, old_value);
-    println!("New : {} {}", args.pv_name, new_value);
+    let mut fmt = ValueFormat::default();
+    if let Some(c) = args.field_separator {
+        fmt.field_separator = c;
+    }
+    let sep = fmt.field_separator;
+    let old_rendered = format_value(&old_value, &fmt, None);
+    let new_rendered = format_value(&new_value, &fmt, None);
+    let is_scalar = new_value.count() == 1;
+    let pad = |name: &str| -> String {
+        if is_scalar && sep == ' ' {
+            format!("{name:<width$}", width = PV_NAME_WIDTH)
+        } else {
+            name.to_string()
+        }
+    };
+
+    if args.terse {
+        // C `caput -t`: only the new value (no name, no Old/New).
+        println!("{new_rendered}");
+    } else if args.long_mode {
+        // C `caput -l`: same shape as `caget -a` for both lines.
+        // `*` is the timestamp placeholder (channel API doesn't yet
+        // surface DBR_TIME).
+        println!(
+            "Old : {name}{sep}*{sep}{val}{sep}{sep}",
+            name = pad(&pv_name),
+            sep = sep,
+            val = old_rendered,
+        );
+        println!(
+            "New : {name}{sep}*{sep}{val}{sep}{sep}",
+            name = pad(&pv_name),
+            sep = sep,
+            val = new_rendered,
+        );
+    } else {
+        // Default: `Old : <name-padded><sep><value>` and likewise for
+        // New. Mirrors C `caput.c::main` post-put echo.
+        println!(
+            "Old : {name}{sep}{val}",
+            name = pad(&pv_name),
+            val = old_rendered
+        );
+        println!(
+            "New : {name}{sep}{val}",
+            name = pad(&pv_name),
+            val = new_rendered
+        );
+    }
+}
+
+fn parse_array(
+    native_type: epics_ca_rs::DbFieldType,
+    tokens: &[String],
+) -> Result<epics_ca_rs::EpicsValue, String> {
+    use epics_ca_rs::DbFieldType as DT;
+    use epics_ca_rs::EpicsValue;
+    match native_type {
+        DT::Short => {
+            let mut arr = Vec::with_capacity(tokens.len());
+            for t in tokens {
+                arr.push(
+                    EpicsValue::parse(DT::Short, t)
+                        .and_then(|v| match v {
+                            EpicsValue::Short(n) => Ok(n),
+                            _ => Err(epics_ca_rs::CaError::InvalidValue("not short".into())),
+                        })
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+            Ok(EpicsValue::ShortArray(arr))
+        }
+        DT::Float => {
+            let mut arr = Vec::with_capacity(tokens.len());
+            for t in tokens {
+                arr.push(t.parse::<f32>().map_err(|e| e.to_string())?);
+            }
+            Ok(EpicsValue::FloatArray(arr))
+        }
+        DT::Double => {
+            let mut arr = Vec::with_capacity(tokens.len());
+            for t in tokens {
+                arr.push(t.parse::<f64>().map_err(|e| e.to_string())?);
+            }
+            Ok(EpicsValue::DoubleArray(arr))
+        }
+        DT::Long => {
+            let mut arr = Vec::with_capacity(tokens.len());
+            for t in tokens {
+                arr.push(t.parse::<i32>().map_err(|e| e.to_string())?);
+            }
+            Ok(EpicsValue::LongArray(arr))
+        }
+        DT::Enum => {
+            let mut arr = Vec::with_capacity(tokens.len());
+            for t in tokens {
+                arr.push(t.parse::<u16>().map_err(|e| e.to_string())?);
+            }
+            Ok(EpicsValue::EnumArray(arr))
+        }
+        DT::Char => Ok(EpicsValue::CharArray(
+            tokens
+                .iter()
+                .map(|t| t.parse::<u8>().unwrap_or(0))
+                .collect(),
+        )),
+        DT::String => Ok(EpicsValue::StringArray(tokens.to_vec())),
+    }
 }

@@ -951,6 +951,35 @@ async fn broadcast(socket: &AsyncUdpV4, packet: &[u8], extra_targets: &[SocketAd
         .unwrap_or(DEFAULT_BROADCAST_PORT);
     targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), bport));
 
+    // pvxs `clientconfig.cpp::expand` parity: when EPICS_PVA_AUTO_ADDR_LIST
+    // is YES (the default), enumerate every up-non-loopback NIC's IPv4
+    // broadcast address and add it to the search target list. Without
+    // this, on multi-NIC hosts (and macOS in particular) we send only
+    // to 255.255.255.255 — which the kernel may not translate to the
+    // NIC's per-subnet broadcast in all cases, so SEARCHes never reach
+    // local IOCs that happen to be listening on `192.168.X.255:5076`.
+    // Symptom: `pvget-rs <PV>` against a local pva-rs server hangs
+    // until first SEARCH timeout while pvxs `pvget` connects fine.
+    if crate::config::env::auto_addr_list_enabled() {
+        for sa in crate::config::env::list_broadcast_addresses(bport) {
+            // The helper appends 255.255.255.255 as a fallback — we
+            // already pushed it above; the post-loop dedup catches it.
+            targets.push(sa);
+        }
+        // Defensive deviation from pvxs: also add `127.0.0.1:port`
+        // explicitly. pvxs and EPICS convention rely on the local IOC
+        // also binding the NIC broadcast addr (so a NIC-broadcast
+        // SEARCH reaches it via `192.168.X.255`). That breaks down on
+        // hosts with no usable NIC (CI containers, isolated dev VMs,
+        // build sandboxes — anywhere `getifaddrs` returns only
+        // loopback). pvxs users hit this and have to set
+        // `EPICS_PVA_ADDR_LIST=127.0.0.1` by hand; we send the extra
+        // unicast unconditionally to make the zero-config local-IOC
+        // workflow work. Cost: one extra UDP datagram per SEARCH
+        // burst — negligible.
+        targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
+    }
+
     if let Ok(env) = std::env::var("EPICS_PVA_ADDR_LIST") {
         for tok in env.split(|c: char| c == ',' || c.is_whitespace()) {
             let tok = tok.trim();
@@ -967,6 +996,11 @@ async fn broadcast(socket: &AsyncUdpV4, packet: &[u8], extra_targets: &[SocketAd
     for &t in extra_targets {
         targets.push(t);
     }
+
+    // Dedup while preserving insertion order — limited broadcast wins
+    // its slot, NIC broadcasts/extras come after.
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|t| seen.insert(*t));
 
     for t in targets {
         // Limited broadcast (255.255.255.255) and multicast (224/4)

@@ -162,7 +162,7 @@ pub struct SearchEngine {
 impl SearchEngine {
     /// Spawn the engine. Returns a handle that channels use to issue
     /// `find()` requests.
-    pub async fn spawn(extra_targets: Vec<SocketAddr>) -> PvaResult<Self> {
+    pub async fn spawn(mut extra_targets: Vec<SocketAddr>) -> PvaResult<Self> {
         let beacons = BeaconTracker::new();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>(256);
 
@@ -192,6 +192,30 @@ impl SearchEngine {
                  (EPICS_PVA_ADDR_LIST empty, EPICS_PVA_AUTO_ADDR_LIST=NO, \
                  no programmatic addr_list). All searches will time out."
             );
+        }
+
+        // Resolve EPICS_PVA_ADDR_LIST once at startup and merge into
+        // `extra_targets`. Uses the shared parser (`parse_addr_list_with_port`)
+        // so `IP`, `IP:port`, `hostname`, and `hostname:port` all work —
+        // previously the search engine only handled literal IPs and
+        // silently dropped DNS hostnames, mirroring the pre-fix libca
+        // bug captured in `parse_addr_list_with_port`'s P-6 comment.
+        // DNS is blocking; offload to the blocking pool so a slow
+        // resolver doesn't stall the engine spawn on the runtime's
+        // worker thread for the full DNS timeout.
+        if let Some(s) = env_addrs.as_deref() {
+            let s = s.to_string();
+            let bport = crate::config::env::broadcast_port();
+            let resolved = tokio::task::spawn_blocking(move || {
+                crate::config::env::parse_addr_list_with_port(&s, bport)
+            })
+            .await
+            .unwrap_or_default();
+            for sa in resolved {
+                if !extra_targets.contains(&sa) {
+                    extra_targets.push(sa);
+                }
+            }
         }
 
         let beacons_clone = beacons.clone();
@@ -989,19 +1013,10 @@ async fn broadcast(socket: &AsyncUdpV4, packet: &[u8], extra_targets: &[SocketAd
         targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
     }
 
-    if let Ok(env) = std::env::var("EPICS_PVA_ADDR_LIST") {
-        for tok in env.split(|c: char| c == ',' || c.is_whitespace()) {
-            let tok = tok.trim();
-            if tok.is_empty() {
-                continue;
-            }
-            if let Ok(sa) = tok.parse::<SocketAddr>() {
-                targets.push(sa);
-            } else if let Ok(ip) = tok.parse::<IpAddr>() {
-                targets.push(SocketAddr::new(ip, bport));
-            }
-        }
-    }
+    // EPICS_PVA_ADDR_LIST is parsed once at SearchEngine::spawn and
+    // merged into `extra_targets` (with DNS hostnames resolved). Per-
+    // tick re-reading is redundant and would re-pay the DNS cost on
+    // every SEARCH burst.
     for &t in extra_targets {
         targets.push(t);
     }

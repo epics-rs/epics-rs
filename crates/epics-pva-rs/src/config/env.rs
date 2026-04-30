@@ -37,18 +37,34 @@ pub fn parse_addr_list_with_port(env: &str, default_port: u16) -> Vec<SocketAddr
                 return Some(SocketAddr::new(ip, default_port));
             }
             // 3. `host:port` or bare hostname — synchronous DNS
-            //    resolve via ToSocketAddrs. Take the first address;
-            //    callers iterate and dedup.
+            //    resolve via ToSocketAddrs. Prefer the first IPv4
+            //    answer over IPv6: this stack's `AsyncUdpV4` is
+            //    IPv4-only and would reject a V6 destination at
+            //    send time. macOS commonly orders IPv6 ahead of
+            //    IPv4 (e.g. `localhost` → `::1` before `127.0.0.1`)
+            //    so taking the first answer unconditionally would
+            //    silently drop unicast SEARCH to localhost.
             let with_port = if s.contains(':') {
                 s.to_string()
             } else {
                 format!("{s}:{default_port}")
             };
             match with_port.to_socket_addrs() {
-                Ok(mut iter) => iter.next().or_else(|| {
-                    tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
-                    None
-                }),
+                Ok(iter) => {
+                    let mut v4: Option<SocketAddr> = None;
+                    let mut v6: Option<SocketAddr> = None;
+                    for sa in iter {
+                        match sa {
+                            SocketAddr::V4(_) if v4.is_none() => v4 = Some(sa),
+                            SocketAddr::V6(_) if v6.is_none() => v6 = Some(sa),
+                            _ => {}
+                        }
+                    }
+                    v4.or(v6).or_else(|| {
+                        tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
+                        None
+                    })
+                }
                 Err(e) => {
                     tracing::debug!(token = %s, error = %e, "EPICS_PVA addr-list: resolve failed");
                     None

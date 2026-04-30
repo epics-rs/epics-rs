@@ -343,7 +343,16 @@ fn bind_beacon_udp() -> Option<AsyncUdpV4> {
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(DEFAULT_BROADCAST_PORT);
-    let sock = match AsyncUdpV4::bind(port, true) {
+    // Skip the loopback NIC: any local pva-rs *server* has its UDP
+    // responder bound on 127.0.0.1:5076 with SO_REUSEPORT, and a
+    // co-bound client beacon socket on the same (addr, port) would
+    // race with the server for inbound SEARCH packets via the kernel's
+    // REUSEPORT load-balancing on macOS / Linux. Beacons that the
+    // local server emits go to NIC subnet broadcasts (never to the
+    // loopback addr — see `config::env::list_broadcast_addresses`
+    // which filters loopback), so dropping the loopback bind here
+    // costs nothing on the receive side.
+    let sock = match AsyncUdpV4::bind_non_loopback(port, true) {
         Ok(s) => s,
         Err(e) => {
             debug!("beacon socket bind to {port} failed: {e}; fast-reconnect disabled");

@@ -128,12 +128,42 @@ impl AsyncUdpV4 {
         Self::bind_with_map(&IfaceMap::new(), port, broadcast)
     }
 
+    /// Like [`Self::bind`] but skips the loopback NIC. Use this when
+    /// the bound port is shared across processes (e.g. PVA UDP 5076)
+    /// and a co-bound loopback socket on another local process would
+    /// race with this one for incoming packets via SO_REUSEPORT
+    /// load-balancing on macOS / Linux.
+    ///
+    /// Concrete failure this avoids: a pva-rs *client* binding its
+    /// beacon-receive socket on `127.0.0.1:5076` while a pva-rs
+    /// *server* on the same host has its UDP responder bound on
+    /// `127.0.0.1:5076`. macOS distributes inbound `127.0.0.1:5076`
+    /// packets between them via SO_REUSEPORT, so SEARCH packets
+    /// destined to the server randomly land on the client's beacon
+    /// socket and are silently dropped (the beacon receiver only
+    /// processes BEACON, not SEARCH).
+    pub fn bind_non_loopback(port: u16, broadcast: bool) -> io::Result<Self> {
+        Self::bind_with_map_filtered(&IfaceMap::new(), port, broadcast, true)
+    }
+
     /// Like [`Self::bind`] but reuses an existing [`IfaceMap`] —
     /// useful when callers maintain a long-lived shared map.
     pub fn bind_with_map(map: &IfaceMap, port: u16, broadcast: bool) -> io::Result<Self> {
+        Self::bind_with_map_filtered(map, port, broadcast, false)
+    }
+
+    fn bind_with_map_filtered(
+        map: &IfaceMap,
+        port: u16,
+        broadcast: bool,
+        skip_loopback: bool,
+    ) -> io::Result<Self> {
         let ifaces = map.all();
         let mut sockets = Vec::with_capacity(ifaces.len() * 2);
         for info in ifaces {
+            if skip_loopback && info.ip.is_loopback() {
+                continue;
+            }
             match bind_one(&info, port, broadcast) {
                 Ok(nic) => sockets.push(nic),
                 Err(e) => {

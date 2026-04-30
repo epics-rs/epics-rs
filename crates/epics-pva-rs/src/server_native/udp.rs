@@ -9,7 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::net::{AsyncUdpV4, bind_loopback_mcast};
+use epics_base_rs::net::{AsyncUdpV4, ORIGIN_TAG_MCAST_GROUP, bind_loopback_mcast};
+use std::net::SocketAddrV4;
 use tracing::debug;
 
 use crate::codec::PvaCodec;
@@ -274,6 +275,8 @@ pub async fn run_udp_responder_with_config(
                 process_search_datagram(
                     &source,
                     &socket,
+                    lo_mcast.as_ref(),
+                    udp_port,
                     &buf[..frame_len],
                     meta.src,
                     meta.iface_ip,
@@ -314,6 +317,8 @@ pub async fn run_udp_responder_with_config(
                 process_search_datagram(
                     &source,
                     &socket,
+                    lo_mcast.as_ref(),
+                    udp_port,
                     inner,
                     src,
                     reply_iface_ip,
@@ -331,6 +336,52 @@ pub async fn run_udp_responder_with_config(
     // when this function unwinds.
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Build a forward-ready copy of `frame` when its first SEARCH message
+/// has the Unicast flag set. Mirrors pvxs `udp_collector.cpp:387-396`:
+/// the recipient of the forwarded message has no access to the
+/// original UDP source, so the forwarder rewrites the SEARCH's reply
+/// address field with the resolved `reply_dest` (a fully concrete
+/// destination) AND clears the Unicast flag before sending. Returns
+/// `None` when the frame doesn't open with a unicast-flagged SEARCH —
+/// no forward needed.
+///
+/// SEARCH payload layout (after the 8-byte PVA header):
+///
+/// | offset | size | field            |
+/// |--------|------|------------------|
+/// |   0    |  4   | sequence_id      |
+/// |   4    |  1   | flags            |
+/// |   5    |  3   | reserved         |
+/// |   8    | 16   | response_addr    |
+/// |  24    |  2   | response_port    |
+fn try_build_forward_frame(frame: &[u8], reply_dest: SocketAddrV4) -> Option<Vec<u8>> {
+    let req = parse_search_request(frame)?;
+    if !req.unicast {
+        return None;
+    }
+    if frame.len() < PvaHeader::SIZE + 26 {
+        return None;
+    }
+    let mut out = frame.to_vec();
+    let payload_off = PvaHeader::SIZE;
+    // Clear Unicast bit so peers don't re-forward (pvxs uses the flag
+    // as a "single-server-targeted" marker).
+    out[payload_off + 4] &= !0x80;
+    // Overwrite the 16-byte response_addr with the resolved IPv4
+    // (v4-mapped IPv6 form). This is what the recipient must use as
+    // the reply destination since the original UDP source is the
+    // forwarder, not the requester.
+    let addr_bytes = ip_to_bytes(IpAddr::V4(*reply_dest.ip()));
+    out[payload_off + 8..payload_off + 24].copy_from_slice(&addr_bytes);
+    // Overwrite the 2-byte response_port in the SEARCH's byte order.
+    let port_bytes = match req.byte_order {
+        ByteOrder::Big => reply_dest.port().to_be_bytes(),
+        ByteOrder::Little => reply_dest.port().to_le_bytes(),
+    };
+    out[payload_off + 24..payload_off + 26].copy_from_slice(&port_bytes);
+    Some(out)
 }
 
 /// Inbound source filter: drop UDP packets whose source IP is itself
@@ -371,6 +422,8 @@ fn filter_inbound(peer: SocketAddr, ignore_addrs: &[(IpAddr, u16)]) -> bool {
 async fn process_search_datagram(
     source: &DynSource,
     socket: &AsyncUdpV4,
+    lo_mcast: Option<&Arc<tokio::net::UdpSocket>>,
+    udp_port: u16,
     frame: &[u8],
     udp_src: SocketAddr,
     reply_iface_ip: Ipv4Addr,
@@ -379,6 +432,45 @@ async fn process_search_datagram(
     guid: [u8; 12],
     protocol: &'static str,
 ) {
+    // Forward path (pvxs `udp_collector.cpp:387-396`): a unicast
+    // SEARCH addressed at one of our NIC unicast IPs (origin=Direct +
+    // unicast flag) is wrapped in CMD_ORIGIN_TAG and re-broadcast to
+    // 224.0.0.128:port so other local PVA peers can answer too. Only
+    // taken when origin=Direct (anti-loop: we never re-forward an
+    // ORIGIN_TAG-peeled packet) and a loopback mcast socket is bound.
+    // After forwarding we return — our own lo_mcast loops the packet
+    // back via IP_MULTICAST_LOOP=1, where it re-enters this function
+    // as origin=FromOriginTag and is processed locally.
+    if origin == Origin::Direct {
+        if let Some(lo) = lo_mcast {
+            // Resolve the concrete reply destination for the forwarded
+            // message: the SEARCH-payload addr if specified, else
+            // (UDP source IP, announced port). Fold into a SocketAddrV4
+            // for the forward-frame rewriter.
+            if let Some(req) = parse_search_request(frame) {
+                if req.unicast {
+                    let reply_ip = req.reply_addr.unwrap_or_else(|| match udp_src.ip() {
+                        IpAddr::V4(v4) => v4,
+                        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+                    });
+                    let reply_dest = SocketAddrV4::new(reply_ip, req.reply_port);
+                    if let Some(forward) = try_build_forward_frame(frame, reply_dest) {
+                        let prefix = PvaCodec::build_origin_tag_prefix(reply_iface_ip);
+                        let mut out = Vec::with_capacity(prefix.len() + forward.len());
+                        out.extend_from_slice(&prefix);
+                        out.extend_from_slice(&forward);
+                        let dest =
+                            SocketAddr::V4(SocketAddrV4::new(ORIGIN_TAG_MCAST_GROUP, udp_port));
+                        if let Err(e) = lo.send_to(&out, dest).await {
+                            debug!("ORIGIN_TAG forward to {dest}: {e}");
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     let mut pos = 0usize;
     while pos + PvaHeader::SIZE <= frame.len() {
         let chunk = &frame[pos..];
@@ -529,6 +621,11 @@ struct SearchRequest {
     /// populated, even when `reply_addr` is `None`.
     reply_addr: Option<Ipv4Addr>,
     reply_port: u16,
+    /// True when the SEARCH header had the Unicast flag (`0x80`,
+    /// `pva_search_flags::Unicast`) set. pvxs uses this as a marker
+    /// that the forwarder must clear before relaying via the loopback
+    /// ORIGIN_TAG channel (`udp_collector.cpp:391`).
+    unicast: bool,
     /// Total bytes consumed from the input slice (header + payload),
     /// used by the multi-message drain loop to advance to the next
     /// chained message in the same datagram.
@@ -571,7 +668,8 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     let payload = &frame[PvaHeader::SIZE..PvaHeader::SIZE + payload_len];
     let mut p = Cursor::new(payload);
     let seq = p.get_u32(order).ok()?;
-    let _flags = p.get_u8().ok()?;
+    let flags = p.get_u8().ok()?;
+    let unicast = flags & 0x80 != 0;
     let _ = p.get_bytes(3).ok()?;
     let addr_bytes = p.get_bytes(16).ok()?;
     let mut addr16 = [0u8; 16];
@@ -607,6 +705,7 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
         queries,
         reply_addr,
         reply_port,
+        unicast,
         consumed: PvaHeader::SIZE + payload_len,
     })
 }
@@ -614,6 +713,249 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end forward path: `process_search_datagram` invoked
+    /// with `Origin::Direct` and a unicast-flagged SEARCH MUST emit
+    /// a CMD_ORIGIN_TAG-prefixed packet on `224.0.0.128:port` (the
+    /// loopback ORIGIN_TAG channel). A second observer socket joined
+    /// to the same group via `bind_loopback_mcast` should receive it,
+    /// and peeling the prefix should yield the inner SEARCH with the
+    /// Unicast flag cleared and the reply addr rewritten to the
+    /// resolved destination — pvxs `udp_collector.cpp:387-396` end-
+    /// to-end parity.
+    #[tokio::test]
+    async fn forward_path_emits_origin_tag_on_unicast_search() {
+        use crate::pvdata::{FieldDesc, PvField};
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        // Minimal source: has_pv returns false for every name. The
+        // forward path triggers BEFORE local processing, so the
+        // source is only consulted on the FromOriginTag (loop-back)
+        // path which is out of scope for this test.
+        struct EmptySource;
+        #[allow(clippy::manual_async_fn)]
+        impl ChannelSource for EmptySource {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { Vec::new() }
+            }
+            fn has_pv(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn get_introspection(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _name: &str,
+                _value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                async { Err("read-only test source".into()) }
+            }
+            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let source: DynSource = Arc::new(EmptySource);
+        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+
+        // Bind the lo_mcast send socket on an ephemeral port AND a
+        // second observer socket on the same port (SO_REUSEPORT).
+        // Both are joined to 224.0.0.128 — the observer will receive
+        // the forwarded packet via IP_MULTICAST_LOOP=1.
+        let lo_mcast = Arc::new(bind_loopback_mcast(0).expect("lo_mcast bind"));
+        let port = lo_mcast.local_addr().unwrap().port();
+        let observer = bind_loopback_mcast(port).expect("observer bind");
+
+        // Build a unicast SEARCH for "MY:PV" with reply 127.0.0.1:9999.
+        let codec = PvaCodec { big_endian: false };
+        let frame = codec.build_search(7, 42, "MY:PV", [127, 0, 0, 1], 9999, true);
+
+        let udp_src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 99, 5), 30000));
+        // Simulated NIC unicast IP — embedded into the ORIGIN_TAG
+        // prefix as the orig destination.
+        let reply_iface_ip = Ipv4Addr::new(192, 168, 99, 10);
+
+        process_search_datagram(
+            &source,
+            &socket,
+            Some(&lo_mcast),
+            port,
+            &frame,
+            udp_src,
+            reply_iface_ip,
+            Origin::Direct,
+            5076,
+            [0u8; 12],
+            "tcp",
+        )
+        .await;
+
+        let mut buf = [0u8; 4096];
+        let (n, _src) = tokio::time::timeout(Duration::from_secs(2), observer.recv_from(&mut buf))
+            .await
+            .expect("observer recv timeout — forward not emitted")
+            .expect("observer recv ok");
+        let raw = &buf[..n];
+
+        let (peeled, inner) = PvaCodec::try_peel_origin_tag(raw).expect("peel ok");
+        assert_eq!(
+            peeled,
+            Some(reply_iface_ip),
+            "ORIGIN_TAG prefix must carry the iface IP"
+        );
+
+        let req = parse_search_request(inner).expect("inner SEARCH parses");
+        assert!(
+            !req.unicast,
+            "forwarded SEARCH must have Unicast flag cleared"
+        );
+        assert_eq!(
+            req.reply_addr,
+            Some(Ipv4Addr::new(127, 0, 0, 1)),
+            "reply addr preserved from original SEARCH"
+        );
+        assert_eq!(req.reply_port, 9999);
+        assert_eq!(req.queries.len(), 1);
+        assert_eq!(req.queries[0].1, "MY:PV");
+    }
+
+    /// `process_search_datagram` with `Origin::FromOriginTag` MUST
+    /// NOT re-forward — anti-loop guard (pvxs `udp_collector.cpp`
+    /// only enters the Forwarding branch when origin is the
+    /// non-loopback per-NIC path). Verify by sending a unicast SEARCH
+    /// with `FromOriginTag` origin and asserting the observer never
+    /// sees a forwarded packet.
+    #[tokio::test]
+    async fn forward_path_skipped_when_origin_is_from_origin_tag() {
+        use crate::pvdata::{FieldDesc, PvField};
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        // Same EmptySource as above; duplicated to keep the tests
+        // independent of test-ordering.
+        struct EmptySource;
+        #[allow(clippy::manual_async_fn)]
+        impl ChannelSource for EmptySource {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { Vec::new() }
+            }
+            fn has_pv(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn get_introspection(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _name: &str,
+                _value: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                async { Err("read-only test source".into()) }
+            }
+            fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _name: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let source: DynSource = Arc::new(EmptySource);
+        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let lo_mcast = Arc::new(bind_loopback_mcast(0).expect("lo_mcast bind"));
+        let port = lo_mcast.local_addr().unwrap().port();
+        let observer = bind_loopback_mcast(port).expect("observer bind");
+
+        let codec = PvaCodec { big_endian: false };
+        let frame = codec.build_search(7, 42, "MY:PV", [127, 0, 0, 1], 9999, true);
+
+        process_search_datagram(
+            &source,
+            &socket,
+            Some(&lo_mcast),
+            port,
+            &frame,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30000)),
+            Ipv4Addr::LOCALHOST,
+            Origin::FromOriginTag,
+            5076,
+            [0u8; 12],
+            "tcp",
+        )
+        .await;
+
+        // Observer must NOT receive anything — short timeout proves
+        // the absence of forward emission.
+        let mut buf = [0u8; 4096];
+        let r =
+            tokio::time::timeout(Duration::from_millis(150), observer.recv_from(&mut buf)).await;
+        assert!(
+            r.is_err(),
+            "FromOriginTag origin must NOT trigger re-forward, but observer got {r:?}"
+        );
+    }
+
+    /// `try_build_forward_frame` rewrites the first SEARCH's reply
+    /// addr + port with the resolved destination AND clears the
+    /// Unicast flag (pvxs `udp_collector.cpp:387-396`). Returns
+    /// `None` when the frame's first message isn't a unicast-flagged
+    /// SEARCH — the caller then skips forwarding entirely.
+    #[test]
+    fn try_build_forward_frame_clears_unicast_and_overwrites_reply_dest() {
+        let codec = PvaCodec { big_endian: false };
+        // Original SEARCH: unicast=true, reply 0.0.0.0:5076.
+        let original = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], 5076, true);
+        // Forwarder resolves reply_dest = 192.168.1.5:54321 (the UDP
+        // source IP + announced port).
+        let dest = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 5), 54321);
+        let out = try_build_forward_frame(&original, dest).expect("unicast → Some");
+
+        // Re-parse the forwarded frame: unicast must be cleared, reply
+        // must reflect the resolved dest.
+        let req = parse_search_request(&out).expect("re-parse ok");
+        assert!(!req.unicast, "unicast flag must be cleared");
+        assert_eq!(req.reply_addr, Some(Ipv4Addr::new(192, 168, 1, 5)));
+        assert_eq!(req.reply_port, 54321);
+
+        // Non-unicast SEARCH: forward returns None (no rewrite).
+        let bcast = codec.build_search(7, 42, "MY:PV", [10, 0, 0, 1], 5076, false);
+        assert!(try_build_forward_frame(&bcast, dest).is_none());
+    }
 
     /// `parse_search_request` extracts the reply addr + port from the
     /// SEARCH payload's 16-byte address field. Specific IPv4 → `Some`,

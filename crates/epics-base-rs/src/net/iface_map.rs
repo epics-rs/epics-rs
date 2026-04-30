@@ -79,6 +79,36 @@ impl IfaceMap {
         age
     }
 
+    /// Spawn a background tokio task that refreshes the snapshot
+    /// every `period` until the returned [`tokio::task::JoinHandle`]
+    /// is aborted. Mirrors pvxs `IfMapDaemon` (evhelper.cpp:715-758)
+    /// which polls every 15 s.
+    ///
+    /// Returns the handle so callers that own the runtime can store
+    /// it for shutdown; dropping it does NOT cancel the task — abort
+    /// it explicitly. Idempotent: multiple background refreshers on
+    /// the same map cost extra wakeups but are harmless.
+    ///
+    /// Without this, dynamic infrastructure (DHCP renewals changing
+    /// the broadcast address; K8s pod network re-attach; VM live
+    /// migration; cable hot-plug) leaves the snapshot stale, and
+    /// any sender that derives a broadcast destination from the
+    /// snapshot ends up sending to the wrong subnet.
+    pub fn spawn_refresh(&self, period: Duration) -> tokio::task::JoinHandle<()> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            // First tick fires immediately — skip it so we don't
+            // refresh twice in a row right after `IfaceMap::new()`
+            // (which already populated the snapshot).
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                me.refresh();
+            }
+        })
+    }
+
     /// Snapshot of all IPv4 interfaces. Includes loopback unless
     /// callers filter via [`IfaceInfo::up_non_loopback`].
     pub fn all(&self) -> Vec<IfaceInfo> {
@@ -234,5 +264,23 @@ mod tests {
             Ipv4Addr::UNSPECIFIED,
             Ipv4Addr::new(8, 8, 8, 8)
         ));
+    }
+
+    /// `spawn_refresh` actually fires the periodic refresh — verify
+    /// the snapshot's `last_refresh` advances at least once in the
+    /// poll window. Mirrors pvxs `IfMapDaemon` 15 s behaviour at a
+    /// short test cadence (50 ms × ~3 ticks ≈ 150 ms total).
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_refresh_advances_last_refresh() {
+        let map = IfaceMap::new();
+        let initial = map.inner.lock().last_refresh;
+        let handle = map.spawn_refresh(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = map.inner.lock().last_refresh;
+        assert!(
+            after > initial,
+            "background refresh must update last_refresh"
+        );
+        handle.abort();
     }
 }

@@ -2120,19 +2120,27 @@ fn parse_addr_list() -> CaResult<Vec<SocketAddr>> {
 
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
         for entry in list.split_whitespace() {
-            let addr = if entry.contains(':') {
-                // Try direct parse first, fall back to DNS resolution
+            // Per-token failures (bad port, unresolvable hostname) are
+            // logged and dropped — a single broken entry must not take
+            // down the whole client. libca's
+            // `addAddrToChannelAccessAddressList` (configMain.c) follows
+            // the same drop-and-continue policy.
+            let parsed: Result<SocketAddr, CaError> = if entry.contains(':') {
                 entry.parse::<SocketAddr>().or_else(|_| {
                     let (host, port_str) = entry.rsplit_once(':').unwrap();
                     let port: u16 = port_str
                         .parse()
                         .map_err(|e| CaError::Protocol(format!("bad port in '{entry}': {e}")))?;
                     resolve_host(host, port)
-                })?
+                })
             } else {
-                resolve_host(entry, default_port)?
+                resolve_host(entry, default_port)
             };
-            addrs.push(addr);
+            match parsed {
+                Ok(addr) => addrs.push(addr),
+                Err(e) => tracing::debug!(token = %entry, error = %e,
+                    "EPICS_CA_ADDR_LIST: dropped unresolvable entry"),
+            }
         }
     }
 

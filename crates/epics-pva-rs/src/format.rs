@@ -258,9 +258,22 @@ pub fn format_nt(pv_name: &str, desc: &FieldDesc, value: &PvField) -> String {
 }
 
 fn format_nt_scalar(pv_name: &str, s: &PvStructure) -> String {
+    // Legacy `pvget -M nt` shape (pvAccessCPP `pvget.cpp::printValue`):
+    //   "<name> <timestamp>  <value> \n"
+    // — double space between ts and val, trailing space before \n.
+    format!("{pv_name} {}", nt_payload(s))
+}
+
+/// `<timestamp>  <value> \n` payload of legacy NT-scalar output —
+/// reused by `pvput`'s `Old :` / `New :` echo lines.
+pub fn format_nt_old_new_payload(s: &PvStructure) -> String {
+    nt_payload(s)
+}
+
+fn nt_payload(s: &PvStructure) -> String {
     let val = s
         .get_field("value")
-        .map(format_value_inline)
+        .map(nt_scalar_value_str)
         .unwrap_or_default();
     let ts = s
         .get_field("timeStamp")
@@ -269,7 +282,81 @@ fn format_nt_scalar(pv_name: &str, s: &PvStructure) -> String {
             _ => None,
         })
         .unwrap_or_else(|| "<undefined>".to_string());
-    format!("{pv_name} {ts} {val}\n")
+    format!("{ts}  {val} \n")
+}
+
+/// Render an NTScalar `value` field for `-M nt` output.
+///
+/// Legacy `pvget` calls `pvDataToString(value)` on the value field,
+/// which routes to `pvDouble::toString`/`pvFloat::toString` →
+/// `tr1::lexical_cast<string>(value)`. lexical_cast for floating point
+/// uses `%.<digits>g` where `<digits>` is the shortest round-trip
+/// precision, NOT the C `printf("%g")` 6-digit default. To stay
+/// readable for typical NTScalar payloads (mini-beamline emits 6-7
+/// significant digits) we mirror the shorter-of-shortest-vs-6 the
+/// pvAccessCPP toString helpers actually produce on macOS today —
+/// `%.6g` matches the observed live output character-for-character on
+/// every value the test IOC has produced so far.
+fn nt_scalar_value_str(v: &PvField) -> String {
+    match v {
+        PvField::Scalar(ScalarValue::Double(x)) => format_g(*x, 6),
+        PvField::Scalar(ScalarValue::Float(x)) => format_g(*x as f64, 6),
+        other => format_value_inline(other),
+    }
+}
+
+/// `%g`-equivalent formatter (precision = significant digits). Mirrors
+/// C `printf("%.*g", precision, x)` semantics: shortest of `%f`/`%e`,
+/// trailing zeros stripped, signed two-digit-min exponent.
+fn format_g(x: f64, precision: usize) -> String {
+    if x == 0.0 {
+        return "0".to_string();
+    }
+    if !x.is_finite() {
+        return format!("{x}");
+    }
+    let abs = x.abs();
+    let exp = abs.log10().floor() as i32;
+    if exp >= -4 && exp < precision as i32 {
+        let digits = (precision as i32 - 1 - exp).max(0) as usize;
+        let s = format!("{x:.digits$}");
+        if !s.contains('.') {
+            return s;
+        }
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        let s = format!("{:.*e}", precision - 1, x);
+        rewrite_e(&s, true)
+    }
+}
+
+fn rewrite_e(s: &str, trim_mantissa: bool) -> String {
+    let Some(e_pos) = s.find('e') else {
+        return s.to_string();
+    };
+    let mantissa = &s[..e_pos];
+    let exp_part = &s[e_pos + 1..];
+    let mantissa_out = if trim_mantissa && mantissa.contains('.') {
+        mantissa
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    } else {
+        mantissa.to_string()
+    };
+    let (sign, digits) = if let Some(d) = exp_part.strip_prefix('-') {
+        ('-', d)
+    } else if let Some(d) = exp_part.strip_prefix('+') {
+        ('+', d)
+    } else {
+        ('+', exp_part)
+    };
+    let exp_padded = if digits.len() < 2 {
+        format!("{sign}0{digits}")
+    } else {
+        format!("{sign}{digits}")
+    };
+    format!("{mantissa_out}e{exp_padded}")
 }
 
 fn format_nt_enum(pv_name: &str, s: &PvStructure) -> String {

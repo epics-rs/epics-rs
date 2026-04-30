@@ -1,10 +1,12 @@
+use chrono::{DateTime, Local};
 use clap::Parser;
+use epics_base_rs::server::snapshot::DbrClass;
 use epics_ca_rs::CaError;
 use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
 };
 use epics_ca_rs::client::CaClient;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 // C `caget -V` prints a blank line then
 //   "EPICS Version EPICS 7.0.10.1-DEV, CA Protocol version 4.13"
@@ -159,6 +161,58 @@ impl Args {
     }
 }
 
+/// Per-PV GET payload returned from the per-channel task.
+/// `Plain` is the cheap typed-value path (no timestamp); `Time` is
+/// the DBR_TIME variant produced by `-a` so the print loop can lift
+/// the real server timestamp + alarm pair onto the wire.
+enum GetResult {
+    Plain(epics_ca_rs::EpicsValue),
+    Time(epics_base_rs::server::snapshot::Snapshot),
+}
+
+fn format_server_timestamp(ts: SystemTime) -> String {
+    let dt: DateTime<Local> = ts.into();
+    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+}
+
+fn sevr_to_str(sevr: u16) -> &'static str {
+    match sevr {
+        0 => "NO_ALARM",
+        1 => "MINOR",
+        2 => "MAJOR",
+        3 => "INVALID",
+        _ => "Illegal value",
+    }
+}
+
+fn stat_to_str(stat: u16) -> &'static str {
+    match stat {
+        0 => "NO_ALARM",
+        1 => "READ",
+        2 => "WRITE",
+        3 => "HIHI",
+        4 => "HIGH",
+        5 => "LOLO",
+        6 => "LOW",
+        7 => "STATE",
+        8 => "COS",
+        9 => "COMM",
+        10 => "TIMEOUT",
+        11 => "HW_LIMIT",
+        12 => "CALC",
+        13 => "SCAN",
+        14 => "LINK",
+        15 => "SOFT",
+        16 => "BAD_SUB",
+        17 => "UDF",
+        18 => "DISABLE",
+        19 => "SIMM",
+        20 => "READ_ACCESS",
+        21 => "WRITE_ACCESS",
+        _ => "Illegal value",
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -198,6 +252,7 @@ async fn main() {
 
     // Connect + read all PVs in parallel within single timeout window
     // (C: connect_pvs → ca_pend_io → ca_array_get → ca_pend_io).
+    let want_time = args.wide;
     let mut handles = Vec::new();
     for (name, ch) in &channels {
         let name = name.clone();
@@ -208,11 +263,26 @@ async fn main() {
             if connect.is_err() {
                 return (name, Err("not connected".to_string()));
             }
-            match ch.get_with_timeout(t).await {
-                Ok((_dbr, value)) => (name, Ok(value)),
-                Err(CaError::Timeout) => (name, Err("timeout".to_string())),
-                Err(e) => (name, Err(format!("{e}"))),
-            }
+            // For `-a` (wide / DBR_TIME) we need timestamp + alarm,
+            // so route through `get_with_metadata` and wrap the
+            // response in the same `Ok` variant. The plain path stays
+            // on `get_with_timeout` because it doesn't pay for the
+            // bigger DBR_TIME response.
+            let outcome = if want_time {
+                match tokio::time::timeout(t, ch.get_with_metadata(DbrClass::Time)).await {
+                    Ok(Ok(snap)) => Ok(GetResult::Time(snap)),
+                    Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
+                    Ok(Err(e)) => Err(format!("{e}")),
+                    Err(_) => Err("timeout".to_string()),
+                }
+            } else {
+                match ch.get_with_timeout(t).await {
+                    Ok((_dbr, value)) => Ok(GetResult::Plain(value)),
+                    Err(CaError::Timeout) => Err("timeout".to_string()),
+                    Err(e) => Err(format!("{e}")),
+                }
+            };
+            (name, outcome)
         }));
     }
 
@@ -238,29 +308,46 @@ async fn main() {
     let mut failed = false;
     for (pv_name, result) in &results {
         match result {
-            Ok(value) => {
+            Ok(GetResult::Plain(value)) => {
                 let rendered = format_value(value, &fmt, None);
                 let is_scalar = value.count() == 1;
                 if args.terse {
-                    // C `caget -t`: value only (no name, no leading sep).
                     println!("{rendered}");
-                } else if args.wide {
-                    // C `-a` shape (`tool_lib.c::print_time_val_sts`):
-                    //   `<name-or-padded><sep><timestamp><sep><value>`
-                    // followed by either `<sep><stat><sep><sevr>` when
-                    // status||severity, or `<sep><sep>` (two empty
-                    // fields) on NO_ALARM. We don't yet plumb the
-                    // alarm pair through the channel API, so always
-                    // emit the NO_ALARM tail. Timestamp placeholder
-                    // is `*` until the GET response surfaces it.
+                } else {
+                    println!("{}{}{}", pad_name(is_scalar, pv_name), sep, rendered);
+                }
+            }
+            Ok(GetResult::Time(snap)) => {
+                // C `-a` shape (`tool_lib.c::print_time_val_sts`):
+                //   `<name-or-padded><sep><timestamp><sep><value>`
+                // then either `<sep><stat><sep><sevr>` when status or
+                // severity is non-zero, or `<sep><sep>` (two empty
+                // fields) on NO_ALARM. Mirror that exactly using the
+                // alarm pair the DBR_TIME response carried.
+                let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
+                let rendered = format_value(&snap.value, &fmt, enum_strings);
+                let is_scalar = snap.value.count() == 1;
+                let ts = format_server_timestamp(snap.timestamp);
+                let stat = snap.alarm.status;
+                let sevr = snap.alarm.severity;
+                if args.terse {
+                    println!("{rendered}");
+                } else if stat == 0 && sevr == 0 {
                     println!(
-                        "{name}{sep}*{sep}{val}{sep}{sep}",
+                        "{name}{sep}{ts}{sep}{val}{sep}{sep}",
                         name = pad_name(is_scalar, pv_name),
                         sep = sep,
                         val = rendered,
                     );
                 } else {
-                    println!("{}{}{}", pad_name(is_scalar, pv_name), sep, rendered);
+                    println!(
+                        "{name}{sep}{ts}{sep}{val}{sep}{stat_str}{sep}{sevr_str}",
+                        name = pad_name(is_scalar, pv_name),
+                        sep = sep,
+                        val = rendered,
+                        stat_str = stat_to_str(stat),
+                        sevr_str = sevr_to_str(sevr),
+                    );
                 }
             }
             Err(e) if e.contains("not connected") || e.contains("isconnect") => {

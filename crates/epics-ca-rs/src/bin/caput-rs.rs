@@ -1,8 +1,74 @@
+use chrono::{DateTime, Local};
 use clap::Parser;
+use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_ca_rs::CaError;
 use epics_ca_rs::cli::{PV_NAME_WIDTH, ValueFormat, format_value};
 use epics_ca_rs::client::CaClient;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+fn format_server_timestamp(ts: SystemTime) -> String {
+    let dt: DateTime<Local> = ts.into();
+    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+}
+
+fn sevr_to_str(sevr: u16) -> &'static str {
+    match sevr {
+        0 => "NO_ALARM",
+        1 => "MINOR",
+        2 => "MAJOR",
+        3 => "INVALID",
+        _ => "Illegal value",
+    }
+}
+
+fn stat_to_str(stat: u16) -> &'static str {
+    match stat {
+        0 => "NO_ALARM",
+        1 => "READ",
+        2 => "WRITE",
+        3 => "HIHI",
+        4 => "HIGH",
+        5 => "LOLO",
+        6 => "LOW",
+        7 => "STATE",
+        8 => "COS",
+        9 => "COMM",
+        10 => "TIMEOUT",
+        11 => "HW_LIMIT",
+        12 => "CALC",
+        13 => "SCAN",
+        14 => "LINK",
+        15 => "SOFT",
+        16 => "BAD_SUB",
+        17 => "UDF",
+        18 => "DISABLE",
+        19 => "SIMM",
+        20 => "READ_ACCESS",
+        21 => "WRITE_ACCESS",
+        _ => "Illegal value",
+    }
+}
+
+/// Print one `Old : ...` / `New : ...` line in long-mode shape:
+///   `<prefix>{name-padded}<sep><ts>{sep}<value>{sep}{stat?}{sep}{sevr?}`
+/// Mirrors `tool_lib.c::print_time_val_sts` — when alarm is
+/// (NO_ALARM, NO_ALARM) the trailing two fields are emitted empty.
+fn print_long_line(prefix: &str, name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) {
+    let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
+    let val = format_value(&snap.value, fmt, enum_strings);
+    let ts = format_server_timestamp(snap.timestamp);
+    let stat = snap.alarm.status;
+    let sevr = snap.alarm.severity;
+    if stat == 0 && sevr == 0 {
+        println!("{prefix}{name_col}{sep}{ts}{sep}{val}{sep}{sep}");
+    } else {
+        println!(
+            "{prefix}{name_col}{sep}{ts}{sep}{val}{sep}{stat_str}{sep}{sevr_str}",
+            stat_str = stat_to_str(stat),
+            sevr_str = sevr_to_str(sevr),
+        );
+    }
+}
 
 const VERSION_INFO: &str = concat!(
     "\nEPICS Version epics-rs ",
@@ -125,16 +191,33 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Determine the channel's native type.
-    let (native_type, old_value) = match ch.get_with_timeout(timeout).await {
-        Ok(pair) => pair,
-        Err(CaError::Timeout) => {
-            eprintln!("Read operation timed out: PV data was not read.");
-            std::process::exit(1);
+    // Determine the channel's native type. Long mode also wants the
+    // server timestamp + alarm pair captured BEFORE the put so the
+    // `Old :` line reflects the actual pre-put state — the regular
+    // path stays on the cheaper plain GET.
+    let (native_type, old_value, old_snap) = if args.long_mode {
+        match ch.get_with_metadata(DbrClass::Time).await {
+            Ok(snap) => (snap.value.dbr_type(), snap.value.clone(), Some(snap)),
+            Err(CaError::Timeout) => {
+                eprintln!("Read operation timed out: PV data was not read.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+    } else {
+        match ch.get_with_timeout(timeout).await {
+            Ok((t, v)) => (t, v, None),
+            Err(CaError::Timeout) => {
+                eprintln!("Read operation timed out: PV data was not read.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
@@ -189,9 +272,19 @@ async fn main() {
 
     // Re-read for echoing to stdout (matches C caput which always
     // reads the PV back after the put).
-    let new_value = match ch.get_with_timeout(timeout).await {
-        Ok((_, val)) => val,
-        Err(_) => parsed_value,
+    let (new_value, new_snap) = if args.long_mode {
+        match ch.get_with_metadata(DbrClass::Time).await {
+            Ok(snap) => (snap.value.clone(), Some(snap)),
+            Err(_) => (parsed_value.clone(), None),
+        }
+    } else {
+        (
+            match ch.get_with_timeout(timeout).await {
+                Ok((_, val)) => val,
+                Err(_) => parsed_value.clone(),
+            },
+            None,
+        )
     };
 
     let mut fmt = ValueFormat::default();
@@ -214,21 +307,17 @@ async fn main() {
         // C `caput -t`: only the new value (no name, no Old/New).
         println!("{new_rendered}");
     } else if args.long_mode {
-        // C `caput -l`: same shape as `caget -a` for both lines.
-        // `*` is the timestamp placeholder (channel API doesn't yet
-        // surface DBR_TIME).
-        println!(
-            "Old : {name}{sep}*{sep}{val}{sep}{sep}",
-            name = pad(&pv_name),
-            sep = sep,
-            val = old_rendered,
-        );
-        println!(
-            "New : {name}{sep}*{sep}{val}{sep}{sep}",
-            name = pad(&pv_name),
-            sep = sep,
-            val = new_rendered,
-        );
+        // C `caput -l`: same shape as `caget -a` for both lines, using
+        // the DBR_TIME snapshots captured around the put.
+        let name_col = pad(&pv_name);
+        match &old_snap {
+            Some(s) => print_long_line("Old : ", &name_col, sep, s, &fmt),
+            None => println!("Old : {name_col}{sep}*{sep}{old_rendered}{sep}{sep}"),
+        }
+        match &new_snap {
+            Some(s) => print_long_line("New : ", &name_col, sep, s, &fmt),
+            None => println!("New : {name_col}{sep}*{sep}{new_rendered}{sep}{sep}"),
+        }
     } else {
         // Default: `Old : <name-padded><sep><value>` and likewise for
         // New. Mirrors C `caput.c::main` post-put echo.

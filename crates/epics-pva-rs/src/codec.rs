@@ -7,11 +7,12 @@
 //! It is byte-exact compatible with `spvirit_codec::spvirit_encode` for the
 //! commands we emit; see `tests/proto_spvirit_parity.rs` for the cross-check.
 
+use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr};
 
 use crate::proto::{
-    ByteOrder, Command, PvaHeader, QosFlags, Status, WriteExt, encode_size_into,
-    encode_string_into, ip_to_bytes,
+    ByteOrder, Command, HeaderFlags, PvaHeader, QosFlags, Status, WriteExt, encode_size_into,
+    encode_string_into, ip_from_bytes, ip_to_bytes,
 };
 
 // Public constants (kept for backward compatibility with downstream callers).
@@ -26,6 +27,11 @@ pub const CMD_MONITOR: u8 = Command::Monitor as u8;
 pub const CMD_DESTROY_REQUEST: u8 = Command::DestroyRequest as u8;
 pub const CMD_GET_FIELD: u8 = Command::GetField as u8;
 pub const QOS_INIT: u8 = QosFlags::INIT;
+
+/// Fixed size of a `CMD_ORIGIN_TAG` prefix: 8-byte PVA header + 16-byte
+/// IPv4-mapped IPv6 destination address. Matches pvxs
+/// `udp_collector.cpp::cmd_origin_tag_size`.
+pub const ORIGIN_TAG_PREFIX_SIZE: usize = PvaHeader::SIZE + 16;
 
 /// PVA message codec — manages byte order and provides message building helpers.
 ///
@@ -241,6 +247,73 @@ impl PvaCodec {
 
     // ─── DESTROY_REQUEST ─────────────────────────────────────────────────
 
+    // ─── ORIGIN_TAG (loopback multicast forwarding prefix) ───────────────
+
+    /// Encode a `CMD_ORIGIN_TAG` prefix carrying `orig_dest_ip` as the
+    /// original destination address. Always emits 24 bytes: an 8-byte
+    /// PVA header (cmd=22, payload_length=16) followed by the 16-byte
+    /// IPv4-mapped IPv6 form of the destination.
+    ///
+    /// Mirrors pvxs `UDPCollector::forwardM` (udp_collector.cpp:544-568).
+    /// pvxs writes the prefix big-endian via `FixedBuf M(true, ...)` —
+    /// we match for wire-byte equivalence. The receiver reads the
+    /// header's MSB flag and decodes either way.
+    ///
+    /// The prefix is independent of the inner forwarded packet's byte
+    /// order, so this is a free function (no `&self`).
+    pub fn build_origin_tag_prefix(orig_dest_ip: Ipv4Addr) -> [u8; ORIGIN_TAG_PREFIX_SIZE] {
+        let mut out = [0u8; ORIGIN_TAG_PREFIX_SIZE];
+        let header = PvaHeader::application(false, ByteOrder::Big, Command::OriginTag as u8, 16);
+        out[..8].copy_from_slice(&header.encode());
+        out[8..].copy_from_slice(&ip_to_bytes(IpAddr::V4(orig_dest_ip)));
+        out
+    }
+
+    /// Try to peel a `CMD_ORIGIN_TAG` prefix off the head of `buf`.
+    /// Returns `(orig_dest, inner)` on success.
+    ///
+    /// `orig_dest` is `None` when the prefix carries the unspecified
+    /// address (`::` / `0.0.0.0`) — the forwarder had no per-NIC info.
+    /// `Some(ip)` on a concrete IPv4 destination. IPv6-only origins
+    /// also yield `None` since this stack is IPv4-only.
+    ///
+    /// Returns `None` on any parse failure: too short, wrong magic,
+    /// wrong command, payload length < 16, or buffer shorter than the
+    /// declared payload. Forward-compatible with longer payloads
+    /// (`payload_length > 16`): trailing bytes are skipped, matching
+    /// pvxs `udp_collector.cpp::case CMD_ORIGIN_TAG`.
+    pub fn try_peel_origin_tag(buf: &[u8]) -> Option<(Option<Ipv4Addr>, &[u8])> {
+        if buf.len() < PvaHeader::SIZE + 16 {
+            return None;
+        }
+        let mut cur = Cursor::new(buf);
+        let header = PvaHeader::decode(&mut cur).ok()?;
+        if header.command != Command::OriginTag as u8 {
+            return None;
+        }
+        if header.flags.0 & HeaderFlags::CONTROL != 0 {
+            return None;
+        }
+        let payload_len = header.payload_length as usize;
+        if payload_len < 16 {
+            return None;
+        }
+        let total = PvaHeader::SIZE + payload_len;
+        if buf.len() < total {
+            return None;
+        }
+        let mut addr = [0u8; 16];
+        addr.copy_from_slice(&buf[PvaHeader::SIZE..PvaHeader::SIZE + 16]);
+        let orig_dest = match ip_from_bytes(&addr) {
+            // pvxs `originaddr.isAny()` treats both the all-zeros IPv6
+            // sentinel and IPv4 0.0.0.0 (v4-mapped `::ffff:0.0.0.0`) as
+            // "valid forward, no per-NIC info". Match that here.
+            Some(IpAddr::V4(v4)) if !v4.is_unspecified() => Some(v4),
+            _ => None,
+        };
+        Some((orig_dest, &buf[total..]))
+    }
+
     pub fn build_destroy_request(&self, server_channel_id: u32, ioid: u32) -> Vec<u8> {
         // DESTROY_REQUEST payload is `sid:u32 + ioid:u32` only — no subcmd
         // byte (pvxs `Connection::sendDestroyRequest`, fixed in 1f91eb9e).
@@ -292,6 +365,126 @@ mod tests {
         assert_eq!(payload.len(), 8);
         assert_eq!(&payload[..4], &[99, 0, 0, 0]);
         assert_eq!(&payload[4..8], &[17, 0, 0, 0]);
+    }
+
+    /// `build_origin_tag_prefix` produces the exact 24-byte shape pvxs
+    /// `UDPCollector::forwardM` writes: BE PVA header `cmd=22, len=16`
+    /// followed by IPv4-mapped IPv6 of the dest IP.
+    #[test]
+    fn origin_tag_prefix_byte_layout() {
+        let prefix = PvaCodec::build_origin_tag_prefix(Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(prefix.len(), 24);
+        // Header: magic, version, flags=BE-only(0x80), cmd=22, len=16 (BE)
+        assert_eq!(prefix[0], 0xCA);
+        assert_eq!(prefix[1], PVA_VERSION);
+        assert_eq!(prefix[2], 0x80, "prefix must be big-endian per pvxs");
+        assert_eq!(prefix[3], 22, "cmd must be CMD_ORIGIN_TAG");
+        assert_eq!(&prefix[4..8], &[0, 0, 0, 16], "payload_length=16 BE");
+        // Address bytes: 10 zeros, 0xFFFF v4-mapped marker, then the v4 octets.
+        assert_eq!(&prefix[8..18], &[0u8; 10]);
+        assert_eq!(&prefix[18..20], &[0xFF, 0xFF]);
+        assert_eq!(&prefix[20..24], &[192, 168, 1, 100]);
+    }
+
+    /// Round-trip: `build_origin_tag_prefix` then `try_peel_origin_tag`
+    /// recovers the original destination IP and exposes the trailing
+    /// inner payload unchanged.
+    #[test]
+    fn origin_tag_round_trip() {
+        let dest = Ipv4Addr::new(10, 0, 0, 42);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&PvaCodec::build_origin_tag_prefix(dest));
+        let inner = b"\xCA\x02\x00\x03\x00\x00\x00\x00inner-payload";
+        wire.extend_from_slice(inner);
+
+        let (peeled, rest) = PvaCodec::try_peel_origin_tag(&wire).expect("valid prefix");
+        assert_eq!(peeled, Some(dest));
+        assert_eq!(rest, inner);
+    }
+
+    /// Unspecified `0.0.0.0` orig dest peels as `None` — pvxs
+    /// `originaddr.isAny()` branch (udp_collector.cpp:511-525). Caller
+    /// uses this as "valid forward, no per-NIC info available".
+    #[test]
+    fn origin_tag_unspecified_decodes_as_none() {
+        let prefix = PvaCodec::build_origin_tag_prefix(Ipv4Addr::UNSPECIFIED);
+        let (peeled, rest) = PvaCodec::try_peel_origin_tag(&prefix).expect("valid prefix");
+        assert_eq!(peeled, None, "UNSPECIFIED must yield None per pvxs isAny");
+        assert!(rest.is_empty());
+    }
+
+    /// Reject malformed input: too short, wrong magic, wrong command,
+    /// payload length below the 16-byte minimum, or truncated payload.
+    #[test]
+    fn origin_tag_rejects_malformed() {
+        // Too short.
+        assert!(PvaCodec::try_peel_origin_tag(&[]).is_none());
+        assert!(PvaCodec::try_peel_origin_tag(&[0u8; 10]).is_none());
+        assert!(PvaCodec::try_peel_origin_tag(&[0u8; 23]).is_none());
+
+        // Bad magic.
+        let mut bad = PvaCodec::build_origin_tag_prefix(Ipv4Addr::LOCALHOST).to_vec();
+        bad[0] = 0xAB;
+        assert!(PvaCodec::try_peel_origin_tag(&bad).is_none());
+
+        // Wrong command (SEARCH instead of OriginTag).
+        let mut wrong_cmd = PvaCodec::build_origin_tag_prefix(Ipv4Addr::LOCALHOST).to_vec();
+        wrong_cmd[3] = Command::Search as u8;
+        assert!(PvaCodec::try_peel_origin_tag(&wrong_cmd).is_none());
+
+        // CONTROL flag set — pvxs reserves ORIGIN_TAG for application
+        // frames only; a control-flagged frame must be rejected.
+        let mut ctrl = PvaCodec::build_origin_tag_prefix(Ipv4Addr::LOCALHOST).to_vec();
+        ctrl[2] |= HeaderFlags::CONTROL;
+        assert!(PvaCodec::try_peel_origin_tag(&ctrl).is_none());
+
+        // payload_length = 8 (< 16).
+        let mut short_payload = PvaCodec::build_origin_tag_prefix(Ipv4Addr::LOCALHOST).to_vec();
+        short_payload[4..8].copy_from_slice(&8u32.to_be_bytes());
+        assert!(PvaCodec::try_peel_origin_tag(&short_payload).is_none());
+
+        // payload_length = 32 but only 16 bytes follow → truncated.
+        let mut truncated = PvaCodec::build_origin_tag_prefix(Ipv4Addr::LOCALHOST).to_vec();
+        truncated[4..8].copy_from_slice(&32u32.to_be_bytes());
+        assert!(PvaCodec::try_peel_origin_tag(&truncated).is_none());
+    }
+
+    /// IPv6-only origin → `None`. This stack is IPv4-only; an
+    /// honest-IPv6 16-byte address (not v4-mapped) carries no useful
+    /// per-NIC info for our routing, so peel returns `Some((None, _))`
+    /// — same as the unspecified case from the caller's perspective.
+    #[test]
+    fn origin_tag_ipv6_only_origin_decodes_as_none() {
+        // Build a prefix manually with a real IPv6 address (::1).
+        let mut wire = Vec::new();
+        let header = PvaHeader::application(false, ByteOrder::Big, 22, 16);
+        header.write_into(&mut wire);
+        let v6 = std::net::Ipv6Addr::LOCALHOST;
+        wire.extend_from_slice(&v6.octets());
+
+        let (peeled, rest) = PvaCodec::try_peel_origin_tag(&wire).expect("valid prefix");
+        assert_eq!(peeled, None, "IPv6-only origin must yield None");
+        assert!(rest.is_empty());
+    }
+
+    /// Forward-compatible with payloads larger than 16 bytes: pvxs
+    /// `M.skip(head.len-16u, ...)` discards trailing extension data.
+    /// Verify our peel skips them too and only returns bytes after the
+    /// declared payload as the "inner" slice.
+    #[test]
+    fn origin_tag_skips_extra_payload_bytes() {
+        // Build a prefix with payload_length=24 (16 v4 + 8 trailing).
+        let dest = Ipv4Addr::new(10, 1, 2, 3);
+        let mut wire = Vec::new();
+        let header = PvaHeader::application(false, ByteOrder::Big, 22, 24);
+        header.write_into(&mut wire);
+        wire.extend_from_slice(&ip_to_bytes(IpAddr::V4(dest)));
+        wire.extend_from_slice(&[0xAA; 8]); // 8 extension bytes
+        wire.extend_from_slice(b"INNER");
+
+        let (peeled, rest) = PvaCodec::try_peel_origin_tag(&wire).expect("forward-compat");
+        assert_eq!(peeled, Some(dest));
+        assert_eq!(rest, b"INNER");
     }
 
     /// Discover packet wire format (pvxs `tickSearch(SearchKind::

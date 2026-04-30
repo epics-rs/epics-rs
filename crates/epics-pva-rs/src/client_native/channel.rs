@@ -473,11 +473,33 @@ impl Channel {
                 } else {
                     super::search_engine::SearchReason::Initial
                 };
+                // Use single-server `find()` (delivers on first
+                // SEARCH_RESPONSE) wrapped in a `MULTI_SERVER_WINDOW`
+                // timeout, instead of `find_all()` (always waits the
+                // full window). For the common case the first server
+                // to reply IS the one we want to use; the multi-
+                // server collection only mattered for populating
+                // the failover `alternatives` cache, and the cost
+                // was paying the full window even when the only
+                // local server replied in microseconds.
+                //
+                // Symptom this fixes: `pvget-rs PV` against a local
+                // IOC took ~1 s while legacy `pvget` returned in
+                // ~10 ms. Root cause: `find_all` accumulated the
+                // first response immediately but only delivered it
+                // at the engine's 1 Hz tick. With this change the
+                // common path returns at first response and only
+                // pays the window timeout when no server answers.
                 match &self.resolver {
-                    Resolver::Search(engine) => engine
-                        .find_all(&self.pv_name, reason)
-                        .await
-                        .unwrap_or_default(),
+                    Resolver::Search(engine) => match tokio::time::timeout(
+                        super::search_engine::MULTI_SERVER_WINDOW,
+                        engine.find(&self.pv_name, reason),
+                    )
+                    .await
+                    {
+                        Ok(Ok(addr)) => vec![addr],
+                        _ => Vec::new(),
+                    },
                     Resolver::Direct(addr) => vec![*addr],
                 }
             }

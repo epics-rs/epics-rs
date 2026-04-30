@@ -527,6 +527,28 @@ async fn run_engine(
             }
         };
 
+        // Earliest unfired `Multi` (FindAll) deadline. Without this,
+        // the only place deadlines get flushed is the 1 Hz `tick`
+        // arm, so a SEARCH_RESPONSE that arrives at e.g. 5 ms still
+        // makes the caller wait the rest of the second for the next
+        // tick before `find_all` returns. Sleep precisely until the
+        // earliest deadline so the common single-server case
+        // resolves in `MULTI_SERVER_WINDOW` (200 ms) — not in
+        // whatever fraction of the 1 s tick remains.
+        let next_multi_deadline: Option<Instant> = pending
+            .values()
+            .filter_map(|p| match &p.responder {
+                Responder::Multi { deadline, .. } if p.attempt > 0 => Some(*deadline),
+                _ => None,
+            })
+            .min();
+        let deadline_arm = async {
+            match next_multi_deadline {
+                Some(d) => tokio::time::sleep_until(d.into()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(SearchCommand::Find { pv_name, responder, reason }) => {
@@ -795,67 +817,40 @@ async fn run_engine(
                 }
             }
 
+            _ = deadline_arm => {
+                // The earliest unfired `Multi` deadline elapsed —
+                // flush it (and any others now past). Without this
+                // arm, deadlines were only checked at the 1 Hz tick,
+                // so a SEARCH_RESPONSE that arrived in 5 ms still
+                // sat in `accumulated` until the next tick (up to
+                // 1 s of dead time). With it the common single-
+                // server case resolves at `MULTI_SERVER_WINDOW`
+                // (200 ms), regardless of where the tick happens
+                // to fall.
+                flush_expired_pending(
+                    &mut pending,
+                    &mut by_name,
+                    &mut search_buckets,
+                );
+            }
+
             _ = tick.tick() => {
                 let now = Instant::now();
 
                 // 1. Flush expired FindAll multi-window responders.
-                //    Always flush at deadline regardless of whether
-                //    `accumulated` is empty — without this, a missing
-                //    PV (no server claims the name) leaves the
-                //    oneshot Sender alive forever, hanging the caller's
-                //    `find_all().await` and so any user-set
-                //    `PvaClient::timeout` on the outer op never gets
-                //    a chance to apply (the inner ensure_active never
-                //    returns control). pvxs returns from
-                //    Operation::wait on the user timeout regardless of
-                //    whether a search succeeded; the analogous
-                //    behaviour in pva-rs is "deliver Vec::new() at
-                //    deadline so the caller can decide whether to
-                //    error or retry".
+                //    Same logic the deadline arm runs — covers the
+                //    case where deadline_arm was racing against a
+                //    just-armed entry and missed it on this iteration.
                 //
-                //    Also detect closed Single responders (caller
-                //    dropped the find() future via outer timeout /
-                //    abort) so the pending entry doesn't leak.
-                let mut to_flush_multi = Vec::new();
-                let mut to_drop_single = Vec::new();
-                for (sid, p) in pending.iter() {
-                    match &p.responder {
-                        Responder::Multi { deadline, responder, .. } => {
-                            if responder.is_closed() {
-                                to_drop_single.push(*sid);
-                            } else if now >= *deadline && p.attempt > 0 {
-                                // attempt > 0 ensures the first
-                                // broadcast actually went out; without
-                                // this, Reconnect entries that haven't
-                                // had their bucket fire yet would
-                                // flush prematurely with no responses.
-                                to_flush_multi.push(*sid);
-                            }
-                        }
-                        Responder::Single(tx) => {
-                            if tx.is_closed() {
-                                to_drop_single.push(*sid);
-                            }
-                        }
-                    }
-                }
-                for sid in to_flush_multi {
-                    if let Some(p) = pending.remove(&sid) {
-                        by_name.remove(&p.pv_name);
-                        search_buckets[p.bucket].retain(|x| *x != sid);
-                        if let Responder::Multi { responder, accumulated, .. } = p.responder {
-                            let _ = responder.send(accumulated);
-                        }
-                    }
-                }
-                for sid in to_drop_single {
-                    if let Some(p) = pending.remove(&sid) {
-                        by_name.remove(&p.pv_name);
-                        search_buckets[p.bucket].retain(|x| *x != sid);
-                        // Sender drops at end of scope; that's the
-                        // signal to the caller (already-cancelled).
-                    }
-                }
+                //    Closed Single responders (caller dropped the
+                //    find() future via outer timeout / abort) are
+                //    cleaned up in the same pass to keep pending
+                //    bounded.
+                flush_expired_pending(
+                    &mut pending,
+                    &mut by_name,
+                    &mut search_buckets,
+                );
 
                 // 2. Process exactly one search bucket per tick. Pending
                 //    searches in this bucket get one UDP retransmit; the
@@ -1042,6 +1037,67 @@ async fn broadcast(socket: &AsyncUdpV4, packet: &[u8], extra_targets: &[SocketAd
         };
         if let Err(e) = result {
             debug!("search broadcast to {t} failed: {e}");
+        }
+    }
+}
+
+/// Flush any pending entries whose Multi deadline has elapsed (deliver
+/// the accumulated server list to the caller's oneshot) AND drop any
+/// Single entries whose responder has been closed by the caller.
+/// Idempotent — safe to call from both the precise deadline-arm path
+/// and the fallback 1 Hz tick.
+fn flush_expired_pending(
+    pending: &mut HashMap<u32, Pending>,
+    by_name: &mut HashMap<String, u32>,
+    search_buckets: &mut [Vec<u32>],
+) {
+    let now = Instant::now();
+    let mut to_flush_multi = Vec::new();
+    let mut to_drop_single = Vec::new();
+    for (sid, p) in pending.iter() {
+        match &p.responder {
+            Responder::Multi {
+                deadline,
+                responder,
+                ..
+            } => {
+                if responder.is_closed() {
+                    to_drop_single.push(*sid);
+                } else if now >= *deadline && p.attempt > 0 {
+                    // `attempt > 0` ensures the first broadcast went
+                    // out — Reconnect entries waiting on a bucket fire
+                    // would otherwise flush prematurely with empty
+                    // results.
+                    to_flush_multi.push(*sid);
+                }
+            }
+            Responder::Single(tx) => {
+                if tx.is_closed() {
+                    to_drop_single.push(*sid);
+                }
+            }
+        }
+    }
+    for sid in to_flush_multi {
+        if let Some(p) = pending.remove(&sid) {
+            by_name.remove(&p.pv_name);
+            search_buckets[p.bucket].retain(|x| *x != sid);
+            if let Responder::Multi {
+                responder,
+                accumulated,
+                ..
+            } = p.responder
+            {
+                let _ = responder.send(accumulated);
+            }
+        }
+    }
+    for sid in to_drop_single {
+        if let Some(p) = pending.remove(&sid) {
+            by_name.remove(&p.pv_name);
+            search_buckets[p.bucket].retain(|x| *x != sid);
+            // Sender drops at end of scope; that's the signal to the
+            // caller (already-cancelled).
         }
     }
 }

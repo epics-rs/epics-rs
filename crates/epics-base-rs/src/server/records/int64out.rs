@@ -3,6 +3,10 @@ use epics_macros_rs::EpicsRecord;
 // int64out: 64-bit integer output.
 // CA limitation: served as DBR_DOUBLE over Channel Access (precision loss for |val|>2^53).
 // Native i64 storage is lossless; precision is only lost at the CA wire boundary.
+//
+// Alarm threshold fields (HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV) are intentionally absent
+// from the field list so they route to RecordInstance::common.analog_alarm via
+// put_common_field, matching the path used by longout/ao.
 #[derive(EpicsRecord)]
 #[record(type = "int64out")]
 pub struct Int64outRecord {
@@ -18,22 +22,6 @@ pub struct Int64outRecord {
     pub drvh: f64,
     #[field(type = "Double")]
     pub drvl: f64,
-    #[field(type = "Double")]
-    pub hihi: f64,
-    #[field(type = "Double")]
-    pub high: f64,
-    #[field(type = "Double")]
-    pub low: f64,
-    #[field(type = "Double")]
-    pub lolo: f64,
-    #[field(type = "Short")]
-    pub hhsv: i16,
-    #[field(type = "Short")]
-    pub hsv: i16,
-    #[field(type = "Short")]
-    pub lsv: i16,
-    #[field(type = "Short")]
-    pub llsv: i16,
     #[field(type = "Double")]
     pub hyst: f64,
     #[field(type = "Double")]
@@ -73,14 +61,6 @@ impl Default for Int64outRecord {
             lopr: 0.0,
             drvh: 0.0,
             drvl: 0.0,
-            hihi: 0.0,
-            high: 0.0,
-            low: 0.0,
-            lolo: 0.0,
-            hhsv: 0,
-            hsv: 0,
-            lsv: 0,
-            llsv: 0,
             hyst: 0.0,
             lalm: 0.0,
             ivoa: 0,

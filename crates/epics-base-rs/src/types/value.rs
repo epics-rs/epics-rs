@@ -510,7 +510,7 @@ impl EpicsValue {
 
     /// Convert to a different native type (scalar only; arrays use first element).
     pub fn convert_to(&self, target: DbFieldType) -> EpicsValue {
-        if self.dbr_type() == target {
+        if self.db_field_type() == target {
             return self.clone();
         }
         // Menu string resolution: when converting String to Short/Enum,

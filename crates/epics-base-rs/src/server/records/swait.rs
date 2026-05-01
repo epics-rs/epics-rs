@@ -19,7 +19,6 @@ pub struct SwaitRecord {
     pub dold: f64,
     pub oval: f64,
     pub out: String,
-    pub outn: String,
     pub prec: i16,
     // INxN: input link names; INxP: process passive flags (0/1)
     pub inp_names: [String; 12], // INAN..INLN
@@ -41,7 +40,6 @@ impl Default for SwaitRecord {
             dold: 0.0,
             oval: 0.0,
             out: String::new(),
-            outn: String::new(),
             prec: 0,
             inp_names: Default::default(),
             inp_passive: [0; 12],
@@ -119,9 +117,9 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
     FieldDesc { name: "DOPT", dbf_type: DbFieldType::Short,  read_only: false },
     FieldDesc { name: "DOLD", dbf_type: DbFieldType::Double, read_only: false },
     FieldDesc { name: "OVAL", dbf_type: DbFieldType::Double, read_only: true  },
-    // OUT is intentionally absent: db_loader routes it to RecordInstance::common.out
-    // so that parsed_out is populated for the processing framework's output dispatch.
-    FieldDesc { name: "OUTN", dbf_type: DbFieldType::String, read_only: false },
+    // OUT and OUTN are intentionally absent: both route to RecordInstance::common.out
+    // via put_common_field so that parsed_out is populated for output dispatch.
+    // OUTN is swait's output link field name; RecordInstance handles the alias.
     FieldDesc { name: "PREC", dbf_type: DbFieldType::Short,  read_only: false },
     FieldDesc { name: "A",    dbf_type: DbFieldType::Double, read_only: false },
     FieldDesc { name: "B",    dbf_type: DbFieldType::Double, read_only: false },
@@ -219,7 +217,7 @@ impl Record for SwaitRecord {
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "DOLD" => Some(EpicsValue::Double(self.dold)),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
-            "OUTN" => Some(EpicsValue::String(self.outn.clone())),
+            // OUTN is aliased to common.out via RecordInstance; not stored locally.
             "PREC" => Some(EpicsValue::Short(self.prec)),
             _ => {
                 if let Some(idx) = Self::num_val_index(name) {
@@ -254,7 +252,7 @@ impl Record for SwaitRecord {
             "DOLD" => {
                 self.dold = value.to_f64().ok_or_else(|| CaError::TypeMismatch("DOLD".into()))?;
             }
-            "OUTN" => { if let EpicsValue::String(v) = value { self.outn = v; } }
+            // OUTN falls through to put_common_field which mirrors to common.out.
             "PREC" => { if let EpicsValue::Short(v) = value { self.prec = v; } }
             _ => {
                 if let Some(idx) = Self::num_val_index(name) {

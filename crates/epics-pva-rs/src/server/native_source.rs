@@ -468,6 +468,15 @@ fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
                     })
                     .collect(),
             )),
+            ScalarValue::Long(_) => Some(EpicsValue::Int64Array(
+                items
+                    .iter()
+                    .filter_map(|v| match v {
+                        ScalarValue::Long(x) => Some(*x),
+                        _ => None,
+                    })
+                    .collect(),
+            )),
             ScalarValue::Float(_) => Some(EpicsValue::FloatArray(
                 items
                     .iter()
@@ -489,7 +498,7 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
         ScalarValue::Byte(x) => EpicsValue::Char(*x as u8),
         ScalarValue::Short(x) => EpicsValue::Short(*x),
         ScalarValue::Int(x) => EpicsValue::Long(*x),
-        ScalarValue::Long(x) => EpicsValue::Long(*x as i32),
+        ScalarValue::Long(x) => EpicsValue::Int64(*x),
         ScalarValue::UByte(x) => EpicsValue::Char(*x),
         ScalarValue::UShort(x) => EpicsValue::Enum(*x),
         ScalarValue::UInt(x) => EpicsValue::Long(*x as i32),

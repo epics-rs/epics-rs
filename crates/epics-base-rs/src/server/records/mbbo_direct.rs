@@ -193,18 +193,54 @@ impl Record for MbboDirectRecord {
                 }
                 self.val_to_bits();
             }
-            "RVAL" => { if let EpicsValue::Long(v) = value { self.rval = v; } }
-            "MASK" => { if let EpicsValue::Long(v) = value { self.mask = v; } }
-            "SHFT" => { if let EpicsValue::Short(v) = value { self.shft = v; } }
-            "NOBT" => { if let EpicsValue::Short(v) = value { self.nobt = v; } }
-            "IVOA" => { if let EpicsValue::Short(v) = value { self.ivoa = v; } }
-            "IVOV" => { if let EpicsValue::Long(v) = value { self.ivov = v as u32; } }
-            "OMSL" => { if let EpicsValue::Short(v) = value { self.omsl = v; } }
-            "DOL"  => { if let EpicsValue::String(v) = value { self.dol = v; } }
-            "SIMM" => { if let EpicsValue::Short(v) = value { self.simm = v; } }
-            "SIML" => { if let EpicsValue::String(v) = value { self.siml = v; } }
-            "SIOL" => { if let EpicsValue::String(v) = value { self.siol = v; } }
-            "SIMS" => { if let EpicsValue::Short(v) = value { self.sims = v; } }
+            "RVAL" => {
+                if let EpicsValue::Long(v) = value { self.rval = v; }
+                else { return Err(CaError::TypeMismatch("RVAL".into())); }
+            }
+            "MASK" => {
+                if let EpicsValue::Long(v) = value { self.mask = v; }
+                else { return Err(CaError::TypeMismatch("MASK".into())); }
+            }
+            "SHFT" => {
+                if let EpicsValue::Short(v) = value { self.shft = v; }
+                else { return Err(CaError::TypeMismatch("SHFT".into())); }
+            }
+            "NOBT" => {
+                if let EpicsValue::Short(v) = value { self.nobt = v; }
+                else { return Err(CaError::TypeMismatch("NOBT".into())); }
+            }
+            "IVOA" => {
+                if let EpicsValue::Short(v) = value { self.ivoa = v; }
+                else { return Err(CaError::TypeMismatch("IVOA".into())); }
+            }
+            "IVOV" => {
+                if let EpicsValue::Long(v) = value { self.ivov = v as u32; }
+                else { return Err(CaError::TypeMismatch("IVOV".into())); }
+            }
+            "OMSL" => {
+                if let EpicsValue::Short(v) = value { self.omsl = v; }
+                else { return Err(CaError::TypeMismatch("OMSL".into())); }
+            }
+            "DOL" => {
+                if let EpicsValue::String(v) = value { self.dol = v; }
+                else { return Err(CaError::TypeMismatch("DOL".into())); }
+            }
+            "SIMM" => {
+                if let EpicsValue::Short(v) = value { self.simm = v; }
+                else { return Err(CaError::TypeMismatch("SIMM".into())); }
+            }
+            "SIML" => {
+                if let EpicsValue::String(v) = value { self.siml = v; }
+                else { return Err(CaError::TypeMismatch("SIML".into())); }
+            }
+            "SIOL" => {
+                if let EpicsValue::String(v) = value { self.siol = v; }
+                else { return Err(CaError::TypeMismatch("SIOL".into())); }
+            }
+            "SIMS" => {
+                if let EpicsValue::Short(v) = value { self.sims = v; }
+                else { return Err(CaError::TypeMismatch("SIMS".into())); }
+            }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
                     let bit = match value {

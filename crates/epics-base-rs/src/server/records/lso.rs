@@ -52,7 +52,7 @@ impl LsoRecord {
     }
 
     fn clamped(&self) -> String {
-        let max = (self.sizv as usize).saturating_sub(1).max(0);
+        let max = (self.sizv as usize).saturating_sub(1);
         if self.val.len() > max {
             self.val[..max].to_string()
         } else {
@@ -132,7 +132,7 @@ impl Record for LsoRecord {
                     }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 };
-                let max = (self.sizv as usize).saturating_sub(1).max(0);
+                let max = (self.sizv as usize).saturating_sub(1);
                 self.val = if s.len() > max { s[..max].to_string() } else { s };
                 self.len = (self.val.len() + 1) as u32;
             }
@@ -143,7 +143,10 @@ impl Record for LsoRecord {
                     return Err(CaError::TypeMismatch("SIZV".into()));
                 }
             }
-            "IVOA" => { if let EpicsValue::Short(v) = value { self.ivoa = v; } }
+            "IVOA" => {
+                if let EpicsValue::Short(v) = value { self.ivoa = v; }
+                else { return Err(CaError::TypeMismatch("IVOA".into())); }
+            }
             "IVOV" => {
                 match value {
                     EpicsValue::String(s) => self.ivov = s,
@@ -154,12 +157,30 @@ impl Record for LsoRecord {
                     _ => return Err(CaError::TypeMismatch("IVOV".into())),
                 }
             }
-            "OMSL" => { if let EpicsValue::Short(v) = value { self.omsl = v; } }
-            "DOL"  => { if let EpicsValue::String(v) = value { self.dol = v; } }
-            "SIMM" => { if let EpicsValue::Short(v) = value { self.simm = v; } }
-            "SIML" => { if let EpicsValue::String(v) = value { self.siml = v; } }
-            "SIOL" => { if let EpicsValue::String(v) = value { self.siol = v; } }
-            "SIMS" => { if let EpicsValue::Short(v) = value { self.sims = v; } }
+            "OMSL" => {
+                if let EpicsValue::Short(v) = value { self.omsl = v; }
+                else { return Err(CaError::TypeMismatch("OMSL".into())); }
+            }
+            "DOL" => {
+                if let EpicsValue::String(v) = value { self.dol = v; }
+                else { return Err(CaError::TypeMismatch("DOL".into())); }
+            }
+            "SIMM" => {
+                if let EpicsValue::Short(v) = value { self.simm = v; }
+                else { return Err(CaError::TypeMismatch("SIMM".into())); }
+            }
+            "SIML" => {
+                if let EpicsValue::String(v) = value { self.siml = v; }
+                else { return Err(CaError::TypeMismatch("SIML".into())); }
+            }
+            "SIOL" => {
+                if let EpicsValue::String(v) = value { self.siol = v; }
+                else { return Err(CaError::TypeMismatch("SIOL".into())); }
+            }
+            "SIMS" => {
+                if let EpicsValue::Short(v) = value { self.sims = v; }
+                else { return Err(CaError::TypeMismatch("SIMS".into())); }
+            }
             _ => return Err(CaError::FieldNotFound(name.to_string())),
         }
         Ok(())

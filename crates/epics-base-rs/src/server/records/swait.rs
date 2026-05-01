@@ -27,6 +27,7 @@ pub struct SwaitRecord {
     // numeric input values A-L
     pub num_vals: [f64; 12],
     prev_val: f64,
+    cached_should_output: bool,
 }
 
 impl Default for SwaitRecord {
@@ -46,6 +47,7 @@ impl Default for SwaitRecord {
             inp_passive: [0; 12],
             num_vals: [0.0; 12],
             prev_val: 0.0,
+            cached_should_output: true,
         }
     }
 }
@@ -66,14 +68,14 @@ impl SwaitRecord {
         inputs
     }
 
-    fn should_output(&self) -> bool {
+    fn eval_should_output(&self) -> bool {
         match self.oopt {
-            0 => true, // Every
-            1 => (self.val - self.prev_val).abs() > f64::EPSILON, // OnChange
-            2 => self.val == 0.0,    // WhenZero
-            3 => self.val != 0.0,    // WhenNonzero
-            4 => self.prev_val != 0.0 && self.val == 0.0, // TransZero
-            5 => self.prev_val == 0.0 && self.val != 0.0, // TransNonzero
+            0 => true,
+            1 => (self.val - self.prev_val).abs() > f64::EPSILON,
+            2 => self.val == 0.0,
+            3 => self.val != 0.0,
+            4 => self.prev_val != 0.0 && self.val == 0.0,
+            5 => self.prev_val == 0.0 && self.val != 0.0,
             _ => false,
         }
     }
@@ -191,11 +193,17 @@ impl Record for SwaitRecord {
             }
         }
 
-        if self.should_output() {
+        // Cache before framework calls should_output() via trait dispatch.
+        self.cached_should_output = self.eval_should_output();
+        if self.cached_should_output {
             self.oval = if self.dopt == 1 { self.dold } else { self.val };
         }
 
         Ok(ProcessOutcome::complete())
+    }
+
+    fn should_output(&self) -> bool {
+        self.cached_should_output
     }
 
     fn val(&self) -> Option<EpicsValue> {

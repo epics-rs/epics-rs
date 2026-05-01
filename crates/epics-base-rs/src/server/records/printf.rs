@@ -75,9 +75,9 @@ impl PrintfRecord {
             let substituted = match spec {
                 b'd' | b'i' => format_int(fmt_str, val as i64),
                 b'u' => format_uint(fmt_str, val as u64),
-                b'o' => format!("{:o}", val as u64),
-                b'x' => format!("{:x}", val as u64),
-                b'X' => format!("{:X}", val as u64),
+                b'o' => format_octhex(fmt_str, val as u64, b'o'),
+                b'x' => format_octhex(fmt_str, val as u64, b'x'),
+                b'X' => format_octhex(fmt_str, val as u64, b'X'),
                 b'e' | b'E' | b'f' | b'g' | b'G' => format_float(fmt_str, val),
                 b's' => format!("{}", val),
                 _ => format!("{}", val),
@@ -85,7 +85,7 @@ impl PrintfRecord {
             result.push_str(&substituted);
         }
 
-        let max = (self.sizv as usize).saturating_sub(1).max(0);
+        let max = (self.sizv as usize).saturating_sub(1);
         if result.len() > max { result.truncate(max); }
         result
     }
@@ -114,8 +114,16 @@ impl PrintfRecord {
     }
 }
 
-fn parse_width_prec(inner: &str) -> (usize, usize, bool) {
+// Returns (width, prec, left_align, zero_pad).
+// zero_pad is true when '0' flag is present (e.g. %08d), unless '-' overrides it.
+fn parse_width_prec(inner: &str) -> (usize, usize, bool, bool) {
     let left_align = inner.contains('-');
+    let zero_pad = !left_align && {
+        // After stripping non-'0' flag chars, check if next char is '0' followed by a digit.
+        let after_flags = inner.trim_start_matches(|c: char| matches!(c, '-' | '+' | ' ' | '#'));
+        after_flags.starts_with('0')
+            && after_flags.as_bytes().get(1).map_or(false, |b| b.is_ascii_digit())
+    };
     let s = inner.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
     let (width_str, prec_str) = if let Some(dot) = s.find('.') {
         (&s[..dot], &s[dot + 1..])
@@ -124,58 +132,107 @@ fn parse_width_prec(inner: &str) -> (usize, usize, bool) {
     };
     let width: usize = width_str.trim_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0);
     let prec: usize = prec_str.trim_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(6);
-    (width, prec, left_align)
+    (width, prec, left_align, zero_pad)
+}
+
+// Apply width padding. Handles left-align, right-align, and zero-fill.
+// For zero-fill on signed values the sign is placed before the zeros.
+fn pad_string(s: String, width: usize, left_align: bool, zero_pad: bool) -> String {
+    if width <= s.len() {
+        return s;
+    }
+    if left_align {
+        format!("{:<width$}", s, width = width)
+    } else if zero_pad {
+        if s.starts_with('-') || s.starts_with('+') {
+            format!("{}{:0>width$}", &s[..1], &s[1..], width = width - 1)
+        } else {
+            format!("{:0>width$}", s, width = width)
+        }
+    } else {
+        format!("{:>width$}", s, width = width)
+    }
 }
 
 fn format_int(fmt: &str, val: i64) -> String {
     let inner = &fmt[1..fmt.len() - 1];
-    let (width, _, left_align) = parse_width_prec(inner);
-    let s = format!("{}", val);
-    if width > s.len() {
-        if left_align {
-            format!("{:<width$}", s, width = width)
-        } else {
-            format!("{:>width$}", s, width = width)
-        }
-    } else {
-        s
-    }
+    let (width, _, left_align, zero_pad) = parse_width_prec(inner);
+    pad_string(format!("{}", val), width, left_align, zero_pad)
 }
 
 fn format_uint(fmt: &str, val: u64) -> String {
     let inner = &fmt[1..fmt.len() - 1];
-    let (width, _, left_align) = parse_width_prec(inner);
-    let s = format!("{}", val);
-    if width > s.len() {
-        if left_align {
-            format!("{:<width$}", s, width = width)
-        } else {
-            format!("{:>width$}", s, width = width)
-        }
-    } else {
-        s
-    }
+    let (width, _, left_align, zero_pad) = parse_width_prec(inner);
+    pad_string(format!("{}", val), width, left_align, zero_pad)
+}
+
+fn format_octhex(fmt: &str, val: u64, spec: u8) -> String {
+    let inner = &fmt[1..fmt.len() - 1];
+    let (width, _, left_align, zero_pad) = parse_width_prec(inner);
+    let s = match spec {
+        b'o' => format!("{:o}", val),
+        b'x' => format!("{:x}", val),
+        _ => format!("{:X}", val),
+    };
+    pad_string(s, width, left_align, zero_pad)
 }
 
 fn format_float(fmt: &str, val: f64) -> String {
     let bytes = fmt.as_bytes();
     let spec = *bytes.last().unwrap_or(&b'g');
     let inner = &fmt[1..fmt.len() - 1];
-    let (width, prec, left_align) = parse_width_prec(inner);
+    let (width, prec, left_align, zero_pad) = parse_width_prec(inner);
 
     let s = match spec {
-        b'e' | b'E' => format!("{:.prec$e}", val, prec = prec),
+        b'e' => format!("{:.prec$e}", val, prec = prec),
+        b'E' => format!("{:.prec$E}", val, prec = prec),
         b'f' => format!("{:.prec$}", val, prec = prec),
+        b'g' => format_g_val(val, prec, false),
+        b'G' => format_g_val(val, prec, true),
         _ => format!("{:.prec$}", val, prec = prec),
     };
-    if width > s.len() {
-        if left_align {
-            format!("{:<width$}", s, width = width)
+    pad_string(s, width, left_align, zero_pad)
+}
+
+fn format_g_val(val: f64, prec: usize, upper: bool) -> String {
+    if val == 0.0 {
+        return "0".to_string();
+    }
+    let p = if prec == 0 { 1 } else { prec };
+    let exp = val.abs().log10().floor() as i32;
+
+    if exp < -4 || exp >= p as i32 {
+        let sig_prec = p.saturating_sub(1);
+        let raw = if upper {
+            format!("{:.prec$E}", val, prec = sig_prec)
         } else {
-            format!("{:>width$}", s, width = width)
-        }
+            format!("{:.prec$e}", val, prec = sig_prec)
+        };
+        strip_trailing_zeros_sci(&raw, upper)
     } else {
-        s
+        let decimal_places = (p as i32 - 1 - exp).max(0) as usize;
+        let raw = format!("{:.prec$}", val, prec = decimal_places);
+        if raw.contains('.') {
+            raw.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            raw
+        }
+    }
+}
+
+fn strip_trailing_zeros_sci(s: &str, upper: bool) -> String {
+    let sep = if upper { 'E' } else { 'e' };
+    if let Some(pos) = s.find(sep) {
+        let mantissa = &s[..pos];
+        let exp_part = &s[pos..];
+        let trimmed = if mantissa.contains('.') {
+            mantissa.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            mantissa
+        };
+        format!("{}{}", trimmed, exp_part)
+    } else {
+        s.to_string()
     }
 }
 

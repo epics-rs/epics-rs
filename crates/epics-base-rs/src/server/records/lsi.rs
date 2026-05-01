@@ -45,7 +45,7 @@ impl LsiRecord {
     }
 
     fn clamped(&self) -> String {
-        let max = (self.sizv as usize).saturating_sub(1).max(0);
+        let max = (self.sizv as usize).saturating_sub(1);
         if self.val.len() > max {
             self.val[..max].to_string()
         } else {
@@ -81,7 +81,9 @@ impl Record for LsiRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let clamped = self.clamped();
+        self.olen = self.len;
         self.len = (clamped.len() + 1) as u32;
+        self.oval = self.val.clone();
         Ok(ProcessOutcome::complete())
     }
 
@@ -117,7 +119,7 @@ impl Record for LsiRecord {
                     }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 };
-                let max = (self.sizv as usize).saturating_sub(1).max(0);
+                let max = (self.sizv as usize).saturating_sub(1);
                 self.val = if s.len() > max { s[..max].to_string() } else { s };
                 self.len = (self.val.len() + 1) as u32;
             }
@@ -130,15 +132,19 @@ impl Record for LsiRecord {
             }
             "SIMM" => {
                 if let EpicsValue::Short(v) = value { self.simm = v; }
+                else { return Err(CaError::TypeMismatch("SIMM".into())); }
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value { self.siml = v; }
+                else { return Err(CaError::TypeMismatch("SIML".into())); }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value { self.siol = v; }
+                else { return Err(CaError::TypeMismatch("SIOL".into())); }
             }
             "SIMS" => {
                 if let EpicsValue::Short(v) = value { self.sims = v; }
+                else { return Err(CaError::TypeMismatch("SIMS".into())); }
             }
             _ => return Err(CaError::FieldNotFound(name.to_string())),
         }

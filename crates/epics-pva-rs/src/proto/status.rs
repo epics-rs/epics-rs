@@ -16,6 +16,7 @@
 
 use std::io::Cursor;
 
+use crate::decode_err;
 use super::buffer::{ByteOrder, DecodeError, ReadExt, WriteExt};
 use super::string::{decode_string, encode_string_into};
 
@@ -126,7 +127,7 @@ impl Status {
             return Ok(Status::OkNoMsg);
         }
         let kind = StatusKind::from_byte(kind_byte)
-            .ok_or_else(|| DecodeError(format!("unknown status kind 0x{kind_byte:02X}")))?;
+            .ok_or_else(|| decode_err!("unknown status kind 0x{kind_byte:02X}"))?;
         let message = decode_string(cur, order)?.unwrap_or_default();
         let stack = decode_string(cur, order)?.unwrap_or_default();
         Ok(Status::Detailed {

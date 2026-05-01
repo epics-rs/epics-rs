@@ -17,6 +17,7 @@
 
 use std::io::Cursor;
 
+use crate::decode_err;
 use super::buffer::{ByteOrder, DecodeError, ReadExt};
 use super::size::{decode_size, encode_size_into};
 
@@ -180,7 +181,7 @@ impl BitSet {
     /// Decode the next BitSet from `cur` (pvxs byte-count format).
     pub fn decode(cur: &mut Cursor<&[u8]>, order: ByteOrder) -> Result<Self, DecodeError> {
         let nbytes = decode_size(cur, order)?
-            .ok_or_else(|| DecodeError("bitset size cannot be null".into()))?
+            .ok_or_else(|| decode_err!("bitset size cannot be null"))?
             as usize;
         let wire = cur.get_bytes(nbytes)?;
         let bytes = match order {

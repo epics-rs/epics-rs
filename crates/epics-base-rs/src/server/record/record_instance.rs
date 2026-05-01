@@ -144,7 +144,9 @@ impl RecordInstance {
     pub fn new_boxed(name: String, record: Box<dyn Record>) -> Self {
         let rtype = record.record_type();
         let analog_alarm = match rtype {
-            "ai" | "ao" | "longin" | "longout" => Some(AnalogAlarmConfig::default()),
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" => {
+                Some(AnalogAlarmConfig::default())
+            }
             _ => None,
         };
         let mut common = CommonFields::default();

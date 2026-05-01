@@ -1,8 +1,9 @@
 use epics_macros_rs::EpicsRecord;
 
 // int64in: 64-bit integer input.
-// CA protocol has no native 64-bit integer type; EPICS base serves int64 as DBR_DOUBLE over CA.
-// All value/limit fields use Double to match that wire representation.
+// PRECISION LIMITATION: VAL is stored and served as f64 (DBR_DOUBLE) because EpicsValue has no
+// Int64 variant. f64 has 53-bit mantissa, so integers with |val| > 2^53 (~9×10^15) lose
+// precision. A proper fix requires adding EpicsValue::Int64 + CA INT64 wire support.
 #[derive(EpicsRecord)]
 #[record(type = "int64in")]
 pub struct Int64inRecord {

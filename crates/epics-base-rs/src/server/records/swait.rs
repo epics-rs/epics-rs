@@ -119,7 +119,8 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
     FieldDesc { name: "DOPT", dbf_type: DbFieldType::Short,  read_only: false },
     FieldDesc { name: "DOLD", dbf_type: DbFieldType::Double, read_only: false },
     FieldDesc { name: "OVAL", dbf_type: DbFieldType::Double, read_only: true  },
-    FieldDesc { name: "OUT",  dbf_type: DbFieldType::String, read_only: false },
+    // OUT is intentionally absent: db_loader routes it to RecordInstance::common.out
+    // so that parsed_out is populated for the processing framework's output dispatch.
     FieldDesc { name: "OUTN", dbf_type: DbFieldType::String, read_only: false },
     FieldDesc { name: "PREC", dbf_type: DbFieldType::Short,  read_only: false },
     FieldDesc { name: "A",    dbf_type: DbFieldType::Double, read_only: false },
@@ -218,7 +219,6 @@ impl Record for SwaitRecord {
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "DOLD" => Some(EpicsValue::Double(self.dold)),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
-            "OUT"  => Some(EpicsValue::String(self.out.clone())),
             "OUTN" => Some(EpicsValue::String(self.outn.clone())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             _ => {
@@ -254,7 +254,6 @@ impl Record for SwaitRecord {
             "DOLD" => {
                 self.dold = value.to_f64().ok_or_else(|| CaError::TypeMismatch("DOLD".into()))?;
             }
-            "OUT"  => { if let EpicsValue::String(v) = value { self.out = v; } }
             "OUTN" => { if let EpicsValue::String(v) = value { self.outn = v; } }
             "PREC" => { if let EpicsValue::Short(v) = value { self.prec = v; } }
             _ => {

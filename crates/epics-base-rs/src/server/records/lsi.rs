@@ -46,11 +46,12 @@ impl LsiRecord {
 
     fn clamped(&self) -> String {
         let max = (self.sizv as usize).saturating_sub(1);
-        if self.val.len() > max {
-            self.val[..max].to_string()
-        } else {
-            self.val.clone()
+        if self.val.len() <= max {
+            return self.val.clone();
         }
+        // Walk back to a valid UTF-8 char boundary at or before max.
+        let trunc = (0..=max).rev().find(|&i| self.val.is_char_boundary(i)).unwrap_or(0);
+        self.val[..trunc].to_string()
     }
 }
 
@@ -120,7 +121,12 @@ impl Record for LsiRecord {
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 };
                 let max = (self.sizv as usize).saturating_sub(1);
-                self.val = if s.len() > max { s[..max].to_string() } else { s };
+                self.val = if s.len() > max {
+                    let trunc = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+                    s[..trunc].to_string()
+                } else {
+                    s
+                };
                 self.len = (self.val.len() + 1) as u32;
             }
             "SIZV" => {

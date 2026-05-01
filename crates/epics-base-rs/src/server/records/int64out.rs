@@ -1,7 +1,8 @@
 use epics_macros_rs::EpicsRecord;
 
 // int64out: 64-bit integer output.
-// CA protocol has no native 64-bit integer type; EPICS base serves int64 as DBR_DOUBLE over CA.
+// PRECISION LIMITATION: same as int64in — VAL stored as f64, |val| > 2^53 loses precision.
+// Fix requires EpicsValue::Int64 + CA INT64 wire support.
 #[derive(EpicsRecord)]
 #[record(type = "int64out")]
 pub struct Int64outRecord {

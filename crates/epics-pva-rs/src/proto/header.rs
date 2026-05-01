@@ -20,6 +20,7 @@
 
 use std::io::Cursor;
 
+use crate::decode_err;
 use super::buffer::{ByteOrder, DecodeError, ReadExt, WriteExt};
 
 /// PVA magic byte. Always `0xCA`.
@@ -139,9 +140,7 @@ impl PvaHeader {
     pub fn decode(cur: &mut Cursor<&[u8]>) -> Result<Self, DecodeError> {
         let magic = cur.get_u8()?;
         if magic != MAGIC {
-            return Err(DecodeError(format!(
-                "bad magic 0x{magic:02X}, expected 0xCA"
-            )));
+            return Err(decode_err!("bad magic 0x{magic:02X}, expected 0xCA"));
         }
         let version = cur.get_u8()?;
         let flags = HeaderFlags(cur.get_u8()?);

@@ -16,7 +16,7 @@
 //!   that channel immediately.
 //! - Beacon anomaly throttling via [`super::beacon_throttle::BeaconTracker`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use epics_base_rs::net::AsyncUdpV4;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::interval;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
@@ -516,6 +516,7 @@ async fn run_engine(
     // Matches the new server-side recv buffer (server_native/udp.rs).
     let mut search_buf = vec![0u8; 64 * 1024];
     let mut beacon_buf = vec![0u8; 64 * 1024];
+    let mut search_send_errs: HashSet<SocketAddr> = HashSet::new();
 
     loop {
         // Build a beacon-recv future regardless of whether we bound it
@@ -600,7 +601,7 @@ async fn run_engine(
                             p.attempt = 1;
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
-                            broadcast(&search_socket, &pkt, &extra_targets).await;
+                            broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs).await;
                         }
                     }
                 }
@@ -640,7 +641,7 @@ async fn run_engine(
                             p.attempt = 1;
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
-                            broadcast(&search_socket, &pkt, &extra_targets).await;
+                            broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs).await;
                         }
                     }
                 }
@@ -756,7 +757,7 @@ async fn run_engine(
                     // `ping_all()` was effectively a silent op.
                     let probe_id = NEXT_SEARCH_ID.fetch_add(1, Ordering::Relaxed);
                     let pkt = codec.build_discover_search(probe_id, response_port);
-                    broadcast(&search_socket, &pkt, &extra_targets).await;
+                    broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs).await;
                 }
                 None => break,
             },
@@ -945,7 +946,7 @@ async fn run_engine(
                         )
                     });
                     if let Some(pkt) = pkt_opt {
-                        broadcast(&search_socket, &pkt, &extra_targets).await;
+                        broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs).await;
                         if let Some(p) = pending.get(&sid) {
                             search_buckets[p.bucket].push(sid);
                         }
@@ -969,7 +970,12 @@ async fn run_engine(
     }
 }
 
-async fn broadcast(socket: &AsyncUdpV4, packet: &[u8], extra_targets: &[SocketAddr]) {
+async fn broadcast(
+    socket: &AsyncUdpV4,
+    packet: &[u8],
+    extra_targets: &[SocketAddr],
+    send_errs: &mut HashSet<SocketAddr>,
+) {
     let mut targets: Vec<SocketAddr> = Vec::with_capacity(8);
 
     // Limited broadcast to default UDP port.
@@ -1035,8 +1041,17 @@ async fn broadcast(socket: &AsyncUdpV4, packet: &[u8], extra_targets: &[SocketAd
         } else {
             socket.send_to(packet, t).await.map(|_| ())
         };
-        if let Err(e) = result {
-            debug!("search broadcast to {t} failed: {e}");
+        match result {
+            Ok(()) => {
+                send_errs.remove(&t);
+            }
+            Err(e) => {
+                if send_errs.insert(t) {
+                    warn!("search broadcast to {t} failed: {e}");
+                } else {
+                    debug!("search broadcast to {t} failed: {e}");
+                }
+            }
         }
     }
 }

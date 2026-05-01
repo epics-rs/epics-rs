@@ -267,7 +267,23 @@ pub fn server_intf_addr_list() -> Vec<IpAddr> {
     if let Ok(s) = std::env::var("EPICS_PVAS_INTF_ADDR_LIST") {
         return s
             .split(|c: char| c == ',' || c.is_whitespace())
-            .filter_map(|t| t.trim().parse::<IpAddr>().ok())
+            .filter_map(|t| {
+                let t = t.trim();
+                if t.is_empty() {
+                    return None;
+                }
+                match t.parse::<IpAddr>() {
+                    Ok(addr) => Some(addr),
+                    Err(e) => {
+                        tracing::warn!(
+                            token = %t,
+                            error = %e,
+                            "EPICS_PVAS_INTF_ADDR_LIST: invalid IP address, skipping"
+                        );
+                        None
+                    }
+                }
+            })
             .collect();
     }
     list_intf_addresses()

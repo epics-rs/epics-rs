@@ -25,6 +25,7 @@
 
 use std::io::Cursor;
 
+use crate::decode_err;
 use super::TypedScalarArray;
 use super::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue};
 
@@ -261,7 +262,7 @@ where
 {
     let nbytes = n
         .checked_mul(N)
-        .ok_or_else(|| DecodeError("scalar array element count × size overflows".into()))?;
+        .ok_or_else(|| decode_err!("scalar array element count × size overflows"))?;
     let bytes = cur.get_bytes(nbytes)?;
     if same_endian {
         // Allocate an aligned Vec<T>, memcpy bytes in.
@@ -656,9 +657,7 @@ fn decode_type_desc_cached_at_depth(
     depth: u32,
 ) -> Result<FieldDesc, DecodeError> {
     if depth > MAX_FIELD_DEPTH {
-        return Err(DecodeError(format!(
-            "FieldDesc nesting exceeds MAX_FIELD_DEPTH ({MAX_FIELD_DEPTH})"
-        )));
+        return Err(decode_err!("FieldDesc nesting exceeds MAX_FIELD_DEPTH ({MAX_FIELD_DEPTH})"));
     }
     let tag = cur.get_u8()?;
     match tag {
@@ -675,25 +674,21 @@ fn decode_type_desc_cached_at_depth(
             cache
                 .get(&key)
                 .cloned()
-                .ok_or_else(|| DecodeError(format!("typecache miss for slot {key}")))
+                .ok_or_else(|| decode_err!("typecache miss for slot {key}"))
         }
         TAG_STRUCTURE => decode_structure_body_cached_at_depth(cur, order, false, cache, depth + 1),
         TAG_UNION => decode_union_body_cached_at_depth(cur, order, false, cache, depth + 1),
         TAG_STRUCTURE_ARRAY => {
             let inner = cur.get_u8()?;
             if inner != TAG_STRUCTURE {
-                return Err(DecodeError(format!(
-                    "structure-array element tag 0x{inner:02X} (expected 0x80)"
-                )));
+                return Err(decode_err!("structure-array element tag 0x{inner:02X} (expected 0x80)"));
             }
             decode_structure_body_cached_at_depth(cur, order, true, cache, depth + 1)
         }
         TAG_UNION_ARRAY => {
             let inner = cur.get_u8()?;
             if inner != TAG_UNION {
-                return Err(DecodeError(format!(
-                    "union-array element tag 0x{inner:02X} (expected 0x81)"
-                )));
+                return Err(decode_err!("union-array element tag 0x{inner:02X} (expected 0x81)"));
             }
             decode_union_body_cached_at_depth(cur, order, true, cache, depth + 1)
         }
@@ -701,17 +696,17 @@ fn decode_type_desc_cached_at_depth(
         TAG_VARIANT_ARRAY => Ok(FieldDesc::VariantArray),
         TAG_BOUNDED_STRING => {
             let bound = decode_size(cur, order)?
-                .ok_or_else(|| DecodeError("bounded string size cannot be null".into()))?;
+                .ok_or_else(|| decode_err!("bounded string size cannot be null"))?;
             Ok(FieldDesc::BoundedString(bound))
         }
         b if b & 0x08 != 0 => {
             let scalar = ScalarType::from_array_type_code(b)
-                .ok_or_else(|| DecodeError(format!("unknown scalar array tag 0x{b:02X}")))?;
+                .ok_or_else(|| decode_err!("unknown scalar array tag 0x{b:02X}"))?;
             Ok(FieldDesc::ScalarArray(scalar))
         }
         b => {
             let scalar = ScalarType::from_type_code(b)
-                .ok_or_else(|| DecodeError(format!("unknown type tag 0x{b:02X}")))?;
+                .ok_or_else(|| decode_err!("unknown type tag 0x{b:02X}"))?;
             Ok(FieldDesc::Scalar(scalar))
         }
     }
@@ -726,7 +721,7 @@ fn decode_structure_body_cached_at_depth(
 ) -> Result<FieldDesc, DecodeError> {
     let struct_id = decode_string(cur, order)?.unwrap_or_default();
     let n = decode_size(cur, order)?
-        .ok_or_else(|| DecodeError("structure field count cannot be null".into()))?
+        .ok_or_else(|| decode_err!("structure field count cannot be null"))?
         as usize;
     let mut fields = Vec::with_capacity(safe_capacity(n, cur));
     for _ in 0..n {
@@ -748,7 +743,7 @@ fn decode_union_body_cached_at_depth(
 ) -> Result<FieldDesc, DecodeError> {
     let struct_id = decode_string(cur, order)?.unwrap_or_default();
     let n = decode_size(cur, order)?
-        .ok_or_else(|| DecodeError("union variant count cannot be null".into()))?
+        .ok_or_else(|| decode_err!("union variant count cannot be null"))?
         as usize;
     let mut variants = Vec::with_capacity(safe_capacity(n, cur));
     for _ in 0..n {
@@ -1148,15 +1143,13 @@ fn decode_pv_field_at_depth(
     depth: u32,
 ) -> Result<PvField, DecodeError> {
     if depth > MAX_FIELD_DEPTH {
-        return Err(DecodeError(format!(
-            "PvField nesting exceeds MAX_FIELD_DEPTH ({MAX_FIELD_DEPTH})"
-        )));
+        return Err(decode_err!("PvField nesting exceeds MAX_FIELD_DEPTH ({MAX_FIELD_DEPTH})"));
     }
     Ok(match desc {
         FieldDesc::Scalar(st) => PvField::Scalar(decode_scalar_value(*st, cur, order)?),
         FieldDesc::ScalarArray(st) => {
             let n = decode_size(cur, order)?
-                .ok_or_else(|| DecodeError("scalar array length cannot be null".into()))?
+                .ok_or_else(|| decode_err!("scalar array length cannot be null"))?
                 as usize;
             // F-G10 fast path: decode straight into a typed Arc<[T]>
             // when the element is a fixed-size POD primitive. Single
@@ -1182,7 +1175,7 @@ fn decode_pv_field_at_depth(
         }
         FieldDesc::StructureArray { struct_id, fields } => {
             let n = decode_size(cur, order)?
-                .ok_or_else(|| DecodeError("structure array length cannot be null".into()))?
+                .ok_or_else(|| decode_err!("structure array length cannot be null"))?
                 as usize;
             let mut out = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
@@ -1206,9 +1199,7 @@ fn decode_pv_field_at_depth(
                         }
                     }
                     other => {
-                        return Err(DecodeError(format!(
-                            "structure array element presence byte 0x{other:02X} (expected 0x00 or 0x01)"
-                        )));
+                        return Err(decode_err!("structure array element presence byte 0x{other:02X} (expected 0x00 or 0x01)"));
                     }
                 }
             }
@@ -1229,7 +1220,7 @@ fn decode_pv_field_at_depth(
                     let sel = sel_u32 as i32;
                     let (variant_name, vdesc) = variants
                         .get(sel as usize)
-                        .ok_or_else(|| DecodeError(format!("union selector {sel} out of range")))?
+                        .ok_or_else(|| decode_err!("union selector {sel} out of range"))?
                         .clone();
                     let value = decode_pv_field_at_depth(&vdesc, cur, order, depth + 1)?;
                     PvField::Union {
@@ -1242,7 +1233,7 @@ fn decode_pv_field_at_depth(
         }
         FieldDesc::UnionArray { variants, .. } => {
             let n = decode_size(cur, order)?
-                .ok_or_else(|| DecodeError("union array length cannot be null".into()))?
+                .ok_or_else(|| decode_err!("union array length cannot be null"))?
                 as usize;
             let mut items = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
@@ -1259,7 +1250,7 @@ fn decode_pv_field_at_depth(
                         let (variant_name, vdesc) = variants
                             .get(sel as usize)
                             .ok_or_else(|| {
-                                DecodeError(format!("union array selector {sel} out of range"))
+                                decode_err!("union array selector {sel} out of range")
                             })?
                             .clone();
                         let value = decode_pv_field_at_depth(&vdesc, cur, order, depth + 1)?;
@@ -1300,7 +1291,7 @@ fn decode_pv_field_at_depth(
         }
         FieldDesc::VariantArray => {
             let n = decode_size(cur, order)?
-                .ok_or_else(|| DecodeError("variant array length".into()))?
+                .ok_or_else(|| decode_err!("variant array length"))?
                 as usize;
             let mut items = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {

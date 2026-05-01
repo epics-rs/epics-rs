@@ -7,6 +7,7 @@
 
 use std::io::Cursor;
 
+use crate::decode_err;
 use super::buffer::{ByteOrder, DecodeError, ReadExt};
 use super::size::{decode_size, encode_size_into};
 
@@ -36,7 +37,7 @@ pub fn decode_string(
     let bytes = cur.get_bytes(len)?;
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|e| DecodeError(format!("invalid UTF-8: {e}")))
+        .map_err(|e| decode_err!("invalid UTF-8: {e}"))
 }
 
 #[cfg(test)]

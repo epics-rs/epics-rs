@@ -4,6 +4,7 @@
 //! SEARCH_RESPONSE messages naming our TCP endpoint. Beacons are emitted
 //! periodically to advertise our presence.
 
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 use epics_base_rs::net::{AsyncUdpV4, ORIGIN_TAG_MCAST_GROUP, bind_loopback_mcast};
 use std::net::SocketAddrV4;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
@@ -166,6 +167,7 @@ pub async fn run_udp_responder_with_config(
         let mut change_count: u16 = 0;
         let mut last_set_hash: u64 = 0;
         let mut emitted: u32 = 0;
+        let mut beacon_send_errs: HashSet<SocketAddr> = HashSet::new();
         loop {
             let cur_period = if emitted < beacon_burst_count as u32 {
                 beacon_period
@@ -207,11 +209,23 @@ pub async fn run_udp_responder_with_config(
                     SocketAddr::V4(v4) => v4.ip().is_broadcast() || v4.ip().is_multicast(),
                     SocketAddr::V6(_) => false,
                 };
-                let _ = if needs_fanout {
+                let result = if needs_fanout {
                     beacon_socket.fanout_to(&beacon, *dest).await.map(|_| ())
                 } else {
                     beacon_socket.send_to(&beacon, *dest).await.map(|_| ())
                 };
+                match result {
+                    Ok(()) => {
+                        beacon_send_errs.remove(dest);
+                    }
+                    Err(e) => {
+                        if beacon_send_errs.insert(*dest) {
+                            warn!("beacon TX to {dest} failed: {e}");
+                        } else {
+                            debug!("beacon TX to {dest} failed: {e}");
+                        }
+                    }
+                }
             }
             beacon_seq = beacon_seq.wrapping_add(1);
             emitted = emitted.saturating_add(1);

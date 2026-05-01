@@ -127,6 +127,17 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+/// Construct a [`DecodeError`] with the call-site source file and line embedded.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! decode_err {
+    ($($arg:tt)*) => {
+        $crate::proto::buffer::DecodeError(
+            format!("[{}:{}] {}", file!(), line!(), format_args!($($arg)*))
+        )
+    };
+}
+
 /// Endian-aware reader over a byte cursor. Adds methods used throughout the
 /// PVA codec on top of [`Cursor<&[u8]>`].
 pub trait ReadExt {
@@ -148,7 +159,7 @@ impl ReadExt for Cursor<&[u8]> {
     fn get_u8(&mut self) -> Result<u8, DecodeError> {
         let mut buf = [0u8; 1];
         self.read_exact(&mut buf)
-            .map_err(|_| DecodeError("short read u8".into()))?;
+            .map_err(|_| decode_err!("short read u8"))?;
         Ok(buf[0])
     }
     fn get_i8(&mut self) -> Result<i8, DecodeError> {
@@ -157,7 +168,7 @@ impl ReadExt for Cursor<&[u8]> {
     fn get_u16(&mut self, order: ByteOrder) -> Result<u16, DecodeError> {
         let mut buf = [0u8; 2];
         self.read_exact(&mut buf)
-            .map_err(|_| DecodeError("short read u16".into()))?;
+            .map_err(|_| decode_err!("short read u16"))?;
         Ok(match order {
             ByteOrder::Big => u16::from_be_bytes(buf),
             ByteOrder::Little => u16::from_le_bytes(buf),
@@ -169,7 +180,7 @@ impl ReadExt for Cursor<&[u8]> {
     fn get_u32(&mut self, order: ByteOrder) -> Result<u32, DecodeError> {
         let mut buf = [0u8; 4];
         self.read_exact(&mut buf)
-            .map_err(|_| DecodeError("short read u32".into()))?;
+            .map_err(|_| decode_err!("short read u32"))?;
         Ok(match order {
             ByteOrder::Big => u32::from_be_bytes(buf),
             ByteOrder::Little => u32::from_le_bytes(buf),
@@ -181,7 +192,7 @@ impl ReadExt for Cursor<&[u8]> {
     fn get_u64(&mut self, order: ByteOrder) -> Result<u64, DecodeError> {
         let mut buf = [0u8; 8];
         self.read_exact(&mut buf)
-            .map_err(|_| DecodeError("short read u64".into()))?;
+            .map_err(|_| decode_err!("short read u64"))?;
         Ok(match order {
             ByteOrder::Big => u64::from_be_bytes(buf),
             ByteOrder::Little => u64::from_le_bytes(buf),
@@ -193,7 +204,7 @@ impl ReadExt for Cursor<&[u8]> {
     fn get_f32(&mut self, order: ByteOrder) -> Result<f32, DecodeError> {
         let mut buf = [0u8; 4];
         self.read_exact(&mut buf)
-            .map_err(|_| DecodeError("short read f32".into()))?;
+            .map_err(|_| decode_err!("short read f32"))?;
         Ok(match order {
             ByteOrder::Big => f32::from_be_bytes(buf),
             ByteOrder::Little => f32::from_le_bytes(buf),
@@ -202,7 +213,7 @@ impl ReadExt for Cursor<&[u8]> {
     fn get_f64(&mut self, order: ByteOrder) -> Result<f64, DecodeError> {
         let mut buf = [0u8; 8];
         self.read_exact(&mut buf)
-            .map_err(|_| DecodeError("short read f64".into()))?;
+            .map_err(|_| decode_err!("short read f64"))?;
         Ok(match order {
             ByteOrder::Big => f64::from_be_bytes(buf),
             ByteOrder::Little => f64::from_le_bytes(buf),
@@ -211,7 +222,7 @@ impl ReadExt for Cursor<&[u8]> {
     fn get_bytes(&mut self, n: usize) -> Result<Vec<u8>, DecodeError> {
         let mut buf = vec![0u8; n];
         self.read_exact(&mut buf)
-            .map_err(|_| DecodeError(format!("short read {n} bytes")))?;
+            .map_err(|_| decode_err!("short read {n} bytes"))?;
         Ok(buf)
     }
     fn remaining(&self) -> usize {

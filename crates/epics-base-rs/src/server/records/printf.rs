@@ -69,7 +69,11 @@ impl PrintfRecord {
             i += 1;
             let fmt_str = std::str::from_utf8(&bytes[spec_start..i]).unwrap_or("%s");
 
-            let val = if inp_idx < 10 { self.num_vals[inp_idx] } else { 0.0 };
+            let val = if inp_idx < 10 {
+                self.num_vals[inp_idx]
+            } else {
+                0.0
+            };
             inp_idx += 1;
 
             let substituted = match spec {
@@ -86,7 +90,9 @@ impl PrintfRecord {
         }
 
         let max = (self.sizv as usize).saturating_sub(1);
-        if result.len() > max { result.truncate(max); }
+        if result.len() > max {
+            result.truncate(max);
+        }
         result
     }
 
@@ -120,9 +126,12 @@ fn parse_width_prec(inner: &str) -> (usize, usize, bool, bool) {
     let left_align = inner.contains('-');
     let zero_pad = !left_align && {
         // After stripping non-'0' flag chars, check if next char is '0' followed by a digit.
-        let after_flags = inner.trim_start_matches(|c: char| matches!(c, '-' | '+' | ' ' | '#'));
+        let after_flags = inner.trim_start_matches(['-', '+', ' ', '#']);
         after_flags.starts_with('0')
-            && after_flags.as_bytes().get(1).map_or(false, |b| b.is_ascii_digit())
+            && after_flags
+                .as_bytes()
+                .get(1)
+                .map_or(false, |b| b.is_ascii_digit())
     };
     let s = inner.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
     let (width_str, prec_str) = if let Some(dot) = s.find('.') {
@@ -130,8 +139,14 @@ fn parse_width_prec(inner: &str) -> (usize, usize, bool, bool) {
     } else {
         (s, "")
     };
-    let width: usize = width_str.trim_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0);
-    let prec: usize = prec_str.trim_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(6);
+    let width: usize = width_str
+        .trim_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .unwrap_or(0);
+    let prec: usize = prec_str
+        .trim_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .unwrap_or(6);
     (width, prec, left_align, zero_pad)
 }
 
@@ -237,29 +252,121 @@ fn strip_trailing_zeros_sci(s: &str, upper: bool) -> String {
 }
 
 static PRINTF_FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL",  dbf_type: DbFieldType::Char,   read_only: true  },
-    FieldDesc { name: "SIZV", dbf_type: DbFieldType::Short,  read_only: false },
-    FieldDesc { name: "FMT",  dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP0", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP1", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP2", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP3", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP4", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP5", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP6", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP7", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP8", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INP9", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "A",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "B",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "C",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "D",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "E",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "F",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "G",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "H",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "I",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "J",    dbf_type: DbFieldType::Double, read_only: false },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Char,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "SIZV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "FMT",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP0",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP1",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP2",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP3",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP4",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP5",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP6",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP7",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP8",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INP9",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "A",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "C",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "D",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "E",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "F",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "G",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "H",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "I",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "J",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 impl Record for PrintfRecord {
@@ -286,9 +393,9 @@ impl Record for PrintfRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL"  => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
+            "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
             "SIZV" => Some(EpicsValue::Short(self.sizv as i16)),
-            "FMT"  => Some(EpicsValue::String(self.fmt.clone())),
+            "FMT" => Some(EpicsValue::String(self.fmt.clone())),
             _ => {
                 if let Some(idx) = Self::inp_index(name) {
                     return Some(EpicsValue::String(self.inp_links[idx].clone()));
@@ -304,11 +411,16 @@ impl Record for PrintfRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "SIZV" => {
-                if let EpicsValue::Short(v) = value { self.sizv = v.max(1) as u16; }
+                if let EpicsValue::Short(v) = value {
+                    self.sizv = v.max(1) as u16;
+                }
             }
             "FMT" => {
-                if let EpicsValue::String(s) = value { self.fmt = s; }
-                else { return Err(CaError::TypeMismatch("FMT".into())); }
+                if let EpicsValue::String(s) = value {
+                    self.fmt = s;
+                } else {
+                    return Err(CaError::TypeMismatch("FMT".into()));
+                }
             }
             _ => {
                 if let Some(idx) = Self::inp_index(name) {
@@ -318,8 +430,9 @@ impl Record for PrintfRecord {
                         return Err(CaError::TypeMismatch(name.into()));
                     }
                 } else if let Some(idx) = Self::val_index(name) {
-                    self.num_vals[idx] =
-                        value.to_f64().ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                    self.num_vals[idx] = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                 } else {
                     return Err(CaError::FieldNotFound(name.to_string()));
                 }
@@ -330,8 +443,16 @@ impl Record for PrintfRecord {
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[
-            ("INP0", "A"), ("INP1", "B"), ("INP2", "C"), ("INP3", "D"), ("INP4", "E"),
-            ("INP5", "F"), ("INP6", "G"), ("INP7", "H"), ("INP8", "I"), ("INP9", "J"),
+            ("INP0", "A"),
+            ("INP1", "B"),
+            ("INP2", "C"),
+            ("INP3", "D"),
+            ("INP4", "E"),
+            ("INP5", "F"),
+            ("INP6", "G"),
+            ("INP7", "H"),
+            ("INP8", "I"),
+            ("INP9", "J"),
         ]
     }
 }

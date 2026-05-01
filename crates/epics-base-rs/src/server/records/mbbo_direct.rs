@@ -70,44 +70,175 @@ impl MbboDirectRecord {
 }
 
 const BIT_NAMES: [&str; 16] = [
-    "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7",
-    "B8", "B9", "BA", "BB", "BC", "BD", "BE", "BF",
+    "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA", "BB", "BC", "BD", "BE", "BF",
 ];
 
 static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL",  dbf_type: DbFieldType::Long,  read_only: false },
-    FieldDesc { name: "RVAL", dbf_type: DbFieldType::Long,  read_only: false },
-    FieldDesc { name: "ORAW", dbf_type: DbFieldType::Long,  read_only: true  },
-    FieldDesc { name: "RBV",  dbf_type: DbFieldType::Long,  read_only: true  },
-    FieldDesc { name: "ORBV", dbf_type: DbFieldType::Long,  read_only: true  },
-    FieldDesc { name: "MASK", dbf_type: DbFieldType::Long,  read_only: false },
-    FieldDesc { name: "SHFT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "NOBT", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "MLST", dbf_type: DbFieldType::Long,  read_only: true  },
-    FieldDesc { name: "IVOA", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IVOV", dbf_type: DbFieldType::Long,  read_only: false },
-    FieldDesc { name: "OMSL", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DOL",  dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "B0",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "B1",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "B2",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "B3",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "B4",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "B5",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "B6",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "B7",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "B8",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "B9",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "BA",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "BB",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "BC",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "BD",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "BE",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "BF",   dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "SIMM", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SIML", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "SIOL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "SIMS", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RVAL",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ORAW",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "RBV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ORBV",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MASK",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SHFT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "NOBT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MLST",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "IVOA",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IVOV",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OMSL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B0",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B1",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B2",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B3",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B4",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B5",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B6",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B7",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B8",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B9",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BA",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BB",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BC",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BD",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BE",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BF",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIML",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMS",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for MbboDirectRecord {
@@ -155,10 +286,10 @@ impl Record for MbboDirectRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL"  => Some(EpicsValue::Long(self.val as i32)),
+            "VAL" => Some(EpicsValue::Long(self.val as i32)),
             "RVAL" => Some(EpicsValue::Long(self.rval)),
             "ORAW" => Some(EpicsValue::Long(self.oraw)),
-            "RBV"  => Some(EpicsValue::Long(self.rbv)),
+            "RBV" => Some(EpicsValue::Long(self.rbv)),
             "ORBV" => Some(EpicsValue::Long(self.orbv)),
             "MASK" => Some(EpicsValue::Long(self.mask)),
             "SHFT" => Some(EpicsValue::Short(self.shft)),
@@ -167,17 +298,16 @@ impl Record for MbboDirectRecord {
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Long(self.ivov as i32)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "DOL"  => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => {
-                if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
-                    Some(EpicsValue::Char(self.bits[idx]))
-                } else {
-                    None
-                }
+                BIT_NAMES
+                    .iter()
+                    .position(|&n| n == name)
+                    .map(|idx| EpicsValue::Char(self.bits[idx]))
             }
         }
     }
@@ -186,67 +316,103 @@ impl Record for MbboDirectRecord {
         match name {
             "VAL" => {
                 match value {
-                    EpicsValue::Long(v)  => self.val = v as u32,
+                    EpicsValue::Long(v) => self.val = v as u32,
                     EpicsValue::Short(v) => self.val = v as u32,
-                    EpicsValue::Char(v)  => self.val = v as u32,
+                    EpicsValue::Char(v) => self.val = v as u32,
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 }
                 self.val_to_bits();
             }
             "RVAL" => {
-                if let EpicsValue::Long(v) = value { self.rval = v; }
-                else { return Err(CaError::TypeMismatch("RVAL".into())); }
+                if let EpicsValue::Long(v) = value {
+                    self.rval = v;
+                } else {
+                    return Err(CaError::TypeMismatch("RVAL".into()));
+                }
             }
             "MASK" => {
-                if let EpicsValue::Long(v) = value { self.mask = v; }
-                else { return Err(CaError::TypeMismatch("MASK".into())); }
+                if let EpicsValue::Long(v) = value {
+                    self.mask = v;
+                } else {
+                    return Err(CaError::TypeMismatch("MASK".into()));
+                }
             }
             "SHFT" => {
-                if let EpicsValue::Short(v) = value { self.shft = v; }
-                else { return Err(CaError::TypeMismatch("SHFT".into())); }
+                if let EpicsValue::Short(v) = value {
+                    self.shft = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SHFT".into()));
+                }
             }
             "NOBT" => {
-                if let EpicsValue::Short(v) = value { self.nobt = v; }
-                else { return Err(CaError::TypeMismatch("NOBT".into())); }
+                if let EpicsValue::Short(v) = value {
+                    self.nobt = v;
+                } else {
+                    return Err(CaError::TypeMismatch("NOBT".into()));
+                }
             }
             "IVOA" => {
-                if let EpicsValue::Short(v) = value { self.ivoa = v; }
-                else { return Err(CaError::TypeMismatch("IVOA".into())); }
+                if let EpicsValue::Short(v) = value {
+                    self.ivoa = v;
+                } else {
+                    return Err(CaError::TypeMismatch("IVOA".into()));
+                }
             }
             "IVOV" => {
-                if let EpicsValue::Long(v) = value { self.ivov = v as u32; }
-                else { return Err(CaError::TypeMismatch("IVOV".into())); }
+                if let EpicsValue::Long(v) = value {
+                    self.ivov = v as u32;
+                } else {
+                    return Err(CaError::TypeMismatch("IVOV".into()));
+                }
             }
             "OMSL" => {
-                if let EpicsValue::Short(v) = value { self.omsl = v; }
-                else { return Err(CaError::TypeMismatch("OMSL".into())); }
+                if let EpicsValue::Short(v) = value {
+                    self.omsl = v;
+                } else {
+                    return Err(CaError::TypeMismatch("OMSL".into()));
+                }
             }
             "DOL" => {
-                if let EpicsValue::String(v) = value { self.dol = v; }
-                else { return Err(CaError::TypeMismatch("DOL".into())); }
+                if let EpicsValue::String(v) = value {
+                    self.dol = v;
+                } else {
+                    return Err(CaError::TypeMismatch("DOL".into()));
+                }
             }
             "SIMM" => {
-                if let EpicsValue::Short(v) = value { self.simm = v; }
-                else { return Err(CaError::TypeMismatch("SIMM".into())); }
+                if let EpicsValue::Short(v) = value {
+                    self.simm = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SIMM".into()));
+                }
             }
             "SIML" => {
-                if let EpicsValue::String(v) = value { self.siml = v; }
-                else { return Err(CaError::TypeMismatch("SIML".into())); }
+                if let EpicsValue::String(v) = value {
+                    self.siml = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SIML".into()));
+                }
             }
             "SIOL" => {
-                if let EpicsValue::String(v) = value { self.siol = v; }
-                else { return Err(CaError::TypeMismatch("SIOL".into())); }
+                if let EpicsValue::String(v) = value {
+                    self.siol = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SIOL".into()));
+                }
             }
             "SIMS" => {
-                if let EpicsValue::Short(v) = value { self.sims = v; }
-                else { return Err(CaError::TypeMismatch("SIMS".into())); }
+                if let EpicsValue::Short(v) = value {
+                    self.sims = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SIMS".into()));
+                }
             }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
                     let bit = match value {
-                        EpicsValue::Char(v)  => v & 1,
+                        EpicsValue::Char(v) => v & 1,
                         EpicsValue::Short(v) => (v & 1) as u8,
-                        EpicsValue::Long(v)  => (v & 1) as u8,
+                        EpicsValue::Long(v) => (v & 1) as u8,
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
                     self.bits[idx] = bit;

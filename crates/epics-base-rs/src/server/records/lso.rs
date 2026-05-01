@@ -56,25 +56,80 @@ impl LsoRecord {
         if self.val.len() <= max {
             return self.val.clone();
         }
-        let trunc = (0..=max).rev().find(|&i| self.val.is_char_boundary(i)).unwrap_or(0);
+        let trunc = (0..=max)
+            .rev()
+            .find(|&i| self.val.is_char_boundary(i))
+            .unwrap_or(0);
         self.val[..trunc].to_string()
     }
 }
 
 static LSO_FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL",  dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "OVAL", dbf_type: DbFieldType::Char,  read_only: true  },
-    FieldDesc { name: "SIZV", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "LEN",  dbf_type: DbFieldType::Long,  read_only: true  },
-    FieldDesc { name: "OLEN", dbf_type: DbFieldType::Long,  read_only: true  },
-    FieldDesc { name: "IVOA", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IVOV", dbf_type: DbFieldType::Char,  read_only: false },
-    FieldDesc { name: "OMSL", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "DOL",  dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "SIMM", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SIML", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "SIOL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "SIMS", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OVAL",
+        dbf_type: DbFieldType::Char,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "SIZV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LEN",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "OLEN",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "IVOA",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IVOV",
+        dbf_type: DbFieldType::Char,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OMSL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIML",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMS",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for LsoRecord {
@@ -104,15 +159,15 @@ impl Record for LsoRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL"  => Some(EpicsValue::CharArray(self.clamped().into_bytes())),
+            "VAL" => Some(EpicsValue::CharArray(self.clamped().into_bytes())),
             "OVAL" => Some(EpicsValue::CharArray(self.oval.clone().into_bytes())),
             "SIZV" => Some(EpicsValue::Short(self.sizv as i16)),
-            "LEN"  => Some(EpicsValue::Long(self.len as i32)),
+            "LEN" => Some(EpicsValue::Long(self.len as i32)),
             "OLEN" => Some(EpicsValue::Long(self.olen as i32)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::CharArray(self.ivov.clone().into_bytes())),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "DOL"  => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone())),
@@ -134,7 +189,10 @@ impl Record for LsoRecord {
                 };
                 let max = (self.sizv as usize).saturating_sub(1);
                 self.val = if s.len() > max {
-                    let trunc = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+                    let trunc = (0..=max)
+                        .rev()
+                        .find(|&i| s.is_char_boundary(i))
+                        .unwrap_or(0);
                     s[..trunc].to_string()
                 } else {
                     s
@@ -149,42 +207,61 @@ impl Record for LsoRecord {
                 }
             }
             "IVOA" => {
-                if let EpicsValue::Short(v) = value { self.ivoa = v; }
-                else { return Err(CaError::TypeMismatch("IVOA".into())); }
-            }
-            "IVOV" => {
-                match value {
-                    EpicsValue::String(s) => self.ivov = s,
-                    EpicsValue::CharArray(bytes) => {
-                        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                        self.ivov = String::from_utf8_lossy(&bytes[..end]).into_owned();
-                    }
-                    _ => return Err(CaError::TypeMismatch("IVOV".into())),
+                if let EpicsValue::Short(v) = value {
+                    self.ivoa = v;
+                } else {
+                    return Err(CaError::TypeMismatch("IVOA".into()));
                 }
             }
+            "IVOV" => match value {
+                EpicsValue::String(s) => self.ivov = s,
+                EpicsValue::CharArray(bytes) => {
+                    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                    self.ivov = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                }
+                _ => return Err(CaError::TypeMismatch("IVOV".into())),
+            },
             "OMSL" => {
-                if let EpicsValue::Short(v) = value { self.omsl = v; }
-                else { return Err(CaError::TypeMismatch("OMSL".into())); }
+                if let EpicsValue::Short(v) = value {
+                    self.omsl = v;
+                } else {
+                    return Err(CaError::TypeMismatch("OMSL".into()));
+                }
             }
             "DOL" => {
-                if let EpicsValue::String(v) = value { self.dol = v; }
-                else { return Err(CaError::TypeMismatch("DOL".into())); }
+                if let EpicsValue::String(v) = value {
+                    self.dol = v;
+                } else {
+                    return Err(CaError::TypeMismatch("DOL".into()));
+                }
             }
             "SIMM" => {
-                if let EpicsValue::Short(v) = value { self.simm = v; }
-                else { return Err(CaError::TypeMismatch("SIMM".into())); }
+                if let EpicsValue::Short(v) = value {
+                    self.simm = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SIMM".into()));
+                }
             }
             "SIML" => {
-                if let EpicsValue::String(v) = value { self.siml = v; }
-                else { return Err(CaError::TypeMismatch("SIML".into())); }
+                if let EpicsValue::String(v) = value {
+                    self.siml = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SIML".into()));
+                }
             }
             "SIOL" => {
-                if let EpicsValue::String(v) = value { self.siol = v; }
-                else { return Err(CaError::TypeMismatch("SIOL".into())); }
+                if let EpicsValue::String(v) = value {
+                    self.siol = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SIOL".into()));
+                }
             }
             "SIMS" => {
-                if let EpicsValue::Short(v) = value { self.sims = v; }
-                else { return Err(CaError::TypeMismatch("SIMS".into())); }
+                if let EpicsValue::Short(v) = value {
+                    self.sims = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SIMS".into()));
+                }
             }
             _ => return Err(CaError::FieldNotFound(name.to_string())),
         }

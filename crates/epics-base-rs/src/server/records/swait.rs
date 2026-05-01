@@ -1,6 +1,6 @@
-use crate::calc::{CompiledExpr, scalc_compile, scalc_eval};
 use crate::calc::StringInputs;
 use crate::calc::engine::value::StackValue;
+use crate::calc::{CompiledExpr, scalc_compile, scalc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
@@ -51,7 +51,7 @@ impl Default for SwaitRecord {
 }
 
 // Channel letters A-L in order
-const CHAN: [char; 12] = ['A','B','C','D','E','F','G','H','I','J','K','L'];
+const CHAN: [char; 12] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
 
 impl SwaitRecord {
     fn recompile(&mut self) {
@@ -59,7 +59,10 @@ impl SwaitRecord {
     }
 
     fn build_inputs(&self) -> StringInputs {
-        let mut inputs = StringInputs { num_vars: [0.0; 16], str_vars: Default::default() };
+        let mut inputs = StringInputs {
+            num_vars: [0.0; 16],
+            str_vars: Default::default(),
+        };
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
         }
@@ -106,57 +109,227 @@ impl SwaitRecord {
             None
         }
     }
-
-
 }
 
 static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
-    FieldDesc { name: "VAL",  dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "CALC", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OOPT", dbf_type: DbFieldType::Short,  read_only: false },
-    FieldDesc { name: "DOPT", dbf_type: DbFieldType::Short,  read_only: false },
-    FieldDesc { name: "DOLD", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "OVAL", dbf_type: DbFieldType::Double, read_only: true  },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "CALC",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OOPT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOPT",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOLD",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OVAL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
     // OUT and OUTN are intentionally absent: both route to RecordInstance::common.out
     // via put_common_field so that parsed_out is populated for output dispatch.
     // OUTN is swait's output link field name; RecordInstance handles the alias.
-    FieldDesc { name: "PREC", dbf_type: DbFieldType::Short,  read_only: false },
-    FieldDesc { name: "A",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "B",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "C",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "D",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "E",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "F",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "G",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "H",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "I",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "J",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "K",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "L",    dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "INAN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INBN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INCN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INDN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INEN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INFN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INGN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INHN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "ININ", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INJN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INKN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INLN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "INAP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INBP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INCP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INDP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INEP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INFP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INGP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INHP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INIP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INJP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INKP", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "INLP", dbf_type: DbFieldType::Short, read_only: false },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "A",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "B",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "C",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "D",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "E",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "F",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "G",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "H",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "I",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "J",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "K",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "L",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INAN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INBN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INCN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INDN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INEN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INFN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INGN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INHN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ININ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INJN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INKN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INLN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INAP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INBP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INCP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INDP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INEP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INFP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INGP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INHP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INIP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INJP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INKP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INLP",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for SwaitRecord {
@@ -211,7 +384,7 @@ impl Record for SwaitRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL"  => Some(EpicsValue::Double(self.val)),
+            "VAL" => Some(EpicsValue::Double(self.val)),
             "CALC" => Some(EpicsValue::String(self.calc.clone())),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
@@ -237,7 +410,9 @@ impl Record for SwaitRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
-                self.val = value.to_f64().ok_or_else(|| CaError::TypeMismatch("VAL".into()))?;
+                self.val = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("VAL".into()))?;
             }
             "CALC" => {
                 if let EpicsValue::String(s) = value {
@@ -247,17 +422,32 @@ impl Record for SwaitRecord {
                     return Err(CaError::TypeMismatch("CALC".into()));
                 }
             }
-            "OOPT" => { if let EpicsValue::Short(v) = value { self.oopt = v; } }
-            "DOPT" => { if let EpicsValue::Short(v) = value { self.dopt = v; } }
+            "OOPT" => {
+                if let EpicsValue::Short(v) = value {
+                    self.oopt = v;
+                }
+            }
+            "DOPT" => {
+                if let EpicsValue::Short(v) = value {
+                    self.dopt = v;
+                }
+            }
             "DOLD" => {
-                self.dold = value.to_f64().ok_or_else(|| CaError::TypeMismatch("DOLD".into()))?;
+                self.dold = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("DOLD".into()))?;
             }
             // OUTN falls through to put_common_field which mirrors to common.out.
-            "PREC" => { if let EpicsValue::Short(v) = value { self.prec = v; } }
+            "PREC" => {
+                if let EpicsValue::Short(v) = value {
+                    self.prec = v;
+                }
+            }
             _ => {
                 if let Some(idx) = Self::num_val_index(name) {
-                    self.num_vals[idx] =
-                        value.to_f64().ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                    self.num_vals[idx] = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                 } else if let Some(idx) = Self::inp_name_index(name) {
                     if let EpicsValue::String(s) = value {
                         self.inp_names[idx] = s;
@@ -280,9 +470,18 @@ impl Record for SwaitRecord {
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[
-            ("INAN", "A"), ("INBN", "B"), ("INCN", "C"), ("INDN", "D"),
-            ("INEN", "E"), ("INFN", "F"), ("INGN", "G"), ("INHN", "H"),
-            ("ININ", "I"), ("INJN", "J"), ("INKN", "K"), ("INLN", "L"),
+            ("INAN", "A"),
+            ("INBN", "B"),
+            ("INCN", "C"),
+            ("INDN", "D"),
+            ("INEN", "E"),
+            ("INFN", "F"),
+            ("INGN", "G"),
+            ("INHN", "H"),
+            ("ININ", "I"),
+            ("INJN", "J"),
+            ("INKN", "K"),
+            ("INLN", "L"),
         ]
     }
 }

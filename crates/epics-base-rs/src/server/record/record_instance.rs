@@ -883,29 +883,53 @@ impl RecordInstance {
             "HIHI" => {
                 if let Some(a) = &mut self.common.analog_alarm {
                     if let Some(v) = value.to_f64().or_else(|| {
-                        if let EpicsValue::String(s) = &value { s.parse::<f64>().ok() } else { None }
-                    }) { a.hihi = v; }
+                        if let EpicsValue::String(s) = &value {
+                            s.parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    }) {
+                        a.hihi = v;
+                    }
                 }
             }
             "HIGH" => {
                 if let Some(a) = &mut self.common.analog_alarm {
                     if let Some(v) = value.to_f64().or_else(|| {
-                        if let EpicsValue::String(s) = &value { s.parse::<f64>().ok() } else { None }
-                    }) { a.high = v; }
+                        if let EpicsValue::String(s) = &value {
+                            s.parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    }) {
+                        a.high = v;
+                    }
                 }
             }
             "LOW" => {
                 if let Some(a) = &mut self.common.analog_alarm {
                     if let Some(v) = value.to_f64().or_else(|| {
-                        if let EpicsValue::String(s) = &value { s.parse::<f64>().ok() } else { None }
-                    }) { a.low = v; }
+                        if let EpicsValue::String(s) = &value {
+                            s.parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    }) {
+                        a.low = v;
+                    }
                 }
             }
             "LOLO" => {
                 if let Some(a) = &mut self.common.analog_alarm {
                     if let Some(v) = value.to_f64().or_else(|| {
-                        if let EpicsValue::String(s) = &value { s.parse::<f64>().ok() } else { None }
-                    }) { a.lolo = v; }
+                        if let EpicsValue::String(s) = &value {
+                            s.parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    }) {
+                        a.lolo = v;
+                    }
                 }
             }
             "HHSV" => {

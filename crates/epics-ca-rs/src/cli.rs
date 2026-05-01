@@ -122,9 +122,7 @@ pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[St
         EpicsValue::LongArray(arr) => {
             render_array_int(arr.iter().map(|&n| n as i64), arr.len(), fmt, sep)
         }
-        EpicsValue::Int64Array(arr) => {
-            render_array_int(arr.iter().copied(), arr.len(), fmt, sep)
-        }
+        EpicsValue::Int64Array(arr) => render_array_int(arr.iter().copied(), arr.len(), fmt, sep),
         EpicsValue::EnumArray(arr) => {
             let mut parts = Vec::with_capacity(arr.len() + 1);
             parts.push(arr.len().to_string());

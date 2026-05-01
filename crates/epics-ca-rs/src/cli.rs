@@ -111,6 +111,7 @@ pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[St
         EpicsValue::String(s) => s.clone(),
         EpicsValue::Short(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Long(n) => format_int_i64(*n as i64, fmt.int_style),
+        EpicsValue::Int64(n) => format_int_i64(*n, fmt.int_style),
         EpicsValue::Char(n) => format_int_i64((*n as i8) as i64, fmt.int_style),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         EpicsValue::Float(x) => format_float(*x as f64, fmt),
@@ -120,6 +121,9 @@ pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[St
         }
         EpicsValue::LongArray(arr) => {
             render_array_int(arr.iter().map(|&n| n as i64), arr.len(), fmt, sep)
+        }
+        EpicsValue::Int64Array(arr) => {
+            render_array_int(arr.iter().copied(), arr.len(), fmt, sep)
         }
         EpicsValue::EnumArray(arr) => {
             let mut parts = Vec::with_capacity(arr.len() + 1);

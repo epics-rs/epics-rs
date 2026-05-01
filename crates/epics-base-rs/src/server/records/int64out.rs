@@ -1,13 +1,13 @@
 use epics_macros_rs::EpicsRecord;
 
 // int64out: 64-bit integer output.
-// PRECISION LIMITATION: same as int64in — VAL stored as f64, |val| > 2^53 loses precision.
-// Fix requires EpicsValue::Int64 + CA INT64 wire support.
+// CA limitation: served as DBR_DOUBLE over Channel Access (precision loss for |val|>2^53).
+// Native i64 storage is lossless; precision is only lost at the CA wire boundary.
 #[derive(EpicsRecord)]
 #[record(type = "int64out")]
 pub struct Int64outRecord {
-    #[field(type = "Double")]
-    pub val: f64,
+    #[field(type = "Int64")]
+    pub val: i64,
     #[field(type = "String")]
     pub egu: String,
     #[field(type = "Double")]
@@ -67,7 +67,7 @@ pub struct Int64outRecord {
 impl Default for Int64outRecord {
     fn default() -> Self {
         Self {
-            val: 0.0,
+            val: 0,
             egu: String::new(),
             hopr: 0.0,
             lopr: 0.0,
@@ -102,7 +102,7 @@ impl Default for Int64outRecord {
 impl Int64outRecord {
     pub fn new(val: i64) -> Self {
         Self {
-            val: val as f64,
+            val,
             ..Default::default()
         }
     }

@@ -26,6 +26,9 @@ pub enum DbFieldType {
     Char = 4, // aka UInt8
     Long = 5, // aka Int32
     Double = 6,
+    /// Internal-only type for int64in/int64out records.
+    /// No CA wire type 7 exists; over CA these PVs appear as Double (type 6).
+    Int64 = 7,
 }
 
 impl DbFieldType {
@@ -49,18 +52,28 @@ impl DbFieldType {
             Self::Short | Self::Enum => 2,
             Self::Float | Self::Long => 4,
             Self::Char => 1,
-            Self::Double => 8,
+            Self::Double | Self::Int64 => 8,
         }
     }
 
     /// Return the DBR_TIME_xxx type code for this native type.
+    /// Int64 has no CA wire type; it maps to DBR_TIME_DOUBLE (20).
     pub fn time_dbr_type(&self) -> u16 {
-        *self as u16 + 14
+        let ca = match self {
+            Self::Int64 => Self::Double,
+            other => *other,
+        };
+        ca as u16 + 14
     }
 
     /// Return the DBR_CTRL_xxx type code for this native type.
+    /// Int64 has no CA wire type; it maps to DBR_CTRL_DOUBLE (34).
     pub fn ctrl_dbr_type(&self) -> u16 {
-        *self as u16 + 28
+        let ca = match self {
+            Self::Int64 => Self::Double,
+            other => *other,
+        };
+        ca as u16 + 28
     }
 
     /// Calculate total buffer size for N elements of this type.

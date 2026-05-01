@@ -311,6 +311,7 @@ impl PvDatabase {
                     EpicsValue::Char(v) => *v != 0,
                     EpicsValue::Short(v) => *v != 0,
                     EpicsValue::Long(v) => *v != 0,
+                    EpicsValue::Int64(v) => *v != 0,
                     EpicsValue::Double(v) => *v != 0.0,
                     _ => true,
                 };

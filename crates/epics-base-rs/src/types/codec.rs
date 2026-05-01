@@ -162,6 +162,14 @@ fn serialize_gr_ctrl(
             buf.extend_from_slice(&vec![0u8; n_limits]);
             buf.push(0); // RISC_pad
         }
+        // Int64 has no CA GR/CTRL type — this arm is unreachable in normal CA paths.
+        // Use same layout as Double (precision(2)+pad(2)+units(8)+n*f64 limits).
+        DbFieldType::Int64 => {
+            buf.extend_from_slice(&[0u8; 4]); // precision + pad
+            buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
+            let n_limits = if ctrl { 8 } else { 6 };
+            buf.extend_from_slice(&vec![0u8; n_limits * 8]);
+        }
     }
 
     buf.extend_from_slice(val_bytes);
@@ -244,6 +252,10 @@ fn encode_gr(
             encode_units_limits_u8(&mut buf, snapshot, 6);
             buf.push(0); // RISC_pad
         }
+        // Int64 has no CA GR type; use Double layout.
+        DbFieldType::Int64 => {
+            encode_prec_units_limits_f64(&mut buf, snapshot, 6);
+        }
     }
 
     buf.extend_from_slice(val_bytes);
@@ -284,6 +296,10 @@ fn encode_ctrl(
         DbFieldType::Char => {
             encode_units_limits_u8(&mut buf, snapshot, 8);
             buf.push(0); // RISC_pad
+        }
+        // Int64 has no CA CTRL type; use Double layout.
+        DbFieldType::Int64 => {
+            encode_prec_units_limits_f64(&mut buf, snapshot, 8);
         }
     }
 
@@ -708,6 +724,36 @@ fn decode_gr_ctrl(
             display = Some(DisplayInfo {
                 units,
                 precision: 0,
+                upper_disp_limit: limits[0],
+                lower_disp_limit: limits[1],
+                upper_alarm_limit: limits[2],
+                upper_warning_limit: limits[3],
+                lower_warning_limit: limits[4],
+                lower_alarm_limit: limits[5],
+                ..Default::default()
+            });
+            if ctrl {
+                control = Some(ControlInfo {
+                    upper_ctrl_limit: limits[6],
+                    lower_ctrl_limit: limits[7],
+                });
+            }
+        }
+        // Int64 has no CA GR/CTRL type; decode as Double layout.
+        DbFieldType::Int64 => {
+            let precision = read_i16(data, off)?;
+            off += 4; // precision(2) + pad(2)
+            let units = read_string(data, off, MAX_UNITS_SIZE);
+            off += MAX_UNITS_SIZE;
+            let n_limits = if ctrl { 8 } else { 6 };
+            let mut limits = [0.0f64; 8];
+            for i in 0..n_limits {
+                limits[i] = read_f64(data, off)?;
+                off += 8;
+            }
+            display = Some(DisplayInfo {
+                units,
+                precision,
                 upper_disp_limit: limits[0],
                 lower_disp_limit: limits[1],
                 upper_alarm_limit: limits[2],

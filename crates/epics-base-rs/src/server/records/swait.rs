@@ -69,7 +69,7 @@ impl SwaitRecord {
     fn eval_should_output(&self) -> bool {
         match self.oopt {
             0 => true,
-            1 => (self.val - self.prev_val).abs() > f64::EPSILON,
+            1 => self.val != self.prev_val,
             2 => self.val == 0.0,
             3 => self.val != 0.0,
             4 => self.prev_val != 0.0 && self.val == 0.0,

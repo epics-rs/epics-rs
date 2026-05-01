@@ -106,7 +106,7 @@ impl Record for MbbiDirectRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
+            if self.mask == 0 && self.nobt > 0 && self.nobt <= 16 {
                 self.mask = ((1i64 << self.nobt) - 1) as i32;
             }
             self.mlst = self.val;

@@ -1,0 +1,144 @@
+# epics-rs Roadmap
+
+**Status**: Draft, 2026-05
+**Scope**: Strategic direction for epics-rs after the v0.13.0 production-parity baseline.
+
+## Positioning
+
+**epics-rs is a Rust-native EPICS stack specialized for modern Linux IOC infrastructure.**
+
+The post-v0.13.0 strategy is to *deepen* on tier-1 desktop/server operating systems rather than *broaden* across embedded RTOSs. Production targets are Linux (vanilla and PREEMPT_RT); macOS and Windows are first-class developer targets. RTEMS, VxWorks, and bare-metal microcontroller targets are out of scope; pvxs already serves those well, and epics-rs and pvxs are positioned as complementary rather than competing.
+
+Rationale:
+
+- Rust toolchain on RTEMS is tier-3, out-of-tree, and not production-ready. Waiting on tier-2 promotion is an external blocker we cannot drive.
+- Embedded/microcontroller demand for direct EPICS nodes is hypothetical; the current production pattern is host-side IOC + dumb device.
+- Designing a runtime abstraction layer to keep all targets open imposes per-call overhead, API surface loss, and maintenance cost on the dominant Linux server use case. We pay the price every day to support a use case that may never materialize.
+- Specializing on Linux unlocks io_uring, AF_XDP, eBPF, NUMA-aware scheduling, PREEMPT_RT, systemd, and cgroups v2 as first-class capabilities — none of which translate cleanly through an RTOS abstraction.
+
+## Supported targets
+
+| Tier | Targets | Guarantees |
+|------|---------|------------|
+| 1 (production) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (vanilla and PREEMPT_RT) | Full CI, performance baseline tracked, all features |
+| 2 (developer) | `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` | Full CI, all features, no RT/perf guarantees |
+| 3 (community) | Other Linux architectures, FreeBSD | Best-effort, no CI |
+| Out of scope | RTEMS, VxWorks, no_std/embedded | Use pvxs |
+
+Tier-2 targets receive all features and bug fixes; the tier distinction is about performance and real-time guarantees, not feature parity. macOS and Windows users get every cross-platform improvement (buffer tuning, allocation reduction, raw-frame forwarding, runtime tuning, `tokio-console`, OpenTelemetry tracing) automatically. Linux-only capabilities (PREEMPT_RT, io_uring, AF_XDP, eBPF probes, systemd, cgroups v2) are compile-time gated via `#[cfg(target_os = "linux")]` and feature flags, so they have zero footprint on tier-2 builds.
+
+This matrix is binding. Pull requests that compromise tier-1 capabilities to widen target coverage will be rejected.
+
+## Phase 1 — Linux real-time support
+
+Bring tier-1 Linux targets to deterministic-latency operation suitable for accelerator IOC deployments. PREEMPT_RT is mainline since kernel 6.12; the substrate exists, the work is integration.
+
+### Scope
+
+- `epics-rt` feature flag (default off) that enables RT-aware behavior across the workspace.
+- `mlockall(MCL_CURRENT | MCL_FUTURE)` invoked from a public initialization entry point. Must be called before tokio runtime starts.
+- `SCHED_FIFO` / `SCHED_DEADLINE` thread classes for monitor and reactor threads, configurable per crate.
+- Priority-inheritance mutexes on RT-critical paths. Either `parking_lot` with PI configuration or direct `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` bindings; benchmark both.
+- CPU affinity / pinning via `tokio::runtime::Builder::on_thread_start` calling `sched_setaffinity`.
+- Allocation-free hot paths in PVA monitor encoder, CA `event_callback` dispatch, and gateway fan-out. Use thread-local arenas (`bumpalo`) or `Bytes` reuse pools; no `Vec::new()` per frame.
+- Pre-faulted stack size for RT threads.
+
+### Out of scope for Phase 1
+
+- Hard sub-microsecond determinism. PREEMPT_RT delivers single-digit-microsecond worst-case latency on tuned hardware; epics-rs aims for jitter under 1 ms end-to-end on a typical accelerator IOC, matching what RTEMS provides today.
+- Real-time scheduling for the entire workspace. Only marked-RT tasks get RT class; control-plane tasks remain `SCHED_OTHER`.
+
+### Acceptance criteria
+
+- PVA monitor end-to-end latency on PREEMPT_RT shows 99.99th-percentile jitter within target. Numbers established by Phase 1 baseline.
+- No allocation in the steady-state monitor send path, verified by `dhat` or `heaptrack`.
+- Documentation: deployment recipe (kernel config, BIOS, isolcpus, irqaffinity, RT throttling) in `docs/deployment/linux-rt.md`.
+
+### Estimated effort
+
+4–6 person-weeks.
+
+## Phase 2 — High-performance I/O for CA and PVA
+
+Apply kernel-level networking optimizations to both protocols at once. Optimizations are protocol-agnostic at the OS interface; each has different deployment cost and effect surface.
+
+### Sprint 0 — Free wins (week 1)
+
+Zero or near-zero risk; opt-in flags or audit-and-tune. No measurement gate required.
+
+- Audit and configure `SO_RCVBUF` / `SO_SNDBUF` for gateway TCP sockets and UDP responders. Default to OS maximum on gateway role.
+- `TCP_NODELAY` audit on PVA ops and CA `event_callback` paths. Coalesce small writes via `writev` where Nagle was masking the issue.
+- `SO_REUSEPORT` on UDP search responders for multi-worker fan-in.
+- `SO_BUSY_POLL` opt-in (`EPICS_PVA_BUSY_POLL_US`, `EPICS_CA_BUSY_POLL_US`). Trades CPU for tail-latency. Off by default.
+- Tokio runtime configuration: explicit `worker_threads`, tuned `event_interval`, bounded `max_blocking_threads` to prevent silent leaks.
+- Performance baseline tooling: a `bench` workspace target that produces reproducible throughput / p50 / p99 / p99.99 numbers under standard load profiles (single IOC, gateway fan-out, search burst).
+
+### Sprint 1 — Measured wins (weeks 2–4)
+
+Items that require a baseline first. Target effects are documented; numbers come from measurement.
+
+- PVA gateway raw-frame forwarding: re-evaluate `EPICS_PVA_GW_RAW_FRAMES` opt-in versus default-on. The infrastructure landed in v0.11 (kodex F-G12); production validation is the gating step.
+- PVA monitor encoder allocation audit. Move per-frame `Vec` allocations to per-channel reusable buffers. Validate with `dhat-rs`.
+- CA `event_callback` writev coalescing where prelude and payload currently issue two writes.
+- Adaptive `epoll`/`mio` event count per loop based on backlog depth.
+
+### Sprint 2 — io_uring backend (single hot path)
+
+Tokio-uring is a separate runtime; it cannot replace the workspace-wide tokio runtime. The realistic shape is a hybrid: control-plane tasks run on regular tokio, while a designated hot-path task (initially the PVA monitor sender) runs on a `tokio_uring::start` thread and communicates via lock-free queues.
+
+- Feature-flagged `epics-pva-rs/io-uring`. Off by default until Linux 6.0 is the documented minimum.
+- Target operations: `IORING_OP_SEND_ZC` (zero-copy send) and `IORING_OP_SEND_BUNDLE` for batched fan-out.
+- Multi-shot recv (`IORING_OP_RECV_MULTISHOT`) for the search responder.
+- Effect surface: throughput improvement scales with PVA monitor fan-out width; gateway with 1k+ subscribers expected to benefit most. With raw-frame forwarding default-on, io_uring's marginal gain narrows — measure both together to decide priority.
+- Estimated effort: 2–4 person-weeks.
+
+### Sprint 3 — AF_XDP for UDP search and beacon (per-deployment)
+
+Kernel-bypass UDP via XDP/eBPF. Bypasses the BSD socket layer entirely; UDP-only; requires `CAP_NET_ADMIN` and NIC driver support (`igb`, `ixgbe`, `mlx5`, etc.).
+
+- Out-of-tree feature crate `epics-net-xdp` providing an alternate transport for PVA and CA search responders and beacon receivers.
+- Use case: large-site gateways handling thousands of concurrent client search bursts where a vanilla UDP socket drops packets.
+- Default off and not built into the standard binary; requires explicit opt-in plus deployment infrastructure.
+- Measurement gate: Sprint 0 baseline must show packet drop or CPU saturation on the UDP path before this is undertaken.
+- Estimated effort: 4–6 person-weeks.
+
+### Cross-cutting requirements
+
+- All optimizations must be measured before and after. No "optimization" lands without a delta on the standard benchmark suite.
+- All optimizations must be opt-in or runtime-detectable. The default build runs unmodified across tier-1 and tier-2 targets.
+- AF_XDP and io_uring code paths must compile-out cleanly when the feature flag is off.
+
+## Phase 3 — Observability and operations (parallel)
+
+Deepen Linux-native operational integration. Items below are mostly additive; can be done in parallel with Phases 1 and 2.
+
+- `tokio-console` integration for live task and lock visualization.
+- `tracing` + OpenTelemetry exporter as an opt-in feature for distributed tracing across IOC and gateway.
+- `eBPF` USDT probes for in-kernel observability of PVA channel state, monitor delivery, and ACF decisions. Deliver as `bpftrace` recipes in `docs/observability/`.
+- systemd integration: socket activation, journal-aware logging, watchdog ping.
+- cgroups v2 resource limit awareness: respect memory limits in cache sizing, react to CPU pressure.
+- Linux audit subsystem integration for ACF security events.
+
+## Cross-cutting principles
+
+1. **Measure first.** No optimization lands without a benchmark delta. The Sprint 0 baseline is the prerequisite for everything in Phase 2 and Phase 3.
+2. **Opt-in over rewrite.** Where a kernel feature requires a recent Linux version (PREEMPT_RT, io_uring multi-shot, AF_XDP), gate behind a feature flag. The default build runs on tier-1 and tier-2 unchanged.
+3. **Tier-1 first.** Every change is validated on Linux. macOS and Windows are kept green via CI but do not gate Linux work.
+4. **No abstraction layers we don't need.** We deliberately do not add a runtime trait or proto/transport split solely to preserve RTOS optionality. If a refactor has standalone value (testing speed, fuzzing surface, modularity), that is the justification — not future portability.
+5. **Honest tier policy.** Out-of-scope targets stay out of scope. Users requesting RTEMS support are directed to pvxs; this is documented in README.
+
+## Non-goals
+
+- RTEMS, VxWorks, or any RTOS target.
+- `no_std` or embedded microcontroller support for protocol crates.
+- Runtime abstraction layer over Tokio.
+- Drop-in compatibility with EPICS Base C builds for fields beyond the IOC protocol surface.
+
+## Open questions
+
+These are intentionally not answered in this document. Each blocks a specific phase.
+
+- **PREEMPT_RT minimum kernel version.** 6.12 is the mainline merge; what is the realistic deployment baseline at accelerator sites in 2026? This determines whether Phase 1 targets 6.12 or earlier RT-patch kernels.
+- **io_uring minimum kernel.** 5.10 unlocks core operations; 6.0 unlocks `SEND_BUNDLE` and `RECV_MULTISHOT`. Which is the supported floor?
+- **AF_XDP deployment cost.** What is the operational overhead at sites where XDP requires interaction with vendor NIC firmware? Decide whether to invest before measurement justifies it.
+- **macOS production status.** Today macOS is a developer target. Should it be promoted to tier-1 production for the (small) macOS IOC user base, or kept tier-2 indefinitely?

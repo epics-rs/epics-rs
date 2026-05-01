@@ -4,8 +4,6 @@ Pure Rust implementation of the [EPICS](https://epics-controls.org/) control sys
 
 No C dependencies. No `libca`. No `libCom`. Just `cargo build`.
 
-**100% wire-compatible** with C EPICS clients (`caget`, `camonitor`, CSS, etc.).
-
 ## Motivation
 
 EPICS is the proven standard for large-scale control systems at accelerator facilities, synchrotron light sources, fusion experiments, and beyond. Its ecosystem of support modules — asyn, motor, areaDetector, calc, sequencer, autosave, and many more — represents decades of field-tested engineering.

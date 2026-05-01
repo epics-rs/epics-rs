@@ -234,6 +234,7 @@ pub fn value_to_save_str(value: &EpicsValue) -> String {
         EpicsValue::Float(v) => format!("{:.7e}", v),
         EpicsValue::Short(v) => v.to_string(),
         EpicsValue::Long(v) => v.to_string(),
+        EpicsValue::Int64(v) => v.to_string(),
         EpicsValue::Enum(v) => v.to_string(),
         EpicsValue::Char(v) => v.to_string(),
         EpicsValue::DoubleArray(arr) => {
@@ -257,6 +258,10 @@ pub fn value_to_save_str(value: &EpicsValue) -> String {
             format!("[{}]", parts.join(","))
         }
         EpicsValue::EnumArray(arr) => {
+            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
+            format!("[{}]", parts.join(","))
+        }
+        EpicsValue::Int64Array(arr) => {
             let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
             format!("[{}]", parts.join(","))
         }
@@ -286,6 +291,7 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
         EpicsValue::Double(_) => s.parse::<f64>().ok().map(EpicsValue::Double),
         EpicsValue::Float(_) => s.parse::<f32>().ok().map(EpicsValue::Float),
         EpicsValue::Long(_) => s.parse::<i32>().ok().map(EpicsValue::Long),
+        EpicsValue::Int64(_) => s.parse::<i64>().ok().map(EpicsValue::Int64),
         EpicsValue::Short(_) => s.parse::<i16>().ok().map(EpicsValue::Short),
         EpicsValue::Enum(_) => s.parse::<u16>().ok().map(EpicsValue::Enum),
         EpicsValue::Char(_) => s.parse::<u8>().ok().map(EpicsValue::Char),
@@ -306,6 +312,9 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
         }
         EpicsValue::EnumArray(_) => {
             parse_array_str(s, |v| v.parse::<u16>().ok()).map(EpicsValue::EnumArray)
+        }
+        EpicsValue::Int64Array(_) => {
+            parse_array_str(s, |v| v.parse::<i64>().ok()).map(EpicsValue::Int64Array)
         }
         EpicsValue::StringArray(_) => {
             let inner = s.trim_start_matches('[').trim_end_matches(']');

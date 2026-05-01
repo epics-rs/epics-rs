@@ -42,6 +42,7 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         EpicsValue::Char(v) => PvField::Scalar(ScalarValue::UByte(*v)),
         EpicsValue::Enum(v) => PvField::Scalar(ScalarValue::Int(*v as i32)),
         EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
+        EpicsValue::Int64(v) => PvField::Scalar(ScalarValue::Long(*v)),
         EpicsValue::DoubleArray(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::Double(*x)).collect())
         }
@@ -62,6 +63,9 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         }
         EpicsValue::StringArray(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::String(x.clone())).collect())
+        }
+        EpicsValue::Int64Array(v) => {
+            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Long(*x)).collect())
         }
     };
 
@@ -94,6 +98,7 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::Char(_) => (FieldDesc::Scalar(ScalarType::UByte), false),
         EpicsValue::Enum(_) => (FieldDesc::Scalar(ScalarType::Int), false),
         EpicsValue::String(_) => (FieldDesc::Scalar(ScalarType::String), false),
+        EpicsValue::Int64(_) => (FieldDesc::Scalar(ScalarType::Long), false),
         EpicsValue::DoubleArray(_) => (FieldDesc::ScalarArray(ScalarType::Double), true),
         EpicsValue::FloatArray(_) => (FieldDesc::ScalarArray(ScalarType::Float), true),
         EpicsValue::LongArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
@@ -101,6 +106,7 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::CharArray(_) => (FieldDesc::ScalarArray(ScalarType::UByte), true),
         EpicsValue::EnumArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
         EpicsValue::StringArray(_) => (FieldDesc::ScalarArray(ScalarType::String), true),
+        EpicsValue::Int64Array(_) => (FieldDesc::ScalarArray(ScalarType::Long), true),
     };
     let struct_id = if is_array {
         "epics:nt/NTScalarArray:1.0"
@@ -462,6 +468,15 @@ fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
                     })
                     .collect(),
             )),
+            ScalarValue::Long(_) => Some(EpicsValue::Int64Array(
+                items
+                    .iter()
+                    .filter_map(|v| match v {
+                        ScalarValue::Long(x) => Some(*x),
+                        _ => None,
+                    })
+                    .collect(),
+            )),
             ScalarValue::Float(_) => Some(EpicsValue::FloatArray(
                 items
                     .iter()
@@ -483,7 +498,7 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
         ScalarValue::Byte(x) => EpicsValue::Char(*x as u8),
         ScalarValue::Short(x) => EpicsValue::Short(*x),
         ScalarValue::Int(x) => EpicsValue::Long(*x),
-        ScalarValue::Long(x) => EpicsValue::Long(*x as i32),
+        ScalarValue::Long(x) => EpicsValue::Int64(*x),
         ScalarValue::UByte(x) => EpicsValue::Char(*x),
         ScalarValue::UShort(x) => EpicsValue::Enum(*x),
         ScalarValue::UInt(x) => EpicsValue::Long(*x as i32),

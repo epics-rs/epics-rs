@@ -168,7 +168,8 @@ impl PvDatabase {
 
             // DOL link info for output records with OMSL=CLOSED_LOOP
             let dol = match rtype {
-                "ao" | "longout" | "bo" | "mbbo" | "stringout" => {
+                "ao" | "longout" | "int64out" | "bo" | "mbbo" | "mbboDirect" | "stringout"
+                | "lso" => {
                     let omsl = instance
                         .record
                         .get_field("OMSL")
@@ -1342,7 +1343,10 @@ impl PvDatabase {
         let (siml_link, siol_link, sims, _rtype, is_input) = {
             let instance = rec.read().await;
             let rtype = instance.record.record_type().to_string();
-            let is_input = matches!(rtype.as_str(), "ai" | "bi" | "longin" | "stringin");
+            let is_input = matches!(
+                rtype.as_str(),
+                "ai" | "bi" | "longin" | "int64in" | "stringin" | "lsi" | "event"
+            );
 
             let siml = instance
                 .record

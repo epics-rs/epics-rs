@@ -73,7 +73,7 @@ impl PvDatabase {
                     .find(|f| f.name.eq_ignore_ascii_case(&field))
                     .map(|f| f.dbf_type);
                 if let Some(target) = target_type {
-                    if value.dbr_type() != target {
+                    if value.db_field_type() != target {
                         // C EPICS dbPut (12cfd41): nRequest=0 into a scalar
                         // field must NOT silently coerce. `convert_to` on an
                         // empty array calls `to_f64().unwrap_or(0.0)` and
@@ -204,7 +204,7 @@ impl PvDatabase {
                     .find(|f| f.name.eq_ignore_ascii_case(&field))
                     .map(|f| f.dbf_type);
                 if let Some(target) = target_type {
-                    if value.dbr_type() != target {
+                    if value.db_field_type() != target {
                         // C EPICS dbPut (12cfd41): empty-array → scalar
                         // coercion would produce silent zero; reject.
                         if value.is_empty_array() {
@@ -311,6 +311,7 @@ impl PvDatabase {
                     EpicsValue::Char(v) => *v != 0,
                     EpicsValue::Short(v) => *v != 0,
                     EpicsValue::Long(v) => *v != 0,
+                    EpicsValue::Int64(v) => *v != 0,
                     EpicsValue::Double(v) => *v != 0.0,
                     _ => true,
                 };
@@ -373,7 +374,7 @@ impl PvDatabase {
                     .find(|f| f.name.eq_ignore_ascii_case(&field))
                     .map(|f| f.dbf_type);
                 if let Some(target) = target_type {
-                    if value.dbr_type() != target {
+                    if value.db_field_type() != target {
                         // C EPICS dbPut (12cfd41): empty-array → scalar
                         // coercion would produce silent zero; reject.
                         if value.is_empty_array() {

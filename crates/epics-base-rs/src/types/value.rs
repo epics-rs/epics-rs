@@ -13,6 +13,9 @@ pub enum EpicsValue {
     Char(u8),
     Long(i32),
     Double(f64),
+    /// Internal int64 storage for int64in/int64out records.
+    /// Over CA these appear as DBR_DOUBLE; over PVA they are native int64.
+    Int64(i64),
     // Array variants
     ShortArray(Vec<i16>),
     FloatArray(Vec<f32>),
@@ -20,6 +23,7 @@ pub enum EpicsValue {
     DoubleArray(Vec<f64>),
     LongArray(Vec<i32>),
     CharArray(Vec<u8>),
+    Int64Array(Vec<i64>),
     /// DBR_STRING with `count > 1`. Each element is at most 40 bytes
     /// per the DBR_STRING spec; the wire layout is `count * 40` bytes
     /// of NUL-padded strings. Used by `mbbo`/`mbbi` choice arrays
@@ -37,6 +41,7 @@ impl fmt::Display for EpicsValue {
             Self::Char(v) => write!(f, "{v}"),
             Self::Long(v) => write!(f, "{v}"),
             Self::Double(v) => write!(f, "{v}"),
+            Self::Int64(v) => write!(f, "{v}"),
             Self::ShortArray(arr) => {
                 let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
                 write!(f, "[{}]", parts.join(", "))
@@ -54,6 +59,10 @@ impl fmt::Display for EpicsValue {
                 write!(f, "[{}]", parts.join(", "))
             }
             Self::LongArray(arr) => {
+                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
+                write!(f, "[{}]", parts.join(", "))
+            }
+            Self::Int64Array(arr) => {
                 let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
                 write!(f, "[{}]", parts.join(", "))
             }
@@ -98,6 +107,7 @@ impl EpicsValue {
             Self::EnumArray(arr) => render(arr, max_elems),
             Self::DoubleArray(arr) => render(arr, max_elems),
             Self::LongArray(arr) => render(arr, max_elems),
+            Self::Int64Array(arr) => render(arr, max_elems),
             Self::StringArray(arr) => {
                 if arr.len() <= max_elems {
                     let parts: Vec<String> = arr.iter().map(|s| format!("{s:?}")).collect();
@@ -177,6 +187,14 @@ impl EpicsValue {
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ])))
             }
+            DbFieldType::Int64 => {
+                if data.len() < 8 {
+                    return Err(CaError::Protocol("int64 data too small".into()));
+                }
+                Ok(Self::Int64(i64::from_be_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ])))
+            }
         }
     }
 
@@ -196,6 +214,9 @@ impl EpicsValue {
             Self::Char(v) => vec![*v],
             Self::Long(v) => v.to_be_bytes().to_vec(),
             Self::Double(v) => v.to_be_bytes().to_vec(),
+            // Over CA, Int64 is served as Double (8-byte f64 big-endian).
+            // Precision is lost for |v| > 2^53; that is a CA protocol limitation.
+            Self::Int64(v) => (*v as f64).to_be_bytes().to_vec(),
             Self::ShortArray(arr) => {
                 let mut buf = Vec::with_capacity(arr.len() * 2);
                 for v in arr {
@@ -228,6 +249,13 @@ impl EpicsValue {
                 let mut buf = Vec::with_capacity(arr.len() * 4);
                 for v in arr {
                     buf.extend_from_slice(&v.to_be_bytes());
+                }
+                buf
+            }
+            Self::Int64Array(arr) => {
+                let mut buf = Vec::with_capacity(arr.len() * 8);
+                for v in arr {
+                    buf.extend_from_slice(&(*v as f64).to_be_bytes());
                 }
                 buf
             }
@@ -273,6 +301,7 @@ impl EpicsValue {
                 DbFieldType::Char => Self::CharArray(Vec::new()),
                 DbFieldType::Long => Self::LongArray(Vec::new()),
                 DbFieldType::Double => Self::DoubleArray(Vec::new()),
+                DbFieldType::Int64 => Self::Int64Array(Vec::new()),
             });
         }
         if count == 1 {
@@ -354,6 +383,26 @@ impl EpicsValue {
                 }
                 Ok(Self::LongArray(arr))
             }
+            DbFieldType::Int64 => {
+                let mut arr = Vec::with_capacity(cap_for(8));
+                for i in 0..count {
+                    let offset = i * 8;
+                    if offset + 8 > data.len() {
+                        break;
+                    }
+                    arr.push(i64::from_be_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
+                    ]));
+                }
+                Ok(Self::Int64Array(arr))
+            }
             DbFieldType::Char => {
                 let len = count.min(data.len());
                 Ok(Self::CharArray(data[..len].to_vec()))
@@ -381,7 +430,8 @@ impl EpicsValue {
         }
     }
 
-    /// Get the DBR type for this value
+    /// Get the DBR type for this value (CA wire type).
+    /// Int64 has no CA wire type — it appears as Double over Channel Access.
     pub fn dbr_type(&self) -> DbFieldType {
         match self {
             Self::String(_) | Self::StringArray(_) => DbFieldType::String,
@@ -391,6 +441,7 @@ impl EpicsValue {
             Self::Char(_) | Self::CharArray(_) => DbFieldType::Char,
             Self::Long(_) | Self::LongArray(_) => DbFieldType::Long,
             Self::Double(_) | Self::DoubleArray(_) => DbFieldType::Double,
+            Self::Int64(_) | Self::Int64Array(_) => DbFieldType::Double,
         }
     }
 
@@ -402,6 +453,7 @@ impl EpicsValue {
             Self::EnumArray(arr) => arr.len() as u32,
             Self::DoubleArray(arr) => arr.len() as u32,
             Self::LongArray(arr) => arr.len() as u32,
+            Self::Int64Array(arr) => arr.len() as u32,
             Self::CharArray(arr) => arr.len() as u32,
             Self::StringArray(arr) => arr.len() as u32,
             _ => 1,
@@ -431,6 +483,9 @@ impl EpicsValue {
             Self::LongArray(arr) if arr.is_empty()
         ) || matches!(
             self,
+            Self::Int64Array(arr) if arr.is_empty()
+        ) || matches!(
+            self,
             Self::CharArray(arr) if arr.is_empty()
         ) || matches!(
             self,
@@ -446,6 +501,7 @@ impl EpicsValue {
             Self::EnumArray(arr) => arr.truncate(max),
             Self::DoubleArray(arr) => arr.truncate(max),
             Self::LongArray(arr) => arr.truncate(max),
+            Self::Int64Array(arr) => arr.truncate(max),
             Self::CharArray(arr) => arr.truncate(max),
             Self::StringArray(arr) => arr.truncate(max),
             _ => {}
@@ -454,7 +510,7 @@ impl EpicsValue {
 
     /// Convert to a different native type (scalar only; arrays use first element).
     pub fn convert_to(&self, target: DbFieldType) -> EpicsValue {
-        if self.dbr_type() == target {
+        if self.db_field_type() == target {
             return self.clone();
         }
         // Menu string resolution: when converting String to Short/Enum,
@@ -489,11 +545,19 @@ impl EpicsValue {
             }
             DbFieldType::Long => EpicsValue::Long(self.to_f64().unwrap_or(0.0) as i32),
             DbFieldType::Double => EpicsValue::Double(self.to_f64().unwrap_or(0.0)),
+            DbFieldType::Int64 => {
+                // Avoid f64 round-trip when value is already Int64.
+                if let EpicsValue::Int64(v) = self {
+                    EpicsValue::Int64(*v)
+                } else {
+                    EpicsValue::Int64(self.to_f64().unwrap_or(0.0) as i64)
+                }
+            }
         }
     }
 
-    /// Convert to f64, if possible.
-    /// Return the DbFieldType that matches this value's variant.
+    /// Return the internal DbFieldType that matches this value's variant.
+    /// Unlike dbr_type(), this returns Int64 for Int64 variants (not Double).
     pub fn db_field_type(&self) -> DbFieldType {
         match self {
             Self::Double(_) => DbFieldType::Double,
@@ -503,6 +567,7 @@ impl EpicsValue {
             Self::Enum(_) => DbFieldType::Enum,
             Self::Char(_) => DbFieldType::Char,
             Self::String(_) => DbFieldType::String,
+            Self::Int64(_) | Self::Int64Array(_) => DbFieldType::Int64,
             Self::CharArray(_) => DbFieldType::Char,
             Self::ShortArray(_) => DbFieldType::Short,
             Self::LongArray(_) => DbFieldType::Long,
@@ -520,6 +585,7 @@ impl EpicsValue {
             Self::Long(v) => Some(*v as f64),
             Self::Short(v) => Some(*v as f64),
             Self::Enum(v) => Some(*v as f64),
+            Self::Int64(v) => Some(*v as f64),
             // DBF_CHAR is epicsInt8 (signed) per epics-base c5012d9f73:
             // reinterpret the storage byte as i8 before widening so 0xFF → -1.0,
             // not 255.0. The CharArray storage stays u8 because that matches the
@@ -620,6 +686,7 @@ impl EpicsValue {
                 DbFieldType::Char => Ok(Self::Char(0)),
                 DbFieldType::Long => Ok(Self::Long(0)),
                 DbFieldType::Double => Ok(Self::Double(0.0)),
+                DbFieldType::Int64 => Ok(Self::Int64(0)),
             };
         }
         match dbr_type {
@@ -651,6 +718,9 @@ impl EpicsValue {
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
             DbFieldType::Long => Self::parse_int(s)
                 .map(|v| Self::Long(v as i32))
+                .map_err(|e| CaError::InvalidValue(e.to_string())),
+            DbFieldType::Int64 => Self::parse_int(s)
+                .map(Self::Int64)
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
             DbFieldType::Double => s
                 .parse::<f64>()

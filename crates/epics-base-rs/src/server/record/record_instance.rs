@@ -65,6 +65,20 @@ fn is_metadata_field(name: &str) -> bool {
     )
 }
 
+fn parse_alarm_severity(value: &EpicsValue) -> AlarmSeverity {
+    match value {
+        EpicsValue::Short(v) => AlarmSeverity::from_u16(*v as u16),
+        EpicsValue::String(s) => AlarmSeverity::from_u16(match s.as_str() {
+            "NO_ALARM" => 0,
+            "MINOR" => 1,
+            "MAJOR" => 2,
+            "INVALID" => 3,
+            other => other.parse::<u16>().unwrap_or(0),
+        }),
+        other => AlarmSeverity::from_u16(other.to_f64().unwrap_or(0.0) as u16),
+    }
+}
+
 /// A type-erased record instance stored in the database.
 pub struct RecordInstance {
     pub name: String,
@@ -144,7 +158,9 @@ impl RecordInstance {
     pub fn new_boxed(name: String, record: Box<dyn Record>) -> Self {
         let rtype = record.record_type();
         let analog_alarm = match rtype {
-            "ai" | "ao" | "longin" | "longout" => Some(AnalogAlarmConfig::default()),
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" => {
+                Some(AnalogAlarmConfig::default())
+            }
             _ => None,
         };
         let mut common = CommonFields::default();
@@ -310,7 +326,7 @@ impl RecordInstance {
                     ..Default::default()
                 });
             }
-            "longin" | "longout" => {
+            "longin" | "longout" | "int64in" | "int64out" => {
                 let egu = self
                     .record
                     .get_field("EGU")
@@ -392,7 +408,7 @@ impl RecordInstance {
     fn populate_control_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
-            "ao" | "longout" => {
+            "ao" | "longout" | "int64out" => {
                 // Output records use DRVH/DRVL, fallback to HOPR/LOPR
                 let drvh = self.record.get_field("DRVH").and_then(|v| v.to_f64());
                 let drvl = self.record.get_field("DRVL").and_then(|v| v.to_f64());
@@ -623,6 +639,14 @@ impl RecordInstance {
                 .analog_alarm
                 .as_ref()
                 .map(|a| EpicsValue::Short(a.llsv as i16)),
+            // swait OUTN is aliased to common.out
+            "OUTN" => {
+                if self.record.record_type() == "swait" {
+                    Some(EpicsValue::String(self.common.out.clone()))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -855,45 +879,87 @@ impl RecordInstance {
             }
             "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
             "PROC" => { /* Trigger handled by put_record_field_from_ca; no-op here */ }
-            // Analog alarm fields
+            // Analog alarm fields — accept Double, Long, or String (DB-load path sends String)
             "HIHI" => {
-                if let (Some(a), EpicsValue::Double(v)) = (&mut self.common.analog_alarm, value) {
-                    a.hihi = v;
+                if let Some(a) = &mut self.common.analog_alarm {
+                    if let Some(v) = value.to_f64().or_else(|| {
+                        if let EpicsValue::String(s) = &value {
+                            s.parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    }) {
+                        a.hihi = v;
+                    }
                 }
             }
             "HIGH" => {
-                if let (Some(a), EpicsValue::Double(v)) = (&mut self.common.analog_alarm, value) {
-                    a.high = v;
+                if let Some(a) = &mut self.common.analog_alarm {
+                    if let Some(v) = value.to_f64().or_else(|| {
+                        if let EpicsValue::String(s) = &value {
+                            s.parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    }) {
+                        a.high = v;
+                    }
                 }
             }
             "LOW" => {
-                if let (Some(a), EpicsValue::Double(v)) = (&mut self.common.analog_alarm, value) {
-                    a.low = v;
+                if let Some(a) = &mut self.common.analog_alarm {
+                    if let Some(v) = value.to_f64().or_else(|| {
+                        if let EpicsValue::String(s) = &value {
+                            s.parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    }) {
+                        a.low = v;
+                    }
                 }
             }
             "LOLO" => {
-                if let (Some(a), EpicsValue::Double(v)) = (&mut self.common.analog_alarm, value) {
-                    a.lolo = v;
+                if let Some(a) = &mut self.common.analog_alarm {
+                    if let Some(v) = value.to_f64().or_else(|| {
+                        if let EpicsValue::String(s) = &value {
+                            s.parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    }) {
+                        a.lolo = v;
+                    }
                 }
             }
             "HHSV" => {
-                if let (Some(a), EpicsValue::Short(v)) = (&mut self.common.analog_alarm, value) {
-                    a.hhsv = AlarmSeverity::from_u16(v as u16);
+                if let Some(a) = &mut self.common.analog_alarm {
+                    a.hhsv = parse_alarm_severity(&value);
                 }
             }
             "HSV" => {
-                if let (Some(a), EpicsValue::Short(v)) = (&mut self.common.analog_alarm, value) {
-                    a.hsv = AlarmSeverity::from_u16(v as u16);
+                if let Some(a) = &mut self.common.analog_alarm {
+                    a.hsv = parse_alarm_severity(&value);
                 }
             }
             "LSV" => {
-                if let (Some(a), EpicsValue::Short(v)) = (&mut self.common.analog_alarm, value) {
-                    a.lsv = AlarmSeverity::from_u16(v as u16);
+                if let Some(a) = &mut self.common.analog_alarm {
+                    a.lsv = parse_alarm_severity(&value);
                 }
             }
             "LLSV" => {
-                if let (Some(a), EpicsValue::Short(v)) = (&mut self.common.analog_alarm, value) {
-                    a.llsv = AlarmSeverity::from_u16(v as u16);
+                if let Some(a) = &mut self.common.analog_alarm {
+                    a.llsv = parse_alarm_severity(&value);
+                }
+            }
+            // swait-specific: OUTN is the output link name for swait records.
+            // Mirrors to common.out so the processing framework dispatches it.
+            "OUTN" => {
+                if self.record.record_type() == "swait" {
+                    if let EpicsValue::String(s) = value {
+                        self.common.out = s;
+                        self.parsed_out = parse_link_v2(&self.common.out);
+                    }
                 }
             }
             _ => {}
@@ -934,11 +1000,12 @@ impl RecordInstance {
         }
 
         match rtype {
-            "ai" | "ao" | "longin" | "longout" => {
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" => {
                 if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
                     let val = match self.record.val() {
                         Some(EpicsValue::Double(v)) => v,
                         Some(EpicsValue::Long(v)) => v as f64,
+                        Some(EpicsValue::Int64(v)) => v as f64,
                         _ => return,
                     };
                     self.evaluate_analog_alarm(val, alarm_cfg);

@@ -15,6 +15,7 @@ pub fn dbf_to_scalar_type(dbf: DbFieldType) -> ScalarType {
         DbFieldType::Char => ScalarType::Byte,
         DbFieldType::Long => ScalarType::Int,
         DbFieldType::Double => ScalarType::Double,
+        DbFieldType::Int64 => ScalarType::Long,
     }
 }
 
@@ -31,6 +32,7 @@ pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
         EpicsValue::Char(v) => ScalarValue::Byte(*v as i8),
         EpicsValue::Long(v) => ScalarValue::Int(*v),
         EpicsValue::Double(v) => ScalarValue::Double(*v),
+        EpicsValue::Int64(v) => ScalarValue::Long(*v),
         // Arrays: take first element or default
         EpicsValue::ShortArray(a) => ScalarValue::Short(a.first().copied().unwrap_or(0)),
         EpicsValue::FloatArray(a) => ScalarValue::Float(a.first().copied().unwrap_or(0.0)),
@@ -39,6 +41,7 @@ pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
         EpicsValue::LongArray(a) => ScalarValue::Int(a.first().copied().unwrap_or(0)),
         EpicsValue::CharArray(a) => ScalarValue::Byte(a.first().copied().unwrap_or(0) as i8),
         EpicsValue::StringArray(a) => ScalarValue::String(a.first().cloned().unwrap_or_default()),
+        EpicsValue::Int64Array(a) => ScalarValue::Long(a.first().copied().unwrap_or(0)),
     }
 }
 
@@ -75,6 +78,7 @@ pub fn scalar_to_epics_typed(val: &ScalarValue, target: DbFieldType) -> EpicsVal
         DbFieldType::Double => EpicsValue::Double(scalar_to_f64(val)),
         DbFieldType::Float => EpicsValue::Float(scalar_to_f64(val) as f32),
         DbFieldType::Long => EpicsValue::Long(scalar_to_i64(val) as i32),
+        DbFieldType::Int64 => EpicsValue::Int64(scalar_to_i64(val)),
         DbFieldType::Short => EpicsValue::Short(scalar_to_i64(val) as i16),
         DbFieldType::Char => EpicsValue::Char(scalar_to_i64(val) as u8),
         DbFieldType::Enum => EpicsValue::Enum(scalar_to_i64(val) as u16),
@@ -172,6 +176,9 @@ pub fn epics_to_pv_field(val: &EpicsValue) -> PvField {
         }
         EpicsValue::StringArray(a) => {
             PvField::ScalarArray(a.iter().map(|v| ScalarValue::String(v.clone())).collect())
+        }
+        EpicsValue::Int64Array(a) => {
+            PvField::ScalarArray(a.iter().map(|v| ScalarValue::Long(*v)).collect())
         }
         other => PvField::Scalar(epics_to_scalar(other)),
     }

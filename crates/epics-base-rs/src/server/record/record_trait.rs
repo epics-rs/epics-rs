@@ -238,7 +238,7 @@ pub trait Record: Send + Sync + 'static {
     fn can_device_write(&self) -> bool {
         matches!(
             self.record_type(),
-            "ao" | "bo" | "longout" | "mbbo" | "stringout"
+            "ao" | "bo" | "longout" | "int64out" | "mbbo" | "mbboDirect" | "stringout" | "lso"
         )
     }
 

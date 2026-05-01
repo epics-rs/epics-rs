@@ -526,7 +526,7 @@ fn cmd_db_load_records() -> CommandDef {
             // Build include config from EPICS_DB_INCLUDE_PATH
             let include_paths: Vec<std::path::PathBuf> =
                 if let Ok(val) = std::env::var("EPICS_DB_INCLUDE_PATH") {
-                    std::env::split_paths(&val).collect()
+                    split_db_paths(&val)
                 } else {
                     Vec::new()
                 };
@@ -725,6 +725,47 @@ fn dbf_type_name(val: &EpicsValue) -> &'static str {
     }
 }
 
+/// Split `EPICS_DB_INCLUDE_PATH` into individual paths.
+///
+/// Supports both `;`-separated (Windows convention) and `:`-separated (Unix convention)
+/// path lists. When splitting on `:`, a single ASCII letter followed by `:` is treated
+/// as a Windows drive letter and is NOT used as a split point.
+fn split_db_paths(val: &str) -> Vec<std::path::PathBuf> {
+    if val.contains(';') {
+        return val
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect();
+    }
+    let mut paths = Vec::new();
+    let mut current = String::new();
+    for ch in val.chars() {
+        if ch == ':' {
+            let is_drive = current.len() == 1
+                && current
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_alphabetic())
+                    .unwrap_or(false);
+            if is_drive {
+                current.push(':');
+            } else {
+                if !current.is_empty() {
+                    paths.push(std::path::PathBuf::from(&current));
+                    current.clear();
+                }
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        paths.push(std::path::PathBuf::from(current));
+    }
+    paths
+}
+
 /// Map common field names to their DBF types.
 fn common_field_dbf_type(field: &str) -> Option<crate::types::DbFieldType> {
     use crate::types::DbFieldType;
@@ -892,6 +933,44 @@ mod tests {
         assert!(names.contains(&"dbLoadRecords"));
         assert!(names.contains(&"epicsEnvSet"));
         assert!(names.contains(&"exit"));
+    }
+
+    #[test]
+    fn test_split_db_paths_unix() {
+        let paths = split_db_paths("/opt/epics/db:/home/user/db");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], std::path::PathBuf::from("/opt/epics/db"));
+        assert_eq!(paths[1], std::path::PathBuf::from("/home/user/db"));
+    }
+
+    #[test]
+    fn test_split_db_paths_windows_semicolon() {
+        let paths = split_db_paths(r"C:\epics\db;D:\user\db");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], std::path::PathBuf::from(r"C:\epics\db"));
+        assert_eq!(paths[1], std::path::PathBuf::from(r"D:\user\db"));
+    }
+
+    #[test]
+    fn test_split_db_paths_windows_colon_separator() {
+        // st.cmd uses ':' separator even on Windows — must not split inside drive letter
+        let paths = split_db_paths(r"C:\epics\db:D:\user\db");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], std::path::PathBuf::from(r"C:\epics\db"));
+        assert_eq!(paths[1], std::path::PathBuf::from(r"D:\user\db"));
+    }
+
+    #[test]
+    fn test_split_db_paths_single() {
+        let paths = split_db_paths("/opt/epics/db");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], std::path::PathBuf::from("/opt/epics/db"));
+    }
+
+    #[test]
+    fn test_split_db_paths_empty() {
+        let paths = split_db_paths("");
+        assert!(paths.is_empty());
     }
 
     #[test]

@@ -18,27 +18,19 @@ epics-rs takes a different approach to this setup problem by leveraging Rust's C
 cargo build --release --workspace
 ```
 
-This makes it straightforward to spin up a new device simulator:
-
-```bash
-cargo new my-device-sim
-cd my-device-sim
-# Add epics-rs dependencies to Cargo.toml
-cargo run --release
-```
-
-The wire protocol is identical to C EPICS, so existing clients (`caget`, `camonitor`, CSS, PyDM, Phoebus) work without modification. The goal is not to replace C EPICS in production facilities, but to provide a **fast path from idea to running simulation** — where the focus stays on device logic rather than build infrastructure.
+The wire protocol is identical to C EPICS, so existing clients (`caget`, `camonitor`, `pvget`, `pvmonitor`, CSS, PyDM, Phoebus) work without modification. The goal is not to replace C EPICS in production facilities, but to provide a **fast path from idea to running simulation** — where the focus stays on device logic rather than build infrastructure.
 
 ## Overview
 
 epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
-- **Channel Access protocol** — client & server (UDP name resolution + TCP virtual circuit)
-- **pvAccess bridge** — QSRV equivalent, exposes records as PVA channels (NTScalar, NTEnum, Group PV)
-- **IOC runtime** — 23 record types, .db file loading, link chains, scan scheduling
+- **Channel Access protocol** — client & server (UDP name resolution + TCP virtual circuit, beacons, repeater)
+- **pvAccess protocol** — client & server (search engine, monitor/get/put/RPC, multi-server-on-one-host via ORIGIN_TAG forwarding)
+- **QSRV bridge** — record ↔ pvAccess bridge, exposes records as NTScalar/NTEnum/NTNDArray and Group PVs (C++ QSRV JSON format compatible)
+- **IOC runtime** — 35 base record types + .db file loader, link chains, scan scheduling, access security (ACF), iocsh
 - **asyn framework** — actor-based async port driver model
 - **Motor record** — 9-phase state machine, coordinate transforms, backlash compensation
-- **areaDetector** — NDArray, driver base, 23 plugins
+- **areaDetector** — NDArray, driver base, 26 plugins (Stats/ROI/FFT/file writers/codec/PVA push/…)
 - **Optics** — 6-DOF table record, monochromator/slit/filter/BPM controllers, X-ray absorption data
 - **Standard records** — epid (PID/MaxMin feedback), throttle (rate-limited output), timestamp
 - **Scaler** — 64-channel counter with presets, auto-count, delayed start
@@ -52,7 +44,7 @@ All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add 
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.9", features = ["ad"] }
+epics-rs = { version = "0.13", features = ["ad"] }
 ```
 
 This single dependency pulls in everything needed. In your code:
@@ -70,25 +62,27 @@ use epics_rs::asyn;        // port driver framework
 |---------|-------------|---------|
 | `ca` | Channel Access client & server | **yes** |
 | `pva` | pvAccess client & server | no |
-| `bridge` | Record <-> PVA bridge (QSRV equivalent) | no |
+| `bridge` | Record ↔ PVA bridge (QSRV equivalent) | no |
 | `asyn` | Async port driver framework | no |
 | `motor` | Motor record + SimMotor | no |
-| `ad` | areaDetector (core + 23 plugins) | no |
+| `ad` | areaDetector (core + plugins) | no |
+| `ioc` | areaDetector IOC support (records, iocsh) | no |
 | `calc` | Calc expression engine | always |
 | `autosave` | PV save/restore | always |
 | `busy` | Busy record | always |
 | `std` | Standard records (epid, throttle, timestamp) | no |
 | `scaler` | Scaler record (64-channel counter) | no |
 | `optics` | Optics (table, monochromator, slit, filter, BPM) | no |
-| `mqtt` | MQTT driver (broker bridge, FLAT/JSON) | no |
-| `full` | Everything | no |
+| `full` | Everything above | no |
+
+> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.13"` directly when needed.
 
 ```toml
 # Motor + areaDetector
-epics-rs = { version = "0.9", features = ["motor", "ad"] }
+epics-rs = { version = "0.13", features = ["motor", "ad"] }
 
 # Everything
-epics-rs = { version = "0.9", features = ["full"] }
+epics-rs = { version = "0.13", features = ["full"] }
 ```
 
 ### Individual Crates
@@ -97,8 +91,8 @@ You can also depend on sub-crates directly if you only need specific functionali
 
 ```toml
 [dependencies]
-ad-plugins-rs = "0.9"   # just the areaDetector plugins
-epics-base-rs = "0.9"   # just the IOC runtime
+ad-plugins-rs = "0.13"  # just the areaDetector plugins
+epics-base-rs = "0.13"  # just the IOC runtime
 ```
 
 ## Workspace Structure
@@ -107,15 +101,16 @@ epics-base-rs = "0.9"   # just the IOC runtime
 epics-rs/
 ├── crates/
 │   ├── epics-rs/         # Umbrella crate (feature-gated re-exports)
-│   ├── epics-base-rs/    # Core: IOC runtime, 23 record types, iocsh, db loader
+│   ├── epics-base-rs/    # Core: IOC runtime, 35 record types, iocsh, db loader
 │   ├── epics-ca-rs/      # Channel Access protocol (client + server)
-│   ├── epics-pva-rs/     # pvAccess protocol (client + server via spvirit)
-│   ├── epics-bridge-rs/  # Record <-> PVA bridge (QSRV equivalent)
+│   ├── epics-pva-rs/     # pvAccess protocol (client + server)
+│   ├── epics-bridge-rs/  # Record ↔ PVA bridge (QSRV equivalent)
 │   ├── epics-macros-rs/  # #[derive(EpicsRecord)] proc macro
+│   ├── epics-tools-rs/   # ca*-rs / pv*-rs CLI tools (caget, pvget, …)
 │   ├── asyn-rs/          # Async device I/O framework (port driver model)
 │   ├── motor-rs/         # Motor record + SimMotor
 │   ├── ad-core-rs/       # areaDetector core (NDArray, NDArrayPool, driver base)
-│   ├── ad-plugins-rs/    # 23 NDPlugins (Stats, ROI, FFT, TIFF, JPEG, HDF5, etc.)
+│   ├── ad-plugins-rs/    # 26 NDPlugins (Stats, ROI, FFT, TIFF, JPEG, HDF5, NeXus, NetCDF, PVA, …)
 │   ├── std-rs/           # Standard records (epid, throttle, timestamp) + device support
 │   ├── scaler-rs/        # Scaler record (64-channel counter) + device support
 │   ├── optics-rs/        # Optics (table, monochromator, slit, filter, BPM)
@@ -127,7 +122,7 @@ epics-rs/
     ├── xrt-beamline/     # X-ray beamline with real-time ray tracing (xrt-rs)
     ├── qsrv-ioc/         # QSRV group PV demo (PVA composite over CA records)
     ├── mqtt-ioc/         # MQTT IOC example
-    └── ...               # Other examples
+    └── ophyd-test-ioc/   # PVs expected by the bluesky/ophyd test suite
 ```
 
 ### Crate Dependency Graph
@@ -149,9 +144,10 @@ epics-rs (umbrella — feature-gated re-exports)
     │
     ├── epics-ca-rs (Channel Access protocol)
     ├── epics-pva-rs (pvAccess client + server)
-    └── epics-bridge-rs (Record <-> PVA bridge)
-             ├── epics-base-rs
-             └── epics-pva-rs
+    ├── epics-bridge-rs (Record ↔ PVA bridge)
+    │        ├── epics-base-rs
+    │        └── epics-pva-rs
+    └── epics-tools-rs (procserv-rs and CLI helpers)
 ```
 
 ## Architecture: C EPICS vs epics-rs
@@ -266,32 +262,28 @@ Adding a new record type requires only a new file in `records/` — no changes t
 
 ## Record Types
 
-| Type | Description | Value Type |
-|------|-------------|------------|
-| ai | Analog input | Double |
-| ao | Analog output | Double |
-| bi | Binary input | Enum (u16) |
-| bo | Binary output | Enum (u16) |
-| longin | Long input | Long (i32) |
-| longout | Long output | Long (i32) |
-| mbbi | Multi-bit binary input | Enum (u16) |
-| mbbo | Multi-bit binary output | Enum (u16) |
-| stringin | String input | String |
-| stringout | String output | String |
-| waveform | Array data | DoubleArray / LongArray / CharArray |
-| calc | Calculation | Double |
-| calcout | Calculation with output | Double |
-| fanout | Forward link fanout | — |
-| dfanout | Data fanout | Double |
-| seq | Sequence | Double |
-| sel | Select | Double |
-| compress | Circular buffer / N-to-1 compression | DoubleArray |
-| histogram | Signal histogram | LongArray |
-| sub | Subroutine | Double |
-| epid | Extended PID feedback (PID/MaxMin) | Double |
-| throttle | Rate-limited output | Double |
-| timestamp | Formatted timestamp string | String |
-| scaler | 64-channel 32-bit counter | Double (elapsed time) |
+`epics-base-rs` provides 35 base record types; the satellite crates add domain-specific records (`motor`, `table`, `scaler`, `epid`, `throttle`, `timestamp`).
+
+### Base records (epics-base-rs)
+
+| Group | Records |
+|-------|---------|
+| Analog / integer scalar | `ai`, `ao`, `longin`, `longout`, `int64in`, `int64out` |
+| Binary / enum | `bi`, `bo`, `mbbi`, `mbbo`, `mbbi_direct`, `mbbo_direct`, `busy` |
+| String | `stringin`, `stringout`, `lsi`, `lso`, `printf` |
+| Array / waveform | `waveform`, `compress`, `histogram` |
+| Calculation | `calc`, `calcout`, `scalcout`, `transform`, `swait`, `sub`, `asub` |
+| Sequencing / fanout | `fanout`, `dfanout`, `seq`, `sseq`, `sel`, `event` |
+| Misc | `asyn` |
+
+### Add-on records (per crate)
+
+| Crate | Records |
+|-------|---------|
+| `motor-rs` | `motor` (9-phase state machine, backlash, retries, coordinate transforms) |
+| `optics-rs` | `table` (6-DOF optical table, 4 geometry modes) |
+| `scaler-rs` | `scaler` (64-channel 32-bit counter, OneShot/AutoCount) |
+| `std-rs` | `epid` (PID/MaxMin feedback), `throttle` (rate-limited output), `timestamp` (formatted timestamp string) |
 
 ## Quick Start
 
@@ -324,21 +316,23 @@ softioc-rs --db my_ioc.db -m "P=TEST:,R=TEMP"
 
 ```bash
 caget-rs TEMP              # read
-caput-rs TEMP 42.0          # write
-camonitor-rs TEMP           # subscribe
-cainfo-rs TEMP              # metadata
+caput-rs TEMP 42.0         # write
+camonitor-rs TEMP          # subscribe
+cainfo-rs TEMP             # metadata
 ```
 
-C EPICS clients (`caget`, `camonitor`, CSS, PyDM, etc.) also work as-is.
+The default output of `caget-rs` / `camonitor-rs` / `caput-rs` / `cainfo-rs` matches the legacy C tools byte-for-byte (PV-name padded to 30 chars, `%g` 6-digit precision, double-space ts↔value, `Old : … New : …` echo). Full C-tool flag set is supported on every binary: `-V`, `-t`, `-a`, `-d`, `-c`, `-p`, `-n`, `-#`, `-S`, `-e`/`-f`/`-g`, `-s`, `-lx`/`-lo`/`-lb`, `-0x`/`-0o`/`-0b`, `-F`. C EPICS clients (`caget`, `camonitor`, CSS, PyDM, …) also work as-is.
 
 ### PVA Client Tools
 
 ```bash
 pvget-rs TEMP              # read via pvAccess
-pvmonitor-rs TEMP           # subscribe via pvAccess
-pvput-rs TEMP 42.0          # write via pvAccess
-pvinfo-rs TEMP              # PV type info
+pvmonitor-rs TEMP          # subscribe via pvAccess
+pvput-rs TEMP 42.0         # write via pvAccess
+pvinfo-rs TEMP             # PV type info
 ```
+
+Legacy `pv*` flags are wired on every PVA tool (`-V`, `-w`, `-r`, `-p`, `-M`, `-v`, `-q`, `-d`); `-M nt` output matches `pvget` byte-for-byte. First-response latency on `pvget-rs <PV>` is 5–10 ms against a local IOC.
 
 ### Library Usage
 
@@ -373,14 +367,14 @@ IocApplication::new()
 The protocol runner is pluggable — use `run_ca_pva_qsrv_ioc` for dual CA+PVA:
 
 ```rust
-// CA + PVA simultaneously
+// CA + PVA simultaneously (QSRV bridge auto-wired)
 use epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc;
-app.startup_script("ioc/st.cmd")
+
+IocApplication::new()
+    .register_device_support("myDriver", || Box::new(MyDeviceSupport::new()))
+    .startup_script("ioc/st.cmd")
     .run(run_ca_pva_qsrv_ioc)
     .await?;
-    let pva = PvaServer::new(config.db.clone(), 5075);
-    epics_base_rs::runtime::select! { _ = ca.run() => {}, _ = pva.run() => {} }
-}).await
 ```
 
 st.cmd uses **the same syntax as C++ EPICS** (`iocInit()` is called automatically after the script completes):
@@ -399,6 +393,18 @@ use epics_rs::ca::client::CaClient;
 let client = CaClient::new().await?;
 let (_type, value) = client.caget("TEMP").await?;
 client.caput("TEMP", "42.0").await?;
+```
+
+#### PVA Client Library
+
+```rust
+use epics_pva_rs::client::PvaClient;
+
+let client = PvaClient::new().await?;
+let value = client.get("TEMP").await?;
+client.put("TEMP", 42.0).await?;
+let mut sub = client.monitor("TEMP").await?;
+while let Some(update) = sub.recv().await { /* … */ }
 ```
 
 ### Runtime Interface
@@ -430,7 +436,7 @@ IOC binaries and device support implementations should use `epics_base_rs::runti
 
 ### epics-base-rs (core)
 
-IOC runtime, 23 record types, iocsh, .db file loader, access security, autosave integration, calc engine, busy record.
+IOC runtime, 35 base record types, iocsh, .db file loader, access security, autosave integration, calc engine, busy record.
 
 - Record system with `#[derive(EpicsRecord)]` proc macro
 - PvDatabase with record processing chains (FLNK, INP/OUT links)
@@ -439,16 +445,23 @@ IOC runtime, 23 record types, iocsh, .db file loader, access security, autosave 
 
 ### epics-ca-rs
 
-Channel Access protocol client and server.
+Channel Access protocol — client and server.
 
 - UDP name resolution + TCP virtual circuit
 - Extended CA header (>64 KB payloads)
 - Beacon emitter with reset on connect/disconnect
 - Monitor subscriptions with deadband filtering
+- `EPICS_CA_ADDR_LIST` hostname resolution with graceful skip on unresolvable tokens
+- Full C-tool flag parity on every CLI binary (`-V`/`-t`/`-a`/`-#`/`-S`/`-e`/`-f`/`-g`/`-s`/`-l[xob]`/`-0[xob]`/`-F`)
 
 ### epics-pva-rs
 
-pvAccess protocol client.
+pvAccess protocol — client and server.
+
+- **Client** — search engine (pvxs `Multi`/`FindAll` parity, deadline-aware tick), cached channels, `pvget`/`pvput`/`pvmonitor`/RPC, `pvRequest` field selection, hostname resolution in `EPICS_PVA_ADDR_LIST`
+- **Server** — TCP virtual circuit, UDP responder, beacons, `CMD_DESTROY_CHANNEL` propagation, `CMD_MESSAGE` log forwarding, RPC INIT/DATA wire-shape compatible with pvxs/pvAccessCPP
+- **ORIGIN_TAG forwarding** — pvxs UDP-collector mechanism for multi-server-on-one-host topologies (`224.0.0.128` loopback multicast)
+- **Auto-address list** — per-NIC IPv4 broadcast + `127.0.0.1` enumeration on macOS/Linux
 
 ### epics-bridge-rs
 
@@ -489,7 +502,7 @@ areaDetector framework:
 - **NDArray** — N-dimensional typed array (10 data types)
 - **NDArrayPool** — free-list buffer reuse
 - **ADDriverBase** — detector driver base (Single/Multiple/Continuous modes)
-- **23 plugins** — Stats, ROI, ROIStat, Process, Transform, ColorConvert, Overlay, FFT, TimeSeries, CircularBuff, Codec, Gather, Scatter, StdArrays, FileTIFF, FileJPEG, FileHDF5, Attribute, AttrPlot, BadPixel, PosPlugin, Passthrough
+- **26 plugins** — Stats, ROI, ROIStat, Process, Transform, ColorConvert, Overlay, FFT, TimeSeries, CircularBuff, Codec, Gather, Scatter, StdArrays, FileTIFF, FileJPEG, FileHDF5, FileNeXus, FileNetCDF, FileMagick, Attribute, AttrPlot, BadPixel, PosPlugin, Passthrough, Pva (NTNDArray push)
 - **Parallel processing** — rayon data-parallelism for CPU-heavy plugins (Stats, ROIStat, ColorConvert, Process). Shared thread pool sized to `available_cores - 2` to leave headroom for driver threads and the async runtime. Enabled by default; see [ad-plugins README](crates/ad-plugins-rs/README.md#parallel-processing)
 
 #### Async acquisition API
@@ -687,6 +700,20 @@ pydm opi/pydm/ADTop.ui -m "P=mini:dot:,R=cam1:"
 
 ---
 
+### ophyd-test-ioc — Ophyd Test Suite IOC
+
+Provides the PVs expected by [bluesky/ophyd](https://github.com/bluesky/ophyd)'s test suite, replacing the Docker-based [epics-services-for-ophyd](https://github.com/bluesky/epics-services-for-ophyd). 9 SimMotor instances, 6 soft-channel sensors, and a MovingDot 2D area detector with the standard plugin chain.
+
+**Build and run:**
+
+```bash
+cargo run --release -p ophyd-test-ioc --bin ophyd_test_ioc -- examples/ophyd-test-ioc/ioc/st.cmd
+```
+
+See [examples/ophyd-test-ioc/README.md](examples/ophyd-test-ioc/README.md) for the full PV list.
+
+---
+
 ### sim-detector — areaDetector Simulation
 
 A full-featured simulated areaDetector driver matching the C++ [ADSimDetector](https://github.com/areaDetector/ADSimDetector). Supports four simulation modes (LinearRamp, Peaks, Sine, OffsetNoise) with configurable gains, peak positions, and noise. Includes the full plugin chain (Stats, ROI, FFT, file writers, etc.) via `commonPlugins.cmd`.
@@ -785,7 +812,10 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 | `caput-rs` | Write PV value |
 | `camonitor-rs` | Subscribe to PV changes |
 | `cainfo-rs` | Display PV metadata |
-| `ca-repeater-rs` | CA name resolver |
+| `ca-repeater-rs` | CA repeater daemon |
+| `ca-replay-rs` | Capture / replay CA wire traffic |
+| `ca-lint-rs` | CA wire-format diagnostics |
+| `ca-admin-rs` | CA server administration |
 
 ### pvAccess Tools
 
@@ -795,12 +825,20 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 | `pvput-rs` | PVA write |
 | `pvmonitor-rs` | PVA subscribe |
 | `pvinfo-rs` | PVA metadata |
+| `pvcall-rs` | PVA RPC call |
+| `pvlist-rs` | List PVA servers |
+| `pvxvct-rs` | PVA virtual-circuit inspector |
 
-### IOC & Tools
+### IOC & Gateways
 
 | Binary | Description |
 |--------|-------------|
-| `softioc-rs` | Soft IOC server |
+| `softioc-rs` | Soft IOC server (CA) |
+| `qsrv-rs` | QSRV-style CA + PVA dual IOC |
+| `ca-gateway-rs` | CA → CA gateway |
+| `pva-gateway-rs` | PVA → PVA gateway |
+| `dual-gateway-rs` | CA ↔ PVA bidirectional gateway |
+| `procserv-rs` | `procServ`-compatible IOC supervisor |
 
 ## Feature Flags
 
@@ -815,11 +853,11 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 ## Testing
 
 ```bash
-# All tests (2,500+)
+# All tests (3,000+)
 cargo test --workspace
 ```
 
-Test coverage: protocol encoding, wire format golden packets, snapshot generation, GR/CTRL metadata serialization, record processing, link chains, calc engine, .db parsing, access security, autosave, iocsh, IOC builder, event scheduling, motor state machine, asyn port driver, PID algorithms, scaler state machine, optics table record (46 golden tests vs C), crystallography, X-ray absorption, monochromator/slit/filter/BPM controllers, derive macros, pvAccess serialization, etc.
+Test coverage: protocol encoding, wire-format golden packets (CA + PVA), pvxs interop fixtures, search-engine deadline scheduling, ORIGIN_TAG forwarding, snapshot generation, GR/CTRL metadata serialization, record processing, link chains, calc engine, .db parsing, access security, autosave, iocsh, IOC builder, event scheduling, motor state machine, asyn port driver, PID algorithms, scaler state machine, optics table record (46 golden tests vs C), crystallography, X-ray absorption, monochromator/slit/filter/BPM controllers, derive macros, etc.
 
 ## Requirements
 

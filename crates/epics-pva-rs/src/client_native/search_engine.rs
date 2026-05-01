@@ -16,7 +16,7 @@
 //!   that channel immediately.
 //! - Beacon anomaly throttling via [`super::beacon_throttle::BeaconTracker`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -516,7 +516,7 @@ async fn run_engine(
     // Matches the new server-side recv buffer (server_native/udp.rs).
     let mut search_buf = vec![0u8; 64 * 1024];
     let mut beacon_buf = vec![0u8; 64 * 1024];
-    let mut search_send_errs: HashMap<SocketAddr, bool> = HashMap::new();
+    let mut search_send_errs: HashSet<SocketAddr> = HashSet::new();
 
     loop {
         // Build a beacon-recv future regardless of whether we bound it
@@ -974,7 +974,7 @@ async fn broadcast(
     socket: &AsyncUdpV4,
     packet: &[u8],
     extra_targets: &[SocketAddr],
-    send_errs: &mut HashMap<SocketAddr, bool>,
+    send_errs: &mut HashSet<SocketAddr>,
 ) {
     let mut targets: Vec<SocketAddr> = Vec::with_capacity(8);
 
@@ -1046,7 +1046,7 @@ async fn broadcast(
                 send_errs.remove(&t);
             }
             Err(e) => {
-                if send_errs.insert(t, true).is_none() {
+                if send_errs.insert(t) {
                     warn!("search broadcast to {t} failed: {e}");
                 } else {
                     debug!("search broadcast to {t} failed: {e}");

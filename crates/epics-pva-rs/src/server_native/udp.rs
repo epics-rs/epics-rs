@@ -4,6 +4,7 @@
 //! SEARCH_RESPONSE messages naming our TCP endpoint. Beacons are emitted
 //! periodically to advertise our presence.
 
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -166,8 +167,7 @@ pub async fn run_udp_responder_with_config(
         let mut change_count: u16 = 0;
         let mut last_set_hash: u64 = 0;
         let mut emitted: u32 = 0;
-        let mut beacon_send_errs: std::collections::HashMap<SocketAddr, bool> =
-            std::collections::HashMap::new();
+        let mut beacon_send_errs: HashSet<SocketAddr> = HashSet::new();
         loop {
             let cur_period = if emitted < beacon_burst_count as u32 {
                 beacon_period
@@ -219,7 +219,7 @@ pub async fn run_udp_responder_with_config(
                         beacon_send_errs.remove(dest);
                     }
                     Err(e) => {
-                        if beacon_send_errs.insert(*dest, true).is_none() {
+                        if beacon_send_errs.insert(*dest) {
                             warn!("beacon TX to {dest} failed: {e}");
                         } else {
                             debug!("beacon TX to {dest} failed: {e}");

@@ -25,6 +25,7 @@
 
 use std::io::Cursor;
 
+use crate::decode_err;
 use super::TypedScalarArray;
 use super::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue};
 
@@ -314,7 +315,6 @@ where
         }
     }
 }
-use crate::decode_err;
 use crate::proto::{
     ByteOrder, DecodeError, ReadExt, WriteExt, decode_size, decode_string, encode_size_into,
     encode_string_into,

@@ -934,7 +934,7 @@ impl RecordInstance {
         }
 
         match rtype {
-            "ai" | "ao" | "longin" | "longout" => {
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" => {
                 if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
                     let val = match self.record.val() {
                         Some(EpicsValue::Double(v)) => v,

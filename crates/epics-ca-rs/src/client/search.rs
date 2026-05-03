@@ -781,7 +781,9 @@ fn handle_udp_response(
 /// gets a UDP retransmit and is then re-armed into a future bucket
 /// using pvxs's `nSearch+1` escalation (`tickSearch` line 1193-1196):
 ///
-///     next = (idx + min(attempt, nBuckets)) % nBuckets
+/// ```text
+/// next = (idx + min(attempt, nBuckets)) % nBuckets
+/// ```
 ///
 /// `attempt` is bumped immediately after the send so the first
 /// retry lands at idx+1 (1 s later), the second at idx+2 (2 s

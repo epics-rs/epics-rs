@@ -4,8 +4,38 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::sync::oneshot;
+use epics_base_rs::types::DbFieldType;
 
 use crate::channel::AccessRights;
+use crate::client::state::ChannelState;
+
+// --- Channel snapshot sidecar (Option C, Phase B) ---
+
+/// Immutable, per-channel snapshot published by the coordinator
+/// whenever lifecycle state changes. CaChannel hot paths
+/// (`ch.get` / `ch.put` / `ch.subscribe`) read from this map
+/// directly instead of round-tripping `CoordRequest::GetChannelInfo`
+/// for every operation.
+///
+/// The coordinator inserts/updates an entry on every relevant
+/// `TransportEvent` (ChannelCreated, AccessRightsChanged, …) and
+/// removes it on Drop. Stale-read window: a tiny race exists where
+/// a CaChannel sees an old snapshot for one nanosecond after a
+/// state change; that's acceptable because the request will either
+/// fail at the server (which already knows the new state) or get
+/// retried on disconnect drain.
+#[derive(Clone)]
+pub(crate) struct ChannelSnapshotPublic {
+    pub sid: u32,
+    pub native_type: DbFieldType,
+    pub element_count: u32,
+    pub server_addr: SocketAddr,
+    pub access_rights: AccessRights,
+    pub state: ChannelState,
+}
+
+/// Shared snapshot registry. Coordinator publishes; CaChannel reads.
+pub(crate) type ChannelSnapshots = Arc<DashMap<u32, ChannelSnapshotPublic>>;
 
 // --- Direct in-flight op registries (Option C) ---
 

@@ -209,6 +209,10 @@ pub struct CaClient {
     /// here directly; the per-server read loop removes and fulfils
     /// them on response arrival without a coordinator round-trip.
     in_flight: InFlightOps,
+    /// Per-channel snapshot sidecar (Option C, Phase B). Coordinator
+    /// publishes channel state on every lifecycle change; CaChannel
+    /// hot paths read directly without a `GetChannelInfo` round-trip.
+    snapshots: ChannelSnapshots,
     diagnostics: Arc<CaDiagnostics>,
     _coordinator: tokio::task::JoinHandle<()>,
     _search_task: tokio::task::JoinHandle<()>,
@@ -227,10 +231,6 @@ enum CoordRequest {
     WaitConnected {
         cid: u32,
         reply: oneshot::Sender<()>,
-    },
-    GetChannelInfo {
-        cid: u32,
-        reply: oneshot::Sender<Option<ChannelSnapshot>>,
     },
     Subscribe {
         cid: u32,
@@ -298,17 +298,6 @@ enum CoordRequest {
     Shutdown {
         reply: oneshot::Sender<()>,
     },
-}
-
-#[derive(Clone)]
-struct ChannelSnapshot {
-    sid: u32,
-    native_type: DbFieldType,
-    element_count: u32,
-    server_addr: SocketAddr,
-    access_rights: AccessRights,
-    state: ChannelState,
-    pv_name: String,
 }
 
 /// Optional configuration knobs for `CaClient::new_with_config`.
@@ -479,6 +468,7 @@ impl CaClient {
         });
 
         let in_flight = InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
 
         let transport_task = {
             #[cfg(feature = "experimental-rust-tls")]
@@ -511,6 +501,7 @@ impl CaClient {
             search_tx.clone(),
             transport_tx.clone(),
             in_flight.clone(),
+            snapshots.clone(),
             diagnostics.clone(),
         ));
 
@@ -523,6 +514,7 @@ impl CaClient {
             transport_tx,
             coord_tx,
             in_flight,
+            snapshots,
             diagnostics,
             _coordinator: coordinator,
             _search_task: search_task,
@@ -599,6 +591,7 @@ impl CaClient {
             coord_tx: self.coord_tx.clone(),
             transport_tx: self.transport_tx.clone(),
             in_flight: self.in_flight.clone(),
+            snapshots: self.snapshots.clone(),
             conn_tx,
             _lifecycle: lifecycle,
         }
@@ -639,16 +632,7 @@ impl CaClient {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: ch.cid,
-            reply: reply_tx,
-        });
-        let snap = reply_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
+        let snap = ch.snapshot()?;
         let value = EpicsValue::parse(snap.native_type, value_str)?;
         ch.put_nowait(&value).await?;
         let _ = self
@@ -668,16 +652,7 @@ impl CaClient {
         let timeout = Duration::from_secs_f64(timeout_secs);
         ch.wait_connected(timeout).await?;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: ch.cid,
-            reply: reply_tx,
-        });
-        let snap = reply_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
+        let snap = ch.snapshot()?;
         let value = EpicsValue::parse(snap.native_type, value_str)?;
         ch.put_with_timeout(&value, timeout).await?;
         let _ = self
@@ -690,27 +665,11 @@ impl CaClient {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: ch.cid,
-            reply: reply_tx,
-        });
-        let snap = reply_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
+        let info = ch.info().await;
         let _ = self
             .coord_tx
             .send(CoordRequest::DropChannel { cid: ch.cid });
-
-        Ok(ChannelInfo {
-            pv_name: snap.pv_name,
-            server_addr: snap.server_addr,
-            native_type: snap.native_type,
-            element_count: snap.element_count,
-            access_rights: snap.access_rights,
-        })
+        info
     }
 
     /// Monitor a PV with callback (legacy API).
@@ -762,6 +721,9 @@ pub struct CaChannel {
     /// loop. The transport's per-server read loop fulfils them on
     /// `ReadResponse` / `WriteResponse` arrival.
     in_flight: InFlightOps,
+    /// Per-channel snapshot sidecar (Option C, Phase B). Read by hot
+    /// paths in lieu of `CoordRequest::GetChannelInfo`.
+    snapshots: ChannelSnapshots,
     conn_tx: broadcast::Sender<ConnectionEvent>,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
@@ -783,20 +745,9 @@ impl CaChannel {
     /// Get channel-level metadata (native type, element count, host, access rights)
     /// without performing a CA read.
     pub async fn info(&self) -> CaResult<ChannelInfo> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
         Ok(ChannelInfo {
-            pv_name: snap.pv_name,
+            pv_name: self.pv_name.clone(),
             server_addr: snap.server_addr,
             native_type: snap.native_type,
             element_count: snap.element_count,
@@ -804,24 +755,24 @@ impl CaChannel {
         })
     }
 
+    /// Phase B fast-path: read the channel's published snapshot without
+    /// touching the coordinator. Returns `Disconnected` if either no
+    /// snapshot is published yet (channel is searching/connecting/
+    /// failed-to-resolve native type) or the snapshot reflects a
+    /// non-operational state.
+    fn snapshot(&self) -> CaResult<ChannelSnapshotPublic> {
+        match self.snapshots.get(&self.cid) {
+            Some(s) if s.state.is_operational() => Ok(s.clone()),
+            _ => Err(CaError::Disconnected),
+        }
+    }
+
     pub async fn get(&self) -> CaResult<(DbFieldType, EpicsValue)> {
         self.get_with_timeout(Duration::from_secs(30)).await
     }
 
     pub async fn get_with_timeout(&self, timeout: Duration) -> CaResult<(DbFieldType, EpicsValue)> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -870,19 +821,7 @@ impl CaChannel {
     /// Get a PV value with metadata, requesting at most `count` elements.
     /// Pass 0 for the full element count.
     pub async fn get_with_metadata_count(&self, class: DbrClass, count: u32) -> CaResult<Snapshot> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
 
         let request_count = if count > 0 {
             count.min(snap.element_count)
@@ -923,19 +862,7 @@ impl CaChannel {
     }
 
     pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -966,19 +893,7 @@ impl CaChannel {
 
     /// Write with completion callback and configurable timeout.
     pub async fn put_with_timeout(&self, value: &EpicsValue, timeout: Duration) -> CaResult<()> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1007,19 +922,7 @@ impl CaChannel {
     /// waiting for server acknowledgement. Used by ophyd's EpicsMotor.set()
     /// which monitors DMOV for completion instead.
     pub async fn put_nowait(&self, value: &EpicsValue) -> CaResult<()> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
@@ -1249,6 +1152,7 @@ async fn run_coordinator(
     search_tx: mpsc::UnboundedSender<SearchRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     in_flight: types::InFlightOps,
+    snapshots: ChannelSnapshots,
     diag: Arc<CaDiagnostics>,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
@@ -1320,20 +1224,6 @@ async fn run_coordinator(
                                 .or_default()
                                 .push(reply);
                         }
-                    }
-                    CoordRequest::GetChannelInfo { cid, reply } => {
-                        let snap = channels.get(&cid).and_then(|ch| {
-                            Some(ChannelSnapshot {
-                                sid: ch.sid,
-                                native_type: ch.native_type?,
-                                element_count: ch.element_count,
-                                server_addr: ch.server_addr?,
-                                access_rights: ch.access_rights,
-                                state: ch.state,
-                                pv_name: ch.pv_name.clone(),
-                            })
-                        });
-                        let _ = reply.send(snap);
                     }
                     CoordRequest::Subscribe { cid, subid, mask, deadband, callback_tx, reply } => {
                         if let Some(ch) = channels.get(&cid) {
@@ -1459,6 +1349,7 @@ async fn run_coordinator(
                             }
                         }
                         channels.remove(&cid);
+                        snapshots.remove(&cid);
                     }
                     CoordRequest::GetWatchdogDelay { cid, reply } => {
                         let delay = channels.get(&cid).and_then(|ch| {
@@ -1658,6 +1549,27 @@ async fn run_coordinator(
                             ch.access_rights = access;
                             ch.last_connected_at = Some(std::time::Instant::now());
 
+                            // Phase B: publish snapshot for fast-path readers.
+                            // Only publish if we have a usable native_type;
+                            // otherwise the channel is still effectively
+                            // unusable and CaChannel hot paths should fall
+                            // back to "no snapshot → Disconnected".
+                            if let Some(dbr) = dbr_type {
+                                snapshots.insert(
+                                    cid,
+                                    types::ChannelSnapshotPublic {
+                                        sid,
+                                        native_type: dbr,
+                                        element_count,
+                                        server_addr,
+                                        access_rights: access,
+                                        state: ChannelState::Connected,
+                                    },
+                                );
+                            } else {
+                                snapshots.remove(&cid);
+                            }
+
                             if was_disconnected {
                                 tracing::info!(pv = %ch.pv_name, cid, sid, server = %server_addr, "channel reconnected");
                             } else {
@@ -1731,6 +1643,9 @@ async fn run_coordinator(
                                 read: access.read,
                                 write: access.write,
                             });
+                            if let Some(mut snap) = snapshots.get_mut(&cid) {
+                                snap.access_rights = access;
+                            }
                         }
                     }
                     TransportEvent::ChannelCreateFailed { cid } => {
@@ -1741,6 +1656,7 @@ async fn run_coordinator(
                             // the channel will immediately re-search and may
                             // still connect before the caller's timeout.
                             ch.state = ChannelState::Disconnected;
+                            snapshots.remove(&cid);
                             let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
                             let _ = search_tx.send(SearchRequest::Schedule {
                                 cid,
@@ -1770,7 +1686,7 @@ async fn run_coordinator(
                         flow_control.remove(&server_addr);
                         last_rx_at.remove(&server_addr);
                         server_minor_version.remove(&server_addr);
-                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, server_addr, &diag, &in_flight);
+                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, server_addr, &diag, &in_flight, &snapshots);
                     }
                     TransportEvent::ServerDisconnect { cid, server_addr } => {
                         // Single channel disconnect (CA_PROTO_SERVER_DISCONN).
@@ -1788,6 +1704,7 @@ async fn run_coordinator(
                         if let Some(ch) = channels.get_mut(&cid) {
                             if ch.server_addr == Some(server_addr) {
                                 ch.state = ChannelState::Disconnected;
+                                snapshots.remove(&cid);
                                 let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
 
                                 let cids = vec![cid];
@@ -1825,6 +1742,9 @@ async fn run_coordinator(
                                 && ch.state == ChannelState::Connected
                             {
                                 ch.state = ChannelState::Unresponsive;
+                                if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
+                                    snap.state = ChannelState::Unresponsive;
+                                }
                                 let _ = ch.conn_tx.send(ConnectionEvent::Unresponsive);
                             }
                         }
@@ -1837,6 +1757,9 @@ async fn run_coordinator(
                                 && ch.state == ChannelState::Unresponsive
                             {
                                 ch.state = ChannelState::Connected;
+                                if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
+                                    snap.state = ChannelState::Connected;
+                                }
                                 let _ = ch.conn_tx.send(ConnectionEvent::Connected);
                             }
                         }
@@ -1864,6 +1787,7 @@ fn handle_disconnect(
     server_addr: SocketAddr,
     diag: &CaDiagnostics,
     in_flight: &types::InFlightOps,
+    snapshots: &ChannelSnapshots,
 ) {
     let mut affected_cids = Vec::new();
     let now = std::time::Instant::now();
@@ -1873,6 +1797,7 @@ fn handle_disconnect(
             && (ch.state.is_operational() || ch.state == ChannelState::Connecting)
         {
             ch.state = ChannelState::Disconnected;
+            snapshots.remove(&ch.cid);
             affected_cids.push(ch.cid);
             let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
 

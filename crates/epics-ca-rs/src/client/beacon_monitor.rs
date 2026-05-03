@@ -38,8 +38,29 @@ pub(crate) enum BeaconAnomalyKind {
 struct BeaconState {
     last_id: u32,
     last_seen: Instant,
-    /// Estimated period between beacons (exponential moving average).
-    period_estimate: Duration,
+    /// Estimated period between beacons (exponential moving average,
+    /// alpha = 0.25). `None` until the second beacon arrives — at
+    /// which point we adopt the first observed inter-beacon
+    /// interval as the initial estimate. Mirrors libca `bhe.cpp:51`
+    /// where `averagePeriod = -DBL_MAX` is the "no estimate yet"
+    /// sentinel and `bhe.cpp:199` sets it to the first measured
+    /// `currentPeriod`.
+    ///
+    /// Why this matters: hardcoding the initial estimate (we used
+    /// `Duration::from_secs(15)`) made the EMA start from a value
+    /// that was unrelated to the actual server's beacon cadence.
+    /// During the standard rsrv `online_notify_task` ramp-up
+    /// (server-side beacon emitter starts at 20 ms and doubles up
+    /// to 15 s — which `epics-ca-rs/src/server/beacon.rs` also
+    /// implements), the first 4-8 beacons all have intervals well
+    /// below 15 s / 3, so the PeriodCollapse branch (which fires
+    /// when `actual_interval < period_estimate / 3`) tripped on
+    /// every one of them. That cascaded into the transport
+    /// watchdog flag → echo probe → 5 s timeout → spurious
+    /// disconnect → user-visible `get_with_metadata(timeout=2.0)`
+    /// failures observed in the mini-beamline IOC against its own
+    /// epics-ca-rs server.
+    period_estimate: Option<Duration>,
     count: u64,
 }
 
@@ -305,7 +326,7 @@ fn handle_beacon(
     let entry = servers.entry(server_addr).or_insert_with(|| BeaconState {
         last_id: beacon_id.wrapping_sub(1),
         last_seen: now,
-        period_estimate: Duration::from_secs(15),
+        period_estimate: None,
         count: 0,
     });
 
@@ -392,7 +413,9 @@ fn handle_beacon(
         Some(BeaconAnomalyKind::IdMismatch)
     } else if entry.count > 3
         && actual_interval > MIN_PERIOD_COLLAPSE_INTERVAL
-        && actual_interval < entry.period_estimate / 3
+        && entry
+            .period_estimate
+            .is_some_and(|est| actual_interval < est / 3)
     {
         Some(BeaconAnomalyKind::PeriodCollapse)
     } else {
@@ -405,12 +428,25 @@ fn handle_beacon(
     entry.count += 1;
 
     if entry.count > 1 {
-        let alpha = 0.25;
-        let new_estimate = Duration::from_secs_f64(
-            entry.period_estimate.as_secs_f64() * (1.0 - alpha)
-                + actual_interval.as_secs_f64() * alpha,
-        );
-        entry.period_estimate = new_estimate;
+        // First observed inter-beacon interval defines the initial
+        // estimate; subsequent samples blend in via the EMA. Mirrors
+        // libca `bhe.cpp:199` (`this->averagePeriod = currentPeriod`
+        // on the second beacon, after the `averagePeriod < 0.0`
+        // sentinel guard). See `BeaconState::period_estimate` doc
+        // for why a hardcoded 15 s placeholder caused a false
+        // PeriodCollapse cascade against ramp-up beacon emitters.
+        match entry.period_estimate {
+            None => {
+                entry.period_estimate = Some(actual_interval);
+            }
+            Some(prev) => {
+                let alpha = 0.25;
+                let new_estimate = Duration::from_secs_f64(
+                    prev.as_secs_f64() * (1.0 - alpha) + actual_interval.as_secs_f64() * alpha,
+                );
+                entry.period_estimate = Some(new_estimate);
+            }
+        }
     }
 
     // Search-engine wake-up (libca `udpiiu::beaconAnomalyNotify`):
@@ -619,7 +655,7 @@ mod tests {
             BeaconState {
                 last_id: 99,
                 last_seen: Instant::now() - Duration::from_millis(200),
-                period_estimate: Duration::from_secs(15),
+                period_estimate: Some(Duration::from_secs(15)),
                 count: 10,
             },
         );
@@ -645,6 +681,88 @@ mod tests {
     /// increasing ids must NOT trip the period-collapse branch — only
     /// the `first_sighting = true` path on the very first beacon. This
     /// tests that the 50 ms floor doesn't fire spurious anomalies on
+    /// Regression guard: rsrv `online_notify_task` ramp-up beacons
+    /// (20 ms doubling to 15 s — same pattern epics-ca-rs's own
+    /// `server/beacon.rs` emits) must NOT fire a stream of
+    /// `PeriodCollapse` anomalies on the FIRST sighting of a
+    /// freshly-started IOC. Pre-fix the per-server initial
+    /// `period_estimate = Duration::from_secs(15)` placeholder
+    /// caused every ramp-up beacon past the 50 ms floor (so the
+    /// 4th beacon onwards) to satisfy
+    /// `actual_interval < 15 s / 3 = 5 s` and trip
+    /// `PeriodCollapse`. Mini-beamline IOC users observed this as
+    /// 5-s `get_with_metadata(timeout=2.0)` failures driven by the
+    /// transport watchdog flag → echo probe → reconnect cascade
+    /// downstream. Fix mirrors libca `bhe.cpp:51,199` where
+    /// `averagePeriod = -DBL_MAX` until the first measured
+    /// `currentPeriod` defines it.
+    ///
+    /// We reproduce the standard rsrv ramp-up: 20 ms, 40 ms,
+    /// 80 ms, 160 ms, 320 ms, 640 ms, 1.28 s, 2.56 s, 5.12 s,
+    /// 10.24 s, then capped at 15 s. Only the very first beacon
+    /// should fire (FirstSighting). All subsequent ramp-up
+    /// beacons must classify as steady-state (no anomaly).
+    #[test]
+    fn rsrv_rampup_beacons_do_not_fire_period_collapse() {
+        // Drive `handle_beacon` directly with a controlled
+        // BeaconState so we can advance `last_seen` artificially —
+        // the real implementation uses `Instant::now()` and we'd
+        // need full virtual time to drive 11 beacons across 30+ s.
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.count = 5064;
+        hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
+        hdr.cid = 0;
+
+        // Beacon #1 — first sighting.
+        handle_beacon(hdr, &mut servers, &tx);
+        // Drain the FirstSighting event.
+        let mut first_sighting_seen = false;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(
+                msg,
+                CoordRequest::ForceRescanServer {
+                    kind: BeaconAnomalyKind::FirstSighting,
+                    ..
+                }
+            ) {
+                first_sighting_seen = true;
+            }
+        }
+        assert!(first_sighting_seen, "first beacon must fire FirstSighting");
+
+        // Subsequent ramp-up: roll `last_seen` back so each
+        // simulated interval is what we want, then handle_beacon
+        // computes `actual_interval = now - last_seen`.
+        let intervals_ms = [20u64, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
+        for (i, &ms) in intervals_ms.iter().enumerate() {
+            // Reach into the entry to back-date last_seen by `ms`.
+            let s = servers.get_mut(&server).expect("entry");
+            s.last_seen = std::time::Instant::now() - Duration::from_millis(ms);
+            hdr.cid = (i as u32) + 1;
+            handle_beacon(hdr, &mut servers, &tx);
+
+            // Inspect every emitted CoordRequest; PeriodCollapse
+            // would surface as a `ForceRescanServer { kind:
+            // PeriodCollapse, .. }` here — and that's the bug.
+            while let Ok(msg) = rx.try_recv() {
+                if let CoordRequest::ForceRescanServer { kind, .. } = msg {
+                    assert_ne!(
+                        kind,
+                        BeaconAnomalyKind::PeriodCollapse,
+                        "ramp-up beacon #{} (interval={} ms) must not classify \
+                         as PeriodCollapse — see BeaconState::period_estimate doc",
+                        i + 2,
+                        ms
+                    );
+                }
+            }
+        }
+    }
+
     /// healthy fast cadences.
     #[test]
     fn fast_cadence_monotonic_ids_does_not_fire_spurious_anomaly() {
@@ -864,7 +982,7 @@ mod tests {
             BeaconState {
                 last_id: 0,
                 last_seen: now - Duration::from_secs(10),
-                period_estimate: Duration::from_secs(15),
+                period_estimate: Some(Duration::from_secs(15)),
                 count: 5,
             },
         );
@@ -873,7 +991,7 @@ mod tests {
             BeaconState {
                 last_id: 0,
                 last_seen: now - Duration::from_secs(300),
-                period_estimate: Duration::from_secs(15),
+                period_estimate: Some(Duration::from_secs(15)),
                 count: 5,
             },
         );

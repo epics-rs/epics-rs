@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.13.6 — 2026-05-03
+
+Fixes a false-positive `PeriodCollapse` cascade against IOCs that
+emit standard `online_notify_task` ramp-up beacons (20 ms doubling
+to 15 s) — including epics-ca-rs's own server, so an IOC built on
+this crate would trip its own client-side beacon monitor on every
+fresh run. Symptom in the field: `get_with_metadata(timeout=2.0)`
+against the mini-beamline IOC failed for the first ~10 s of the
+run, driven by transport watchdog flag → echo probe → 5 s
+timeout → spurious channel disconnect.
+
+### epics-ca-rs
+
+- **fix**: `BeaconState::period_estimate` is now `Option<Duration>`
+  with `None` initial. The first observed inter-beacon interval is
+  adopted as the initial estimate (libca `bhe.cpp:51,199` parity:
+  `averagePeriod = -DBL_MAX` until `averagePeriod = currentPeriod`
+  on the second beacon), and the EMA blends in from there. The
+  prior `Duration::from_secs(15)` placeholder caused every
+  ramp-up beacon past the 50 ms `MIN_PERIOD_COLLAPSE_INTERVAL`
+  floor to satisfy `actual_interval < period_estimate / 3` and
+  classify as `PeriodCollapse`. The PeriodCollapse classification
+  now skips when `period_estimate.is_none()`, which is by
+  construction true until the second beacon — and after that
+  the EMA tracks the actual server cadence rather than a hardcoded
+  guess.
+- **test**: regression guard
+  `rsrv_rampup_beacons_do_not_fire_period_collapse` simulates the
+  full 11-beacon ramp-up sequence (20 ms, 40 ms, …, 10.24 s) and
+  asserts no `PeriodCollapse` fires past the initial
+  `FirstSighting`. Total `epics-ca-rs --lib` is now 96 tests.
+
 ## v0.13.5 — 2026-05-03
 
 Doctest-only patch on top of v0.13.4. The `process_bucket` doc

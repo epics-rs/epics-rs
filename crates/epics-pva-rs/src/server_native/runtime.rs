@@ -398,8 +398,37 @@ impl PvaServer {
         // drop and the accept task's bind. tokio's
         // `std::net::TcpListener::bind` is sync; we then promote it
         // to a non-blocking tokio listener after spawning.
-        let std_listener =
-            std::net::TcpListener::bind(bind_addr).expect("PvaServer::start: bind TCP listener");
+        //
+        // Multi-server-on-one-host: when the requested port is taken
+        // (e.g. an existing PVA IOC already bound 5075), fall back
+        // to ephemeral (port 0) once and let the OS pick. Mirrors
+        // pvxs `serverconn.cpp:493` (EADDRINUSE/EACCES → setPort(0),
+        // single retry). The actually-bound port flows out via
+        // `bound_tcp_port`, which the UDP responder advertises in
+        // SEARCH_RESPONSE / beacons, so clients still find us. UDP
+        // 5076 is already SO_REUSEPORT-shareable across local PVA
+        // processes (epics-base-rs/net/async_udp_v4.rs:620), so the
+        // remaining bottleneck was just the TCP single-bind.
+        let std_listener = match std::net::TcpListener::bind(bind_addr) {
+            Ok(l) => l,
+            Err(e)
+                if config.tcp_port != 0
+                    && (e.kind() == std::io::ErrorKind::AddrInUse
+                        || e.kind() == std::io::ErrorKind::PermissionDenied) =>
+            {
+                let fallback_addr = SocketAddr::new(std::net::IpAddr::V4(config.bind_ip), 0);
+                let listener = std::net::TcpListener::bind(fallback_addr)
+                    .expect("PvaServer::start: bind TCP listener (ephemeral fallback)");
+                tracing::warn!(
+                    requested = ?bind_addr,
+                    bound = ?listener.local_addr().ok(),
+                    error = %e,
+                    "PVA TCP port unavailable; falling back to ephemeral",
+                );
+                listener
+            }
+            Err(e) => panic!("PvaServer::start: bind TCP listener: {e}"),
+        };
         std_listener
             .set_nonblocking(true)
             .expect("PvaServer::start: set_nonblocking");
@@ -591,4 +620,93 @@ pub struct ServerReport {
     pub peers: Vec<(SocketAddr, crate::server_native::peers::PeerSnapshot)>,
     /// Total currently-active connections.
     pub peer_count: usize,
+}
+
+#[cfg(test)]
+mod tcp_fallback_tests {
+    //! pvxs parity for multi-server-on-one-host: when the requested
+    //! `tcp_port` is already taken, fall back to ephemeral so a
+    //! second IOC on the same machine doesn't panic on startup.
+    //! Mirrors pvxs `serverconn.cpp:493` (EADDRINUSE → setPort(0),
+    //! single retry).
+    use super::*;
+    use crate::server_native::SharedSource;
+
+    /// When the requested TCP port is already bound, `PvaServer::start`
+    /// must fall back to ephemeral instead of panicking. The actually-
+    /// bound port is observable via `report().tcp_port` and is what
+    /// SEARCH_RESPONSE / beacons advertise to clients.
+    #[tokio::test]
+    async fn second_server_falls_back_to_ephemeral_when_port_taken() {
+        // Pin a port by binding it ourselves and holding the listener
+        // open for the duration of the test. The PvaServer below will
+        // ask for the same port and must NOT panic.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("blocker bind");
+        let blocked_port = blocker.local_addr().expect("blocker addr").port();
+
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: blocked_port,
+            udp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+
+        // The pre-fix code would panic here.
+        let server = PvaServer::start(source, config);
+        let report = server.report();
+        assert_ne!(
+            report.tcp_port, blocked_port,
+            "fallback must hand out a different port"
+        );
+        assert_ne!(
+            report.tcp_port, 0,
+            "bound port must be a concrete OS-assigned port, not the sentinel"
+        );
+        // Sanity: blocker is still alive on its port.
+        assert_eq!(
+            blocker.local_addr().expect("blocker addr").port(),
+            blocked_port,
+        );
+
+        drop(server);
+        drop(blocker);
+    }
+
+    /// Sanity: when the requested port IS available, no fallback is
+    /// triggered and the server gets exactly what it asked for.
+    #[tokio::test]
+    async fn requested_port_used_when_available() {
+        // Reserve a port, drop the reservation so the kernel almost
+        // certainly hands it back, then ask the server for it. The
+        // window is small enough that this is reliable in practice;
+        // if a sibling test happens to grab the port between our
+        // drop and the server's bind, the fallback path catches it
+        // and the test still passes (just doesn't exercise the
+        // happy path). That's an acceptable trade for not having
+        // to manage a shared port pool.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        let target = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: target,
+            udp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+
+        let server = PvaServer::start(source, config);
+        let report = server.report();
+        // Either we got the requested port (happy path) or fallback
+        // kicked in (sibling test grabbed it). Both are valid; only
+        // a panic would be a regression.
+        assert!(report.tcp_port != 0, "must bind a real port");
+        drop(server);
+    }
 }

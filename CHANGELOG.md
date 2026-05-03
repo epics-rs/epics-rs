@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.14.0 — 2026-05-04
+
+Per-op coordinator round-trips removed from the CA client hot path
+(Option C). Reads, writes and the channel-info lookups they depend
+on now go straight from `CaChannel` to the per-server transport
+without traversing the `tokio::select!` coordinator loop. Against a
+localhost IOC, parallel `bulk_caget` workloads that previously
+serialised through ~25 µs of coordinator-iteration overhead per
+touch (3 touches per op) now run at the network round-trip floor.
+Lifecycle work — search, connect, disconnect, beacon anomaly,
+subscription registration — still flows through the coordinator,
+which keeps the wire protocol semantics and reconnect logic
+unchanged.
+
+A second small batch of changes (PVA writer-task frame coalescing,
+batched `caget_many` / `get_many` helpers, layer-1 reference
+feature map covering 177 CA + 174 PVA upstream items) ships in the
+same release.
+
+### epics-ca-rs
+
+- **perf (Phase A)**: direct read/write registry. `ch.get` /
+  `ch.put` insert reply oneshots into a shared `InFlightOps`
+  (DashMap keyed by ioid); the per-server transport `read_loop`
+  removes and fulfils them on `CA_PROTO_READ_NOTIFY` /
+  `CA_PROTO_WRITE_NOTIFY`. Removes 2 of 3 coordinator touches per
+  op. `CoordRequest::ReadNotify` / `WriteNotify` and
+  `TransportEvent::ReadResponse` / `ReadError` / `WriteResponse`
+  removed (no longer constructed).
+- **perf (Phase B)**: per-channel snapshot sidecar. The coordinator
+  publishes `ChannelSnapshotPublic { sid, native_type,
+  element_count, server_addr, access_rights, state }` into a shared
+  `Arc<DashMap<u32, _>>` on every lifecycle change (ChannelCreated,
+  AccessRightsChanged, ChannelCreateFailed, ServerDisconnect,
+  TcpClosed, DropChannel, CircuitUnresponsive, CircuitResponsive).
+  `CaChannel` hot paths read directly via `snapshot()`, eliminating
+  the `CoordRequest::GetChannelInfo` round-trip — the third coord
+  touch.
+- **perf (Phase D)**: transport-shared `ServerLastRxAt` sidecar.
+  The transport `read_loop` stamps it on every received TCP frame
+  so `ca_receive_watchdog_delay` stays accurate for read-only and
+  write-only workloads, whose responses no longer reach the
+  coordinator.
+- **perf (Phase E)**: per-server `DirectServerWriter` sidecar. Hot
+  ops enqueue CA frames straight to the per-server writer task via
+  `Arc<DashMap<SocketAddr, DirectServerWriter>>`, bypassing
+  `transport::run_transport_manager` once a circuit is operational.
+  Backpressure preserved via the existing
+  `pending_frames: AtomicUsize` and `SEND_BACKPRESSURE_FRAMES`
+  threshold (now public via `types::SEND_BACKPRESSURE_FRAMES`).
+- **api**: batched read helpers — `CaClient::caget_many[_with_timeout]`
+  and `CaClient::get_many[_with_timeout]`. Spawns N reads in
+  parallel and joins; the canonical fast path for "read N PVs at
+  once".
+- **fix**: `DropChannel` now drains the in-flight registry for the
+  cid. Prevents a bounded leak when a caller drops a get/put future
+  (cancellation) and then drops the channel before either the
+  response arrives or a disconnect drain runs.
+- **test**: new `e2e_bulk_caget_parallel_20pvs` and
+  `e2e_bulk_get_many_100pvs` benches; `bench_caget` /
+  `bench_caput` / `bench_bulk_caget` no longer collide on a fixed
+  port (`unused_local_port()`). New
+  `response_arrives_before_disconnect_drain` regression pins the
+  in-flight-vs-drain race semantics.
+- **internal**: `CoordRequest::GetChannelInfo` and the unused
+  `ChannelSnapshot` struct removed; coordinator state simplified
+  (per-server `last_rx_at` / `read_waiters` / `write_waiters` maps
+  gone — moved to the sidecars).
+
+### epics-pva-rs
+
+- **perf**: `ServerConn` writer task now drains queued frames via
+  `try_recv` after the first await and issues a single
+  `write_all(&batch)` for the combined buffer. Eliminates one
+  syscall per frame under bursty workloads (subscribe storms,
+  reconnect floods); cancel / backpressure semantics unchanged.
+
+### docs
+
+- **add**: `docs/reference-feature-map/{README,ca,pva}.md` — Layer 1
+  stable inventory of the CA and PVA public API and wire protocol
+  surfaces, extracted from `epics-base/modules/ca` (libca + rsrv,
+  177 entries, pinned at `c9817fa59`) and `pvxs` (174 entries,
+  pinned at `9beba6b`). Each entry has a stable ID, symbol,
+  upstream `header:line` citation, and a one-line description,
+  grouped by functional area. Layer 2 (epics-rs coverage overlay)
+  is intentionally left as a future artifact.
+
 ## v0.13.6 — 2026-05-03
 
 Fixes a false-positive `PeriodCollapse` cascade against IOCs that

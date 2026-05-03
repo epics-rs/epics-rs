@@ -1774,4 +1774,82 @@ mod tests {
              took {elapsed:?} — fast-tick mode may have regressed"
         );
     }
+
+    /// End-to-end retry escalation timing test. Verifies that the
+    /// production engine loop reproduces pvxs's `nSearch+1`
+    /// pattern at the actual scheduler level — unit tests of
+    /// `cascade_smoothed_next` cover the formula in isolation, but
+    /// only this test catches an accumulator drift between the
+    /// pure fn and the live `current_bucket`-advancing tick loop.
+    ///
+    /// Expected SEARCH arrival times (relative to find submission):
+    ///   #1 at ~1 s   (first tick after Find lands)
+    ///   #2 at ~2 s   (idx+1, +1 cycle)
+    ///   #3 at ~4 s   (idx+(1+2)=idx+3, +2 cycles)
+    ///
+    /// Slack: ±500 ms per gap to absorb scheduler / mio jitter on
+    /// loaded CI. Total runtime ~4 s.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_escalation_pvxs_pattern() {
+        use epics_base_rs::net::AsyncUdpV4;
+        use std::net::Ipv4Addr;
+
+        unsafe {
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false)
+            .expect("bind sniffer");
+        let sniffer_addr = sniffer
+            .local_addrs()
+            .first()
+            .copied()
+            .expect("sniffer addr");
+        let engine = SearchEngine::spawn(vec![sniffer_addr])
+            .await
+            .expect("spawn");
+
+        let pv = "ESCALATION:PVA";
+        let started = std::time::Instant::now();
+        let _find_handle = tokio::spawn({
+            let engine = engine.clone();
+            let pv = pv.to_string();
+            async move { engine.find(&pv, SearchReason::Reconnect).await }
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let mut packet_times = Vec::new();
+        for i in 0..3 {
+            let t = tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let (n, _) = sniffer.recv_from(&mut buf).await.expect("recv");
+                    if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                        return started.elapsed();
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("SEARCH #{} did not arrive within 8 s", i + 1));
+            packet_times.push(t);
+        }
+
+        // Gap assertions. T#1 at ~1 s; T#2 at ~T#1+1 s; T#3 at ~T#2+2 s.
+        assert!(
+            packet_times[0] < Duration::from_millis(1500),
+            "first SEARCH should arrive ~1 s after Find; got {:?}",
+            packet_times[0]
+        );
+        let gap_12 = packet_times[1].saturating_sub(packet_times[0]);
+        let gap_23 = packet_times[2].saturating_sub(packet_times[1]);
+        assert!(
+            (700..=1500).contains(&(gap_12.as_millis() as u64)),
+            "gap #1→#2 should be ~1 s (nSearch=1); got {gap_12:?}. \
+             Production retry escalation may have regressed."
+        );
+        assert!(
+            (1500..=2700).contains(&(gap_23.as_millis() as u64)),
+            "gap #2→#3 should be ~2 s (nSearch=2); got {gap_23:?}. \
+             Production retry escalation may have regressed."
+        );
+    }
 }

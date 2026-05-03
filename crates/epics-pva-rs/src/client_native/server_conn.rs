@@ -242,14 +242,20 @@ impl ServerConn {
         let cancel_writer = cancel.clone();
         let alive_writer = alive.clone();
         tokio::spawn(async move {
+            let mut batch = Vec::with_capacity(8192);
             loop {
                 tokio::select! {
                     _ = cancel_writer.cancelled() => break,
                     msg = writer_rx.recv() => match msg {
                         Some(bytes) => {
-                            if writer_owned.write_all(&bytes).await.is_err() {
+                            batch.extend_from_slice(&bytes);
+                            while let Ok(next) = writer_rx.try_recv() {
+                                batch.extend_from_slice(&next);
+                            }
+                            if writer_owned.write_all(&batch).await.is_err() {
                                 break;
                             }
+                            batch.clear();
                         }
                         None => break,
                     }

@@ -213,6 +213,10 @@ pub struct CaClient {
     /// publishes channel state on every lifecycle change; CaChannel
     /// hot paths read directly without a `GetChannelInfo` round-trip.
     snapshots: ChannelSnapshots,
+    /// Per-server writer sidecar (Option C, Phase E). Lets hot reads
+    /// and writes enqueue frames directly to the connection writer
+    /// once lifecycle has already established the virtual circuit.
+    server_writers: DirectServerWriters,
     diagnostics: Arc<CaDiagnostics>,
     _coordinator: tokio::task::JoinHandle<()>,
     _search_task: tokio::task::JoinHandle<()>,
@@ -469,6 +473,7 @@ impl CaClient {
 
         let in_flight = InFlightOps::new();
         let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+        let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
         let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
 
         let transport_task = {
@@ -478,6 +483,7 @@ impl CaClient {
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
+                    server_writers.clone(),
                     last_rx_at.clone(),
                     tls_arc,
                     config.tls_server_name.clone(),
@@ -490,6 +496,7 @@ impl CaClient {
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
+                    server_writers.clone(),
                     last_rx_at.clone(),
                 ))
             }
@@ -519,6 +526,7 @@ impl CaClient {
             coord_tx,
             in_flight,
             snapshots,
+            server_writers,
             diagnostics,
             _coordinator: coordinator,
             _search_task: search_task,
@@ -596,6 +604,7 @@ impl CaClient {
             transport_tx: self.transport_tx.clone(),
             in_flight: self.in_flight.clone(),
             snapshots: self.snapshots.clone(),
+            server_writers: self.server_writers.clone(),
             conn_tx,
             _lifecycle: lifecycle,
         }
@@ -629,6 +638,90 @@ impl CaClient {
             .coord_tx
             .send(CoordRequest::DropChannel { cid: ch.cid });
         result
+    }
+
+    /// Bulk one-shot read for many PV names.
+    ///
+    /// This connects all channels concurrently, then sends established
+    /// reads through [`Self::get_many_with_timeout`], which coalesces
+    /// same-server `READ_NOTIFY` requests into a single writer enqueue.
+    /// Results are returned in input order.
+    pub async fn caget_many<S>(&self, pv_names: &[S]) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
+    where
+        S: AsRef<str> + Sync,
+    {
+        self.caget_many_with_timeout(pv_names, Duration::from_secs(30))
+            .await
+    }
+
+    /// Bulk one-shot read with a caller-supplied connect/read timeout.
+    pub async fn caget_many_with_timeout<S>(
+        &self,
+        pv_names: &[S],
+        timeout: Duration,
+    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
+    where
+        S: AsRef<str> + Sync,
+    {
+        let channels: Vec<CaChannel> = pv_names
+            .iter()
+            .map(|name| self.create_channel(name.as_ref()))
+            .collect();
+
+        let connected =
+            futures_util::future::join_all(channels.iter().map(|ch| ch.wait_connected(timeout)))
+                .await;
+
+        let mut results: Vec<Option<CaResult<(DbFieldType, EpicsValue)>>> =
+            (0..channels.len()).map(|_| None).collect();
+        let mut ready_indices = Vec::new();
+        let mut ready_channels = Vec::new();
+        for (idx, result) in connected.into_iter().enumerate() {
+            match result {
+                Ok(()) => {
+                    ready_indices.push(idx);
+                    ready_channels.push(channels[idx].clone());
+                }
+                Err(e) => results[idx] = Some(Err(e)),
+            }
+        }
+
+        let read_results = self
+            .get_many_with_timeout(&ready_channels, timeout)
+            .await
+            .into_iter();
+        for (idx, result) in ready_indices.into_iter().zip(read_results) {
+            results[idx] = Some(result);
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(CaError::Shutdown)))
+            .collect()
+    }
+
+    /// Bulk read for already-created channels.
+    ///
+    /// Unlike spawning `ch.get()` N times, this path constructs every
+    /// request up front, groups requests by server, and enqueues one
+    /// concatenated CA frame per server. That matches libca's bulk
+    /// flush model more closely and avoids per-PV task scheduling.
+    /// Results are returned in channel order.
+    pub async fn get_many(
+        &self,
+        channels: &[CaChannel],
+    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
+        self.get_many_with_timeout(channels, Duration::from_secs(30))
+            .await
+    }
+
+    /// Bulk read for already-created channels with a caller-supplied timeout.
+    pub async fn get_many_with_timeout(
+        &self,
+        channels: &[CaChannel],
+        timeout: Duration,
+    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
+        CaChannel::get_many_with_timeout(channels, timeout).await
     }
 
     /// Fire-and-forget write (CA_PROTO_WRITE). Matches C `caput` behavior.
@@ -728,6 +821,9 @@ pub struct CaChannel {
     /// Per-channel snapshot sidecar (Option C, Phase B). Read by hot
     /// paths in lieu of `CoordRequest::GetChannelInfo`.
     snapshots: ChannelSnapshots,
+    /// Per-server writer sidecar (Option C, Phase E). Read/write hot
+    /// paths use this after `snapshot()` proves the channel is active.
+    server_writers: DirectServerWriters,
     conn_tx: broadcast::Sender<ConnectionEvent>,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
@@ -771,8 +867,258 @@ impl CaChannel {
         }
     }
 
+    fn direct_writer(&self, server_addr: SocketAddr) -> Option<DirectServerWriter> {
+        self.server_writers.get(&server_addr).map(|w| w.clone())
+    }
+
+    fn build_read_notify_frame(sid: u32, data_type: u16, count: u32, ioid: u32) -> Vec<u8> {
+        let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        hdr.data_type = data_type;
+        hdr.cid = sid;
+        hdr.available = ioid;
+        if count > 0xFFFF {
+            hdr.set_payload_size(0, count);
+        } else {
+            hdr.count = count as u16;
+        }
+        hdr.to_bytes_extended()
+    }
+
+    fn build_write_frame(
+        cmd: u16,
+        sid: u32,
+        data_type: u16,
+        count: u32,
+        ioid: Option<u32>,
+        payload: Vec<u8>,
+    ) -> Vec<u8> {
+        let padded_len = align8(payload.len());
+        let mut padded = payload;
+        padded.resize(padded_len, 0);
+
+        let mut hdr = CaHeader::new(cmd);
+        hdr.data_type = data_type;
+        hdr.cid = sid;
+        if let Some(ioid) = ioid {
+            hdr.available = ioid;
+        }
+        hdr.set_payload_size(padded.len(), count);
+
+        let mut frame = hdr.to_bytes_extended();
+        frame.extend_from_slice(&padded);
+        frame
+    }
+
+    fn send_read_notify_fast(
+        &self,
+        snap: &ChannelSnapshotPublic,
+        data_type: u16,
+        count: u32,
+        ioid: u32,
+    ) -> CaResult<()> {
+        if let Some(writer) = self.direct_writer(snap.server_addr) {
+            return writer.send_frame(Self::build_read_notify_frame(
+                snap.sid, data_type, count, ioid,
+            ));
+        }
+
+        self.transport_tx
+            .send(TransportCommand::ReadNotify {
+                sid: snap.sid,
+                data_type,
+                count,
+                ioid,
+                server_addr: snap.server_addr,
+            })
+            .map_err(|_| CaError::Shutdown)
+    }
+
+    fn send_write_notify_fast(
+        &self,
+        snap: &ChannelSnapshotPublic,
+        count: u32,
+        ioid: u32,
+        payload: Vec<u8>,
+    ) -> CaResult<()> {
+        if let Some(writer) = self.direct_writer(snap.server_addr) {
+            return writer.send_frame(Self::build_write_frame(
+                CA_PROTO_WRITE_NOTIFY,
+                snap.sid,
+                snap.native_type as u16,
+                count,
+                Some(ioid),
+                payload,
+            ));
+        }
+
+        self.transport_tx
+            .send(TransportCommand::WriteNotify {
+                sid: snap.sid,
+                data_type: snap.native_type as u16,
+                count,
+                ioid,
+                payload,
+                server_addr: snap.server_addr,
+            })
+            .map_err(|_| CaError::Shutdown)
+    }
+
+    fn send_write_nowait_fast(
+        &self,
+        snap: &ChannelSnapshotPublic,
+        count: u32,
+        payload: Vec<u8>,
+    ) -> CaResult<()> {
+        if let Some(writer) = self.direct_writer(snap.server_addr) {
+            return writer.send_frame(Self::build_write_frame(
+                CA_PROTO_WRITE,
+                snap.sid,
+                snap.native_type as u16,
+                count,
+                None,
+                payload,
+            ));
+        }
+
+        self.transport_tx
+            .send(TransportCommand::Write {
+                sid: snap.sid,
+                data_type: snap.native_type as u16,
+                count,
+                payload,
+                server_addr: snap.server_addr,
+            })
+            .map_err(|_| CaError::Shutdown)
+    }
+
     pub async fn get(&self) -> CaResult<(DbFieldType, EpicsValue)> {
         self.get_with_timeout(Duration::from_secs(30)).await
+    }
+
+    pub async fn get_many(channels: &[CaChannel]) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
+        Self::get_many_with_timeout(channels, Duration::from_secs(30)).await
+    }
+
+    pub async fn get_many_with_timeout(
+        channels: &[CaChannel],
+        timeout: Duration,
+    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
+        struct PendingBulkRead {
+            index: usize,
+            ioid: u32,
+            in_flight: InFlightOps,
+            reply_rx: oneshot::Receiver<CaResult<(u16, u32, Vec<u8>)>>,
+        }
+
+        struct BulkReadGroup {
+            writer: DirectServerWriter,
+            frame: Vec<u8>,
+            pending: Vec<PendingBulkRead>,
+        }
+
+        let mut results: Vec<Option<CaResult<(DbFieldType, EpicsValue)>>> =
+            (0..channels.len()).map(|_| None).collect();
+        let mut groups: HashMap<SocketAddr, BulkReadGroup> = HashMap::new();
+        let mut pending: Vec<PendingBulkRead> = Vec::new();
+
+        for (index, ch) in channels.iter().enumerate() {
+            let snap = match ch.snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    results[index] = Some(Err(e));
+                    continue;
+                }
+            };
+
+            let ioid = alloc_ioid();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            ch.in_flight.reads.insert(ioid, (ch.cid, reply_tx));
+            let pending_read = PendingBulkRead {
+                index,
+                ioid,
+                in_flight: ch.in_flight.clone(),
+                reply_rx,
+            };
+
+            let frame = Self::build_read_notify_frame(
+                snap.sid,
+                snap.native_type as u16,
+                snap.element_count,
+                ioid,
+            );
+
+            if let Some(writer) = ch.direct_writer(snap.server_addr) {
+                let group = groups
+                    .entry(snap.server_addr)
+                    .or_insert_with(|| BulkReadGroup {
+                        writer,
+                        frame: Vec::new(),
+                        pending: Vec::new(),
+                    });
+                group.frame.extend_from_slice(&frame);
+                group.pending.push(pending_read);
+            } else {
+                match ch.send_read_notify_fast(
+                    &snap,
+                    snap.native_type as u16,
+                    snap.element_count,
+                    ioid,
+                ) {
+                    Ok(()) => pending.push(pending_read),
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&ioid);
+                        results[index] = Some(Err(e));
+                    }
+                }
+            }
+        }
+
+        for (_, group) in groups {
+            match group.writer.send_frame(group.frame) {
+                Ok(()) => pending.extend(group.pending),
+                Err(_) => {
+                    for p in group.pending {
+                        p.in_flight.reads.remove(&p.ioid);
+                        results[p.index] = Some(Err(CaError::Disconnected));
+                    }
+                }
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        for p in pending {
+            let PendingBulkRead {
+                index,
+                ioid,
+                in_flight,
+                reply_rx,
+            } = p;
+            let result = tokio::time::timeout_at(deadline, reply_rx).await;
+            in_flight.reads.remove(&ioid);
+
+            let decoded = match result {
+                Ok(Ok(Ok((data_type, count, data)))) => {
+                    let dbr_type = match DbFieldType::from_u16(data_type) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            results[index] = Some(Err(e));
+                            continue;
+                        }
+                    };
+                    EpicsValue::from_bytes_array(dbr_type, &data, count as usize)
+                        .map(|value| (dbr_type, value))
+                }
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err(CaError::Shutdown),
+                Err(_) => Err(CaError::Timeout),
+            };
+            results[index] = Some(decoded);
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(CaError::Shutdown)))
+            .collect()
     }
 
     pub async fn get_with_timeout(&self, timeout: Duration) -> CaResult<(DbFieldType, EpicsValue)> {
@@ -791,13 +1137,12 @@ impl CaChannel {
         // either way; not a leak.
         self.in_flight.reads.insert(ioid, (self.cid, reply_tx));
 
-        let _ = self.transport_tx.send(TransportCommand::ReadNotify {
-            sid: snap.sid,
-            data_type: snap.native_type as u16,
-            count: snap.element_count,
-            ioid,
-            server_addr: snap.server_addr,
-        });
+        if let Err(e) =
+            self.send_read_notify_fast(&snap, snap.native_type as u16, snap.element_count, ioid)
+        {
+            self.in_flight.reads.remove(&ioid);
+            return Err(e);
+        }
 
         let result = tokio::time::timeout(timeout, reply_rx).await;
         // Always remove the registry entry when control returns —
@@ -848,13 +1193,10 @@ impl CaChannel {
         // for drop-semantics commentary.
         self.in_flight.reads.insert(ioid, (self.cid, reply_tx));
 
-        let _ = self.transport_tx.send(TransportCommand::ReadNotify {
-            sid: snap.sid,
-            data_type: request_type,
-            count: request_count,
-            ioid,
-            server_addr: snap.server_addr,
-        });
+        if let Err(e) = self.send_read_notify_fast(&snap, request_type, request_count, ioid) {
+            self.in_flight.reads.remove(&ioid);
+            return Err(e);
+        }
 
         let result = tokio::time::timeout(Duration::from_secs(30), reply_rx).await;
         self.in_flight.reads.remove(&ioid);
@@ -875,14 +1217,10 @@ impl CaChannel {
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        let _ = self.transport_tx.send(TransportCommand::WriteNotify {
-            sid: snap.sid,
-            data_type: snap.native_type as u16,
-            count,
-            ioid,
-            payload,
-            server_addr: snap.server_addr,
-        });
+        if let Err(e) = self.send_write_notify_fast(&snap, count, ioid, payload) {
+            self.in_flight.writes.remove(&ioid);
+            return Err(e);
+        }
 
         // Default put timeout configurable via EPICS_CA_PUT_TIMEOUT (seconds).
         let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
@@ -906,14 +1244,10 @@ impl CaChannel {
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        let _ = self.transport_tx.send(TransportCommand::WriteNotify {
-            sid: snap.sid,
-            data_type: snap.native_type as u16,
-            count,
-            ioid,
-            payload,
-            server_addr: snap.server_addr,
-        });
+        if let Err(e) = self.send_write_notify_fast(&snap, count, ioid, payload) {
+            self.in_flight.writes.remove(&ioid);
+            return Err(e);
+        }
 
         let result = tokio::time::timeout(timeout, reply_rx).await;
         self.in_flight.writes.remove(&ioid);
@@ -930,15 +1264,7 @@ impl CaChannel {
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        let _ = self.transport_tx.send(TransportCommand::Write {
-            sid: snap.sid,
-            data_type: snap.native_type as u16,
-            count,
-            payload,
-            server_addr: snap.server_addr,
-        });
-
-        Ok(())
+        self.send_write_nowait_fast(&snap, count, payload)
     }
 
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {

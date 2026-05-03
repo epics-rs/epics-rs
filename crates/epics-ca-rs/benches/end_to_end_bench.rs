@@ -38,7 +38,7 @@ fn make_runtime() -> Runtime {
 /// Spin up a softioc populated with N PVs of the given type. Returns
 /// `(server_handle, port)`. Server runs forever; the bench drops the
 /// handle when done so the runtime cleans up.
-async fn boot_softioc(n_pvs: usize) -> (tokio::task::JoinHandle<()>, u16) {
+async fn boot_softioc(n_pvs: usize, port: u16) -> tokio::task::JoinHandle<()> {
     let mut builder = CaServer::builder().port(0);
     for i in 0..n_pvs {
         builder = builder.pv(&format!("BENCH:PV:{i}"), EpicsValue::Double(i as f64));
@@ -49,15 +49,24 @@ async fn boot_softioc(n_pvs: usize) -> (tokio::task::JoinHandle<()>, u16) {
     // reproducibility in benchmarks. (Production code would pick a
     // dynamic port and read it back; bench uses a fixed offset to
     // avoid collisions when run repeatedly.)
-    let port = 5099u16;
     // Override port to the fixed value before starting.
     let server = CaServer::from_parts(server.database().clone(), port, None, None, None);
     let handle = tokio::spawn(async move {
-        let _ = server.run().await;
+        if let Err(e) = server.run().await {
+            eprintln!("CA benchmark server exited: {e}");
+        }
     });
     // Give the listener time to bind.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    (handle, port)
+    handle
+}
+
+fn unused_local_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("reserve benchmark port")
+        .local_addr()
+        .expect("benchmark port addr")
+        .port()
 }
 
 fn point_addr_list_at(port: u16) {
@@ -72,8 +81,9 @@ fn point_addr_list_at(port: u16) {
 
 fn bench_caget(c: &mut Criterion) {
     let rt = make_runtime();
-    let (_server, port) = rt.block_on(async { boot_softioc(8).await });
+    let port = unused_local_port();
     point_addr_list_at(port);
+    let _server = rt.block_on(async { boot_softioc(8, port).await });
     let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
 
     // Warm up — establish channels before timing.
@@ -104,8 +114,9 @@ fn bench_caget(c: &mut Criterion) {
 /// this near the network round-trip floor.
 fn bench_bulk_caget(c: &mut Criterion) {
     let rt = make_runtime();
-    let (_server, port) = rt.block_on(async { boot_softioc(20).await });
+    let port = unused_local_port();
     point_addr_list_at(port);
+    let _server = rt.block_on(async { boot_softioc(20, port).await });
     let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
 
     // Warm up — establish channels before timing so we measure the
@@ -143,10 +154,51 @@ fn bench_bulk_caget(c: &mut Criterion) {
     });
 }
 
+/// Bulk reads over persistent channels using the batched `get_many`
+/// API. This is the closest Rust-side analogue to libca's "queue N
+/// reads, flush once, then collect completions" path.
+fn bench_bulk_get_many(c: &mut Criterion) {
+    let rt = make_runtime();
+    let port = unused_local_port();
+    point_addr_list_at(port);
+    let _server = rt.block_on(async { boot_softioc(100, port).await });
+    let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
+
+    let channels = rt.block_on(async {
+        let mut channels = Vec::with_capacity(100);
+        for i in 0..100 {
+            channels.push(client.create_channel(&format!("BENCH:PV:{i}")));
+        }
+        let connected = futures_util::future::join_all(
+            channels
+                .iter()
+                .map(|ch| ch.wait_connected(Duration::from_secs(3))),
+        )
+        .await;
+        for result in connected {
+            result.expect("channel connected");
+        }
+        channels
+    });
+
+    c.bench_function("e2e_bulk_get_many_100pvs", |b| {
+        let client = client.clone();
+        let channels = channels.clone();
+        b.to_async(&rt).iter(|| {
+            let client = client.clone();
+            let channels = channels.clone();
+            async move {
+                let _ = client.get_many(&channels).await;
+            }
+        });
+    });
+}
+
 fn bench_caput(c: &mut Criterion) {
     let rt = make_runtime();
-    let (_server, port) = rt.block_on(async { boot_softioc(1).await });
+    let port = unused_local_port();
     point_addr_list_at(port);
+    let _server = rt.block_on(async { boot_softioc(1, port).await });
     let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
     rt.block_on(async {
         let _ = client.caput("BENCH:PV:0", "1.0").await;
@@ -171,6 +223,6 @@ criterion_group! {
         .sample_size(20)
         .measurement_time(Duration::from_secs(8))
         .warm_up_time(Duration::from_secs(2));
-    targets = bench_caget, bench_bulk_caget, bench_caput
+    targets = bench_caget, bench_bulk_caget, bench_bulk_get_many, bench_caput
 }
 criterion_main!(e2e);

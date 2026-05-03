@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
-use epics_base_rs::error::CaResult;
-use epics_base_rs::runtime::sync::oneshot;
+use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::runtime::sync::{mpsc, oneshot};
 use epics_base_rs::types::DbFieldType;
 
 use crate::channel::AccessRights;
@@ -25,6 +26,47 @@ use crate::client::state::ChannelState;
 /// transport keep the stamp current and the coordinator (which is
 /// the one answering `ca_receive_watchdog_delay`) read it directly.
 pub(crate) type ServerLastRxAt = Arc<DashMap<SocketAddr, Instant>>;
+
+// --- Direct per-server writer sidecar (Option C, Phase E) ---
+
+/// Send buffer backpressure threshold (matches C EPICS flushBlockThreshold).
+/// If more than this many frames are pending, the connection is stalled.
+pub(crate) const SEND_BACKPRESSURE_FRAMES: usize = 4096;
+
+/// Cloneable write handle for an established virtual circuit.
+///
+/// Hot one-shot operations (`CaChannel::get` / `put`) use this sidecar
+/// to enqueue frames straight to the per-server writer task, bypassing
+/// the transport manager actor after the channel has already reached
+/// `Operational`. Lifecycle operations still go through the transport
+/// manager so connection setup/teardown remains centralized.
+#[derive(Clone)]
+pub(crate) struct DirectServerWriter {
+    pub(crate) write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub(crate) pending_frames: Arc<AtomicUsize>,
+}
+
+impl DirectServerWriter {
+    pub(crate) fn send_frame(&self, frame: Vec<u8>) -> CaResult<()> {
+        let pending = self.pending_frames.load(Ordering::Relaxed);
+        if pending >= SEND_BACKPRESSURE_FRAMES {
+            return Err(CaError::Disconnected);
+        }
+
+        self.pending_frames.fetch_add(1, Ordering::Relaxed);
+        if self.write_tx.send(frame).is_err() {
+            let prev = self.pending_frames.load(Ordering::Relaxed);
+            self.pending_frames
+                .store(prev.saturating_sub(1), Ordering::Relaxed);
+            return Err(CaError::Disconnected);
+        }
+        Ok(())
+    }
+}
+
+/// Shared server-writer registry. Transport manager publishes; channel hot
+/// paths read.
+pub(crate) type DirectServerWriters = Arc<DashMap<SocketAddr, DirectServerWriter>>;
 
 // --- Channel snapshot sidecar (Option C, Phase B) ---
 

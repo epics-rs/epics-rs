@@ -11,7 +11,10 @@ use tokio::net::TcpStream;
 use crate::channel::AccessRights;
 use crate::protocol::*;
 
-use super::types::{TransportCommand, TransportEvent};
+use super::types::{
+    DirectServerWriter, DirectServerWriters, SEND_BACKPRESSURE_FRAMES, TransportCommand,
+    TransportEvent,
+};
 
 /// Optional client-side TLS handshaker. `None` means plaintext.
 /// Behind the `tls` feature so default builds carry zero TLS code.
@@ -26,10 +29,6 @@ const ECHO_TIMEOUT_SECS: u64 = 5;
 /// Maximum accumulated TCP read buffer before disconnecting.
 /// Protects against malformed servers declaring huge payloads.
 const MAX_ACCUMULATED: usize = 1024 * 1024; // 1 MB
-
-/// Send buffer backpressure threshold (matches C EPICS flushBlockThreshold).
-/// If more than this many frames are pending, the connection is stalled.
-const SEND_BACKPRESSURE_FRAMES: usize = 4096;
 
 /// Default echo interval in seconds (matches C EPICS CA_CONN_VERIFY_PERIOD).
 /// Overridden by EPICS_CA_CONN_TMO environment variable.
@@ -71,6 +70,7 @@ pub(crate) async fn run_transport_manager(
     mut command_rx: mpsc::UnboundedReceiver<TransportCommand>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     in_flight: super::types::InFlightOps,
+    server_writers: DirectServerWriters,
     last_rx_at: super::types::ServerLastRxAt,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<String>,
@@ -156,6 +156,7 @@ pub(crate) async fn run_transport_manager(
                         // dead. Abort the dead pair before
                         // spawning a fresh connect.
                         if let Some(old) = connections.remove(&server_addr) {
+                            server_writers.remove(&server_addr);
                             old._read_task.abort();
                             old._write_task.abort();
                         }
@@ -198,7 +199,7 @@ pub(crate) async fn run_transport_manager(
                     }
                 }
 
-                process_command(cmd, &mut connections, &event_tx);
+                process_command(cmd, &mut connections, &server_writers, &event_tx);
             }
             Some(joined) = pending_connects.join_next() => {
                 let (server_addr, result) = match joined {
@@ -212,12 +213,25 @@ pub(crate) async fn run_transport_manager(
                 let queued = queued_per_server.remove(&server_addr).unwrap_or_default();
                 match result {
                     Some(conn) => {
+                        server_writers.insert(
+                            server_addr,
+                            DirectServerWriter {
+                                write_tx: conn.write_tx.clone(),
+                                pending_frames: conn.pending_frames.clone(),
+                            },
+                        );
                         connections.insert(server_addr, conn);
                         for queued_cmd in queued {
-                            process_command(queued_cmd, &mut connections, &event_tx);
+                            process_command(
+                                queued_cmd,
+                                &mut connections,
+                                &server_writers,
+                                &event_tx,
+                            );
                         }
                     }
                     None => {
+                        server_writers.remove(&server_addr);
                         // Connect failed. Surface
                         // ChannelCreateFailed for each queued
                         // CreateChannel so the coordinator knows
@@ -267,6 +281,7 @@ fn cmd_server_addr(cmd: &TransportCommand) -> SocketAddr {
 fn process_command(
     cmd: TransportCommand,
     connections: &mut HashMap<SocketAddr, ServerConnection>,
+    server_writers: &DirectServerWriters,
     event_tx: &mpsc::UnboundedSender<TransportEvent>,
 ) {
     match cmd {
@@ -282,7 +297,7 @@ fn process_command(
             create_hdr.available = CA_MINOR_VERSION as u32;
             let mut frame = create_hdr.to_bytes().to_vec();
             frame.extend_from_slice(&pv_payload);
-            send_frame(connections, server_addr, frame, event_tx);
+            send_frame(connections, server_writers, server_addr, frame, event_tx);
         }
         TransportCommand::ReadNotify {
             sid,
@@ -300,7 +315,13 @@ fn process_command(
             } else {
                 hdr.count = count as u16;
             }
-            send_frame(connections, server_addr, hdr.to_bytes_extended(), event_tx);
+            send_frame(
+                connections,
+                server_writers,
+                server_addr,
+                hdr.to_bytes_extended(),
+                event_tx,
+            );
         }
         TransportCommand::Write {
             sid,
@@ -320,7 +341,7 @@ fn process_command(
 
             let mut frame = hdr.to_bytes_extended();
             frame.extend_from_slice(&padded);
-            send_frame(connections, server_addr, frame, event_tx);
+            send_frame(connections, server_writers, server_addr, frame, event_tx);
         }
         TransportCommand::WriteNotify {
             sid,
@@ -342,7 +363,7 @@ fn process_command(
 
             let mut frame = hdr.to_bytes_extended();
             frame.extend_from_slice(&padded);
-            send_frame(connections, server_addr, frame, event_tx);
+            send_frame(connections, server_writers, server_addr, frame, event_tx);
         }
         TransportCommand::Subscribe {
             sid,
@@ -368,7 +389,7 @@ fn process_command(
 
             let mut frame = hdr.to_bytes_extended();
             frame.extend_from_slice(&mask_payload);
-            send_frame(connections, server_addr, frame, event_tx);
+            send_frame(connections, server_writers, server_addr, frame, event_tx);
         }
         TransportCommand::Unsubscribe {
             sid,
@@ -380,7 +401,13 @@ fn process_command(
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = subid;
-            send_frame(connections, server_addr, hdr.to_bytes().to_vec(), event_tx);
+            send_frame(
+                connections,
+                server_writers,
+                server_addr,
+                hdr.to_bytes().to_vec(),
+                event_tx,
+            );
         }
         TransportCommand::ClearChannel {
             cid,
@@ -390,7 +417,13 @@ fn process_command(
             let mut hdr = CaHeader::new(CA_PROTO_CLEAR_CHANNEL);
             hdr.cid = sid;
             hdr.available = cid;
-            send_frame(connections, server_addr, hdr.to_bytes().to_vec(), event_tx);
+            send_frame(
+                connections,
+                server_writers,
+                server_addr,
+                hdr.to_bytes().to_vec(),
+                event_tx,
+            );
         }
         TransportCommand::BeaconArrivalNotify {
             server_addr,
@@ -409,17 +442,30 @@ fn process_command(
         }
         TransportCommand::EventsOff { server_addr } => {
             let hdr = CaHeader::new(CA_PROTO_EVENTS_OFF);
-            send_frame(connections, server_addr, hdr.to_bytes().to_vec(), event_tx);
+            send_frame(
+                connections,
+                server_writers,
+                server_addr,
+                hdr.to_bytes().to_vec(),
+                event_tx,
+            );
         }
         TransportCommand::EventsOn { server_addr } => {
             let hdr = CaHeader::new(CA_PROTO_EVENTS_ON);
-            send_frame(connections, server_addr, hdr.to_bytes().to_vec(), event_tx);
+            send_frame(
+                connections,
+                server_writers,
+                server_addr,
+                hdr.to_bytes().to_vec(),
+                event_tx,
+            );
         }
     }
 }
 
 fn send_frame(
     connections: &mut HashMap<SocketAddr, ServerConnection>,
+    server_writers: &DirectServerWriters,
     server_addr: SocketAddr,
     frame: Vec<u8>,
     event_tx: &mpsc::UnboundedSender<TransportEvent>,
@@ -441,6 +487,7 @@ fn send_frame(
     };
     if failed {
         connections.remove(&server_addr);
+        server_writers.remove(&server_addr);
         let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
     }
 }
@@ -897,11 +944,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     if hdr.cid == ECA_NORMAL {
                         let data = accumulated[data_start..data_start + actual_post].to_vec();
                         if let Some((_, (_, reply_tx))) = in_flight.reads.remove(&ioid) {
-                            let _ = reply_tx.send(Ok((
-                                hdr.data_type,
-                                hdr.actual_count(),
-                                data,
-                            )));
+                            let _ = reply_tx.send(Ok((hdr.data_type, hdr.actual_count(), data)));
                         }
                     } else if let Some((_, (_, reply_tx))) = in_flight.reads.remove(&ioid) {
                         let _ = reply_tx.send(Err(epics_base_rs::error::CaError::Protocol(

@@ -1,6 +1,136 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+use dashmap::DashMap;
+use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::runtime::sync::{mpsc, oneshot};
+use epics_base_rs::types::DbFieldType;
 
 use crate::channel::AccessRights;
+use crate::client::state::ChannelState;
+
+// --- Per-server last-RX timestamp sidecar (Option C, Phase D) ---
+
+/// Last instant a frame was received from each server. Bumped by the
+/// per-server transport `read_loop` whenever any TCP frame arrives —
+/// covers `READ_NOTIFY`, `WRITE_NOTIFY`, `EVENT_ADD`, `ACCESS_RIGHTS`,
+/// `CREATE_CH_RESP`, version negotiation, echoes, etc.
+///
+/// Phase A turned read/write responses into a transport-direct path
+/// that never reaches the coordinator, so the coordinator can no
+/// longer maintain this stamp from `TransportEvent`s alone — a
+/// read-heavy client without monitors would look idle even though
+/// frames are arriving every millisecond. The sidecar lets the
+/// transport keep the stamp current and the coordinator (which is
+/// the one answering `ca_receive_watchdog_delay`) read it directly.
+pub(crate) type ServerLastRxAt = Arc<DashMap<SocketAddr, Instant>>;
+
+// --- Direct per-server writer sidecar (Option C, Phase E) ---
+
+/// Send buffer backpressure threshold (matches C EPICS flushBlockThreshold).
+/// If more than this many frames are pending, the connection is stalled.
+pub(crate) const SEND_BACKPRESSURE_FRAMES: usize = 4096;
+
+/// Cloneable write handle for an established virtual circuit.
+///
+/// Hot one-shot operations (`CaChannel::get` / `put`) use this sidecar
+/// to enqueue frames straight to the per-server writer task, bypassing
+/// the transport manager actor after the channel has already reached
+/// `Operational`. Lifecycle operations still go through the transport
+/// manager so connection setup/teardown remains centralized.
+#[derive(Clone)]
+pub(crate) struct DirectServerWriter {
+    pub(crate) write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub(crate) pending_frames: Arc<AtomicUsize>,
+}
+
+impl DirectServerWriter {
+    pub(crate) fn send_frame(&self, frame: Vec<u8>) -> CaResult<()> {
+        let pending = self.pending_frames.load(Ordering::Relaxed);
+        if pending >= SEND_BACKPRESSURE_FRAMES {
+            return Err(CaError::Disconnected);
+        }
+
+        self.pending_frames.fetch_add(1, Ordering::Relaxed);
+        if self.write_tx.send(frame).is_err() {
+            let prev = self.pending_frames.load(Ordering::Relaxed);
+            self.pending_frames
+                .store(prev.saturating_sub(1), Ordering::Relaxed);
+            return Err(CaError::Disconnected);
+        }
+        Ok(())
+    }
+}
+
+/// Shared server-writer registry. Transport manager publishes; channel hot
+/// paths read.
+pub(crate) type DirectServerWriters = Arc<DashMap<SocketAddr, DirectServerWriter>>;
+
+// --- Channel snapshot sidecar (Option C, Phase B) ---
+
+/// Immutable, per-channel snapshot published by the coordinator
+/// whenever lifecycle state changes. CaChannel hot paths
+/// (`ch.get` / `ch.put` / `ch.subscribe`) read from this map
+/// directly instead of round-tripping `CoordRequest::GetChannelInfo`
+/// for every operation.
+///
+/// The coordinator inserts/updates an entry on every relevant
+/// `TransportEvent` (ChannelCreated, AccessRightsChanged, …) and
+/// removes it on Drop. Stale-read window: a tiny race exists where
+/// a CaChannel sees an old snapshot for one nanosecond after a
+/// state change; that's acceptable because the request will either
+/// fail at the server (which already knows the new state) or get
+/// retried on disconnect drain.
+#[derive(Clone)]
+pub(crate) struct ChannelSnapshotPublic {
+    pub sid: u32,
+    pub native_type: DbFieldType,
+    pub element_count: u32,
+    pub server_addr: SocketAddr,
+    pub access_rights: AccessRights,
+    pub state: ChannelState,
+}
+
+/// Shared snapshot registry. Coordinator publishes; CaChannel reads.
+pub(crate) type ChannelSnapshots = Arc<DashMap<u32, ChannelSnapshotPublic>>;
+
+// --- Direct in-flight op registries (Option C) ---
+
+/// Reply channel type for one-shot reads. Carries (data_type, count, payload).
+pub(crate) type ReadReplyTx = oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>;
+/// Reply channel type for one-shot writes (write-notify completion).
+pub(crate) type WriteReplyTx = oneshot::Sender<CaResult<()>>;
+
+/// Shared in-flight op registry. Channel handles insert reply oneshots
+/// here keyed by `ioid`; the per-server transport read loop removes
+/// and fulfils them on `ReadResponse` / `WriteResponse` arrival.
+///
+/// This replaces the previous design where every read/write went
+/// through the coordinator's `tokio::select!` loop twice (once on
+/// op submission to register the waiter, once on response to dispatch
+/// it). With ~25 µs of coordinator-iteration overhead on each touch,
+/// `bulk_caget(20)` showed ~1.8 ms wall time in benchmarks against a
+/// localhost IOC despite the 20 spawned tasks all "running in
+/// parallel". Routing reads/writes directly here removes both
+/// touches; the coordinator only sees the lifecycle path
+/// (`RegisterChannel`, search-found, TCP close, beacon anomaly).
+///
+/// The `cid` field stored alongside each reply lets the disconnect-
+/// cleanup path filter pending ops by channel when a server's
+/// virtual circuit dies (Phase D).
+#[derive(Clone, Default)]
+pub(crate) struct InFlightOps {
+    pub(crate) reads: Arc<DashMap<u32, (u32, ReadReplyTx)>>,
+    pub(crate) writes: Arc<DashMap<u32, (u32, WriteReplyTx)>>,
+}
+
+impl InFlightOps {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
 
 // --- Search Engine messages ---
 
@@ -135,20 +265,6 @@ pub(crate) enum TransportEvent {
         element_count: u32,
         access: AccessRights,
         server_addr: SocketAddr,
-    },
-    ReadResponse {
-        ioid: u32,
-        data_type: u16,
-        count: u32,
-        data: Vec<u8>,
-    },
-    ReadError {
-        ioid: u32,
-        eca_status: u32,
-    },
-    WriteResponse {
-        ioid: u32,
-        status: u32,
     },
     MonitorData {
         subid: u32,

@@ -18,7 +18,7 @@
 //! holding an `Arc<ServerConn>` observe the closed state via [`ServerConn::is_alive`]
 //! and transition to "Reconnecting".
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,6 +31,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+use dashmap::DashMap;
 
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
@@ -69,56 +70,40 @@ pub fn heartbeat_timeout() -> Duration {
 /// the server-side default. Override compile-time only for now.
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
-/// One framed message dispatched to a per-IOID waiter.
-type FrameTx = mpsc::UnboundedSender<Frame>;
-
-/// Routing table for incoming frames.
+/// Routing slot for a registered IOID.
 ///
-/// Each in-flight one-shot op (GET/PUT/GET_FIELD INIT/data) registers a
-/// `FrameTx` keyed by its ioid. Streaming ops (MONITOR) register the same
-/// way; they keep receiving frames until the handle is dropped or the op
-/// is destroyed.
-#[derive(Default)]
-struct Router {
-    by_ioid: HashMap<u32, FrameTx>,
-    /// Routes for CREATE_CHANNEL responses by cid.
-    by_cid: HashMap<u32, oneshot::Sender<Frame>>,
-    /// Per-SID server-initiated `CMD_DESTROY_CHANNEL` signals
-    /// (pvxs e668038 "client track opByIOID per channel"). When the
-    /// server administratively destroys a channel — e.g. SharedPV
-    /// close, max-channel limit eviction — pva-rs would otherwise
-    /// silently drop the frame and the channel's monitor would hang
-    /// forever waiting for data that won't come. Each `Channel`
-    /// registers a `(flag, notify)` pair on the Active transition;
-    /// route_frame fires both when DESTROY_CHANNEL targets the SID,
-    /// causing `Channel::is_active` to return false and waking
-    /// `wait_until_inactive` so the next ensure_active re-searches.
-    by_sid_close: HashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>,
-    /// Reverse map ioid → sid populated by `register_ioid_stream`.
-    /// On `CMD_DESTROY_CHANNEL` route_frame uses it to drop every
-    /// in-flight op's `FrameTx` entry that belongs to the destroyed
-    /// SID — the consumer's `stream.recv()` then returns `None` and
-    /// the op surfaces as `ConnectionLost`, which the monitor /
-    /// op_get / op_put loops already handle by re-driving
-    /// `ensure_active`. Without this, signalling the channel-level
-    /// `server_destroyed` flag/notify alone left every blocked op
-    /// hanging on the unrelated `by_ioid` channel until the whole
-    /// `ServerConn` died.
-    ioid_to_sid: HashMap<u32, u32>,
+/// GET/PUT register a `TwoShot` (2 oneshots for INIT + DATA).
+/// MONITOR registers a `Stream` (unbounded mpsc).
+pub(crate) enum IoidSlot {
+    /// Pipelined two-frame ops (GET, PUT, RPC): FIFO queue of oneshots.
+    TwoShot(VecDeque<oneshot::Sender<Frame>>),
+    /// Streaming ops (MONITOR): unbounded channel.
+    Stream(mpsc::UnboundedSender<Frame>),
+    /// Long-lived warm-GET op: a single mutex-guarded oneshot slot
+    /// that the caller refills before each new GET frame send. Lets
+    /// the channel skip INIT for subsequent GETs against the same
+    /// (sid, ioid) — server keeps the introspection binding alive
+    /// because we never DESTROY the ioid.
+    Reusable(Arc<Mutex<Option<oneshot::Sender<Frame>>>>),
 }
 
 /// A persistent server connection.
 pub struct ServerConn {
     pub addr: SocketAddr,
     pub byte_order: ByteOrder,
-    writer_tx: mpsc::Sender<Vec<u8>>,
+    writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     cancel: CancellationToken,
     alive: Arc<AtomicBool>,
     last_rx_nanos: Arc<AtomicU64>,
-    router: Arc<Mutex<Router>>,
+    /// Per-IOID routing: DashMap for lock-free access.
+    by_ioid: Arc<DashMap<u32, IoidSlot>>,
+    /// CREATE_CHANNEL response routing by CID.
+    by_cid: Arc<DashMap<u32, oneshot::Sender<Frame>>>,
+    /// Per-SID server-initiated CMD_DESTROY_CHANNEL signals.
+    by_sid_close: Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
+    /// Reverse map ioid → sid for DESTROY_CHANNEL cleanup.
+    ioid_to_sid: Arc<DashMap<u32, u32>>,
     /// Per-connection FieldDesc cache for 0xFD/0xFE wire markers.
-    /// Populated as INIT responses arrive; consulted when subsequent
-    /// frames reference a slot. Lives for the life of the connection.
     type_cache: Arc<Mutex<crate::pvdata::encode::TypeCache>>,
 }
 
@@ -232,24 +217,33 @@ impl ServerConn {
         wait_for_validated(&mut reader, &mut rx_buf, op_timeout).await?;
 
         // Spawn background tasks.
-        let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let cancel = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let last_rx_nanos = Arc::new(AtomicU64::new(now_nanos()));
-        let router: Arc<Mutex<Router>> = Arc::new(Mutex::new(Router::default()));
+        let by_ioid: Arc<DashMap<u32, IoidSlot>> = Arc::new(DashMap::new());
+        let by_cid: Arc<DashMap<u32, oneshot::Sender<Frame>>> = Arc::new(DashMap::new());
+        let by_sid_close: Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>> = Arc::new(DashMap::new());
+        let ioid_to_sid: Arc<DashMap<u32, u32>> = Arc::new(DashMap::new());
 
         // Writer task
         let cancel_writer = cancel.clone();
         let alive_writer = alive.clone();
         tokio::spawn(async move {
+            let mut batch = Vec::with_capacity(8192);
             loop {
                 tokio::select! {
                     _ = cancel_writer.cancelled() => break,
                     msg = writer_rx.recv() => match msg {
                         Some(bytes) => {
-                            if writer_owned.write_all(&bytes).await.is_err() {
+                            batch.extend_from_slice(&bytes);
+                            while let Ok(next) = writer_rx.try_recv() {
+                                batch.extend_from_slice(&next);
+                            }
+                            if writer_owned.write_all(&batch).await.is_err() {
                                 break;
                             }
+                            batch.clear();
                         }
                         None => break,
                     }
@@ -263,7 +257,10 @@ impl ServerConn {
         let cancel_reader = cancel.clone();
         let alive_reader = alive.clone();
         let last_rx_reader = last_rx_nanos.clone();
-        let router_reader = router.clone();
+        let by_ioid_reader = by_ioid.clone();
+        let by_cid_reader = by_cid.clone();
+        let by_sid_close_reader = by_sid_close.clone();
+        let ioid_to_sid_reader = ioid_to_sid.clone();
         let writer_tx_reader = writer_tx.clone();
         let order_reader = byte_order;
         tokio::spawn(async move {
@@ -317,7 +314,7 @@ impl ServerConn {
                             while let Ok(Some((frame, fn_)) ) = try_parse_frame(&buf) {
                                 buf.drain(..fn_);
                                 if frame.header.flags.is_control() {
-                                    handle_control_frame(&frame, &writer_tx_reader, order_reader).await;
+                                    handle_control_frame(&frame, &writer_tx_reader, order_reader);
                                     continue;
                                 }
                                 // P-G21: segmentation gate (mirrors
@@ -396,7 +393,7 @@ impl ServerConn {
                                         payload: std::mem::take(&mut seg_buf),
                                     }
                                 };
-                                route_frame(dispatch_frame, &router_reader);
+                                route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, order_reader);
                             }
                         }
                         Err(_) => break,
@@ -413,13 +410,10 @@ impl ServerConn {
             // fire those signals — leaving the entries pinned would
             // be a small leak the next reconnect would have to
             // recover via stale-sid detection in is_active().
-            {
-                let mut guard = router_reader.lock();
-                guard.by_ioid.clear();
-                guard.by_cid.clear();
-                guard.by_sid_close.clear();
-                guard.ioid_to_sid.clear();
-            }
+            by_ioid_reader.clear();
+            by_cid_reader.clear();
+            by_sid_close_reader.clear();
+            ioid_to_sid_reader.clear();
         });
 
         // Heartbeat task
@@ -448,7 +442,7 @@ impl ServerConn {
                         let h = PvaHeader::control(false, order_hb, ControlCommand::EchoRequest.code(), 0);
                         let mut bytes = Vec::with_capacity(8);
                         h.write_into(&mut bytes);
-                        if writer_tx_hb.send(bytes).await.is_err() {
+                        if writer_tx_hb.send(bytes).is_err() {
                             break;
                         }
                     }
@@ -465,7 +459,10 @@ impl ServerConn {
             cancel,
             alive,
             last_rx_nanos,
-            router,
+            by_ioid,
+            by_cid,
+            by_sid_close,
+            ioid_to_sid,
             type_cache: Arc::new(Mutex::new(crate::pvdata::encode::TypeCache::new())),
         }))
     }
@@ -485,78 +482,105 @@ impl ServerConn {
         self.alive.store(false, Ordering::SeqCst);
     }
 
-    /// Send a fully-built frame.
-    pub async fn send(&self, frame: Vec<u8>) -> PvaResult<()> {
+    /// Send a fully-built frame (synchronous — no .await needed).
+    ///
+    /// The writer channel is unbounded so this never blocks. Frames are
+    /// batched and flushed by the writer task. This matches CA's
+    /// `DirectServerWriter::send_frame` pattern.
+    pub fn send_sync(&self, frame: Vec<u8>) -> PvaResult<()> {
         if !self.is_alive() {
             return Err(PvaError::Protocol("server connection closed".into()));
         }
         self.writer_tx
             .send(frame)
-            .await
             .map_err(|_| PvaError::Protocol("writer queue closed".into()))
     }
 
-    /// Best-effort, non-blocking enqueue. Returns `false` if the queue is
-    /// full or the connection has shut down. Intended for `Drop` paths
-    /// where awaiting is impossible — callers must accept the lossy
-    /// behaviour and rely on the server's own cleanup-on-disconnect for
-    /// the case the frame doesn't make it on the wire.
+    /// Async wrapper around [`send_sync`] for backward compatibility.
+    /// New code should prefer `send_sync` to avoid unnecessary async overhead.
+    pub async fn send(&self, frame: Vec<u8>) -> PvaResult<()> {
+        self.send_sync(frame)
+    }
+
+    /// Best-effort, non-blocking enqueue. Returns `false` if the
+    /// connection has shut down.
     pub fn try_send(&self, frame: Vec<u8>) -> bool {
         if !self.is_alive() {
             return false;
         }
-        self.writer_tx.try_send(frame).is_ok()
+        self.writer_tx.send(frame).is_ok()
     }
 
     /// Register a one-shot waiter for a CREATE_CHANNEL response.
     pub fn register_cid_waiter(&self, cid: u32) -> oneshot::Receiver<Frame> {
         let (tx, rx) = oneshot::channel();
-        self.router.lock().by_cid.insert(cid, tx);
+        self.by_cid.insert(cid, tx);
         rx
     }
 
-    /// Register a stream of frames matching a particular ioid.
+    /// Register two oneshot receivers for a pipelined GET/PUT/RPC op.
     ///
-    /// **Backpressure model**: returns an unbounded channel because the
-    /// PVA monitor protocol bounds inflight frames at the wire level
-    /// via the pipeline-ack window (`pipeline_size`, default 4) — a
-    /// well-behaved server stops emitting once the unacked window is
-    /// full. The unbounded receiver therefore stays bounded in
-    /// practice. A malicious server that ignores the ack window can
-    /// still grow this queue, but the per-frame `max_message_size`
-    /// cap (`PvaServerConfig::max_message_size`, applied in the
-    /// reader) bounds each payload, and the parent connection's
-    /// `op_timeout` / `idle_timeout` machinery eventually tears down
-    /// truly pathological peers.
+    /// The server sends two responses (INIT + DATA) for the same ioid.
+    /// The reader task pops oneshots FIFO: first frame → first oneshot,
+    /// second frame → second oneshot. This avoids creating an
+    /// `unbounded_channel` per GET (heap allocation + vtable dispatch).
+    pub fn register_ioid_twoshot(
+        &self,
+        sid: u32,
+        ioid: u32,
+    ) -> (oneshot::Receiver<Frame>, oneshot::Receiver<Frame>) {
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let mut q = VecDeque::with_capacity(2);
+        q.push_back(tx1);
+        q.push_back(tx2);
+        self.by_ioid.insert(ioid, IoidSlot::TwoShot(q));
+        self.ioid_to_sid.insert(ioid, sid);
+        (rx1, rx2)
+    }
+
+    /// Register a stream of frames matching a particular ioid (MONITOR).
     pub fn register_ioid_stream(&self, sid: u32, ioid: u32) -> mpsc::UnboundedReceiver<Frame> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut g = self.router.lock();
-        g.by_ioid.insert(ioid, tx);
-        g.ioid_to_sid.insert(ioid, sid);
+        self.by_ioid.insert(ioid, IoidSlot::Stream(tx));
+        self.ioid_to_sid.insert(ioid, sid);
         rx
+    }
+
+    /// Register a reusable single-frame slot for warm-GET reuse.
+    ///
+    /// Caller keeps the returned `Arc<Mutex<Option<oneshot>>>` and
+    /// refills it with a fresh oneshot before each warm-GET frame
+    /// send. The reader task `take()`s the current sender on every
+    /// matching frame. The slot itself stays in `by_ioid` until
+    /// explicitly unregistered (e.g. on channel teardown).
+    pub fn register_ioid_reusable(
+        &self,
+        sid: u32,
+        ioid: u32,
+    ) -> Arc<Mutex<Option<oneshot::Sender<Frame>>>> {
+        let slot = Arc::new(Mutex::new(None));
+        self.by_ioid.insert(ioid, IoidSlot::Reusable(slot.clone()));
+        self.ioid_to_sid.insert(ioid, sid);
+        slot
     }
 
     pub fn unregister_ioid(&self, ioid: u32) {
-        let mut g = self.router.lock();
-        g.by_ioid.remove(&ioid);
-        g.ioid_to_sid.remove(&ioid);
+        self.by_ioid.remove(&ioid);
+        self.ioid_to_sid.remove(&ioid);
     }
 
-    /// Register a (flag, notify) pair for server-initiated CMD_DESTROY_CHANNEL
-    /// notification on `sid`. When the server destroys our channel, the flag
-    /// is set to `true` and the notify wakes any `wait_until_inactive`
-    /// waiter so the channel can re-search.
     pub fn register_sid_close(
         &self,
         sid: u32,
         flag: Arc<AtomicBool>,
         notify: Arc<tokio::sync::Notify>,
     ) {
-        self.router.lock().by_sid_close.insert(sid, (flag, notify));
+        self.by_sid_close.insert(sid, (flag, notify));
     }
 
     pub fn unregister_sid_close(&self, sid: u32) {
-        self.router.lock().by_sid_close.remove(&sid);
+        self.by_sid_close.remove(&sid);
     }
 
     /// Wait for the connection to terminate (returns when reader/writer/heartbeat
@@ -670,9 +694,14 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-async fn handle_control_frame(frame: &Frame, writer_tx: &mpsc::Sender<Vec<u8>>, order: ByteOrder) {
+fn handle_control_frame(
+    frame: &Frame,
+    writer_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    order: ByteOrder,
+) {
     if frame.header.command == ControlCommand::EchoRequest.code() {
-        // Server pinged us — bounce back.
+        // Server pinged us — bounce back. Direct unbounded send: no
+        // scheduler hop, mirrors the CA `DirectServerWriter` pattern.
         let resp = PvaHeader::control(
             false,
             order,
@@ -681,104 +710,59 @@ async fn handle_control_frame(frame: &Frame, writer_tx: &mpsc::Sender<Vec<u8>>, 
         );
         let mut bytes = Vec::with_capacity(8);
         resp.write_into(&mut bytes);
-        let _ = writer_tx.send(bytes).await;
+        let _ = writer_tx.send(bytes);
     }
     // Other control messages (SetMarker, AckMarker, EchoResponse) update
     // last_rx implicitly; no further action.
 }
 
-fn route_frame(frame: Frame, router: &Arc<Mutex<Router>>) {
+fn route_frame(
+    frame: Frame,
+    by_ioid: &Arc<DashMap<u32, IoidSlot>>,
+    by_cid: &Arc<DashMap<u32, oneshot::Sender<Frame>>>,
+    by_sid_close: &Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
+    ioid_to_sid: &Arc<DashMap<u32, u32>>,
+    order: ByteOrder,
+) {
     let cmd = frame.header.command;
-    let order = frame.header.flags.byte_order();
 
-    // CMD_MESSAGE (server → client log message for an in-progress op).
-    // Mirrors pvxs `Connection::handle_MESSAGE` (clientconn.cpp added in
-    // pvxs 0eea8fd1c7 "fix CMD_MESSAGE handling"). Decode + log here
-    // instead of routing by IOID — the per-op stream loop reads
-    // `payload[4]` as `subcmd` and would misinterpret `mtype`:
-    //   • mtype=0 (Info)    → subcmd=0  → falls into the data path,
-    //     decodes the rest of the payload as monitor delta, corrupting
-    //     the stream.
-    //   • mtype=1,2 (Warn,Err) → subcmd!=0 and `subcmd & 0x10 == 0` →
-    //     silently dropped, swallowing the diagnostic.
+    // CMD_MESSAGE — log server diagnostic, don't route by IOID.
     if cmd == Command::Message.code() {
         log_server_message(&frame.payload, order);
         return;
     }
 
-    // CMD_DESTROY_CHANNEL from server (pvxs e668038 "client track
-    // opByIOID per channel"). Server is administratively closing a
-    // channel — fire the per-SID close signal so the owning Channel
-    // transitions out of Active and re-searches via its existing
-    // ensure_active path. Without this, server-side SharedPV close
-    // leaves the client's monitor stream hanging silently because
-    // no further frames arrive on the dead SID.
+    // CMD_DESTROY_CHANNEL from server.
     if cmd == Command::DestroyChannel.code() {
         if let Some(sid) = peek_u32(&frame.payload, 0, order) {
-            // Drop every in-flight op's FrameTx entry that maps to
-            // this destroyed SID so each blocked consumer's
-            // `stream.recv().await` returns None → op surfaces as
-            // ConnectionLost → the monitor / op_get / op_put loops
-            // re-drive ensure_active, which now observes the
-            // server_destroyed flag set below and re-searches.
-            // Without this, signalling the channel-level
-            // (flag, notify) alone left every blocked op hanging on
-            // the by_ioid channel until the whole ServerConn died
-            // (pvxs e668038 "client track opByIOID per channel").
-            //
-            // CRITICAL: `flag.store + notify_waiters()` MUST run
-            // while we still hold the router lock. The flag is a
-            // shared `Arc<AtomicBool>` owned by `Channel` and reused
-            // across re-registrations (set_state(Active) clears it
-            // and re-inserts a new (sid, (flag, notify))). If we
-            // dropped the lock before storing, a concurrent
-            // `set_state(Active{new_sid})` could clear the flag and
-            // register a fresh entry — and our deferred store would
-            // then taint the healthy new SID, forcing an unnecessary
-            // re-search. Holding the lock guarantees set_state
-            // serialises after our destroy critical section.
             let mut dropped_ioids = 0usize;
-            {
-                let mut g = router.lock();
-                let entry = g.by_sid_close.remove(&sid);
-                let matching: Vec<u32> = g
-                    .ioid_to_sid
-                    .iter()
-                    .filter(|(_, s)| **s == sid)
-                    .map(|(i, _)| *i)
-                    .collect();
-                for ioid in &matching {
-                    g.ioid_to_sid.remove(ioid);
-                    g.by_ioid.remove(ioid);
-                    dropped_ioids += 1;
-                }
-                if let Some((flag, notify)) = entry {
-                    flag.store(true, Ordering::Relaxed);
-                    // notify_waiters is non-blocking (marks waiters
-                    // ready, runtime polls them later) — safe to
-                    // call under the router lock.
-                    notify.notify_waiters();
-                    drop(g);
-                    tracing::warn!(
-                        sid,
-                        dropped_ioids,
-                        "server destroyed channel — triggering re-search"
-                    );
-                } else {
-                    drop(g);
-                    tracing::debug!(sid, "server destroyed unknown channel (already torn down?)");
-                }
+            // Collect matching ioids first, then remove.
+            let matching: Vec<u32> = ioid_to_sid
+                .iter()
+                .filter(|r| *r.value() == sid)
+                .map(|r| *r.key())
+                .collect();
+            for ioid in &matching {
+                ioid_to_sid.remove(ioid);
+                by_ioid.remove(ioid);
+                dropped_ioids += 1;
+            }
+            // Fire the close signal.
+            if let Some((_, (flag, notify))) = by_sid_close.remove(&sid) {
+                flag.store(true, Ordering::Relaxed);
+                notify.notify_waiters();
+                tracing::warn!(sid, dropped_ioids, "server destroyed channel — triggering re-search");
+            } else {
+                tracing::debug!(sid, "server destroyed unknown channel (already torn down?)");
             }
         }
         return;
     }
 
-    let mut router_guard = router.lock();
-
     // CREATE_CHANNEL responses route by CID.
     if cmd == Command::CreateChannel.code() {
         if let Some(cid) = peek_u32(&frame.payload, 0, order) {
-            if let Some(tx) = router_guard.by_cid.remove(&cid) {
+            if let Some((_, tx)) = by_cid.remove(&cid) {
                 let _ = tx.send(frame);
                 return;
             }
@@ -786,11 +770,33 @@ fn route_frame(frame: Frame, router: &Arc<Mutex<Router>>) {
     }
 
     // Application op responses (GET/PUT/MONITOR/RPC/GET_FIELD) route by IOID.
-    let ioid = peek_u32(&frame.payload, 0, order);
-    if let Some(ioid) = ioid {
-        if let Some(tx) = router_guard.by_ioid.get(&ioid).cloned() {
-            drop(router_guard);
-            let _ = tx.send(frame);
+    if let Some(ioid) = peek_u32(&frame.payload, 0, order) {
+        // Try to dispatch. For TwoShot, pop the first available oneshot.
+        // For Stream, send to the unbounded channel.
+        if let Some(mut entry) = by_ioid.get_mut(&ioid) {
+            match entry.value_mut() {
+                IoidSlot::TwoShot(q) => {
+                    if let Some(tx) = q.pop_front() {
+                        let _ = tx.send(frame);
+                    }
+                    // If queue is now empty, remove the entry entirely.
+                    if q.is_empty() {
+                        drop(entry);
+                        by_ioid.remove(&ioid);
+                    }
+                }
+                IoidSlot::Stream(tx) => {
+                    let _ = tx.send(frame);
+                }
+                IoidSlot::Reusable(slot) => {
+                    // Take the current sender (if any) and fulfil it.
+                    // The slot itself stays registered — next warm
+                    // GET will refill it.
+                    if let Some(tx) = slot.lock().take() {
+                        let _ = tx.send(frame);
+                    }
+                }
+            }
         }
     }
     // Otherwise: drop silently. (Beacons/SearchResponse are handled
@@ -946,20 +952,30 @@ mod tests {
         log_server_message(&[0u8; 5], ByteOrder::Little); // ioid + mtype but no string
     }
 
+    /// Build a fresh set of router DashMaps for unit tests.
+    fn fresh_router() -> (
+        Arc<DashMap<u32, IoidSlot>>,
+        Arc<DashMap<u32, oneshot::Sender<Frame>>>,
+        Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
+        Arc<DashMap<u32, u32>>,
+    ) {
+        (
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+        )
+    }
+
     #[test]
     fn destroy_channel_fires_registered_close_signal() {
-        use std::sync::atomic::{AtomicBool, Ordering as AtoOrd};
-        // Build a router with a registered (flag, notify) pair.
-        let router: Arc<Mutex<Router>> = Arc::new(Mutex::new(Router::default()));
+        use std::sync::atomic::Ordering as AtoOrd;
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid) = fresh_router();
         let flag = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(tokio::sync::Notify::new());
         let sid = 0xDEADBEEFu32;
-        router
-            .lock()
-            .by_sid_close
-            .insert(sid, (flag.clone(), notify.clone()));
+        by_sid_close.insert(sid, (flag.clone(), notify.clone()));
 
-        // Build a CMD_DESTROY_CHANNEL frame: payload = sid (u32 LE).
         let order = ByteOrder::Little;
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -971,32 +987,23 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        // route_frame should fire the notify and set the flag.
-        route_frame(frame, &router);
+        route_frame(frame, &by_ioid, &by_cid, &by_sid_close, &ioid_to_sid, order);
         assert!(flag.load(AtoOrd::Relaxed));
-        // Entry is consumed after firing.
-        assert!(!router.lock().by_sid_close.contains_key(&sid));
+        assert!(!by_sid_close.contains_key(&sid));
     }
 
-    /// `flag.store(true)` for the destroyed sid must run BEFORE we
-    /// drop the router lock, so a concurrent `set_state(Active{new_sid})`
-    /// can't sneak in, clear the (shared `Arc`) flag, and then have
-    /// our deferred store taint the healthy new SID. This test
-    /// verifies the lock-held ordering at the unit level: the
-    /// `by_sid_close` removal and the `flag.store` are observable
-    /// as a single critical section by anyone holding the same
-    /// router lock.
+    /// `flag.store(true)` for the destroyed sid must run together with
+    /// the `by_sid_close` removal so a concurrent re-register can't
+    /// observe a torn state. With DashMap we get per-shard atomicity
+    /// for the remove + the subsequent flag.store; both are observed
+    /// before route_frame returns.
     #[test]
-    fn destroy_critical_section_holds_lock_through_flag_store() {
-        use std::sync::atomic::AtomicBool;
-        let router: Arc<Mutex<Router>> = Arc::new(Mutex::new(Router::default()));
+    fn destroy_critical_section_completes_before_route_frame_returns() {
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid) = fresh_router();
         let flag = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(tokio::sync::Notify::new());
         let sid = 7u32;
-        router
-            .lock()
-            .by_sid_close
-            .insert(sid, (flag.clone(), notify.clone()));
+        by_sid_close.insert(sid, (flag.clone(), notify.clone()));
         let mut payload = Vec::new();
         payload.put_u32(sid, ByteOrder::Little);
         let header = PvaHeader::application(
@@ -1005,49 +1012,45 @@ mod tests {
             Command::DestroyChannel.code(),
             payload.len() as u32,
         );
-        // The lock-holding race-window check is structural: if
-        // route_frame returns and the flag is set, the entry must
-        // also be gone. (If the order were reversed and a concurrent
-        // re-register snuck in, we could observe entry-present +
-        // flag-set, indicating a torn critical section.)
-        route_frame(Frame { header, payload }, &router);
-        let g = router.lock();
-        assert!(!g.by_sid_close.contains_key(&sid));
-        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        route_frame(
+            Frame { header, payload },
+            &by_ioid,
+            &by_cid,
+            &by_sid_close,
+            &ioid_to_sid,
+            ByteOrder::Little,
+        );
+        assert!(!by_sid_close.contains_key(&sid));
+        assert!(flag.load(Ordering::Relaxed));
     }
 
     /// route_frame on `CMD_DESTROY_CHANNEL` must also drop every
-    /// in-flight op's FrameTx whose ioid maps to the destroyed sid.
-    /// Without this, blocked `stream.recv().await` calls hang
-    /// forever and the server_destroyed flag/notify alone don't
-    /// surface to the op consumer (review HIGH #1).
+    /// in-flight op's frame sender whose ioid maps to the destroyed
+    /// sid. Without this, blocked oneshot/stream awaits hang forever.
     #[test]
     fn destroy_channel_drops_associated_ioid_streams() {
-        use std::sync::atomic::AtomicBool;
-        let router: Arc<Mutex<Router>> = Arc::new(Mutex::new(Router::default()));
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid) = fresh_router();
         let sid = 42u32;
         let other_sid = 99u32;
-        // Register two ioids on the destroyed sid + one on a
-        // different sid that must NOT be dropped.
+
+        // Register two streams on the destroyed sid + one on another sid.
         let (tx_a, mut rx_a) = mpsc::unbounded_channel::<Frame>();
         let (tx_b, mut rx_b) = mpsc::unbounded_channel::<Frame>();
         let (tx_c, mut rx_c) = mpsc::unbounded_channel::<Frame>();
-        {
-            let mut g = router.lock();
-            g.by_ioid.insert(1001, tx_a);
-            g.ioid_to_sid.insert(1001, sid);
-            g.by_ioid.insert(1002, tx_b);
-            g.ioid_to_sid.insert(1002, sid);
-            g.by_ioid.insert(1003, tx_c);
-            g.ioid_to_sid.insert(1003, other_sid);
-            g.by_sid_close.insert(
-                sid,
-                (
-                    Arc::new(AtomicBool::new(false)),
-                    Arc::new(tokio::sync::Notify::new()),
-                ),
-            );
-        }
+        by_ioid.insert(1001, IoidSlot::Stream(tx_a));
+        ioid_to_sid.insert(1001, sid);
+        by_ioid.insert(1002, IoidSlot::Stream(tx_b));
+        ioid_to_sid.insert(1002, sid);
+        by_ioid.insert(1003, IoidSlot::Stream(tx_c));
+        ioid_to_sid.insert(1003, other_sid);
+        by_sid_close.insert(
+            sid,
+            (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(tokio::sync::Notify::new()),
+            ),
+        );
+
         let mut payload = Vec::new();
         payload.put_u32(sid, ByteOrder::Little);
         let header = PvaHeader::application(
@@ -1056,26 +1059,25 @@ mod tests {
             Command::DestroyChannel.code(),
             payload.len() as u32,
         );
-        route_frame(Frame { header, payload }, &router);
-        // Streams on the destroyed sid must report None (sender dropped).
-        assert!(
-            rx_a.try_recv().is_err(),
-            "ioid 1001 stream should be closed"
+        route_frame(
+            Frame { header, payload },
+            &by_ioid,
+            &by_cid,
+            &by_sid_close,
+            &ioid_to_sid,
+            ByteOrder::Little,
         );
-        assert!(
-            rx_b.try_recv().is_err(),
-            "ioid 1002 stream should be closed"
-        );
-        // Stream on other sid must still be open.
+
+        assert!(rx_a.try_recv().is_err(), "ioid 1001 stream should be closed");
+        assert!(rx_b.try_recv().is_err(), "ioid 1002 stream should be closed");
         assert!(matches!(
             rx_c.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        let g = router.lock();
-        assert!(!g.by_ioid.contains_key(&1001));
-        assert!(!g.by_ioid.contains_key(&1002));
-        assert!(g.by_ioid.contains_key(&1003));
-        assert!(!g.ioid_to_sid.contains_key(&1001));
-        assert!(g.ioid_to_sid.contains_key(&1003));
+        assert!(!by_ioid.contains_key(&1001));
+        assert!(!by_ioid.contains_key(&1002));
+        assert!(by_ioid.contains_key(&1003));
+        assert!(!ioid_to_sid.contains_key(&1001));
+        assert!(ioid_to_sid.contains_key(&1003));
     }
 }

@@ -204,6 +204,19 @@ pub struct CaClient {
     search_tx: mpsc::UnboundedSender<SearchRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
+    /// Shared registry of in-flight one-shot reads and writes
+    /// (Option C, Phase A). Channel handles insert reply oneshots
+    /// here directly; the per-server read loop removes and fulfils
+    /// them on response arrival without a coordinator round-trip.
+    in_flight: InFlightOps,
+    /// Per-channel snapshot sidecar (Option C, Phase B). Coordinator
+    /// publishes channel state on every lifecycle change; CaChannel
+    /// hot paths read directly without a `GetChannelInfo` round-trip.
+    snapshots: ChannelSnapshots,
+    /// Per-server writer sidecar (Option C, Phase E). Lets hot reads
+    /// and writes enqueue frames directly to the connection writer
+    /// once lifecycle has already established the virtual circuit.
+    server_writers: DirectServerWriters,
     diagnostics: Arc<CaDiagnostics>,
     _coordinator: tokio::task::JoinHandle<()>,
     _search_task: tokio::task::JoinHandle<()>,
@@ -223,10 +236,6 @@ enum CoordRequest {
         cid: u32,
         reply: oneshot::Sender<()>,
     },
-    GetChannelInfo {
-        cid: u32,
-        reply: oneshot::Sender<Option<ChannelSnapshot>>,
-    },
     Subscribe {
         cid: u32,
         subid: u32,
@@ -243,17 +252,6 @@ enum CoordRequest {
     },
     DropChannel {
         cid: u32,
-    },
-    ReadNotify {
-        cid: u32,
-        ioid: u32,
-        reply: oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>,
-    },
-    WriteNotify {
-        cid: u32,
-        ioid: u32,
-        value: EpicsValue,
-        reply: oneshot::Sender<CaResult<()>>,
     },
     /// Beacon anomaly classified by `beacon_monitor`. Coordinator
     /// rescans all disconnected/searching channels regardless of
@@ -304,17 +302,6 @@ enum CoordRequest {
     Shutdown {
         reply: oneshot::Sender<()>,
     },
-}
-
-#[derive(Clone)]
-struct ChannelSnapshot {
-    sid: u32,
-    native_type: DbFieldType,
-    element_count: u32,
-    server_addr: SocketAddr,
-    access_rights: AccessRights,
-    state: ChannelState,
-    pv_name: String,
 }
 
 /// Optional configuration knobs for `CaClient::new_with_config`.
@@ -484,12 +471,20 @@ impl CaClient {
             }
         });
 
+        let in_flight = InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+        let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
+        let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
+
         let transport_task = {
             #[cfg(feature = "experimental-rust-tls")]
             {
                 epics_base_rs::runtime::task::spawn(transport::run_transport_manager(
                     transport_rx,
                     transport_evt_tx,
+                    in_flight.clone(),
+                    server_writers.clone(),
+                    last_rx_at.clone(),
                     tls_arc,
                     config.tls_server_name.clone(),
                     sni_overrides,
@@ -500,6 +495,9 @@ impl CaClient {
                 epics_base_rs::runtime::task::spawn(transport::run_transport_manager(
                     transport_rx,
                     transport_evt_tx,
+                    in_flight.clone(),
+                    server_writers.clone(),
+                    last_rx_at.clone(),
                 ))
             }
         };
@@ -512,6 +510,9 @@ impl CaClient {
             transport_evt_rx,
             search_tx.clone(),
             transport_tx.clone(),
+            in_flight.clone(),
+            snapshots.clone(),
+            last_rx_at,
             diagnostics.clone(),
         ));
 
@@ -523,6 +524,9 @@ impl CaClient {
             search_tx,
             transport_tx,
             coord_tx,
+            in_flight,
+            snapshots,
+            server_writers,
             diagnostics,
             _coordinator: coordinator,
             _search_task: search_task,
@@ -598,6 +602,9 @@ impl CaClient {
             pv_name,
             coord_tx: self.coord_tx.clone(),
             transport_tx: self.transport_tx.clone(),
+            in_flight: self.in_flight.clone(),
+            snapshots: self.snapshots.clone(),
+            server_writers: self.server_writers.clone(),
             conn_tx,
             _lifecycle: lifecycle,
         }
@@ -633,21 +640,96 @@ impl CaClient {
         result
     }
 
+    /// Bulk one-shot read for many PV names.
+    ///
+    /// This connects all channels concurrently, then sends established
+    /// reads through [`Self::get_many_with_timeout`], which coalesces
+    /// same-server `READ_NOTIFY` requests into a single writer enqueue.
+    /// Results are returned in input order.
+    pub async fn caget_many<S>(&self, pv_names: &[S]) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
+    where
+        S: AsRef<str> + Sync,
+    {
+        self.caget_many_with_timeout(pv_names, Duration::from_secs(30))
+            .await
+    }
+
+    /// Bulk one-shot read with a caller-supplied connect/read timeout.
+    pub async fn caget_many_with_timeout<S>(
+        &self,
+        pv_names: &[S],
+        timeout: Duration,
+    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
+    where
+        S: AsRef<str> + Sync,
+    {
+        let channels: Vec<CaChannel> = pv_names
+            .iter()
+            .map(|name| self.create_channel(name.as_ref()))
+            .collect();
+
+        let connected =
+            futures_util::future::join_all(channels.iter().map(|ch| ch.wait_connected(timeout)))
+                .await;
+
+        let mut results: Vec<Option<CaResult<(DbFieldType, EpicsValue)>>> =
+            (0..channels.len()).map(|_| None).collect();
+        let mut ready_indices = Vec::new();
+        let mut ready_channels = Vec::new();
+        for (idx, result) in connected.into_iter().enumerate() {
+            match result {
+                Ok(()) => {
+                    ready_indices.push(idx);
+                    ready_channels.push(channels[idx].clone());
+                }
+                Err(e) => results[idx] = Some(Err(e)),
+            }
+        }
+
+        let read_results = self
+            .get_many_with_timeout(&ready_channels, timeout)
+            .await
+            .into_iter();
+        for (idx, result) in ready_indices.into_iter().zip(read_results) {
+            results[idx] = Some(result);
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(CaError::Shutdown)))
+            .collect()
+    }
+
+    /// Bulk read for already-created channels.
+    ///
+    /// Unlike spawning `ch.get()` N times, this path constructs every
+    /// request up front, groups requests by server, and enqueues one
+    /// concatenated CA frame per server. That matches libca's bulk
+    /// flush model more closely and avoids per-PV task scheduling.
+    /// Results are returned in channel order.
+    pub async fn get_many(
+        &self,
+        channels: &[CaChannel],
+    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
+        self.get_many_with_timeout(channels, Duration::from_secs(30))
+            .await
+    }
+
+    /// Bulk read for already-created channels with a caller-supplied timeout.
+    pub async fn get_many_with_timeout(
+        &self,
+        channels: &[CaChannel],
+        timeout: Duration,
+    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
+        CaChannel::get_many_with_timeout(channels, timeout).await
+    }
+
     /// Fire-and-forget write (CA_PROTO_WRITE). Matches C `caput` behavior.
     pub async fn caput(&self, pv_name: &str, value_str: &str) -> CaResult<()> {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: ch.cid,
-            reply: reply_tx,
-        });
-        let snap = reply_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
+        let snap = ch.snapshot()?;
         let value = EpicsValue::parse(snap.native_type, value_str)?;
         ch.put_nowait(&value).await?;
         let _ = self
@@ -667,16 +749,7 @@ impl CaClient {
         let timeout = Duration::from_secs_f64(timeout_secs);
         ch.wait_connected(timeout).await?;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: ch.cid,
-            reply: reply_tx,
-        });
-        let snap = reply_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
+        let snap = ch.snapshot()?;
         let value = EpicsValue::parse(snap.native_type, value_str)?;
         ch.put_with_timeout(&value, timeout).await?;
         let _ = self
@@ -689,27 +762,11 @@ impl CaClient {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: ch.cid,
-            reply: reply_tx,
-        });
-        let snap = reply_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
+        let info = ch.info().await;
         let _ = self
             .coord_tx
             .send(CoordRequest::DropChannel { cid: ch.cid });
-
-        Ok(ChannelInfo {
-            pv_name: snap.pv_name,
-            server_addr: snap.server_addr,
-            native_type: snap.native_type,
-            element_count: snap.element_count,
-            access_rights: snap.access_rights,
-        })
+        info
     }
 
     /// Monitor a PV with callback (legacy API).
@@ -755,6 +812,18 @@ pub struct CaChannel {
     pv_name: String,
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
+    /// Shared in-flight registry for reads and writes (Option C
+    /// Phase A). `ch.get()` / `ch.put()` insert their reply oneshots
+    /// directly here, bypassing the coordinator's `tokio::select!`
+    /// loop. The transport's per-server read loop fulfils them on
+    /// `ReadResponse` / `WriteResponse` arrival.
+    in_flight: InFlightOps,
+    /// Per-channel snapshot sidecar (Option C, Phase B). Read by hot
+    /// paths in lieu of `CoordRequest::GetChannelInfo`.
+    snapshots: ChannelSnapshots,
+    /// Per-server writer sidecar (Option C, Phase E). Read/write hot
+    /// paths use this after `snapshot()` proves the channel is active.
+    server_writers: DirectServerWriters,
     conn_tx: broadcast::Sender<ConnectionEvent>,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
@@ -776,20 +845,9 @@ impl CaChannel {
     /// Get channel-level metadata (native type, element count, host, access rights)
     /// without performing a CA read.
     pub async fn info(&self) -> CaResult<ChannelInfo> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
         Ok(ChannelInfo {
-            pv_name: snap.pv_name,
+            pv_name: self.pv_name.clone(),
             server_addr: snap.server_addr,
             native_type: snap.native_type,
             element_count: snap.element_count,
@@ -797,43 +855,303 @@ impl CaChannel {
         })
     }
 
+    /// Phase B fast-path: read the channel's published snapshot without
+    /// touching the coordinator. Returns `Disconnected` if either no
+    /// snapshot is published yet (channel is searching/connecting/
+    /// failed-to-resolve native type) or the snapshot reflects a
+    /// non-operational state.
+    fn snapshot(&self) -> CaResult<ChannelSnapshotPublic> {
+        match self.snapshots.get(&self.cid) {
+            Some(s) if s.state.is_operational() => Ok(s.clone()),
+            _ => Err(CaError::Disconnected),
+        }
+    }
+
+    fn direct_writer(&self, server_addr: SocketAddr) -> Option<DirectServerWriter> {
+        self.server_writers.get(&server_addr).map(|w| w.clone())
+    }
+
+    fn build_read_notify_frame(sid: u32, data_type: u16, count: u32, ioid: u32) -> Vec<u8> {
+        let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        hdr.data_type = data_type;
+        hdr.cid = sid;
+        hdr.available = ioid;
+        if count > 0xFFFF {
+            hdr.set_payload_size(0, count);
+        } else {
+            hdr.count = count as u16;
+        }
+        hdr.to_bytes_extended()
+    }
+
+    fn build_write_frame(
+        cmd: u16,
+        sid: u32,
+        data_type: u16,
+        count: u32,
+        ioid: Option<u32>,
+        payload: Vec<u8>,
+    ) -> Vec<u8> {
+        let padded_len = align8(payload.len());
+        let mut padded = payload;
+        padded.resize(padded_len, 0);
+
+        let mut hdr = CaHeader::new(cmd);
+        hdr.data_type = data_type;
+        hdr.cid = sid;
+        if let Some(ioid) = ioid {
+            hdr.available = ioid;
+        }
+        hdr.set_payload_size(padded.len(), count);
+
+        let mut frame = hdr.to_bytes_extended();
+        frame.extend_from_slice(&padded);
+        frame
+    }
+
+    fn send_read_notify_fast(
+        &self,
+        snap: &ChannelSnapshotPublic,
+        data_type: u16,
+        count: u32,
+        ioid: u32,
+    ) -> CaResult<()> {
+        if let Some(writer) = self.direct_writer(snap.server_addr) {
+            return writer.send_frame(Self::build_read_notify_frame(
+                snap.sid, data_type, count, ioid,
+            ));
+        }
+
+        self.transport_tx
+            .send(TransportCommand::ReadNotify {
+                sid: snap.sid,
+                data_type,
+                count,
+                ioid,
+                server_addr: snap.server_addr,
+            })
+            .map_err(|_| CaError::Shutdown)
+    }
+
+    fn send_write_notify_fast(
+        &self,
+        snap: &ChannelSnapshotPublic,
+        count: u32,
+        ioid: u32,
+        payload: Vec<u8>,
+    ) -> CaResult<()> {
+        if let Some(writer) = self.direct_writer(snap.server_addr) {
+            return writer.send_frame(Self::build_write_frame(
+                CA_PROTO_WRITE_NOTIFY,
+                snap.sid,
+                snap.native_type as u16,
+                count,
+                Some(ioid),
+                payload,
+            ));
+        }
+
+        self.transport_tx
+            .send(TransportCommand::WriteNotify {
+                sid: snap.sid,
+                data_type: snap.native_type as u16,
+                count,
+                ioid,
+                payload,
+                server_addr: snap.server_addr,
+            })
+            .map_err(|_| CaError::Shutdown)
+    }
+
+    fn send_write_nowait_fast(
+        &self,
+        snap: &ChannelSnapshotPublic,
+        count: u32,
+        payload: Vec<u8>,
+    ) -> CaResult<()> {
+        if let Some(writer) = self.direct_writer(snap.server_addr) {
+            return writer.send_frame(Self::build_write_frame(
+                CA_PROTO_WRITE,
+                snap.sid,
+                snap.native_type as u16,
+                count,
+                None,
+                payload,
+            ));
+        }
+
+        self.transport_tx
+            .send(TransportCommand::Write {
+                sid: snap.sid,
+                data_type: snap.native_type as u16,
+                count,
+                payload,
+                server_addr: snap.server_addr,
+            })
+            .map_err(|_| CaError::Shutdown)
+    }
+
     pub async fn get(&self) -> CaResult<(DbFieldType, EpicsValue)> {
         self.get_with_timeout(Duration::from_secs(30)).await
     }
 
-    pub async fn get_with_timeout(&self, timeout: Duration) -> CaResult<(DbFieldType, EpicsValue)> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
+    pub async fn get_many(channels: &[CaChannel]) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
+        Self::get_many_with_timeout(channels, Duration::from_secs(30)).await
+    }
 
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
+    pub async fn get_many_with_timeout(
+        channels: &[CaChannel],
+        timeout: Duration,
+    ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
+        struct PendingBulkRead {
+            index: usize,
+            ioid: u32,
+            in_flight: InFlightOps,
+            reply_rx: oneshot::Receiver<CaResult<(u16, u32, Vec<u8>)>>,
         }
+
+        struct BulkReadGroup {
+            writer: DirectServerWriter,
+            frame: Vec<u8>,
+            pending: Vec<PendingBulkRead>,
+        }
+
+        let mut results: Vec<Option<CaResult<(DbFieldType, EpicsValue)>>> =
+            (0..channels.len()).map(|_| None).collect();
+        let mut groups: HashMap<SocketAddr, BulkReadGroup> = HashMap::new();
+        let mut pending: Vec<PendingBulkRead> = Vec::new();
+
+        for (index, ch) in channels.iter().enumerate() {
+            let snap = match ch.snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    results[index] = Some(Err(e));
+                    continue;
+                }
+            };
+
+            let ioid = alloc_ioid();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            ch.in_flight.reads.insert(ioid, (ch.cid, reply_tx));
+            let pending_read = PendingBulkRead {
+                index,
+                ioid,
+                in_flight: ch.in_flight.clone(),
+                reply_rx,
+            };
+
+            let frame = Self::build_read_notify_frame(
+                snap.sid,
+                snap.native_type as u16,
+                snap.element_count,
+                ioid,
+            );
+
+            if let Some(writer) = ch.direct_writer(snap.server_addr) {
+                let group = groups
+                    .entry(snap.server_addr)
+                    .or_insert_with(|| BulkReadGroup {
+                        writer,
+                        frame: Vec::new(),
+                        pending: Vec::new(),
+                    });
+                group.frame.extend_from_slice(&frame);
+                group.pending.push(pending_read);
+            } else {
+                match ch.send_read_notify_fast(
+                    &snap,
+                    snap.native_type as u16,
+                    snap.element_count,
+                    ioid,
+                ) {
+                    Ok(()) => pending.push(pending_read),
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&ioid);
+                        results[index] = Some(Err(e));
+                    }
+                }
+            }
+        }
+
+        for (_, group) in groups {
+            match group.writer.send_frame(group.frame) {
+                Ok(()) => pending.extend(group.pending),
+                Err(_) => {
+                    for p in group.pending {
+                        p.in_flight.reads.remove(&p.ioid);
+                        results[p.index] = Some(Err(CaError::Disconnected));
+                    }
+                }
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        for p in pending {
+            let PendingBulkRead {
+                index,
+                ioid,
+                in_flight,
+                reply_rx,
+            } = p;
+            let result = tokio::time::timeout_at(deadline, reply_rx).await;
+            in_flight.reads.remove(&ioid);
+
+            let decoded = match result {
+                Ok(Ok(Ok((data_type, count, data)))) => {
+                    let dbr_type = match DbFieldType::from_u16(data_type) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            results[index] = Some(Err(e));
+                            continue;
+                        }
+                    };
+                    EpicsValue::from_bytes_array(dbr_type, &data, count as usize)
+                        .map(|value| (dbr_type, value))
+                }
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err(CaError::Shutdown),
+                Err(_) => Err(CaError::Timeout),
+            };
+            results[index] = Some(decoded);
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(CaError::Shutdown)))
+            .collect()
+    }
+
+    pub async fn get_with_timeout(&self, timeout: Duration) -> CaResult<(DbFieldType, EpicsValue)> {
+        let snap = self.snapshot()?;
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::ReadNotify {
-            cid: self.cid,
-            ioid,
-            reply: reply_tx,
-        });
+        // Direct registry insert (Option C Phase A) — bypasses the
+        // coordinator. `transport::read_loop` removes the entry and
+        // fulfils the oneshot when CA_PROTO_READ_NOTIFY arrives.
+        // Drop semantics: if the caller drops the future before the
+        // response arrives, `reply_rx` drops, the registry's stored
+        // sender becomes a zombie until either (a) the response
+        // arrives and we send to a dead receiver (no-op), or
+        // (b) disconnect cleanup drains it (Phase D). Bounded
+        // either way; not a leak.
+        self.in_flight.reads.insert(ioid, (self.cid, reply_tx));
 
-        let _ = self.transport_tx.send(TransportCommand::ReadNotify {
-            sid: snap.sid,
-            data_type: snap.native_type as u16,
-            count: snap.element_count,
-            ioid,
-            server_addr: snap.server_addr,
-        });
+        if let Err(e) =
+            self.send_read_notify_fast(&snap, snap.native_type as u16, snap.element_count, ioid)
+        {
+            self.in_flight.reads.remove(&ioid);
+            return Err(e);
+        }
 
-        let (data_type, count, data) = tokio::time::timeout(timeout, reply_rx)
-            .await
+        let result = tokio::time::timeout(timeout, reply_rx).await;
+        // Always remove the registry entry when control returns —
+        // covers the timeout path (response would never arrive) and
+        // the success path (already removed by read_loop, the
+        // `remove` is a no-op then). `drop` of `reply_rx` happens
+        // implicitly on the success path.
+        self.in_flight.reads.remove(&ioid);
+        let (data_type, count, data) = result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)??;
 
@@ -852,19 +1170,7 @@ impl CaChannel {
     /// Get a PV value with metadata, requesting at most `count` elements.
     /// Pass 0 for the full element count.
     pub async fn get_with_metadata_count(&self, class: DbrClass, count: u32) -> CaResult<Snapshot> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
 
         let request_count = if count > 0 {
             count.min(snap.element_count)
@@ -883,22 +1189,18 @@ impl CaChannel {
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::ReadNotify {
-            cid: self.cid,
-            ioid,
-            reply: reply_tx,
-        });
+        // Direct registry insert (Option C Phase A); see ch.get
+        // for drop-semantics commentary.
+        self.in_flight.reads.insert(ioid, (self.cid, reply_tx));
 
-        let _ = self.transport_tx.send(TransportCommand::ReadNotify {
-            sid: snap.sid,
-            data_type: request_type,
-            count: request_count,
-            ioid,
-            server_addr: snap.server_addr,
-        });
+        if let Err(e) = self.send_read_notify_fast(&snap, request_type, request_count, ioid) {
+            self.in_flight.reads.remove(&ioid);
+            return Err(e);
+        }
 
-        let (data_type, resp_count, data) = tokio::time::timeout(Duration::from_secs(30), reply_rx)
-            .await
+        let result = tokio::time::timeout(Duration::from_secs(30), reply_rx).await;
+        self.in_flight.reads.remove(&ioid);
+        let (data_type, resp_count, data) = result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)??;
 
@@ -906,88 +1208,50 @@ impl CaChannel {
     }
 
     pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::WriteNotify {
-            cid: self.cid,
-            ioid,
-            value: value.clone(),
-            reply: reply_tx,
-        });
+        // Direct registry insert (Option C Phase A).
+        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        let _ = self.transport_tx.send(TransportCommand::WriteNotify {
-            sid: snap.sid,
-            data_type: snap.native_type as u16,
-            count,
-            ioid,
-            payload,
-            server_addr: snap.server_addr,
-        });
+        if let Err(e) = self.send_write_notify_fast(&snap, count, ioid, payload) {
+            self.in_flight.writes.remove(&ioid);
+            return Err(e);
+        }
 
         // Default put timeout configurable via EPICS_CA_PUT_TIMEOUT (seconds).
         let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(30.0);
-        tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx)
-            .await
+        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)?
     }
 
     /// Write with completion callback and configurable timeout.
     pub async fn put_with_timeout(&self, value: &EpicsValue, timeout: Duration) -> CaResult<()> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::WriteNotify {
-            cid: self.cid,
-            ioid,
-            value: value.clone(),
-            reply: reply_tx,
-        });
+        // Direct registry insert (Option C Phase A).
+        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        let _ = self.transport_tx.send(TransportCommand::WriteNotify {
-            sid: snap.sid,
-            data_type: snap.native_type as u16,
-            count,
-            ioid,
-            payload,
-            server_addr: snap.server_addr,
-        });
+        if let Err(e) = self.send_write_notify_fast(&snap, count, ioid, payload) {
+            self.in_flight.writes.remove(&ioid);
+            return Err(e);
+        }
 
-        tokio::time::timeout(timeout, reply_rx)
-            .await
+        let result = tokio::time::timeout(timeout, reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)?
     }
@@ -996,31 +1260,11 @@ impl CaChannel {
     /// waiting for server acknowledgement. Used by ophyd's EpicsMotor.set()
     /// which monitors DMOV for completion instead.
     pub async fn put_nowait(&self, value: &EpicsValue) -> CaResult<()> {
-        let (info_tx, info_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::GetChannelInfo {
-            cid: self.cid,
-            reply: info_tx,
-        });
-        let snap = info_rx
-            .await
-            .map_err(|_| CaError::Shutdown)?
-            .ok_or(CaError::Disconnected)?;
-
-        if !snap.state.is_operational() {
-            return Err(CaError::Disconnected);
-        }
+        let snap = self.snapshot()?;
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        let _ = self.transport_tx.send(TransportCommand::Write {
-            sid: snap.sid,
-            data_type: snap.native_type as u16,
-            count,
-            payload,
-            server_addr: snap.server_addr,
-        });
-
-        Ok(())
+        self.send_write_nowait_fast(&snap, count, payload)
     }
 
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {
@@ -1237,24 +1481,20 @@ async fn run_coordinator(
     mut transport_rx: mpsc::UnboundedReceiver<TransportEvent>,
     search_tx: mpsc::UnboundedSender<SearchRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
+    in_flight: types::InFlightOps,
+    snapshots: ChannelSnapshots,
+    last_rx_at: ServerLastRxAt,
     diag: Arc<CaDiagnostics>,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
     let mut pending_wait_connected: HashMap<u32, Vec<oneshot::Sender<()>>> = HashMap::new();
     let mut pending_found: HashMap<u32, SocketAddr> = HashMap::new();
     let mut subscriptions = SubscriptionRegistry::new();
-    let mut read_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)> =
-        HashMap::new();
-    let mut write_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)> = HashMap::new();
     // Reverse index: server_addr -> set of cids last seen on that server.
     // Keep disconnected channels indexed so beacon anomalies can trigger
     // immediate re-search for the affected IOC.
     let mut server_channels: HashMap<SocketAddr, HashSet<u32>> = HashMap::new();
     let mut flow_control: HashMap<SocketAddr, FlowControlState> = HashMap::new();
-    // Last RX timestamp per server, bumped on every TransportEvent that
-    // implies a frame arrived from that circuit. Used to answer
-    // `ca_receive_watchdog_delay`.
-    let mut last_rx_at: HashMap<SocketAddr, std::time::Instant> = HashMap::new();
     // Per-server CA minor protocol version, populated from
     // CA_PROTO_VERSION on TCP handshake. Powers `host_minor_protocol`.
     let mut server_minor_version: HashMap<SocketAddr, u16> = HashMap::new();
@@ -1311,20 +1551,6 @@ async fn run_coordinator(
                                 .or_default()
                                 .push(reply);
                         }
-                    }
-                    CoordRequest::GetChannelInfo { cid, reply } => {
-                        let snap = channels.get(&cid).and_then(|ch| {
-                            Some(ChannelSnapshot {
-                                sid: ch.sid,
-                                native_type: ch.native_type?,
-                                element_count: ch.element_count,
-                                server_addr: ch.server_addr?,
-                                access_rights: ch.access_rights,
-                                state: ch.state,
-                                pv_name: ch.pv_name.clone(),
-                            })
-                        });
-                        let _ = reply.send(snap);
                     }
                     CoordRequest::Subscribe { cid, subid, mask, deadband, callback_tx, reply } => {
                         if let Some(ch) = channels.get(&cid) {
@@ -1450,12 +1676,17 @@ async fn run_coordinator(
                             }
                         }
                         channels.remove(&cid);
-                    }
-                    CoordRequest::ReadNotify { cid, ioid, reply } => {
-                        read_waiters.insert(ioid, (cid, reply));
-                    }
-                    CoordRequest::WriteNotify { cid, ioid, value: _, reply } => {
-                        write_waiters.insert(ioid, (cid, reply));
+                        snapshots.remove(&cid);
+                        // Drop any in-flight read/write entries for this
+                        // cid. Normally `self.in_flight.reads/writes
+                        // .remove(&ioid)` in the op future already cleans
+                        // up; this catches the case where a caller drops
+                        // the future (cancel) and the channel together
+                        // before either the response arrives or a
+                        // disconnect drain runs.
+                        let mut affected = HashSet::with_capacity(1);
+                        affected.insert(cid);
+                        drain_waiters_for_cids(&affected, &in_flight);
                     }
                     CoordRequest::GetWatchdogDelay { cid, reply } => {
                         let delay = channels.get(&cid).and_then(|ch| {
@@ -1463,8 +1694,7 @@ async fn run_coordinator(
                                 return None;
                             }
                             let addr = ch.server_addr?;
-                            let last = last_rx_at.get(&addr)?;
-                            Some(last.elapsed())
+                            last_rx_at.get(&addr).map(|e| e.value().elapsed())
                         });
                         let _ = reply.send(delay);
                     }
@@ -1618,39 +1848,12 @@ async fn run_coordinator(
             }
             evt = transport_rx.recv() => {
                 let Some(evt) = evt else { return };
-                // Bump the per-server "last RX" stamp before we route
-                // the event. Used by `ca_receive_watchdog_delay`. Only
-                // events that genuinely imply a frame arrived from the
-                // remote count — TcpClosed / CircuitUnresponsive are
-                // failure signals and do not.
-                let rx_addr: Option<SocketAddr> = match &evt {
-                    TransportEvent::ChannelCreated { server_addr, .. }
-                    | TransportEvent::ServerDisconnect { server_addr, .. }
-                    | TransportEvent::CircuitResponsive { server_addr }
-                    | TransportEvent::ServerVersion { server_addr, .. } => Some(*server_addr),
-                    TransportEvent::AccessRightsChanged { cid, .. }
-                    | TransportEvent::ChannelCreateFailed { cid } => {
-                        channels.get(cid).and_then(|ch| ch.server_addr)
-                    }
-                    TransportEvent::ReadResponse { ioid, .. }
-                    | TransportEvent::ReadError { ioid, .. } => read_waiters
-                        .get(ioid)
-                        .and_then(|(cid, _)| channels.get(cid))
-                        .and_then(|ch| ch.server_addr),
-                    TransportEvent::WriteResponse { ioid, .. } => write_waiters
-                        .get(ioid)
-                        .and_then(|(cid, _)| channels.get(cid))
-                        .and_then(|ch| ch.server_addr),
-                    TransportEvent::MonitorData { subid, .. } => {
-                        subscriptions.get(*subid).map(|rec| rec.server_addr)
-                    }
-                    TransportEvent::ServerError { .. }
-                    | TransportEvent::TcpClosed { .. }
-                    | TransportEvent::CircuitUnresponsive { .. } => None,
-                };
-                if let Some(addr) = rx_addr {
-                    last_rx_at.insert(addr, std::time::Instant::now());
-                }
+                // The per-server "last RX" stamp is now bumped directly
+                // in the transport `read_loop` via the shared
+                // `ServerLastRxAt` sidecar — covers READ_NOTIFY /
+                // WRITE_NOTIFY / EVENT_ADD frames that no longer round-
+                // trip through this match (Option C, Phase A/D). This
+                // arm therefore no longer touches `last_rx_at`.
                 match evt {
                     TransportEvent::ChannelCreated { cid, sid, data_type, element_count, access, server_addr } => {
                         if let Some(ch) = channels.get_mut(&cid) {
@@ -1663,6 +1866,27 @@ async fn run_coordinator(
                             ch.server_addr = Some(server_addr);
                             ch.access_rights = access;
                             ch.last_connected_at = Some(std::time::Instant::now());
+
+                            // Phase B: publish snapshot for fast-path readers.
+                            // Only publish if we have a usable native_type;
+                            // otherwise the channel is still effectively
+                            // unusable and CaChannel hot paths should fall
+                            // back to "no snapshot → Disconnected".
+                            if let Some(dbr) = dbr_type {
+                                snapshots.insert(
+                                    cid,
+                                    types::ChannelSnapshotPublic {
+                                        sid,
+                                        native_type: dbr,
+                                        element_count,
+                                        server_addr,
+                                        access_rights: access,
+                                        state: ChannelState::Connected,
+                                    },
+                                );
+                            } else {
+                                snapshots.remove(&cid);
+                            }
 
                             if was_disconnected {
                                 tracing::info!(pv = %ch.pv_name, cid, sid, server = %server_addr, "channel reconnected");
@@ -1711,27 +1935,6 @@ async fn run_coordinator(
                             });
                         }
                     }
-                    TransportEvent::ReadResponse { ioid, data_type, count, data } => {
-                        if let Some((_, waiter)) = read_waiters.remove(&ioid) {
-                            let _ = waiter.send(Ok((data_type, count, data)));
-                        }
-                    }
-                    TransportEvent::ReadError { ioid, eca_status } => {
-                        if let Some((_, waiter)) = read_waiters.remove(&ioid) {
-                            let _ = waiter.send(Err(CaError::Protocol(
-                                format!("server returned ECA error {eca_status:#06x}")
-                            )));
-                        }
-                    }
-                    TransportEvent::WriteResponse { ioid, status } => {
-                        if let Some((_, waiter)) = write_waiters.remove(&ioid) {
-                            if status == 1 || status == ECA_NORMAL {
-                                let _ = waiter.send(Ok(()));
-                            } else {
-                                let _ = waiter.send(Err(CaError::WriteFailed(status)));
-                            }
-                        }
-                    }
                     TransportEvent::MonitorData { subid, data_type, count, data } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
@@ -1758,6 +1961,9 @@ async fn run_coordinator(
                                 read: access.read,
                                 write: access.write,
                             });
+                            if let Some(mut snap) = snapshots.get_mut(&cid) {
+                                snap.access_rights = access;
+                            }
                         }
                     }
                     TransportEvent::ChannelCreateFailed { cid } => {
@@ -1768,6 +1974,7 @@ async fn run_coordinator(
                             // the channel will immediately re-search and may
                             // still connect before the caller's timeout.
                             ch.state = ChannelState::Disconnected;
+                            snapshots.remove(&cid);
                             let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
                             let _ = search_tx.send(SearchRequest::Schedule {
                                 cid,
@@ -1797,7 +2004,7 @@ async fn run_coordinator(
                         flow_control.remove(&server_addr);
                         last_rx_at.remove(&server_addr);
                         server_minor_version.remove(&server_addr);
-                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, server_addr, &diag, &mut read_waiters, &mut write_waiters);
+                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, server_addr, &diag, &in_flight, &snapshots);
                     }
                     TransportEvent::ServerDisconnect { cid, server_addr } => {
                         // Single channel disconnect (CA_PROTO_SERVER_DISCONN).
@@ -1815,6 +2022,7 @@ async fn run_coordinator(
                         if let Some(ch) = channels.get_mut(&cid) {
                             if ch.server_addr == Some(server_addr) {
                                 ch.state = ChannelState::Disconnected;
+                                snapshots.remove(&cid);
                                 let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
 
                                 let cids = vec![cid];
@@ -1831,11 +2039,7 @@ async fn run_coordinator(
                                 // Drain blocked read/write waiters for this cid.
                                 let mut affected = HashSet::with_capacity(1);
                                 affected.insert(cid);
-                                drain_waiters_for_cids(
-                                    &affected,
-                                    &mut read_waiters,
-                                    &mut write_waiters,
-                                );
+                                drain_waiters_for_cids(&affected, &in_flight);
 
                                 // Re-search
                                 let _ = search_tx.send(SearchRequest::Schedule {
@@ -1856,6 +2060,9 @@ async fn run_coordinator(
                                 && ch.state == ChannelState::Connected
                             {
                                 ch.state = ChannelState::Unresponsive;
+                                if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
+                                    snap.state = ChannelState::Unresponsive;
+                                }
                                 let _ = ch.conn_tx.send(ConnectionEvent::Unresponsive);
                             }
                         }
@@ -1868,6 +2075,9 @@ async fn run_coordinator(
                                 && ch.state == ChannelState::Unresponsive
                             {
                                 ch.state = ChannelState::Connected;
+                                if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
+                                    snap.state = ChannelState::Connected;
+                                }
                                 let _ = ch.conn_tx.send(ConnectionEvent::Connected);
                             }
                         }
@@ -1894,8 +2104,8 @@ fn handle_disconnect(
     search_tx: &mpsc::UnboundedSender<SearchRequest>,
     server_addr: SocketAddr,
     diag: &CaDiagnostics,
-    read_waiters: &mut HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)>,
-    write_waiters: &mut HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)>,
+    in_flight: &types::InFlightOps,
+    snapshots: &ChannelSnapshots,
 ) {
     let mut affected_cids = Vec::new();
     let now = std::time::Instant::now();
@@ -1905,6 +2115,7 @@ fn handle_disconnect(
             && (ch.state.is_operational() || ch.state == ChannelState::Connecting)
         {
             ch.state = ChannelState::Disconnected;
+            snapshots.remove(&ch.cid);
             affected_cids.push(ch.cid);
             let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
 
@@ -1954,37 +2165,36 @@ fn handle_disconnect(
     // Fail pending read/write waiters for affected channels so callers
     // don't hang forever waiting for a response that will never arrive.
     let affected: HashSet<u32> = affected_cids.into_iter().collect();
-    drain_waiters_for_cids(&affected, read_waiters, write_waiters);
+    drain_waiters_for_cids(&affected, in_flight);
 }
 
-/// Drop every entry in `read_waiters` / `write_waiters` whose cid is in
+/// Drop every entry in the shared in-flight registry whose cid is in
 /// `cids` and signal each Sender with `Err(CaError::Disconnected)`. Used
 /// by both bulk-disconnect (TcpClosed → handle_disconnect) and the
 /// per-cid SERVER_DISCONN path so blocked `caget` / `caput` futures
 /// surface as disconnect errors instead of stalling on the caller's
-/// outer timeout.
-pub(crate) fn drain_waiters_for_cids(
-    cids: &HashSet<u32>,
-    read_waiters: &mut HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)>,
-    write_waiters: &mut HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)>,
-) {
-    let stale_reads: Vec<u32> = read_waiters
+/// outer timeout. Phase A: ops live in `InFlightOps` (DashMap), no
+/// longer in coordinator-local HashMaps.
+pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InFlightOps) {
+    let stale_reads: Vec<u32> = in_flight
+        .reads
         .iter()
-        .filter(|(_, (cid, _))| cids.contains(cid))
-        .map(|(ioid, _)| *ioid)
+        .filter(|entry| cids.contains(&entry.value().0))
+        .map(|entry| *entry.key())
         .collect();
     for ioid in stale_reads {
-        if let Some((_, sender)) = read_waiters.remove(&ioid) {
+        if let Some((_, (_, sender))) = in_flight.reads.remove(&ioid) {
             let _ = sender.send(Err(CaError::Disconnected));
         }
     }
-    let stale_writes: Vec<u32> = write_waiters
+    let stale_writes: Vec<u32> = in_flight
+        .writes
         .iter()
-        .filter(|(_, (cid, _))| cids.contains(cid))
-        .map(|(ioid, _)| *ioid)
+        .filter(|entry| cids.contains(&entry.value().0))
+        .map(|entry| *entry.key())
         .collect();
     for ioid in stale_writes {
-        if let Some((_, sender)) = write_waiters.remove(&ioid) {
+        if let Some((_, (_, sender))) = in_flight.writes.remove(&ioid) {
             let _ = sender.send(Err(CaError::Disconnected));
         }
     }
@@ -2420,9 +2630,7 @@ mod waiter_drain_tests {
     /// instead of stalling on its outer timeout.
     #[tokio::test(flavor = "current_thread")]
     async fn drain_wakes_matching_cid_only() {
-        let mut read_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)> =
-            HashMap::new();
-        let mut write_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)> = HashMap::new();
+        let in_flight = types::InFlightOps::new();
 
         // ioid 1001 / 1002 belong to cid=42 (will be disconnected).
         // ioid 2001 / 2002 belong to cid=99 (must survive).
@@ -2430,50 +2638,73 @@ mod waiter_drain_tests {
         let (rtx_99, rrx_99) = oneshot::channel();
         let (wtx_42, wrx_42) = oneshot::channel();
         let (wtx_99, wrx_99) = oneshot::channel();
-        read_waiters.insert(1001, (42, rtx_42));
-        read_waiters.insert(2001, (99, rtx_99));
-        write_waiters.insert(1002, (42, wtx_42));
-        write_waiters.insert(2002, (99, wtx_99));
+        in_flight.reads.insert(1001, (42, rtx_42));
+        in_flight.reads.insert(2001, (99, rtx_99));
+        in_flight.writes.insert(1002, (42, wtx_42));
+        in_flight.writes.insert(2002, (99, wtx_99));
 
         let mut affected = HashSet::new();
         affected.insert(42u32);
-        drain_waiters_for_cids(&affected, &mut read_waiters, &mut write_waiters);
+        drain_waiters_for_cids(&affected, &in_flight);
 
         // cid=42 waiters: ioids removed from maps + Senders fired with Disconnected.
-        assert!(!read_waiters.contains_key(&1001));
-        assert!(!write_waiters.contains_key(&1002));
+        assert!(!in_flight.reads.contains_key(&1001));
+        assert!(!in_flight.writes.contains_key(&1002));
         assert!(matches!(rrx_42.await, Ok(Err(CaError::Disconnected))));
         assert!(matches!(wrx_42.await, Ok(Err(CaError::Disconnected))));
 
         // cid=99 waiters: untouched.
-        assert!(read_waiters.contains_key(&2001));
-        assert!(write_waiters.contains_key(&2002));
-        // Receivers still not resolved (drop the senders to unblock the test).
-        drop(read_waiters);
-        drop(write_waiters);
+        assert!(in_flight.reads.contains_key(&2001));
+        assert!(in_flight.writes.contains_key(&2002));
+        // Drop the registry to release Senders so the rx awaits don't hang.
+        drop(in_flight);
         assert!(rrx_99.await.is_err()); // sender dropped
         assert!(wrx_99.await.is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn drain_with_empty_cid_set_is_noop() {
-        let mut read_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)> =
-            HashMap::new();
-        let mut write_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)> = HashMap::new();
+        let in_flight = types::InFlightOps::new();
         let (rtx, rrx) = oneshot::channel();
         let (wtx, wrx) = oneshot::channel();
-        read_waiters.insert(10, (1, rtx));
-        write_waiters.insert(20, (2, wtx));
+        in_flight.reads.insert(10, (1, rtx));
+        in_flight.writes.insert(20, (2, wtx));
 
         let affected: HashSet<u32> = HashSet::new();
-        drain_waiters_for_cids(&affected, &mut read_waiters, &mut write_waiters);
+        drain_waiters_for_cids(&affected, &in_flight);
 
-        assert!(read_waiters.contains_key(&10));
-        assert!(write_waiters.contains_key(&20));
-        // Drop maps to release Senders so the rx awaits don't hang in CI.
-        drop(read_waiters);
-        drop(write_waiters);
+        assert!(in_flight.reads.contains_key(&10));
+        assert!(in_flight.writes.contains_key(&20));
+        // Drop the registry so the rx awaits don't hang in CI.
+        drop(in_flight);
         assert!(rrx.await.is_err());
         assert!(wrx.await.is_err());
+    }
+
+    /// Phase D regression: the response-vs-disconnect race must NOT
+    /// produce a spurious `Disconnected` error after the response was
+    /// already delivered. With Option C, both the transport read loop
+    /// (success delivery) and the drain path (disconnect) call
+    /// `in_flight.reads.remove(ioid)`. Whichever wins the race fulfils
+    /// the oneshot; the other no-ops.
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_arrives_before_disconnect_drain() {
+        let in_flight = types::InFlightOps::new();
+        let (rtx, rrx) = oneshot::channel();
+        in_flight.reads.insert(100, (7, rtx));
+
+        // Transport delivers the response first.
+        if let Some((_, (_, sender))) = in_flight.reads.remove(&100) {
+            let _ = sender.send(Ok((6, 1, vec![1, 0, 0, 0])));
+        }
+
+        // Disconnect drain runs immediately after — should find nothing
+        // and leave the receiver's Ok intact.
+        let mut affected = HashSet::new();
+        affected.insert(7u32);
+        drain_waiters_for_cids(&affected, &in_flight);
+
+        let result = rrx.await.expect("oneshot still alive");
+        assert!(matches!(result, Ok((6, 1, _))));
     }
 }

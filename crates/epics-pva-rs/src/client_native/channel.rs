@@ -110,10 +110,11 @@ pub struct Channel {
     last_close_registration: parking_lot::Mutex<Option<(u32, Arc<ServerConn>)>>,
     /// Latched on the first successful Active transition. Distinguishes
     /// a fresh `find()` from a reconnect re-search so the search engine
-    /// can pick `SearchReason::Initial` (immediate broadcast for fast
-    /// single-channel latency) vs `SearchReason::Reconnect` (sid-hashed
-    /// bucket spread so a mass-disconnect cascade doesn't burst the
-    /// network in one tick). pvxs / ca-rs parity.
+    /// can pick `SearchReason::Initial` (immediate broadcast + place at
+    /// `current_bucket+1` for fast single-channel latency) vs
+    /// `SearchReason::Reconnect` (place at `current_bucket`, no
+    /// immediate fire — pvxs `Channel::disconnect` parity). pvxs /
+    /// ca-rs parity.
     has_been_active: std::sync::atomic::AtomicBool,
 }
 
@@ -461,10 +462,12 @@ impl Channel {
             Some(list) => list,
             None => {
                 self.set_state(ChannelState::Searching);
-                // Pick `Reconnect` once we've ever been Active so a
-                // mass-disconnect cascade gets sid-hashed bucket
-                // spread; otherwise this is a fresh resolve and
-                // `Initial` earns the immediate broadcast.
+                // Pick `Reconnect` once we've ever been Active so the
+                // search lands in the current bucket and waits for the
+                // next 1 Hz tick (pvxs `Channel::disconnect` parity);
+                // otherwise this is a fresh resolve and `Initial`
+                // earns the immediate broadcast for fast first-attempt
+                // latency.
                 let reason = if self
                     .has_been_active
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -474,32 +477,62 @@ impl Channel {
                     super::search_engine::SearchReason::Initial
                 };
                 // Use single-server `find()` (delivers on first
-                // SEARCH_RESPONSE) wrapped in a `MULTI_SERVER_WINDOW`
-                // timeout, instead of `find_all()` (always waits the
-                // full window). For the common case the first server
-                // to reply IS the one we want to use; the multi-
-                // server collection only mattered for populating
-                // the failover `alternatives` cache, and the cost
-                // was paying the full window even when the only
-                // local server replied in microseconds.
+                // SEARCH_RESPONSE).
                 //
-                // Symptom this fixes: `pvget-rs PV` against a local
-                // IOC took ~1 s while legacy `pvget` returned in
-                // ~10 ms. Root cause: `find_all` accumulated the
-                // first response immediately but only delivered it
-                // at the engine's 1 Hz tick. With this change the
-                // common path returns at first response and only
-                // pays the window timeout when no server answers.
+                // - Initial: the engine broadcasts immediately on
+                //   receipt, so a healthy server replies in
+                //   microseconds. We wrap in a short
+                //   `MULTI_SERVER_WINDOW` (200 ms) so failure is
+                //   surfaced quickly when no server answers (e.g.
+                //   the user typed a wrong PV name).
+                //
+                // - Reconnect: NO outer timeout. The engine places
+                //   the SEARCH in the current bucket and the next
+                //   periodic tick (≤1 s) broadcasts it; if the
+                //   server doesn't reply, the engine retries on a
+                //   pvxs-style `nSearch+1`-bucket escalation
+                //   (1 s, 2 s, 3 s, ... up to 30 s) and a beacon
+                //   arrival from the recovered server kicks the
+                //   pending entries into fast-tick mode for
+                //   sub-second recovery. Mirrors pvxs's design,
+                //   where Channel::disconnect just leaves the
+                //   channel in `searchBuckets` — there is no
+                //   caller-facing find() with a timeout. Adding
+                //   one was a foot-gun: the previous `MULTI_SERVER_WINDOW`
+                //   ceiling cancelled the SEARCH before its bucket
+                //   could fire (F6 dropped it as a zombie), and
+                //   recovery only happened when a beacon arrived
+                //   and a fresh retry cycle happened to align with
+                //   it. Without the timeout, the find() future
+                //   stays pending indefinitely; the monitor loop
+                //   awaits it (no CPU cost), and dropping the
+                //   `SubscriptionHandle` cancels everything via
+                //   normal future-drop semantics.
+                //
+                // Initial-symptom note (preserved): `pvget-rs PV`
+                // against a local IOC used to take ~1 s vs legacy
+                // `pvget`'s ~10 ms; root cause was `find_all`'s
+                // 1 Hz tick coupling to delivery, fixed by switching
+                // to single-server `find()`.
                 match &self.resolver {
-                    Resolver::Search(engine) => match tokio::time::timeout(
-                        super::search_engine::MULTI_SERVER_WINDOW,
-                        engine.find(&self.pv_name, reason),
-                    )
-                    .await
-                    {
-                        Ok(Ok(addr)) => vec![addr],
-                        _ => Vec::new(),
-                    },
+                    Resolver::Search(engine) => {
+                        let result = match reason {
+                            super::search_engine::SearchReason::Initial => tokio::time::timeout(
+                                super::search_engine::MULTI_SERVER_WINDOW,
+                                engine.find(&self.pv_name, reason),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok()),
+                            super::search_engine::SearchReason::Reconnect => {
+                                engine.find(&self.pv_name, reason).await.ok()
+                            }
+                        };
+                        match result {
+                            Some(addr) => vec![addr],
+                            None => Vec::new(),
+                        }
+                    }
                     Resolver::Direct(addr) => vec![*addr],
                 }
             }

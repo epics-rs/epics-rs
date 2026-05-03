@@ -135,13 +135,33 @@ pub async fn op_get_raw(
     op_get_inner(channel, &[], Some(pv_req), op_timeout).await
 }
 
+/// Bound the search-and-connect phase by the operation's overall
+/// timeout. Now that `Channel::ensure_active` has no caller-side
+/// timeout for `Reconnect` (pvxs `Channel::disconnect` parity —
+/// the search engine drives recovery indefinitely until a
+/// SEARCH_RESPONSE arrives), one-shot ops like `pvget` / `pvput` /
+/// `pvrpc` need an outer cap so a permanently-vanished server
+/// doesn't make the user-facing future hang forever. `pvmonitor`
+/// loops keep using the bare `ensure_active` because their
+/// natural cancel path is `SubscriptionHandle` drop, not a
+/// timeout.
+async fn ensure_active_with_op_timeout(
+    channel: &Arc<Channel>,
+    op_timeout: Duration,
+) -> PvaResult<(Arc<super::server_conn::ServerConn>, u32)> {
+    match tokio::time::timeout(op_timeout, channel.ensure_active()).await {
+        Ok(result) => result,
+        Err(_) => Err(PvaError::Timeout),
+    }
+}
+
 async fn op_get_inner(
     channel: &Arc<Channel>,
     fields: &[&str],
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
-    let (server, sid) = channel.ensure_active().await?;
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
@@ -223,7 +243,7 @@ pub async fn op_get_field(
     subfield: &str,
     op_timeout: Duration,
 ) -> PvaResult<FieldDesc> {
-    let (server, sid) = channel.ensure_active().await?;
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
@@ -292,7 +312,7 @@ pub async fn op_put_field(
     value_str: &str,
     op_timeout: Duration,
 ) -> PvaResult<()> {
-    let (server, sid) = channel.ensure_active().await?;
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
@@ -387,7 +407,7 @@ pub async fn op_put_value(
     value: &PvField,
     op_timeout: Duration,
 ) -> PvaResult<()> {
-    let (server, sid) = channel.ensure_active().await?;
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
@@ -462,7 +482,7 @@ async fn op_put_inner(
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
 ) -> PvaResult<()> {
-    let (server, sid) = channel.ensure_active().await?;
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
@@ -1534,7 +1554,7 @@ pub async fn op_rpc(
     request_value: &PvField,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
-    let (server, sid) = channel.ensure_active().await?;
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };

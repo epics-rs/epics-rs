@@ -1798,8 +1798,7 @@ mod tests {
             std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
             std::env::set_var("EPICS_PVA_ADDR_LIST", "");
         }
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false)
-            .expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()

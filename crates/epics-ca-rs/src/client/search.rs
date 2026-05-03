@@ -1435,8 +1435,7 @@ mod tests {
     async fn retry_escalation_pvxs_pattern() {
         use std::net::Ipv4Addr;
 
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false)
-            .expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()

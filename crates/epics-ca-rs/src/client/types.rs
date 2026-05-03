@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use epics_base_rs::error::CaResult;
@@ -8,6 +9,22 @@ use epics_base_rs::types::DbFieldType;
 
 use crate::channel::AccessRights;
 use crate::client::state::ChannelState;
+
+// --- Per-server last-RX timestamp sidecar (Option C, Phase D) ---
+
+/// Last instant a frame was received from each server. Bumped by the
+/// per-server transport `read_loop` whenever any TCP frame arrives —
+/// covers `READ_NOTIFY`, `WRITE_NOTIFY`, `EVENT_ADD`, `ACCESS_RIGHTS`,
+/// `CREATE_CH_RESP`, version negotiation, echoes, etc.
+///
+/// Phase A turned read/write responses into a transport-direct path
+/// that never reaches the coordinator, so the coordinator can no
+/// longer maintain this stamp from `TransportEvent`s alone — a
+/// read-heavy client without monitors would look idle even though
+/// frames are arriving every millisecond. The sidecar lets the
+/// transport keep the stamp current and the coordinator (which is
+/// the one answering `ca_receive_watchdog_delay`) read it directly.
+pub(crate) type ServerLastRxAt = Arc<DashMap<SocketAddr, Instant>>;
 
 // --- Channel snapshot sidecar (Option C, Phase B) ---
 

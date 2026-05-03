@@ -469,6 +469,7 @@ impl CaClient {
 
         let in_flight = InFlightOps::new();
         let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+        let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
 
         let transport_task = {
             #[cfg(feature = "experimental-rust-tls")]
@@ -477,6 +478,7 @@ impl CaClient {
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
+                    last_rx_at.clone(),
                     tls_arc,
                     config.tls_server_name.clone(),
                     sni_overrides,
@@ -488,6 +490,7 @@ impl CaClient {
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
+                    last_rx_at.clone(),
                 ))
             }
         };
@@ -502,6 +505,7 @@ impl CaClient {
             transport_tx.clone(),
             in_flight.clone(),
             snapshots.clone(),
+            last_rx_at,
             diagnostics.clone(),
         ));
 
@@ -1153,6 +1157,7 @@ async fn run_coordinator(
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     in_flight: types::InFlightOps,
     snapshots: ChannelSnapshots,
+    last_rx_at: ServerLastRxAt,
     diag: Arc<CaDiagnostics>,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
@@ -1164,10 +1169,6 @@ async fn run_coordinator(
     // immediate re-search for the affected IOC.
     let mut server_channels: HashMap<SocketAddr, HashSet<u32>> = HashMap::new();
     let mut flow_control: HashMap<SocketAddr, FlowControlState> = HashMap::new();
-    // Last RX timestamp per server, bumped on every TransportEvent that
-    // implies a frame arrived from that circuit. Used to answer
-    // `ca_receive_watchdog_delay`.
-    let mut last_rx_at: HashMap<SocketAddr, std::time::Instant> = HashMap::new();
     // Per-server CA minor protocol version, populated from
     // CA_PROTO_VERSION on TCP handshake. Powers `host_minor_protocol`.
     let mut server_minor_version: HashMap<SocketAddr, u16> = HashMap::new();
@@ -1350,6 +1351,16 @@ async fn run_coordinator(
                         }
                         channels.remove(&cid);
                         snapshots.remove(&cid);
+                        // Drop any in-flight read/write entries for this
+                        // cid. Normally `self.in_flight.reads/writes
+                        // .remove(&ioid)` in the op future already cleans
+                        // up; this catches the case where a caller drops
+                        // the future (cancel) and the channel together
+                        // before either the response arrives or a
+                        // disconnect drain runs.
+                        let mut affected = HashSet::with_capacity(1);
+                        affected.insert(cid);
+                        drain_waiters_for_cids(&affected, &in_flight);
                     }
                     CoordRequest::GetWatchdogDelay { cid, reply } => {
                         let delay = channels.get(&cid).and_then(|ch| {
@@ -1357,8 +1368,7 @@ async fn run_coordinator(
                                 return None;
                             }
                             let addr = ch.server_addr?;
-                            let last = last_rx_at.get(&addr)?;
-                            Some(last.elapsed())
+                            last_rx_at.get(&addr).map(|e| e.value().elapsed())
                         });
                         let _ = reply.send(delay);
                     }
@@ -1512,30 +1522,12 @@ async fn run_coordinator(
             }
             evt = transport_rx.recv() => {
                 let Some(evt) = evt else { return };
-                // Bump the per-server "last RX" stamp before we route
-                // the event. Used by `ca_receive_watchdog_delay`. Only
-                // events that genuinely imply a frame arrived from the
-                // remote count — TcpClosed / CircuitUnresponsive are
-                // failure signals and do not.
-                let rx_addr: Option<SocketAddr> = match &evt {
-                    TransportEvent::ChannelCreated { server_addr, .. }
-                    | TransportEvent::ServerDisconnect { server_addr, .. }
-                    | TransportEvent::CircuitResponsive { server_addr }
-                    | TransportEvent::ServerVersion { server_addr, .. } => Some(*server_addr),
-                    TransportEvent::AccessRightsChanged { cid, .. }
-                    | TransportEvent::ChannelCreateFailed { cid } => {
-                        channels.get(cid).and_then(|ch| ch.server_addr)
-                    }
-                    TransportEvent::MonitorData { subid, .. } => {
-                        subscriptions.get(*subid).map(|rec| rec.server_addr)
-                    }
-                    TransportEvent::ServerError { .. }
-                    | TransportEvent::TcpClosed { .. }
-                    | TransportEvent::CircuitUnresponsive { .. } => None,
-                };
-                if let Some(addr) = rx_addr {
-                    last_rx_at.insert(addr, std::time::Instant::now());
-                }
+                // The per-server "last RX" stamp is now bumped directly
+                // in the transport `read_loop` via the shared
+                // `ServerLastRxAt` sidecar — covers READ_NOTIFY /
+                // WRITE_NOTIFY / EVENT_ADD frames that no longer round-
+                // trip through this match (Option C, Phase A/D). This
+                // arm therefore no longer touches `last_rx_at`.
                 match evt {
                     TransportEvent::ChannelCreated { cid, sid, data_type, element_count, access, server_addr } => {
                         if let Some(ch) = channels.get_mut(&cid) {

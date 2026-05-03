@@ -61,10 +61,17 @@ struct ServerConnection {
 /// registry: each spawned per-server `read_loop` gets a clone so it
 /// can dispatch `READ_NOTIFY` / `WRITE_NOTIFY` responses straight to
 /// the originating caller's oneshot, without a coordinator hop.
+///
+/// `last_rx_at` is the per-server "last frame received" sidecar
+/// (Option C, Phase D): the read loop bumps it on every TCP frame
+/// so `ca_receive_watchdog_delay` stays accurate even for read-only
+/// or write-only workloads whose responses no longer reach the
+/// coordinator.
 pub(crate) async fn run_transport_manager(
     mut command_rx: mpsc::UnboundedReceiver<TransportCommand>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     in_flight: super::types::InFlightOps,
+    last_rx_at: super::types::ServerLastRxAt,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<String>,
     // Per-server SNI / cert-verification overrides built from the
@@ -158,19 +165,26 @@ pub(crate) async fn run_transport_manager(
                         #[cfg(feature = "experimental-rust-tls")]
                         let sni = pick_sni(server_addr);
                         let in_flight_clone = in_flight.clone();
+                        let last_rx_clone = last_rx_at.clone();
                         pending_connects.spawn(async move {
                             #[cfg(feature = "experimental-rust-tls")]
                             let conn = connect_server(
                                 server_addr,
                                 event_tx_clone,
                                 in_flight_clone,
+                                last_rx_clone,
                                 tls_clone.as_ref(),
                                 sni.as_deref(),
                             )
                             .await;
                             #[cfg(not(feature = "experimental-rust-tls"))]
-                            let conn = connect_server(server_addr, event_tx_clone, in_flight_clone)
-                                .await;
+                            let conn = connect_server(
+                                server_addr,
+                                event_tx_clone,
+                                in_flight_clone,
+                                last_rx_clone,
+                            )
+                            .await;
                             (server_addr, conn)
                         });
                         // Queue this CreateChannel so its
@@ -435,6 +449,7 @@ async fn connect_server(
     server_addr: SocketAddr,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     in_flight: super::types::InFlightOps,
+    last_rx_at: super::types::ServerLastRxAt,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<&ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<&str>,
 ) -> Option<ServerConnection> {
@@ -557,6 +572,7 @@ async fn connect_server(
             write_tx.clone(),
             beacon_arrival_rx,
             in_flight.clone(),
+            last_rx_at.clone(),
         ));
         (read_task, write_task)
     } else {
@@ -575,6 +591,7 @@ async fn connect_server(
             write_tx.clone(),
             beacon_arrival_rx,
             in_flight.clone(),
+            last_rx_at.clone(),
         ));
         (read_task, write_task)
     };
@@ -596,6 +613,7 @@ async fn connect_server(
             write_tx.clone(),
             beacon_arrival_rx,
             in_flight.clone(),
+            last_rx_at.clone(),
         ));
         (read_task, write_task)
     };
@@ -654,6 +672,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut beacon_arrival_rx: mpsc::UnboundedReceiver<bool>,
     in_flight: super::types::InFlightOps,
+    last_rx_at: super::types::ServerLastRxAt,
 ) {
     // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used
     // both on idle expiry and on the first leg of an echo timeout.
@@ -791,6 +810,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         beacon_anomaly = false;
         deadline = tokio::time::Instant::now() + idle_timeout;
         sleep.as_mut().reset(deadline);
+        // Phase D: bump the per-server "last RX" stamp before any
+        // protocol parsing so that even ECHO replies and frames the
+        // parser later rejects still count as proof of liveness.
+        // Read by `ca_receive_watchdog_delay` via the coordinator.
+        last_rx_at.insert(server_addr, std::time::Instant::now());
         if unresponsive_notified {
             unresponsive_notified = false;
             let _ = event_tx.send(TransportEvent::CircuitResponsive { server_addr });
@@ -1016,6 +1040,7 @@ mod read_loop_tests {
             write_tx,
             beacon_rx,
             crate::client::types::InFlightOps::new(),
+            std::sync::Arc::new(dashmap::DashMap::new()),
         ));
         (server_end, event_rx, write_rx, beacon_tx, task)
     }

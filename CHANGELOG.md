@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.13.4 — 2026-05-03
+
+PVA + CA reconnect-after-IOC-restart parity with pvxs
+`Channel::disconnect`. Skips v0.13.3 because the PVA-only fix
+matured into a paired PVA+CA bundle in the same release cycle.
+
+End-to-end pvmonitor-rs / camonitor-rs reconnect after a brief
+IOC restart was 5-30 s + dependent on beacon arrival luck;
+post-fix it's ≤ 1 s on both paths (next 1 Hz tick).
+
+### epics-pva-rs
+
+- **fix**: `placement_bucket` / `cascade_smoothed_next` free fns
+  extracted; `Reconnect` placement is now `current_bucket`
+  (pvxs `client.cpp:213` parity, holdoff = 0). Per-channel retry
+  escalation follows pvxs `tickSearch:1193-1196` (`nSearch+1`
+  bucket forward push: 1 s, 2 s, 3 s, …, 30 s cap) plus 100+
+  delta cascade smoothing (`client.cpp:1199-1206`). Removes the
+  earlier `(current+1+sid%30)` formula and the misnamed
+  `holdoff_cycles + RETRY_HOLDOFF_BUCKETS=10` that conflated
+  pvxs's pre-CREATE_CHANNEL holdoff with the steady-state retry
+  cadence.
+- **fix**: `Channel::ensure_active` no longer applies an outer
+  timeout to `Reconnect` `find()`. The 200 ms cap was
+  cancelling SEARCHes before their bucket fired (F6 zombie-drop
+  path). The engine now drives recovery indefinitely until
+  SEARCH_RESPONSE arrives or the caller drops the future.
+- **fix**: paired with the above, single-shot ops
+  (`pvget` / `pvput` / `pvrpc`) now wrap `ensure_active` in
+  `tokio::time::timeout(op_timeout, …)`. Without this the
+  user-facing future would hang forever when the server
+  permanently disappears. Monitor loops keep the bare
+  unbounded await — their cancel path is `SubscriptionHandle`
+  drop.
+- **internal**: stale "sid-hashed" comments rewritten;
+  `RECONNECT_FIND_TIMEOUT` constant deleted; `Pending.holdoff_cycles`
+  field deleted; SearchReason doc rewritten with the new model.
+- **test**: 7 unit tests against the extracted free fns
+  (placement, escalation, smoothing default, smoothing boundary
+  at delta=100), 3 integration tests
+  (`reconnect_search_broadcasts_within_one_tick`,
+  `hurry_up_kicks_pending_searches_at_fast_tick_cadence`,
+  `retry_escalation_pvxs_pattern`), 1 regression guard
+  (`reconnect_find_does_not_complete_without_response` — catches
+  any future PR that reintroduces a caller-side timeout). Total
+  `epics-pva-rs --lib` is now 191 tests.
+
+### epics-ca-rs
+
+- **fix**: same five-part pvxs-parity port applied to
+  `epics-ca-rs/src/client/search.rs`. CA's 3-way `SearchReason`
+  (Initial / BeaconAnomaly / Reconnect) folds into the shared
+  `placement_bucket` shape: Initial and BeaconAnomaly land at
+  `current+1` (immediate broadcast / fast-tick-driven retransmit
+  pair), Reconnect at `current_bucket`. Pre-existing comment on
+  `handle_request` flagged this as the gap that "made ca-rs
+  single-channel reconnect feel slower than pva-rs"; the port
+  closes it.
+- **fix**: `process_bucket` re-arm is inline (split-borrow on
+  `state.{pending, buckets}`) so `cascade_smoothed_next` sees
+  the running per-tick bucket buildup. The earlier batched
+  `rearm: Vec<(u32, usize)>` defeated within-tick smoothing — a
+  5000-channel mass-disconnect saw delta=0 for every cid and
+  piled them all into `current+1`. PVA-rs uses the equivalent
+  pattern; this commit recovers parity.
+- **internal**: `RETRY_HOLDOFF_CYCLES` const + `holdoff_cycles`
+  field deleted; bucket-placement / retry-escalation logic
+  shared via the same free-fn pair as PVA.
+- **test**: replaced the now-incorrect `reconnect_bucket_spread`
+  test (it asserted cid-hash spread, which we no longer do)
+  with five unit tests against the extracted free fns + 2
+  integration tests (`reconnect_search_broadcasts_within_one_tick`,
+  `retry_escalation_pvxs_pattern`). Total `epics-ca-rs --lib`
+  is now 95 tests.
+
 ## v0.13.2 — 2026-05-03
 
 Single-fix patch for the multi-IOC-on-one-host workflow: starting a

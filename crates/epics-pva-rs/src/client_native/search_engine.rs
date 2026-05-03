@@ -45,20 +45,30 @@ pub const DEFAULT_BROADCAST_PORT: u16 = 5076;
 /// Why a search is being initiated — controls bucket placement and
 /// whether the first SEARCH packet fires immediately.
 ///
-/// Mirrors ca-rs `SearchReason`: an `Initial` find is a single fresh
-/// resolve and earns an immediate broadcast for low first-attempt
-/// latency. A `Reconnect` find is one of potentially many concurrent
-/// re-searches (e.g. a 5000-channel TCP-close cascade) and therefore
-/// goes into a sid-hashed bucket without immediate fire so the burst
-/// is spread across the bucket revolution instead of pummelling the
-/// network in a single tick. pvxs `client.cpp::tickSearch` parity.
+/// Mirrors pvxs `client.cpp` (Channel::disconnect / tickSearch):
+///
+/// - `Initial` is a fresh resolve: the engine fires an immediate
+///   broadcast AND places the search at `current_bucket+1` so the
+///   first scheduled retransmit lands one tick after the
+///   immediate fire.
+///
+/// - `Reconnect` follows pvxs `Channel::disconnect` (client.cpp:213)
+///   semantics: the search is placed at `current_bucket` with no
+///   immediate broadcast, and the next 1 Hz tick fires it. The
+///   per-channel retry escalation (`tickSearch` line 1193:
+///   `nSearch+1` bucket forward push, capped at `nBuckets`) handles
+///   subsequent retransmits at 1 s, 2 s, 3 s, ..., 30 s. Cascade-
+///   spread for mass-disconnects is achieved by the natural
+///   one-bucket-per-tick rate-limit plus a smoothing rule that
+///   defers to `next+1` when the chosen retry bucket is overloaded
+///   by 100+ entries (`tickSearch` line 1199).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchReason {
     /// Brand-new resolve; channel has never been Active.
     Initial,
     /// Channel was Active and the underlying ServerConn died (or the
-    /// server sent CMD_DESTROY_CHANNEL). Distribute the retransmit so
-    /// mass-disconnects don't collapse into a single-tick burst.
+    /// server sent CMD_DESTROY_CHANNEL). pvxs-equivalent recovery
+    /// path — see the type-level comment.
     Reconnect,
 }
 
@@ -434,19 +444,15 @@ struct Pending {
     pv_name: String,
     responder: Responder,
     last_attempt: Instant,
-    attempt: usize,
-    /// Which search bucket this pending occupies. Set on first insert
-    /// and rotated forward by `nBuckets` after each retry.
+    /// Number of times this search has been broadcast. 0 before the
+    /// first transmit; bumped to 1 after the bucket-fire (or
+    /// immediate-fire for `Initial`). Doubles as the pvxs `nSearch`
+    /// counter that controls retry-bucket escalation: each retry
+    /// pushes the search forward by `min(attempt, nBuckets)` buckets,
+    /// giving the 1 s, 2 s, 3 s, ..., 30 s pattern.
+    attempt: u32,
+    /// Which search bucket this pending currently occupies.
     bucket: usize,
-    /// Tick-decremented hold-off counter: when > 0 at the bucket's
-    /// firing tick, the search is NOT transmitted (re-placed in the
-    /// same bucket so it fires again N ticks later, decrementing
-    /// once each cycle). Set to RETRY_HOLDOFF_BUCKETS on first
-    /// retry to avoid storming a slow IOC. The previous formula
-    /// `(current+N+RETRY_HOLDOFF) % N == (current+RETRY_HOLDOFF)` was
-    /// inverted — failed retries fired SOONER (~9 s) than fresh
-    /// (~30 s).
-    holdoff_cycles: u32,
 }
 
 /// pvxs `client.cpp::nBuckets`. 30 buckets at 1 s normal interval gives
@@ -454,10 +460,71 @@ struct Pending {
 /// caps UDP search traffic at roughly `pending.len() / 30` packets per
 /// second instead of letting every channel fire on its own backoff.
 const N_SEARCH_BUCKETS: usize = 30;
-/// Bucket distance to push a re-search after the first retry. Mirrors
-/// pvxs `Channel::disconnect` holdoff = 10 buckets to keep failed
-/// connect attempts from looping faster than the 30s schedule.
-const RETRY_HOLDOFF_BUCKETS: usize = 10;
+
+/// Decide which bucket to drop a fresh search into based on the
+/// caller's intent. Pure function so the production handlers and
+/// the unit tests share the formula and can't drift apart.
+///
+/// - `Initial`: `current_bucket + 1`. The Find handler ALSO fires an
+///   immediate broadcast for `Initial`; the +1 placement is so the
+///   first scheduled retry lands one tick after the immediate fire
+///   instead of being eaten by the same tick the immediate broadcast
+///   already covered.
+/// - `Reconnect`: `current_bucket`. Mirrors pvxs `Channel::disconnect`
+///   (client.cpp:213) which pushes the channel into
+///   `searchBuckets[currentBucket + holdoff]` with `holdoff = 0` for
+///   the typical Active→disconnect case. The next 1 Hz tick takes
+///   the current bucket and broadcasts; latency ≤ 1 s.
+///
+/// Cascade-spread (5000 channels disconnecting simultaneously) is
+/// handled by the natural O(N / nBuckets) per-tick rate-limit and
+/// the runtime-side smoothing in `cascade_smoothed_next` — no
+/// per-channel sid hashing needed.
+fn placement_bucket(current_bucket: usize, reason: SearchReason) -> usize {
+    match reason {
+        SearchReason::Initial => (current_bucket + 1) % N_SEARCH_BUCKETS,
+        SearchReason::Reconnect => current_bucket,
+    }
+}
+
+/// Compute the next-retry bucket for a search that just transmitted.
+/// Mirrors pvxs `tickSearch` (client.cpp:1193-1206):
+///
+///   `next = (idx + nSearch) % nBuckets`, where `nSearch` is the
+///   per-channel attempt counter, capped at `nBuckets`. Each retry
+///   pushes the search forward by one more bucket, which gives a
+///   gradually-escalating backoff: 1 s, 2 s, 3 s, ..., capping at
+///   the 30 s ring period.
+///
+/// Cascade smoothing (line 1199-1206 in pvxs): when the chosen
+/// `next` bucket is overloaded relative to the bucket immediately
+/// after it (>100 entries more), defer to that one. Distributes a
+/// mass-disconnect across two ticks instead of one. The asymmetry
+/// matters only at runtime when the bucket sizes are observable;
+/// the placement formula stays a pure function of bucket counts.
+///
+/// `attempt` is 1-based (1 means "this is the first retransmit
+/// after the initial bucket-fire").
+fn cascade_smoothed_next(
+    current_bucket: usize,
+    attempt: u32,
+    bucket_sizes: impl Fn(usize) -> usize,
+) -> usize {
+    let n_search = (attempt as usize).min(N_SEARCH_BUCKETS);
+    let next = (current_bucket + n_search) % N_SEARCH_BUCKETS;
+    let nextnext = (next + 1) % N_SEARCH_BUCKETS;
+    let next_n = bucket_sizes(next);
+    let nextnext_n = bucket_sizes(nextnext);
+    // pvxs only smooths when `nextN > nextnextN AND difference > 100`
+    // — i.e. the imbalance is large enough that one tick of deferral
+    // visibly evens things out. With the difference < 100 it's fine
+    // to leave the work in `next`.
+    if next_n > nextnext_n && next_n - nextnext_n > 100 {
+        nextnext
+    } else {
+        next
+    }
+}
 
 async fn run_engine(
     mut cmd_rx: mpsc::Receiver<SearchCommand>,
@@ -564,21 +631,7 @@ async fn run_engine(
                         }
                     }
                     let sid = NEXT_SEARCH_ID.fetch_add(1, Ordering::Relaxed);
-                    // Reason-aware bucket placement (ca-rs / pvxs
-                    // parity). Initial: place one bucket ahead so it
-                    // fires on the very next tick AND immediately
-                    // broadcast for low single-channel latency.
-                    // Reconnect: hash sid across all 30 buckets so a
-                    // mass-disconnect cascade doesn't collapse into a
-                    // single-tick burst, and skip the immediate fire
-                    // so the bucket scheduler controls the cadence.
-                    let bucket = match reason {
-                        SearchReason::Initial => (current_bucket + 1) % N_SEARCH_BUCKETS,
-                        SearchReason::Reconnect => {
-                            let offset = (sid as usize) % N_SEARCH_BUCKETS;
-                            (current_bucket + 1 + offset) % N_SEARCH_BUCKETS
-                        }
-                    };
+                    let bucket = placement_bucket(current_bucket, reason);
                     search_buckets[bucket].push(sid);
                     let p = Pending {
                         pv_name: pv_name.clone(),
@@ -586,7 +639,6 @@ async fn run_engine(
                         last_attempt: Instant::now(),
                         attempt: 0,
                         bucket,
-                        holdoff_cycles: 0,
                     };
                     by_name.insert(pv_name, sid);
                     pending.insert(sid, p);
@@ -614,13 +666,7 @@ async fn run_engine(
                         }
                     }
                     let sid = NEXT_SEARCH_ID.fetch_add(1, Ordering::Relaxed);
-                    let bucket = match reason {
-                        SearchReason::Initial => (current_bucket + 1) % N_SEARCH_BUCKETS,
-                        SearchReason::Reconnect => {
-                            let offset = (sid as usize) % N_SEARCH_BUCKETS;
-                            (current_bucket + 1 + offset) % N_SEARCH_BUCKETS
-                        }
-                    };
+                    let bucket = placement_bucket(current_bucket, reason);
                     search_buckets[bucket].push(sid);
                     let p = Pending {
                         pv_name: pv_name.clone(),
@@ -632,7 +678,6 @@ async fn run_engine(
                         last_attempt: Instant::now(),
                         attempt: 0,
                         bucket,
-                        holdoff_cycles: 0,
                     };
                     by_name.insert(pv_name, sid);
                     pending.insert(sid, p);
@@ -679,13 +724,22 @@ async fn run_engine(
                         fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
                         for p in pending.values_mut() {
                             p.last_attempt = Instant::now() - Duration::from_secs(60);
-                            // Reset attempt AND holdoff_cycles so the
-                            // kicked retry doesn't inherit the holdoff
-                            // from past failures (P-G26: failed-once
-                            // searches otherwise still wait their
-                            // remaining 10-cycle holdoff during fast-tick).
+                            // Reset `attempt` so the kicked retry
+                            // re-enters at the 1-bucket forward push
+                            // instead of inheriting the prior
+                            // escalation. NOTE: this is MORE aggressive
+                            // than pvxs `tickSearch` line 1194
+                            // (`if !poked`), which skips the nSearch
+                            // increment for one tick (search re-pushed
+                            // to SAME bucket). Our reset-to-0 means
+                            // post-poke retries cascade at the normal
+                            // 1, 2, 3, … bucket-forward pattern from
+                            // scratch, giving rapid retransmits during
+                            // the fast-tick window. Acceptable trade
+                            // for single-channel recovery; under
+                            // mass-disconnect cascades it spends more
+                            // UDP bandwidth than pvxs would.
                             p.attempt = 0;
-                            p.holdoff_cycles = 0;
                         }
                     }
                     if first_announce {
@@ -711,9 +765,14 @@ async fn run_engine(
                 }
                 Some(SearchCommand::HurryUp) => {
                     // Same effect as a fresh-server beacon: switch to
-                    // fast-tick mode for one revolution and reset every
-                    // pending search's retry deadline / attempt
-                    // counter so they all retry within ~6 s.
+                    // fast-tick mode for one revolution and reset
+                    // every pending search's retry counter so they
+                    // all retry within ~6 s. SEE NOTE in the
+                    // BeaconObserved arm above — our `attempt = 0`
+                    // reset is more aggressive than pvxs's `poked`
+                    // semantic (which preserves nSearch and just
+                    // skips the increment for one tick). Tradeoff is
+                    // documented there.
                     if fast_ticks_remaining == 0 {
                         tick = interval(Duration::from_millis(200));
                         tick.tick().await;
@@ -723,7 +782,6 @@ async fn run_engine(
                     for p in pending.values_mut() {
                         p.last_attempt = now - Duration::from_secs(60);
                         p.attempt = 0;
-                        p.holdoff_cycles = 0;
                     }
                 }
                 Some(SearchCommand::CacheClear { pv_name }) => {
@@ -853,78 +911,67 @@ async fn run_engine(
                     &mut search_buckets,
                 );
 
-                // 2. Process exactly one search bucket per tick. Pending
-                //    searches in this bucket get one UDP retransmit; the
-                //    bucket is then drained and each pending re-armed
-                //    into a future bucket — `current + nBuckets` (i.e.
-                //    same slot, 30 ticks later) for the steady-state
-                //    case, plus an extra `RETRY_HOLDOFF_BUCKETS` shift
-                //    when the search has already failed once or more
-                //    (matches pvxs Channel::disconnect holdoff).
+                // 2. Process exactly one search bucket per tick. Each
+                //    pending in this bucket gets one UDP retransmit
+                //    and is then re-armed into a future bucket using
+                //    pvxs's `nSearch+1` escalation (`tickSearch`,
+                //    client.cpp:1193-1196):
+                //
+                //      next = (idx + min(attempt, nBuckets)) % nBuckets
+                //
+                //    `attempt` is bumped immediately after the send
+                //    so the first retry lands at idx+1 (1 s later),
+                //    the second at idx+2 (2 s after that), the
+                //    third at idx+3 (4 s total), …, capping at
+                //    idx+30 (one full ring = 30 s steady-state). The
+                //    earlier `holdoff_cycles=10` design conflated
+                //    pvxs's pre-CREATE_CHANNEL holdoff with the
+                //    Active-disconnect retry path; pvxs only uses
+                //    the 10-bucket holdoff for `Channel::Connecting`
+                //    drops, never for the steady reconnect cadence.
+                //
+                //    Cascade smoothing: when the chosen `next` bucket
+                //    is overloaded vs `next+1` by 100+ entries, defer
+                //    to `next+1` (mirrors pvxs `client.cpp:1199-1206`).
+                //    Lets a mass-disconnect spread across two ticks
+                //    instead of one.
                 let bucket_ids = std::mem::take(&mut search_buckets[current_bucket]);
                 for sid in bucket_ids {
-                    // Skip-on-holdoff: a retry sets holdoff_cycles =
-                    // RETRY_HOLDOFF_BUCKETS; the search isn't sent
-                    // this cycle, just re-placed in the same bucket
-                    // and the counter decremented. After holdoff
-                    // expires the search fires again. Replaces the
-                    // arithmetically-broken `(current+N+EXTRA) % N`
-                    // formula that effectively reduced retry holdoff
-                    // to 9 s instead of >30 s.
-                    let mut send_now = true;
-                    let mut still_pending = false;
-                    let mut responder_dead = false;
-                    if let Some(p) = pending.get_mut(&sid) {
-                        still_pending = true;
+                    let responder_dead = match pending.get(&sid) {
                         // F6: drop searches whose oneshot responder
                         // was already closed (caller cancelled their
-                        // find() future via timeout / abort). Without
-                        // this the bucket loop keeps re-broadcasting
-                        // dead searches forever.
-                        responder_dead = match &p.responder {
+                        // find() future via outer timeout / abort).
+                        // Without this the bucket loop keeps
+                        // re-broadcasting dead searches forever.
+                        Some(p) => match &p.responder {
                             Responder::Single(tx) => tx.is_closed(),
                             Responder::Multi { responder, .. } => responder.is_closed(),
-                        };
-                        if !responder_dead && p.holdoff_cycles > 0 {
-                            p.holdoff_cycles -= 1;
-                            send_now = false;
-                            // Re-push to the NEXT tick's bucket (not
-                            // current) so the holdoff counter
-                            // decrements once per tick — matching the
-                            // intent that RETRY_HOLDOFF_BUCKETS is a
-                            // bucket-distance shift (~10 ticks ≈ 10 s
-                            // extra) rather than 10 full N-tick cycles
-                            // (~300 s). Re-pushing into current_bucket
-                            // (the round-3 attempt) only fired the
-                            // search once per cycle, multiplying the
-                            // holdoff by N_SEARCH_BUCKETS.
-                            let next = (current_bucket + 1) % N_SEARCH_BUCKETS;
-                            search_buckets[next].push(sid);
-                        }
-                    }
+                        },
+                        // Search was deduped or cancelled out from
+                        // under us before we got here — nothing to
+                        // do.
+                        None => true,
+                    };
                     if responder_dead {
                         if let Some(p) = pending.remove(&sid) {
                             by_name.remove(&p.pv_name);
                         }
                         continue;
                     }
-                    if !still_pending || !send_now {
-                        continue;
-                    }
+
                     let pkt_opt = pending.get_mut(&sid).map(|p| {
-                        // First-broadcast bookkeeping for `Reconnect`
-                        // find_all callers: the deadline was set to
-                        // `find_all_call_time + MULTI_SERVER_WINDOW`
-                        // assuming an immediate broadcast. With the
-                        // bucket-spread Reconnect path that broadcast
-                        // can land 0-30 s later; without re-anchoring,
-                        // the multi-server accumulation window has
-                        // already expired by the time the first SEARCH
-                        // actually goes out, so subsequent responses
-                        // beyond the very first one are dropped.
-                        // Re-arm the deadline relative to NOW on the
-                        // first attempt so the full MULTI_SERVER_WINDOW
-                        // is preserved end-to-end.
+                        // First-broadcast bookkeeping for FindAll
+                        // callers: the deadline was set to
+                        // `call_time + MULTI_SERVER_WINDOW` assuming
+                        // an immediate broadcast. With Reconnect
+                        // placement going through the bucket
+                        // scheduler, the actual first broadcast can
+                        // land up to one tick later. Without re-
+                        // anchoring, the accumulation window may
+                        // already have expired by the time SEARCH
+                        // actually goes out and post-first responses
+                        // get dropped. Re-arm relative to NOW on
+                        // the first attempt only.
                         if p.attempt == 0 {
                             if let Responder::Multi { ref mut deadline, .. } = p.responder {
                                 *deadline = now + MULTI_SERVER_WINDOW;
@@ -932,23 +979,32 @@ async fn run_engine(
                         }
                         p.last_attempt = now;
                         p.attempt = p.attempt.saturating_add(1);
-                        // Re-place in next-tick's slot (one full
-                        // cycle = N ticks ahead), but if this was a
-                        // retry, also tag holdoff so we wait an
-                        // extra RETRY_HOLDOFF_BUCKETS cycles before
-                        // actually transmitting again.
-                        if p.attempt > 1 {
-                            p.holdoff_cycles = RETRY_HOLDOFF_BUCKETS as u32;
-                        }
-                        p.bucket = current_bucket;
                         codec.build_search(
-                            0, sid, &p.pv_name, [0,0,0,0], response_port, false,
+                            0, sid, &p.pv_name, [0, 0, 0, 0], response_port, false,
                         )
                     });
                     if let Some(pkt) = pkt_opt {
-                        broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs).await;
+                        broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs)
+                            .await;
+                        // Re-arm into the escalation bucket. Read
+                        // attempt under a fresh borrow so the closure
+                        // above doesn't have to outlive the
+                        // search_buckets borrow we need below.
                         if let Some(p) = pending.get(&sid) {
-                            search_buckets[p.bucket].push(sid);
+                            let attempt = p.attempt;
+                            let bucket_sizes = |idx: usize| search_buckets[idx].len();
+                            let next = cascade_smoothed_next(
+                                current_bucket,
+                                attempt,
+                                bucket_sizes,
+                            );
+                            // Update the pending's bucket BEFORE the
+                            // mutable push so the in-place state and
+                            // the buckets agree if we re-enter.
+                            if let Some(p) = pending.get_mut(&sid) {
+                                p.bucket = next;
+                            }
+                            search_buckets[next].push(sid);
                         }
                     }
                 }
@@ -1243,8 +1299,12 @@ fn handle_beacon(
         *poke_request = true;
         for p in pending.values_mut() {
             p.last_attempt = Instant::now() - Duration::from_secs(60);
+            // NOTE: more aggressive than pvxs's `poked` semantic
+            // (which preserves nSearch and skips the increment for
+            // one tick). See the BeaconObserved arm in `run_engine`
+            // for the full rationale. Acceptable trade for single-
+            // channel recovery.
             p.attempt = 0;
-            p.holdoff_cycles = 0;
         }
     }
     if first_announce {
@@ -1296,34 +1356,129 @@ mod tests {
         assert_eq!(r.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
-    /// `Reconnect` reason must spread across many buckets when a mass
-    /// disconnect cascade hands the engine a contiguous block of fresh
-    /// sids — replicate the bucket-placement formula and assert we
-    /// touch ≥ N_SEARCH_BUCKETS / 2 distinct slots over a 5_000-sid
-    /// window. `Initial` (current_bucket+1 always) deliberately does
-    /// not get this spread.
+    /// pvxs `Channel::disconnect` (client.cpp:213) parity: a
+    /// `Reconnect` SEARCH lands in the CURRENT bucket — not a
+    /// sid-hashed slot. Cascade-spread on first reconnect is
+    /// achieved naturally by the one-bucket-per-tick rate-limit;
+    /// the per-channel `nSearch`-bucket forward push handles
+    /// retry escalation. See decision
+    /// `bc7a1203-cac5-4ba1-a5b6-194e1a564482`.
     #[test]
-    fn reconnect_bucket_spread_across_ring() {
-        let current_bucket = 7usize;
-        let sids: Vec<u32> = (1_000..6_000).collect();
-        let mut hit = [false; N_SEARCH_BUCKETS];
-        for sid in sids {
-            let offset = (sid as usize) % N_SEARCH_BUCKETS;
-            let bucket = (current_bucket + 1 + offset) % N_SEARCH_BUCKETS;
-            hit[bucket] = true;
+    fn placement_reconnect_uses_current_bucket() {
+        for current in 0..N_SEARCH_BUCKETS {
+            assert_eq!(
+                placement_bucket(current, SearchReason::Reconnect),
+                current,
+                "Reconnect must drop in current bucket (got {current})"
+            );
         }
-        let distinct = hit.iter().filter(|h| **h).count();
+    }
+
+    /// `Initial` is paired with an immediate broadcast in the Find /
+    /// FindAll handlers, so its bucket placement is one tick ahead
+    /// — that's where the FIRST scheduled retransmit (after the
+    /// immediate fire) lands. Wrap-around at the ring boundary is
+    /// part of the contract and exercised here.
+    #[test]
+    fn placement_initial_is_one_bucket_ahead_with_wraparound() {
+        assert_eq!(placement_bucket(0, SearchReason::Initial), 1);
+        assert_eq!(placement_bucket(13, SearchReason::Initial), 14);
         assert_eq!(
-            distinct, N_SEARCH_BUCKETS,
-            "Reconnect should land in every bucket given a wide sid block; got {distinct}"
+            placement_bucket(N_SEARCH_BUCKETS - 1, SearchReason::Initial),
+            0,
+            "wrap-around at ring boundary"
         );
     }
 
+    /// pvxs `tickSearch` (client.cpp:1193-1196) escalates the retry
+    /// bucket by `nSearch+1` after each transmit. We verify the
+    /// pattern bucket-by-bucket: 1, 2, 3, 4, … capping at
+    /// `N_SEARCH_BUCKETS`. Wrap-around plays into the cap behaviour
+    /// because we don't go past the ring; once `attempt` hits
+    /// `N_SEARCH_BUCKETS`, the increment lands on the SAME index
+    /// (full ring), which is the steady-state 30-tick retry cadence.
     #[test]
-    fn initial_bucket_is_next_tick() {
-        let current_bucket = 13usize;
-        let bucket = (current_bucket + 1) % N_SEARCH_BUCKETS;
-        assert_eq!(bucket, 14);
+    fn cascade_next_implements_pvxs_nsearch_escalation() {
+        let no_imbalance = |_| 0usize;
+        let current = 7;
+
+        // attempt=1: idx + 1
+        assert_eq!(
+            cascade_smoothed_next(current, 1, no_imbalance),
+            (current + 1) % N_SEARCH_BUCKETS,
+        );
+        // attempt=2: idx + 2
+        assert_eq!(
+            cascade_smoothed_next(current, 2, no_imbalance),
+            (current + 2) % N_SEARCH_BUCKETS,
+        );
+        // attempt=10: idx + 10
+        assert_eq!(
+            cascade_smoothed_next(current, 10, no_imbalance),
+            (current + 10) % N_SEARCH_BUCKETS,
+        );
+        // attempt=N_SEARCH_BUCKETS: wraps to current (full ring).
+        assert_eq!(
+            cascade_smoothed_next(current, N_SEARCH_BUCKETS as u32, no_imbalance),
+            current,
+        );
+        // attempt > N_SEARCH_BUCKETS: still capped, same behaviour.
+        assert_eq!(
+            cascade_smoothed_next(current, 1_000_000, no_imbalance),
+            current,
+        );
+    }
+
+    /// pvxs `client.cpp:1199-1206` smoothing: when the chosen `next`
+    /// bucket is overloaded versus `next+1` by 100+ entries, defer
+    /// to `next+1`. Crosses two ticks instead of one, evening out
+    /// the burst. Below the 100-entry delta the smoothing must NOT
+    /// trigger — even moderate imbalance is acceptable in exchange
+    /// for keeping the retry latency tight.
+    #[test]
+    fn cascade_smoothing_defers_when_next_is_overloaded() {
+        let current = 5;
+        let attempt = 1; // → next = 6, nextnext = 7
+
+        // 200 entries at 6, 0 at 7: defer → 7.
+        let sizes_overloaded = |idx: usize| match idx {
+            6 => 200,
+            _ => 0,
+        };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, sizes_overloaded),
+            7,
+            "imbalance > 100 must defer to nextnext"
+        );
+
+        // 90 entries at 6, 0 at 7: NOT enough to trigger smoothing.
+        let sizes_below_threshold = |idx: usize| match idx {
+            6 => 90,
+            _ => 0,
+        };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, sizes_below_threshold),
+            6,
+            "imbalance ≤ 100 stays in next"
+        );
+
+        // 200 at next AND 200 at nextnext: no asymmetry → stay in next.
+        let sizes_balanced = |idx: usize| match idx {
+            6 | 7 => 200,
+            _ => 0,
+        };
+        assert_eq!(cascade_smoothed_next(current, attempt, sizes_balanced), 6,);
+
+        // Overload at nextnext (not next): smoothing only defers
+        // FORWARD, never backward — stays in next.
+        let sizes_reverse_overload = |idx: usize| match idx {
+            7 => 200,
+            _ => 0,
+        };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, sizes_reverse_overload),
+            6,
+        );
     }
 
     /// `find_all` must NOT hang indefinitely when no server claims the
@@ -1364,6 +1519,336 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "must flush within a few ticks; took {elapsed:?}"
+        );
+    }
+
+    /// End-to-end Reconnect bucket-fire test. Boots a real
+    /// `SearchEngine`, binds a sniffer socket on localhost as the
+    /// only broadcast destination, submits a `Find(Reconnect)`, and
+    /// asserts that a SEARCH packet for the right PV name lands on
+    /// the sniffer within ~1.1 s — i.e. the next tick after `Find`
+    /// arrival, mirroring pvxs `Channel::disconnect` recovery
+    /// timing. Without the v0.13.x fix the search would have been
+    /// placed in a sid-hashed bucket up to 30 s away and never
+    /// fired (the channel-layer timeout would have cancelled the
+    /// caller's oneshot before any tick processed it).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_search_broadcasts_within_one_tick() {
+        use epics_base_rs::net::AsyncUdpV4;
+        use std::net::Ipv4Addr;
+
+        // Suppress real broadcast targets so the only destination
+        // is our sniffer below. SAFETY: see find_all_returns_empty.
+        unsafe {
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+
+        // Sniffer on loopback ephemeral. The engine will be told
+        // about it via `extra_targets`.
+        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer_addr = sniffer
+            .local_addrs()
+            .first()
+            .copied()
+            .expect("sniffer local_addr");
+
+        let engine = SearchEngine::spawn(vec![sniffer_addr])
+            .await
+            .expect("spawn engine");
+
+        // Issue a Reconnect find. The engine places it in
+        // `current_bucket`; the next 1-Hz tick fires the broadcast.
+        // We poll the sniffer until a packet shows up. Cap the
+        // wait at 3 s — pvxs-equivalent timing is ≤ 1.1 s; the
+        // extra ~2 s is jitter slack so the test isn't flaky on a
+        // loaded CI runner.
+        let pv = "TEST:RECONNECT:PV";
+        let started = std::time::Instant::now();
+        let find_handle = tokio::spawn({
+            let engine = engine.clone();
+            let pv = pv.to_string();
+            async move { engine.find(&pv, SearchReason::Reconnect).await }
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let recv_result = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (n, _from) = sniffer.recv_from(&mut buf).await?;
+                // The CMD_SEARCH frame includes the PV name as a
+                // C-string somewhere in the payload. We don't need
+                // a full decoder for this test — substring match
+                // is conclusive enough since random ephemeral UDP
+                // traffic on loopback isn't going to spell out
+                // our chosen PV name by accident.
+                if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                    return Ok::<usize, std::io::Error>(n);
+                }
+                // Not our packet (unlikely on isolated loopback
+                // sniffer, but defensive). Loop back and read
+                // again.
+            }
+        })
+        .await;
+
+        let elapsed = started.elapsed();
+        find_handle.abort();
+
+        let n = recv_result
+            .expect("Reconnect SEARCH must arrive within 3 s")
+            .expect("recv_from must not error");
+        assert!(
+            n > 0,
+            "received an empty datagram — Reconnect SEARCH path is broken"
+        );
+        // Tight assertion catches the regression we're guarding
+        // against (5-30 s pre-fix latency) without being flaky on a
+        // loaded CI runner. 2.5 s gives ~1.5 s of slack on top of
+        // the ≤ 1.1 s pvxs-parity target.
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "Reconnect should broadcast within ~1.1 s (one tick); \
+             took {elapsed:?} — bucket placement / tick handler may \
+             have regressed (review decision \
+             bc7a1203-cac5-4ba1-a5b6-194e1a564482)"
+        );
+    }
+
+    /// Regression guard for the `RECONNECT_FIND_TIMEOUT` removal:
+    /// the engine's `find(Reconnect)` future must NOT resolve early
+    /// when no server is responding. It must stay pending until
+    /// either (a) a SEARCH_RESPONSE arrives, (b) the caller drops
+    /// the future. Without this guard a future PR could
+    /// reintroduce a caller-side timeout (or change `find_all`'s
+    /// empty-deadline behaviour to fire for `find` too) and
+    /// silently revive the disconnect-storm bug.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_find_does_not_complete_without_response() {
+        // Suppress real broadcast so no actual SEARCH leaves the
+        // process to potentially get answered by some other PVA
+        // server on the LAN.
+        unsafe {
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+        let engine = SearchEngine::spawn(Vec::new()).await.expect("spawn engine");
+
+        // Race the find against a 1.5 s sleep. The bucket fire is
+        // expected at ~1 s (one tick after the Find lands), but no
+        // server replies, so the find() future should still be
+        // pending after the bucket fire. 1.5 s > 1.1 s ensures the
+        // bucket has fired (so we know the test isn't passing for
+        // the wrong reason — i.e. the engine never even got to
+        // process the Find). After the sleep wins, we drop the
+        // find future.
+        let timed_out = tokio::select! {
+            biased;
+            _ = engine.find("MISSING:RECONNECT:PV", SearchReason::Reconnect) => false,
+            _ = tokio::time::sleep(Duration::from_millis(1500)) => true,
+        };
+        assert!(
+            timed_out,
+            "Reconnect find() resolved early (no server is responding); \
+             a caller-side timeout has been reintroduced — see \
+             channel.rs::ensure_active. find() must stay pending until \
+             SEARCH_RESPONSE arrives or the caller drops the future."
+        );
+    }
+
+    /// Smoothing boundary cases — pvxs's threshold is strictly
+    /// `delta > 100`. Tests one entry below (delta=100, stays in
+    /// `next`) and one above (delta=101, defers to `nextnext`).
+    /// Catches the easy-to-introduce off-by-one (`>= 100`).
+    #[test]
+    fn cascade_smoothing_boundary_at_delta_100() {
+        let current = 5;
+        let attempt = 1; // → next = 6, nextnext = 7
+
+        // delta = 100 (100 vs 0): NOT enough to trigger.
+        let exactly_100 = |idx: usize| match idx {
+            6 => 100,
+            _ => 0,
+        };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, exactly_100),
+            6,
+            "delta == 100 must NOT trigger smoothing (strict > 100)"
+        );
+
+        // delta = 101: triggers.
+        let just_over_100 = |idx: usize| match idx {
+            6 => 101,
+            _ => 0,
+        };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, just_over_100),
+            7,
+            "delta == 101 must trigger smoothing"
+        );
+    }
+
+    /// `HurryUp` (and equivalently `BeaconObserved` for fresh GUID)
+    /// must:
+    ///   1. Switch the engine into 200 ms fast-tick cadence.
+    ///   2. Reset all pending searches' attempt counters so the
+    ///      kicked retries cascade from the 1-bucket forward push.
+    ///   3. Make the next SEARCH for an existing pending fire
+    ///      within ~250 ms (one fast tick), not the next 1 s tick.
+    ///
+    /// We observe the BEHAVIOUR (SEARCH packet timing on a sniffer),
+    /// not internal state, because internal fields aren't part of
+    /// the engine's public contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hurry_up_kicks_pending_searches_at_fast_tick_cadence() {
+        use epics_base_rs::net::AsyncUdpV4;
+        use std::net::Ipv4Addr;
+
+        unsafe {
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer_addr = sniffer
+            .local_addrs()
+            .first()
+            .copied()
+            .expect("sniffer local_addr");
+
+        let engine = SearchEngine::spawn(vec![sniffer_addr])
+            .await
+            .expect("spawn engine");
+        let pv = "TEST:HURRYUP:PV";
+
+        // Submit Reconnect find — placed at current_bucket, will
+        // fire at next 1 s tick.
+        let _find_handle = tokio::spawn({
+            let engine = engine.clone();
+            let pv = pv.to_string();
+            async move { engine.find(&pv, SearchReason::Reconnect).await }
+        });
+
+        // Drain the FIRST SEARCH (the one fired by the normal
+        // 1-Hz tick after Find arrives). This puts the search
+        // into `attempt=1` state, parked in some retry bucket.
+        let mut buf = vec![0u8; 4096];
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (n, _) = sniffer.recv_from(&mut buf).await.expect("first recv");
+                if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("first SEARCH must arrive");
+
+        // Now hit HurryUp. This switches to 200 ms cadence and
+        // resets attempt — the kicked retry should fire on the
+        // FAST tick, not the slow 1 s tick.
+        engine.hurry_up().await;
+        let started = std::time::Instant::now();
+
+        // Look for the SECOND SEARCH packet for the same PV.
+        // Bound at 1 s — much shorter than the slow 1 s tick that
+        // would be next without fast-tick mode. (We just consumed
+        // the slow tick's broadcast above; the next slow tick is
+        // ~1 s away. If HurryUp doesn't activate fast-tick, this
+        // test fails.)
+        let elapsed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let (n, _) = sniffer.recv_from(&mut buf).await.expect("second recv");
+                if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                    return started.elapsed();
+                }
+            }
+        })
+        .await
+        .expect("HurryUp-kicked SEARCH must arrive within 1 s — fast-tick mode regressed");
+
+        // Pre-fix slow tick would have given ~1 s here. Fast tick
+        // (200 ms) plus jitter is well under 700 ms even on a
+        // loaded CI runner.
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "HurryUp should fire next SEARCH within one fast tick (~200 ms); \
+             took {elapsed:?} — fast-tick mode may have regressed"
+        );
+    }
+
+    /// End-to-end retry escalation timing test. Verifies that the
+    /// production engine loop reproduces pvxs's `nSearch+1`
+    /// pattern at the actual scheduler level — unit tests of
+    /// `cascade_smoothed_next` cover the formula in isolation, but
+    /// only this test catches an accumulator drift between the
+    /// pure fn and the live `current_bucket`-advancing tick loop.
+    ///
+    /// Expected SEARCH arrival times (relative to find submission):
+    ///   #1 at ~1 s   (first tick after Find lands)
+    ///   #2 at ~2 s   (idx+1, +1 cycle)
+    ///   #3 at ~4 s   (idx+(1+2)=idx+3, +2 cycles)
+    ///
+    /// Slack: ±500 ms per gap to absorb scheduler / mio jitter on
+    /// loaded CI. Total runtime ~4 s.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_escalation_pvxs_pattern() {
+        use epics_base_rs::net::AsyncUdpV4;
+        use std::net::Ipv4Addr;
+
+        unsafe {
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer_addr = sniffer
+            .local_addrs()
+            .first()
+            .copied()
+            .expect("sniffer addr");
+        let engine = SearchEngine::spawn(vec![sniffer_addr])
+            .await
+            .expect("spawn");
+
+        let pv = "ESCALATION:PVA";
+        let started = std::time::Instant::now();
+        let _find_handle = tokio::spawn({
+            let engine = engine.clone();
+            let pv = pv.to_string();
+            async move { engine.find(&pv, SearchReason::Reconnect).await }
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let mut packet_times = Vec::new();
+        for i in 0..3 {
+            let t = tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let (n, _) = sniffer.recv_from(&mut buf).await.expect("recv");
+                    if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                        return started.elapsed();
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("SEARCH #{} did not arrive within 8 s", i + 1));
+            packet_times.push(t);
+        }
+
+        // Gap assertions. T#1 at ~1 s; T#2 at ~T#1+1 s; T#3 at ~T#2+2 s.
+        assert!(
+            packet_times[0] < Duration::from_millis(1500),
+            "first SEARCH should arrive ~1 s after Find; got {:?}",
+            packet_times[0]
+        );
+        let gap_12 = packet_times[1].saturating_sub(packet_times[0]);
+        let gap_23 = packet_times[2].saturating_sub(packet_times[1]);
+        assert!(
+            (700..=1500).contains(&(gap_12.as_millis() as u64)),
+            "gap #1→#2 should be ~1 s (nSearch=1); got {gap_12:?}. \
+             Production retry escalation may have regressed."
+        );
+        assert!(
+            (1500..=2700).contains(&(gap_23.as_millis() as u64)),
+            "gap #2→#3 should be ~2 s (nSearch=2); got {gap_23:?}. \
+             Production retry escalation may have regressed."
         );
     }
 }

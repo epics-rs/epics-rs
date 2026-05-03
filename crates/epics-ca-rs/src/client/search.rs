@@ -80,10 +80,70 @@ async fn send_with_fanout(
 /// second instead of letting every channel fire on its own backoff.
 const N_SEARCH_BUCKETS: usize = 30;
 
-/// Bucket distance to push a re-search after the first retry. Mirrors
-/// pvxs `Channel::disconnect` holdoff = 10 buckets to keep failed
-/// connect attempts from looping faster than the 30s schedule.
-const RETRY_HOLDOFF_CYCLES: u32 = 10;
+/// Decide which bucket to drop a fresh search into based on the
+/// caller's intent. Pure function so the production handler and the
+/// unit tests share the formula and can't drift apart.
+///
+/// - `Initial` / `BeaconAnomaly` (new cid): `current_bucket + 1`. The
+///   handler ALSO fires an immediate broadcast for `Initial`; the +1
+///   placement is so the first scheduled retry lands one tick after
+///   the immediate fire. `BeaconAnomaly` for a new cid relies on
+///   the engine's fast-tick mode to retransmit within ~6 s, so the
+///   +1 placement gets caught by the next fast tick.
+/// - `Reconnect`: `current_bucket`. Mirrors pvxs `Channel::disconnect`
+///   (client.cpp:213) with `holdoff = 0` — the typical Active→
+///   disconnect case sits in the current bucket and the next 1 Hz
+///   tick fires the broadcast. Latency ≤ 1 s.
+///
+/// Cascade-spread (5000 channels disconnecting simultaneously) is
+/// handled by the natural O(N / nBuckets) per-tick rate-limit and
+/// the runtime-side smoothing in `cascade_smoothed_next` — no
+/// per-channel cid hashing needed for the first attempt.
+fn placement_bucket(current_bucket: usize, reason: SearchReason) -> usize {
+    match reason {
+        SearchReason::Initial | SearchReason::BeaconAnomaly => {
+            (current_bucket + 1) % N_SEARCH_BUCKETS
+        }
+        SearchReason::Reconnect => current_bucket,
+    }
+}
+
+/// Compute the next-retry bucket for a search that just transmitted.
+/// Mirrors pvxs `tickSearch` (client.cpp:1193-1206):
+///
+///   `next = (idx + nSearch) % nBuckets`, where `nSearch` is the
+///   per-channel attempt counter, capped at `nBuckets`. Each retry
+///   pushes the search forward by one more bucket: 1 s, 2 s, 3 s,
+///   ..., capping at the 30 s ring period.
+///
+/// Cascade smoothing (line 1199-1206 in pvxs): when the chosen
+/// `next` bucket is overloaded relative to the bucket immediately
+/// after it (>100 entries more), defer to that one. Distributes a
+/// mass-disconnect across two ticks instead of one. Threshold is
+/// strictly `>` 100, matching pvxs.
+///
+/// `attempt` is 1-based (1 means "this is the first retransmit
+/// after the initial bucket-fire"). The earlier
+/// `RETRY_HOLDOFF_CYCLES = 10` mechanism conflated pvxs's pre-
+/// CREATE_CHANNEL holdoff (which only applies to the
+/// `Channel::Connecting` state) with the steady-state retry
+/// cadence; pvxs uses the `nSearch` increment for the latter.
+fn cascade_smoothed_next(
+    current_bucket: usize,
+    attempt: u32,
+    bucket_sizes: impl Fn(usize) -> usize,
+) -> usize {
+    let n_search = (attempt as usize).min(N_SEARCH_BUCKETS);
+    let next = (current_bucket + n_search) % N_SEARCH_BUCKETS;
+    let nextnext = (next + 1) % N_SEARCH_BUCKETS;
+    let next_n = bucket_sizes(next);
+    let nextnext_n = bucket_sizes(nextnext);
+    if next_n > nextnext_n && next_n - nextnext_n > 100 {
+        nextnext
+    } else {
+        next
+    }
+}
 
 /// Normal tick cadence (1 search bucket per second).
 const NORMAL_TICK: Duration = Duration::from_secs(1);
@@ -111,14 +171,13 @@ struct PendingSearch {
     search_payload: Vec<u8>,
     /// Which bucket this search currently lives in.
     bucket: usize,
-    /// Number of attempts so far (for retry holdoff).
+    /// Number of times this search has been broadcast. 0 before the
+    /// first transmit; doubles as the pvxs `nSearch` counter that
+    /// controls retry-bucket escalation in `cascade_smoothed_next`
+    /// — each retry pushes the search forward by `min(attempt,
+    /// nBuckets)` buckets, giving the 1 s, 2 s, 3 s, ..., 30 s
+    /// pattern.
     attempt: u32,
-    /// Tick-decremented hold-off counter: when > 0 at the bucket's
-    /// firing tick, the search is NOT transmitted (re-placed into the
-    /// next bucket so the counter decrements each cycle). Set to
-    /// `RETRY_HOLDOFF_CYCLES` on first retry to space out re-attempts
-    /// against a slow IOC. pvxs `Channel::disconnect` holdoff parity.
-    holdoff_cycles: u32,
     #[allow(dead_code)]
     last_attempt: Option<Instant>,
 }
@@ -191,8 +250,15 @@ impl SearchEngineState {
     /// search retries once within that window.
     fn poke(&mut self) {
         for p in self.pending.values_mut() {
+            // NOTE: more aggressive than pvxs's `poked` semantic
+            // (which preserves nSearch and just skips its increment
+            // for one tick). Resetting attempt to 0 means the
+            // post-poke retries cascade from the 1-bucket forward
+            // push from scratch — rapid retransmits during the
+            // fast-tick window. Acceptable trade for single-channel
+            // recovery; under mass-disconnect cascades it spends
+            // more UDP bandwidth than pvxs would.
             p.attempt = 0;
-            p.holdoff_cycles = 0;
             p.last_attempt = None;
         }
         self.fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
@@ -509,7 +575,6 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
             if reason == SearchReason::BeaconAnomaly && state.pending.contains_key(&cid) {
                 if let Some(p) = state.pending.get_mut(&cid) {
                     p.attempt = 0;
-                    p.holdoff_cycles = 0;
                     p.last_attempt = None;
                 }
                 state.fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
@@ -521,29 +586,24 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
             // Drop any stale entry before re-scheduling.
             state.remove_channel(cid);
 
-            // Bucket assignment by reason:
-            //   Initial / BeaconAnomaly (new): fire on the very next tick.
-            //   Reconnect: spread across the ring by cid hash so a
-            //              mass-disconnect event doesn't pile every
-            //              channel into the same firing bucket.
-            // For a beacon poke we additionally engage fast-tick mode
-            // (200 ms) so every pending search retries within ~6 s.
-            let bucket = match reason {
-                SearchReason::Initial | SearchReason::BeaconAnomaly => {
-                    (state.current_bucket + 1) % N_SEARCH_BUCKETS
-                }
-                SearchReason::Reconnect => {
-                    let offset = (cid as usize) % N_SEARCH_BUCKETS;
-                    (state.current_bucket + 1 + offset) % N_SEARCH_BUCKETS
-                }
-            };
+            // Bucket placement (pvxs `Channel::disconnect` parity):
+            // Initial / BeaconAnomaly land in `current+1` and pair
+            // with an immediate broadcast or fast-tick retransmit;
+            // Reconnect lands in `current_bucket` so the very next
+            // 1-Hz tick fires it (≤ 1 s reconnect latency). The
+            // earlier `(current+1+cid%30)` Reconnect formula gave
+            // 1-30 s reconnect latency that combined with the
+            // channel layer's wait-for-Found path made ca-rs
+            // reconnect feel slower than pva-rs; the comment at
+            // the top of `handle_request` flagged this gap. See
+            // `placement_bucket` for the full rationale.
+            let bucket = placement_bucket(state.current_bucket, reason);
             let p = PendingSearch {
                 cid,
                 pv_name,
                 search_payload,
                 bucket,
                 attempt: 0,
-                holdoff_cycles: 0,
                 last_attempt: None,
             };
             state.buckets[bucket].push(cid);
@@ -717,11 +777,25 @@ fn handle_udp_response(
 // Per-tick bucket processing
 // ---------------------------------------------------------------------------
 
-/// Process exactly one search bucket. Pending searches in this bucket
-/// either get a UDP retransmit (then re-armed into the same bucket so
-/// they fire again after one full N-tick revolution) or, if a retry
-/// holdoff is in effect, get pushed forward one bucket and the
-/// holdoff counter decrements.
+/// Process exactly one search bucket. Each pending in this bucket
+/// gets a UDP retransmit and is then re-armed into a future bucket
+/// using pvxs's `nSearch+1` escalation (`tickSearch` line 1193-1196):
+///
+///     next = (idx + min(attempt, nBuckets)) % nBuckets
+///
+/// `attempt` is bumped immediately after the send so the first
+/// retry lands at idx+1 (1 s later), the second at idx+2 (2 s
+/// after that), the third at idx+3 (4 s total), …, capping at
+/// idx+30 (one full ring = 30 s steady-state). The earlier
+/// `holdoff_cycles=10` design conflated pvxs's pre-CREATE_CHANNEL
+/// holdoff with the Active-disconnect retry path; pvxs only uses
+/// the 10-bucket holdoff for `Channel::Connecting` drops, never
+/// for the steady reconnect cadence.
+///
+/// Cascade smoothing: when the chosen `next` bucket is overloaded
+/// vs `next+1` by 100+ entries, defer to `next+1` (mirrors pvxs
+/// `client.cpp:1199-1206`). Lets a mass-disconnect spread across
+/// two ticks instead of one.
 ///
 /// Steady-state UDP search load = O(1) datagrams per tick regardless
 /// of how many channels are pending — the bucket distributes load
@@ -739,40 +813,50 @@ async fn process_bucket(
     // Expire old penalties.
     state.penalty.retain(|_, entry| entry.until > now);
 
-    let bucket_idx = state.current_bucket;
-    let bucket_ids = std::mem::take(&mut state.buckets[bucket_idx]);
+    let current = state.current_bucket;
+    let bucket_ids = std::mem::take(&mut state.buckets[current]);
 
-    // Walk bucket: skip-on-holdoff or queue for sending.
     let mut to_send: Vec<u32> = Vec::new();
-    for sid in bucket_ids {
-        let Some(p) = state.pending.get_mut(&sid) else {
-            continue;
-        };
-        if p.holdoff_cycles > 0 {
-            p.holdoff_cycles -= 1;
-            // Re-push to NEXT tick's bucket so the holdoff counter
-            // decrements once per tick (matching pvxs intent that
-            // RETRY_HOLDOFF_CYCLES is a per-tick countdown, not a
-            // per-revolution count).
-            let next = (state.current_bucket + 1) % N_SEARCH_BUCKETS;
-            p.bucket = next;
-            state.buckets[next].push(sid);
-            continue;
-        }
+    {
+        // Split-borrow `pending` and `buckets` so cascade_smoothed_next
+        // (which only reads bucket sizes via a closure capture of
+        // `&buckets`) can run inline with the per-sid push back to
+        // `&mut buckets[next]`. Without the split, the closure's
+        // immutable borrow of `state.buckets` would conflict with
+        // the subsequent mutable access — which is why the prior
+        // version had to batch the rearm into a Vec and apply it
+        // post-loop. That batching defeated the within-tick
+        // smoothing benefit: a 5000-channel mass-disconnect saw
+        // delta=0 for every sid (all 5000 saw an empty `next`
+        // bucket because nothing was pushed yet) and piled into
+        // `current+1`. With inline push the second sid sees the
+        // first's buildup, the third sees two, etc., so smoothing
+        // kicks in around the 100-entry boundary just like pvxs's
+        // tickSearch line 1199-1206. PVA-rs uses the equivalent
+        // pattern where `pending` and `search_buckets` are
+        // top-level locals; here we recover the same effect via
+        // explicit split-borrow.
+        let pending = &mut state.pending;
+        let buckets = &mut state.buckets;
+        for sid in bucket_ids {
+            let Some(p) = pending.get_mut(&sid) else {
+                continue;
+            };
+            p.last_attempt = Some(now);
+            p.attempt = p.attempt.saturating_add(1);
+            let attempt = p.attempt;
+            to_send.push(sid);
 
-        // Queue for transmission. Re-place in the same bucket — a
-        // full revolution (30 ticks at 1 s = 30 s normal cadence) is
-        // the steady-state retry interval. Subsequent retries (attempt
-        // > 1) get an extra RETRY_HOLDOFF_CYCLES of skip-cycles before
-        // they actually transmit again.
-        p.last_attempt = Some(now);
-        p.attempt = p.attempt.saturating_add(1);
-        if p.attempt > 1 {
-            p.holdoff_cycles = RETRY_HOLDOFF_CYCLES;
+            let bucket_sizes = |idx: usize| buckets[idx].len();
+            let next = cascade_smoothed_next(current, attempt, bucket_sizes);
+            // Closure dropped at `cascade_smoothed_next` return —
+            // immutable borrow on `buckets` is gone, so the
+            // mutable accesses below compile.
+            if let Some(p) = pending.get_mut(&sid) {
+                p.bucket = next;
+            }
+            buckets[next].push(sid);
         }
-        p.bucket = state.current_bucket;
-        state.buckets[state.current_bucket].push(sid);
-        to_send.push(sid);
     }
 
     state.current_bucket = (state.current_bucket + 1) % N_SEARCH_BUCKETS;
@@ -954,15 +1038,13 @@ mod tests {
     fn poke_resets_attempts_and_engages_fast_mode() {
         let mut state = SearchEngineState::new();
         schedule_initial(&mut state, 1, "PV:1");
-        // Simulate one prior attempt with active holdoff.
+        // Simulate one prior attempt.
         if let Some(p) = state.pending.get_mut(&1) {
             p.attempt = 3;
-            p.holdoff_cycles = 7;
         }
         state.poke();
         let p = state.pending.get(&1).unwrap();
-        assert_eq!(p.attempt, 0);
-        assert_eq!(p.holdoff_cycles, 0);
+        assert_eq!(p.attempt, 0, "poke must reset per-channel retry counter");
         assert_eq!(state.fast_ticks_remaining, N_SEARCH_BUCKETS as u32);
     }
 
@@ -986,7 +1068,6 @@ mod tests {
         // Pretend prior attempts happened.
         if let Some(p) = state.pending.get_mut(&7) {
             p.attempt = 4;
-            p.holdoff_cycles = 8;
         }
         // Now apply a BeaconAnomaly poke for cid=7.
         handle_request(
@@ -1000,7 +1081,6 @@ mod tests {
         let p = state.pending.get(&7).unwrap();
         assert_eq!(p.bucket, original_bucket, "poke must not relocate bucket");
         assert_eq!(p.attempt, 0);
-        assert_eq!(p.holdoff_cycles, 0);
         assert_eq!(state.fast_ticks_remaining, N_SEARCH_BUCKETS as u32);
         // And the bucket vector still has the cid exactly once.
         let count = state.buckets[original_bucket]
@@ -1017,7 +1097,6 @@ mod tests {
         // Pretend channel #1 had multiple prior failures.
         if let Some(p) = state.pending.get_mut(&1) {
             p.attempt = 2;
-            p.holdoff_cycles = 5;
         }
         handle_request(
             &mut state,
@@ -1137,29 +1216,286 @@ mod tests {
         );
     }
 
-    /// `Reconnect` schedules must spread across the bucket ring by
-    /// cid hash, not collapse into `current+1` like `Initial` does.
-    /// Replicates the bucket-placement formula and asserts a
-    /// contiguous block of cids touches every bucket.
+    /// pvxs `Channel::disconnect` parity: `Reconnect` schedules
+    /// must land in `current_bucket` (zero holdoff for the typical
+    /// Active disconnect — `client.cpp:213`). Cascade-spread on
+    /// first reconnect is achieved by the natural one-bucket-per-
+    /// tick rate-limit, not by per-cid hashing. The earlier
+    /// `(current+1+cid%30)` formula gave 1-30 s reconnect latency
+    /// that the channel layer's wait-for-Found path couldn't hide.
     #[test]
-    fn reconnect_bucket_spread() {
-        let mut state = SearchEngineState::new();
-        state.current_bucket = 0;
-        let mut hit = [false; N_SEARCH_BUCKETS];
-        for cid in 1_000u32..(1_000 + N_SEARCH_BUCKETS as u32) {
-            handle_request(
-                &mut state,
-                SearchRequest::Schedule {
-                    cid,
-                    pv_name: format!("PV:{cid}"),
-                    reason: SearchReason::Reconnect,
-                },
+    fn placement_reconnect_uses_current_bucket() {
+        for current in 0..N_SEARCH_BUCKETS {
+            assert_eq!(
+                placement_bucket(current, SearchReason::Reconnect),
+                current,
+                "Reconnect must drop in current bucket (got {current})"
             );
-            hit[state.pending.get(&cid).unwrap().bucket] = true;
         }
+    }
+
+    /// `Initial` and `BeaconAnomaly` both pair with an immediate
+    /// broadcast / fast-tick retransmit, so their bucket placement
+    /// is one tick ahead — that's where the FIRST scheduled
+    /// retransmit (after the immediate fire) lands. Wrap-around at
+    /// the ring boundary is part of the contract.
+    #[test]
+    fn placement_initial_and_beacon_anomaly_one_bucket_ahead() {
+        for reason in [SearchReason::Initial, SearchReason::BeaconAnomaly] {
+            assert_eq!(placement_bucket(0, reason), 1);
+            assert_eq!(placement_bucket(13, reason), 14);
+            assert_eq!(
+                placement_bucket(N_SEARCH_BUCKETS - 1, reason),
+                0,
+                "wrap-around at ring boundary"
+            );
+        }
+    }
+
+    /// pvxs `tickSearch` line 1193-1196 escalates the retry bucket
+    /// by `nSearch+1` after each transmit. Pattern: 1, 2, 3, ...,
+    /// capping at `N_SEARCH_BUCKETS` (where the cap means "full
+    /// ring", which lands back on the same bucket → 30 s
+    /// steady-state retry cadence).
+    #[test]
+    fn cascade_next_implements_pvxs_nsearch_escalation() {
+        let no_imbalance = |_| 0usize;
+        let current = 7;
+
+        assert_eq!(
+            cascade_smoothed_next(current, 1, no_imbalance),
+            (current + 1) % N_SEARCH_BUCKETS,
+        );
+        assert_eq!(
+            cascade_smoothed_next(current, 2, no_imbalance),
+            (current + 2) % N_SEARCH_BUCKETS,
+        );
+        assert_eq!(
+            cascade_smoothed_next(current, 10, no_imbalance),
+            (current + 10) % N_SEARCH_BUCKETS,
+        );
+        assert_eq!(
+            cascade_smoothed_next(current, N_SEARCH_BUCKETS as u32, no_imbalance),
+            current,
+            "attempt at cap wraps to current (full-ring steady state)",
+        );
+        assert_eq!(
+            cascade_smoothed_next(current, 1_000_000, no_imbalance),
+            current,
+            "attempt > cap stays clamped",
+        );
+    }
+
+    /// pvxs `client.cpp:1199-1206` smoothing: when the chosen
+    /// `next` bucket is overloaded versus `next+1` by 100+ entries,
+    /// defer to `next+1`. Crosses two ticks instead of one.
+    #[test]
+    fn cascade_smoothing_defers_when_next_is_overloaded() {
+        let current = 5;
+        let attempt = 1; // → next=6, nextnext=7
+
+        let overloaded = |idx: usize| if idx == 6 { 200 } else { 0 };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, overloaded),
+            7,
+            "delta > 100 must defer"
+        );
+
+        let below = |idx: usize| if idx == 6 { 90 } else { 0 };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, below),
+            6,
+            "delta < 100 stays in next"
+        );
+
+        let balanced = |idx: usize| if idx == 6 || idx == 7 { 200 } else { 0 };
+        assert_eq!(cascade_smoothed_next(current, attempt, balanced), 6);
+
+        let reverse = |idx: usize| if idx == 7 { 200 } else { 0 };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, reverse),
+            6,
+            "smoothing only defers forward, never backward"
+        );
+    }
+
+    /// Smoothing boundary cases — pvxs's threshold is strictly
+    /// `delta > 100`. Catches the easy-to-introduce off-by-one
+    /// (`>= 100`).
+    #[test]
+    fn cascade_smoothing_boundary_at_delta_100() {
+        let current = 5;
+        let attempt = 1;
+        let exactly_100 = |idx: usize| if idx == 6 { 100 } else { 0 };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, exactly_100),
+            6,
+            "delta == 100 must NOT trigger"
+        );
+        let just_over_100 = |idx: usize| if idx == 6 { 101 } else { 0 };
+        assert_eq!(
+            cascade_smoothed_next(current, attempt, just_over_100),
+            7,
+            "delta == 101 must trigger"
+        );
+    }
+
+    /// End-to-end Reconnect bucket-fire test. Boots `run_search_engine`
+    /// with a sniffer socket as the only addr_list destination,
+    /// submits a `Schedule { Reconnect }`, and asserts that a
+    /// SEARCH packet for the right cid lands on the sniffer within
+    /// ~1.1 s — i.e. the next tick after Schedule arrival, mirroring
+    /// pvxs `Channel::disconnect` recovery timing. Without the
+    /// pvxs-parity placement the search would have been placed in a
+    /// cid-hashed bucket up to 30 s away and never fired within a
+    /// reasonable window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_search_broadcasts_within_one_tick() {
+        use std::net::Ipv4Addr;
+
+        // Sniffer on loopback ephemeral. Used as the engine's
+        // ONLY addr_list destination.
+        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer_addr = sniffer
+            .local_addrs()
+            .first()
+            .copied()
+            .expect("sniffer local_addr");
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
+        let engine_handle = tokio::spawn(run_search_engine(
+            vec![sniffer_addr],
+            Vec::new(),
+            req_rx,
+            resp_tx,
+        ));
+
+        // Schedule a Reconnect for cid=42. Engine places it in
+        // current_bucket; the next 1-Hz tick fires the broadcast.
+        let cid = 42u32;
+        let pv = "TEST:CA:RECONNECT:PV";
+        let started = std::time::Instant::now();
+        req_tx
+            .send(SearchRequest::Schedule {
+                cid,
+                pv_name: pv.into(),
+                reason: SearchReason::Reconnect,
+            })
+            .expect("schedule send");
+
+        let mut buf = vec![0u8; 4096];
+        let recv_result = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (n, _from) = sniffer.recv_from(&mut buf).await?;
+                if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                    return Ok::<usize, std::io::Error>(n);
+                }
+            }
+        })
+        .await;
+
+        let elapsed = started.elapsed();
+        engine_handle.abort();
+
+        let n = recv_result
+            .expect("Reconnect SEARCH must arrive within 3 s")
+            .expect("recv_from must not error");
         assert!(
-            hit.iter().all(|h| *h),
-            "Reconnect cids must hit every bucket in the ring"
+            n > 0,
+            "received an empty datagram — Reconnect SEARCH path is broken"
+        );
+        // Tight assertion catches the regression we're guarding
+        // against (cid-hashed 1-30 s pre-fix latency) without being
+        // flaky on a loaded CI runner. 2.5 s gives ~1.5 s slack on
+        // top of the ≤ 1.1 s pvxs-parity target.
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "Reconnect should broadcast within ~1.1 s (one tick); \
+             took {elapsed:?} — bucket placement / tick handler may \
+             have regressed"
+        );
+    }
+
+    /// End-to-end retry escalation timing test. Verifies that the
+    /// production process_bucket loop reproduces pvxs's `nSearch+1`
+    /// pattern at the actual scheduler level — unit tests of
+    /// `cascade_smoothed_next` cover the formula in isolation, but
+    /// only this test catches an accumulator drift between the
+    /// pure fn and the live `current_bucket`-advancing tick loop.
+    ///
+    /// Expected SEARCH arrival times (relative to Schedule submission):
+    ///   #1 at ~1 s   (first tick after Schedule lands)
+    ///   #2 at ~2 s   (idx+1, +1 cycle)
+    ///   #3 at ~4 s   (idx+(1+2)=idx+3, +2 cycles)
+    ///
+    /// Slack: ±500 ms per gap to absorb scheduler / mio jitter on
+    /// loaded CI. Total runtime ~4 s.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_escalation_pvxs_pattern() {
+        use std::net::Ipv4Addr;
+
+        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer_addr = sniffer
+            .local_addrs()
+            .first()
+            .copied()
+            .expect("sniffer addr");
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
+        let engine_handle = tokio::spawn(run_search_engine(
+            vec![sniffer_addr],
+            Vec::new(),
+            req_rx,
+            resp_tx,
+        ));
+
+        let cid = 77u32;
+        let pv = "ESCALATION:CA";
+        let started = std::time::Instant::now();
+        req_tx
+            .send(SearchRequest::Schedule {
+                cid,
+                pv_name: pv.into(),
+                reason: SearchReason::Reconnect,
+            })
+            .expect("schedule");
+
+        let mut buf = vec![0u8; 4096];
+        let mut packet_times = Vec::new();
+        for i in 0..3 {
+            let t = tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let (n, _) = sniffer.recv_from(&mut buf).await.expect("recv");
+                    if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                        return started.elapsed();
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("SEARCH #{} did not arrive within 8 s", i + 1));
+            packet_times.push(t);
+        }
+
+        engine_handle.abort();
+
+        assert!(
+            packet_times[0] < Duration::from_millis(1500),
+            "first SEARCH should arrive ~1 s after Schedule; got {:?}",
+            packet_times[0]
+        );
+        let gap_12 = packet_times[1].saturating_sub(packet_times[0]);
+        let gap_23 = packet_times[2].saturating_sub(packet_times[1]);
+        assert!(
+            (700..=1500).contains(&(gap_12.as_millis() as u64)),
+            "gap #1→#2 should be ~1 s (nSearch=1); got {gap_12:?}. \
+             Production retry escalation may have regressed."
+        );
+        assert!(
+            (1500..=2700).contains(&(gap_23.as_millis() as u64)),
+            "gap #2→#3 should be ~2 s (nSearch=2); got {gap_23:?}. \
+             Production retry escalation may have regressed."
         );
     }
 }

@@ -1,5 +1,99 @@
 # Changelog
 
+## v0.13.1 — 2026-05-03
+
+CA client beacon-watchdog rewrite for libca parity. Eliminates a
+false-positive disconnect storm that surfaced whenever multiple
+`CaClient` instances co-existed in one process (e.g. pyepics shim +
+ophyd-async backend + integration-test fixture, all in the same
+Python process). Each fresh client used to fire a spurious
+`EchoProbe` on its very first beacon from every IOC; under load
+the 5-s echo deadline tripped and produced cascading
+`TcpClosed` → reconnect events that the user perceived as random
+"restored N subscriptions" log spam.
+
+The fix splits beacon handling into a libca-style dual-path
+design: search-engine wake-up on classified anomalies, and a
+per-circuit watchdog that healthy beacons refresh and anomaly
+beacons leave alone. Internal-only API changes — no public
+breaking changes.
+
+### epics-ca-rs
+
+- **fix**: beacon anomalies are now classified into
+  `BeaconAnomalyKind::{FirstSighting, IdMismatch, PeriodCollapse}`.
+  Only the latter two emit warn-level "IOC may have restarted"
+  diagnostics and feed the
+  `ca_client_beacon_anomalies_total` metric; `FirstSighting` is a
+  per-client bookkeeping event (our beacon map was empty for this
+  server, not "the IOC restarted") and now logs at debug under
+  `ca_client_beacon_first_sighting_total`. Resolves the misleading
+  warns that started appearing for every IOC at process start when
+  several `CaClient`s came up in parallel.
+- **fix**: removed the immediate `EchoProbe` on beacon anomaly
+  (libca's `tcpRecvWatchdog` model). The transport's per-circuit
+  read loop is now structured around a single pinned
+  `tokio::time::Sleep` whose deadline is mutated in place by:
+  data arrival (clear flags + reset to now + 30 s — libca
+  `messageArrivalNotify`), healthy beacon arrival (reset to
+  now + 30 s when the anomaly flag isn't set — libca
+  `beaconArrivalNotify`), and anomaly beacon arrival (set sticky
+  flag, deadline UNCHANGED — libca `beaconAnomalyNotify`).
+  Idle expiry still sends an echo and switches to the 5-s
+  echo-pending state; the change is that we no longer pre-empt
+  the 30-s schedule on a beacon anomaly. The previous fast-track
+  was the trigger for the disconnect storm under load.
+- **fix**: libca `bhe.cpp:179` parity (narrowed) — a beacon whose
+  sequence number jumps forward by 2 or 3, or backwards by 1-4,
+  is dropped as a duplicate-route artifact rather than classified
+  as `IdMismatch`. Without this, multi-NIC sites that delivered
+  redundant copies tripped the watchdog flag and suppressed
+  healthy-beacon refreshes for ~30 s on what was in reality a
+  perfectly healthy IOC. We deliberately narrow libca's
+  256-id backwards window to 4 because our `IdMismatch` branch
+  catches restart-to-1 directly via the id sequence (libca relies
+  on period-collapse instead and would otherwise swallow that
+  signal into the dedup path).
+- **fix**: `BeaconArrival` routing falls back to port-only
+  matching when the beacon's announced address doesn't exactly
+  match an operational circuit's `server_addr`. Two real-world
+  cases fold into the same fallback: INADDR_ANY (the IOC sent
+  `available = 0` and the upstream repeater didn't rewrite it)
+  and multi-homed IOCs whose beacon NIC differs from the NIC the
+  search-reply came in on. Cross-host port collisions cause a
+  benign false-refresh — the wrong circuit's deadline is pushed
+  by 30 s, but its own watchdog still detects death within
+  30 + 5 s if it actually died. Routing logic extracted into
+  `beacon_arrival_targets` and unit-tested.
+- **fix**: `connect_server` now runs in a `tokio::task::JoinSet`
+  rather than awaiting inline in the transport command loop.
+  Previously a 5-s TCP / 15-s TLS handshake on server A blocked
+  every other command — `BeaconArrivalNotify` for already-
+  connected circuits, `CreateChannel` for server B, etc. — for
+  the duration. Per-server FIFO is preserved by a
+  `HashMap<SocketAddr, Vec<TransportCommand>>` queue that drains
+  on connect completion. Connect failure surfaces
+  `ChannelCreateFailed` for queued `CreateChannel` commands and
+  a single `TcpClosed` so the coordinator can clear server
+  state.
+- **internal**: introduced `CoordRequest::BeaconArrival` (separate
+  from `ForceRescanServer`); `TransportCommand::EchoProbe` removed
+  in favour of `TransportCommand::BeaconArrivalNotify`. Read loop
+  drops `Arc<Notify>` echo_probe in favour of an
+  `mpsc::UnboundedSender<bool>` per circuit. The `biased;` hint on
+  read_loop's select is removed — tokio's randomized polling
+  gives starvation-free fairness, and the bias was risking the
+  opposite of what the comment claimed.
+- **test**: 3 new transport `read_loop` virtual-clock tests
+  (healthy-beacon-extends, anomaly-suppresses-refresh,
+  data-clears-flag) using `tokio::test(start_paused = true)` and
+  `tokio::io::duplex` for the mock peer; 5 new `beacon_monitor`
+  classification / dedup tests; 6 new `beacon_arrival_targets`
+  routing tests. Total `epics-ca-rs --lib` is now 89 tests, up
+  from 76.
+- **dev-deps**: added `tokio` with `test-util` feature for the
+  virtual-clock tests.
+
 ## v0.13.0 — 2026-05-01
 
 Operational fixes for the local-IOC zero-config workflow + CLI tool

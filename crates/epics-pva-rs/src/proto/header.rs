@@ -20,8 +20,8 @@
 
 use std::io::Cursor;
 
-use crate::decode_err;
 use super::buffer::{ByteOrder, DecodeError, ReadExt, WriteExt};
+use crate::decode_err;
 
 /// PVA magic byte. Always `0xCA`.
 pub const MAGIC: u8 = 0xCA;

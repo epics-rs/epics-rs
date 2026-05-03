@@ -9,6 +9,28 @@ use crate::protocol::*;
 
 use super::CoordRequest;
 
+/// Why the beacon monitor decided this beacon is "anomalous".
+///
+/// `FirstSighting` is benign from the *server's* point of view — the
+/// IOC is fine, we just hadn't been listening before (or had pruned
+/// its `BeaconState` after `BEACON_STALE_THRESHOLD`). It still
+/// matters for the search engine: channels stuck in `Searching` /
+/// `Disconnected` should re-search immediately because we now know
+/// the server is alive. It does NOT justify probing the TCP circuit
+/// of operational channels — by definition we already have a working
+/// circuit, and an extra EchoProbe under load just risks tripping the
+/// 5-s echo timeout in `transport.rs`.
+///
+/// `IdMismatch` and `PeriodCollapse` are real restart signals and
+/// warrant the full treatment (search wake-up + EchoProbe to
+/// operational circuits, so a half-dead TCP gets surfaced fast).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BeaconAnomalyKind {
+    FirstSighting,
+    IdMismatch,
+    PeriodCollapse,
+}
+
 // ---------------------------------------------------------------------------
 // Per-server beacon state
 // ---------------------------------------------------------------------------
@@ -308,6 +330,41 @@ fn handle_beacon(
         return;
     }
 
+    // libca `bhe.cpp:159-182` parity (narrowed): drop beacons
+    // whose sequence number jumps FORWARD by 2 or 3 (likely a
+    // duplicate route that's slightly ahead of us, or a brief
+    // input-queue overrun) or BACKWARDS by 1-4 (a redundant route
+    // delivering an older copy). Without this, those cases hit
+    // the `IdMismatch` branch below and flag the transport
+    // watchdog for ~30 s on what is in reality a healthy IOC.
+    //
+    // We deliberately narrow libca's backwards window from 256 to
+    // 4. libca conflates "duplicate route" with "id reset to a
+    // small number" because it relies on the period-collapse
+    // check to detect restarts. Our `IdMismatch` branch detects
+    // restart-to-1 directly via the id sequence and catches
+    // sub-50 ms restarts that period-collapse misses. The wider
+    // libca window would swallow those into the dedup path.
+    //
+    // Update `last_id` to the new value so the next genuine
+    // beacon computes its advance from the most recent
+    // observation (also matches libca, where
+    // `lastBeaconNumber = beaconNumber` runs before the discard
+    // checks). `last_seen`, `count`, and `period_estimate` are
+    // left untouched — the drop-only-dups path keeps a server
+    // stuck emitting nothing-but-dups on the
+    // BEACON_STALE_THRESHOLD prune trajectory.
+    const BACKWARDS_DUP_WINDOW: u32 = 4;
+    if !first_sighting {
+        let advance = beacon_id.wrapping_sub(entry.last_id);
+        let backwards_dup = advance > u32::MAX - BACKWARDS_DUP_WINDOW;
+        let small_forward_dup = advance == 2 || advance == 3;
+        if backwards_dup || small_forward_dup {
+            entry.last_id = beacon_id;
+            return;
+        }
+    }
+
     // Anomaly: beacon_id not monotonically increasing (IOC restarted
     // with a fresh sequence), OR period suddenly dropped below 1/3 of
     // the estimated steady-state period (IOC restarted and is in its
@@ -324,11 +381,23 @@ fn handle_beacon(
     // "legitimate fast-beacon initial phase" (real IOCs send
     // every 100-500 ms during startup).
     const MIN_PERIOD_COLLAPSE_INTERVAL: Duration = Duration::from_millis(50);
-    let is_anomaly = first_sighting
-        || beacon_id != expected_next_id
-        || (entry.count > 3
-            && actual_interval > MIN_PERIOD_COLLAPSE_INTERVAL
-            && actual_interval < entry.period_estimate / 3);
+    // Classify in priority order: FirstSighting wins because there's
+    // no prior `last_id` / `period_estimate` to make the other two
+    // checks meaningful. IdMismatch beats PeriodCollapse because a
+    // real restart (id reset to 1) is the dispositive signal even if
+    // the inter-beacon interval also happens to be sub-period.
+    let anomaly_kind = if first_sighting {
+        Some(BeaconAnomalyKind::FirstSighting)
+    } else if beacon_id != expected_next_id {
+        Some(BeaconAnomalyKind::IdMismatch)
+    } else if entry.count > 3
+        && actual_interval > MIN_PERIOD_COLLAPSE_INTERVAL
+        && actual_interval < entry.period_estimate / 3
+    {
+        Some(BeaconAnomalyKind::PeriodCollapse)
+    } else {
+        None
+    };
 
     // Update state.
     entry.last_id = beacon_id;
@@ -344,16 +413,46 @@ fn handle_beacon(
         entry.period_estimate = new_estimate;
     }
 
-    // pvxs `onBeacon` poke semantic: only fire on first sighting of a
-    // (server, GUID) — i.e. a real anomaly (new server / IOC restart /
-    // beacon-period collapse). Steady-state beacons just refresh
-    // `last_seen` so the entry stays out of the prune set above; they
-    // intentionally do NOT poke the coordinator. The earlier "soft
-    // poke on every beacon" code amplified normal beacon traffic into
-    // a permanent fast-tick search storm whenever multiple IOCs
-    // beaconed within the engine's revolution window.
-    if is_anomaly {
-        let _ = coord_tx.send(CoordRequest::ForceRescanServer { server_addr });
+    // Search-engine wake-up (libca `udpiiu::beaconAnomalyNotify`):
+    // ONLY on a classified anomaly. The earlier "soft poke on every
+    // beacon" code amplified normal beacon traffic into a permanent
+    // fast-tick search storm whenever multiple IOCs beaconed within
+    // the engine's revolution window — keep that path lean.
+    if let Some(kind) = anomaly_kind {
+        let _ = coord_tx.send(CoordRequest::ForceRescanServer { server_addr, kind });
+    }
+
+    // Transport-watchdog notification (libca `tcpRecvWatchdog::
+    // beaconArrivalNotify` / `beaconAnomalyNotify`). Routed via the
+    // coordinator to the per-circuit read loop, where it either
+    // pushes the deadline forward (healthy beacon) or sets a sticky
+    // anomaly flag (id-mismatch / period-collapse) that suppresses
+    // subsequent healthy-beacon refreshes until the next data
+    // arrival or echo response.
+    //
+    // FirstSighting is intentionally skipped — and this is a
+    // deliberate divergence from libca, worth being honest about.
+    // libca's `bhe.cpp:137` path (BHE freshly created via the
+    // TCP-connect search-reply route, then first beacon arrives)
+    // calls `beaconAnomalyNotify` as a precaution, setting the
+    // tcpRecvWatchdog flag. We don't, on the reasoning that:
+    //   * the next healthy beacon (≤ one beacon period) will
+    //     refresh the deadline naturally, and
+    //   * if the server actually restarted in that one-period
+    //     gap, the existing 30 s idle-timeout echo handles it.
+    // This keeps the FirstSighting path purely a search-engine
+    // concern and avoids per-CaClient false flags on startup,
+    // which was the original disconnect-storm trigger.
+    let arrival_anomaly = match anomaly_kind {
+        None => Some(false),
+        Some(BeaconAnomalyKind::IdMismatch | BeaconAnomalyKind::PeriodCollapse) => Some(true),
+        Some(BeaconAnomalyKind::FirstSighting) => None,
+    };
+    if let Some(anomaly) = arrival_anomaly {
+        let _ = coord_tx.send(CoordRequest::BeaconArrival {
+            server_addr,
+            anomaly,
+        });
     }
 }
 
@@ -440,11 +539,16 @@ mod tests {
         hdr.cid = 100;
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
 
-        // First beacon — first sighting → anomaly fires.
+        // First beacon — first sighting → anomaly fires with the
+        // FirstSighting kind so the coordinator can wake searches
+        // without probing operational TCP circuits.
         handle_beacon(hdr, &mut servers, &tx);
         assert!(matches!(
             rx.try_recv(),
-            Ok(CoordRequest::ForceRescanServer { .. })
+            Ok(CoordRequest::ForceRescanServer {
+                kind: BeaconAnomalyKind::FirstSighting,
+                ..
+            })
         ));
         // Drain any further send (none expected).
         assert!(rx.try_recv().is_err());
@@ -483,8 +587,57 @@ mod tests {
         hdr.cid = 1;
         handle_beacon(hdr, &mut servers, &tx);
         assert!(
-            matches!(rx.try_recv(), Ok(CoordRequest::ForceRescanServer { .. })),
-            "id-mismatch restart must fire anomaly even when interval < 50ms"
+            matches!(
+                rx.try_recv(),
+                Ok(CoordRequest::ForceRescanServer {
+                    kind: BeaconAnomalyKind::IdMismatch,
+                    ..
+                })
+            ),
+            "id-mismatch restart must fire IdMismatch anomaly even when interval < 50ms"
+        );
+    }
+
+    /// Period collapse with monotonic ids (e.g. an IOC abruptly
+    /// switching from 15-s steady-state to 200-ms fast-beacon mode
+    /// without resetting the id counter) must classify as
+    /// `PeriodCollapse`, not `FirstSighting` or `IdMismatch`. The
+    /// coordinator routes this to the EchoProbe path because a real
+    /// restart sometimes manifests this way (re-IOC scripts that
+    /// preserve the counter across restarts).
+    #[test]
+    fn period_collapse_classifies_as_period_collapse() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+
+        let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        // Pre-seed a steady-state entry: 15-s period_estimate, 10
+        // beacons in, last_seen far enough back that
+        // actual_interval > 50 ms but < 5 s = period_estimate / 3.
+        servers.insert(
+            server,
+            BeaconState {
+                last_id: 99,
+                last_seen: Instant::now() - Duration::from_millis(200),
+                period_estimate: Duration::from_secs(15),
+                count: 10,
+            },
+        );
+
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.count = 5064;
+        hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
+        hdr.cid = 100; // monotonic — rules out IdMismatch
+        handle_beacon(hdr, &mut servers, &tx);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(CoordRequest::ForceRescanServer {
+                    kind: BeaconAnomalyKind::PeriodCollapse,
+                    ..
+                })
+            ),
+            "monotonic-id, sub-period interval must classify as PeriodCollapse"
         );
     }
 
@@ -503,19 +656,200 @@ mod tests {
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
 
         // Five monotonically increasing beacons (ids 100..105). First
-        // is first_sighting → anomaly. Rest must not fire.
+        // is first_sighting → ForceRescanServer fires once. Rest must
+        // not fire any ForceRescanServer (they will, however, fire
+        // BeaconArrival{anomaly=false} — that's the libca-style
+        // healthy-beacon watchdog refresh and is correct here).
         for id in 100..105 {
             hdr.cid = id;
             handle_beacon(hdr, &mut servers, &tx);
         }
-        // Drain whatever fired (just the first_sighting anomaly).
-        let mut anomalies = 0;
-        while rx.try_recv().is_ok() {
-            anomalies += 1;
+        let mut search_wakes = 0;
+        let mut healthy_arrivals = 0;
+        let mut anomaly_arrivals = 0;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                CoordRequest::ForceRescanServer { .. } => search_wakes += 1,
+                CoordRequest::BeaconArrival { anomaly: false, .. } => healthy_arrivals += 1,
+                CoordRequest::BeaconArrival { anomaly: true, .. } => anomaly_arrivals += 1,
+                _ => {}
+            }
         }
         assert_eq!(
-            anomalies, 1,
-            "monotonic fast-cadence beacons must fire anomaly only on first sighting"
+            search_wakes, 1,
+            "monotonic fast-cadence beacons must wake searches only on first sighting"
+        );
+        assert_eq!(
+            anomaly_arrivals, 0,
+            "monotonic fast-cadence beacons must not flag the watchdog"
+        );
+        assert_eq!(
+            healthy_arrivals, 4,
+            "each post-first-sighting healthy beacon must refresh the transport watchdog"
+        );
+    }
+
+    /// libca `tcpRecvWatchdog::beaconAnomalyNotify` parity: when the
+    /// monitor classifies a beacon as a real restart (`IdMismatch`
+    /// here), it must emit a `BeaconArrival { anomaly: true }`
+    /// alongside the search-wake `ForceRescanServer`. The transport
+    /// uses that to set its sticky flag without firing an immediate
+    /// echo — the receive watchdog will then expire on schedule.
+    #[test]
+    fn id_mismatch_emits_anomaly_beacon_arrival() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.count = 5064;
+        hdr.cid = 100;
+        hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
+        // Establish the BHE so the second beacon isn't a first sighting.
+        handle_beacon(hdr, &mut servers, &tx);
+        // Drain first-sighting messages.
+        while rx.try_recv().is_ok() {}
+
+        // Restart: id resets to 1.
+        hdr.cid = 1;
+        handle_beacon(hdr, &mut servers, &tx);
+        let mut saw_search_wake = false;
+        let mut saw_anomaly_arrival = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                CoordRequest::ForceRescanServer {
+                    kind: BeaconAnomalyKind::IdMismatch,
+                    ..
+                } => saw_search_wake = true,
+                CoordRequest::BeaconArrival { anomaly: true, .. } => saw_anomaly_arrival = true,
+                _ => {}
+            }
+        }
+        assert!(saw_search_wake, "IdMismatch must wake searches");
+        assert!(
+            saw_anomaly_arrival,
+            "IdMismatch must flag the transport watchdog"
+        );
+    }
+
+    /// FirstSighting is purely a per-client bookkeeping event; we
+    /// either don't have a circuit yet or just pruned the BHE for an
+    /// existing circuit. In either case the watchdog must not be
+    /// flagged — emitting `BeaconArrival { anomaly: true }` here was
+    /// the original cause of the disconnect storms.
+    #[test]
+    fn first_sighting_does_not_emit_beacon_arrival() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.count = 5064;
+        hdr.cid = 100;
+        hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
+        handle_beacon(hdr, &mut servers, &tx);
+
+        let mut saw_first_sighting = false;
+        let mut saw_arrival = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                CoordRequest::ForceRescanServer {
+                    kind: BeaconAnomalyKind::FirstSighting,
+                    ..
+                } => saw_first_sighting = true,
+                CoordRequest::BeaconArrival { .. } => saw_arrival = true,
+                _ => {}
+            }
+        }
+        assert!(saw_first_sighting, "first sighting must wake searches");
+        assert!(
+            !saw_arrival,
+            "first sighting must not touch the transport watchdog"
+        );
+    }
+
+    /// libca `bhe.cpp:179` parity: a forward jump of 2 or 3 in the
+    /// beacon sequence is treated as a duplicate-route artifact, not
+    /// an anomaly. With lazy-echo this matters: classifying it as
+    /// `IdMismatch` would set the transport watchdog flag and
+    /// suppress healthy-beacon refreshes for the next ~30 s on what
+    /// is in reality a perfectly healthy IOC. The drop-only-dup
+    /// path must update `last_id` so the next genuine beacon
+    /// computes its advance against the most recent observation.
+    #[test]
+    fn small_forward_advance_is_dropped_not_classified() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.count = 5064;
+        hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
+        // Establish steady-state beacons (ids 100..103).
+        for id in 100..103 {
+            hdr.cid = id;
+            handle_beacon(hdr, &mut servers, &tx);
+        }
+        while rx.try_recv().is_ok() {}
+
+        // Advance of 2 (last_id = 102, next id = 104) — must drop.
+        hdr.cid = 104;
+        handle_beacon(hdr, &mut servers, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "advance=2 must be silently dropped, not classified as anomaly"
+        );
+
+        // Advance of 3 from the just-updated 104 — also drop.
+        hdr.cid = 107;
+        handle_beacon(hdr, &mut servers, &tx);
+        assert!(rx.try_recv().is_err(), "advance=3 must be silently dropped");
+
+        // last_id should now be 107 (drop path still updates it).
+        // The next monotonic beacon (108 = advance=1) is healthy.
+        hdr.cid = 108;
+        handle_beacon(hdr, &mut servers, &tx);
+        let mut saw_arrival_healthy = false;
+        let mut saw_anomaly = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                CoordRequest::BeaconArrival { anomaly: false, .. } => saw_arrival_healthy = true,
+                CoordRequest::BeaconArrival { anomaly: true, .. }
+                | CoordRequest::ForceRescanServer { .. } => saw_anomaly = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_arrival_healthy,
+            "after dropped dups, advance=1 must classify as healthy"
+        );
+        assert!(
+            !saw_anomaly,
+            "monotonic recovery from drop sequence must not fire anomaly"
+        );
+    }
+
+    /// Backwards advance (within libca's 256-id window) is also
+    /// dropped — same reasoning as the small-forward case but for
+    /// duplicates that arrive late through a slower NIC path.
+    #[test]
+    fn small_backwards_advance_is_dropped() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.count = 5064;
+        hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
+        for id in 100..103 {
+            hdr.cid = id;
+            handle_beacon(hdr, &mut servers, &tx);
+        }
+        while rx.try_recv().is_ok() {}
+
+        // last_id is 102. A late copy with id=101 — wrapping_sub
+        // gives u32::MAX (advance treated as 0xFFFFFFFF, > MAX-256).
+        hdr.cid = 101;
+        handle_beacon(hdr, &mut servers, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "backwards-by-1 (within 256) must drop"
         );
     }
 

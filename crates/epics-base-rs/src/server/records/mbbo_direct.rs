@@ -303,12 +303,10 @@ impl Record for MbboDirectRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
-            _ => {
-                BIT_NAMES
-                    .iter()
-                    .position(|&n| n == name)
-                    .map(|idx| EpicsValue::Char(self.bits[idx]))
-            }
+            _ => BIT_NAMES
+                .iter()
+                .position(|&n| n == name)
+                .map(|idx| EpicsValue::Char(self.bits[idx])),
         }
     }
 

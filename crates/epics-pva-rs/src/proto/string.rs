@@ -7,9 +7,9 @@
 
 use std::io::Cursor;
 
-use crate::decode_err;
 use super::buffer::{ByteOrder, DecodeError, ReadExt};
 use super::size::{decode_size, encode_size_into};
+use crate::decode_err;
 
 /// Encode a string and return a freshly allocated buffer.
 pub fn encode_string(value: &str, order: ByteOrder) -> Vec<u8> {

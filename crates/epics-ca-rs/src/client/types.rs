@@ -105,10 +105,19 @@ pub(crate) enum TransportCommand {
         sid: u32,
         server_addr: SocketAddr,
     },
-    /// Beacon anomaly detected — force immediate echo probe to detect
-    /// dead connections faster (matches C EPICS beaconAnomaly flag).
-    EchoProbe {
+    /// Beacon arrival routed from the beacon monitor to the per-circuit
+    /// receive watchdog. `anomaly = false` for healthy beacons (mirrors
+    /// libca `tcpRecvWatchdog::beaconArrivalNotify` — pet the watchdog
+    /// so a quiet circuit isn't probed unnecessarily). `anomaly = true`
+    /// when the monitor classified the beacon as a real restart signal
+    /// (`IdMismatch` / `PeriodCollapse`); the read loop only sets a
+    /// flag (mirrors libca `beaconAnomalyNotify`) and lets the existing
+    /// idle watchdog expire on its own schedule rather than firing an
+    /// immediate echo probe — under load that immediate probe was the
+    /// trigger for spurious 5-s echo timeouts and reconnect storms.
+    BeaconArrivalNotify {
         server_addr: SocketAddr,
+        anomaly: bool,
     },
     EventsOff {
         server_addr: SocketAddr,

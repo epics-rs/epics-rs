@@ -111,6 +111,11 @@ tempfile = "3"
 proptest = "1"
 rcgen = "0.13"
 serial_test = "3"
+# test-util is required for `tokio::test(start_paused = true)` and
+# `tokio::time::pause`, used by the lazy-echo virtual-clock tests in
+# client::transport. Pulled in only for tests so production builds
+# don't carry the test runtime hooks.
+tokio = { version = "1", features = ["test-util"] }
 
 [[bench]]
 name = "protocol_bench"

@@ -16,9 +16,9 @@
 
 use std::io::Cursor;
 
-use crate::decode_err;
 use super::buffer::{ByteOrder, DecodeError, ReadExt, WriteExt};
 use super::string::{decode_string, encode_string_into};
+use crate::decode_err;
 
 /// Severity / kind of a `Status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.13.5 — 2026-05-03
+
+Doctest-only patch on top of v0.13.4. The `process_bucket` doc
+in `epics-ca-rs/src/client/search.rs` had a 4-space-indented
+pseudo-code line that rustdoc treated as a Rust code block,
+breaking `cargo test -p epics-ca-rs` (doctests). Production
+behaviour unchanged from v0.13.4 — only docs.
+
+### epics-ca-rs
+
+- **fix**: wrap the `next = (idx + min(attempt, nBuckets)) %
+  nBuckets` formula in a ```text fence so rustdoc skips it
+  instead of compiling. Caught by GitHub Actions CI; pre-publish
+  verification used `cargo test --lib` which skips doctests.
+
 ## v0.13.4 — 2026-05-03
 
 PVA + CA reconnect-after-IOC-restart parity with pvxs

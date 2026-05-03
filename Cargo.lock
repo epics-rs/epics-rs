@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ad-core-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -18,7 +18,7 @@ dependencies = [
 
 [[package]]
 name = "ad-plugins-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "ad-core-rs",
  "asyn-rs",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "asyn-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "bitflags",
  "criterion",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "epics-base-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "bytes",
  "chrono",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "epics-bridge-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "epics-base-rs",
  "proc-macro-crate",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "bytes",
  "chrono",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "epics-tools-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "chrono",
  "clap",
@@ -1954,7 +1954,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "mini-beamline"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "motor-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "asyn-rs",
  "bitflags",
@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-ioc"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "ophyd-test-ioc"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "optics-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -2616,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "qsrv-ioc"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "epics-base-rs",
  "epics-bridge-rs",
@@ -3081,7 +3081,7 @@ dependencies = [
 
 [[package]]
 name = "scaler-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "scope-ioc"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -3285,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "sim-detector"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -3406,7 +3406,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "std-rs"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "asyn-rs",
  "chrono",
@@ -4514,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-beamline"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",

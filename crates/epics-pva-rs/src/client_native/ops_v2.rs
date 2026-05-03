@@ -65,6 +65,11 @@ struct IoidGuard {
     /// to avoid emitting a redundant DESTROY after the success-path
     /// destroy has already been sent.
     destroy_sid: Option<u32>,
+    /// When true, Drop becomes a no-op: no DESTROY, no router unregister.
+    /// Set by `defuse()` for the warm-GET cache path where the caller
+    /// intentionally keeps the (sid, ioid) binding alive past op_get's
+    /// return so subsequent warm GETs can reuse it.
+    defused: bool,
 }
 
 impl IoidGuard {
@@ -73,6 +78,7 @@ impl IoidGuard {
             server,
             ioid,
             destroy_sid: None,
+            defused: false,
         }
     }
 
@@ -89,10 +95,22 @@ impl IoidGuard {
     fn disarm(&mut self) {
         self.destroy_sid = None;
     }
+
+    /// Make Drop a complete no-op. Used by the warm-GET cache path,
+    /// which transitions the by_ioid entry from TwoShot to Reusable
+    /// and intentionally keeps both the server-side ioid binding and
+    /// the client-side router slot alive past op_get's return.
+    fn defuse(&mut self) {
+        self.defused = true;
+        self.destroy_sid = None;
+    }
 }
 
 impl Drop for IoidGuard {
     fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
         if let Some(sid) = self.destroy_sid.take() {
             // Best-effort server-side cleanup. We can't `await`, so we
             // fall back to a non-blocking enqueue and ignore the result.
@@ -149,6 +167,10 @@ async fn ensure_active_with_op_timeout(
     channel: &Arc<Channel>,
     op_timeout: Duration,
 ) -> PvaResult<(Arc<super::server_conn::ServerConn>, u32)> {
+    // Fast path: avoid allocating a timer future if the channel is already active.
+    if let Some(active) = channel.try_get_active() {
+        return Ok(active);
+    }
     match tokio::time::timeout(op_timeout, channel.ensure_active()).await {
         Ok(result) => result,
         Err(_) => Err(PvaError::Timeout),
@@ -165,22 +187,65 @@ async fn op_get_inner(
     let order = server.byte_order;
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
+
+    // Warm-GET fast path: skip INIT when we already have a cached
+    // (sid, ioid) bound to this channel from a previous default GET
+    // (no `fields` filter, no raw pv_request). Cuts the wire cost in
+    // half (1 RTT instead of 2) and saves one frame-decode + one
+    // type-cache mutex acquisition. Only applies to the default
+    // "fetch every field" path because that's the binding the
+    // server cached on our behalf last time.
+    let is_default_request = raw_pv_req.is_none() && fields.is_empty();
+    if is_default_request {
+        if let Some(warm) = take_warm_get(channel, &server, sid) {
+            // Refill the slot with a fresh oneshot, send GET, await
+            // single response. If anything goes wrong we fall through
+            // to the cold path which re-establishes the cache.
+            match try_warm_get(&server, &codec, &warm, op_timeout).await {
+                Ok(Some(pv)) => {
+                    // Re-cache so the next call also takes the fast path.
+                    *channel.cached_get.lock() = Some(warm);
+                    return Ok(((*pv.0).clone(), pv.1));
+                }
+                Ok(None) | Err(_) => {
+                    // Cache stale (server forgot ioid, channel reset, etc.).
+                    // Fall through to cold path; do NOT restore the cache
+                    // — the next cold success will refill it.
+                }
+            }
+        }
+    }
+
     let ioid = alloc_ioid();
 
     let pv_req = match raw_pv_req {
-        Some(b) => b.to_vec(),
-        None if fields.is_empty() => sentinel_all_fields(),
-        None => build_pv_request_fields(fields, big_endian),
+        Some(b) => std::borrow::Cow::Borrowed(b),
+        None if fields.is_empty() => std::borrow::Cow::Borrowed(sentinel_all_fields()),
+        None => std::borrow::Cow::Owned(build_pv_request_fields(fields, big_endian)),
     };
 
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    // TwoShot routing: one oneshot per response (INIT then DATA).
+    // Avoids the per-op `unbounded_channel` allocation that used to
+    // back the stream-style path; the reader task pops FIFO from the
+    // TwoShot VecDeque so first frame → rx_init, second → rx_data.
+    let (rx_init, rx_data) = server.register_ioid_twoshot(sid, ioid);
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
     let cache = server.type_cache();
 
-    // INIT
-    let init_req = codec.build_get_init(sid, ioid, &pv_req);
-    server.send(init_req).await?;
-    let init_frame = await_frame(&mut stream, op_timeout).await?;
+    // Pipeline: combine INIT + GET frames into a single buffer and
+    // send as one channel message. The writer task writes both in one
+    // TCP write_all (they're contiguous bytes). The server parses them
+    // as two PVA messages by header length. This reduces writer channel
+    // hops from 2 to 1 and guarantees both frames land in the same
+    // TCP segment (no Nagle delay between them).
+    let mut combined = codec.build_get_init(sid, ioid, &pv_req);
+    combined.extend_from_slice(&codec.build_get(sid, ioid));
+    // Sync send into the unbounded writer queue — no scheduler hop,
+    // mirrors CA's `DirectServerWriter::send_frame`.
+    server.send_sync(combined)?;
+
+    // Receive INIT response
+    let init_frame = await_oneshot_frame(rx_init, op_timeout).await?;
     let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock())? {
         OpResponse::Init(i) => i,
         other => {
@@ -197,19 +262,16 @@ async fn op_get_inner(
             init.status
         )));
     }
-    // INIT succeeded → server has registered (sid, ioid). Arm so any
-    // mid-op drop fires a DESTROY_REQUEST to release that slot.
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
-    // DATA
-    let data_req = codec.build_get(sid, ioid);
-    server.send(data_req).await?;
-    let data_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_op_response(&data_frame, Some(&intro))? {
+    // Receive DATA response (already sent, just waiting for the reply)
+    let data_frame = await_oneshot_frame(rx_data, op_timeout).await?;
+    let intro_arc = Arc::new(intro);
+    let result = match decode_op_response(&data_frame, Some(&intro_arc))? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
-                Ok((intro, d.value))
+                Ok(((*intro_arc).clone(), d.value))
             } else {
                 Err(PvaError::Protocol(format!("GET data: {:?}", d.status)))
             }
@@ -219,13 +281,83 @@ async fn op_get_inner(
         ))),
     };
 
-    // Best-effort cleanup. Disarm the guard first so it doesn't fire a
-    // redundant DESTROY when it drops below.
-    ioid_guard.disarm();
-    let destroy = codec.build_destroy_request(sid, ioid);
-    let _ = server.send(destroy).await;
-    server.unregister_ioid(ioid);
+    // Cache (sid, ioid, intro) so the next default GET on this
+    // channel can take the warm path. Replace the TwoShot slot with
+    // a Reusable slot the warm path can refill, and defuse the
+    // IoidGuard so its Drop does NOT unregister + DESTROY — the
+    // server keeps the binding alive for our reuse.
+    if is_default_request && result.is_ok() {
+        let slot = server.register_ioid_reusable(sid, ioid);
+        *channel.cached_get.lock() = Some(super::channel::CachedGet {
+            server: Arc::downgrade(&server),
+            sid,
+            ioid,
+            intro: intro_arc,
+            slot,
+        });
+        ioid_guard.defuse();
+    } else {
+        ioid_guard.disarm();
+        // Fire-and-forget cleanup — try_send avoids awaiting the
+        // writer task, saving one channel hop (~3-5µs).
+        let destroy = codec.build_destroy_request(sid, ioid);
+        server.try_send(destroy);
+        server.unregister_ioid(ioid);
+    }
     result
+}
+
+/// Take the cached warm-GET state if it's still bound to the same
+/// (server, sid). Lazy invalidation: a stale cache (different sid /
+/// dropped server / disconnected) silently returns None and the
+/// caller falls through to the cold path.
+fn take_warm_get(
+    channel: &Arc<Channel>,
+    server: &Arc<super::server_conn::ServerConn>,
+    sid: u32,
+) -> Option<super::channel::CachedGet> {
+    let mut guard = channel.cached_get.lock();
+    let cached = guard.take()?;
+    let cached_server = cached.server.upgrade()?;
+    if Arc::ptr_eq(&cached_server, server) && cached.sid == sid && server.is_alive() {
+        Some(cached)
+    } else {
+        // Wrong server / sid — drop. Reader's by_ioid entry will be
+        // GC'd when the connection tears down.
+        None
+    }
+}
+
+/// Warm-GET fast path: send GET only (no INIT), await single response,
+/// decode using cached intro. Returns Ok(None) if the server forgot
+/// the ioid (replied with an error status), Ok(Some) on success, Err
+/// on transport / timeout failures.
+async fn try_warm_get(
+    server: &Arc<super::server_conn::ServerConn>,
+    codec: &PvaCodec,
+    warm: &super::channel::CachedGet,
+    op_timeout: Duration,
+) -> PvaResult<Option<(Arc<FieldDesc>, PvField)>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *warm.slot.lock() = Some(tx);
+    let frame = codec.build_get(warm.sid, warm.ioid);
+    if let Err(_) = server.send_sync(frame) {
+        warm.slot.lock().take();
+        return Err(PvaError::Protocol("warm GET send failed".into()));
+    }
+    let data_frame = await_oneshot_frame(rx, op_timeout).await?;
+    match decode_op_response(&data_frame, Some(&warm.intro))? {
+        OpResponse::Data(d) => {
+            if d.status.is_success() {
+                Ok(Some((warm.intro.clone(), d.value)))
+            } else {
+                // Server rejected — likely lost the binding (channel
+                // close / GC). Caller should retry cold.
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 // ── GET_FIELD (introspection only) ────────────────────────────────────
@@ -321,9 +453,9 @@ pub async fn op_put_field(
     // pvRequest selects exactly the target field so server-side bitset
     // bookkeeping aligns with the descriptor we'll get back.
     let pv_req = if field_path.is_empty() {
-        sentinel_all_fields()
+        std::borrow::Cow::Borrowed(sentinel_all_fields())
     } else {
-        build_pv_request_fields(&[field_path], big_endian)
+        std::borrow::Cow::Owned(build_pv_request_fields(&[field_path], big_endian))
     };
     let mut stream = server.register_ioid_stream(sid, ioid);
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
@@ -1001,10 +1133,10 @@ where
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
     let pv_req = if fields.is_empty() {
-        sentinel_all_fields()
+        std::borrow::Cow::Borrowed(sentinel_all_fields())
     } else {
         let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-        build_pv_request_fields(&refs, big_endian)
+        std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian))
     };
     let mut stream = server.register_ioid_stream(sid, ioid);
     let init_req = codec.build_monitor_init(sid, ioid, &pv_req);
@@ -1404,11 +1536,11 @@ where
     let ioid = alloc_ioid();
 
     let pv_req = match raw_pv_req {
-        Some(b) => b.to_vec(),
-        None if fields.is_empty() => sentinel_all_fields(),
+        Some(b) => std::borrow::Cow::Borrowed(b),
+        None if fields.is_empty() => std::borrow::Cow::Borrowed(sentinel_all_fields()),
         None => {
             let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-            build_pv_request_fields(&refs, big_endian)
+            std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian))
         }
     };
 
@@ -1651,8 +1783,23 @@ async fn await_frame(
     Ok(frame)
 }
 
-fn sentinel_all_fields() -> Vec<u8> {
-    vec![0xFD, 0x02, 0x00, 0x80, 0x00, 0x00]
+/// Single-shot variant of [`await_frame`] for the new TwoShot ioid
+/// router path. Avoids the per-op `unbounded_channel` allocation —
+/// the reader task pops oneshots FIFO from `IoidSlot::TwoShot`'s
+/// VecDeque, so each pipelined GET / PUT response lands directly on
+/// a stack-allocated oneshot future.
+async fn await_oneshot_frame(
+    rx: tokio::sync::oneshot::Receiver<super::decode::Frame>,
+    op_timeout: Duration,
+) -> PvaResult<super::decode::Frame> {
+    timeout(op_timeout, rx)
+        .await
+        .map_err(|_| PvaError::Timeout)?
+        .map_err(|_| PvaError::Protocol("connection closed".into()))
+}
+
+fn sentinel_all_fields() -> &'static [u8] {
+    &[0xFD, 0x02, 0x00, 0x80, 0x00, 0x00]
 }
 
 /// Build a PUT value where only `field_path` (e.g. `"alarm.severity"`)

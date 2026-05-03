@@ -116,6 +116,25 @@ pub struct Channel {
     /// immediate fire — pvxs `Channel::disconnect` parity). pvxs /
     /// ca-rs parity.
     has_been_active: std::sync::atomic::AtomicBool,
+    /// Warm-GET fast path: cache the (sid, ioid, intro, slot) of a
+    /// successfully completed default `op_get` so subsequent calls on
+    /// the same channel can skip INIT and reuse the server-side
+    /// introspection binding. Lazily invalidated when `ensure_active`
+    /// returns a different (server, sid) — no need to hook the state
+    /// transition path. See `op_get_inner`.
+    pub(crate) cached_get: parking_lot::Mutex<Option<CachedGet>>,
+}
+
+/// Server-side state cached after the first successful default GET
+/// against a channel. Lets subsequent GETs skip INIT — saves one
+/// round-trip per call (~50µs localhost).
+pub(crate) struct CachedGet {
+    pub(crate) server: std::sync::Weak<ServerConn>,
+    pub(crate) sid: u32,
+    pub(crate) ioid: u32,
+    pub(crate) intro: Arc<crate::pvdata::FieldDesc>,
+    pub(crate) slot:
+        Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<super::decode::Frame>>>>,
 }
 
 /// How a channel resolves its PV name to a server address.
@@ -269,6 +288,7 @@ impl Channel {
             server_destroyed_notify: Arc::new(Notify::new()),
             last_close_registration: parking_lot::Mutex::new(None),
             has_been_active: std::sync::atomic::AtomicBool::new(false),
+            cached_get: parking_lot::Mutex::new(None),
         }
     }
 
@@ -300,6 +320,7 @@ impl Channel {
             server_destroyed_notify: Arc::new(Notify::new()),
             last_close_registration: parking_lot::Mutex::new(None),
             has_been_active: std::sync::atomic::AtomicBool::new(false),
+            cached_get: parking_lot::Mutex::new(None),
         }
     }
 
@@ -315,6 +336,22 @@ impl Channel {
             return false;
         }
         matches!(*self.state.read(), ChannelState::Active { ref server, .. } if server.is_alive())
+    }
+
+    /// Fast-path check to get the active server and sid without allocating
+    /// async futures or timers. Used by op_get / op_put to avoid timeout
+    /// overhead when the channel is already active.
+    pub fn try_get_active(&self) -> Option<(Arc<ServerConn>, u32)> {
+        let s = self.state.read();
+        if let ChannelState::Active { server, sid, .. } = &*s {
+            let destroyed = self
+                .server_destroyed
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if !destroyed && server.is_alive() {
+                return Some((server.clone(), *sid));
+            }
+        }
+        None
     }
 
     /// Notify pulsed by `route_frame` on server-initiated

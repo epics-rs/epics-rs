@@ -950,6 +950,214 @@ impl PvaClient {
             sync_cancel: true,
         }
     }
+
+    /// Concurrent multi-PV GET. Resolves channels and issues GET ops
+    /// in parallel. Returns results in the same order as the input PV
+    /// names. Failed PVs map to `Err`.
+    ///
+    /// PVA's GET is a stateful 3-frame exchange (INIT → DATA → DESTROY),
+    /// so true wire-level batching (like CA's caget_many) isn't possible.
+    /// Instead we dispatch N independent GETs concurrently — channels
+    /// are cached, so PVs on the same server share one TCP connection.
+    ///
+    /// ```ignore
+    /// let results = client.pvget_many(&["PV:A", "PV:B", "PV:C"]).await;
+    /// for (i, r) in results.iter().enumerate() {
+    ///     match r {
+    ///         Ok(field) => println!("PV[{i}] = {field}"),
+    ///         Err(e)    => println!("PV[{i}] failed: {e}"),
+    ///     }
+    /// }
+    /// ```
+    pub async fn pvget_many(&self, pv_names: &[&str]) -> Vec<PvaResult<PvField>> {
+        let n = pv_names.len();
+        let mut results: Vec<PvaResult<PvField>> = (0..n)
+            .map(|_| Err(PvaError::Timeout))
+            .collect();
+
+        // Phase 1: ensure each channel has a warm-GET cache populated.
+        // The first call per channel pays the full INIT+GET cost
+        // (op_get does it transparently); subsequent calls only need
+        // a single GET frame.
+        //
+        // We do this serially on the first miss per name to keep code
+        // simple — the overwhelming common case is "all channels are
+        // already warm from a previous bulk call", in which case this
+        // loop is a fast vec-build.
+        struct WarmReq {
+            idx: usize,
+            channel: Arc<Channel>,
+            warm: super::channel::CachedGet,
+            // oneshot the writer-task signal will fulfil
+            rx: tokio::sync::oneshot::Receiver<super::decode::Frame>,
+            // for decode: cached intro
+            intro: Arc<FieldDesc>,
+        }
+        let mut warm_reqs: Vec<WarmReq> = Vec::with_capacity(n);
+        let mut by_server: HashMap<SocketAddr, Vec<usize>> = HashMap::new();
+        let mut combined_frames: HashMap<SocketAddr, Vec<u8>> = HashMap::new();
+        let mut server_handles: HashMap<SocketAddr, Arc<super::server_conn::ServerConn>> =
+            HashMap::new();
+
+        for (idx, name) in pv_names.iter().enumerate() {
+            // Resolve channel.
+            let channel = match self.channel(name).await {
+                Ok(c) => c,
+                Err(e) => {
+                    results[idx] = Err(e);
+                    continue;
+                }
+            };
+
+            // Cold path on first call — populates cached_get.
+            if channel.cached_get.lock().is_none() {
+                match op_get(&channel, &[], self.inner.timeout).await {
+                    Ok((_intro, value)) => {
+                        // Result is delivered via cold path; record it now.
+                        results[idx] = Ok(value);
+                        continue;
+                    }
+                    Err(e) => {
+                        results[idx] = Err(e);
+                        continue;
+                    }
+                }
+            }
+
+            // Take warm state for batching.
+            let warm = match channel.cached_get.lock().take() {
+                Some(w) => w,
+                None => continue,
+            };
+            let server = match warm.server.upgrade() {
+                Some(s) if s.is_alive() => s,
+                _ => {
+                    // Stale — fall back to cold.
+                    match op_get(&channel, &[], self.inner.timeout).await {
+                        Ok((_intro, value)) => results[idx] = Ok(value),
+                        Err(e) => results[idx] = Err(e),
+                    }
+                    continue;
+                }
+            };
+            let order = server.byte_order;
+            let codec = crate::codec::PvaCodec {
+                big_endian: matches!(order, crate::proto::ByteOrder::Big),
+            };
+
+            // Refill the slot with a fresh oneshot, build GET frame,
+            // append to per-server combined buffer.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            *warm.slot.lock() = Some(tx);
+            let frame = codec.build_get(warm.sid, warm.ioid);
+
+            by_server.entry(server.addr).or_default().push(warm_reqs.len());
+            combined_frames
+                .entry(server.addr)
+                .or_default()
+                .extend_from_slice(&frame);
+            server_handles.entry(server.addr).or_insert_with(|| server.clone());
+            let intro = warm.intro.clone();
+            warm_reqs.push(WarmReq {
+                idx,
+                channel,
+                warm,
+                rx,
+                intro,
+            });
+        }
+
+        // Phase 2: per server, send the combined frame in ONE TCP
+        // write. The PVA protocol parses messages by header length so
+        // back-to-back GETs in the same buffer are processed in
+        // order; the server replies with N data frames that the
+        // reader task routes to each ioid's Reusable slot.
+        let mut failed_servers: Vec<SocketAddr> = Vec::new();
+        for (addr, frame) in combined_frames {
+            if let Some(server) = server_handles.get(&addr) {
+                if server.send_sync(frame).is_err() {
+                    failed_servers.push(addr);
+                }
+            }
+        }
+        for addr in &failed_servers {
+            if let Some(indices) = by_server.get(addr) {
+                for &wi in indices {
+                    let req = &warm_reqs[wi];
+                    req.warm.slot.lock().take();
+                    // Replace with a closed-error placeholder; we'll
+                    // skip the await for these.
+                    results[req.idx] =
+                        Err(PvaError::Protocol("server send failed".into()));
+                }
+            }
+        }
+
+        // Phase 3: sequential await over the per-server signalled
+        // oneshots. The reader task fires all oneshots back-to-back
+        // as the per-server response burst arrives, so most rx's are
+        // already ready by the time we reach them — sequential is
+        // effectively as fast as join_all here without pulling in
+        // futures-util as a dep.
+        use super::decode::OpResponse;
+        let op_timeout = self.inner.timeout;
+        for req in warm_reqs {
+            let WarmReq {
+                idx,
+                channel,
+                warm,
+                rx,
+                intro,
+            } = req;
+            // Skip await if Phase 2 already marked this server failed.
+            if matches!(&results[idx], Err(_)) {
+                *channel.cached_get.lock() = Some(warm);
+                continue;
+            }
+            let frame_res = tokio::time::timeout(op_timeout, rx).await;
+            let value = match frame_res {
+                Ok(Ok(frame)) => match super::decode::decode_op_response(&frame, Some(&intro)) {
+                    Ok(OpResponse::Data(d)) if d.status.is_success() => Ok(d.value),
+                    Ok(OpResponse::Data(d)) => Err(PvaError::Protocol(format!(
+                        "warm GET data: {:?}",
+                        d.status
+                    ))),
+                    Ok(other) => {
+                        Err(PvaError::Protocol(format!("expected GET data, got {other:?}")))
+                    }
+                    Err(e) => Err(e),
+                },
+                Ok(Err(_)) => Err(PvaError::Protocol("warm GET channel closed".into())),
+                Err(_) => Err(PvaError::Timeout),
+            };
+            // Restore cache so the next call also takes the batched path.
+            *channel.cached_get.lock() = Some(warm);
+            results[idx] = value;
+        }
+
+        results
+    }
+
+    /// Same as [`Self::pvget_many`] but returns full introspection +
+    /// server address for each PV.
+    pub async fn pvget_many_full(&self, pv_names: &[&str]) -> Vec<PvaResult<PvGetResult>> {
+        let n = pv_names.len();
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, name) in pv_names.iter().enumerate() {
+            let client = self.clone();
+            let name = name.to_string();
+            set.spawn(async move { (idx, client.pvget_full(&name).await) });
+        }
+        let mut results: Vec<PvaResult<PvGetResult>> = (0..n)
+            .map(|_| Err(PvaError::Timeout))
+            .collect();
+        while let Some(join_result) = set.join_next().await {
+            if let Ok((idx, pva_result)) = join_result {
+                results[idx] = pva_result;
+            }
+        }
+        results
+    }
 }
 
 /// Snapshot returned by [`PvaClient::report`]. pvxs Report

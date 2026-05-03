@@ -2017,10 +2017,7 @@ pub(crate) fn drain_waiters_for_cids(
 ///
 /// The returned `Vec` is what the coordinator forwards to the
 /// transport manager — one `BeaconArrivalNotify` per element.
-fn beacon_arrival_targets<I>(
-    channel_states: I,
-    beacon_addr: SocketAddr,
-) -> Vec<SocketAddr>
+fn beacon_arrival_targets<I>(channel_states: I, beacon_addr: SocketAddr) -> Vec<SocketAddr>
 where
     I: IntoIterator<Item = (ChannelState, Option<SocketAddr>)>,
 {

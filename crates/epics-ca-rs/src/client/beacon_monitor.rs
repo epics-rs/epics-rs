@@ -357,7 +357,7 @@ fn handle_beacon(
     const BACKWARDS_DUP_WINDOW: u32 = 4;
     if !first_sighting {
         let advance = beacon_id.wrapping_sub(entry.last_id);
-        let backwards_dup = advance >= u32::MAX - BACKWARDS_DUP_WINDOW + 1;
+        let backwards_dup = advance > u32::MAX - BACKWARDS_DUP_WINDOW;
         let small_forward_dup = advance == 2 || advance == 3;
         if backwards_dup || small_forward_dup {
             entry.last_id = beacon_id;
@@ -800,10 +800,7 @@ mod tests {
         // Advance of 3 from the just-updated 104 — also drop.
         hdr.cid = 107;
         handle_beacon(hdr, &mut servers, &tx);
-        assert!(
-            rx.try_recv().is_err(),
-            "advance=3 must be silently dropped"
-        );
+        assert!(rx.try_recv().is_err(), "advance=3 must be silently dropped");
 
         // last_id should now be 107 (drop path still updates it).
         // The next monotonic beacon (108 = advance=1) is healthy.

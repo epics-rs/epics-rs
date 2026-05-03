@@ -966,11 +966,11 @@ mod read_loop_tests {
     /// (where the read loop's outgoing echo requests land), and a
     /// beacon-arrival channel. Returns the handles the test needs.
     fn spawn_read_loop() -> (
-        tokio::io::DuplexStream,                  // server end of pipe
-        mpsc::UnboundedReceiver<TransportEvent>,  // events emitted
-        mpsc::UnboundedReceiver<Vec<u8>>,         // frames the loop wrote
-        mpsc::UnboundedSender<bool>,              // beacon arrival sender
-        tokio::task::JoinHandle<()>,              // the loop task
+        tokio::io::DuplexStream,                 // server end of pipe
+        mpsc::UnboundedReceiver<TransportEvent>, // events emitted
+        mpsc::UnboundedReceiver<Vec<u8>>,        // frames the loop wrote
+        mpsc::UnboundedSender<bool>,             // beacon arrival sender
+        tokio::task::JoinHandle<()>,             // the loop task
     ) {
         let (server_end, client_end) = tokio::io::duplex(8192);
         let (event_tx, event_rx) = mpsc::unbounded_channel();

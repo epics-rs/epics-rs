@@ -17,9 +17,9 @@
 
 use std::io::Cursor;
 
-use crate::decode_err;
 use super::buffer::{ByteOrder, DecodeError, ReadExt};
 use super::size::{decode_size, encode_size_into};
+use crate::decode_err;
 
 /// Compact bit container with LSB-first packing matching pvxs `bitmask.cpp`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

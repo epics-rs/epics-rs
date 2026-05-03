@@ -255,15 +255,31 @@ enum CoordRequest {
         value: EpicsValue,
         reply: oneshot::Sender<CaResult<()>>,
     },
-    /// Beacon anomaly detected for `server_addr` (first sighting /
-    /// sequence reset / period collapse). Coordinator rescans all
-    /// disconnected/searching channels and sends an immediate echo
-    /// probe to any operational channel on this server. Steady-state
-    /// beacons no longer reach this branch — `beacon_monitor.rs`
-    /// only fires on the anomaly path now (see comment there for
-    /// rationale).
+    /// Beacon anomaly classified by `beacon_monitor`. Coordinator
+    /// rescans all disconnected/searching channels regardless of
+    /// `kind`. The transport watchdog is updated through the
+    /// separate `BeaconArrival` path — this variant intentionally
+    /// no longer carries an EchoProbe-style side effect, mirroring
+    /// libca's split between `udpiiu::beaconAnomalyNotify` (which
+    /// only wakes searches) and `tcpRecvWatchdog::beaconAnomalyNotify`
+    /// (which only flips a per-circuit flag).
     ForceRescanServer {
         server_addr: SocketAddr,
+        kind: beacon_monitor::BeaconAnomalyKind,
+    },
+    /// Beacon arrival notification for the per-circuit receive
+    /// watchdog. `anomaly = false` for healthy beacons (libca
+    /// `beaconArrivalNotify` — refresh watchdog deadline);
+    /// `anomaly = true` for `IdMismatch` / `PeriodCollapse` (libca
+    /// `beaconAnomalyNotify` — set sticky flag, no immediate echo).
+    /// `FirstSighting` deliberately does NOT generate this message:
+    /// either we don't yet have a virtual circuit to the server, in
+    /// which case the watchdog is irrelevant, or we do (we just
+    /// pruned the BHE) and the next healthy beacon will refresh it
+    /// naturally.
+    BeaconArrival {
+        server_addr: SocketAddr,
+        anomaly: bool,
     },
     /// Time since this channel's circuit last received any frame.
     /// `None` if the channel isn't operational. Mirrors libca
@@ -1492,20 +1508,55 @@ async fn run_coordinator(
                         let _ = reply.send(());
                         return; // Exit coordinator loop
                     }
-                    CoordRequest::ForceRescanServer { server_addr } => {
-                        diag.beacon_anomalies.fetch_add(1, Ordering::Relaxed);
-                        diag.record(DiagEvent::BeaconAnomaly { server: server_addr });
-                        tracing::warn!(server = %server_addr, "beacon anomaly detected — IOC may have restarted");
-                        metrics::counter!("ca_client_beacon_anomalies_total", "server" => server_addr.to_string()).increment(1);
+                    CoordRequest::ForceRescanServer { server_addr, kind } => {
+                        // FirstSighting is a per-client bookkeeping
+                        // event (our beacon map was empty for this
+                        // server), not a server-side anomaly. Logging
+                        // it as a warning every time a fresh CaClient
+                        // hears its first beacon was misleading and
+                        // would over-promote a benign condition.
+                        // Reserve the warn-level "IOC may have
+                        // restarted" message for real restart signals.
+                        let is_real_restart = matches!(
+                            kind,
+                            beacon_monitor::BeaconAnomalyKind::IdMismatch
+                                | beacon_monitor::BeaconAnomalyKind::PeriodCollapse
+                        );
+                        if is_real_restart {
+                            diag.beacon_anomalies.fetch_add(1, Ordering::Relaxed);
+                            diag.record(DiagEvent::BeaconAnomaly { server: server_addr });
+                            tracing::warn!(
+                                server = %server_addr,
+                                ?kind,
+                                "beacon anomaly detected — IOC may have restarted"
+                            );
+                            metrics::counter!(
+                                "ca_client_beacon_anomalies_total",
+                                "server" => server_addr.to_string()
+                            )
+                            .increment(1);
+                        } else {
+                            tracing::debug!(
+                                server = %server_addr,
+                                "first sighting of beacon source — waking pending searches"
+                            );
+                            metrics::counter!(
+                                "ca_client_beacon_first_sighting_total",
+                                "server" => server_addr.to_string()
+                            )
+                            .increment(1);
+                        }
 
-                        // Rescan ALL disconnected/searching channels. The
-                        // beacon address may use INADDR_ANY and won't
-                        // match our stored server_addr, so a per-server
-                        // lookup is unreliable. Operational channels on
-                        // this server also get an immediate echo probe so
-                        // a dead TCP circuit is detected faster (matches
-                        // libca `beaconAnomaly` watchdog flag).
-                        let mut probed_servers = HashSet::new();
+                        // Rescan all disconnected/searching channels.
+                        // The beacon's announced address may use
+                        // INADDR_ANY and won't match our stored
+                        // server_addr, so a per-server lookup would
+                        // be unreliable. Operational circuits get
+                        // their watchdog state updated through the
+                        // separate `BeaconArrival` path — this branch
+                        // no longer issues EchoProbe directly, mirror-
+                        // ing libca's split between udpiiu (search
+                        // wake) and tcpRecvWatchdog (lazy probe).
                         for ch in channels.values() {
                             if ch.state == ChannelState::Disconnected
                                 || ch.state == ChannelState::Searching
@@ -1515,17 +1566,26 @@ async fn run_coordinator(
                                     pv_name: ch.pv_name.clone(),
                                     reason: SearchReason::BeaconAnomaly,
                                 });
-                            } else if ch.state.is_operational() {
-                                if let Some(addr) = ch.server_addr {
-                                    if probed_servers.insert(addr) {
-                                        let _ = transport_tx.send(
-                                            TransportCommand::EchoProbe {
-                                                server_addr: addr,
-                                            },
-                                        );
-                                    }
-                                }
                             }
+                        }
+                    }
+                    CoordRequest::BeaconArrival { server_addr, anomaly } => {
+                        // Pure transport-watchdog signal. The
+                        // routing decision (exact match vs.
+                        // port-only fallback for INADDR_ANY /
+                        // multi-homed IOCs) lives in
+                        // `beacon_arrival_targets` so it can be
+                        // unit-tested without standing up the full
+                        // coordinator. See the function's doc
+                        // comment for the full rationale.
+                        let states = channels.values().map(|ch| (ch.state, ch.server_addr));
+                        for target in beacon_arrival_targets(states, server_addr) {
+                            let _ = transport_tx.send(
+                                TransportCommand::BeaconArrivalNotify {
+                                    server_addr: target,
+                                    anomaly,
+                                },
+                            );
                         }
                     }
                 }
@@ -1930,6 +1990,70 @@ pub(crate) fn drain_waiters_for_cids(
     }
 }
 
+/// Decide which operational circuits should receive a
+/// `BeaconArrivalNotify` for a beacon announced from `beacon_addr`.
+///
+/// Common (and cheapest) path: the beacon's announced address
+/// matches an operational circuit's stored `server_addr` exactly,
+/// in which case we deliver to just that circuit.
+///
+/// Two fallbacks share a single port-only matching path:
+///   * INADDR_ANY (`beacon_addr.ip().is_unspecified()`) — the IOC
+///     sent `available = 0` and the upstream repeater didn't
+///     rewrite it. There's no exact match to find.
+///   * Multi-homed IOC — the beacon arrived through NIC A and the
+///     search-reply that established the circuit came from NIC B.
+///     The announced address is `A:port`, the circuit's stored
+///     address is `B:port`, so exact-match silently misses; we
+///     match by port instead.
+///
+/// Cross-host port collisions (two unrelated IOCs both on port
+/// 5064 across different machines, both with operational
+/// circuits) cause a benign false-refresh: the wrong circuit's
+/// deadline gets pushed by 30 s, but its own watchdog still
+/// detects death within 30 + 5 s if it actually died. We accept
+/// that trade to recover correct behaviour on the multi-homed
+/// case, which is real and was previously a silent regression.
+///
+/// The returned `Vec` is what the coordinator forwards to the
+/// transport manager — one `BeaconArrivalNotify` per element.
+fn beacon_arrival_targets<I>(
+    channel_states: I,
+    beacon_addr: SocketAddr,
+) -> Vec<SocketAddr>
+where
+    I: IntoIterator<Item = (ChannelState, Option<SocketAddr>)>,
+{
+    let beacon_unspec = beacon_addr.ip().is_unspecified();
+    let mut found_exact = false;
+    let mut port_targets: HashSet<SocketAddr> = HashSet::new();
+
+    for (state, addr_opt) in channel_states {
+        if !state.is_operational() {
+            continue;
+        }
+        let Some(addr) = addr_opt else { continue };
+        if !beacon_unspec && addr == beacon_addr {
+            // Exact match dominates — don't bother collecting
+            // port matches we'd discard. Order of HashMap
+            // iteration is non-deterministic but this break is
+            // safe regardless: when we know the exact circuit
+            // exists, we never look at the fallback set.
+            found_exact = true;
+            break;
+        }
+        if addr.port() == beacon_addr.port() {
+            port_targets.insert(addr);
+        }
+    }
+
+    if found_exact {
+        vec![beacon_addr]
+    } else {
+        port_targets.into_iter().collect()
+    }
+}
+
 fn remove_server_channel(
     server_channels: &mut HashMap<SocketAddr, HashSet<u32>>,
     server_addr: SocketAddr,
@@ -2167,6 +2291,104 @@ fn parse_addr_list() -> CaResult<Vec<SocketAddr>> {
     }
 
     Ok(addrs)
+}
+
+#[cfg(test)]
+mod beacon_arrival_routing_tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Common path: announced address matches an operational
+    /// circuit exactly. Result is a single-element vec containing
+    /// that address — port-only fallback is NOT consulted.
+    #[test]
+    fn exact_match_dominates() {
+        let states = vec![
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064"))),
+            (ChannelState::Connected, Some(addr("10.0.0.2:5064"))),
+        ];
+        let targets = beacon_arrival_targets(states, addr("10.0.0.1:5064"));
+        assert_eq!(targets, vec![addr("10.0.0.1:5064")]);
+    }
+
+    /// INADDR_ANY beacon (e.g. `0.0.0.0:5064`) — exact-match is
+    /// impossible, so we fall back to port-only across operational
+    /// circuits. Both 10.0.0.1:5064 and 10.0.0.2:5064 should
+    /// receive the notify.
+    #[test]
+    fn unspecified_addr_falls_back_to_port_match() {
+        let states = vec![
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064"))),
+            (ChannelState::Connected, Some(addr("10.0.0.2:5064"))),
+            (ChannelState::Connected, Some(addr("10.0.0.3:6000"))),
+        ];
+        let mut targets = beacon_arrival_targets(states, addr("0.0.0.0:5064"));
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![addr("10.0.0.1:5064"), addr("10.0.0.2:5064")],
+            ":6000 must NOT be a target for a :5064 beacon"
+        );
+    }
+
+    /// Multi-homed IOC: beacon announces NIC A but the circuit was
+    /// established via NIC B. Exact match misses, port-only
+    /// fallback matches B's address.
+    #[test]
+    fn multi_homed_falls_back_to_port_match() {
+        let states = vec![
+            // Circuit was established via NIC B (10.0.0.2).
+            (ChannelState::Connected, Some(addr("10.0.0.2:5064"))),
+        ];
+        // Beacon arrives via NIC A (10.0.0.1) — different IP, same port.
+        let targets = beacon_arrival_targets(states, addr("10.0.0.1:5064"));
+        assert_eq!(
+            targets,
+            vec![addr("10.0.0.2:5064")],
+            "multi-homed IOC must be reachable via port-only fallback"
+        );
+    }
+
+    /// Non-operational channels (Searching, Disconnected, etc.)
+    /// never match — the watchdog only exists for operational
+    /// circuits.
+    #[test]
+    fn non_operational_channels_do_not_match() {
+        let states = vec![
+            (ChannelState::Searching, Some(addr("10.0.0.1:5064"))),
+            (ChannelState::Disconnected, Some(addr("10.0.0.2:5064"))),
+        ];
+        let targets = beacon_arrival_targets(states, addr("10.0.0.1:5064"));
+        assert!(
+            targets.is_empty(),
+            "non-operational channels must not generate watchdog notifies"
+        );
+    }
+
+    /// No matching circuit at all — empty vec, no spurious sends.
+    #[test]
+    fn no_match_returns_empty() {
+        let states = vec![(ChannelState::Connected, Some(addr("10.0.0.1:5064")))];
+        let targets = beacon_arrival_targets(states, addr("10.0.0.99:5065"));
+        assert!(targets.is_empty());
+    }
+
+    /// Multiple circuits to the same exact address (rare but
+    /// possible during state transitions) — `vec![beacon_addr]`
+    /// is a single notify regardless. Transport's per-circuit
+    /// keying handles dedup downstream.
+    #[test]
+    fn exact_match_emits_single_notify() {
+        let states = vec![
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064"))),
+            (ChannelState::Connected, Some(addr("10.0.0.1:5064"))),
+        ];
+        let targets = beacon_arrival_targets(states, addr("10.0.0.1:5064"));
+        assert_eq!(targets, vec![addr("10.0.0.1:5064")]);
+    }
 }
 
 #[cfg(test)]

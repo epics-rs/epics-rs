@@ -2362,4 +2362,31 @@ mod waiter_drain_tests {
         assert!(rrx.await.is_err());
         assert!(wrx.await.is_err());
     }
+
+    /// Phase D regression: the response-vs-disconnect race must NOT
+    /// produce a spurious `Disconnected` error after the response was
+    /// already delivered. With Option C, both the transport read loop
+    /// (success delivery) and the drain path (disconnect) call
+    /// `in_flight.reads.remove(ioid)`. Whichever wins the race fulfils
+    /// the oneshot; the other no-ops.
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_arrives_before_disconnect_drain() {
+        let in_flight = types::InFlightOps::new();
+        let (rtx, rrx) = oneshot::channel();
+        in_flight.reads.insert(100, (7, rtx));
+
+        // Transport delivers the response first.
+        if let Some((_, (_, sender))) = in_flight.reads.remove(&100) {
+            let _ = sender.send(Ok((6, 1, vec![1, 0, 0, 0])));
+        }
+
+        // Disconnect drain runs immediately after — should find nothing
+        // and leave the receiver's Ok intact.
+        let mut affected = HashSet::new();
+        affected.insert(7u32);
+        drain_waiters_for_cids(&affected, &in_flight);
+
+        let result = rrx.await.expect("oneshot still alive");
+        assert!(matches!(result, Ok((6, 1, _))));
+    }
 }

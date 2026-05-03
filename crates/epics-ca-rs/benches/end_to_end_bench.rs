@@ -96,6 +96,53 @@ fn bench_caget(c: &mut Criterion) {
     });
 }
 
+/// Parallel reads — exercises the Option C direct-dispatch path.
+/// Pre-Phase-A this benchmark measured ~1.8 ms wall against a
+/// localhost IOC for 20 channels because every read serialised
+/// through the coordinator's `tokio::select!` loop. Phase A
+/// (direct in-flight registry) + Phase B (snapshot sidecar) drive
+/// this near the network round-trip floor.
+fn bench_bulk_caget(c: &mut Criterion) {
+    let rt = make_runtime();
+    let (_server, port) = rt.block_on(async { boot_softioc(20).await });
+    point_addr_list_at(port);
+    let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
+
+    // Warm up — establish channels before timing so we measure the
+    // hot read path, not connect.
+    rt.block_on(async {
+        let mut handles = Vec::with_capacity(20);
+        for i in 0..20 {
+            let c = client.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = c.caget(&format!("BENCH:PV:{i}")).await;
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    });
+
+    c.bench_function("e2e_bulk_caget_parallel_20pvs", |b| {
+        let client = client.clone();
+        b.to_async(&rt).iter(|| {
+            let client = client.clone();
+            async move {
+                let mut handles = Vec::with_capacity(20);
+                for i in 0..20 {
+                    let c = client.clone();
+                    handles.push(tokio::spawn(async move {
+                        let _ = c.caget(&format!("BENCH:PV:{i}")).await;
+                    }));
+                }
+                for h in handles {
+                    let _ = h.await;
+                }
+            }
+        });
+    });
+}
+
 fn bench_caput(c: &mut Criterion) {
     let rt = make_runtime();
     let (_server, port) = rt.block_on(async { boot_softioc(1).await });
@@ -124,6 +171,6 @@ criterion_group! {
         .sample_size(20)
         .measurement_time(Duration::from_secs(8))
         .warm_up_time(Duration::from_secs(2));
-    targets = bench_caget, bench_caput
+    targets = bench_caget, bench_bulk_caget, bench_caput
 }
 criterion_main!(e2e);

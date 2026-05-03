@@ -204,6 +204,11 @@ pub struct CaClient {
     search_tx: mpsc::UnboundedSender<SearchRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
+    /// Shared registry of in-flight one-shot reads and writes
+    /// (Option C, Phase A). Channel handles insert reply oneshots
+    /// here directly; the per-server read loop removes and fulfils
+    /// them on response arrival without a coordinator round-trip.
+    in_flight: InFlightOps,
     diagnostics: Arc<CaDiagnostics>,
     _coordinator: tokio::task::JoinHandle<()>,
     _search_task: tokio::task::JoinHandle<()>,
@@ -243,17 +248,6 @@ enum CoordRequest {
     },
     DropChannel {
         cid: u32,
-    },
-    ReadNotify {
-        cid: u32,
-        ioid: u32,
-        reply: oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>,
-    },
-    WriteNotify {
-        cid: u32,
-        ioid: u32,
-        value: EpicsValue,
-        reply: oneshot::Sender<CaResult<()>>,
     },
     /// Beacon anomaly classified by `beacon_monitor`. Coordinator
     /// rescans all disconnected/searching channels regardless of
@@ -484,12 +478,15 @@ impl CaClient {
             }
         });
 
+        let in_flight = InFlightOps::new();
+
         let transport_task = {
             #[cfg(feature = "experimental-rust-tls")]
             {
                 epics_base_rs::runtime::task::spawn(transport::run_transport_manager(
                     transport_rx,
                     transport_evt_tx,
+                    in_flight.clone(),
                     tls_arc,
                     config.tls_server_name.clone(),
                     sni_overrides,
@@ -500,6 +497,7 @@ impl CaClient {
                 epics_base_rs::runtime::task::spawn(transport::run_transport_manager(
                     transport_rx,
                     transport_evt_tx,
+                    in_flight.clone(),
                 ))
             }
         };
@@ -512,6 +510,7 @@ impl CaClient {
             transport_evt_rx,
             search_tx.clone(),
             transport_tx.clone(),
+            in_flight.clone(),
             diagnostics.clone(),
         ));
 
@@ -523,6 +522,7 @@ impl CaClient {
             search_tx,
             transport_tx,
             coord_tx,
+            in_flight,
             diagnostics,
             _coordinator: coordinator,
             _search_task: search_task,
@@ -598,6 +598,7 @@ impl CaClient {
             pv_name,
             coord_tx: self.coord_tx.clone(),
             transport_tx: self.transport_tx.clone(),
+            in_flight: self.in_flight.clone(),
             conn_tx,
             _lifecycle: lifecycle,
         }
@@ -755,6 +756,12 @@ pub struct CaChannel {
     pv_name: String,
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
+    /// Shared in-flight registry for reads and writes (Option C
+    /// Phase A). `ch.get()` / `ch.put()` insert their reply oneshots
+    /// directly here, bypassing the coordinator's `tokio::select!`
+    /// loop. The transport's per-server read loop fulfils them on
+    /// `ReadResponse` / `WriteResponse` arrival.
+    in_flight: InFlightOps,
     conn_tx: broadcast::Sender<ConnectionEvent>,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
@@ -818,11 +825,16 @@ impl CaChannel {
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::ReadNotify {
-            cid: self.cid,
-            ioid,
-            reply: reply_tx,
-        });
+        // Direct registry insert (Option C Phase A) — bypasses the
+        // coordinator. `transport::read_loop` removes the entry and
+        // fulfils the oneshot when CA_PROTO_READ_NOTIFY arrives.
+        // Drop semantics: if the caller drops the future before the
+        // response arrives, `reply_rx` drops, the registry's stored
+        // sender becomes a zombie until either (a) the response
+        // arrives and we send to a dead receiver (no-op), or
+        // (b) disconnect cleanup drains it (Phase D). Bounded
+        // either way; not a leak.
+        self.in_flight.reads.insert(ioid, (self.cid, reply_tx));
 
         let _ = self.transport_tx.send(TransportCommand::ReadNotify {
             sid: snap.sid,
@@ -832,8 +844,14 @@ impl CaChannel {
             server_addr: snap.server_addr,
         });
 
-        let (data_type, count, data) = tokio::time::timeout(timeout, reply_rx)
-            .await
+        let result = tokio::time::timeout(timeout, reply_rx).await;
+        // Always remove the registry entry when control returns —
+        // covers the timeout path (response would never arrive) and
+        // the success path (already removed by read_loop, the
+        // `remove` is a no-op then). `drop` of `reply_rx` happens
+        // implicitly on the success path.
+        self.in_flight.reads.remove(&ioid);
+        let (data_type, count, data) = result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)??;
 
@@ -883,11 +901,9 @@ impl CaChannel {
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::ReadNotify {
-            cid: self.cid,
-            ioid,
-            reply: reply_tx,
-        });
+        // Direct registry insert (Option C Phase A); see ch.get
+        // for drop-semantics commentary.
+        self.in_flight.reads.insert(ioid, (self.cid, reply_tx));
 
         let _ = self.transport_tx.send(TransportCommand::ReadNotify {
             sid: snap.sid,
@@ -897,8 +913,9 @@ impl CaChannel {
             server_addr: snap.server_addr,
         });
 
-        let (data_type, resp_count, data) = tokio::time::timeout(Duration::from_secs(30), reply_rx)
-            .await
+        let result = tokio::time::timeout(Duration::from_secs(30), reply_rx).await;
+        self.in_flight.reads.remove(&ioid);
+        let (data_type, resp_count, data) = result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)??;
 
@@ -922,12 +939,8 @@ impl CaChannel {
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::WriteNotify {
-            cid: self.cid,
-            ioid,
-            value: value.clone(),
-            reply: reply_tx,
-        });
+        // Direct registry insert (Option C Phase A).
+        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
@@ -944,8 +957,9 @@ impl CaChannel {
         let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(30.0);
-        tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx)
-            .await
+        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)?
     }
@@ -968,12 +982,8 @@ impl CaChannel {
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.coord_tx.send(CoordRequest::WriteNotify {
-            cid: self.cid,
-            ioid,
-            value: value.clone(),
-            reply: reply_tx,
-        });
+        // Direct registry insert (Option C Phase A).
+        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
@@ -986,8 +996,9 @@ impl CaChannel {
             server_addr: snap.server_addr,
         });
 
-        tokio::time::timeout(timeout, reply_rx)
-            .await
+        let result = tokio::time::timeout(timeout, reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)?
     }
@@ -1237,15 +1248,13 @@ async fn run_coordinator(
     mut transport_rx: mpsc::UnboundedReceiver<TransportEvent>,
     search_tx: mpsc::UnboundedSender<SearchRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
+    in_flight: types::InFlightOps,
     diag: Arc<CaDiagnostics>,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
     let mut pending_wait_connected: HashMap<u32, Vec<oneshot::Sender<()>>> = HashMap::new();
     let mut pending_found: HashMap<u32, SocketAddr> = HashMap::new();
     let mut subscriptions = SubscriptionRegistry::new();
-    let mut read_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)> =
-        HashMap::new();
-    let mut write_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)> = HashMap::new();
     // Reverse index: server_addr -> set of cids last seen on that server.
     // Keep disconnected channels indexed so beacon anomalies can trigger
     // immediate re-search for the affected IOC.
@@ -1451,12 +1460,6 @@ async fn run_coordinator(
                         }
                         channels.remove(&cid);
                     }
-                    CoordRequest::ReadNotify { cid, ioid, reply } => {
-                        read_waiters.insert(ioid, (cid, reply));
-                    }
-                    CoordRequest::WriteNotify { cid, ioid, value: _, reply } => {
-                        write_waiters.insert(ioid, (cid, reply));
-                    }
                     CoordRequest::GetWatchdogDelay { cid, reply } => {
                         let delay = channels.get(&cid).and_then(|ch| {
                             if !ch.state.is_operational() {
@@ -1632,15 +1635,6 @@ async fn run_coordinator(
                     | TransportEvent::ChannelCreateFailed { cid } => {
                         channels.get(cid).and_then(|ch| ch.server_addr)
                     }
-                    TransportEvent::ReadResponse { ioid, .. }
-                    | TransportEvent::ReadError { ioid, .. } => read_waiters
-                        .get(ioid)
-                        .and_then(|(cid, _)| channels.get(cid))
-                        .and_then(|ch| ch.server_addr),
-                    TransportEvent::WriteResponse { ioid, .. } => write_waiters
-                        .get(ioid)
-                        .and_then(|(cid, _)| channels.get(cid))
-                        .and_then(|ch| ch.server_addr),
                     TransportEvent::MonitorData { subid, .. } => {
                         subscriptions.get(*subid).map(|rec| rec.server_addr)
                     }
@@ -1711,27 +1705,6 @@ async fn run_coordinator(
                             });
                         }
                     }
-                    TransportEvent::ReadResponse { ioid, data_type, count, data } => {
-                        if let Some((_, waiter)) = read_waiters.remove(&ioid) {
-                            let _ = waiter.send(Ok((data_type, count, data)));
-                        }
-                    }
-                    TransportEvent::ReadError { ioid, eca_status } => {
-                        if let Some((_, waiter)) = read_waiters.remove(&ioid) {
-                            let _ = waiter.send(Err(CaError::Protocol(
-                                format!("server returned ECA error {eca_status:#06x}")
-                            )));
-                        }
-                    }
-                    TransportEvent::WriteResponse { ioid, status } => {
-                        if let Some((_, waiter)) = write_waiters.remove(&ioid) {
-                            if status == 1 || status == ECA_NORMAL {
-                                let _ = waiter.send(Ok(()));
-                            } else {
-                                let _ = waiter.send(Err(CaError::WriteFailed(status)));
-                            }
-                        }
-                    }
                     TransportEvent::MonitorData { subid, data_type, count, data } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
@@ -1797,7 +1770,7 @@ async fn run_coordinator(
                         flow_control.remove(&server_addr);
                         last_rx_at.remove(&server_addr);
                         server_minor_version.remove(&server_addr);
-                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, server_addr, &diag, &mut read_waiters, &mut write_waiters);
+                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, server_addr, &diag, &in_flight);
                     }
                     TransportEvent::ServerDisconnect { cid, server_addr } => {
                         // Single channel disconnect (CA_PROTO_SERVER_DISCONN).
@@ -1831,11 +1804,7 @@ async fn run_coordinator(
                                 // Drain blocked read/write waiters for this cid.
                                 let mut affected = HashSet::with_capacity(1);
                                 affected.insert(cid);
-                                drain_waiters_for_cids(
-                                    &affected,
-                                    &mut read_waiters,
-                                    &mut write_waiters,
-                                );
+                                drain_waiters_for_cids(&affected, &in_flight);
 
                                 // Re-search
                                 let _ = search_tx.send(SearchRequest::Schedule {
@@ -1894,8 +1863,7 @@ fn handle_disconnect(
     search_tx: &mpsc::UnboundedSender<SearchRequest>,
     server_addr: SocketAddr,
     diag: &CaDiagnostics,
-    read_waiters: &mut HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)>,
-    write_waiters: &mut HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)>,
+    in_flight: &types::InFlightOps,
 ) {
     let mut affected_cids = Vec::new();
     let now = std::time::Instant::now();
@@ -1954,37 +1922,36 @@ fn handle_disconnect(
     // Fail pending read/write waiters for affected channels so callers
     // don't hang forever waiting for a response that will never arrive.
     let affected: HashSet<u32> = affected_cids.into_iter().collect();
-    drain_waiters_for_cids(&affected, read_waiters, write_waiters);
+    drain_waiters_for_cids(&affected, in_flight);
 }
 
-/// Drop every entry in `read_waiters` / `write_waiters` whose cid is in
+/// Drop every entry in the shared in-flight registry whose cid is in
 /// `cids` and signal each Sender with `Err(CaError::Disconnected)`. Used
 /// by both bulk-disconnect (TcpClosed → handle_disconnect) and the
 /// per-cid SERVER_DISCONN path so blocked `caget` / `caput` futures
 /// surface as disconnect errors instead of stalling on the caller's
-/// outer timeout.
-pub(crate) fn drain_waiters_for_cids(
-    cids: &HashSet<u32>,
-    read_waiters: &mut HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)>,
-    write_waiters: &mut HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)>,
-) {
-    let stale_reads: Vec<u32> = read_waiters
+/// outer timeout. Phase A: ops live in `InFlightOps` (DashMap), no
+/// longer in coordinator-local HashMaps.
+pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InFlightOps) {
+    let stale_reads: Vec<u32> = in_flight
+        .reads
         .iter()
-        .filter(|(_, (cid, _))| cids.contains(cid))
-        .map(|(ioid, _)| *ioid)
+        .filter(|entry| cids.contains(&entry.value().0))
+        .map(|entry| *entry.key())
         .collect();
     for ioid in stale_reads {
-        if let Some((_, sender)) = read_waiters.remove(&ioid) {
+        if let Some((_, (_, sender))) = in_flight.reads.remove(&ioid) {
             let _ = sender.send(Err(CaError::Disconnected));
         }
     }
-    let stale_writes: Vec<u32> = write_waiters
+    let stale_writes: Vec<u32> = in_flight
+        .writes
         .iter()
-        .filter(|(_, (cid, _))| cids.contains(cid))
-        .map(|(ioid, _)| *ioid)
+        .filter(|entry| cids.contains(&entry.value().0))
+        .map(|entry| *entry.key())
         .collect();
     for ioid in stale_writes {
-        if let Some((_, sender)) = write_waiters.remove(&ioid) {
+        if let Some((_, (_, sender))) = in_flight.writes.remove(&ioid) {
             let _ = sender.send(Err(CaError::Disconnected));
         }
     }
@@ -2420,9 +2387,7 @@ mod waiter_drain_tests {
     /// instead of stalling on its outer timeout.
     #[tokio::test(flavor = "current_thread")]
     async fn drain_wakes_matching_cid_only() {
-        let mut read_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)> =
-            HashMap::new();
-        let mut write_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)> = HashMap::new();
+        let in_flight = types::InFlightOps::new();
 
         // ioid 1001 / 1002 belong to cid=42 (will be disconnected).
         // ioid 2001 / 2002 belong to cid=99 (must survive).
@@ -2430,49 +2395,45 @@ mod waiter_drain_tests {
         let (rtx_99, rrx_99) = oneshot::channel();
         let (wtx_42, wrx_42) = oneshot::channel();
         let (wtx_99, wrx_99) = oneshot::channel();
-        read_waiters.insert(1001, (42, rtx_42));
-        read_waiters.insert(2001, (99, rtx_99));
-        write_waiters.insert(1002, (42, wtx_42));
-        write_waiters.insert(2002, (99, wtx_99));
+        in_flight.reads.insert(1001, (42, rtx_42));
+        in_flight.reads.insert(2001, (99, rtx_99));
+        in_flight.writes.insert(1002, (42, wtx_42));
+        in_flight.writes.insert(2002, (99, wtx_99));
 
         let mut affected = HashSet::new();
         affected.insert(42u32);
-        drain_waiters_for_cids(&affected, &mut read_waiters, &mut write_waiters);
+        drain_waiters_for_cids(&affected, &in_flight);
 
         // cid=42 waiters: ioids removed from maps + Senders fired with Disconnected.
-        assert!(!read_waiters.contains_key(&1001));
-        assert!(!write_waiters.contains_key(&1002));
+        assert!(!in_flight.reads.contains_key(&1001));
+        assert!(!in_flight.writes.contains_key(&1002));
         assert!(matches!(rrx_42.await, Ok(Err(CaError::Disconnected))));
         assert!(matches!(wrx_42.await, Ok(Err(CaError::Disconnected))));
 
         // cid=99 waiters: untouched.
-        assert!(read_waiters.contains_key(&2001));
-        assert!(write_waiters.contains_key(&2002));
-        // Receivers still not resolved (drop the senders to unblock the test).
-        drop(read_waiters);
-        drop(write_waiters);
+        assert!(in_flight.reads.contains_key(&2001));
+        assert!(in_flight.writes.contains_key(&2002));
+        // Drop the registry to release Senders so the rx awaits don't hang.
+        drop(in_flight);
         assert!(rrx_99.await.is_err()); // sender dropped
         assert!(wrx_99.await.is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn drain_with_empty_cid_set_is_noop() {
-        let mut read_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>)> =
-            HashMap::new();
-        let mut write_waiters: HashMap<u32, (u32, oneshot::Sender<CaResult<()>>)> = HashMap::new();
+        let in_flight = types::InFlightOps::new();
         let (rtx, rrx) = oneshot::channel();
         let (wtx, wrx) = oneshot::channel();
-        read_waiters.insert(10, (1, rtx));
-        write_waiters.insert(20, (2, wtx));
+        in_flight.reads.insert(10, (1, rtx));
+        in_flight.writes.insert(20, (2, wtx));
 
         let affected: HashSet<u32> = HashSet::new();
-        drain_waiters_for_cids(&affected, &mut read_waiters, &mut write_waiters);
+        drain_waiters_for_cids(&affected, &in_flight);
 
-        assert!(read_waiters.contains_key(&10));
-        assert!(write_waiters.contains_key(&20));
-        // Drop maps to release Senders so the rx awaits don't hang in CI.
-        drop(read_waiters);
-        drop(write_waiters);
+        assert!(in_flight.reads.contains_key(&10));
+        assert!(in_flight.writes.contains_key(&20));
+        // Drop the registry so the rx awaits don't hang in CI.
+        drop(in_flight);
         assert!(rrx.await.is_err());
         assert!(wrx.await.is_err());
     }

@@ -18,6 +18,8 @@ tracing = "0.1"
 metrics = "0.23"
 async-trait = "0.1"
 futures-util = "0.3"
+dashmap = "6"
+parking_lot = "0.12"
 metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }

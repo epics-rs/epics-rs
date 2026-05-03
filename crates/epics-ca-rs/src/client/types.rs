@@ -1,6 +1,47 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use epics_base_rs::error::CaResult;
+use epics_base_rs::runtime::sync::oneshot;
 
 use crate::channel::AccessRights;
+
+// --- Direct in-flight op registries (Option C) ---
+
+/// Reply channel type for one-shot reads. Carries (data_type, count, payload).
+pub(crate) type ReadReplyTx = oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>;
+/// Reply channel type for one-shot writes (write-notify completion).
+pub(crate) type WriteReplyTx = oneshot::Sender<CaResult<()>>;
+
+/// Shared in-flight op registry. Channel handles insert reply oneshots
+/// here keyed by `ioid`; the per-server transport read loop removes
+/// and fulfils them on `ReadResponse` / `WriteResponse` arrival.
+///
+/// This replaces the previous design where every read/write went
+/// through the coordinator's `tokio::select!` loop twice (once on
+/// op submission to register the waiter, once on response to dispatch
+/// it). With ~25 µs of coordinator-iteration overhead on each touch,
+/// `bulk_caget(20)` showed ~1.8 ms wall time in benchmarks against a
+/// localhost IOC despite the 20 spawned tasks all "running in
+/// parallel". Routing reads/writes directly here removes both
+/// touches; the coordinator only sees the lifecycle path
+/// (`RegisterChannel`, search-found, TCP close, beacon anomaly).
+///
+/// The `cid` field stored alongside each reply lets the disconnect-
+/// cleanup path filter pending ops by channel when a server's
+/// virtual circuit dies (Phase D).
+#[derive(Clone, Default)]
+pub(crate) struct InFlightOps {
+    pub(crate) reads: Arc<DashMap<u32, (u32, ReadReplyTx)>>,
+    pub(crate) writes: Arc<DashMap<u32, (u32, WriteReplyTx)>>,
+}
+
+impl InFlightOps {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
 
 // --- Search Engine messages ---
 
@@ -135,20 +176,6 @@ pub(crate) enum TransportEvent {
         element_count: u32,
         access: AccessRights,
         server_addr: SocketAddr,
-    },
-    ReadResponse {
-        ioid: u32,
-        data_type: u16,
-        count: u32,
-        data: Vec<u8>,
-    },
-    ReadError {
-        ioid: u32,
-        eca_status: u32,
-    },
-    WriteResponse {
-        ioid: u32,
-        status: u32,
     },
     MonitorData {
         subid: u32,

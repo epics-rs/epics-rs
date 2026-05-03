@@ -55,9 +55,16 @@ struct ServerConnection {
     _write_task: tokio::task::JoinHandle<()>,
 }
 
+/// Per-task transport manager.
+///
+/// `in_flight` is the Option-C Phase-A shared in-flight read/write
+/// registry: each spawned per-server `read_loop` gets a clone so it
+/// can dispatch `READ_NOTIFY` / `WRITE_NOTIFY` responses straight to
+/// the originating caller's oneshot, without a coordinator hop.
 pub(crate) async fn run_transport_manager(
     mut command_rx: mpsc::UnboundedReceiver<TransportCommand>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
+    in_flight: super::types::InFlightOps,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<String>,
     // Per-server SNI / cert-verification overrides built from the
@@ -150,17 +157,20 @@ pub(crate) async fn run_transport_manager(
                         let tls_clone = tls.clone();
                         #[cfg(feature = "experimental-rust-tls")]
                         let sni = pick_sni(server_addr);
+                        let in_flight_clone = in_flight.clone();
                         pending_connects.spawn(async move {
                             #[cfg(feature = "experimental-rust-tls")]
                             let conn = connect_server(
                                 server_addr,
                                 event_tx_clone,
+                                in_flight_clone,
                                 tls_clone.as_ref(),
                                 sni.as_deref(),
                             )
                             .await;
                             #[cfg(not(feature = "experimental-rust-tls"))]
-                            let conn = connect_server(server_addr, event_tx_clone).await;
+                            let conn = connect_server(server_addr, event_tx_clone, in_flight_clone)
+                                .await;
                             (server_addr, conn)
                         });
                         // Queue this CreateChannel so its
@@ -424,6 +434,7 @@ fn send_frame(
 async fn connect_server(
     server_addr: SocketAddr,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
+    in_flight: super::types::InFlightOps,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<&ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<&str>,
 ) -> Option<ServerConnection> {
@@ -545,6 +556,7 @@ async fn connect_server(
             event_tx,
             write_tx.clone(),
             beacon_arrival_rx,
+            in_flight.clone(),
         ));
         (read_task, write_task)
     } else {
@@ -562,6 +574,7 @@ async fn connect_server(
             event_tx,
             write_tx.clone(),
             beacon_arrival_rx,
+            in_flight.clone(),
         ));
         (read_task, write_task)
     };
@@ -582,6 +595,7 @@ async fn connect_server(
             event_tx,
             write_tx.clone(),
             beacon_arrival_rx,
+            in_flight.clone(),
         ));
         (read_task, write_task)
     };
@@ -639,6 +653,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut beacon_arrival_rx: mpsc::UnboundedReceiver<bool>,
+    in_flight: super::types::InFlightOps,
 ) {
     // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used
     // both on idle expiry and on the first leg of an echo timeout.
@@ -849,26 +864,44 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     });
                 }
                 CA_PROTO_READ_NOTIFY => {
+                    // Direct dispatch to the in-flight read registry
+                    // (Option C Phase A) — bypasses the coordinator's
+                    // `tokio::select!` loop. The originating
+                    // `ch.get()` task is awaiting the oneshot we
+                    // resolve here.
+                    let ioid = hdr.available;
                     if hdr.cid == ECA_NORMAL {
                         let data = accumulated[data_start..data_start + actual_post].to_vec();
-                        let _ = event_tx.send(TransportEvent::ReadResponse {
-                            ioid: hdr.available,
-                            data_type: hdr.data_type,
-                            count: hdr.actual_count(),
-                            data,
-                        });
-                    } else {
-                        let _ = event_tx.send(TransportEvent::ReadError {
-                            ioid: hdr.available,
-                            eca_status: hdr.cid,
-                        });
+                        if let Some((_, (_, reply_tx))) = in_flight.reads.remove(&ioid) {
+                            let _ = reply_tx.send(Ok((
+                                hdr.data_type,
+                                hdr.actual_count(),
+                                data,
+                            )));
+                        }
+                    } else if let Some((_, (_, reply_tx))) = in_flight.reads.remove(&ioid) {
+                        let _ = reply_tx.send(Err(epics_base_rs::error::CaError::Protocol(
+                            format!("server returned ECA error {:#06x}", hdr.cid),
+                        )));
                     }
                 }
                 CA_PROTO_WRITE_NOTIFY => {
-                    let _ = event_tx.send(TransportEvent::WriteResponse {
-                        ioid: hdr.available,
-                        status: hdr.cid,
-                    });
+                    // Direct dispatch to the in-flight write registry
+                    // (Option C Phase A). Mirrors the read path: the
+                    // originating `ch.put()` task is awaiting the
+                    // oneshot we resolve here. `hdr.cid` carries the
+                    // ECA status — `1` (`ECA_NORMAL`) means success;
+                    // anything else is mapped to `CaError::WriteFailed`.
+                    let ioid = hdr.available;
+                    let status = hdr.cid;
+                    if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
+                        if status == 1 || status == ECA_NORMAL {
+                            let _ = reply_tx.send(Ok(()));
+                        } else {
+                            let _ = reply_tx
+                                .send(Err(epics_base_rs::error::CaError::WriteFailed(status)));
+                        }
+                    }
                 }
                 CA_PROTO_EVENT_ADD => {
                     let data = accumulated[data_start..data_start + actual_post].to_vec();
@@ -982,6 +1015,7 @@ mod read_loop_tests {
             event_tx,
             write_tx,
             beacon_rx,
+            crate::client::types::InFlightOps::new(),
         ));
         (server_end, event_rx, write_rx, beacon_tx, task)
     }

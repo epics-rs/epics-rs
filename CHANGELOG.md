@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.13.2 — 2026-05-03
+
+Single-fix patch for the multi-IOC-on-one-host workflow: starting a
+second PVA IOC while a first was already running used to panic the
+server task with `Os { code: 98, kind: AddrInUse }` from the
+hard-coded TCP port 5075 bind. CA path was unaffected (its server
+defaults to ephemeral TCP). UDP 5076 was already shareable across
+local PVA processes via SO_REUSEADDR + SO_REUSEPORT, and the
+v0.13.0 ORIGIN_TAG forwarding path already routes SEARCH between
+co-bound UDP responders — only the TCP single-bind was the
+remaining bottleneck.
+
+### epics-pva-rs
+
+- **fix**: `PvaServer::start` falls back to ephemeral (`tcp_port = 0`)
+  on `AddrInUse` / `PermissionDenied` if the requested port is
+  non-zero. Single retry, mirrors pvxs `serverconn.cpp:493-499`
+  (`bind_addr.setPort(0); fallback = false; continue;`). The
+  actually-bound port flows out via `bound_tcp_port` and is what
+  the UDP responder advertises in SEARCH_RESPONSE / beacons, so
+  clients still reach the second server. A `tracing::warn!` with
+  requested / bound / error fields is emitted on fallback so
+  operators can see when 5075 was contended.
+- **test**: 2 unit tests in `tcp_fallback_tests` —
+  port-blocked-by-pinned-listener triggers fallback (no panic,
+  different port returned, blocker still holds original);
+  requested-port-available happy path. Total `epics-pva-rs --lib`
+  is now 184 tests (up from 182).
+
 ## v0.13.1 — 2026-05-03
 
 CA client beacon-watchdog rewrite for libca parity. Eliminates a

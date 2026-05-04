@@ -606,7 +606,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (reader, writer) = tokio::io::split(stream);
-    let writer = Arc::new(Mutex::new(BufWriter::new(writer)));
+    // Bigger BufWriter so a 100-PV batched response burst (~3 KB) fits
+    // without auto-flushing mid-batch. The dispatch hot-path no longer
+    // calls `flush()` per message — `handle_client` flushes once per
+    // outer read iteration after the inner message-drain loop, which
+    // turns N small TCP writes into one. Default 8 KB was hit at ~330
+    // responses; 64 KB covers the common bulk_caget(100) case with
+    // headroom for follow-on monitor events queued in the same tick.
+    let writer = Arc::new(Mutex::new(BufWriter::with_capacity(64 * 1024, writer)));
     let mut state = ClientState::new(acf, tcp_port);
     #[cfg(feature = "cap-tokens")]
     {
@@ -753,8 +760,34 @@ where
             )
             .await
             {
-                Ok(res) => res?,
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // Regression defence: dispatch_message no longer
+                    // flushes per response (batched at the bottom of
+                    // this outer loop). On a propagated dispatch
+                    // error, exit-via-`?` would drop the BufWriter
+                    // before the outer flush fires, so any responses
+                    // queued by earlier successful handlers in this
+                    // batch — or by an error-path `send_cmd_error`
+                    // call inside the failing handler — would be
+                    // lost. Best-effort flush before propagating so
+                    // the client sees them; ignore errors here
+                    // because the underlying TCP is most likely
+                    // already broken (which is why dispatch failed).
+                    let _ = writer.lock().await.flush().await;
+                    return Err(e);
+                }
                 Err(_) => {
+                    // send_timeout fires — dispatch_message future is
+                    // cancelled mid-flight. BufWriter may hold a
+                    // partial frame (e.g., header without payload if
+                    // cancellation landed between the two write_alls
+                    // of a READ_NOTIFY response). Flushing here would
+                    // ship the orphan header to the client and leave
+                    // it parsing an incomplete frame, so we skip the
+                    // flush and let BufWriter drop discard the
+                    // partial bytes — same behaviour as before the
+                    // batch-flush refactor.
                     tracing::warn!(
                         peer = %peer,
                         "CA server: dispatch send-timeout (stuck client?), closing"
@@ -768,6 +801,20 @@ where
 
         if offset > 0 {
             accumulated.drain(..offset);
+            // Batched flush: dispatch_message buffered all responses for
+            // this read iteration into BufWriter without flushing. Flush
+            // once now so the kernel sees a single TCP write per inbound
+            // burst. Cuts e2e_bulk_get_many(100) from ~225µs → batched
+            // single write (server-side throughput floor was ~2.2µs/PV
+            // due to per-message flush; this collapses it to one syscall).
+            //
+            // Errors here mean the TCP write stalled / peer closed —
+            // surface as the read loop's normal disconnect path.
+            let mut w = writer.lock().await;
+            if let Err(e) = w.flush().await {
+                return Err(e.into());
+            }
+            drop(w);
         }
     }
 
@@ -832,7 +879,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             resp.cid = 1;
             let mut w = writer.lock().await;
             w.write_all(&resp.to_bytes()).await?;
-            w.flush().await?;
+            // flush deferred to handle_client outer loop (batched)
         }
 
         CA_PROTO_HOST_NAME => {
@@ -953,7 +1000,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 fail.cid = hdr.cid;
                 let mut w = writer.lock().await;
                 w.write_all(&fail.to_bytes()).await?;
-                w.flush().await?;
+                // flush deferred to handle_client outer loop (batched)
                 return Ok(());
             }
 
@@ -1016,7 +1063,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 fail.cid = client_cid;
                                 let mut w = writer.lock().await;
                                 w.write_all(&fail.to_bytes()).await?;
-                                w.flush().await?;
+                                // flush deferred to handle_client outer loop (batched)
                                 return Ok(());
                             }
                         }
@@ -1053,7 +1100,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 let mut w = writer.lock().await;
                 w.write_all(&ar.to_bytes()).await?;
                 w.write_all(&resp.to_bytes_extended()).await?;
-                w.flush().await?;
+                // flush deferred to handle_client outer loop (batched)
                 drop(w);
 
                 let result = match access_level {
@@ -1080,7 +1127,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 fail.cid = client_cid;
                 let mut w = writer.lock().await;
                 w.write_all(&fail.to_bytes()).await?;
-                w.flush().await?;
+                // flush deferred to handle_client outer loop (batched)
                 drop(w);
 
                 state.audit("create_chan", &pv_name, "", "not_found").await;
@@ -1184,7 +1231,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let mut w = writer.lock().await;
             w.write_all(&resp.to_bytes_extended()).await?;
             w.write_all(&padded).await?;
-            w.flush().await?;
+            // flush deferred to handle_client outer loop (batched)
         }
 
         CA_PROTO_WRITE | CA_PROTO_WRITE_NOTIFY => {
@@ -1252,7 +1299,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     resp.available = ioid;
                     let mut w = writer.lock().await;
                     w.write_all(&resp.to_bytes()).await?;
-                    w.flush().await?;
+                    // flush deferred to handle_client outer loop (batched)
                 }
                 return Ok(());
             }
@@ -1315,7 +1362,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     resp.available = ioid;
                     let mut w = writer.lock().await;
                     w.write_all(&resp.to_bytes()).await?;
-                    w.flush().await?;
+                    // flush deferred to handle_client outer loop (batched)
                 }
                 state.audit("caput", &audit_pv, "", "denied").await;
                 return Ok(());
@@ -1430,7 +1477,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
 
                     let mut w = writer.lock().await;
                     w.write_all(&resp.to_bytes()).await?;
-                    w.flush().await?;
+                    // flush deferred to handle_client outer loop (batched)
                 }
             }
         }
@@ -1694,7 +1741,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 resp.available = sub_id;
                 let mut w = writer.lock().await;
                 w.write_all(&resp.to_bytes()).await?;
-                w.flush().await?;
+                // flush deferred to handle_client outer loop (batched)
             }
         }
 
@@ -1708,15 +1755,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
 
         CA_PROTO_READ_SYNC => {
             // READ_SYNC is a barrier/flush for previously queued responses.
-            let mut w = writer.lock().await;
-            w.flush().await?;
+            // No-op here: handle_client's outer-loop flush always fires
+            // after the inner message-drain at offset > 0, so any
+            // responses buffered before this READ_SYNC will be flushed
+            // at the same point as if we had flushed inline.
         }
 
         CA_PROTO_ECHO => {
             let resp = CaHeader::new(CA_PROTO_ECHO);
             let mut w = writer.lock().await;
             w.write_all(&resp.to_bytes()).await?;
-            w.flush().await?;
+            // flush deferred to handle_client outer loop (batched)
         }
 
         CA_PROTO_SEARCH => {
@@ -1745,7 +1794,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 let mut w = writer.lock().await;
                 w.write_all(&resp.to_bytes_extended()).await?;
                 w.write_all(&search_payload).await?;
-                w.flush().await?;
+                // flush deferred to handle_client outer loop (batched)
             } else if hdr.data_type == CA_DO_REPLY {
                 // Explicit negative reply requested — send NOT_FOUND so the
                 // client doesn't have to wait for a search timeout.
@@ -1756,7 +1805,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 nf.available = hdr.available;
                 let mut w = writer.lock().await;
                 w.write_all(&nf.to_bytes()).await?;
-                w.flush().await?;
+                // flush deferred to handle_client outer loop (batched)
             }
             // Otherwise silent — clients without CA_DO_REPLY treat absence
             // as "this server doesn't have it" and move on.
@@ -1804,7 +1853,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 resp.available = cid;
                 let mut w = writer.lock().await;
                 w.write_all(&resp.to_bytes()).await?;
-                w.flush().await?;
+                // flush deferred to handle_client outer loop (batched)
             }
         }
 
@@ -1903,7 +1952,7 @@ async fn send_cmd_error<W: AsyncWrite + Unpin + Send + 'static>(
     resp.available = ioid_or_subid;
     let mut w = writer.lock().await;
     w.write_all(&resp.to_bytes()).await?;
-    w.flush().await?;
+    // flush deferred to handle_client outer loop (batched)
     Ok(())
 }
 
@@ -1925,6 +1974,6 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     w.write_all(&resp.to_bytes_extended()).await?;
     w.write_all(&original_hdr.to_bytes()).await?;
     w.write_all(&error_msg_bytes).await?;
-    w.flush().await?;
+    // flush deferred to handle_client outer loop (batched)
     Ok(())
 }

@@ -194,6 +194,52 @@ fn bench_bulk_get_many(c: &mut Criterion) {
     });
 }
 
+/// Bulk-read scaling bench: same in-process softIoc, vary N over
+/// {10, 20, 50, 100} to expose super-linear scaling on the server's
+/// response path. Measures the same `get_many` route as
+/// `bench_bulk_get_many` so the only difference is N.
+fn bench_bulk_get_many_scaling(c: &mut Criterion) {
+    let rt = make_runtime();
+    let port = unused_local_port();
+    point_addr_list_at(port);
+    let _server = rt.block_on(boot_softioc(100, port));
+    let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
+
+    let channels = rt.block_on(async {
+        let mut channels = Vec::with_capacity(100);
+        for i in 0..100 {
+            channels.push(client.create_channel(&format!("BENCH:PV:{i}")));
+        }
+        let connected = futures_util::future::join_all(
+            channels
+                .iter()
+                .map(|ch| ch.wait_connected(Duration::from_secs(3))),
+        )
+        .await;
+        for result in connected {
+            result.expect("channel connected");
+        }
+        channels
+    });
+
+    let mut group = c.benchmark_group("e2e_bulk_get_many_scaling");
+    for &n in &[10usize, 20, 50, 100] {
+        let subset: Vec<_> = channels.iter().take(n).cloned().collect();
+        group.bench_function(format!("{n:03}pvs"), |b| {
+            let client = client.clone();
+            let subset = subset.clone();
+            b.to_async(&rt).iter(|| {
+                let client = client.clone();
+                let subset = subset.clone();
+                async move {
+                    let _ = client.get_many(&subset).await;
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 /// Bulk reads by PV name. First warm call populates CaClient's
 /// one-shot channel cache; timed iterations should then take the same
 /// hot batched-read path as `get_many`.
@@ -256,6 +302,6 @@ criterion_group! {
         .sample_size(20)
         .measurement_time(Duration::from_secs(8))
         .warm_up_time(Duration::from_secs(2));
-    targets = bench_caget, bench_bulk_caget, bench_bulk_get_many, bench_bulk_caget_many, bench_caput
+    targets = bench_caget, bench_bulk_caget, bench_bulk_get_many, bench_bulk_get_many_scaling, bench_bulk_caget_many, bench_caput
 }
 criterion_main!(e2e);

@@ -1341,7 +1341,11 @@ impl CaChannel {
 
         let deadline = tokio::time::Instant::now() + timeout;
         for p in pending {
-            let Pending { index, reply_rx, kind } = p;
+            let Pending {
+                index,
+                reply_rx,
+                kind,
+            } = p;
             let result = tokio::time::timeout_at(deadline, reply_rx).await;
             let decoded: CaResult<(DbFieldType, EpicsValue)> = match result {
                 Ok(Ok(Ok(reply))) => Self::decode_plain_read_reply(reply),
@@ -1349,10 +1353,7 @@ impl CaChannel {
                 Ok(Err(_)) => Err(CaError::Shutdown),
                 Err(_) => Err(CaError::Timeout),
             };
-            let is_local_error = matches!(
-                decoded,
-                Err(CaError::Timeout) | Err(CaError::Shutdown)
-            );
+            let is_local_error = matches!(decoded, Err(CaError::Timeout) | Err(CaError::Shutdown));
 
             match kind {
                 PendingKind::Cold {
@@ -1378,8 +1379,7 @@ impl CaChannel {
                         // of any concurrent install race drops its
                         // entry to avoid a leaked DashMap row.
                         let warm_ioid = alloc_ioid();
-                        let slot: types::WarmReplySlot =
-                            Arc::new(parking_lot::Mutex::new(None));
+                        let slot: types::WarmReplySlot = Arc::new(parking_lot::Mutex::new(None));
                         in_flight.reads.insert(
                             warm_ioid,
                             ReadWaiter::Warm {

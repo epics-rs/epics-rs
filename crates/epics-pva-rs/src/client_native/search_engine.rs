@@ -821,7 +821,7 @@ async fn run_engine(
             },
 
             res = search_socket.recv_from(&mut search_buf) => {
-                if let Ok((n, _from)) = res {
+                if let Ok((n, peer)) = res {
                     // Multi-message drain (P-G10): pvxs packs many
                     // SEARCH messages per UDP datagram. Without the
                     // loop we'd parse only the first and silently
@@ -830,7 +830,7 @@ async fn run_engine(
                     while pos < n {
                         let consumed = handle_search_response(
                             &search_buf[pos..n],
-                            &mut pending, &mut by_name, &beacons, &ignore_guids,
+                            &mut pending, &mut by_name, &beacons, &ignore_guids, peer,
                         );
                         if consumed == 0 {
                             break;
@@ -1181,6 +1181,7 @@ fn handle_search_response(
     by_name: &mut HashMap<String, u32>,
     _beacons: &Arc<BeaconTracker>,
     ignore_guids: &std::collections::HashSet<[u8; 12]>,
+    peer: SocketAddr,
 ) -> usize {
     let Ok(Some((frame, consumed))) = try_parse_frame(bytes) else {
         return 0;
@@ -1197,7 +1198,7 @@ fn handle_search_response(
         return consumed;
     }
     for cid in resp.cids {
-        let server = rewrite_loopback(resp.server_addr);
+        let server = rewrite_loopback(resp.server_addr, peer);
         let Some(entry) = pending.get_mut(&cid) else {
             continue;
         };
@@ -1319,9 +1320,12 @@ fn handle_beacon(
     consumed
 }
 
-fn rewrite_loopback(addr: SocketAddr) -> SocketAddr {
-    if addr.ip().is_unspecified() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+fn rewrite_loopback(addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() || addr.ip().is_loopback() {
+        if !peer.ip().is_loopback() {
+            return SocketAddr::new(peer.ip(), addr.port());
+        }
+        return SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
     } else {
         addr
     }
@@ -1346,13 +1350,15 @@ mod tests {
     #[test]
     fn rewrite_loopback_preserves_real_addr() {
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 5075);
-        assert_eq!(rewrite_loopback(a), a);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5076);
+        assert_eq!(rewrite_loopback(a, peer), a);
     }
 
     #[test]
     fn rewrite_loopback_replaces_unspecified() {
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5075);
-        let r = rewrite_loopback(a);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5076);
+        let r = rewrite_loopback(a, peer);
         assert_eq!(r.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 

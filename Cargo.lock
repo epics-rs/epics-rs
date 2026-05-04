@@ -1979,6 +1979,7 @@ dependencies = [
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
+ "epics-pva-rs",
  "libm",
  "motor-rs",
  "optics-rs",

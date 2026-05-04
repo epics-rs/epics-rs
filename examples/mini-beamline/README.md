@@ -109,6 +109,13 @@ Eight full MotorRecords using `SimMotor` from `motor-rs`:
 |----|------|-------------|
 | `mini:current` | ai | Beam current (mA, I/O Intr) |
 
+### Random Waveform Benchmark PVs
+
+| PV | Type | Description |
+|----|------|-------------|
+| `mini:wf1` ... `mini:wf10` | waveform | 10000-element DOUBLE arrays for bulk-transfer benchmarks |
+| `mini:wf:bundle` | native PVA structure | Aggregate PVA PV containing `wf1` ... `wf10` as `double[]` fields |
+
 ### Point Detectors
 
 For each `R` = `ph:`, `edge:`, `slit:`:

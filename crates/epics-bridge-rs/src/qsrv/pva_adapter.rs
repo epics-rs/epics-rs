@@ -15,12 +15,12 @@ use epics_pva_rs::pvdata::{PvField, PvStructure};
 
 use super::provider::{AnyChannel, BridgeProvider, Channel, ChannelProvider, PvaMonitor};
 
-/// Handle for a PVA plugin PV: latest snapshot + subscriber list.
+/// Handle for a native PVA PV: latest snapshot + subscriber list.
 ///
-/// Registered via [`QsrvPvStore::register_pva_pv`] so that the native PVA
-/// server can serve NTNDArray (or any structure-shaped value) produced by
-/// areaDetector PVA plugins. Snapshots and notifications use native
-/// [`PvField`] values; no spvirit dependency.
+/// Registered via [`QsrvPvStore::register_pva_pv`] so the native PVA
+/// server can serve structure-shaped values produced directly by IOC code
+/// (for example NTNDArray or aggregate benchmark PVs). Snapshots and
+/// notifications use native [`PvField`] values; no spvirit dependency.
 #[derive(Clone)]
 pub struct PvaPvHandle {
     pub latest: Arc<parking_lot::Mutex<Option<PvField>>>,
@@ -28,7 +28,7 @@ pub struct PvaPvHandle {
 }
 
 // ---------------------------------------------------------------------------
-// Global PVA PV registry — NDPvaConfigure stores handles here during st.cmd,
+// Global PVA PV registry — IOC code stores handles here during startup,
 // the CA+PVA runner reads them at server startup.
 // ---------------------------------------------------------------------------
 
@@ -36,7 +36,7 @@ static PVA_PV_REGISTRY: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, PvaPvHandle>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Register a PVA plugin PV. Called from `NDPvaConfigure` during st.cmd.
+/// Register a native PVA PV before the CA+PVA runner starts.
 pub fn register_pva_pv_global(pv_name: &str, handle: PvaPvHandle) {
     PVA_PV_REGISTRY
         .lock()
@@ -44,7 +44,7 @@ pub fn register_pva_pv_global(pv_name: &str, handle: PvaPvHandle) {
         .insert(pv_name.to_string(), handle);
 }
 
-/// Take all registered PVA plugin PVs. Called by [`run_ca_pva_qsrv_ioc`]
+/// Take all registered native PVA PVs. Called by [`run_ca_pva_qsrv_ioc`]
 /// to wire them into `QsrvPvStore`.
 pub fn take_registered_pva_pvs() -> std::collections::HashMap<String, PvaPvHandle> {
     std::mem::take(&mut *PVA_PV_REGISTRY.lock().unwrap())
@@ -52,14 +52,14 @@ pub fn take_registered_pva_pvs() -> std::collections::HashMap<String, PvaPvHandl
 
 /// PvStore implementation backed by a qsrv [`BridgeProvider`].
 ///
-/// Handles single-record PVs, group composite PVs, and PVA plugin PVs
+/// Handles single-record PVs, group composite PVs, and native PVA PVs
 /// (NTNDArray from areaDetector). Group PVs ride on the
 /// `NtPayload::Generic` variant with a recursive `PvValue` tree.
 pub struct QsrvPvStore {
     provider: Arc<BridgeProvider>,
     /// Per-PV cache of opened channels.
     channels: RwLock<HashMap<String, Arc<AnyChannel>>>,
-    /// PVA plugin PVs (e.g., NTNDArray from NDPluginPva).
+    /// Native PVA PVs (e.g., NTNDArray from NDPluginPva).
     pva_pvs: Arc<RwLock<HashMap<String, PvaPvHandle>>>,
 }
 
@@ -76,7 +76,7 @@ impl QsrvPvStore {
         &self.provider
     }
 
-    /// Register a PVA plugin PV (e.g., NTNDArray from NDPluginPva).
+    /// Register a native PVA PV (e.g., NTNDArray from NDPluginPva).
     ///
     /// After registration, the PV is discoverable via `has_pv`, readable
     /// via `get_snapshot`, and subscribable via `subscribe`.
@@ -151,7 +151,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let name_owned = name.to_string();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            // Plugin-registered PVA PVs (NTNDArray etc.) live only in
+            // Native-registered PVA PVs (NTNDArray etc.) live only in
             // pva_pvs — the BridgeProvider has no record for them, so
             // self.channel() would return None and the descriptor
             // would be lost. Probe the PVA registry first.
@@ -231,7 +231,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let name_owned = name.to_string();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            // Plugin-registered PVA PVs publish into their own
+            // Native-registered PVA PVs publish into their own
             // subscriber list maintained by the registering plugin
             // (NDPluginPva); the QSRV side just appends a tx so the
             // plugin's `post()` fans out into the PVA server.
@@ -274,7 +274,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
 ///
 /// Designed as a protocol runner for [`IocApplication::run`]. Starts a CA
 /// server in the background, creates a `QsrvPvStore` wrapping the database,
-/// registers any PVA plugin PVs (NTNDArray from NDPluginPva), then runs the
+/// registers any native PVA PVs (NTNDArray from NDPluginPva), then runs the
 /// PVA server with an interactive iocsh shell.
 ///
 /// # Example
@@ -300,11 +300,11 @@ pub async fn run_ca_pva_qsrv_ioc(
     let provider = Arc::new(BridgeProvider::new(db.clone()));
     let store = Arc::new(QsrvPvStore::new(provider));
 
-    // Register PVA plugin PVs (NTNDArray from NDPvaConfigure).
+    // Register native PVA PVs (NTNDArray from NDPvaConfigure, etc.).
     // Handles were stored in the global registry during st.cmd execution.
     let pva_pvs = take_registered_pva_pvs();
     for (pv_name, handle) in pva_pvs {
-        eprintln!("QSRV: registering PVA PV: {pv_name}");
+        eprintln!("PVA: registering native PV: {pv_name}");
         store
             .register_pva_pv(&pv_name, handle.latest, handle.subscribers)
             .await;

@@ -58,6 +58,19 @@ dbLoadRecords("$(OPTICS)/db/kohzuSeq.db", "P=$(PREFIX),M_THETA=dcm:theta,M_Y=dcm
 # Load beam current
 dbLoadRecords("$(MINI_BEAMLINE)/db/beam_current.template", "P=$(PREFIX)")
 
+# Random-waveform PVs for bulk-transfer benchmarks
+# (mini:wf1..mini:wf10, each a 10000-element f64 waveform)
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=1,NELM=10000")
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=2,NELM=10000")
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=3,NELM=10000")
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=4,NELM=10000")
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=5,NELM=10000")
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=6,NELM=10000")
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=7,NELM=10000")
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=8,NELM=10000")
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=9,NELM=10000")
+dbLoadRecords("$(MINI_BEAMLINE)/db/random_waveform.template", "P=$(PREFIX)wf,N=10,NELM=10000")
+
 # Load point detectors
 dbLoadRecords("$(MINI_BEAMLINE)/db/point_detector.template", "P=$(PREFIX),R=ph:,MTR=ph:mtr,PORT=PD_PH")
 dbLoadRecords("$(MINI_BEAMLINE)/db/point_detector.template", "P=$(PREFIX),R=edge:,MTR=edge:mtr,PORT=PD_EDGE")

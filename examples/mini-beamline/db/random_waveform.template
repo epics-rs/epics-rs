@@ -1,0 +1,15 @@
+# 10000-element double waveform for bulk-transfer benchmarks.
+# Populated once at IOC init with deterministic random data; static
+# thereafter (the bench measures wire/decode cost, not update rate).
+#
+# Macros:
+#   P    record prefix (e.g. "mini:wf")
+#   N    record suffix (e.g. "1" → "mini:wf1")
+#   NELM array length (default 10000)
+record(waveform, "$(P)$(N)") {
+    field(DTYP, "miniRandomWaveform")
+    field(NELM, "$(NELM=10000)")
+    field(FTVL, "DOUBLE")
+    field(SCAN, "Passive")
+    field(PINI, "YES")
+}

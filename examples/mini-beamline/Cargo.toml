@@ -6,7 +6,7 @@ description = "Mini beamline IOC: beam current, point detectors, and moving dot 
 publish = false
 
 [features]
-ioc = ["dep:epics-base-rs", "dep:epics-ca-rs", "dep:epics-bridge-rs", "dep:ad-plugins-rs", "ad-plugins-rs/ioc", "ad-plugins-rs/pva", "ad-core-rs/ioc", "asyn-rs/epics", "dep:motor-rs", "dep:optics-rs"]
+ioc = ["dep:epics-base-rs", "dep:epics-ca-rs", "dep:epics-pva-rs", "dep:epics-bridge-rs", "dep:ad-plugins-rs", "ad-plugins-rs/ioc", "ad-plugins-rs/pva", "ad-core-rs/ioc", "asyn-rs/epics", "dep:motor-rs", "dep:optics-rs"]
 
 [dependencies]
 ad-core-rs = { workspace = true }
@@ -19,6 +19,7 @@ parking_lot = "0.12"
 libm = "0.2"
 epics-base-rs = { workspace = true, optional = true }
 epics-ca-rs = { workspace = true, optional = true }
+epics-pva-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, optional = true }
 
 [[bin]]

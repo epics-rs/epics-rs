@@ -31,6 +31,7 @@ use mini_beamline::beam_current::{self, BeamCurrentValue};
 use mini_beamline::moving_dot::driver::{MovingDotRuntime, create_moving_dot_with_config};
 use mini_beamline::physics::{BeamCurrentConfig, DetectorMode, MovingDotImageConfig};
 use mini_beamline::point_detector::{self, PointDetectorRuntime};
+use mini_beamline::random_waveform::ioc_support::RandomWaveformFactory;
 
 // ============================================================================
 // Environment helpers
@@ -305,6 +306,19 @@ async fn main() -> CaResult<()> {
                 .expect("miniBeamlineConfig must be called before iocInit");
             Box::new(BeamCurrentDeviceSupport::new(h.beam_value.clone(), rx))
         });
+    }
+
+    // ========================================================================
+    // Random-waveform device support (for bulk-transfer benchmarks).
+    //
+    // The individual waveform records and `mini:wf:bundle` share the
+    // same pre-generated arrays. Records select data by their trailing
+    // index (`mini:wf1` -> `wf1`) so the bundle and per-record PVs match.
+    // ========================================================================
+    {
+        let factory = Arc::new(RandomWaveformFactory::new_with_count(10_000, 10));
+        factory.register_pva_bundle("mini:wf:bundle", "wf");
+        app = app.register_device_support("miniRandomWaveform", move || factory.make());
     }
     // PointDetector and MovingDot records now use standard asyn DTYPs
     // (asynFloat64, asynInt32) with @asyn(PORT,...) links. The universal

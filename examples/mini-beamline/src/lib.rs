@@ -9,3 +9,4 @@ pub mod beam_current;
 pub mod moving_dot;
 pub mod physics;
 pub mod point_detector;
+pub mod random_waveform;

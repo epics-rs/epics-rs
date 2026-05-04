@@ -341,7 +341,7 @@ async fn try_warm_get(
     let (tx, rx) = tokio::sync::oneshot::channel();
     *warm.slot.lock() = Some(tx);
     let frame = codec.build_get(warm.sid, warm.ioid);
-    if let Err(_) = server.send_sync(frame) {
+    if server.send_sync(frame).is_err() {
         warm.slot.lock().take();
         return Err(PvaError::Protocol("warm GET send failed".into()));
     }

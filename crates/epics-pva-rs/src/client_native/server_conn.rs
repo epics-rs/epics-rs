@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -31,7 +32,6 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
-use dashmap::DashMap;
 
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
@@ -223,7 +223,8 @@ impl ServerConn {
         let last_rx_nanos = Arc::new(AtomicU64::new(now_nanos()));
         let by_ioid: Arc<DashMap<u32, IoidSlot>> = Arc::new(DashMap::new());
         let by_cid: Arc<DashMap<u32, oneshot::Sender<Frame>>> = Arc::new(DashMap::new());
-        let by_sid_close: Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>> = Arc::new(DashMap::new());
+        let by_sid_close: Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>> =
+            Arc::new(DashMap::new());
         let ioid_to_sid: Arc<DashMap<u32, u32>> = Arc::new(DashMap::new());
 
         // Writer task
@@ -751,7 +752,11 @@ fn route_frame(
             if let Some((_, (flag, notify))) = by_sid_close.remove(&sid) {
                 flag.store(true, Ordering::Relaxed);
                 notify.notify_waiters();
-                tracing::warn!(sid, dropped_ioids, "server destroyed channel — triggering re-search");
+                tracing::warn!(
+                    sid,
+                    dropped_ioids,
+                    "server destroyed channel — triggering re-search"
+                );
             } else {
                 tracing::debug!(sid, "server destroyed unknown channel (already torn down?)");
             }
@@ -1068,8 +1073,14 @@ mod tests {
             ByteOrder::Little,
         );
 
-        assert!(rx_a.try_recv().is_err(), "ioid 1001 stream should be closed");
-        assert!(rx_b.try_recv().is_err(), "ioid 1002 stream should be closed");
+        assert!(
+            rx_a.try_recv().is_err(),
+            "ioid 1001 stream should be closed"
+        );
+        assert!(
+            rx_b.try_recv().is_err(),
+            "ioid 1002 stream should be closed"
+        );
         assert!(matches!(
             rx_c.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)

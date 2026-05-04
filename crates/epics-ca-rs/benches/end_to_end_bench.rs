@@ -83,7 +83,7 @@ fn bench_caget(c: &mut Criterion) {
     let rt = make_runtime();
     let port = unused_local_port();
     point_addr_list_at(port);
-    let _server = rt.block_on(async { boot_softioc(8, port).await });
+    let _server = rt.block_on(boot_softioc(8, port));
     let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
 
     // Warm up — establish channels before timing.
@@ -116,7 +116,7 @@ fn bench_bulk_caget(c: &mut Criterion) {
     let rt = make_runtime();
     let port = unused_local_port();
     point_addr_list_at(port);
-    let _server = rt.block_on(async { boot_softioc(20, port).await });
+    let _server = rt.block_on(boot_softioc(20, port));
     let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
 
     // Warm up — establish channels before timing so we measure the
@@ -161,7 +161,7 @@ fn bench_bulk_get_many(c: &mut Criterion) {
     let rt = make_runtime();
     let port = unused_local_port();
     point_addr_list_at(port);
-    let _server = rt.block_on(async { boot_softioc(100, port).await });
+    let _server = rt.block_on(boot_softioc(100, port));
     let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
 
     let channels = rt.block_on(async {
@@ -198,7 +198,7 @@ fn bench_caput(c: &mut Criterion) {
     let rt = make_runtime();
     let port = unused_local_port();
     point_addr_list_at(port);
-    let _server = rt.block_on(async { boot_softioc(1, port).await });
+    let _server = rt.block_on(boot_softioc(1, port));
     let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
     rt.block_on(async {
         let _ = client.caput("BENCH:PV:0", "1.0").await;

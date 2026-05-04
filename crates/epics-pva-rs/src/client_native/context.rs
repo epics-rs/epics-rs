@@ -971,9 +971,7 @@ impl PvaClient {
     /// ```
     pub async fn pvget_many(&self, pv_names: &[&str]) -> Vec<PvaResult<PvField>> {
         let n = pv_names.len();
-        let mut results: Vec<PvaResult<PvField>> = (0..n)
-            .map(|_| Err(PvaError::Timeout))
-            .collect();
+        let mut results: Vec<PvaResult<PvField>> = (0..n).map(|_| Err(PvaError::Timeout)).collect();
 
         // Phase 1: ensure each channel has a warm-GET cache populated.
         // The first call per channel pays the full INIT+GET cost
@@ -1051,12 +1049,17 @@ impl PvaClient {
             *warm.slot.lock() = Some(tx);
             let frame = codec.build_get(warm.sid, warm.ioid);
 
-            by_server.entry(server.addr).or_default().push(warm_reqs.len());
+            by_server
+                .entry(server.addr)
+                .or_default()
+                .push(warm_reqs.len());
             combined_frames
                 .entry(server.addr)
                 .or_default()
                 .extend_from_slice(&frame);
-            server_handles.entry(server.addr).or_insert_with(|| server.clone());
+            server_handles
+                .entry(server.addr)
+                .or_insert_with(|| server.clone());
             let intro = warm.intro.clone();
             warm_reqs.push(WarmReq {
                 idx,
@@ -1087,8 +1090,7 @@ impl PvaClient {
                     req.warm.slot.lock().take();
                     // Replace with a closed-error placeholder; we'll
                     // skip the await for these.
-                    results[req.idx] =
-                        Err(PvaError::Protocol("server send failed".into()));
+                    results[req.idx] = Err(PvaError::Protocol("server send failed".into()));
                 }
             }
         }
@@ -1110,7 +1112,7 @@ impl PvaClient {
                 intro,
             } = req;
             // Skip await if Phase 2 already marked this server failed.
-            if matches!(&results[idx], Err(_)) {
+            if results[idx].is_err() {
                 *channel.cached_get.lock() = Some(warm);
                 continue;
             }
@@ -1118,13 +1120,12 @@ impl PvaClient {
             let value = match frame_res {
                 Ok(Ok(frame)) => match super::decode::decode_op_response(&frame, Some(&intro)) {
                     Ok(OpResponse::Data(d)) if d.status.is_success() => Ok(d.value),
-                    Ok(OpResponse::Data(d)) => Err(PvaError::Protocol(format!(
-                        "warm GET data: {:?}",
-                        d.status
-                    ))),
-                    Ok(other) => {
-                        Err(PvaError::Protocol(format!("expected GET data, got {other:?}")))
+                    Ok(OpResponse::Data(d)) => {
+                        Err(PvaError::Protocol(format!("warm GET data: {:?}", d.status)))
                     }
+                    Ok(other) => Err(PvaError::Protocol(format!(
+                        "expected GET data, got {other:?}"
+                    ))),
                     Err(e) => Err(e),
                 },
                 Ok(Err(_)) => Err(PvaError::Protocol("warm GET channel closed".into())),
@@ -1148,9 +1149,8 @@ impl PvaClient {
             let name = name.to_string();
             set.spawn(async move { (idx, client.pvget_full(&name).await) });
         }
-        let mut results: Vec<PvaResult<PvGetResult>> = (0..n)
-            .map(|_| Err(PvaError::Timeout))
-            .collect();
+        let mut results: Vec<PvaResult<PvGetResult>> =
+            (0..n).map(|_| Err(PvaError::Timeout)).collect();
         while let Some(join_result) = set.join_next().await {
             if let Ok((idx, pva_result)) = join_result {
                 results[idx] = pva_result;

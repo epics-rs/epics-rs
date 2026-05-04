@@ -696,7 +696,7 @@ impl CaClient {
 
         results
             .into_iter()
-            .map(|r| r.unwrap_or_else(|| Err(CaError::Shutdown)))
+            .map(|r| r.unwrap_or(Err(CaError::Shutdown)))
             .collect()
     }
 
@@ -1117,7 +1117,7 @@ impl CaChannel {
 
         results
             .into_iter()
-            .map(|r| r.unwrap_or_else(|| Err(CaError::Shutdown)))
+            .map(|r| r.unwrap_or(Err(CaError::Shutdown)))
             .collect()
     }
 
@@ -1475,6 +1475,7 @@ fn flow_control_note_consumed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_coordinator(
     mut coord_rx: mpsc::UnboundedReceiver<CoordRequest>,
     mut search_rx: mpsc::UnboundedReceiver<SearchResponse>,

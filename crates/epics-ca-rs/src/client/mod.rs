@@ -11,12 +11,13 @@ pub use sync_group::{SyncGroup, SyncGroupResults};
 
 pub use circuit_breaker::{BreakerConfig, BreakerState};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use std::time::Duration;
 
 use epics_base_rs::runtime::sync::{broadcast, mpsc, oneshot};
+use parking_lot::Mutex;
 
 use crate::channel::{AccessRights, ChannelInfo, alloc_cid, alloc_ioid, alloc_subid};
 use crate::protocol::*;
@@ -86,6 +87,34 @@ pub struct DiagRecord {
 }
 
 const EVENT_HISTORY_CAPACITY: usize = 256;
+const ONE_SHOT_CHANNEL_CACHE_CAPACITY: usize = 4096;
+
+#[derive(Default)]
+struct OneShotChannelCache {
+    channels: HashMap<String, CaChannel>,
+    order: VecDeque<String>,
+}
+
+impl OneShotChannelCache {
+    fn get_or_create(&mut self, client: &CaClient, pv_name: String) -> CaChannel {
+        if let Some(channel) = self.channels.get(&pv_name) {
+            return channel.clone();
+        }
+
+        let channel = client.create_channel_expanded(pv_name.clone());
+        self.channels.insert(pv_name.clone(), channel.clone());
+        self.order.push_back(pv_name);
+
+        while self.channels.len() > ONE_SHOT_CHANNEL_CACHE_CAPACITY {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.channels.remove(&oldest);
+        }
+
+        channel
+    }
+}
 
 /// Diagnostic counters for CA client health monitoring.
 pub struct CaDiagnostics {
@@ -204,6 +233,13 @@ pub struct CaClient {
     search_tx: mpsc::UnboundedSender<SearchRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
+    /// Bounded cache used by by-name one-shot bulk reads.
+    ///
+    /// `create_channel` remains uncached so persistent user channels
+    /// keep independent lifecycle/subscription state. This cache only
+    /// prevents repeated `caget_many([...])` calls from paying
+    /// create/search/connect on every invocation.
+    one_shot_channels: Mutex<OneShotChannelCache>,
     /// Shared registry of in-flight one-shot reads and writes
     /// (Option C, Phase A). Channel handles insert reply oneshots
     /// here directly; the per-server read loop removes and fulfils
@@ -524,6 +560,7 @@ impl CaClient {
             search_tx,
             transport_tx,
             coord_tx,
+            one_shot_channels: Mutex::new(OneShotChannelCache::default()),
             in_flight,
             snapshots,
             server_writers,
@@ -568,18 +605,12 @@ impl CaClient {
 
     /// Create a persistent channel. Returns immediately (starts searching in background).
     pub fn create_channel(&self, name: &str) -> CaChannel {
+        self.create_channel_expanded(expand_pv_name(name))
+    }
+
+    fn create_channel_expanded(&self, pv_name: String) -> CaChannel {
         let cid = alloc_cid();
         let (conn_tx, _) = broadcast::channel(16);
-
-        // EPICS_CA_USE_SHELL_VARS=YES expands ${VAR}/$(VAR) tokens in PV
-        // names against the process environment, matching libca behaviour.
-        let pv_name = if epics_base_rs::runtime::env::get_or("EPICS_CA_USE_SHELL_VARS", "NO")
-            .eq_ignore_ascii_case("YES")
-        {
-            expand_shell_vars(name)
-        } else {
-            name.to_string()
-        };
 
         let _ = self.coord_tx.send(CoordRequest::RegisterChannel {
             cid,
@@ -597,17 +628,24 @@ impl CaClient {
             cid,
             coord_tx: self.coord_tx.clone(),
         });
+        let channel_pv_name: Arc<str> = Arc::from(pv_name.as_str());
         CaChannel {
             cid,
-            pv_name,
+            pv_name: channel_pv_name,
             coord_tx: self.coord_tx.clone(),
             transport_tx: self.transport_tx.clone(),
             in_flight: self.in_flight.clone(),
             snapshots: self.snapshots.clone(),
             server_writers: self.server_writers.clone(),
             conn_tx,
+            cached_read: Arc::new(Mutex::new(None)),
             _lifecycle: lifecycle,
         }
+    }
+
+    fn cached_one_shot_channel(&self, name: &str) -> CaChannel {
+        let pv_name = expand_pv_name(name);
+        self.one_shot_channels.lock().get_or_create(self, pv_name)
     }
 
     // --- Legacy one-shot API (backwards-compatible) ---
@@ -640,11 +678,13 @@ impl CaClient {
         result
     }
 
-    /// Bulk one-shot read for many PV names.
+    /// Bulk read for many PV names.
     ///
-    /// This connects all channels concurrently, then sends established
-    /// reads through [`Self::get_many_with_timeout`], which coalesces
-    /// same-server `READ_NOTIFY` requests into a single writer enqueue.
+    /// Channels are cached by expanded PV name, so repeated calls avoid
+    /// create/search/connect overhead and go straight through
+    /// [`Self::get_many_with_timeout`], which coalesces same-server
+    /// `READ_NOTIFY` requests into a single writer enqueue. Cold or
+    /// disconnected cached channels are connected and retried once.
     /// Results are returned in input order.
     pub async fn caget_many<S>(&self, pv_names: &[S]) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
     where
@@ -654,7 +694,7 @@ impl CaClient {
             .await
     }
 
-    /// Bulk one-shot read with a caller-supplied connect/read timeout.
+    /// Bulk by-name read with a caller-supplied connect/read timeout.
     pub async fn caget_many_with_timeout<S>(
         &self,
         pv_names: &[S],
@@ -665,39 +705,54 @@ impl CaClient {
     {
         let channels: Vec<CaChannel> = pv_names
             .iter()
-            .map(|name| self.create_channel(name.as_ref()))
+            .map(|name| self.cached_one_shot_channel(name.as_ref()))
             .collect();
 
-        let connected =
-            futures_util::future::join_all(channels.iter().map(|ch| ch.wait_connected(timeout)))
-                .await;
+        let mut results = self.get_many_with_timeout(&channels, timeout).await;
 
-        let mut results: Vec<Option<CaResult<(DbFieldType, EpicsValue)>>> =
-            (0..channels.len()).map(|_| None).collect();
+        let retry_indices: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, result)| {
+                if matches!(
+                    result,
+                    Err(CaError::Disconnected) | Err(CaError::ChannelNotFound(_))
+                ) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if retry_indices.is_empty() {
+            return results;
+        }
+
+        let connected = futures_util::future::join_all(retry_indices.iter().map(|&idx| {
+            let channel = channels[idx].clone();
+            async move { (idx, channel.wait_connected(timeout).await) }
+        }))
+        .await;
+
         let mut ready_indices = Vec::new();
         let mut ready_channels = Vec::new();
-        for (idx, result) in connected.into_iter().enumerate() {
+        for (idx, result) in connected {
             match result {
                 Ok(()) => {
                     ready_indices.push(idx);
                     ready_channels.push(channels[idx].clone());
                 }
-                Err(e) => results[idx] = Some(Err(e)),
+                Err(e) => results[idx] = Err(e),
             }
         }
 
-        let read_results = self
-            .get_many_with_timeout(&ready_channels, timeout)
-            .await
-            .into_iter();
+        let read_results = self.get_many_with_timeout(&ready_channels, timeout).await;
         for (idx, result) in ready_indices.into_iter().zip(read_results) {
-            results[idx] = Some(result);
+            results[idx] = result;
         }
 
         results
-            .into_iter()
-            .map(|r| r.unwrap_or(Err(CaError::Shutdown)))
-            .collect()
     }
 
     /// Bulk read for already-created channels.
@@ -806,10 +861,39 @@ impl Drop for ChannelLifecycle {
     }
 }
 
+/// Warm READ_NOTIFY cache: persistent ioid + reusable Sender slot used
+/// by `get_many_with_timeout` to skip per-call `alloc_ioid` + DashMap
+/// insert/remove. The first successful default GET on a channel
+/// populates this; subsequent calls reuse `(ioid, sid, slot)` and only
+/// pay the actual `READ_NOTIFY` frame send + response decode.
+///
+/// Mirrors `epics-pva-rs` `CachedGet` — see `pvget_many` in
+/// `client_native/context.rs` for the original design.
+///
+/// Invalidation: the channel-side caller compares
+/// `(server_addr, sid, data_type, element_count)` against the current
+/// snapshot before each warm-call. On mismatch (reconnect / DBR change /
+/// element-count change) the cached entry is dropped and the
+/// dispatcher's DashMap entry is removed; the next call falls back to
+/// the cold path.
+///
+/// On disconnect, `drain_waiters_for_cids` removes the DashMap entry
+/// and signals `Disconnected` through `slot`; the channel-side
+/// `Option<CachedRead>` is left in place but the (server_addr, sid)
+/// mismatch on reconnect re-pulls it into a fresh cold call.
+pub(crate) struct CachedRead {
+    pub(crate) ioid: u32,
+    pub(crate) sid: u32,
+    pub(crate) server_addr: SocketAddr,
+    pub(crate) data_type: u16,
+    pub(crate) element_count: u32,
+    pub(crate) slot: types::WarmReplySlot,
+}
+
 #[derive(Clone)]
 pub struct CaChannel {
     cid: u32,
-    pv_name: String,
+    pv_name: Arc<str>,
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     transport_tx: mpsc::UnboundedSender<TransportCommand>,
     /// Shared in-flight registry for reads and writes (Option C
@@ -825,6 +909,14 @@ pub struct CaChannel {
     /// paths use this after `snapshot()` proves the channel is active.
     server_writers: DirectServerWriters,
     conn_tx: broadcast::Sender<ConnectionEvent>,
+    /// Warm-read fast path. `None` until the first successful default
+    /// GET; refilled (with a fresh Sender) on every subsequent
+    /// `get_many_with_timeout` call. See `CachedRead`.
+    ///
+    /// `Arc<Mutex<...>>` so all clones of a `CaChannel` share the same
+    /// cache slot — otherwise two clones would each pay the cold-path
+    /// once on first use.
+    cached_read: Arc<Mutex<Option<CachedRead>>>,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
 }
@@ -838,7 +930,7 @@ impl CaChannel {
         });
         tokio::time::timeout(timeout, reply_rx)
             .await
-            .map_err(|_| CaError::ChannelNotFound(self.pv_name.clone()))?
+            .map_err(|_| CaError::ChannelNotFound(self.pv_name.to_string()))?
             .map_err(|_| CaError::Shutdown)
     }
 
@@ -847,7 +939,7 @@ impl CaChannel {
     pub async fn info(&self) -> CaResult<ChannelInfo> {
         let snap = self.snapshot()?;
         Ok(ChannelInfo {
-            pv_name: self.pv_name.clone(),
+            pv_name: self.pv_name.to_string(),
             server_addr: snap.server_addr,
             native_type: snap.native_type,
             element_count: snap.element_count,
@@ -882,6 +974,21 @@ impl CaChannel {
             hdr.count = count as u16;
         }
         hdr.to_bytes_extended()
+    }
+
+    fn decode_plain_read_reply(reply: ReadReply) -> CaResult<(DbFieldType, EpicsValue)> {
+        match reply {
+            ReadReply::Plain { dbr_type, value } => Ok((dbr_type, value)),
+            ReadReply::Raw {
+                data_type,
+                count,
+                data,
+            } => {
+                let dbr_type = DbFieldType::from_u16(data_type)?;
+                EpicsValue::from_bytes_array(dbr_type, &data, count as usize)
+                    .map(|value| (dbr_type, value))
+            }
+        }
     }
 
     fn build_write_frame(
@@ -1003,23 +1110,52 @@ impl CaChannel {
         channels: &[CaChannel],
         timeout: Duration,
     ) -> Vec<CaResult<(DbFieldType, EpicsValue)>> {
-        struct PendingBulkRead {
+        // Per-PV state. Cold path = first call on a channel; allocates
+        // a fresh ioid + ReadWaiter::OneShot. Warm path = subsequent
+        // calls reuse the channel's CachedRead (persistent ioid +
+        // ReadWaiter::Warm + reusable Sender slot) — no `alloc_ioid`,
+        // no DashMap insert, dispatcher uses a read-locked `get`
+        // instead of a write-locked `remove`. Mirrors PVA `pvget_many`
+        // (epics-pva-rs `client_native/context.rs`).
+        enum PendingKind {
+            Cold {
+                ioid: u32,
+                in_flight: InFlightOps,
+                /// Channel state captured at call-time; used to install
+                /// a fresh CachedRead after the cold response succeeds.
+                cid: u32,
+                cached_read_slot: Arc<Mutex<Option<CachedRead>>>,
+                sid: u32,
+                server_addr: SocketAddr,
+                data_type: u16,
+                element_count: u32,
+            },
+            Warm {
+                ioid: u32,
+                in_flight: InFlightOps,
+                cached_read_slot: Arc<Mutex<Option<CachedRead>>>,
+                /// Borrowed cache entry — restored on success, evicted
+                /// on timeout/shutdown so the next call starts cold.
+                cached: CachedRead,
+            },
+        }
+
+        struct Pending {
             index: usize,
-            ioid: u32,
-            in_flight: InFlightOps,
-            reply_rx: oneshot::Receiver<CaResult<(u16, u32, Vec<u8>)>>,
+            reply_rx: oneshot::Receiver<CaResult<ReadReply>>,
+            kind: PendingKind,
         }
 
         struct BulkReadGroup {
             writer: DirectServerWriter,
             frame: Vec<u8>,
-            pending: Vec<PendingBulkRead>,
+            pending: Vec<Pending>,
         }
 
         let mut results: Vec<Option<CaResult<(DbFieldType, EpicsValue)>>> =
             (0..channels.len()).map(|_| None).collect();
         let mut groups: HashMap<SocketAddr, BulkReadGroup> = HashMap::new();
-        let mut pending: Vec<PendingBulkRead> = Vec::new();
+        let mut pending: Vec<Pending> = Vec::new();
 
         for (index, ch) in channels.iter().enumerate() {
             let snap = match ch.snapshot() {
@@ -1030,22 +1166,82 @@ impl CaChannel {
                 }
             };
 
-            let ioid = alloc_ioid();
-            let (reply_tx, reply_rx) = oneshot::channel();
-            ch.in_flight.reads.insert(ioid, (ch.cid, reply_tx));
-            let pending_read = PendingBulkRead {
-                index,
-                ioid,
-                in_flight: ch.in_flight.clone(),
-                reply_rx,
+            // Warm-path attempt: take the cached entry iff it matches
+            // the live snapshot. A mismatch (reconnect ⇒ new sid /
+            // server, or DB record edit ⇒ new native type / count)
+            // evicts both the channel-side cached_read and the
+            // dispatcher-side DashMap entry; the next call falls
+            // through to cold and re-populates from scratch.
+            let warm_taken: Option<CachedRead> = {
+                let mut guard = ch.cached_read.lock();
+                let matches = matches!(guard.as_ref(), Some(c)
+                    if c.server_addr == snap.server_addr
+                        && c.sid == snap.sid
+                        && c.data_type == snap.native_type as u16
+                        && c.element_count == snap.element_count);
+                if matches {
+                    guard.take()
+                } else if guard.is_some() {
+                    let stale = guard.take().unwrap();
+                    ch.in_flight.reads.remove(&stale.ioid);
+                    None
+                } else {
+                    None
+                }
             };
 
-            let frame = Self::build_read_notify_frame(
-                snap.sid,
-                snap.native_type as u16,
-                snap.element_count,
-                ioid,
-            );
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let (frame, kind) = if let Some(cached) = warm_taken {
+                // Refill the reusable Sender slot. The dispatcher takes
+                // this on response without removing the DashMap entry.
+                *cached.slot.lock() = Some(reply_tx);
+                let frame = Self::build_read_notify_frame(
+                    cached.sid,
+                    cached.data_type,
+                    cached.element_count,
+                    cached.ioid,
+                );
+                let kind = PendingKind::Warm {
+                    ioid: cached.ioid,
+                    in_flight: ch.in_flight.clone(),
+                    cached_read_slot: ch.cached_read.clone(),
+                    cached,
+                };
+                (frame, kind)
+            } else {
+                let ioid = alloc_ioid();
+                ch.in_flight.reads.insert(
+                    ioid,
+                    ReadWaiter::OneShot {
+                        cid: ch.cid,
+                        mode: ReadReplyMode::Plain,
+                        reply_tx,
+                    },
+                );
+                let frame = Self::build_read_notify_frame(
+                    snap.sid,
+                    snap.native_type as u16,
+                    snap.element_count,
+                    ioid,
+                );
+                let kind = PendingKind::Cold {
+                    ioid,
+                    in_flight: ch.in_flight.clone(),
+                    cid: ch.cid,
+                    cached_read_slot: ch.cached_read.clone(),
+                    sid: snap.sid,
+                    server_addr: snap.server_addr,
+                    data_type: snap.native_type as u16,
+                    element_count: snap.element_count,
+                };
+                (frame, kind)
+            };
+
+            let pending_read = Pending {
+                index,
+                reply_rx,
+                kind,
+            };
 
             if let Some(writer) = ch.direct_writer(snap.server_addr) {
                 let group = groups
@@ -1058,16 +1254,47 @@ impl CaChannel {
                 group.frame.extend_from_slice(&frame);
                 group.pending.push(pending_read);
             } else {
-                match ch.send_read_notify_fast(
-                    &snap,
-                    snap.native_type as u16,
-                    snap.element_count,
-                    ioid,
-                ) {
-                    Ok(()) => pending.push(pending_read),
-                    Err(e) => {
-                        ch.in_flight.reads.remove(&ioid);
-                        results[index] = Some(Err(e));
+                // No direct writer ⇒ fall back to the transport-mediated
+                // send. Cold path can use it; warm path needs a live
+                // direct writer (the cached server is gone), so we
+                // evict the warm entry and surface Disconnected.
+                match pending_read.kind {
+                    PendingKind::Cold {
+                        ioid, in_flight, ..
+                    } => match ch.send_read_notify_fast(
+                        &snap,
+                        snap.native_type as u16,
+                        snap.element_count,
+                        ioid,
+                    ) {
+                        Ok(()) => pending.push(Pending {
+                            index,
+                            reply_rx: pending_read.reply_rx,
+                            kind: PendingKind::Cold {
+                                ioid,
+                                in_flight,
+                                cid: ch.cid,
+                                cached_read_slot: ch.cached_read.clone(),
+                                sid: snap.sid,
+                                server_addr: snap.server_addr,
+                                data_type: snap.native_type as u16,
+                                element_count: snap.element_count,
+                            },
+                        }),
+                        Err(e) => {
+                            in_flight.reads.remove(&ioid);
+                            results[index] = Some(Err(e));
+                        }
+                    },
+                    PendingKind::Warm {
+                        ioid,
+                        in_flight,
+                        cached_read_slot,
+                        ..
+                    } => {
+                        in_flight.reads.remove(&ioid);
+                        *cached_read_slot.lock() = None;
+                        results[index] = Some(Err(CaError::Disconnected));
                     }
                 }
             }
@@ -1078,40 +1305,137 @@ impl CaChannel {
                 Ok(()) => pending.extend(group.pending),
                 Err(_) => {
                     for p in group.pending {
-                        p.in_flight.reads.remove(&p.ioid);
+                        match p.kind {
+                            PendingKind::Cold {
+                                ioid, in_flight, ..
+                            } => {
+                                in_flight.reads.remove(&ioid);
+                            }
+                            PendingKind::Warm {
+                                ioid,
+                                in_flight,
+                                cached_read_slot,
+                                ..
+                            } => {
+                                in_flight.reads.remove(&ioid);
+                                *cached_read_slot.lock() = None;
+                            }
+                        }
                         results[p.index] = Some(Err(CaError::Disconnected));
                     }
                 }
             }
         }
 
+        // Sequential drain (mirrors PVA `pvget_many`): the read_loop
+        // dispatches all per-server responses back-to-back as the burst
+        // arrives, so most rx's are already ready by the time we reach
+        // them. Sequential await over ready oneshots is cheap (poll
+        // returns immediately, no scheduler hop) and avoids the
+        // FuturesUnordered bookkeeping (~50ns per item × 100 items
+        // ≈ 5µs). Out-of-order arrival is rare on a single TCP circuit
+        // because CA responses are emitted in request order.
+        //
+        // Phase 2: scalar plain reads are decoded in the read loop, so
+        // the hot path avoids allocating/copying one payload Vec per PV.
+
         let deadline = tokio::time::Instant::now() + timeout;
         for p in pending {
-            let PendingBulkRead {
-                index,
-                ioid,
-                in_flight,
-                reply_rx,
-            } = p;
+            let Pending { index, reply_rx, kind } = p;
             let result = tokio::time::timeout_at(deadline, reply_rx).await;
-            in_flight.reads.remove(&ioid);
-
-            let decoded = match result {
-                Ok(Ok(Ok((data_type, count, data)))) => {
-                    let dbr_type = match DbFieldType::from_u16(data_type) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            results[index] = Some(Err(e));
-                            continue;
-                        }
-                    };
-                    EpicsValue::from_bytes_array(dbr_type, &data, count as usize)
-                        .map(|value| (dbr_type, value))
-                }
+            let decoded: CaResult<(DbFieldType, EpicsValue)> = match result {
+                Ok(Ok(Ok(reply))) => Self::decode_plain_read_reply(reply),
                 Ok(Ok(Err(e))) => Err(e),
                 Ok(Err(_)) => Err(CaError::Shutdown),
                 Err(_) => Err(CaError::Timeout),
             };
+            let is_local_error = matches!(
+                decoded,
+                Err(CaError::Timeout) | Err(CaError::Shutdown)
+            );
+
+            match kind {
+                PendingKind::Cold {
+                    ioid,
+                    in_flight,
+                    cid,
+                    cached_read_slot,
+                    sid,
+                    server_addr,
+                    data_type,
+                    element_count,
+                } => {
+                    if is_local_error {
+                        // read_loop hasn't dispatched (no Warm shortcut
+                        // for cold), so we sweep the OneShot entry now.
+                        in_flight.reads.remove(&ioid);
+                    }
+                    if decoded.is_ok() {
+                        // First successful default GET ⇒ install warm
+                        // cache. Allocate a fresh ioid (separate from
+                        // the cold one which read_loop already removed)
+                        // and register a persistent Warm waiter. Loser
+                        // of any concurrent install race drops its
+                        // entry to avoid a leaked DashMap row.
+                        let warm_ioid = alloc_ioid();
+                        let slot: types::WarmReplySlot =
+                            Arc::new(parking_lot::Mutex::new(None));
+                        in_flight.reads.insert(
+                            warm_ioid,
+                            ReadWaiter::Warm {
+                                cid,
+                                mode: ReadReplyMode::Plain,
+                                slot: slot.clone(),
+                            },
+                        );
+                        let cached = CachedRead {
+                            ioid: warm_ioid,
+                            sid,
+                            server_addr,
+                            data_type,
+                            element_count,
+                            slot,
+                        };
+                        let mut guard = cached_read_slot.lock();
+                        if guard.is_none() {
+                            *guard = Some(cached);
+                        } else {
+                            drop(guard);
+                            in_flight.reads.remove(&warm_ioid);
+                        }
+                    }
+                }
+                PendingKind::Warm {
+                    ioid,
+                    in_flight,
+                    cached_read_slot,
+                    cached,
+                } => {
+                    if is_local_error {
+                        // Stale cache: drop the entry so the next call
+                        // can re-establish from cold. The DashMap entry
+                        // here might still receive a late server
+                        // response, which the dispatcher will discard.
+                        in_flight.reads.remove(&ioid);
+                        drop(cached);
+                        *cached_read_slot.lock() = None;
+                    } else {
+                        // Success or server-side error: keep the cache.
+                        // Restore the borrowed CachedRead. If a racing
+                        // install already populated the slot (e.g.,
+                        // duplicate channel in input list), drop ours
+                        // and evict its DashMap entry.
+                        let mut guard = cached_read_slot.lock();
+                        if guard.is_none() {
+                            *guard = Some(cached);
+                        } else {
+                            drop(guard);
+                            in_flight.reads.remove(&ioid);
+                        }
+                    }
+                }
+            }
+
             results[index] = Some(decoded);
         }
 
@@ -1135,7 +1459,14 @@ impl CaChannel {
         // arrives and we send to a dead receiver (no-op), or
         // (b) disconnect cleanup drains it (Phase D). Bounded
         // either way; not a leak.
-        self.in_flight.reads.insert(ioid, (self.cid, reply_tx));
+        self.in_flight.reads.insert(
+            ioid,
+            ReadWaiter::OneShot {
+                cid: self.cid,
+                mode: ReadReplyMode::Plain,
+                reply_tx,
+            },
+        );
 
         if let Err(e) =
             self.send_read_notify_fast(&snap, snap.native_type as u16, snap.element_count, ioid)
@@ -1151,13 +1482,10 @@ impl CaChannel {
         // `remove` is a no-op then). `drop` of `reply_rx` happens
         // implicitly on the success path.
         self.in_flight.reads.remove(&ioid);
-        let (data_type, count, data) = result
+        let reply = result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)??;
-
-        let dbr_type = DbFieldType::from_u16(data_type)?;
-        let value = EpicsValue::from_bytes_array(dbr_type, &data, count as usize)?;
-        Ok((dbr_type, value))
+        Self::decode_plain_read_reply(reply)
     }
 
     /// Get a PV value with metadata. Use `DbrClass::Time` for timestamp + alarm,
@@ -1191,7 +1519,14 @@ impl CaChannel {
         let (reply_tx, reply_rx) = oneshot::channel();
         // Direct registry insert (Option C Phase A); see ch.get
         // for drop-semantics commentary.
-        self.in_flight.reads.insert(ioid, (self.cid, reply_tx));
+        self.in_flight.reads.insert(
+            ioid,
+            ReadWaiter::OneShot {
+                cid: self.cid,
+                mode: ReadReplyMode::Raw,
+                reply_tx,
+            },
+        );
 
         if let Err(e) = self.send_read_notify_fast(&snap, request_type, request_count, ioid) {
             self.in_flight.reads.remove(&ioid);
@@ -1200,11 +1535,20 @@ impl CaChannel {
 
         let result = tokio::time::timeout(Duration::from_secs(30), reply_rx).await;
         self.in_flight.reads.remove(&ioid);
-        let (data_type, resp_count, data) = result
+        let reply = result
             .map_err(|_| CaError::Timeout)?
             .map_err(|_| CaError::Shutdown)??;
 
-        decode_dbr(data_type, &data, resp_count as usize)
+        match reply {
+            ReadReply::Raw {
+                data_type,
+                count,
+                data,
+            } => decode_dbr(data_type, &data, count as usize),
+            ReadReply::Plain { .. } => Err(CaError::Protocol(
+                "metadata read returned a plain scalar reply".into(),
+            )),
+        }
     }
 
     pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {
@@ -1794,7 +2138,7 @@ async fn run_coordinator(
                             {
                                 let _ = search_tx.send(SearchRequest::Schedule {
                                     cid: ch.cid,
-                                    pv_name: ch.pv_name.clone(),
+                                    pv_name: ch.pv_name.to_string(),
                                     reason: SearchReason::BeaconAnomaly,
                                 });
                             }
@@ -1835,7 +2179,7 @@ async fn run_coordinator(
                                 server_channels.entry(server_addr).or_default().insert(cid);
                                 let _ = transport_tx.send(TransportCommand::CreateChannel {
                                     cid,
-                                    pv_name: ch.pv_name.clone(),
+                                    pv_name: ch.pv_name.to_string(),
                                     server_addr,
                                 });
                             }
@@ -1919,12 +2263,12 @@ async fn run_coordinator(
                                 &transport_tx,
                             );
                             diag.connections.fetch_add(1, Ordering::Relaxed);
-                            diag.record(DiagEvent::Connected { pv: ch.pv_name.clone(), server: server_addr });
+                            diag.record(DiagEvent::Connected { pv: ch.pv_name.to_string(), server: server_addr });
                             if restored > 0 || stale > 0 {
                                 diag.reconnections.fetch_add(1, Ordering::Relaxed);
                                 diag.subscriptions_restored.fetch_add(restored as u64, Ordering::Relaxed);
                                 diag.subscriptions_stale.fetch_add(stale as u64, Ordering::Relaxed);
-                                diag.record(DiagEvent::Reconnected { pv: ch.pv_name.clone(), restored, stale });
+                                diag.record(DiagEvent::Reconnected { pv: ch.pv_name.to_string(), restored, stale });
                                 eprintln!("CA: {}: restored {restored} subscriptions ({stale} stale removed)", ch.pv_name);
                             }
 
@@ -1979,7 +2323,7 @@ async fn run_coordinator(
                             let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
                             let _ = search_tx.send(SearchRequest::Schedule {
                                 cid,
-                                pv_name: ch.pv_name.clone(),
+                                pv_name: ch.pv_name.to_string(),
                                 reason: SearchReason::Reconnect,
                             });
                             // Notify search engine of failed connect (penalty box).
@@ -2045,7 +2389,7 @@ async fn run_coordinator(
                                 // Re-search
                                 let _ = search_tx.send(SearchRequest::Schedule {
                                     cid,
-                                    pv_name: ch.pv_name.clone(),
+                                    pv_name: ch.pv_name.to_string(),
                                     reason: SearchReason::Reconnect,
                                 });
                             }
@@ -2138,7 +2482,7 @@ fn handle_disconnect(
             // `initial_lane = reconnect_count.clamp(1, 8)`.
             let _ = search_tx.send(SearchRequest::Schedule {
                 cid: ch.cid,
-                pv_name: ch.pv_name.clone(),
+                pv_name: ch.pv_name.to_string(),
                 reason: SearchReason::Reconnect,
             });
         }
@@ -2180,12 +2524,12 @@ pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InF
     let stale_reads: Vec<u32> = in_flight
         .reads
         .iter()
-        .filter(|entry| cids.contains(&entry.value().0))
+        .filter(|entry| cids.contains(&entry.value().cid()))
         .map(|entry| *entry.key())
         .collect();
     for ioid in stale_reads {
-        if let Some((_, (_, sender))) = in_flight.reads.remove(&ioid) {
-            let _ = sender.send(Err(CaError::Disconnected));
+        if let Some((_, waiter)) = in_flight.reads.remove(&ioid) {
+            waiter.send(Err(CaError::Disconnected));
         }
     }
     let stale_writes: Vec<u32> = in_flight
@@ -2293,6 +2637,20 @@ fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
         .or(addrs.first())
         .copied()
         .ok_or_else(|| CaError::Protocol(format!("no addresses for '{host}'")))
+}
+
+/// Apply libca-compatible PV-name expansion when
+/// `EPICS_CA_USE_SHELL_VARS=YES`.
+fn expand_pv_name(name: &str) -> String {
+    // EPICS_CA_USE_SHELL_VARS=YES expands ${VAR}/$(VAR) tokens in PV
+    // names against the process environment, matching libca behaviour.
+    if epics_base_rs::runtime::env::get_or("EPICS_CA_USE_SHELL_VARS", "NO")
+        .eq_ignore_ascii_case("YES")
+    {
+        expand_shell_vars(name)
+    } else {
+        name.to_string()
+    }
 }
 
 /// Expand shell-style `${VAR}` and `$(VAR)` references in `s` against the
@@ -2639,8 +2997,22 @@ mod waiter_drain_tests {
         let (rtx_99, rrx_99) = oneshot::channel();
         let (wtx_42, wrx_42) = oneshot::channel();
         let (wtx_99, wrx_99) = oneshot::channel();
-        in_flight.reads.insert(1001, (42, rtx_42));
-        in_flight.reads.insert(2001, (99, rtx_99));
+        in_flight.reads.insert(
+            1001,
+            types::ReadWaiter::OneShot {
+                cid: 42,
+                mode: types::ReadReplyMode::Raw,
+                reply_tx: rtx_42,
+            },
+        );
+        in_flight.reads.insert(
+            2001,
+            types::ReadWaiter::OneShot {
+                cid: 99,
+                mode: types::ReadReplyMode::Raw,
+                reply_tx: rtx_99,
+            },
+        );
         in_flight.writes.insert(1002, (42, wtx_42));
         in_flight.writes.insert(2002, (99, wtx_99));
 
@@ -2668,7 +3040,14 @@ mod waiter_drain_tests {
         let in_flight = types::InFlightOps::new();
         let (rtx, rrx) = oneshot::channel();
         let (wtx, wrx) = oneshot::channel();
-        in_flight.reads.insert(10, (1, rtx));
+        in_flight.reads.insert(
+            10,
+            types::ReadWaiter::OneShot {
+                cid: 1,
+                mode: types::ReadReplyMode::Raw,
+                reply_tx: rtx,
+            },
+        );
         in_flight.writes.insert(20, (2, wtx));
 
         let affected: HashSet<u32> = HashSet::new();
@@ -2692,11 +3071,22 @@ mod waiter_drain_tests {
     async fn response_arrives_before_disconnect_drain() {
         let in_flight = types::InFlightOps::new();
         let (rtx, rrx) = oneshot::channel();
-        in_flight.reads.insert(100, (7, rtx));
+        in_flight.reads.insert(
+            100,
+            types::ReadWaiter::OneShot {
+                cid: 7,
+                mode: types::ReadReplyMode::Raw,
+                reply_tx: rtx,
+            },
+        );
 
         // Transport delivers the response first.
-        if let Some((_, (_, sender))) = in_flight.reads.remove(&100) {
-            let _ = sender.send(Ok((6, 1, vec![1, 0, 0, 0])));
+        if let Some((_, waiter)) = in_flight.reads.remove(&100) {
+            waiter.send(Ok(types::ReadReply::Raw {
+                data_type: 6,
+                count: 1,
+                data: vec![1, 0, 0, 0],
+            }));
         }
 
         // Disconnect drain runs immediately after — should find nothing
@@ -2706,6 +3096,13 @@ mod waiter_drain_tests {
         drain_waiters_for_cids(&affected, &in_flight);
 
         let result = rrx.await.expect("oneshot still alive");
-        assert!(matches!(result, Ok((6, 1, _))));
+        assert!(matches!(
+            result,
+            Ok(types::ReadReply::Raw {
+                data_type: 6,
+                count: 1,
+                ..
+            })
+        ));
     }
 }

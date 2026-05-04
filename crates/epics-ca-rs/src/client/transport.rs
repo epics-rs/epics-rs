@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::runtime::sync::mpsc;
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -12,9 +13,69 @@ use crate::channel::AccessRights;
 use crate::protocol::*;
 
 use super::types::{
-    DirectServerWriter, DirectServerWriters, SEND_BACKPRESSURE_FRAMES, TransportCommand,
-    TransportEvent,
+    DirectServerWriter, DirectServerWriters, InFlightOps, ReadReply, ReadReplyMode, ReadWaiter,
+    SEND_BACKPRESSURE_FRAMES, TransportCommand, TransportEvent, WarmReplySlot,
 };
+
+fn dispatch_read_reply_with<F>(in_flight: &InFlightOps, ioid: u32, make_result: F)
+where
+    F: FnOnce(ReadReplyMode) -> epics_base_rs::error::CaResult<ReadReply>,
+{
+    // Hot path: warm waiter — peek the entry, take the Sender from its
+    // slot, leave the entry in place so the next call on the same
+    // channel can reuse this ioid without going through `alloc_ioid` +
+    // DashMap insert/remove. Cold path: one-shot waiter, removed on
+    // dispatch as before.
+    //
+    // Two DashMap touches on the cold path (1 read-lock `get` + 1
+    // write-lock `remove`) instead of one — accepted because the
+    // single-`get` cold path is network-bound (~70µs warm) and the
+    // bulk-read hot path (this `Warm` branch) is what saves ~2µs/PV.
+    let warm: Option<(ReadReplyMode, WarmReplySlot)> = {
+        if let Some(entry) = in_flight.reads.get(&ioid) {
+            match &*entry {
+                ReadWaiter::Warm { mode, slot, .. } => Some((*mode, slot.clone())),
+                ReadWaiter::OneShot { .. } => None,
+            }
+        } else {
+            None
+        }
+    };
+    if let Some((mode, slot)) = warm {
+        let result = make_result(mode);
+        if let Some(tx) = slot.lock().take() {
+            let _ = tx.send(result);
+        }
+        return;
+    }
+    if let Some((_, waiter)) = in_flight.reads.remove(&ioid) {
+        let result = make_result(waiter.mode());
+        waiter.send(result);
+    }
+}
+
+fn make_read_reply(
+    mode: ReadReplyMode,
+    data_type: u16,
+    count: u32,
+    data: &[u8],
+) -> epics_base_rs::error::CaResult<ReadReply> {
+    if matches!(mode, ReadReplyMode::Plain) && count == 1 {
+        let dbr_type = DbFieldType::from_u16(data_type)?;
+        let value = EpicsValue::from_bytes_array(dbr_type, data, count as usize)?;
+        Ok(ReadReply::Plain { dbr_type, value })
+    } else {
+        Ok(ReadReply::Raw {
+            data_type,
+            count,
+            data: data.to_vec(),
+        })
+    }
+}
+
+fn dispatch_read_error(in_flight: &InFlightOps, ioid: u32, error: epics_base_rs::error::CaError) {
+    dispatch_read_reply_with(in_flight, ioid, |_| Err(error));
+}
 
 /// Optional client-side TLS handshaker. `None` means plaintext.
 /// Behind the `tls` feature so default builds carry zero TLS code.
@@ -937,19 +998,24 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 CA_PROTO_READ_NOTIFY => {
                     // Direct dispatch to the in-flight read registry
                     // (Option C Phase A) — bypasses the coordinator's
-                    // `tokio::select!` loop. The originating
-                    // `ch.get()` task is awaiting the oneshot we
-                    // resolve here.
+                    // `tokio::select!` loop. Plain scalar reads are
+                    // decoded here so the hot path does not allocate
+                    // one payload Vec per response.
                     let ioid = hdr.available;
                     if hdr.cid == ECA_NORMAL {
-                        let data = accumulated[data_start..data_start + actual_post].to_vec();
-                        if let Some((_, (_, reply_tx))) = in_flight.reads.remove(&ioid) {
-                            let _ = reply_tx.send(Ok((hdr.data_type, hdr.actual_count(), data)));
-                        }
-                    } else if let Some((_, (_, reply_tx))) = in_flight.reads.remove(&ioid) {
-                        let _ = reply_tx.send(Err(epics_base_rs::error::CaError::Protocol(
-                            format!("server returned ECA error {:#06x}", hdr.cid),
-                        )));
+                        let data = &accumulated[data_start..data_start + actual_post];
+                        dispatch_read_reply_with(&in_flight, ioid, |mode| {
+                            make_read_reply(mode, hdr.data_type, hdr.actual_count(), data)
+                        });
+                    } else {
+                        dispatch_read_error(
+                            &in_flight,
+                            ioid,
+                            epics_base_rs::error::CaError::Protocol(format!(
+                                "server returned ECA error {:#06x}",
+                                hdr.cid
+                            )),
+                        );
                     }
                 }
                 CA_PROTO_WRITE_NOTIFY => {

@@ -6,7 +6,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::sync::{mpsc, oneshot};
-use epics_base_rs::types::DbFieldType;
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::channel::AccessRights;
 use crate::client::state::ChannelState;
@@ -98,10 +98,86 @@ pub(crate) type ChannelSnapshots = Arc<DashMap<u32, ChannelSnapshotPublic>>;
 
 // --- Direct in-flight op registries (Option C) ---
 
-/// Reply channel type for one-shot reads. Carries (data_type, count, payload).
-pub(crate) type ReadReplyTx = oneshot::Sender<CaResult<(u16, u32, Vec<u8>)>>;
+pub(crate) enum ReadReply {
+    Plain {
+        dbr_type: DbFieldType,
+        value: EpicsValue,
+    },
+    Raw {
+        data_type: u16,
+        count: u32,
+        data: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReadReplyMode {
+    Plain,
+    Raw,
+}
+
+/// Reply channel type for reads.
+pub(crate) type ReadReplyTx = oneshot::Sender<CaResult<ReadReply>>;
 /// Reply channel type for one-shot writes (write-notify completion).
 pub(crate) type WriteReplyTx = oneshot::Sender<CaResult<()>>;
+
+/// Reusable Sender slot used by `ReadWaiter::Warm` — the channel-side
+/// caller refills it before each call, the dispatcher takes it on
+/// response. Wrapped in a `parking_lot::Mutex` because both sides hold
+/// the lock for nanoseconds (just `take`/`replace`).
+pub(crate) type WarmReplySlot = Arc<parking_lot::Mutex<Option<ReadReplyTx>>>;
+
+pub(crate) enum ReadWaiter {
+    OneShot {
+        cid: u32,
+        mode: ReadReplyMode,
+        reply_tx: ReadReplyTx,
+    },
+    /// Persistent waiter installed by `CachedRead`. Same ioid stays in
+    /// the registry across calls so subsequent reads skip
+    /// `alloc_ioid` + DashMap insert/remove. The dispatcher takes the
+    /// `Sender` from `slot` on response without removing the entry; the
+    /// channel-side caller refills `slot` before each frame send. See
+    /// `transport::dispatch_read_reply_with` and
+    /// `client::CaChannel::cached_read` for the full lifecycle.
+    Warm {
+        cid: u32,
+        mode: ReadReplyMode,
+        slot: WarmReplySlot,
+    },
+}
+
+impl ReadWaiter {
+    pub(crate) fn cid(&self) -> u32 {
+        match self {
+            Self::OneShot { cid, .. } => *cid,
+            Self::Warm { cid, .. } => *cid,
+        }
+    }
+
+    pub(crate) fn mode(&self) -> ReadReplyMode {
+        match self {
+            Self::OneShot { mode, .. } => *mode,
+            Self::Warm { mode, .. } => *mode,
+        }
+    }
+
+    /// Consume the waiter and signal `result`. Used by the disconnect
+    /// drain path (`drain_waiters_for_cids`) where we want both
+    /// `OneShot` and `Warm` waiters notified-and-evicted.
+    pub(crate) fn send(self, result: CaResult<ReadReply>) {
+        match self {
+            Self::OneShot { reply_tx, .. } => {
+                let _ = reply_tx.send(result);
+            }
+            Self::Warm { slot, .. } => {
+                if let Some(tx) = slot.lock().take() {
+                    let _ = tx.send(result);
+                }
+            }
+        }
+    }
+}
 
 /// Shared in-flight op registry. Channel handles insert reply oneshots
 /// here keyed by `ioid`; the per-server transport read loop removes
@@ -122,7 +198,7 @@ pub(crate) type WriteReplyTx = oneshot::Sender<CaResult<()>>;
 /// virtual circuit dies (Phase D).
 #[derive(Clone, Default)]
 pub(crate) struct InFlightOps {
-    pub(crate) reads: Arc<DashMap<u32, (u32, ReadReplyTx)>>,
+    pub(crate) reads: Arc<DashMap<u32, ReadWaiter>>,
     pub(crate) writes: Arc<DashMap<u32, (u32, WriteReplyTx)>>,
 }
 

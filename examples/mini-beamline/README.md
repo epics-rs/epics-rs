@@ -113,8 +113,8 @@ Eight full MotorRecords using `SimMotor` from `motor-rs`:
 
 | PV | Type | Description |
 |----|------|-------------|
-| `mini:wf1` ... `mini:wf10` | waveform | 10000-element DOUBLE arrays for bulk-transfer benchmarks |
-| `mini:wf:bundle` | native PVA structure | Aggregate PVA PV containing `wf1` ... `wf10` as `double[]` fields |
+| `mini:wf1` ... `mini:wf10` | waveform | 10000-element DOUBLE arrays refreshed once per second |
+| `mini:wf:bundle` | native PVA structure | Aggregate PVA PV containing `wf1` ... `wf10` as once-per-second `double[]` fields |
 
 ### Point Detectors
 

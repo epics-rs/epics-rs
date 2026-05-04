@@ -1,5 +1,92 @@
 # Changelog
 
+## v0.14.1 — 2026-05-04
+
+Performance follow-up to v0.14.0. Bulk CA reads (`bulk_caget`,
+`get_many_with_timeout`, ophyd-epicsrs `bulk_get_pvs`) get a 2-3×
+end-to-end speedup at N=100 PVs against the in-process softIoc:
+roughly 220 µs → 90 µs. The wins come from two complementary
+changes — a warm-GET registry on the CA client side and batched
+response flushing on the CA server side — that together close
+most of the bulk-read gap to PVA.
+
+### epics-ca-rs (client)
+
+- **perf**: warm-GET cache on `CaChannel`. The first successful
+  default GET on a channel populates a `CachedRead { ioid, sid,
+  server_addr, data_type, element_count, slot }`; subsequent
+  `get_many_with_timeout` calls refill the slot's
+  `Sender<ReadReply>` and reuse the persistent ioid, skipping
+  per-call `alloc_ioid` + DashMap insert/remove + oneshot
+  allocation. The new `ReadWaiter::Warm` registry variant lets
+  the per-server `read_loop` dispatcher peek a Warm waiter via a
+  read-locked `DashMap::get` (instead of write-locked `remove`)
+  and take the response Sender from its `WarmReplySlot`. Mirrors
+  `epics-pva-rs` `CachedGet` — see `pvget_many` in
+  `client_native/context.rs` for the original design.
+- **perf**: `get_many_with_timeout` drains pending oneshots
+  sequentially (PVA `pvget_many` pattern). The read_loop fires
+  per-server response burst back-to-back, so most rx's are ready
+  by the time the await reaches them; sequential await is as
+  fast as `FuturesUnordered` for the warm case and saves the
+  per-item bookkeeping overhead.
+- Cache invalidation: snapshot mismatch on
+  `(server_addr, sid, data_type, element_count)` evicts the
+  cached entry and removes its registry row; the next call
+  falls back to cold and re-populates. `drain_waiters_for_cids`
+  treats `Warm` and `OneShot` waiters the same — both reaped on
+  disconnect, with the slot-held Sender (if any) signalled
+  `Disconnected`.
+
+### epics-ca-rs (server)
+
+- **perf**: batched dispatch flush in `handle_client`. The
+  per-message `flush()` calls inside `dispatch_message` and the
+  `send_cmd_error` / `send_ca_error` helpers were forcing one TCP
+  write per response, capping bulk-read throughput at the
+  server-side response rate (~2.2 µs/PV at N=100). They now run
+  into a 64 KB `BufWriter` with no inline flush; `handle_client`
+  flushes once per outer read iteration after the inner
+  message-drain loop, collapsing N responses into a single
+  syscall per inbound TCP burst. Subscription delivery, async
+  `WRITE_NOTIFY` completion, `send_monitor_snapshot`, and
+  `reeval_access_rights` keep their own flushes — they run
+  independently of the read loop and need their data pushed
+  promptly. `READ_SYNC` becomes a no-op since the outer-loop
+  flush fires for any iteration with offset > 0.
+- **fix**: dispatch error path now flushes before propagating.
+  `handle_client` matches dispatch's three result arms
+  separately: `Ok(Ok(()))` is the hot path; `Ok(Err(e))`
+  best-effort flushes any responses queued by earlier
+  successful handlers in this batch (and any error reply emitted
+  by the failing handler via `send_cmd_error`) before returning
+  the error; `Err(_)` (send-timeout) intentionally skips the
+  flush because the cancelled future may have left a partial
+  frame in the buffer.
+
+### bench
+
+- **add**: `e2e_bulk_get_many_scaling` group runs the in-process
+  softIoc bulk read at N = 10 / 20 / 50 / 100 PVs from a single
+  client. Captures the per-N scaling shape so future server /
+  client changes can be compared against it without eyeballing
+  single-N numbers.
+- **add**: `e2e_bulk_caget_many_cached_100pvs` measures the warm
+  by-name `caget_many` path (channel cache hit + batched
+  `get_many` underneath). Complements `e2e_bulk_get_many` which
+  starts from pre-built channel handles.
+
+### measurements (in-process softIoc, criterion)
+
+| N   | v0.14.0  | v0.14.1 | Δ     |
+| --- | -------- | ------- | ----- |
+| 10  | 43.9 µs  | 36.6 µs | -17 % |
+| 20  | 61.8 µs  | 43.3 µs | -32 % |
+| 50  | 115.8 µs | 60.0 µs | -48 % |
+| 100 | 223.3 µs | 93.3 µs | -58 % |
+
+Per-PV server dispatch cost: 2.2 µs/PV → 0.9 µs/PV at N=100.
+
 ## v0.14.0 — 2026-05-04
 
 Per-op coordinator round-trips removed from the CA client hot path

@@ -194,6 +194,39 @@ fn bench_bulk_get_many(c: &mut Criterion) {
     });
 }
 
+/// Bulk reads by PV name. First warm call populates CaClient's
+/// one-shot channel cache; timed iterations should then take the same
+/// hot batched-read path as `get_many`.
+fn bench_bulk_caget_many(c: &mut Criterion) {
+    let rt = make_runtime();
+    let port = unused_local_port();
+    point_addr_list_at(port);
+    let _server = rt.block_on(boot_softioc(100, port));
+    let client = Arc::new(rt.block_on(async { CaClient::new().await.expect("client") }));
+    let names: Vec<String> = (0..100).map(|i| format!("BENCH:PV:{i}")).collect();
+
+    rt.block_on(async {
+        let results = client
+            .caget_many_with_timeout(&names, Duration::from_secs(3))
+            .await;
+        for result in results {
+            result.expect("warm caget_many connected");
+        }
+    });
+
+    c.bench_function("e2e_bulk_caget_many_cached_100pvs", |b| {
+        let client = client.clone();
+        let names = names.clone();
+        b.to_async(&rt).iter(|| {
+            let client = client.clone();
+            let names = names.clone();
+            async move {
+                let _ = client.caget_many(&names).await;
+            }
+        });
+    });
+}
+
 fn bench_caput(c: &mut Criterion) {
     let rt = make_runtime();
     let port = unused_local_port();
@@ -223,6 +256,6 @@ criterion_group! {
         .sample_size(20)
         .measurement_time(Duration::from_secs(8))
         .warm_up_time(Duration::from_secs(2));
-    targets = bench_caget, bench_bulk_caget, bench_bulk_get_many, bench_caput
+    targets = bench_caget, bench_bulk_caget, bench_bulk_get_many, bench_bulk_caget_many, bench_caput
 }
 criterion_main!(e2e);

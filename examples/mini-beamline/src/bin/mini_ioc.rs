@@ -311,9 +311,11 @@ async fn main() -> CaResult<()> {
     // ========================================================================
     // Random-waveform device support (for bulk-transfer benchmarks).
     //
-    // The individual waveform records and `mini:wf:bundle` share the
-    // same pre-generated arrays. Records select data by their trailing
-    // index (`mini:wf1` -> `wf1`) so the bundle and per-record PVs match.
+    // Each `mini:wf<N>` record refreshes its slot on every 1 Hz scan;
+    // `mini:wf:bundle` re-publishes the full structure once all 10
+    // records have processed in the same cycle. CA per-record monitors
+    // and the PVA bundle therefore see different interleavings — the
+    // bundle is atomic per-cycle, the CA stream is per-record.
     // ========================================================================
     {
         let factory = Arc::new(RandomWaveformFactory::new_with_count(10_000, 10));

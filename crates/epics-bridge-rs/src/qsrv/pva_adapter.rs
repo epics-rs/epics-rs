@@ -304,7 +304,7 @@ pub async fn run_ca_pva_qsrv_ioc(
     // Handles were stored in the global registry during st.cmd execution.
     let pva_pvs = take_registered_pva_pvs();
     for (pv_name, handle) in pva_pvs {
-        eprintln!("PVA: registering native PV: {pv_name}");
+        tracing::info!(pv = %pv_name, "registering native PVA PV");
         store
             .register_pva_pv(&pv_name, handle.latest, handle.subscribers)
             .await;

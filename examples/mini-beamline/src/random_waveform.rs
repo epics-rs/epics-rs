@@ -4,6 +4,12 @@
 //! with deterministic per-record random data. The 10 individual waveform
 //! records and the native PVA bundle share the same backing arrays.
 //!
+//! The bundle (`mini:wf:bundle`) is published *atomically* per cycle:
+//! all 10 records refresh their slot, then the bundle re-emits with the
+//! consistent set. CA per-record monitors stream independently as each
+//! record finishes its scan, so CA and PVA observers see different
+//! interleavings — that is intentional for the benchmark workload.
+//!
 //! Used by `examples/bench_flyscan_waveform.py` (in ophyd-epicsrs) to
 //! reproduce a realistic flyscan workload (N waveforms × M elements
 //! per scan step).
@@ -15,8 +21,8 @@
 
 #[cfg(feature = "ioc")]
 pub mod ioc_support {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, OnceLock};
 
     use parking_lot::Mutex;
     use rand::rngs::StdRng;
@@ -29,7 +35,7 @@ pub mod ioc_support {
     };
     use epics_base_rs::server::record::{Record, ScanType};
     use epics_base_rs::types::EpicsValue;
-    use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+    use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
 
     /// Generate `len` deterministic-random doubles in `[0.0, 1.0)`
     /// from a 64-bit seed.
@@ -75,7 +81,20 @@ pub mod ioc_support {
         next_seed: AtomicU64,
         processed_mask: AtomicU64,
         expected_mask: u64,
-        field_prefix: Mutex<String>,
+        /// Set once via [`Self::set_field_prefix`] before the bundle is
+        /// first published; immutable thereafter so subscribers' negotiated
+        /// `FieldDesc` (which embeds the field names) stays stable for the
+        /// lifetime of the PV. Mirrors pvxs `SharedPV::post`'s requirement
+        /// that subsequent posts match the type of `open()`.
+        field_prefix: OnceLock<String>,
+        /// Captured on first publish, used to defend against accidental
+        /// shape drift on later publishes (count or scalar-type changes
+        /// would break already-connected monitors).
+        expected_desc: OnceLock<FieldDesc>,
+        /// Count of monitor events the bundle had to drop because a
+        /// subscriber's mpsc was full. Best-effort observability — not
+        /// a hard contract.
+        dropped_events: AtomicU64,
         latest: Arc<Mutex<Option<PvField>>>,
         subscribers: Arc<Mutex<Vec<mpsc::Sender<PvField>>>>,
     }
@@ -96,7 +115,9 @@ pub mod ioc_support {
                 next_seed: AtomicU64::new(count as u64),
                 processed_mask: AtomicU64::new(0),
                 expected_mask,
-                field_prefix: Mutex::new("wf".to_string()),
+                field_prefix: OnceLock::new(),
+                expected_desc: OnceLock::new(),
+                dropped_events: AtomicU64::new(0),
                 latest: Arc::new(Mutex::new(None)),
                 subscribers: Arc::new(Mutex::new(Vec::new())),
             }
@@ -119,23 +140,72 @@ pub mod ioc_support {
             Some(data)
         }
 
+        /// Lock the bundle's field-name prefix. Calling this twice with
+        /// different values is a programming error — the second prefix
+        /// would change the wire `FieldDesc` mid-flight and break any
+        /// monitors already negotiated with the first shape.
         fn set_field_prefix(&self, field_prefix: &str) {
-            *self.field_prefix.lock() = field_prefix.to_string();
+            match self.field_prefix.set(field_prefix.to_string()) {
+                Ok(()) => {}
+                Err(_) => {
+                    let existing = self.field_prefix.get().map(String::as_str).unwrap_or("");
+                    if existing != field_prefix {
+                        panic!(
+                            "RandomWaveformShared::set_field_prefix called twice with different \
+                             prefixes ({existing:?} then {field_prefix:?}); the bundle's \
+                             FieldDesc must remain stable after the first publish"
+                        );
+                    }
+                }
+            }
+        }
+
+        fn field_prefix(&self) -> &str {
+            self.field_prefix.get().map(String::as_str).unwrap_or("wf")
+        }
+
+        fn dropped_events(&self) -> u64 {
+            self.dropped_events.load(Ordering::Relaxed)
         }
 
         fn publish_bundle(&self) {
             let payload = {
-                let field_prefix = self.field_prefix.lock().clone();
                 let datasets = self.datasets.lock();
-                build_bundle_payload(&datasets, self.len, &field_prefix)
+                build_bundle_payload(&datasets, self.len, self.field_prefix())
             };
+
+            // Type-stability guard: capture the descriptor on first publish,
+            // refuse to send mismatched shapes afterwards. pvxs
+            // `SharedPV::post` enforces the same invariant.
+            let desc = payload.descriptor();
+            match self.expected_desc.get() {
+                None => {
+                    let _ = self.expected_desc.set(desc);
+                }
+                Some(expected) if expected != &desc => {
+                    eprintln!(
+                        "RandomWaveformShared::publish_bundle: shape changed since first \
+                         publish — dropping payload to keep already-connected monitors valid"
+                    );
+                    return;
+                }
+                Some(_) => {}
+            }
 
             *self.latest.lock() = Some(payload.clone());
 
             let mut subscribers = self.subscribers.lock();
             subscribers.retain(|tx| !tx.is_closed());
             for tx in subscribers.iter() {
-                let _ = tx.try_send(payload.clone());
+                if tx.try_send(payload.clone()).is_err() {
+                    let prev = self.dropped_events.fetch_add(1, Ordering::Relaxed);
+                    if prev == 0 {
+                        eprintln!(
+                            "mini:wf:bundle: dropping monitor event — subscriber queue full \
+                             (further drops counted via dropped_events())"
+                        );
+                    }
+                }
             }
         }
 
@@ -247,13 +317,20 @@ pub mod ioc_support {
     }
 
     impl RandomWaveformFactory {
-        pub fn new(len: usize) -> Self {
-            Self::new_with_count(len, 0)
-        }
-
+        /// `count` must be > 0 and must equal the number of waveform records
+        /// that will be wired through this factory — otherwise the bundle's
+        /// `expected_mask` will never be reached and it will never publish.
         pub fn new_with_count(len: usize, count: usize) -> Self {
+            assert!(
+                count > 0,
+                "RandomWaveformFactory needs count > 0 — bundle never publishes otherwise"
+            );
             Self {
-                counter: Arc::new(AtomicU64::new(0)),
+                // Start the per-instance fallback-data seed range above the
+                // shared dataset's seed range (0..count) so that an
+                // unrecognised record name doesn't accidentally land on the
+                // same sequence as datasets[i].
+                counter: Arc::new(AtomicU64::new(count as u64)),
                 len,
                 shared: Arc::new(RandomWaveformShared::new(len, count)),
             }
@@ -268,6 +345,13 @@ pub mod ioc_support {
             ))
         }
 
+        /// Cumulative count of monitor events that were dropped because a
+        /// subscriber's mpsc queue was full. Useful for benchmark scripts
+        /// to assert no drops happened during a run.
+        pub fn dropped_events(&self) -> u64 {
+            self.shared.dropped_events()
+        }
+
         pub fn register_pva_bundle(&self, pv_name: &str, field_prefix: &str) {
             self.shared.set_field_prefix(field_prefix);
             self.shared.publish_bundle();
@@ -278,6 +362,105 @@ pub mod ioc_support {
                     subscribers: self.shared.subscribers.clone(),
                 },
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn trailing_index_basic() {
+            assert_eq!(trailing_index("mini:wf1"), Some(1));
+            assert_eq!(trailing_index("mini:wf10"), Some(10));
+            assert_eq!(trailing_index("wf01"), Some(1));
+            assert_eq!(trailing_index("123"), Some(123));
+        }
+
+        #[test]
+        fn trailing_index_no_digits() {
+            assert_eq!(trailing_index("mini:wf:bundle"), None);
+            assert_eq!(trailing_index("name"), None);
+            assert_eq!(trailing_index(""), None);
+        }
+
+        #[test]
+        fn mark_processed_publishes_when_all_bits_set() {
+            let shared = RandomWaveformShared::new(4, 3);
+            // No publish before any record processes.
+            assert!(shared.latest.lock().is_none());
+            shared.mark_processed(0);
+            shared.mark_processed(1);
+            assert!(shared.latest.lock().is_none());
+            shared.mark_processed(2);
+            assert!(shared.latest.lock().is_some());
+            // Mask should reset for the next cycle.
+            assert_eq!(shared.processed_mask.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn mark_processed_idempotent_within_cycle() {
+            let shared = RandomWaveformShared::new(2, 2);
+            shared.mark_processed(0);
+            shared.mark_processed(0); // duplicate — should not advance cycle
+            assert!(shared.latest.lock().is_none());
+            shared.mark_processed(1);
+            assert!(shared.latest.lock().is_some());
+        }
+
+        #[test]
+        fn mark_processed_zero_count_is_noop() {
+            // count=0 is rejected by the factory, but the shared layer
+            // must still be safe if invoked directly with expected_mask=0.
+            let shared = RandomWaveformShared::new(1, 0);
+            shared.mark_processed(0);
+            assert!(shared.latest.lock().is_none());
+        }
+
+        #[test]
+        fn set_field_prefix_locks_after_first_call() {
+            let shared = RandomWaveformShared::new(2, 1);
+            shared.set_field_prefix("wf");
+            // Idempotent for the same prefix.
+            shared.set_field_prefix("wf");
+            assert_eq!(shared.field_prefix(), "wf");
+        }
+
+        #[test]
+        #[should_panic(expected = "set_field_prefix called twice")]
+        fn set_field_prefix_rejects_conflict() {
+            let shared = RandomWaveformShared::new(2, 1);
+            shared.set_field_prefix("wf");
+            shared.set_field_prefix("ch"); // panics — would change shape
+        }
+
+        #[test]
+        fn publish_bundle_descriptor_is_stable() {
+            let shared = RandomWaveformShared::new(2, 2);
+            shared.set_field_prefix("wf");
+            shared.publish_bundle();
+            let first = shared
+                .latest
+                .lock()
+                .as_ref()
+                .map(|v| v.descriptor())
+                .unwrap();
+            // Bump some data and republish — descriptor must match.
+            shared.update_data(0);
+            shared.publish_bundle();
+            let second = shared
+                .latest
+                .lock()
+                .as_ref()
+                .map(|v| v.descriptor())
+                .unwrap();
+            assert_eq!(first, second);
+        }
+
+        #[test]
+        #[should_panic(expected = "count > 0")]
+        fn factory_rejects_zero_count() {
+            let _ = RandomWaveformFactory::new_with_count(8, 0);
         }
     }
 }

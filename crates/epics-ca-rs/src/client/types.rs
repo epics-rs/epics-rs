@@ -96,6 +96,16 @@ pub(crate) struct ChannelSnapshotPublic {
 /// Shared snapshot registry. Coordinator publishes; CaChannel reads.
 pub(crate) type ChannelSnapshots = Arc<DashMap<u32, ChannelSnapshotPublic>>;
 
+/// Per-channel SEARCH attempt counter (CA-035 `ca_search_attempts`).
+/// SearchEngine bumps on every fanout call (immediate first SEARCH
+/// after Schedule + each bucket-tick retransmit); one bump per
+/// fanout regardless of how many UDP datagrams the addr_list /
+/// nameserver duplication produces. CaChannel surfaces it via
+/// [`super::CaChannel::search_attempts`]. Entry is removed when
+/// the channel is cancelled or its connection succeeds (matching
+/// libca, which resets attempts on circuit creation).
+pub(crate) type SearchAttempts = Arc<DashMap<u32, std::sync::atomic::AtomicU32>>;
+
 // --- Direct in-flight op registries (Option C) ---
 
 pub(crate) enum ReadReply {

@@ -254,6 +254,11 @@ pub struct CaClient {
     /// once lifecycle has already established the virtual circuit.
     server_writers: DirectServerWriters,
     diagnostics: Arc<CaDiagnostics>,
+    /// Per-channel SEARCH attempt counter — see CA-035
+    /// `ca_search_attempts`. Counts every fanout call (immediate
+    /// first SEARCH AND each bucket-tick retransmit). Search engine
+    /// writes; CaChannel reads via [`CaChannel::search_attempts`].
+    search_attempts: types::SearchAttempts,
     _coordinator: tokio::task::JoinHandle<()>,
     _search_task: tokio::task::JoinHandle<()>,
     _transport_task: tokio::task::JoinHandle<()>,
@@ -491,11 +496,13 @@ impl CaClient {
 
         let (coord_tx, coord_rx) = mpsc::unbounded_channel();
 
+        let search_attempts: types::SearchAttempts = Arc::new(dashmap::DashMap::new());
         let search_task = epics_base_rs::runtime::task::spawn(search::run_search_engine(
             addr_list,
             nameserver_addrs,
             search_rx,
             search_resp_tx,
+            search_attempts.clone(),
         ));
 
         #[cfg(feature = "experimental-rust-tls")]
@@ -550,6 +557,7 @@ impl CaClient {
             snapshots.clone(),
             last_rx_at,
             diagnostics.clone(),
+            search_attempts.clone(),
         ));
 
         let beacon_task = epics_base_rs::runtime::task::spawn(beacon_monitor::run_beacon_monitor(
@@ -565,6 +573,7 @@ impl CaClient {
             snapshots,
             server_writers,
             diagnostics,
+            search_attempts,
             _coordinator: coordinator,
             _search_task: search_task,
             _transport_task: transport_task,
@@ -639,6 +648,7 @@ impl CaClient {
             server_writers: self.server_writers.clone(),
             conn_tx,
             cached_read: Arc::new(Mutex::new(None)),
+            search_attempts: self.search_attempts.clone(),
             _lifecycle: lifecycle,
         }
     }
@@ -917,6 +927,10 @@ pub struct CaChannel {
     /// cache slot — otherwise two clones would each pay the cold-path
     /// once on first use.
     cached_read: Arc<Mutex<Option<CachedRead>>>,
+    /// Shared per-channel SEARCH attempt count (CA-035). Same map
+    /// the SearchEngine bumps on every fanout (immediate + retransmit);
+    /// cleared when the channel transitions to Connected.
+    search_attempts: types::SearchAttempts,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
 }
@@ -945,6 +959,23 @@ impl CaChannel {
             element_count: snap.element_count,
             access_rights: snap.access_rights,
         })
+    }
+
+    /// Number of SEARCH attempts the engine has emitted on behalf of
+    /// this channel since it was last connected. Counts the immediate
+    /// first SEARCH (fired at Schedule time) AND every subsequent
+    /// bucket-tick retransmit. One attempt == one fanout call
+    /// regardless of how many UDP datagrams the addr_list /
+    /// nameserver duplication produces, matching libca
+    /// `ca_search_attempts(chid)` semantics (cadef.h:1907).
+    ///
+    /// Returns 0 for an already-connected channel (the counter is
+    /// cleared on successful CREATE_CHANNEL).
+    pub fn search_attempts(&self) -> u32 {
+        self.search_attempts
+            .get(&self.cid)
+            .map(|e| e.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Phase B fast-path: read the channel's published snapshot without
@@ -1830,6 +1861,7 @@ async fn run_coordinator(
     snapshots: ChannelSnapshots,
     last_rx_at: ServerLastRxAt,
     diag: Arc<CaDiagnostics>,
+    search_attempts: types::SearchAttempts,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
     let mut pending_wait_connected: HashMap<u32, Vec<oneshot::Sender<()>>> = HashMap::new();
@@ -2240,6 +2272,20 @@ async fn run_coordinator(
                             }
                             metrics::counter!("ca_client_connections_total", "server" => server_addr.to_string()).increment(1);
                             metrics::gauge!("ca_client_channels_connected").increment(1.0);
+
+                            // Clear the diagnostic counter SYNCHRONOUSLY here,
+                            // before any waiter wakes or Connected fires. The
+                            // search task also clears via SearchRequest::ConnectResult
+                            // below, but that's an async hop — without this
+                            // synchronous remove, a caller awakened by the
+                            // Connected event and immediately calling
+                            // CaChannel::search_attempts() can briefly observe
+                            // the pre-connect non-zero count, contradicting the
+                            // documented "0 once connected" contract. The map
+                            // is Arc-shared so this remove races nothing the
+                            // search task hasn't already accepted as in-flight
+                            // for cleanup.
+                            search_attempts.remove(&cid);
 
                             // Wake connect waiters
                             for waiter in ch.connect_waiters.drain(..) {

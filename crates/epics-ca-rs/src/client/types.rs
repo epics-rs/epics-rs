@@ -106,6 +106,73 @@ pub(crate) type ChannelSnapshots = Arc<DashMap<u32, ChannelSnapshotPublic>>;
 /// libca, which resets attempts on circuit creation).
 pub(crate) type SearchAttempts = Arc<DashMap<u32, std::sync::atomic::AtomicU32>>;
 
+// --- CA-130 ca_add_exception_event ----------------------------------
+
+/// Out-of-band / unrecoverable error categories surfaced via the
+/// per-client exception handler. Mirrors the C `caEventHandlerArgs`
+/// `op` field — but typed instead of a magic-number enum.
+///
+/// Variants are added when a real dispatch site exists. Adding a
+/// variant without a live source would create a dead API; clients
+/// would `match` on it and never receive the case.
+///
+/// `#[non_exhaustive]` so future variants (e.g. BeaconAnomaly when
+/// that path gets a real source) can be added without breaking
+/// downstream `match` blocks. Clients must include a `_ => …` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CaExceptionKind {
+    /// Server emitted a `CA_PROTO_ERROR` (cmd=11) with a status code
+    /// for an operation that wasn't otherwise routed to a callback.
+    /// `status` carries the ECA code, `message` the optional payload.
+    ServerError,
+    /// Server-initiated channel close (`CA_PROTO_SERVER_DISCONN`).
+    /// Per-op waiters tied to the channel are released with
+    /// `Disconnected`; the handler additionally fires for callers
+    /// who want a global notification stream.
+    ServerDisconnect,
+}
+
+/// Single OOB-error notification delivered to a registered handler.
+///
+/// `#[non_exhaustive]` so additional context fields (e.g. timestamp,
+/// retry-attempt count) can be added without breaking downstream
+/// struct-literal construction. Construct via mutating an instance
+/// from the public API or use functional update on a constructed
+/// value; do not literal-init from the outside.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CaException {
+    pub kind: CaExceptionKind,
+    pub message: String,
+    pub server_addr: Option<SocketAddr>,
+    pub pv_name: Option<String>,
+    /// ECA status code when applicable (server-error path).
+    pub status: Option<u32>,
+}
+
+/// Boxed handler. Returns `()`; logs are emitted regardless so a
+/// handler that panics or is slow can't suppress the existing
+/// tracing diagnostics.
+pub type CaExceptionHandler = Arc<dyn Fn(&CaException) + Send + Sync>;
+
+/// Shared slot for the per-client handler. `parking_lot::RwLock`
+/// keeps the read path lock-free in the common (no handler set)
+/// case after the first install. One slot per CaClient instance —
+/// not a process-global singleton.
+pub(crate) type CaExceptionSlot = Arc<parking_lot::RwLock<Option<CaExceptionHandler>>>;
+
+/// Best-effort dispatch — never panics, even if the handler does.
+pub(crate) fn dispatch_exception(slot: &CaExceptionSlot, exc: CaException) {
+    let handler = slot.read().clone();
+    if let Some(h) = handler {
+        // Catch panics so a buggy handler doesn't poison the
+        // dispatching task. We can't recover the handler's bug but
+        // we can keep the rest of the client functional.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(&exc)));
+    }
+}
+
 // --- Direct in-flight op registries (Option C) ---
 
 pub(crate) enum ReadReply {
@@ -366,8 +433,16 @@ pub(crate) enum TransportEvent {
         cid: u32,
     },
     ServerError {
-        _original_request: Option<u16>,
-        _message: String,
+        /// ECA status code (caerr.h) — the server's resp.cid carries
+        /// this in CA_PROTO_ERROR. This is what `ca_extract_msg_no(stat)`
+        /// would parse on the C side.
+        eca_status: u32,
+        /// Original request command that triggered the error
+        /// (from the first u16 of the error payload's copy of the
+        /// original header). Diagnostic only — distinct from `eca_status`.
+        original_request: Option<u16>,
+        message: String,
+        server_addr: SocketAddr,
     },
     TcpClosed {
         server_addr: SocketAddr,

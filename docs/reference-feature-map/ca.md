@@ -118,7 +118,7 @@ ID prefix `CA-NNN` is stable; new entries append, never renumber.
 
 | ID | Symbol | Header:line | Description |
 |----|--------|-------------|-------------|
-| CA-130 | `ca_add_exception_event` | cadef.h:617 | Register a process-wide handler for unrecoverable / out-of-band errors. |
+| CA-130 | `ca_add_exception_event` | cadef.h:617 | Register a per-context handler for unrecoverable / out-of-band errors. (libca: per-CA-context; epics-ca-rs maps this to per-CaClient.) |
 | CA-131 | `ca_signal` | cadef.h:1406 | Format-and-print an `ECA_xxx` status with the standard library prefix. |
 | CA-132 | `ca_signal_with_file_and_lineno` | cadef.h:1420 | Variant with explicit file/line, used by `SEVCHK` macro. |
 | CA-133 | `ca_signal_formated` | cadef.h:1436 | Variant with printf-style format args. |

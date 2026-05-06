@@ -228,6 +228,10 @@ impl std::fmt::Display for DiagnosticsSnapshot {
 use subscription::SubscriptionRegistry;
 use types::*;
 
+// Public re-exports for the CA-130 exception-handler API. Mirror the
+// pattern already used for DiagnosticsSnapshot.
+pub use types::{CaException, CaExceptionHandler, CaExceptionKind};
+
 /// CA client with persistent channels and auto-reconnection.
 pub struct CaClient {
     search_tx: mpsc::UnboundedSender<SearchRequest>,
@@ -259,6 +263,12 @@ pub struct CaClient {
     /// first SEARCH AND each bucket-tick retransmit). Search engine
     /// writes; CaChannel reads via [`CaChannel::search_attempts`].
     search_attempts: types::SearchAttempts,
+    /// Per-client exception handler slot (CA-130
+    /// `ca_add_exception_event`). Scope is this CaClient instance —
+    /// each client owns its own slot. Internal sites call
+    /// [`types::dispatch_exception`] for OOB / unrecoverable errors;
+    /// callers register via [`CaClient::set_exception_handler`].
+    exception_slot: types::CaExceptionSlot,
     _coordinator: tokio::task::JoinHandle<()>,
     _search_task: tokio::task::JoinHandle<()>,
     _transport_task: tokio::task::JoinHandle<()>,
@@ -546,6 +556,8 @@ impl CaClient {
         };
 
         let diagnostics = Arc::new(CaDiagnostics::default());
+        let exception_slot: types::CaExceptionSlot =
+            Arc::new(parking_lot::RwLock::new(None));
 
         let coordinator = epics_base_rs::runtime::task::spawn(run_coordinator(
             coord_rx,
@@ -557,6 +569,7 @@ impl CaClient {
             snapshots.clone(),
             last_rx_at,
             diagnostics.clone(),
+            exception_slot.clone(),
             search_attempts.clone(),
         ));
 
@@ -574,6 +587,7 @@ impl CaClient {
             server_writers,
             diagnostics,
             search_attempts,
+            exception_slot,
             _coordinator: coordinator,
             _search_task: search_task,
             _transport_task: transport_task,
@@ -584,6 +598,40 @@ impl CaClient {
     /// Get a snapshot of diagnostic counters.
     pub fn diagnostics(&self) -> DiagnosticsSnapshot {
         self.diagnostics.snapshot()
+    }
+
+    /// Register a per-client handler for out-of-band errors —
+    /// the Rust analog of libca `ca_add_exception_event` (cadef.h:617).
+    /// Scope is the calling [`CaClient`] instance; each client owns
+    /// its own slot.
+    ///
+    /// Currently dispatches on:
+    /// - `CaExceptionKind::ServerError` — server emitted
+    ///   `CA_PROTO_ERROR` (cmd=11) for an op not routed to a callback.
+    /// - `CaExceptionKind::ServerDisconnect` — server emitted
+    ///   `CA_PROTO_SERVER_DISCONN` for a known channel.
+    ///
+    /// Routine per-operation errors (timeouts, type mismatches) are
+    /// returned through the operation's `Result` and do **not** fire
+    /// the handler. Startup config / TLS errors surface through
+    /// [`CaClient::new`]'s `Result` since the slot does not yet exist.
+    ///
+    /// At most one handler is registered at a time; calling again
+    /// replaces. Returns the previous handler if present so callers
+    /// can chain.
+    pub fn set_exception_handler<F>(&self, f: F) -> Option<types::CaExceptionHandler>
+    where
+        F: Fn(&types::CaException) + Send + Sync + 'static,
+    {
+        let new = Arc::new(f);
+        let mut slot = self.exception_slot.write();
+        std::mem::replace(&mut *slot, Some(new))
+    }
+
+    /// Drop the registered handler. Subsequent OOB errors will only
+    /// surface through `tracing::error!` (the default behaviour).
+    pub fn clear_exception_handler(&self) -> Option<types::CaExceptionHandler> {
+        self.exception_slot.write().take()
     }
 
     /// Number of distinct CA servers this client currently holds an
@@ -1861,6 +1909,7 @@ async fn run_coordinator(
     snapshots: ChannelSnapshots,
     last_rx_at: ServerLastRxAt,
     diag: Arc<CaDiagnostics>,
+    exception_slot: types::CaExceptionSlot,
     search_attempts: types::SearchAttempts,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
@@ -2382,8 +2431,37 @@ async fn run_coordinator(
                             }
                         }
                     }
-                    TransportEvent::ServerError { .. } => {
-                        // Logged in transport layer; no further action needed
+                    TransportEvent::ServerError {
+                        eca_status,
+                        original_request,
+                        message,
+                        server_addr,
+                    } => {
+                        // Already logged in transport layer; surface
+                        // through the exception handler if registered.
+                        // CaException.status is the ECA code (libca
+                        // parity); the original request cmd goes into
+                        // the message text as diagnostic context.
+                        let annotated = match original_request {
+                            Some(cmd) => {
+                                if message.is_empty() {
+                                    format!("(while processing cmd={cmd})")
+                                } else {
+                                    format!("{message} (while processing cmd={cmd})")
+                                }
+                            }
+                            None => message,
+                        };
+                        types::dispatch_exception(
+                            &exception_slot,
+                            types::CaException {
+                                kind: types::CaExceptionKind::ServerError,
+                                message: annotated,
+                                server_addr: Some(server_addr),
+                                pv_name: None,
+                                status: Some(eca_status),
+                            },
+                        );
                     }
                     TransportEvent::TcpClosed { server_addr } => {
                         let n_affected = server_channels
@@ -2416,6 +2494,7 @@ async fn run_coordinator(
                                 snapshots.remove(&cid);
                                 let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
 
+                                let pv_name = ch.pv_name.to_string();
                                 let cids = vec![cid];
                                 let cleared = subscriptions.mark_disconnected(&cids);
                                 for (addr, count) in cleared {
@@ -2435,9 +2514,21 @@ async fn run_coordinator(
                                 // Re-search
                                 let _ = search_tx.send(SearchRequest::Schedule {
                                     cid,
-                                    pv_name: ch.pv_name.to_string(),
+                                    pv_name: pv_name.clone(),
                                     reason: SearchReason::Reconnect,
                                 });
+
+                                // CA-130: surface to per-client handler.
+                                types::dispatch_exception(
+                                    &exception_slot,
+                                    types::CaException {
+                                        kind: types::CaExceptionKind::ServerDisconnect,
+                                        message: "server-initiated channel close".to_string(),
+                                        server_addr: Some(server_addr),
+                                        pv_name: Some(pv_name),
+                                        status: None,
+                                    },
+                                );
                             }
                         }
                     }

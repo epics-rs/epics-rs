@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.14.2 — 2026-05-06
+
+Patch follow-up to v0.14.1. The headline fix is a PVA client search
+parity bump: a remote peer that claims `0.0.0.0` or `127.0.0.1` as
+its server address in the SEARCH_RESPONSE no longer drives the
+client into ECONNREFUSED.
+
+### epics-pva-rs (client)
+
+- **fix**: peer-aware `rewrite_loopback` in the search engine. The
+  UDP source address (peer) is now plumbed through
+  `handle_search_response` and into `rewrite_loopback`, which
+  substitutes the peer's IP whenever the wire-supplied server
+  address is unspecified **or** loopback and the packet came from
+  a non-loopback peer; loopback peers still fall back to
+  `127.0.0.1`. Symptom: `pvget` against a remote Soft IOC bound to
+  `INADDR_ANY` (or a pvAccessCPP server configured via
+  `EPICS_PVAS_INTF_ADDR_LIST=127.0.0.1`) failed with
+  `Connection Refused` on the connect because the previous
+  `rewrite_loopback(addr)` blindly mapped the unspecified address
+  to `127.0.0.1`. This goes beyond pvxs/pvAccessCPP parity:
+  pvxs `procSearchReply` (client.cpp:842-843) and pvAccessCPP
+  `SearchResponseHandler` (clientContextImpl.cpp:2626-2627) only
+  rewrite `INADDR_ANY`; neither overrides explicit-loopback wire
+  claims. The Rust client now does, on the assumption that a
+  non-loopback peer cannot truthfully claim `127.0.0.1` as its
+  reachable address.
+- **test**: replace `rewrite_loopback_replaces_unspecified` (which
+  asserted the old `→ LOCALHOST` behaviour and would have panicked
+  under the new logic) with four targeted tests pinning each
+  branch of the rewrite truth table:
+  unspecified+remote-peer / unspecified+loopback-peer /
+  explicit-loopback+remote-peer / explicit-loopback+loopback-peer.
+- **style**: drop a `needless_return` introduced by the parent
+  fix; `rewrite_loopback` is now an `if`/`else` expression.
+  `cargo clippy --workspace --all-targets -- -D warnings` is
+  green again.
+
+### epics-bridge-rs
+
+- **docs**: rephrase `PvaPvHandle` and the `PVA_PV_REGISTRY` doc
+  comments. The registry hosts native PVA PVs produced by IOC
+  code (NTNDArray, aggregate benchmark bundles, …), not only
+  areaDetector NDPluginPva handles. No behaviour change.
+
+### examples/mini-beamline (`publish = false`)
+
+- **add**: native PVA waveform bundle. A 1 Hz publisher emits a
+  unified `NTAggregate`-shaped structure (`mb:wfX:bundle`) plus
+  per-record CA aliases. Demonstrates the bridge-rs native PVA
+  registry path end-to-end.
+- **fix**: type-stability + drop counting after a code review
+  against pvxs `SharedPV` semantics. Field-name prefix and bundle
+  `FieldDesc` are locked via `OnceLock` after the first publish;
+  later mismatches are dropped with a log. `dropped_events`
+  atomic counts `tx.try_send` failures so bench scripts can
+  assert no silent loss. 9 unit tests cover trailing-index
+  edges, `mark_processed` cycling, descriptor stability, and
+  factory zero-count rejection.
+
 ## v0.14.1 — 2026-05-04
 
 Performance follow-up to v0.14.0. Bulk CA reads (`bulk_caget`,

@@ -649,6 +649,43 @@ impl PvaClient {
         op_put(&ch, value_str, self.inner.timeout).await
     }
 
+    /// Value-only read-modify-write — fetch the channel's `.value`
+    /// subfield, hand it to `build` as a mutable [`PvField`], then PUT
+    /// the modified value back. Mirrors pvxs
+    /// `PutBuilder::fetchPresent(true).build(cb)` (PVA-065). Returns
+    /// the closure's error wrapped in [`PvaError::InvalidValue`] when
+    /// the user signals a problem.
+    ///
+    /// Use this when the put depends on the current value (toggle a
+    /// bit, increment a counter, splice into an array) — the read +
+    /// the write share the same channel handle so reconnect-mid-RMW
+    /// is the only edge case the caller has to think about (it's
+    /// reported the same way as any other transient PvaError).
+    ///
+    /// **Scope**: closure sees and round-trips the `.value` field
+    /// only. Modifications to `alarm`, `timeStamp`, `display`, or
+    /// any other structure subfield are NOT persisted — the PUT
+    /// pvRequest is `field(value)` to match pvxs `Put` semantics
+    /// (and avoid silently writing back stale alarm/severity).
+    /// Use [`Self::pvput_field`] if you need to put non-value
+    /// subfields.
+    pub async fn pvput_build<F>(&self, pv_name: &str, build: F) -> PvaResult<()>
+    where
+        F: FnOnce(&mut crate::pvdata::PvField) -> Result<(), String>,
+    {
+        let ch = self.channel(pv_name).await?;
+        // Fetch only `.value` so the closure sees exactly what the
+        // subsequent op_put_value will round-trip — alarm/timeStamp/
+        // etc. are out of scope and would be silently dropped at PUT
+        // time if the closure touched them.
+        let (_intro, mut value) =
+            crate::client_native::ops_v2::op_get(&ch, &["value"], self.inner.timeout).await?;
+        if let Err(msg) = build(&mut value) {
+            return Err(crate::error::PvaError::InvalidValue(msg));
+        }
+        crate::client_native::ops_v2::op_put_value(&ch, &value, self.inner.timeout).await
+    }
+
     /// PUT a single dotted-path field of the channel's structure.
     /// pvxs `Context::put(name).set(field_path, value).exec()`
     /// parity. Examples:

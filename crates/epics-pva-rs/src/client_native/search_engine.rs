@@ -1323,9 +1323,10 @@ fn handle_beacon(
 fn rewrite_loopback(addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
     if addr.ip().is_unspecified() || addr.ip().is_loopback() {
         if !peer.ip().is_loopback() {
-            return SocketAddr::new(peer.ip(), addr.port());
+            SocketAddr::new(peer.ip(), addr.port())
+        } else {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
         }
-        return SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
     } else {
         addr
     }
@@ -1355,11 +1356,46 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_loopback_replaces_unspecified() {
+    fn rewrite_loopback_unspecified_uses_remote_peer() {
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5075);
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5076);
         let r = rewrite_loopback(a, peer);
-        assert_eq!(r.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            r,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5075)
+        );
+    }
+
+    #[test]
+    fn rewrite_loopback_unspecified_with_loopback_peer_falls_back_to_localhost() {
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5075);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076);
+        let r = rewrite_loopback(a, peer);
+        assert_eq!(r, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075));
+    }
+
+    // Extends pvxs `procSearchReply`, which only rewrites `isAny()`. A
+    // pvAccessCPP server bound via `EPICS_PVAS_INTF_ADDR_LIST=127.0.0.1`
+    // emits a literal 127.0.0.1 in its search reply; treat the wire
+    // address as unreliable when the UDP packet came from a non-loopback
+    // peer.
+    #[test]
+    fn rewrite_loopback_explicit_loopback_overridden_by_remote_peer() {
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5076);
+        let r = rewrite_loopback(a, peer);
+        assert_eq!(
+            r,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5075)
+        );
+    }
+
+    #[test]
+    fn rewrite_loopback_explicit_loopback_kept_for_loopback_peer() {
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076);
+        let r = rewrite_loopback(a, peer);
+        assert_eq!(r, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075));
     }
 
     /// pvxs `Channel::disconnect` (client.cpp:213) parity: a

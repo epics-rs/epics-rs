@@ -17,6 +17,20 @@ pub fn serialize_dbr(
     severity: u16,
     timestamp: SystemTime,
 ) -> CaResult<Vec<u8>> {
+    // DBR_CLASS_NAME (38) carries a single 40-byte string with the
+    // record's recordType. The metadata-free encoding mirrors the C
+    // `dbChannel_classify` reply path. `value` here is expected to
+    // already be a String. Used only by `serialize_dbr` callers; the
+    // server-driven path (`encode_dbr`) reads `Snapshot::class_name`.
+    if dbr_type == super::DBR_CLASS_NAME {
+        let mut buf = [0u8; 40];
+        if let EpicsValue::String(s) = value {
+            let bytes = s.as_bytes();
+            let len = bytes.len().min(39);
+            buf[..len].copy_from_slice(&bytes[..len]);
+        }
+        return Ok(buf.to_vec());
+    }
     let native = super::native_type_for_dbr(dbr_type)?;
     let val_bytes = convert_and_serialize(native, value)?;
     match dbr_type {
@@ -182,6 +196,21 @@ pub fn encode_dbr(
     dbr_type: u16,
     snapshot: &crate::server::snapshot::Snapshot,
 ) -> CaResult<Vec<u8>> {
+    // CLASS_NAME (38) emits a fixed 40-byte string from
+    // snapshot.class_name and ignores snapshot.value entirely.
+    // Early-return BEFORE convert_and_serialize so a waveform PV's
+    // value (potentially N elements wide) is not Display'd into a
+    // throwaway joined string. Mirrors the same shortcut in
+    // serialize_dbr (line ~25).
+    if dbr_type == super::DBR_CLASS_NAME {
+        let mut buf = [0u8; 40];
+        if let Some(ref name) = snapshot.class_name {
+            let bytes = name.as_bytes();
+            let len = bytes.len().min(39);
+            buf[..len].copy_from_slice(&bytes[..len]);
+        }
+        return Ok(buf.to_vec());
+    }
     let native = super::native_type_for_dbr(dbr_type)?;
     let val_bytes = convert_and_serialize(native, &snapshot.value)?;
     let status = snapshot.alarm.status;
@@ -213,6 +242,7 @@ pub fn encode_dbr(
             buf.extend_from_slice(&val_bytes);
             Ok(buf)
         }
+        // CLASS_NAME (38) handled by the early-return above.
         _ => Err(CaError::UnsupportedType(dbr_type)),
     }
 }
@@ -529,6 +559,28 @@ fn epics_secs_to_system_time(secs: u32, nanos: u32) -> SystemTime {
 /// This is the inverse of `encode_dbr()`. It parses status/severity, timestamp,
 /// display/control metadata, and the value payload from the raw bytes.
 pub fn decode_dbr(dbr_type: u16, data: &[u8], count: usize) -> CaResult<Snapshot> {
+    // DBR_CLASS_NAME (38): a fixed-40-byte string with the record's
+    // recordType. Decoded into Snapshot.class_name so callers can read
+    // it without touching `value` (which stays empty/Default).
+    // Strict length check — a short payload is a malformed CA frame,
+    // not a partial result we should silently truncate to garbage.
+    if dbr_type == super::DBR_CLASS_NAME {
+        if data.len() < 40 {
+            return Err(CaError::Protocol(format!(
+                "DBR_CLASS_NAME requires 40-byte payload, got {}",
+                data.len()
+            )));
+        }
+        let name = read_string(data, 0, 40);
+        let mut snap = Snapshot::new(
+            EpicsValue::String(name.clone()),
+            0,
+            0,
+            SystemTime::UNIX_EPOCH,
+        );
+        snap.class_name = Some(name);
+        return Ok(snap);
+    }
     let native = super::native_type_for_dbr(dbr_type)?;
     match dbr_type {
         0..=6 => {

@@ -1191,6 +1191,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             }
 
+            // For DBR_CLASS_NAME (38) substitute the record's recordType
+            // into the response. SimplePv channels have no record-type
+            // identity so they receive an empty string (which matches
+            // what the C IOC does for in-process DBR_CLASS_NAME reads
+            // against synthetic channels).
+            if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                if let ChannelTarget::RecordField { record, .. } = &entry.target {
+                    let inst = record.read().await;
+                    snapshot.class_name = Some(inst.record.record_type().to_string());
+                }
+            }
+
             let data = match encode_dbr(requested_type, &snapshot) {
                 Ok(d) => d,
                 Err(_) => {
@@ -1207,7 +1219,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     return Ok(());
                 }
             };
-            let element_count = snapshot.value.count() as u32;
+            // CA-268: DBR_CLASS_NAME wire payload is always one fixed
+            // 40-byte string. element_count must be 1 regardless of
+            // the underlying record's value count — for waveform
+            // records, snapshot.value.count() can be N, which would
+            // make C clients parse 40 * N bytes of body and fail.
+            let element_count = if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                1
+            } else {
+                snapshot.value.count() as u32
+            };
             let mut padded = data;
             padded.resize(align8(padded.len()), 0);
 
@@ -1644,7 +1665,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         };
 
                         // Send initial value with full metadata
-                        if let Some(snap) = instance.snapshot_for_field(field) {
+                        if let Some(mut snap) = instance.snapshot_for_field(field) {
+                            // CA-268 monitor parity: GET path on
+                            // DBR_CLASS_NAME populates class_name from
+                            // record_type; the EVENT_ADD initial must
+                            // do the same so the first frame carries
+                            // the expected string instead of an empty
+                            // 40-byte pad.
+                            if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                                snap.class_name =
+                                    Some(instance.record.record_type().to_string());
+                            }
                             send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
                         }
 
@@ -1674,12 +1705,35 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     };
                                     event = coalesced;
                                 }
+                                // CA-268 monitor parity: populate
+                                // class_name on every emitted event so
+                                // a `ca_create_subscription` against
+                                // DBR_CLASS_NAME sees the record_type
+                                // string instead of an empty 40-byte
+                                // pad.
+                                if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                                    event.snapshot.class_name = Some(
+                                        record_for_task
+                                            .read()
+                                            .await
+                                            .record
+                                            .record_type()
+                                            .to_string(),
+                                    );
+                                }
                                 let payload_bytes =
                                     match encode_dbr(requested_type, &event.snapshot) {
                                         Ok(bytes) => bytes,
                                         Err(_) => break,
                                     };
-                                let element_count = event.snapshot.value.count() as u32;
+                                // CA-268: see GET path note — fixed 1.
+                                let element_count = if requested_type
+                                    == epics_base_rs::types::DBR_CLASS_NAME
+                                {
+                                    1
+                                } else {
+                                    event.snapshot.value.count() as u32
+                                };
                                 let mut padded = payload_bytes;
                                 padded.resize(align8(padded.len()), 0);
 
@@ -1884,7 +1938,13 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
     snapshot: &epics_base_rs::server::snapshot::Snapshot,
 ) -> CaResult<()> {
     let data = encode_dbr(data_type, snapshot)?;
-    let element_count = snapshot.value.count() as u32;
+    // CA-268: DBR_CLASS_NAME wire payload is always one 40-byte
+    // string regardless of underlying value count.
+    let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
+        1
+    } else {
+        snapshot.value.count() as u32
+    };
     let mut padded = data;
     padded.resize(align8(padded.len()), 0);
 

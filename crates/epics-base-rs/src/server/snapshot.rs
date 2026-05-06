@@ -47,7 +47,14 @@ pub struct EnumInfo {
 }
 
 /// Unified internal state representation for a PV read.
+///
+/// `#[non_exhaustive]` so future field additions (e.g. another DBR
+/// variant's metadata, a new pvxs-style annotation) don't break
+/// external code that constructs `Snapshot` via struct literal.
+/// Internal call sites use `Snapshot::new` + field assignment; that
+/// pattern is forward-compatible.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Snapshot {
     pub value: EpicsValue,
     pub alarm: AlarmInfo,
@@ -57,6 +64,11 @@ pub struct Snapshot {
     pub enums: Option<EnumInfo>,
     /// Timestamp user tag (from Q:time:tag info, nsec LSB splitting).
     pub user_tag: i32,
+    /// IOC record-type class name. Populated by the server before
+    /// encoding a `DBR_CLASS_NAME` (38) response so the client receives
+    /// the actual recordType (`ai`, `bo`, `waveform`, …) rather than an
+    /// empty string. `None` for non-record-backed channels.
+    pub class_name: Option<String>,
 }
 
 impl Snapshot {
@@ -75,6 +87,7 @@ impl Snapshot {
             control: None,
             enums: None,
             user_tag: 0,
+            class_name: None,
         }
     }
 }

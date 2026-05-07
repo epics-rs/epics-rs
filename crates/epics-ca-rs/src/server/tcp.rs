@@ -1673,8 +1673,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             // the expected string instead of an empty
                             // 40-byte pad.
                             if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                                snap.class_name =
-                                    Some(instance.record.record_type().to_string());
+                                snap.class_name = Some(instance.record.record_type().to_string());
                             }
                             send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
                         }
@@ -1727,13 +1726,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                         Err(_) => break,
                                     };
                                 // CA-268: see GET path note — fixed 1.
-                                let element_count = if requested_type
-                                    == epics_base_rs::types::DBR_CLASS_NAME
-                                {
-                                    1
-                                } else {
-                                    event.snapshot.value.count() as u32
-                                };
+                                let element_count =
+                                    if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                                        1
+                                    } else {
+                                        event.snapshot.value.count() as u32
+                                    };
                                 let mut padded = payload_bytes;
                                 padded.resize(align8(padded.len()), 0);
 

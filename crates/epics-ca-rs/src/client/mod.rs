@@ -556,8 +556,7 @@ impl CaClient {
         };
 
         let diagnostics = Arc::new(CaDiagnostics::default());
-        let exception_slot: types::CaExceptionSlot =
-            Arc::new(parking_lot::RwLock::new(None));
+        let exception_slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(None));
 
         let coordinator = epics_base_rs::runtime::task::spawn(run_coordinator(
             coord_rx,

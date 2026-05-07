@@ -486,14 +486,8 @@ mod tests {
     fn intf_and_ignore_addr_lists_expand_dollar_vars() {
         unsafe {
             std::env::set_var("EPICS_RS_AUDIT_IFACE", "127.0.0.1");
-            std::env::set_var(
-                "EPICS_PVA_INTF_ADDR_LIST",
-                "$(EPICS_RS_AUDIT_IFACE)",
-            );
-            std::env::set_var(
-                "EPICS_PVAS_INTF_ADDR_LIST",
-                "${EPICS_RS_AUDIT_IFACE}",
-            );
+            std::env::set_var("EPICS_PVA_INTF_ADDR_LIST", "$(EPICS_RS_AUDIT_IFACE)");
+            std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "${EPICS_RS_AUDIT_IFACE}");
             std::env::set_var(
                 "EPICS_PVAS_IGNORE_ADDR_LIST",
                 "$(EPICS_RS_AUDIT_IFACE):5076",

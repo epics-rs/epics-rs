@@ -115,6 +115,25 @@ struct ServerConnection {
     _write_task: tokio::task::JoinHandle<()>,
 }
 
+/// Hard-stop on drop: abort both the per-server read and write tasks.
+/// Without this, every code path that drops a `ServerConnection` (the
+/// `connections.remove` on send-buffer stall in `send_frame`, the
+/// implicit HashMap drop when `run_transport_manager` returns or its
+/// task is aborted) would detach the inner JoinHandles, leaving the
+/// per-server read/write tasks running until process exit. The
+/// `read_task` holds a clone of `write_tx` and the `pending_frames`
+/// Arc, so detaching it keeps the writer alive too. The companion
+/// `CaClient::Drop` only aborts the four top-level tasks
+/// (`coordinator` / `search` / `transport` / `beacon`); without this
+/// `impl Drop`, aborting the transport manager would not cascade to
+/// the per-circuit tasks it owns.
+impl Drop for ServerConnection {
+    fn drop(&mut self) {
+        self._read_task.abort();
+        self._write_task.abort();
+    }
+}
+
 /// Per-task transport manager.
 ///
 /// `in_flight` is the Option-C Phase-A shared in-flight read/write
@@ -1308,5 +1327,76 @@ mod read_loop_tests {
         assert_eq!(frame.len(), CaHeader::SIZE);
 
         task.abort();
+    }
+}
+
+#[cfg(test)]
+mod server_connection_drop_tests {
+    //! Verifies the per-circuit `ServerConnection::drop` aborts both
+    //! its read and write tasks. Without this, every `connections`
+    //! HashMap drop path (send-buffer-stall removal, transport
+    //! manager exit, `CaClient::drop`) would detach the JoinHandles
+    //! and leave the spawned per-server tasks running until process
+    //! exit. The companion `CaClient::Drop` only aborts top-level
+    //! tasks (coordinator / search / transport / beacon); this
+    //! per-connection Drop is what makes the cascade complete.
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn drop_aborts_read_and_write_tasks() {
+        // Long-running dummy tasks that never complete on their own.
+        let read_task = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        let write_task = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        // AbortHandle sticks around after the JoinHandle is moved
+        // into ServerConnection — lets us observe the post-drop
+        // task state.
+        let read_abort = read_task.abort_handle();
+        let write_abort = write_task.abort_handle();
+
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (beacon_arrival_tx, _ba_rx) = mpsc::unbounded_channel::<bool>();
+
+        let conn = ServerConnection {
+            write_tx,
+            pending_frames: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            beacon_arrival_tx,
+            _read_task: read_task,
+            _write_task: write_task,
+        };
+
+        // Pre-drop: tasks are still running.
+        assert!(!read_abort.is_finished());
+        assert!(!write_abort.is_finished());
+
+        drop(conn);
+
+        // tokio's abort schedules cancellation; let the runtime
+        // drain it.
+        for _ in 0..50 {
+            if read_abort.is_finished() && write_abort.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        assert!(
+            read_abort.is_finished(),
+            "ServerConnection::drop must abort _read_task"
+        );
+        assert!(
+            write_abort.is_finished(),
+            "ServerConnection::drop must abort _write_task"
+        );
     }
 }

@@ -905,6 +905,87 @@ impl CaClient {
     }
 }
 
+/// libca `cac::~cac` parity: best-effort graceful drain on drop.
+///
+/// libca's destructor walks every `tcpiiu` (per-circuit object) and
+/// signals shutdown — the send thread flushes pending writes
+/// (including the `ClearChannel` frames `ca_context_destroy` emits
+/// for every operational channel) before exit, then `pthread_join`
+/// waits for both per-circuit threads to actually finish. The result:
+/// servers learn their channels are gone *immediately* via wire
+/// `ClearChannel`, rather than discovering it via TCP RST + their
+/// own watchdog.
+///
+/// We approximate the same outcome despite tokio's sync `Drop`:
+///   * If a runtime is reachable, spawn a detached cleanup task that
+///     sends `CoordRequest::Shutdown` (the coordinator's handler at
+///     line ~2160 emits `ClearChannel` for every operational channel
+///     before returning) and awaits the reply with a 2-s ceiling.
+///     Once the reply lands, abort the four top-level tasks. Aborts
+///     cascade through the `connections` HashMap → `ServerConnection`
+///     Drop → per-circuit read/write tasks.
+///   * If no runtime is reachable (Drop on a non-tokio thread, or
+///     after the runtime has begun shutting down), abort the four
+///     handles directly. No graceful drain — same fallback as before
+///     this elaboration.
+///
+/// Residual differences from libca that this can't bridge in a sync
+/// `Drop` body:
+///   * Tokio's `JoinHandle::abort` is cooperative cancellation at the
+///     next `.await`, not pthread cancellation. Tasks blocked on a
+///     non-yielding system call (rare here — every loop has a recv
+///     await) would not unblock immediately. libca achieves the same
+///     by closing the socket; tokio's drop of the socket on cancel
+///     is functionally equivalent.
+///   * The detached cleanup task itself is at the runtime's mercy:
+///     if the runtime tears down before the cleanup task completes,
+///     it gets aborted mid-shutdown. Callers that need GUARANTEED
+///     graceful drain must still call `client.shutdown().await`
+///     before dropping; that path is bounded by the caller's own
+///     await and not by Drop's best effort.
+///   * `ServerConnection::Drop` aborts read/write per-circuit tasks
+///     immediately. We don't drain pending write_tx queues at
+///     per-circuit teardown — the `ClearChannel` frames are queued
+///     into `transport_tx` at the coord level and forwarded to
+///     write_loop, but we don't explicitly wait for write_loop to
+///     flush. This is the same trade-off libca's pre-`SO_LINGER`
+///     behaviour makes: the kernel send buffer + RST handles
+///     last-mile delivery from the server's perspective.
+impl Drop for CaClient {
+    fn drop(&mut self) {
+        let coord_tx = self.coord_tx.clone();
+        let coord_abort = self._coordinator.abort_handle();
+        let search_abort = self._search_task.abort_handle();
+        let transport_abort = self._transport_task.abort_handle();
+        let beacon_abort = self._beacon_task.abort_handle();
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                let (tx, rx) = oneshot::channel();
+                if coord_tx
+                    .send(CoordRequest::Shutdown { reply: tx })
+                    .is_ok()
+                {
+                    // Bounded so a wedged coordinator doesn't keep
+                    // the cleanup task alive indefinitely.
+                    let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+                }
+                coord_abort.abort();
+                transport_abort.abort();
+                search_abort.abort();
+                beacon_abort.abort();
+            });
+        } else {
+            // No runtime to drive the graceful sequence — fall back
+            // to immediate abort to at least guarantee no task leak.
+            self._coordinator.abort();
+            self._transport_task.abort();
+            self._search_task.abort();
+            self._beacon_task.abort();
+        }
+    }
+}
+
 /// A persistent CA channel with auto-reconnection.
 /// Per-channel lifecycle guard. Holds the coordinator sender so a
 /// `DropChannel` request fires exactly once — when the last

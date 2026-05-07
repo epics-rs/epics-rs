@@ -1055,6 +1055,15 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     let _ = event_tx.send(TransportEvent::ChannelCreateFailed { cid: hdr.cid });
                 }
                 CA_PROTO_ERROR => {
+                    // CA_PROTO_ERROR wire layout (server send_ca_error):
+                    //   resp.cid = ECA status code (caerr.h)
+                    //   payload  = original 16-byte header copy + msg
+                    // hdr is the response header — hdr.cid carries the
+                    // ECA status. The first u16 of the payload is the
+                    // original request's CMD byte (READ_NOTIFY etc.),
+                    // useful as diagnostic context but distinct from
+                    // the ECA code.
+                    let eca_status = hdr.cid;
                     let orig_cmd = if actual_post >= 16 {
                         let orig_hdr_bytes = &accumulated[data_start..data_start + 16];
                         Some(u16::from_be_bytes([orig_hdr_bytes[0], orig_hdr_bytes[1]]))
@@ -1078,13 +1087,16 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // formatting (color, prefix, structured fields).
                     tracing::error!(
                         server = %server_addr,
+                        eca = eca_status,
                         cmd = ?orig_cmd,
                         msg = %msg,
                         "CA server error",
                     );
                     let _ = event_tx.send(TransportEvent::ServerError {
-                        _original_request: orig_cmd,
-                        _message: msg,
+                        eca_status,
+                        original_request: orig_cmd,
+                        message: msg,
+                        server_addr,
                     });
                 }
                 CA_PROTO_SERVER_DISCONN => {

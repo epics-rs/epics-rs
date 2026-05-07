@@ -188,8 +188,12 @@ impl SearchEngine {
             "YES" | "Y" | "1" | "TRUE"
         );
         let env_addrs = std::env::var("EPICS_PVA_ADDR_LIST").ok();
+        // PVA-466: expand $(VAR) before checking emptiness so an
+        // unset macro collapses to "" and the no-destinations
+        // warning fires correctly.
         let env_has_dest = env_addrs
             .as_deref()
+            .map(|s| crate::config::env::expand_dollar_vars(s))
             .map(|s| {
                 s.split(|c: char| c == ',' || c.is_whitespace())
                     .any(|t| !t.trim().is_empty())
@@ -410,6 +414,11 @@ pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4) {
     let Ok(env) = std::env::var("EPICS_PVA_ADDR_LIST") else {
         return;
     };
+    // PVA-466: expand $(VAR) so multicast joins for templated addrs
+    // (e.g. EPICS_PVA_ADDR_LIST="$(MCAST_GROUP):5076") resolve
+    // consistently with the active-SEARCH path which already
+    // expands via parse_addr_list_with_port.
+    let env = crate::config::env::expand_dollar_vars(&env);
     for tok in env.split(|c: char| c == ',' || c.is_whitespace()) {
         let tok = tok.trim();
         if tok.is_empty() {

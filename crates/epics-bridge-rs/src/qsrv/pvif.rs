@@ -624,28 +624,23 @@ mod tests {
     use epics_base_rs::server::snapshot::{AlarmInfo, EnumInfo, Snapshot};
 
     fn test_snapshot(value: EpicsValue) -> Snapshot {
-        Snapshot {
-            value,
-            alarm: AlarmInfo::default(),
-            timestamp: UNIX_EPOCH,
-            display: Some(DisplayInfo {
-                units: "degC".into(),
-                precision: 3,
-                upper_disp_limit: 100.0,
-                lower_disp_limit: 0.0,
-                upper_alarm_limit: 90.0,
-                upper_warning_limit: 80.0,
-                lower_warning_limit: 10.0,
-                lower_alarm_limit: 5.0,
-                ..Default::default()
-            }),
-            control: Some(ControlInfo {
-                upper_ctrl_limit: 100.0,
-                lower_ctrl_limit: 0.0,
-            }),
-            enums: None,
-            user_tag: 0,
-        }
+        let mut snap = Snapshot::new(value, 0, 0, UNIX_EPOCH);
+        snap.display = Some(DisplayInfo {
+            units: "degC".into(),
+            precision: 3,
+            upper_disp_limit: 100.0,
+            lower_disp_limit: 0.0,
+            upper_alarm_limit: 90.0,
+            upper_warning_limit: 80.0,
+            lower_warning_limit: 10.0,
+            lower_alarm_limit: 5.0,
+            ..Default::default()
+        });
+        snap.control = Some(ControlInfo {
+            upper_ctrl_limit: 100.0,
+            lower_ctrl_limit: 0.0,
+        });
+        snap
     }
 
     #[test]
@@ -705,17 +700,10 @@ mod tests {
 
     #[test]
     fn nt_enum_structure() {
-        let snap = Snapshot {
-            value: EpicsValue::Enum(1),
-            alarm: AlarmInfo::default(),
-            timestamp: UNIX_EPOCH,
-            display: None,
-            control: None,
-            enums: Some(EnumInfo {
-                strings: vec!["Off".into(), "On".into()],
-            }),
-            user_tag: 0,
-        };
+        let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, UNIX_EPOCH);
+        snap.enums = Some(EnumInfo {
+            strings: vec!["Off".into(), "On".into()],
+        });
         let pv = snapshot_to_nt_enum(&snap);
 
         assert_eq!(pv.struct_id, "epics:nt/NTEnum:1.0");
@@ -759,17 +747,10 @@ mod tests {
 
     #[test]
     fn put_roundtrip_enum() {
-        let snap = Snapshot {
-            value: EpicsValue::Enum(2),
-            alarm: AlarmInfo::default(),
-            timestamp: UNIX_EPOCH,
-            display: None,
-            control: None,
-            enums: Some(EnumInfo {
-                strings: vec!["A".into(), "B".into(), "C".into()],
-            }),
-            user_tag: 0,
-        };
+        let mut snap = Snapshot::new(EpicsValue::Enum(2), 0, 0, UNIX_EPOCH);
+        snap.enums = Some(EnumInfo {
+            strings: vec!["A".into(), "B".into(), "C".into()],
+        });
         let pv = snapshot_to_nt_enum(&snap);
         let back = pv_structure_to_epics(&pv).unwrap();
         assert_eq!(back, EpicsValue::Enum(2));

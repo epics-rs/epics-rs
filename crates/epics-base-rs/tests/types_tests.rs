@@ -531,8 +531,9 @@ fn test_encode_ctrl_short_with_ctrl_limits() {
 #[test]
 fn test_encode_invalid_type() {
     let snap = bare_snapshot(EpicsValue::Double(0.0));
-    // 38+ are reserved/unused (35-37 are PUT_ACKT/PUT_ACKS/STSACK_STRING).
-    assert!(encode_dbr(38, &snap).is_err());
+    // 35..=38 are PUT_ACKT/PUT_ACKS/STSACK_STRING/CLASS_NAME (valid).
+    // Anything beyond 38 is unallocated.
+    assert!(encode_dbr(39, &snap).is_err());
     assert!(encode_dbr(100, &snap).is_err());
 }
 
@@ -823,6 +824,110 @@ fn test_dbr_type_helpers() {
     assert_eq!(DbFieldType::Long.ctrl_dbr_type(), 33);
     assert_eq!(DbFieldType::String.time_dbr_type(), 14);
     assert_eq!(DbFieldType::Char.ctrl_dbr_type(), 32);
+    // CA-261/263: STS / GR helpers (added with per-variant constants)
+    assert_eq!(DbFieldType::String.sts_dbr_type(), 7);
+    assert_eq!(DbFieldType::Double.sts_dbr_type(), 13);
+    assert_eq!(DbFieldType::String.gr_dbr_type(), 21);
+    assert_eq!(DbFieldType::Double.gr_dbr_type(), 27);
+    // Int64 has no CA wire type — collapses to Double in every layer
+    assert_eq!(DbFieldType::Int64.sts_dbr_type(), 13);
+    assert_eq!(DbFieldType::Int64.time_dbr_type(), 20);
+    assert_eq!(DbFieldType::Int64.gr_dbr_type(), 27);
+    assert_eq!(DbFieldType::Int64.ctrl_dbr_type(), 34);
+}
+
+#[test]
+fn test_dbr_per_variant_constants_match_layer_arithmetic() {
+    use epics_base_rs::types::{
+        DBR_CHAR, DBR_CTRL_CHAR, DBR_CTRL_DOUBLE, DBR_CTRL_ENUM, DBR_CTRL_FLOAT, DBR_CTRL_LONG,
+        DBR_CTRL_SHORT, DBR_CTRL_STRING, DBR_DOUBLE, DBR_ENUM, DBR_FLOAT, DBR_GR_CHAR,
+        DBR_GR_DOUBLE, DBR_GR_ENUM, DBR_GR_FLOAT, DBR_GR_LONG, DBR_GR_SHORT, DBR_GR_STRING,
+        DBR_INT, DBR_LONG, DBR_SHORT, DBR_STRING, DBR_STS_CHAR, DBR_STS_DOUBLE, DBR_STS_ENUM,
+        DBR_STS_FLOAT, DBR_STS_LONG, DBR_STS_SHORT, DBR_STS_STRING,
+    };
+    // Native (CA-260)
+    assert_eq!(DBR_STRING, 0);
+    assert_eq!(DBR_DOUBLE, 6);
+    // Aliases
+    assert_eq!(DBR_INT, DBR_SHORT);
+    // STS
+    assert_eq!(DBR_STS_STRING, 7);
+    assert_eq!(DBR_STS_SHORT, 8);
+    assert_eq!(DBR_STS_FLOAT, 9);
+    assert_eq!(DBR_STS_ENUM, 10);
+    assert_eq!(DBR_STS_CHAR, 11);
+    assert_eq!(DBR_STS_LONG, 12);
+    assert_eq!(DBR_STS_DOUBLE, 13);
+    // GR (CA-263) — main gap closure
+    assert_eq!(DBR_GR_STRING, 21);
+    assert_eq!(DBR_GR_SHORT, 22);
+    assert_eq!(DBR_GR_FLOAT, 23);
+    assert_eq!(DBR_GR_ENUM, 24);
+    assert_eq!(DBR_GR_CHAR, 25);
+    assert_eq!(DBR_GR_LONG, 26);
+    assert_eq!(DBR_GR_DOUBLE, 27);
+    // CTRL (CA-264) — main gap closure
+    assert_eq!(DBR_CTRL_STRING, 28);
+    assert_eq!(DBR_CTRL_SHORT, 29);
+    assert_eq!(DBR_CTRL_FLOAT, 30);
+    assert_eq!(DBR_CTRL_ENUM, 31);
+    assert_eq!(DBR_CTRL_CHAR, 32);
+    assert_eq!(DBR_CTRL_LONG, 33);
+    assert_eq!(DBR_CTRL_DOUBLE, 34);
+    // Round-trip: each per-variant constant matches the helper output
+    for ft in [
+        DbFieldType::String,
+        DbFieldType::Short,
+        DbFieldType::Float,
+        DbFieldType::Enum,
+        DbFieldType::Char,
+        DbFieldType::Long,
+        DbFieldType::Double,
+    ] {
+        assert_eq!(ft.sts_dbr_type(), ft as u16 + 7);
+        assert_eq!(ft.time_dbr_type(), ft as u16 + 14);
+        assert_eq!(ft.gr_dbr_type(), ft as u16 + 21);
+        assert_eq!(ft.ctrl_dbr_type(), ft as u16 + 28);
+    }
+}
+
+#[test]
+fn test_dbr_class_name_round_trip() {
+    use epics_base_rs::types::{DBR_CLASS_NAME, decode_dbr};
+    let mut snap = bare_snapshot(EpicsValue::String(String::new()));
+    snap.class_name = Some("ai".to_string());
+    let data = encode_dbr(DBR_CLASS_NAME, &snap).unwrap();
+    // Always 40 bytes regardless of the actual string length
+    assert_eq!(data.len(), 40);
+    // Wire form is null-padded "ai\0\0…"
+    assert_eq!(&data[..2], b"ai");
+    assert!(data[2..].iter().all(|&b| b == 0));
+
+    let decoded = decode_dbr(DBR_CLASS_NAME, &data, 1).unwrap();
+    assert_eq!(decoded.class_name.as_deref(), Some("ai"));
+}
+
+#[test]
+fn test_dbr_class_name_truncates_long_record_type() {
+    use epics_base_rs::types::DBR_CLASS_NAME;
+    let mut snap = bare_snapshot(EpicsValue::String(String::new()));
+    // 50 chars; 40-byte wire layout truncates to 39 + NUL
+    snap.class_name = Some("a".repeat(50));
+    let data = encode_dbr(DBR_CLASS_NAME, &snap).unwrap();
+    assert_eq!(data.len(), 40);
+    assert_eq!(&data[..39], &b"a".repeat(39)[..]);
+    assert_eq!(data[39], 0); // last byte is NUL terminator
+}
+
+#[test]
+fn test_dbr_class_name_empty_when_unpopulated() {
+    use epics_base_rs::types::DBR_CLASS_NAME;
+    let snap = bare_snapshot(EpicsValue::String(String::new()));
+    // class_name is None — server emits an all-zero (empty) response,
+    // matching what C IOC does for non-record-backed channels.
+    let data = encode_dbr(DBR_CLASS_NAME, &snap).unwrap();
+    assert_eq!(data.len(), 40);
+    assert!(data.iter().all(|&b| b == 0));
 }
 
 // ── P-1 (BUG_ARCHAEOLOGY libca 8cc20393f / a7bf59079): empty-array

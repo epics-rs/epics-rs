@@ -11,7 +11,8 @@ use tokio::time::interval;
 use crate::protocol::*;
 
 use super::circuit_breaker::CircuitBreakerRegistry;
-use super::types::{SearchReason, SearchRequest, SearchResponse};
+use super::types::{SearchAttempts, SearchReason, SearchRequest, SearchResponse};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Snippet of a UDP/TCP search-response datagram, plus the address it
 /// arrived from. Used to feed nameserver TCP responses through the same
@@ -198,6 +199,14 @@ struct SearchEngineState {
     pending: HashMap<u32, PendingSearch>,
     buckets: Vec<Vec<u32>>,
     current_bucket: usize,
+    /// Shared per-channel SEARCH attempt counter — bumped by
+    /// `fire_searches` on every fanout (immediate first SEARCH AND
+    /// each bucket-tick retransmit) so
+    /// [`super::CaChannel::search_attempts`] (CA-035) returns the
+    /// same number `ca_search_attempts(chid)` returns in libca.
+    /// Entry is removed on Cancel and on successful CREATE_CHANNEL
+    /// reply (mirrors C reset on circuit attach).
+    attempts: SearchAttempts,
     /// After a beacon poke we run one full revolution at FAST_TICK
     /// cadence so all pending searches retry within ~6 s.
     fast_ticks_remaining: u32,
@@ -222,11 +231,17 @@ struct SearchEngineState {
 }
 
 impl SearchEngineState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_attempts(std::sync::Arc::new(dashmap::DashMap::new()))
+    }
+
+    fn with_attempts(attempts: SearchAttempts) -> Self {
         Self {
             pending: HashMap::new(),
             buckets: (0..N_SEARCH_BUCKETS).map(|_| Vec::new()).collect(),
             current_bucket: 0,
+            attempts,
             fast_ticks_remaining: 0,
             penalty: HashMap::new(),
             breakers: CircuitBreakerRegistry::new(),
@@ -241,6 +256,7 @@ impl SearchEngineState {
         if let Some(p) = self.pending.remove(&cid) {
             self.buckets[p.bucket].retain(|x| *x != cid);
         }
+        self.attempts.remove(&cid);
     }
 
     /// pvxs `client.cpp:713 poke()` parity: reset every pending
@@ -274,6 +290,7 @@ pub(crate) async fn run_search_engine(
     nameserver_addrs: Vec<SocketAddr>,
     mut request_rx: mpsc::UnboundedReceiver<SearchRequest>,
     response_tx: mpsc::UnboundedSender<SearchResponse>,
+    attempts: SearchAttempts,
 ) {
     // libca-style multi-NIC: one bound socket per IPv4 interface so
     // `255.255.255.255` and per-subnet broadcasts each leave via the
@@ -302,7 +319,7 @@ pub(crate) async fn run_search_engine(
         });
     }
 
-    let mut state = SearchEngineState::new();
+    let mut state = SearchEngineState::with_attempts(attempts);
     let mut recv_buf = [0u8; 65536];
 
     // pvxs `client.cpp::tickSearch`: a single steady tick advances the
@@ -847,6 +864,11 @@ async fn process_bucket(
             p.last_attempt = Some(now);
             p.attempt = p.attempt.saturating_add(1);
             let attempt = p.attempt;
+            // Diagnostic counter (CaChannel::search_attempts) is bumped
+            // by fire_searches when the SEARCH actually goes on the
+            // wire — covers both this bucket-tick path AND the
+            // immediate-fire path right after Schedule (which never
+            // reaches process_bucket).
             to_send.push(sid);
 
             let bucket_sizes = |idx: usize| buckets[idx].len();
@@ -904,6 +926,18 @@ async fn fire_searches(
             continue;
         };
         let payload = p.search_payload.clone();
+        // CA-035 diagnostic counter: bump per-cid each time we
+        // commit to fanning a SEARCH out. Single fire_searches call
+        // == one logical attempt for the cid regardless of how many
+        // UDP datagrams the addr_list / nameserver fanout produces
+        // (matches libca ca_search_attempts(chid) "attempt" semantic).
+        // Use fetch_add so beacon poke (which resets p.attempt to 0)
+        // does NOT make this counter regress.
+        state
+            .attempts
+            .entry(*sid)
+            .or_insert_with(|| AtomicU32::new(0))
+            .fetch_add(1, Ordering::Relaxed);
 
         if current_frame.len() + payload.len() > MAX_UDP_SEND
             && current_frame.len() > CaHeader::SIZE
@@ -1371,6 +1405,7 @@ mod tests {
             Vec::new(),
             req_rx,
             resp_tx,
+            std::sync::Arc::new(dashmap::DashMap::new()),
         ));
 
         // Schedule a Reconnect for cid=42. Engine places it in
@@ -1451,6 +1486,7 @@ mod tests {
             Vec::new(),
             req_rx,
             resp_tx,
+            std::sync::Arc::new(dashmap::DashMap::new()),
         ));
 
         let cid = 77u32;

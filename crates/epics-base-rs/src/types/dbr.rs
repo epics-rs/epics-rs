@@ -1,9 +1,32 @@
 use crate::error::{CaError, CaResult};
 
-// DBR type ranges: native(0-6), STS(7-13), TIME(14-20), GR(21-27),
-// CTRL(28-34), and a small handful of special types: PUT_ACKT (35),
-// PUT_ACKS (36), STSACK_STRING (37). Everything beyond that is unused.
+// DBR type ranges (matches db_access.h):
+//   native (0..=6), STS (7..=13), TIME (14..=20), GR (21..=27),
+//   CTRL (28..=34), special PUT_ACKT (35), PUT_ACKS (36),
+//   STSACK_STRING (37), CLASS_NAME (38).
+
+// Native scalar types (also exposed via DbFieldType enum)
+pub const DBR_STRING: u16 = 0;
+pub const DBR_SHORT: u16 = 1;
+pub const DBR_FLOAT: u16 = 2;
+pub const DBR_ENUM: u16 = 3;
+pub const DBR_CHAR: u16 = 4;
+pub const DBR_LONG: u16 = 5;
+pub const DBR_DOUBLE: u16 = 6;
+// `DBR_INT` is the libca alias for `DBR_SHORT`.
+pub const DBR_INT: u16 = DBR_SHORT;
+
+// Status-only metadata layer (CA-261)
 pub const DBR_STS_STRING: u16 = 7;
+pub const DBR_STS_SHORT: u16 = 8;
+pub const DBR_STS_FLOAT: u16 = 9;
+pub const DBR_STS_ENUM: u16 = 10;
+pub const DBR_STS_CHAR: u16 = 11;
+pub const DBR_STS_LONG: u16 = 12;
+pub const DBR_STS_DOUBLE: u16 = 13;
+pub const DBR_STS_INT: u16 = DBR_STS_SHORT;
+
+// Status + timestamp layer (CA-262)
 pub const DBR_TIME_STRING: u16 = 14;
 pub const DBR_TIME_SHORT: u16 = 15;
 pub const DBR_TIME_FLOAT: u16 = 16;
@@ -11,9 +34,38 @@ pub const DBR_TIME_ENUM: u16 = 17;
 pub const DBR_TIME_CHAR: u16 = 18;
 pub const DBR_TIME_LONG: u16 = 19;
 pub const DBR_TIME_DOUBLE: u16 = 20;
+pub const DBR_TIME_INT: u16 = DBR_TIME_SHORT;
+
+// Status + graphic (display limits / units / precision) layer (CA-263)
+pub const DBR_GR_STRING: u16 = 21;
+pub const DBR_GR_SHORT: u16 = 22;
+pub const DBR_GR_FLOAT: u16 = 23;
+pub const DBR_GR_ENUM: u16 = 24;
+pub const DBR_GR_CHAR: u16 = 25;
+pub const DBR_GR_LONG: u16 = 26;
+pub const DBR_GR_DOUBLE: u16 = 27;
+pub const DBR_GR_INT: u16 = DBR_GR_SHORT;
+
+// Status + graphic + control limits layer (CA-264)
+pub const DBR_CTRL_STRING: u16 = 28;
+pub const DBR_CTRL_SHORT: u16 = 29;
+pub const DBR_CTRL_FLOAT: u16 = 30;
+pub const DBR_CTRL_ENUM: u16 = 31;
+pub const DBR_CTRL_CHAR: u16 = 32;
+pub const DBR_CTRL_LONG: u16 = 33;
+pub const DBR_CTRL_DOUBLE: u16 = 34;
+pub const DBR_CTRL_INT: u16 = DBR_CTRL_SHORT;
+
+// Special alarm-acknowledgement / introspection types
 pub const DBR_PUT_ACKT: u16 = 35;
 pub const DBR_PUT_ACKS: u16 = 36;
 pub const DBR_STSACK_STRING: u16 = 37;
+/// Returns the IOC's record-type class name as a 40-byte string
+/// (CA-268, db_access.h: `DBR_CLASS_NAME`).
+pub const DBR_CLASS_NAME: u16 = 38;
+
+/// Last allocated DBR type code, matching the C `LAST_BUFFER_TYPE` macro.
+pub const LAST_BUFFER_TYPE: u16 = DBR_CLASS_NAME;
 
 /// EPICS DBR field types (native types only)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,24 +108,37 @@ impl DbFieldType {
         }
     }
 
-    /// Return the DBR_TIME_xxx type code for this native type.
-    /// Int64 has no CA wire type; it maps to DBR_TIME_DOUBLE (20).
-    pub fn time_dbr_type(&self) -> u16 {
-        let ca = match self {
-            Self::Int64 => Self::Double,
-            other => *other,
-        };
-        ca as u16 + 14
+    /// Return the wire type code as a `u16`. Int64 has no CA wire type
+    /// and is reported as `DBR_DOUBLE` (6) for over-the-wire purposes.
+    fn ca_wire_type(&self) -> u16 {
+        match self {
+            Self::Int64 => Self::Double as u16,
+            other => *other as u16,
+        }
     }
 
-    /// Return the DBR_CTRL_xxx type code for this native type.
-    /// Int64 has no CA wire type; it maps to DBR_CTRL_DOUBLE (34).
+    /// Return the `DBR_STS_xxx` type code for this native type
+    /// (Int64 maps to `DBR_STS_DOUBLE`).
+    pub fn sts_dbr_type(&self) -> u16 {
+        self.ca_wire_type() + 7
+    }
+
+    /// Return the `DBR_TIME_xxx` type code for this native type
+    /// (Int64 maps to `DBR_TIME_DOUBLE`).
+    pub fn time_dbr_type(&self) -> u16 {
+        self.ca_wire_type() + 14
+    }
+
+    /// Return the `DBR_GR_xxx` type code for this native type
+    /// (Int64 maps to `DBR_GR_DOUBLE`).
+    pub fn gr_dbr_type(&self) -> u16 {
+        self.ca_wire_type() + 21
+    }
+
+    /// Return the `DBR_CTRL_xxx` type code for this native type
+    /// (Int64 maps to `DBR_CTRL_DOUBLE`).
     pub fn ctrl_dbr_type(&self) -> u16 {
-        let ca = match self {
-            Self::Int64 => Self::Double,
-            other => *other,
-        };
-        ca as u16 + 28
+        self.ca_wire_type() + 28
     }
 
     /// Calculate total buffer size for N elements of this type.
@@ -97,6 +162,7 @@ impl DbFieldType {
 /// dbr_type 14-20 (TIME): +12 bytes (status + severity + stamp)
 /// dbr_type 21-27 (GR): variable (includes limits, units, precision)
 /// dbr_type 28-34 (CTRL): variable (includes control limits)
+/// dbr_type 38 (CLASS_NAME): one fixed 40-byte string
 pub fn dbr_buffer_size(dbr_type: u16, native_type: DbFieldType, count: usize) -> usize {
     let value_size = native_type.element_size() * count;
     let meta_size = match dbr_type / 7 {
@@ -121,6 +187,12 @@ pub fn dbr_buffer_size(dbr_type: u16, native_type: DbFieldType, count: usize) ->
         }
         _ => 0,
     };
+    // DBR_CLASS_NAME (38) is always one MAX_STRING_SIZE (40) string,
+    // regardless of `count` or `native_type`. Use the inverse path so
+    // buffer-sizing callers don't accidentally over-allocate.
+    if dbr_type == DBR_CLASS_NAME {
+        return 40;
+    }
     meta_size + value_size
 }
 
@@ -137,6 +209,9 @@ fn dbr_native_index(dbr_type: u16) -> Option<u16> {
         // so it maps to String.
         35 | 36 => Some(1), // DBR_PUT_ACKT / DBR_PUT_ACKS — u16
         37 => Some(0),      // DBR_STSACK_STRING — value is a string
+        // DBR_CLASS_NAME is a single fixed 40-byte string carrying the
+        // record's recordType. Treat as String for codec purposes.
+        38 => Some(0),
         _ => None,
     }
 }

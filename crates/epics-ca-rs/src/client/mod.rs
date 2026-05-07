@@ -228,6 +228,10 @@ impl std::fmt::Display for DiagnosticsSnapshot {
 use subscription::SubscriptionRegistry;
 use types::*;
 
+// Public re-exports for the CA-130 exception-handler API. Mirror the
+// pattern already used for DiagnosticsSnapshot.
+pub use types::{CaException, CaExceptionHandler, CaExceptionKind};
+
 /// CA client with persistent channels and auto-reconnection.
 pub struct CaClient {
     search_tx: mpsc::UnboundedSender<SearchRequest>,
@@ -254,6 +258,17 @@ pub struct CaClient {
     /// once lifecycle has already established the virtual circuit.
     server_writers: DirectServerWriters,
     diagnostics: Arc<CaDiagnostics>,
+    /// Per-channel SEARCH attempt counter — see CA-035
+    /// `ca_search_attempts`. Counts every fanout call (immediate
+    /// first SEARCH AND each bucket-tick retransmit). Search engine
+    /// writes; CaChannel reads via [`CaChannel::search_attempts`].
+    search_attempts: types::SearchAttempts,
+    /// Per-client exception handler slot (CA-130
+    /// `ca_add_exception_event`). Scope is this CaClient instance —
+    /// each client owns its own slot. Internal sites call
+    /// [`types::dispatch_exception`] for OOB / unrecoverable errors;
+    /// callers register via [`CaClient::set_exception_handler`].
+    exception_slot: types::CaExceptionSlot,
     _coordinator: tokio::task::JoinHandle<()>,
     _search_task: tokio::task::JoinHandle<()>,
     _transport_task: tokio::task::JoinHandle<()>,
@@ -491,11 +506,13 @@ impl CaClient {
 
         let (coord_tx, coord_rx) = mpsc::unbounded_channel();
 
+        let search_attempts: types::SearchAttempts = Arc::new(dashmap::DashMap::new());
         let search_task = epics_base_rs::runtime::task::spawn(search::run_search_engine(
             addr_list,
             nameserver_addrs,
             search_rx,
             search_resp_tx,
+            search_attempts.clone(),
         ));
 
         #[cfg(feature = "experimental-rust-tls")]
@@ -539,6 +556,8 @@ impl CaClient {
         };
 
         let diagnostics = Arc::new(CaDiagnostics::default());
+        let exception_slot: types::CaExceptionSlot =
+            Arc::new(parking_lot::RwLock::new(None));
 
         let coordinator = epics_base_rs::runtime::task::spawn(run_coordinator(
             coord_rx,
@@ -550,6 +569,8 @@ impl CaClient {
             snapshots.clone(),
             last_rx_at,
             diagnostics.clone(),
+            exception_slot.clone(),
+            search_attempts.clone(),
         ));
 
         let beacon_task = epics_base_rs::runtime::task::spawn(beacon_monitor::run_beacon_monitor(
@@ -565,6 +586,8 @@ impl CaClient {
             snapshots,
             server_writers,
             diagnostics,
+            search_attempts,
+            exception_slot,
             _coordinator: coordinator,
             _search_task: search_task,
             _transport_task: transport_task,
@@ -575,6 +598,40 @@ impl CaClient {
     /// Get a snapshot of diagnostic counters.
     pub fn diagnostics(&self) -> DiagnosticsSnapshot {
         self.diagnostics.snapshot()
+    }
+
+    /// Register a per-client handler for out-of-band errors —
+    /// the Rust analog of libca `ca_add_exception_event` (cadef.h:617).
+    /// Scope is the calling [`CaClient`] instance; each client owns
+    /// its own slot.
+    ///
+    /// Currently dispatches on:
+    /// - `CaExceptionKind::ServerError` — server emitted
+    ///   `CA_PROTO_ERROR` (cmd=11) for an op not routed to a callback.
+    /// - `CaExceptionKind::ServerDisconnect` — server emitted
+    ///   `CA_PROTO_SERVER_DISCONN` for a known channel.
+    ///
+    /// Routine per-operation errors (timeouts, type mismatches) are
+    /// returned through the operation's `Result` and do **not** fire
+    /// the handler. Startup config / TLS errors surface through
+    /// [`CaClient::new`]'s `Result` since the slot does not yet exist.
+    ///
+    /// At most one handler is registered at a time; calling again
+    /// replaces. Returns the previous handler if present so callers
+    /// can chain.
+    pub fn set_exception_handler<F>(&self, f: F) -> Option<types::CaExceptionHandler>
+    where
+        F: Fn(&types::CaException) + Send + Sync + 'static,
+    {
+        let new = Arc::new(f);
+        let mut slot = self.exception_slot.write();
+        std::mem::replace(&mut *slot, Some(new))
+    }
+
+    /// Drop the registered handler. Subsequent OOB errors will only
+    /// surface through `tracing::error!` (the default behaviour).
+    pub fn clear_exception_handler(&self) -> Option<types::CaExceptionHandler> {
+        self.exception_slot.write().take()
     }
 
     /// Number of distinct CA servers this client currently holds an
@@ -639,6 +696,7 @@ impl CaClient {
             server_writers: self.server_writers.clone(),
             conn_tx,
             cached_read: Arc::new(Mutex::new(None)),
+            search_attempts: self.search_attempts.clone(),
             _lifecycle: lifecycle,
         }
     }
@@ -917,6 +975,10 @@ pub struct CaChannel {
     /// cache slot — otherwise two clones would each pay the cold-path
     /// once on first use.
     cached_read: Arc<Mutex<Option<CachedRead>>>,
+    /// Shared per-channel SEARCH attempt count (CA-035). Same map
+    /// the SearchEngine bumps on every fanout (immediate + retransmit);
+    /// cleared when the channel transitions to Connected.
+    search_attempts: types::SearchAttempts,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
 }
@@ -945,6 +1007,23 @@ impl CaChannel {
             element_count: snap.element_count,
             access_rights: snap.access_rights,
         })
+    }
+
+    /// Number of SEARCH attempts the engine has emitted on behalf of
+    /// this channel since it was last connected. Counts the immediate
+    /// first SEARCH (fired at Schedule time) AND every subsequent
+    /// bucket-tick retransmit. One attempt == one fanout call
+    /// regardless of how many UDP datagrams the addr_list /
+    /// nameserver duplication produces, matching libca
+    /// `ca_search_attempts(chid)` semantics (cadef.h:1907).
+    ///
+    /// Returns 0 for an already-connected channel (the counter is
+    /// cleared on successful CREATE_CHANNEL).
+    pub fn search_attempts(&self) -> u32 {
+        self.search_attempts
+            .get(&self.cid)
+            .map(|e| e.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Phase B fast-path: read the channel's published snapshot without
@@ -1830,6 +1909,8 @@ async fn run_coordinator(
     snapshots: ChannelSnapshots,
     last_rx_at: ServerLastRxAt,
     diag: Arc<CaDiagnostics>,
+    exception_slot: types::CaExceptionSlot,
+    search_attempts: types::SearchAttempts,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
     let mut pending_wait_connected: HashMap<u32, Vec<oneshot::Sender<()>>> = HashMap::new();
@@ -2241,6 +2322,20 @@ async fn run_coordinator(
                             metrics::counter!("ca_client_connections_total", "server" => server_addr.to_string()).increment(1);
                             metrics::gauge!("ca_client_channels_connected").increment(1.0);
 
+                            // Clear the diagnostic counter SYNCHRONOUSLY here,
+                            // before any waiter wakes or Connected fires. The
+                            // search task also clears via SearchRequest::ConnectResult
+                            // below, but that's an async hop — without this
+                            // synchronous remove, a caller awakened by the
+                            // Connected event and immediately calling
+                            // CaChannel::search_attempts() can briefly observe
+                            // the pre-connect non-zero count, contradicting the
+                            // documented "0 once connected" contract. The map
+                            // is Arc-shared so this remove races nothing the
+                            // search task hasn't already accepted as in-flight
+                            // for cleanup.
+                            search_attempts.remove(&cid);
+
                             // Wake connect waiters
                             for waiter in ch.connect_waiters.drain(..) {
                                 let _ = waiter.send(());
@@ -2336,8 +2431,37 @@ async fn run_coordinator(
                             }
                         }
                     }
-                    TransportEvent::ServerError { .. } => {
-                        // Logged in transport layer; no further action needed
+                    TransportEvent::ServerError {
+                        eca_status,
+                        original_request,
+                        message,
+                        server_addr,
+                    } => {
+                        // Already logged in transport layer; surface
+                        // through the exception handler if registered.
+                        // CaException.status is the ECA code (libca
+                        // parity); the original request cmd goes into
+                        // the message text as diagnostic context.
+                        let annotated = match original_request {
+                            Some(cmd) => {
+                                if message.is_empty() {
+                                    format!("(while processing cmd={cmd})")
+                                } else {
+                                    format!("{message} (while processing cmd={cmd})")
+                                }
+                            }
+                            None => message,
+                        };
+                        types::dispatch_exception(
+                            &exception_slot,
+                            types::CaException {
+                                kind: types::CaExceptionKind::ServerError,
+                                message: annotated,
+                                server_addr: Some(server_addr),
+                                pv_name: None,
+                                status: Some(eca_status),
+                            },
+                        );
                     }
                     TransportEvent::TcpClosed { server_addr } => {
                         let n_affected = server_channels
@@ -2370,6 +2494,7 @@ async fn run_coordinator(
                                 snapshots.remove(&cid);
                                 let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
 
+                                let pv_name = ch.pv_name.to_string();
                                 let cids = vec![cid];
                                 let cleared = subscriptions.mark_disconnected(&cids);
                                 for (addr, count) in cleared {
@@ -2389,9 +2514,21 @@ async fn run_coordinator(
                                 // Re-search
                                 let _ = search_tx.send(SearchRequest::Schedule {
                                     cid,
-                                    pv_name: ch.pv_name.to_string(),
+                                    pv_name: pv_name.clone(),
                                     reason: SearchReason::Reconnect,
                                 });
+
+                                // CA-130: surface to per-client handler.
+                                types::dispatch_exception(
+                                    &exception_slot,
+                                    types::CaException {
+                                        kind: types::CaExceptionKind::ServerDisconnect,
+                                        message: "server-initiated channel close".to_string(),
+                                        server_addr: Some(server_addr),
+                                        pv_name: Some(pv_name),
+                                        status: None,
+                                    },
+                                );
                             }
                         }
                     }

@@ -9,6 +9,53 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+/// Expand `$(VAR)` and `${VAR}` references in `input` against the
+/// process environment. Mirrors pvxs `Config::expand()` (server.h:219).
+/// Unrecognised refs (no env entry) substitute to an empty string —
+/// matching the C IOC `dbLoadRecords` macro-expansion behaviour. A
+/// literal `$` followed by non-`(`/`{` is preserved verbatim.
+pub fn expand_dollar_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            let close = match chars.peek() {
+                Some('(') => Some(')'),
+                Some('{') => Some('}'),
+                _ => None,
+            };
+            if let Some(end) = close {
+                chars.next(); // consume '(' or '{'
+                let mut name = String::new();
+                let mut closed = false;
+                for nc in chars.by_ref() {
+                    if nc == end {
+                        closed = true;
+                        break;
+                    }
+                    name.push(nc);
+                }
+                if closed {
+                    if let Ok(val) = std::env::var(&name) {
+                        out.push_str(&val);
+                    }
+                    // Unset → empty (pvxs Config::expand parity).
+                    continue;
+                }
+                // Unterminated $( … — emit as-is including the open
+                // bracket so the caller's parser can fail loudly
+                // rather than silently consuming text.
+                out.push('$');
+                out.push(if end == ')' { '(' } else { '{' });
+                out.push_str(&name);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Parse a `EPICS_PVA_ADDR_LIST`-style string (comma/whitespace
 /// separated) into a list of `SocketAddr`. Accepts plain IPs (gets
 /// `default_port` appended), `ip:port`, DNS hostnames (resolves via
@@ -22,6 +69,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 /// "Empty PV search address list" with no actionable error.
 pub fn parse_addr_list_with_port(env: &str, default_port: u16) -> Vec<SocketAddr> {
     use std::net::ToSocketAddrs;
+    // PVA-466: pre-expand $(VAR) refs so callers can write
+    // `EPICS_PVA_ADDR_LIST="$(IOC_HOST):5076"` (matching the dbLoad
+    // macro-expansion convention).
+    let env = expand_dollar_vars(env);
+    let env = env.as_str();
     env.split(|c: char| c == ',' || c.is_whitespace())
         .filter_map(|s| {
             let s = s.trim();
@@ -248,11 +300,13 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
 }
 
 /// Parse `EPICS_PVA_INTF_ADDR_LIST` — client-side interface bind list.
-/// Empty = bind to 0.0.0.0 (default behaviour).
+/// Empty = bind to 0.0.0.0 (default behaviour). `$(VAR)` / `${VAR}`
+/// refs are expanded against the process env (PVA-466 parity).
 pub fn list_intf_addresses() -> Vec<IpAddr> {
     std::env::var("EPICS_PVA_INTF_ADDR_LIST")
         .ok()
         .map(|s| {
+            let s = expand_dollar_vars(&s);
             s.split(|c: char| c == ',' || c.is_whitespace())
                 .filter_map(|t| t.trim().parse::<IpAddr>().ok())
                 .collect()
@@ -265,6 +319,8 @@ pub fn list_intf_addresses() -> Vec<IpAddr> {
 /// empty, returns an empty list (caller should bind 0.0.0.0).
 pub fn server_intf_addr_list() -> Vec<IpAddr> {
     if let Ok(s) = std::env::var("EPICS_PVAS_INTF_ADDR_LIST") {
+        // PVA-466: expand $(VAR) refs before tokenising.
+        let s = expand_dollar_vars(&s);
         return s
             .split(|c: char| c == ',' || c.is_whitespace())
             .filter_map(|t| {
@@ -300,6 +356,8 @@ pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
     let Ok(raw) = std::env::var("EPICS_PVAS_IGNORE_ADDR_LIST") else {
         return Vec::new();
     };
+    // PVA-466: expand $(VAR) refs before tokenising.
+    let raw = expand_dollar_vars(&raw);
     raw.split(|c: char| c == ',' || c.is_whitespace())
         .filter_map(|s| {
             let s = s.trim();
@@ -375,6 +433,42 @@ mod tests {
     }
 
     #[test]
+    fn expand_dollar_vars_substitutes_set_var() {
+        // Use a long-named test var to avoid collisions with parallel
+        // tests; expand should pull the value verbatim.
+        // SAFETY: std::env::set_var is unsafe in 2024 edition; tests
+        // run before any background task observes the variable.
+        unsafe {
+            std::env::set_var("EPICS_RS_AUDIT_X", "10.1.2.3");
+        }
+        let out = expand_dollar_vars("$(EPICS_RS_AUDIT_X):5076");
+        assert_eq!(out, "10.1.2.3:5076");
+        let out2 = expand_dollar_vars("${EPICS_RS_AUDIT_X}");
+        assert_eq!(out2, "10.1.2.3");
+        unsafe {
+            std::env::remove_var("EPICS_RS_AUDIT_X");
+        }
+    }
+
+    #[test]
+    fn expand_dollar_vars_unset_collapses_to_empty() {
+        // Unset variables match pvxs Config::expand semantics: empty.
+        unsafe {
+            std::env::remove_var("EPICS_RS_AUDIT_UNSET");
+        }
+        let out = expand_dollar_vars("a$(EPICS_RS_AUDIT_UNSET)b");
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn expand_dollar_vars_preserves_unterminated() {
+        // Unterminated $( … without closing should not eat the rest
+        // of the string silently.
+        let out = expand_dollar_vars("foo$(BAR");
+        assert_eq!(out, "foo$(BAR");
+    }
+
+    #[test]
     fn list_broadcast_addresses_includes_limited_broadcast() {
         let bcasts = list_broadcast_addresses(5076);
         assert!(
@@ -382,6 +476,53 @@ mod tests {
                 .iter()
                 .any(|a| a.ip() == IpAddr::V4(Ipv4Addr::BROADCAST))
         );
+    }
+
+    /// PVA-466: $(VAR) expansion must apply to PVAS_INTF / PVA_INTF /
+    /// PVAS_IGNORE addr lists, not only EPICS_PVA_ADDR_LIST. Without
+    /// the wiring, ops who templated their st.cmd-style addr lists
+    /// see literal `$(IFACE_IP)` tokens silently dropped as invalid.
+    #[test]
+    fn intf_and_ignore_addr_lists_expand_dollar_vars() {
+        unsafe {
+            std::env::set_var("EPICS_RS_AUDIT_IFACE", "127.0.0.1");
+            std::env::set_var(
+                "EPICS_PVA_INTF_ADDR_LIST",
+                "$(EPICS_RS_AUDIT_IFACE)",
+            );
+            std::env::set_var(
+                "EPICS_PVAS_INTF_ADDR_LIST",
+                "${EPICS_RS_AUDIT_IFACE}",
+            );
+            std::env::set_var(
+                "EPICS_PVAS_IGNORE_ADDR_LIST",
+                "$(EPICS_RS_AUDIT_IFACE):5076",
+            );
+        }
+        let client = list_intf_addresses();
+        let server = server_intf_addr_list();
+        let ignore = server_ignore_addr_list();
+        assert_eq!(
+            client,
+            vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
+            "EPICS_PVA_INTF_ADDR_LIST $(VAR) must expand"
+        );
+        assert_eq!(
+            server,
+            vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
+            "EPICS_PVAS_INTF_ADDR_LIST ${{VAR}} must expand"
+        );
+        assert_eq!(
+            ignore,
+            vec![(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5076)],
+            "EPICS_PVAS_IGNORE_ADDR_LIST $(VAR) must expand"
+        );
+        unsafe {
+            std::env::remove_var("EPICS_RS_AUDIT_IFACE");
+            std::env::remove_var("EPICS_PVA_INTF_ADDR_LIST");
+            std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
+            std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
+        }
     }
 
     /// A-G1/A-G4: env-driven server caps fall back to safe defaults when

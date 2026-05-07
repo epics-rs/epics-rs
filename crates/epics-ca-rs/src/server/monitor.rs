@@ -113,7 +113,17 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
 ) -> std::io::Result<()> {
     let payload = encode_dbr(data_type, &event.snapshot)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "encode"))?;
-    let element_count = event.snapshot.value.count() as u32;
+    // CA-268: DBR_CLASS_NAME wire payload is always one fixed 40-byte
+    // string regardless of the underlying value count. Same override
+    // already applied at the GET / send_monitor_snapshot / RecordField
+    // event loop sites. SimplePv channels carry no record_type, so
+    // class_name stays None and the body is 40 zero bytes — matches
+    // IOC behaviour for synthetic channels.
+    let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
+        1
+    } else {
+        event.snapshot.value.count() as u32
+    };
     let mut padded = payload;
     padded.resize(align8(padded.len()), 0);
 

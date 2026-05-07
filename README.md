@@ -40,11 +40,17 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
+**Current release: v0.15.0** — closes five Layer-2 feature-map gaps with
+end-to-end fixes (`DBR_CLASS_NAME`, `CaChannel::search_attempts`,
+`PvaClient::pvput_build`, per-client `ca_add_exception_event`,
+`$(VAR)` expansion across every PVA path/addr env field). See
+[`CHANGELOG.md`](./CHANGELOG.md) for the full list.
+
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.13", features = ["ad"] }
+epics-rs = { version = "0.15", features = ["ad"] }
 ```
 
 This single dependency pulls in everything needed. In your code:
@@ -75,14 +81,14 @@ use epics_rs::asyn;        // port driver framework
 | `optics` | Optics (table, monochromator, slit, filter, BPM) | no |
 | `full` | Everything above | no |
 
-> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.13"` directly when needed.
+> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.15"` directly when needed.
 
 ```toml
 # Motor + areaDetector
-epics-rs = { version = "0.13", features = ["motor", "ad"] }
+epics-rs = { version = "0.15", features = ["motor", "ad"] }
 
 # Everything
-epics-rs = { version = "0.13", features = ["full"] }
+epics-rs = { version = "0.15", features = ["full"] }
 ```
 
 ### Individual Crates
@@ -91,8 +97,8 @@ You can also depend on sub-crates directly if you only need specific functionali
 
 ```toml
 [dependencies]
-ad-plugins-rs = "0.13"  # just the areaDetector plugins
-epics-base-rs = "0.13"  # just the IOC runtime
+ad-plugins-rs = "0.15"  # just the areaDetector plugins
+epics-base-rs = "0.15"  # just the IOC runtime
 ```
 
 ## Workspace Structure

@@ -558,6 +558,9 @@ impl CaClient {
         let diagnostics = Arc::new(CaDiagnostics::default());
         let exception_slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(None));
 
+        let (beacon_ctrl_tx, beacon_ctrl_rx) =
+            mpsc::unbounded_channel::<beacon_monitor::BeaconControl>();
+
         let coordinator = epics_base_rs::runtime::task::spawn(run_coordinator(
             coord_rx,
             search_resp_rx,
@@ -570,10 +573,12 @@ impl CaClient {
             diagnostics.clone(),
             exception_slot.clone(),
             search_attempts.clone(),
+            beacon_ctrl_tx,
         ));
 
         let beacon_task = epics_base_rs::runtime::task::spawn(beacon_monitor::run_beacon_monitor(
             coord_tx.clone(),
+            beacon_ctrl_rx,
         ));
 
         Ok(Self {
@@ -1910,6 +1915,7 @@ async fn run_coordinator(
     diag: Arc<CaDiagnostics>,
     exception_slot: types::CaExceptionSlot,
     search_attempts: types::SearchAttempts,
+    beacon_ctrl_tx: mpsc::UnboundedSender<beacon_monitor::BeaconControl>,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
     let mut pending_wait_connected: HashMap<u32, Vec<oneshot::Sender<()>>> = HashMap::new();
@@ -2570,6 +2576,19 @@ async fn run_coordinator(
                         // CA wire version. Read from CA_PROTO_VERSION
                         // during TCP handshake; cleared on TcpClosed.
                         server_minor_version.insert(server_addr, minor_version);
+                    }
+                    TransportEvent::ServerConnected { server_addr } => {
+                        // libca bhe-on-connect parity: tell the beacon
+                        // monitor to drop its per-server EMA so the
+                        // next beacon reseeds `period_estimate` from
+                        // the live cadence. Without this, an archiver
+                        // that reconnects to a server in the middle of
+                        // its `online_notify_task` ramp-up would log a
+                        // PeriodCollapse cascade against its stale
+                        // steady-state estimate.
+                        let _ = beacon_ctrl_tx.send(
+                            beacon_monitor::BeaconControl::ResetServer { server_addr },
+                        );
                     }
                 }
             }

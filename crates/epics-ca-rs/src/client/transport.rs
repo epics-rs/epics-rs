@@ -282,6 +282,13 @@ pub(crate) async fn run_transport_manager(
                             },
                         );
                         connections.insert(server_addr, conn);
+                        // libca bhe-on-connect parity: announce the
+                        // fresh circuit so the coordinator can ask the
+                        // beacon monitor to reset its per-server EMA.
+                        // Emit BEFORE replaying queued commands so the
+                        // reset is observed before any subsequent
+                        // anomaly classification on this circuit.
+                        let _ = event_tx.send(TransportEvent::ServerConnected { server_addr });
                         for queued_cmd in queued {
                             process_command(
                                 queued_cmd,

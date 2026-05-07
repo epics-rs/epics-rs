@@ -9,6 +9,24 @@ use crate::protocol::*;
 
 use super::CoordRequest;
 
+/// Control messages sent INTO the beacon monitor by the coordinator
+/// (currently only on TCP-circuit (re)connect). libca `bhe.cpp`
+/// resets `averagePeriod` when a fresh client circuit comes up, on
+/// the reasoning that an active TCP handshake is fresh evidence the
+/// server is alive *now* and any prior beacon-cadence measurements
+/// may be stale (the server may have restarted with its beacon
+/// counter preserved, OR an older steady-state EMA may misclassify
+/// the standard rsrv `online_notify_task` ramp-up as a
+/// PeriodCollapse cascade — the cited symptom in archiver-rs's
+/// reconnect logs).
+pub(crate) enum BeaconControl {
+    /// Clear `period_estimate` and `count` for `server_addr` so the
+    /// EMA re-establishes from the next observed inter-beacon
+    /// interval. `last_id` and `last_seen` are intentionally kept so
+    /// the duplicate-detection and stale-prune paths still work.
+    ResetServer { server_addr: SocketAddr },
+}
+
 /// Why the beacon monitor decided this beacon is "anomalous".
 ///
 /// `FirstSighting` is benign from the *server's* point of view — the
@@ -86,9 +104,13 @@ const BEACON_STALE_THRESHOLD: Duration = Duration::from_secs(180);
 /// with the repeater in case it restarted.
 const REREGISTER_INTERVAL: Duration = Duration::from_secs(300);
 
-pub(crate) async fn run_beacon_monitor(coord_tx: mpsc::UnboundedSender<CoordRequest>) {
+pub(crate) async fn run_beacon_monitor(
+    coord_tx: mpsc::UnboundedSender<CoordRequest>,
+    control_rx: mpsc::UnboundedReceiver<BeaconControl>,
+) {
     run_beacon_monitor_inner(
         coord_tx,
+        control_rx,
         #[cfg(feature = "cap-tokens")]
         None,
     )
@@ -105,13 +127,15 @@ pub(crate) async fn run_beacon_monitor(coord_tx: mpsc::UnboundedSender<CoordRequ
 #[allow(dead_code)]
 pub(crate) async fn run_beacon_monitor_with_verifier(
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
+    control_rx: mpsc::UnboundedReceiver<BeaconControl>,
     verifier: std::sync::Arc<crate::server::signed_beacon::SignedBeaconVerifier>,
 ) {
-    run_beacon_monitor_inner(coord_tx, Some(verifier)).await;
+    run_beacon_monitor_inner(coord_tx, control_rx, Some(verifier)).await;
 }
 
 async fn run_beacon_monitor_inner(
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
+    mut control_rx: mpsc::UnboundedReceiver<BeaconControl>,
     #[cfg(feature = "cap-tokens")] verifier: Option<
         std::sync::Arc<crate::server::signed_beacon::SignedBeaconVerifier>,
     >,
@@ -153,17 +177,42 @@ async fn run_beacon_monitor_inner(
     // and forward client-noop traffic. Use 4 KB so chained datagrams are
     // received intact.
     let mut buf = [0u8; 4096];
+    // Set to false once the control channel's last sender drops
+    // (CaClient shutdown). After that we stop polling that branch so
+    // we don't busy-loop on Ready(None); UDP / re-register continue.
+    let mut control_rx_open = true;
 
     loop {
-        // Use timeout to detect beacon silence → re-register with repeater
-        let recv = tokio::time::timeout(REREGISTER_INTERVAL, socket.recv_from(&mut buf)).await;
-        let (len, _src) = match recv {
-            Ok(Ok(v)) => v,
-            Ok(Err(_)) => continue,
-            Err(_) => {
-                // No beacons for 5 minutes — repeater may have restarted
-                let _ = register_with_repeater(&socket).await;
+        // libca bhe-on-connect parity: a coordinator-issued
+        // ResetServer (sent on TransportEvent::ServerConnected) clears
+        // the per-server EMA so the next beacon reseeds
+        // `period_estimate` from the live cadence. Without this, an
+        // archiver that reconnects to a server whose `online_notify`
+        // ramp-up is in progress sees a PeriodCollapse cascade against
+        // its stale steady-state estimate.
+        let recv_fut = tokio::time::timeout(REREGISTER_INTERVAL, socket.recv_from(&mut buf));
+        let (len, _src) = tokio::select! {
+            ctrl = control_rx.recv(), if control_rx_open => {
+                match ctrl {
+                    Some(BeaconControl::ResetServer { server_addr }) => {
+                        apply_reset_server(&mut servers, server_addr);
+                    }
+                    None => {
+                        control_rx_open = false;
+                    }
+                }
                 continue;
+            }
+            recv = recv_fut => {
+                match recv {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(_)) => continue,
+                    Err(_) => {
+                        // No beacons for 5 minutes — repeater may have restarted
+                        let _ = register_with_repeater(&socket).await;
+                        continue;
+                    }
+                }
             }
         };
         if len < CaHeader::SIZE {
@@ -284,6 +333,89 @@ async fn run_beacon_monitor_inner(
             handle_beacon(hdr, &mut servers, &coord_tx);
         }
     }
+}
+
+/// libca `bhe.cpp` "new client connect" parity. Clears the EMA so the
+/// next beacon reseeds `period_estimate` from the live cadence;
+/// preserves `last_id` and `last_seen` so duplicate-detection and
+/// stale-prune still work across the reset.
+///
+/// `circuit_addr` is the TCP `server_addr` of the freshly-connected
+/// circuit. The `BeaconState` map is keyed by the beacon's *announced*
+/// address — per `handle_beacon`'s comment "new servers always set
+/// available=INADDR_ANY (0)", so the dominant key is `0.0.0.0:port`,
+/// NOT the TCP address. Multi-homed IOCs are a second case where the
+/// announced IP is one NIC and the circuit reaches the server via a
+/// different NIC.
+///
+/// We resolve the right entry conservatively. A naive port-only
+/// sweep would silently blind unrelated IOCs that share the default
+/// port 5064 across the network: post-reset `count=0` gates
+/// `PeriodCollapse` for the next 4 beacons, so a same-port IOC that
+/// restarts with a preserved beacon counter inside that window
+/// would go undetected — a real correctness regression, not just a
+/// noise issue.
+///
+/// Resolution order — each step is **terminal** (early-return on
+/// hit). The terminality matters: a single CA server announces
+/// consistently with one IP per process. `server/beacon.rs` computes
+/// `server_ip` once at task start and reuses it for every beacon, so
+/// a given IOC produces *one* beacon-state key (real IP or INADDR_ANY,
+/// never both). If both an exact-match entry and a `0.0.0.0:port`
+/// entry exist simultaneously, they represent DIFFERENT IOCs sharing
+/// the port. Falling through past a hit would silently blind the
+/// other IOC's PeriodCollapse for the next ~4 beacons.
+///
+///   1. **Exact match** `circuit_addr` — works when the IOC announced
+///      its real IP (rare for new IOCs, common for older / pvxs
+///      servers). On hit: reset and return.
+///   2. **`0.0.0.0:port`** (INADDR_ANY) — the dominant case for
+///      modern IOCs. Only consulted when (1) missed. On hit: reset
+///      and return.
+///   3. **Single unambiguous `*:port` entry** — only when both (1)
+///      and (2) missed AND exactly one other `*:port` entry exists.
+///      Catches the multi-homed IOC case (announced via NIC A,
+///      circuit via NIC B) without touching unrelated same-port
+///      IOCs.
+///
+/// When (1)/(2) miss and there are multiple ambiguous `*:port`
+/// entries, we deliberately do NOT reset — a multi-homed IOC sharing
+/// port 5064 with unrelated IOCs reverts to the original
+/// post-reconnect cascade behaviour. Acceptable trade-off: the
+/// alternative was silent restart-detection failure for every other
+/// IOC on that port.
+fn apply_reset_server(servers: &mut HashMap<SocketAddr, BeaconState>, circuit_addr: SocketAddr) {
+    let port = circuit_addr.port();
+    let inaddr_any =
+        SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port));
+
+    if let Some(s) = servers.get_mut(&circuit_addr) {
+        s.period_estimate = None;
+        s.count = 0;
+        return;
+    }
+    if let Some(s) = servers.get_mut(&inaddr_any) {
+        s.period_estimate = None;
+        s.count = 0;
+        return;
+    }
+
+    // Snapshot the matching keys to release the borrow before
+    // mutating; HashMap::iter_mut filtered to a single key gets
+    // gnarly fast.
+    let port_keys: Vec<SocketAddr> = servers
+        .keys()
+        .filter(|k| k.port() == port)
+        .copied()
+        .collect();
+    if port_keys.len() == 1 {
+        if let Some(s) = servers.get_mut(&port_keys[0]) {
+            s.period_estimate = None;
+            s.count = 0;
+        }
+    }
+    // else: ambiguous (zero or multiple non-INADDR_ANY *:port
+    // entries). Skip — see doc comment for rationale.
 }
 
 fn handle_beacon(
@@ -1005,5 +1137,371 @@ mod tests {
             !servers.contains_key(&stale),
             "180-s-idle entry must be pruned"
         );
+    }
+
+    /// Regression for the archiver-rs reconnect noise: a long-lived
+    /// CA client that has built a steady-state EMA (e.g. 15 s) for
+    /// some server, then loses + re-establishes its TCP circuit while
+    /// the server is in `online_notify_task` ramp-up, must NOT log a
+    /// stream of `PeriodCollapse` warnings against its stale
+    /// estimate. `BeaconControl::ResetServer` (issued by the
+    /// coordinator on `TransportEvent::ServerConnected`, libca
+    /// `bhe.cpp` "new client connect" parity) clears the EMA so the
+    /// next beacon reseeds `period_estimate` from the live cadence.
+    #[test]
+    fn reset_on_connect_breaks_period_collapse_cascade_after_reconnect() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+        let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+
+        // Pre-existing steady state: 15-s EMA, 1000 beacons in,
+        // last_id=999. Mirrors a long-running archiver before the
+        // server's TCP circuit drops.
+        servers.insert(
+            server,
+            BeaconState {
+                last_id: 999,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 1000,
+            },
+        );
+
+        // Coordinator reports the new circuit. EMA cleared.
+        apply_reset_server(&mut servers, server);
+        let s = servers.get(&server).expect("entry survives reset");
+        assert!(
+            s.period_estimate.is_none(),
+            "ResetServer must clear period_estimate"
+        );
+        assert_eq!(s.count, 0, "ResetServer must zero count");
+        assert_eq!(
+            s.last_id, 999,
+            "ResetServer must preserve last_id (dedup still works)"
+        );
+
+        // Standard rsrv ramp-up: 20, 40, 80, 160, 320, 640, 1280,
+        // 2560, 5120, 10240 ms — same pattern as the
+        // `rsrv_rampup_beacons_do_not_fire_period_collapse` test, but
+        // arriving on top of the previously-pre-existing entry.
+        let intervals_ms = [20u64, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.count = 5064;
+        hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
+        // Server preserved its beacon counter across restart — ids
+        // continue monotonically from 1000. This is the case
+        // PeriodCollapse was supposed to catch, but the cascade
+        // would otherwise spam every ramp-up beacon past the 50 ms
+        // floor against the stale 15-s EMA.
+        for (i, &ms) in intervals_ms.iter().enumerate() {
+            let s = servers.get_mut(&server).expect("entry");
+            s.last_seen = Instant::now() - Duration::from_millis(ms);
+            hdr.cid = 1000 + (i as u32);
+            handle_beacon(hdr, &mut servers, &tx);
+
+            while let Ok(msg) = rx.try_recv() {
+                if let CoordRequest::ForceRescanServer { kind, .. } = msg {
+                    assert_ne!(
+                        kind,
+                        BeaconAnomalyKind::PeriodCollapse,
+                        "ramp-up beacon #{} (interval={} ms) after \
+                         ResetServer must not classify as PeriodCollapse \
+                         — the cascade is the archiver-rs reconnect noise \
+                         this fix targets",
+                        i + 1,
+                        ms
+                    );
+                }
+            }
+        }
+    }
+
+    /// `apply_reset_server` for an unknown server is a no-op — the
+    /// coordinator will issue ResetServer on every fresh circuit,
+    /// including first-ever connects where we may not yet have a
+    /// `BeaconState` (e.g. the server hadn't beaconed before our
+    /// search reached it via name resolution).
+    #[test]
+    fn reset_unknown_server_is_noop() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        apply_reset_server(&mut servers, server);
+        assert!(servers.is_empty());
+    }
+
+    /// The beacon-state HashMap key is the beacon's *announced*
+    /// address, which for modern IOCs is INADDR_ANY (`available=0`)
+    /// — so the key is `0.0.0.0:port` while the TCP-circuit
+    /// `server_addr` is the real IP:port. An exact-key lookup
+    /// would miss this entry and the reset would be a no-op. Mirror
+    /// `beacon_arrival_targets`'s port-fallback policy so the EMA is
+    /// actually cleared.
+    #[test]
+    fn reset_matches_inaddr_any_announced_entry() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let inaddr_any: SocketAddr = "0.0.0.0:5064".parse().unwrap();
+        servers.insert(
+            inaddr_any,
+            BeaconState {
+                last_id: 999,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 1000,
+            },
+        );
+
+        // Coordinator forwards the TCP-circuit's real address, NOT
+        // the INADDR_ANY beacon key.
+        let circuit: SocketAddr = "10.0.0.5:5064".parse().unwrap();
+        apply_reset_server(&mut servers, circuit);
+
+        let s = servers.get(&inaddr_any).expect("entry preserved");
+        assert!(
+            s.period_estimate.is_none(),
+            "INADDR_ANY-keyed entry must be reset by port-match"
+        );
+        assert_eq!(s.count, 0);
+        assert_eq!(s.last_id, 999, "last_id preserved across reset");
+    }
+
+    /// Multi-homed IOC: beacon arrives via NIC A's IP, but our search
+    /// reply landed via NIC B and the circuit talks to `B:port`.
+    /// Beacon-state key is `A:port`. Same port-fallback applies.
+    #[test]
+    fn reset_matches_multihomed_announced_entry() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let nic_a: SocketAddr = "10.0.0.1:5064".parse().unwrap();
+        servers.insert(
+            nic_a,
+            BeaconState {
+                last_id: 42,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 100,
+            },
+        );
+
+        let nic_b: SocketAddr = "10.0.0.2:5064".parse().unwrap();
+        apply_reset_server(&mut servers, nic_b);
+
+        let s = servers.get(&nic_a).expect("entry preserved");
+        assert!(s.period_estimate.is_none());
+        assert_eq!(s.count, 0);
+    }
+
+    /// Exact-match terminal regression. A single IOC announces with
+    /// one IP per process (server/beacon.rs:46-58 computes
+    /// `server_ip` once at task start and reuses it on every beacon),
+    /// so a given IOC produces *one* beacon-state key — real IP OR
+    /// INADDR_ANY, never both. If both `10.0.0.5:5064` and
+    /// `0.0.0.0:5064` exist in the map at the same time, they are
+    /// DIFFERENT IOCs. After exact-match resets the target,
+    /// continuing on to also reset `0.0.0.0:5064` would silently
+    /// blind the OTHER IOC's PeriodCollapse for the next ~4 beacons
+    /// — same correctness regression as the rejected port-wide
+    /// sweep, just narrower.
+    #[test]
+    fn reset_exact_does_not_cascade_to_inaddr_any_other_ioc() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let target: SocketAddr = "10.0.0.5:5064".parse().unwrap();
+        let inaddr_any: SocketAddr = "0.0.0.0:5064".parse().unwrap();
+        servers.insert(
+            target,
+            BeaconState {
+                last_id: 1,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 1000,
+            },
+        );
+        servers.insert(
+            inaddr_any,
+            BeaconState {
+                last_id: 2,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 500,
+            },
+        );
+
+        apply_reset_server(&mut servers, target);
+
+        let t = servers.get(&target).expect("target preserved");
+        assert!(t.period_estimate.is_none(), "exact-match target reset");
+        assert_eq!(t.count, 0);
+
+        let i = servers.get(&inaddr_any).expect("inaddr-any preserved");
+        assert_eq!(
+            i.period_estimate,
+            Some(Duration::from_secs(15)),
+            "INADDR_ANY entry from a different IOC must not be touched \
+             after an exact-match hit"
+        );
+        assert_eq!(i.count, 500);
+    }
+
+    /// Cross-IOC blinding regression. In real CA networks many
+    /// unrelated IOCs share the default port 5064. A naive port-only
+    /// sweep would clear `count` and `period_estimate` for every
+    /// `*:5064` entry on every reconnect — silently disabling
+    /// PeriodCollapse (gated on `count > 3`) for the next ~4 beacons
+    /// from each unrelated IOC. A neighbour IOC that restarts with a
+    /// preserved beacon counter inside that window would go
+    /// undetected.
+    ///
+    /// With the narrowed policy, an exact-match reset must touch ONLY
+    /// the matched entry; unrelated same-port entries stay intact.
+    #[test]
+    fn reset_does_not_blind_other_same_port_ioc() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let target: SocketAddr = "10.0.0.5:5064".parse().unwrap();
+        let neighbour: SocketAddr = "10.0.0.7:5064".parse().unwrap();
+        servers.insert(
+            target,
+            BeaconState {
+                last_id: 1000,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 1000,
+            },
+        );
+        servers.insert(
+            neighbour,
+            BeaconState {
+                last_id: 2000,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 5000,
+            },
+        );
+
+        apply_reset_server(&mut servers, target);
+
+        let t = servers.get(&target).expect("target preserved");
+        assert!(t.period_estimate.is_none(), "exact-match target reset");
+        assert_eq!(t.count, 0);
+
+        let n = servers.get(&neighbour).expect("neighbour preserved");
+        assert_eq!(
+            n.period_estimate,
+            Some(Duration::from_secs(15)),
+            "unrelated same-port IOC must NOT have its EMA cleared — \
+             that would disable PeriodCollapse on its next restart"
+        );
+        assert_eq!(n.count, 5000, "neighbour count untouched");
+    }
+
+    /// Ambiguous fallback: if neither exact nor INADDR_ANY hits and
+    /// multiple `*:port` entries exist, we can't pick one safely —
+    /// skip the reset entirely (post-reconnect cascade returns for
+    /// the multi-homed-IOC + collision case, but no unrelated IOC is
+    /// blinded).
+    #[test]
+    fn reset_skips_when_ambiguous_no_exact_no_inaddr_any() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let a: SocketAddr = "10.0.0.7:5064".parse().unwrap();
+        let b: SocketAddr = "10.0.0.9:5064".parse().unwrap();
+        servers.insert(
+            a,
+            BeaconState {
+                last_id: 1,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 100,
+            },
+        );
+        servers.insert(
+            b,
+            BeaconState {
+                last_id: 2,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 200,
+            },
+        );
+
+        // Reset for a circuit that doesn't match either entry.
+        let circuit: SocketAddr = "10.0.0.5:5064".parse().unwrap();
+        apply_reset_server(&mut servers, circuit);
+
+        for key in [a, b] {
+            let s = servers.get(&key).expect("entry preserved");
+            assert_eq!(
+                s.period_estimate,
+                Some(Duration::from_secs(15)),
+                "ambiguous fallback must not blind {key}"
+            );
+        }
+    }
+
+    /// INADDR_ANY hit must NOT cascade into a port-wide sweep —
+    /// unrelated real-IP `*:port` entries stay intact even when the
+    /// reset successfully resolves via INADDR_ANY.
+    #[test]
+    fn reset_via_inaddr_any_does_not_touch_unrelated_real_ip_entries() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let inaddr_any: SocketAddr = "0.0.0.0:5064".parse().unwrap();
+        let unrelated: SocketAddr = "10.0.0.7:5064".parse().unwrap();
+        servers.insert(
+            inaddr_any,
+            BeaconState {
+                last_id: 1,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 100,
+            },
+        );
+        servers.insert(
+            unrelated,
+            BeaconState {
+                last_id: 2,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 200,
+            },
+        );
+
+        let circuit: SocketAddr = "10.0.0.5:5064".parse().unwrap();
+        apply_reset_server(&mut servers, circuit);
+
+        let i = servers.get(&inaddr_any).expect("inaddr-any preserved");
+        assert!(i.period_estimate.is_none(), "INADDR_ANY entry reset");
+
+        let u = servers.get(&unrelated).expect("unrelated preserved");
+        assert_eq!(
+            u.period_estimate,
+            Some(Duration::from_secs(15)),
+            "unrelated same-port real-IP entry must not be touched"
+        );
+        assert_eq!(u.count, 200);
+    }
+
+    /// Different port = different IOC. Reset must NOT touch entries on
+    /// unrelated ports (port-fallback's *only* fuzz axis is IP, not
+    /// port).
+    #[test]
+    fn reset_leaves_other_port_entries_alone() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let other: SocketAddr = "0.0.0.0:5065".parse().unwrap();
+        servers.insert(
+            other,
+            BeaconState {
+                last_id: 7,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 50,
+            },
+        );
+
+        let circuit: SocketAddr = "10.0.0.5:5064".parse().unwrap();
+        apply_reset_server(&mut servers, circuit);
+
+        let s = servers.get(&other).expect("entry preserved");
+        assert_eq!(
+            s.period_estimate,
+            Some(Duration::from_secs(15)),
+            "different-port entry must not be touched"
+        );
+        assert_eq!(s.count, 50);
     }
 }

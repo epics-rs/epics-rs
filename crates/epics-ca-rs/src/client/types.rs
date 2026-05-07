@@ -466,4 +466,14 @@ pub(crate) enum TransportEvent {
         server_addr: SocketAddr,
         minor_version: u16,
     },
+    /// A fresh TCP circuit was just inserted into the connections map.
+    /// Used by the coordinator to issue a `BeaconControl::ResetServer`
+    /// to the beacon monitor (libca `bhe.cpp` "new client connect"
+    /// EMA reset) so a stale steady-state period estimate doesn't
+    /// misclassify the server's `online_notify_task` ramp-up as a
+    /// `PeriodCollapse` cascade after reconnect. Emitted exactly once
+    /// per circuit, before any other event for that circuit.
+    ServerConnected {
+        server_addr: SocketAddr,
+    },
 }

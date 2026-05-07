@@ -624,7 +624,7 @@ impl CaClient {
     {
         let new = Arc::new(f);
         let mut slot = self.exception_slot.write();
-        std::mem::replace(&mut *slot, Some(new))
+        slot.replace(new)
     }
 
     /// Drop the registered handler. Subsequent OOB errors will only

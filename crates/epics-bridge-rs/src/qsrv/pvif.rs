@@ -621,7 +621,7 @@ fn alarm_severity_string(severity: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_base_rs::server::snapshot::{AlarmInfo, EnumInfo, Snapshot};
+    use epics_base_rs::server::snapshot::{EnumInfo, Snapshot};
 
     fn test_snapshot(value: EpicsValue) -> Snapshot {
         let mut snap = Snapshot::new(value, 0, 0, UNIX_EPOCH);

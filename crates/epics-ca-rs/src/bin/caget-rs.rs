@@ -167,7 +167,9 @@ impl Args {
 /// the real server timestamp + alarm pair onto the wire.
 enum GetResult {
     Plain(epics_ca_rs::EpicsValue),
-    Time(epics_base_rs::server::snapshot::Snapshot),
+    // Boxed to keep the enum variants size-balanced after Snapshot
+    // gained a class_name: Option<String> field for DBR_CLASS_NAME.
+    Time(Box<epics_base_rs::server::snapshot::Snapshot>),
 }
 
 fn format_server_timestamp(ts: SystemTime) -> String {
@@ -270,7 +272,7 @@ async fn main() {
             // bigger DBR_TIME response.
             let outcome = if want_time {
                 match tokio::time::timeout(t, ch.get_with_metadata(DbrClass::Time)).await {
-                    Ok(Ok(snap)) => Ok(GetResult::Time(snap)),
+                    Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
                     Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
                     Ok(Err(e)) => Err(format!("{e}")),
                     Err(_) => Err("timeout".to_string()),

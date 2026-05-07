@@ -26,6 +26,10 @@ use super::decode::{SearchResponse, decode_search_response, try_parse_frame};
 
 /// Parse `EPICS_PVA_ADDR_LIST` style strings into a list of IPs/SocketAddrs.
 pub fn parse_addr_list(env: &str) -> Vec<SocketAddr> {
+    // PVA-466: $(VAR) / ${VAR} expansion against the process env
+    // so callers of this legacy public parser see the same shell
+    // macro semantics as the config::env path. Unset → empty.
+    let env = crate::config::env::expand_dollar_vars(env);
     env.split(|c: char| c == ',' || c.is_whitespace())
         .filter_map(|s| {
             let s = s.trim();

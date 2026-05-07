@@ -84,6 +84,9 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     let Ok(keychain) = std::env::var("EPICS_PVAS_TLS_KEYCHAIN") else {
         return Ok(None);
     };
+    // PVA-466: expand $(VAR) / ${VAR} in path env so operators can
+    // template `EPICS_PVAS_TLS_KEYCHAIN="$(IOC_HOME)/server.pem"`.
+    let keychain = crate::config::env::expand_dollar_vars(&keychain);
     let path = PathBuf::from(keychain);
 
     let (certs, key) = read_pem_bundle(&path)?;
@@ -135,6 +138,8 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
     }
     let mut roots = RootCertStore::empty();
     if let Ok(ca_path) = std::env::var("EPICS_PVA_TLS_CA_KEYCHAIN") {
+        // PVA-466: expand $(VAR) / ${VAR} in path env.
+        let ca_path = crate::config::env::expand_dollar_vars(&ca_path);
         let path = PathBuf::from(&ca_path);
         let (certs, _) = read_pem_bundle(&path).or_else(|e| match e {
             TlsConfigError::NoKey(_) => read_pem_bundle_certs_only(&path).map(|c| (c, dummy_key())),
@@ -148,6 +153,8 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
     let builder = ClientConfig::builder().with_root_certificates(roots);
 
     let config = if let Ok(keychain) = std::env::var("EPICS_PVA_TLS_KEYCHAIN") {
+        // PVA-466: expand $(VAR) / ${VAR} in path env.
+        let keychain = crate::config::env::expand_dollar_vars(&keychain);
         let path = PathBuf::from(keychain);
         let (certs, key) = read_pem_bundle(&path)?;
         builder

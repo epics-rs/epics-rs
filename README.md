@@ -340,6 +340,102 @@ pvinfo-rs TEMP             # PV type info
 
 Legacy `pv*` flags are wired on every PVA tool (`-V`, `-w`, `-r`, `-p`, `-M`, `-v`, `-q`, `-d`); `-M nt` output matches `pvget` byte-for-byte. First-response latency on `pvget-rs <PV>` is 5–10 ms against a local IOC.
 
+### Use as a CA / PVA client library
+
+For Rust applications that need to **talk to existing EPICS IOCs**
+(soft IOCs, hardware IOCs, gateways — anything speaking the CA / PVA
+wire protocol). The umbrella crate or the per-protocol crates work
+either way.
+
+```toml
+[dependencies]
+# Client + server, both protocols (recommended for new projects):
+epics-rs = { version = "0.15", features = ["pva"] }   # ca enabled by default
+
+# Or per-protocol, no umbrella:
+epics-ca-rs  = "0.15"
+epics-pva-rs = "0.15"
+```
+
+Standard EPICS environment variables (`EPICS_CA_ADDR_LIST` /
+`EPICS_PVA_ADDR_LIST` / `*_AUTO_ADDR_LIST` / `*_NAME_SERVERS` /
+`EPICS_PVAS_TLS_KEYCHAIN` …) are read at client construction time —
+nothing else to wire up if your IOCs are already discoverable.
+
+#### Channel Access (CA)
+
+```rust
+use epics_ca_rs::client::CaClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = CaClient::new().await?;
+
+    // Read — returns (DBR type, value)
+    let (_dbr, value) = client.caget("TEMP:Setpoint").await?;
+    println!("{value}");
+
+    // Write — value parsed from the supplied string
+    client.caput("TEMP:Setpoint", "42.0").await?;
+
+    // Subscribe — callback fires on every value-change event
+    client.camonitor("TEMP:Reading", |value| {
+        println!("update: {value}");
+    }).await?;
+    Ok(())
+}
+```
+
+For richer per-channel control (state changes, async wait-for-connect,
+explicit DBR variants, subscription handles) use
+`client.create_channel(name) -> CaChannel`. See [`docs.rs/epics-ca-rs`](https://docs.rs/epics-ca-rs).
+
+#### pvAccess (PVA)
+
+```rust
+use epics_pva_rs::client::PvaClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = PvaClient::new()?;
+
+    // Read — returns the full structured PvField
+    let value = client.pvget("MY:Struct").await?;
+    println!("{value:?}");
+
+    // Write (string-parsed)
+    client.pvput("MY:Setpoint", "42.0").await?;
+
+    // Subscribe — callback receives each MONITOR update
+    client.pvmonitor("MY:Stream", |update| {
+        println!("update: {update:?}");
+    }).await?;
+    Ok(())
+}
+```
+
+`PvaClient::builder()` exposes per-client overrides (timeout, name
+servers, TLS, priority) when you don't want to thread settings
+through environment variables. See [`docs.rs/epics-pva-rs`](https://docs.rs/epics-pva-rs).
+
+#### Drop-in CLI tools
+
+The protocol crates ship standard CLI replacements that accept the
+same flag set as the C tools:
+
+```sh
+# CA tools — caget-rs / caput-rs / camonitor-rs / cainfo-rs
+cargo install epics-ca-rs
+
+# PVA tools — pvget-rs / pvput-rs / pvmonitor-rs / pvinfo-rs
+cargo install epics-pva-rs
+
+caget-rs TEMP                # read via CA
+camonitor-rs TEMP            # subscribe via CA
+pvget-rs TEMP                # read via PVA
+pvmonitor-rs TEMP            # subscribe via PVA
+```
+
 ### Library Usage
 
 #### Declarative IOC Builder

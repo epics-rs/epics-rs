@@ -1,5 +1,131 @@
 # Changelog
 
+## v0.15.0 — 2026-05-07
+
+Five Layer-2 feature-map gaps closed with audit-driven follow-throughs.
+Each feature ships as one logical commit on top of the v0.14.2 patch
+line; the public surface grows in a forward-compatible direction
+(`#[non_exhaustive]` applied where new variants / fields are likely).
+
+### epics-base-rs
+
+- **feat**: per-variant `DBR_GR_*` (21..27), `DBR_CTRL_*` (28..34),
+  `DBR_STS_*` named constants alongside the existing `DBR_TIME_*`,
+  plus `DBR_STRING..DBR_DOUBLE` natives and `DBR_INT`/`DBR_STS_INT`/
+  `DBR_TIME_INT`/`DBR_GR_INT`/`DBR_CTRL_INT` aliases for `Short`.
+  Adds `DbFieldType::sts_dbr_type()` / `gr_dbr_type()` mirroring the
+  existing `time_dbr_type()` / `ctrl_dbr_type()`. (CA-263 / CA-264)
+- **feat**: `DBR_CLASS_NAME` (38) wire encode/decode in
+  `types/codec.rs`. `Snapshot` grows a `class_name: Option<String>`
+  field populated by the server before encoding so `caget -d
+  CLASS_NAME` returns the actual recordType (`ai`, `bo`, `waveform`,
+  …) instead of an empty/garbage response. The encode path
+  early-returns CLASS_NAME *before* `convert_and_serialize` —
+  otherwise a waveform PV's value is `Display`'d into a throwaway
+  joined string. The decode path rejects payloads shorter than 40
+  bytes with `CaError::Protocol` instead of silently truncating.
+  `LAST_BUFFER_TYPE` follows. (CA-268)
+- **feat**: `Snapshot` annotated `#[non_exhaustive]` so future field
+  additions don't break external struct-literal construction; bridge
+  `qsrv/pvif.rs` test sites migrated to `Snapshot::new` + field
+  assignment.
+
+### epics-ca-rs (client)
+
+- **feat**: `CaChannel::search_attempts() -> u32` — libca
+  `ca_search_attempts(chid)` parity (CA-035). Counts every UDP
+  SEARCH fanout (immediate first SEARCH after `Schedule` AND each
+  bucket-tick retransmit). One increment per fanout call regardless
+  of how many UDP datagrams the addr-list / nameserver duplication
+  produces. Cleared synchronously inside `run_coordinator`'s
+  `TransportEvent::ChannelCreated` arm *before* waking
+  `connect_waiters` and *before* emitting
+  `ConnectionEvent::Connected` so a caller awakened by `Connected`
+  cannot observe the pre-connect non-zero count. The shared atomic
+  counter uses `fetch_add(1)` so beacon `poke()`'s reset of the
+  scheduler's internal backoff counter doesn't make the user-visible
+  diagnostic regress.
+- **feat**: `CaClient::set_exception_handler` /
+  `clear_exception_handler` — libca `ca_add_exception_event`
+  (CA-130). Per-client (not process-global) slot dispatched from
+  `run_coordinator` for `TransportEvent::ServerError` (server-emitted
+  `CA_PROTO_ERROR`) and `TransportEvent::ServerDisconnect`
+  (`CA_PROTO_SERVER_DISCONN`). New `CaException` /
+  `CaExceptionKind` types, both `#[non_exhaustive]`. `CaException
+  .status` carries the ECA code parsed from the response header's
+  `hdr.cid` (where the server places `eca_status` per
+  `send_ca_error`); the original request's command code is appended
+  to `message` text as `(while processing cmd=N)` so the diagnostic
+  context survives without confusing it with the ECA.
+  `TransportEvent::ServerError` grows an explicit `eca_status: u32`
+  field — previously the transport read the first u16 of the
+  payload (= original cmd byte) and routed it as `status`, leaving
+  handler users matching on `ECA_BADTYPE` to receive
+  `CA_PROTO_READ_NOTIFY`-shaped values.
+
+### epics-ca-rs (server)
+
+- **feat**: `DBR_CLASS_NAME` wire-correct emission across **every**
+  emission site — `READ` / `READ_NOTIFY`, the `EVENT_ADD`
+  per-event encode loop in `server/tcp.rs`,
+  `send_monitor_snapshot`, *and* `server/monitor.rs::send_event`
+  (the `SimplePv` subscription path that goes through
+  `spawn_monitor_sender`). Forces `element_count = 1` regardless of
+  the underlying value count and populates `Snapshot.class_name`
+  from `record.record_type()` on monitor paths. Without this
+  override at every site, a waveform PV with `N` elements emitted
+  `count=N` + 40-byte body which makes C clients parse `40*N` body
+  bytes and fail.
+
+### epics-pva-rs (client)
+
+- **feat**: `PvaClient::pvput_build(name, |&mut PvField| -> Result)`
+  — pvxs `PutBuilder::fetchPresent(true).build(cb)` parity
+  (PVA-065). One round-trip read-modify-write — useful for
+  "increment a counter", "toggle a bit", "splice into an array"
+  workloads where the new value depends on the current. **Scope**:
+  closure sees and round-trips the `.value` subfield only.
+  Modifications to `alarm` / `timeStamp` / `display` / any other
+  structure subfield are **not** persisted — the PUT pvRequest is
+  `field(value)` to match pvxs `Put` semantics and avoid silently
+  writing back stale alarm/severity. Use `pvput_field` for
+  non-value subfields.
+
+### epics-pva-rs (config)
+
+- **feat**: `config::env::expand_dollar_vars(&str) -> String` —
+  pvxs `Config::expand()` parity (PVA-466). `$(VAR)` and `${VAR}`
+  substitution against the process environment; unset macros
+  collapse to empty (matches the C IOC `dbLoadRecords` convention),
+  unterminated `$(...` is preserved verbatim so callers fail loudly
+  instead of silently swallowing trailing text. Wired into **every**
+  path-bearing or addr-bearing PVA env reader: `parse_addr_list_with_port`
+  (transitively `EPICS_PVA_ADDR_LIST` /
+  `EPICS_PVAS_BEACON_ADDR_LIST` / `EPICS_PVA_NAME_SERVERS` /
+  `server_addr_list`), `list_intf_addresses`,
+  `server_intf_addr_list`, `server_ignore_addr_list`,
+  `search_engine::join_addr_list_multicast` (multicast group join —
+  active SEARCH was already covered, but multicast beacon
+  discovery / fast-reconnect was silently dropping templated
+  groups), the `env_has_dest` emptiness probe, the legacy
+  `client_native::search::parse_addr_list` public surface, and the
+  three TLS keychain paths (`EPICS_PVAS_TLS_KEYCHAIN`,
+  `EPICS_PVA_TLS_CA_KEYCHAIN`, `EPICS_PVA_TLS_KEYCHAIN`).
+  `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD` is intentionally skipped
+  (passwords should not substitute env refs).
+
+### Notes
+
+- All public types added in this release (`CaException`,
+  `CaExceptionKind`, `Snapshot.class_name` carrier, `MonitorEvent`-
+  carrying paths) extend their containers with `#[non_exhaustive]`
+  where applicable so future field/variant additions are
+  forward-compatible.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+  `Snapshot` growing pushed `caget-rs`'s `GetResult::Time(Snapshot)`
+  variant past `clippy::large_enum_variant`; resolved by boxing
+  (`Time(Box<Snapshot>)`).
+
 ## v0.14.2 — 2026-05-06
 
 Patch follow-up to v0.14.1. The headline fix is a PVA client search

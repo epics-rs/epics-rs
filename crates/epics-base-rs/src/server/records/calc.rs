@@ -2,7 +2,9 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
-/// Calc record — evaluates CALC expression with inputs A-L.
+/// Calc record — evaluates CALC expression with inputs A-U.
+///
+/// Matches epics-base PR #655 (12 → 21 inputs, A-L → A-U).
 pub struct CalcRecord {
     pub val: f64,
     pub calc: String,
@@ -17,7 +19,7 @@ pub struct CalcRecord {
     pub lalm: f64,
     pub alst: f64,
     pub mlst: f64,
-    // Input link strings (INPA..INPL)
+    // Input link strings (INPA..INPU)
     pub inpa: String,
     pub inpb: String,
     pub inpc: String,
@@ -30,7 +32,16 @@ pub struct CalcRecord {
     pub inpj: String,
     pub inpk: String,
     pub inpl: String,
-    // Input values A-L
+    pub inpm: String,
+    pub inpn: String,
+    pub inpo: String,
+    pub inpp: String,
+    pub inpq: String,
+    pub inpr: String,
+    pub inps: String,
+    pub inpt: String,
+    pub inpu: String,
+    // Input values A-U
     pub a: f64,
     pub b: f64,
     pub c: f64,
@@ -43,7 +54,16 @@ pub struct CalcRecord {
     pub j: f64,
     pub k: f64,
     pub l: f64,
-    // Previous values LA-LL (saved after each process)
+    pub m: f64,
+    pub n: f64,
+    pub o: f64,
+    pub p: f64,
+    pub q: f64,
+    pub r: f64,
+    pub s: f64,
+    pub t: f64,
+    pub u: f64,
+    // Previous values LA-LU (saved after each process)
     pub la: f64,
     pub lb: f64,
     pub lc: f64,
@@ -56,6 +76,15 @@ pub struct CalcRecord {
     pub lj: f64,
     pub lk: f64,
     pub ll: f64,
+    pub lm: f64,
+    pub ln: f64,
+    pub lo: f64,
+    pub lp: f64,
+    pub lq: f64,
+    pub lr: f64,
+    pub ls: f64,
+    pub lt: f64,
+    pub lu: f64,
     // CALC_ALARM flag: set when calcPerform fails
     pub calc_alarm: bool,
     // Cached compiled expression (RPCL equivalent)
@@ -88,6 +117,15 @@ impl Default for CalcRecord {
             inpj: String::new(),
             inpk: String::new(),
             inpl: String::new(),
+            inpm: String::new(),
+            inpn: String::new(),
+            inpo: String::new(),
+            inpp: String::new(),
+            inpq: String::new(),
+            inpr: String::new(),
+            inps: String::new(),
+            inpt: String::new(),
+            inpu: String::new(),
             a: 0.0,
             b: 0.0,
             c: 0.0,
@@ -100,6 +138,15 @@ impl Default for CalcRecord {
             j: 0.0,
             k: 0.0,
             l: 0.0,
+            m: 0.0,
+            n: 0.0,
+            o: 0.0,
+            p: 0.0,
+            q: 0.0,
+            r: 0.0,
+            s: 0.0,
+            t: 0.0,
+            u: 0.0,
             la: 0.0,
             lb: 0.0,
             lc: 0.0,
@@ -112,6 +159,15 @@ impl Default for CalcRecord {
             lj: 0.0,
             lk: 0.0,
             ll: 0.0,
+            lm: 0.0,
+            ln: 0.0,
+            lo: 0.0,
+            lp: 0.0,
+            lq: 0.0,
+            lr: 0.0,
+            ls: 0.0,
+            lt: 0.0,
+            lu: 0.0,
             calc_alarm: false,
             rpcl: None,
         }
@@ -126,10 +182,10 @@ impl CalcRecord {
         }
     }
 
-    fn get_vars(&self) -> [f64; 12] {
+    fn get_vars(&self) -> [f64; 21] {
         [
             self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
-            self.l,
+            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
         ]
     }
 
@@ -147,15 +203,25 @@ impl CalcRecord {
             9 => &self.inpj,
             10 => &self.inpk,
             11 => &self.inpl,
+            12 => &self.inpm,
+            13 => &self.inpn,
+            14 => &self.inpo,
+            15 => &self.inpp,
+            16 => &self.inpq,
+            17 => &self.inpr,
+            18 => &self.inps,
+            19 => &self.inpt,
+            20 => &self.inpu,
             _ => "",
         }
     }
 
     /// Get input link strings for external processing.
-    pub fn input_links(&self) -> [&str; 12] {
+    pub fn input_links(&self) -> [&str; 21] {
         [
             &self.inpa, &self.inpb, &self.inpc, &self.inpd, &self.inpe, &self.inpf, &self.inpg,
-            &self.inph, &self.inpi, &self.inpj, &self.inpk, &self.inpl,
+            &self.inph, &self.inpi, &self.inpj, &self.inpk, &self.inpl, &self.inpm, &self.inpn,
+            &self.inpo, &self.inpp, &self.inpq, &self.inpr, &self.inps, &self.inpt, &self.inpu,
         ]
     }
 
@@ -173,6 +239,15 @@ impl CalcRecord {
             9 => self.j = val,
             10 => self.k = val,
             11 => self.l = val,
+            12 => self.m = val,
+            13 => self.n = val,
+            14 => self.o = val,
+            15 => self.p = val,
+            16 => self.q = val,
+            17 => self.r = val,
+            18 => self.s = val,
+            19 => self.t = val,
+            20 => self.u = val,
             _ => {}
         }
     }
@@ -295,6 +370,51 @@ static CALC_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        name: "INPM",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPO",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPP",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPQ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPR",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPS",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPT",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
         read_only: false,
@@ -351,6 +471,51 @@ static CALC_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "L",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "M",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "N",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "O",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "P",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "Q",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "R",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "S",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "T",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "U",
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
@@ -414,6 +579,51 @@ static CALC_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: true,
     },
+    FieldDesc {
+        name: "LM",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LN",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LO",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LP",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LQ",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LR",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LS",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LT",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LU",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
 ];
 
 impl Record for CalcRecord {
@@ -435,8 +645,7 @@ impl Record for CalcRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if let Some(ref compiled) = self.rpcl {
             let vars = self.get_vars();
-            let mut inputs = crate::calc::NumericInputs::new();
-            inputs.vars[..12].copy_from_slice(&vars);
+            let mut inputs = crate::calc::NumericInputs::with_vars(vars);
             // C sets CALC_ALARM on failure but continues processing
             match crate::calc::eval(compiled, &mut inputs) {
                 Ok(v) => {
@@ -449,12 +658,10 @@ impl Record for CalcRecord {
             }
         } else if !self.calc.is_empty() {
             // Fallback: try to compile and eval (e.g., if CALC was set after init)
-            match crate::calc::calc(&self.calc, &mut {
-                let vars = self.get_vars();
-                let mut inputs = crate::calc::NumericInputs::new();
-                inputs.vars[..12].copy_from_slice(&vars);
-                inputs
-            }) {
+            match crate::calc::calc(
+                &self.calc,
+                &mut crate::calc::NumericInputs::with_vars(self.get_vars()),
+            ) {
                 Ok(v) => {
                     self.val = v;
                     self.calc_alarm = false;
@@ -466,7 +673,7 @@ impl Record for CalcRecord {
                 }
             }
         }
-        // Save current values to LA-LL for next cycle
+        // Save current values to LA-LU for next cycle
         self.la = self.a;
         self.lb = self.b;
         self.lc = self.c;
@@ -479,6 +686,15 @@ impl Record for CalcRecord {
         self.lj = self.j;
         self.lk = self.k;
         self.ll = self.l;
+        self.lm = self.m;
+        self.ln = self.n;
+        self.lo = self.o;
+        self.lp = self.p;
+        self.lq = self.q;
+        self.lr = self.r;
+        self.ls = self.s;
+        self.lt = self.t;
+        self.lu = self.u;
         Ok(ProcessOutcome::complete())
     }
 
@@ -508,6 +724,15 @@ impl Record for CalcRecord {
             "INPJ" => Some(EpicsValue::String(self.inpj.clone())),
             "INPK" => Some(EpicsValue::String(self.inpk.clone())),
             "INPL" => Some(EpicsValue::String(self.inpl.clone())),
+            "INPM" => Some(EpicsValue::String(self.inpm.clone())),
+            "INPN" => Some(EpicsValue::String(self.inpn.clone())),
+            "INPO" => Some(EpicsValue::String(self.inpo.clone())),
+            "INPP" => Some(EpicsValue::String(self.inpp.clone())),
+            "INPQ" => Some(EpicsValue::String(self.inpq.clone())),
+            "INPR" => Some(EpicsValue::String(self.inpr.clone())),
+            "INPS" => Some(EpicsValue::String(self.inps.clone())),
+            "INPT" => Some(EpicsValue::String(self.inpt.clone())),
+            "INPU" => Some(EpicsValue::String(self.inpu.clone())),
             "A" => Some(EpicsValue::Double(self.a)),
             "B" => Some(EpicsValue::Double(self.b)),
             "C" => Some(EpicsValue::Double(self.c)),
@@ -520,6 +745,15 @@ impl Record for CalcRecord {
             "J" => Some(EpicsValue::Double(self.j)),
             "K" => Some(EpicsValue::Double(self.k)),
             "L" => Some(EpicsValue::Double(self.l)),
+            "M" => Some(EpicsValue::Double(self.m)),
+            "N" => Some(EpicsValue::Double(self.n)),
+            "O" => Some(EpicsValue::Double(self.o)),
+            "P" => Some(EpicsValue::Double(self.p)),
+            "Q" => Some(EpicsValue::Double(self.q)),
+            "R" => Some(EpicsValue::Double(self.r)),
+            "S" => Some(EpicsValue::Double(self.s)),
+            "T" => Some(EpicsValue::Double(self.t)),
+            "U" => Some(EpicsValue::Double(self.u)),
             "LA" => Some(EpicsValue::Double(self.la)),
             "LB" => Some(EpicsValue::Double(self.lb)),
             "LC" => Some(EpicsValue::Double(self.lc)),
@@ -532,6 +766,15 @@ impl Record for CalcRecord {
             "LJ" => Some(EpicsValue::Double(self.lj)),
             "LK" => Some(EpicsValue::Double(self.lk)),
             "LL" => Some(EpicsValue::Double(self.ll)),
+            "LM" => Some(EpicsValue::Double(self.lm)),
+            "LN" => Some(EpicsValue::Double(self.ln)),
+            "LO" => Some(EpicsValue::Double(self.lo)),
+            "LP" => Some(EpicsValue::Double(self.lp)),
+            "LQ" => Some(EpicsValue::Double(self.lq)),
+            "LR" => Some(EpicsValue::Double(self.lr)),
+            "LS" => Some(EpicsValue::Double(self.ls)),
+            "LT" => Some(EpicsValue::Double(self.lt)),
+            "LU" => Some(EpicsValue::Double(self.lu)),
             _ => None,
         }
     }
@@ -701,6 +944,69 @@ impl Record for CalcRecord {
                 }
                 _ => Err(CaError::TypeMismatch("INPL".into())),
             },
+            "INPM" => match value {
+                EpicsValue::String(s) => {
+                    self.inpm = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPM".into())),
+            },
+            "INPN" => match value {
+                EpicsValue::String(s) => {
+                    self.inpn = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPN".into())),
+            },
+            "INPO" => match value {
+                EpicsValue::String(s) => {
+                    self.inpo = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPO".into())),
+            },
+            "INPP" => match value {
+                EpicsValue::String(s) => {
+                    self.inpp = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPP".into())),
+            },
+            "INPQ" => match value {
+                EpicsValue::String(s) => {
+                    self.inpq = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPQ".into())),
+            },
+            "INPR" => match value {
+                EpicsValue::String(s) => {
+                    self.inpr = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPR".into())),
+            },
+            "INPS" => match value {
+                EpicsValue::String(s) => {
+                    self.inps = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPS".into())),
+            },
+            "INPT" => match value {
+                EpicsValue::String(s) => {
+                    self.inpt = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPT".into())),
+            },
+            "INPU" => match value {
+                EpicsValue::String(s) => {
+                    self.inpu = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPU".into())),
+            },
             "A" => match value {
                 EpicsValue::Double(v) => {
                     self.a = v;
@@ -869,6 +1175,132 @@ impl Record for CalcRecord {
                     }
                 }
             },
+            "M" => match value {
+                EpicsValue::Double(v) => {
+                    self.m = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.m = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch("M".into()))
+                    }
+                }
+            },
+            "N" => match value {
+                EpicsValue::Double(v) => {
+                    self.n = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.n = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch("N".into()))
+                    }
+                }
+            },
+            "O" => match value {
+                EpicsValue::Double(v) => {
+                    self.o = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.o = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch("O".into()))
+                    }
+                }
+            },
+            "P" => match value {
+                EpicsValue::Double(v) => {
+                    self.p = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.p = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch("P".into()))
+                    }
+                }
+            },
+            "Q" => match value {
+                EpicsValue::Double(v) => {
+                    self.q = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.q = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch("Q".into()))
+                    }
+                }
+            },
+            "R" => match value {
+                EpicsValue::Double(v) => {
+                    self.r = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.r = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch("R".into()))
+                    }
+                }
+            },
+            "S" => match value {
+                EpicsValue::Double(v) => {
+                    self.s = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.s = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch("S".into()))
+                    }
+                }
+            },
+            "T" => match value {
+                EpicsValue::Double(v) => {
+                    self.t = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.t = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch("T".into()))
+                    }
+                }
+            },
+            "U" => match value {
+                EpicsValue::Double(v) => {
+                    self.u = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.u = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch("U".into()))
+                    }
+                }
+            },
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -891,6 +1323,15 @@ impl Record for CalcRecord {
             ("INPJ", "J"),
             ("INPK", "K"),
             ("INPL", "L"),
+            ("INPM", "M"),
+            ("INPN", "N"),
+            ("INPO", "O"),
+            ("INPP", "P"),
+            ("INPQ", "Q"),
+            ("INPR", "R"),
+            ("INPS", "S"),
+            ("INPT", "T"),
+            ("INPU", "U"),
         ]
     }
 }

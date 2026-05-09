@@ -3,7 +3,7 @@ pub mod math;
 
 pub use engine::error::CalcError;
 pub use engine::opcodes::{CoreOp, Opcode};
-pub use engine::{CalcResult, CompiledExpr, ExprKind, NumericInputs};
+pub use engine::{CALC_NARGS, CalcResult, CompiledExpr, ExprKind, NumericInputs};
 
 pub use engine::StringInputs;
 pub use engine::opcodes::StringOp;

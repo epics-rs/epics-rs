@@ -488,3 +488,46 @@ fn test_inf_literal() {
     let result = calc("INF", &mut inputs).unwrap();
     assert!(result.is_infinite() && result > 0.0);
 }
+
+// ===== A..U input range (epics-base PR #655: 12 → 21 inputs) =====
+
+#[test]
+fn test_extended_inputs_m_through_u() {
+    // M..U single-letter variables must be parsed and evaluated.
+    // Pre-#655 the parser only accepted A..P; now A..U is the contract.
+    let cases = [
+        ("M+1", 12, 1.0, 2.0),
+        ("N*2", 13, 3.0, 6.0),
+        ("O-O", 14, 5.0, 0.0),
+        ("P+0", 15, 7.0, 7.0),
+        ("Q*Q", 16, 4.0, 16.0),
+        ("R/2", 17, 8.0, 4.0),
+        ("S+1", 18, 9.0, 10.0),
+        ("T-1", 19, 11.0, 10.0),
+        ("U+U", 20, 6.0, 12.0),
+    ];
+    for (expr, idx, val, expected) in cases {
+        assert_calc(expr, &[(idx, val)], expected);
+    }
+}
+
+#[test]
+fn test_full_a_to_u_sum() {
+    // A..U all set to 1; expression is the sum of all 21 inputs.
+    // Verifies the engine accepts all 21 letters in a single expression.
+    let inputs: Vec<(u8, f64)> = (0..21).map(|i| (i, 1.0)).collect();
+    assert_calc(
+        "A+B+C+D+E+F+G+H+I+J+K+L+M+N+O+P+Q+R+S+T+U",
+        &inputs,
+        21.0,
+    );
+}
+
+#[test]
+fn test_double_letter_uu_parses() {
+    // The lexer's doubled-letter variant (e.g. UU) must compile after
+    // #655 widened the legal range from A..L to A..U.
+    assert!(compile("UU").is_ok(), "UU should be a valid token");
+    assert!(compile("MM").is_ok(), "MM should be a valid token");
+    assert!(compile("VV").is_err(), "VV must remain rejected");
+}

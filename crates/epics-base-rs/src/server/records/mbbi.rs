@@ -31,6 +31,11 @@ pub struct MbbiRecord {
     pub ffsv: i16,
     pub unsv: i16,
     pub cosv: i16,
+    /// Alarm filter time constant (seconds). 0 = disabled.
+    /// See `BiRecord::aftc` — same low-pass filter on alarm severity.
+    pub aftc: f64,
+    /// Alarm filter accumulator. 0 = initial sample.
+    pub afvl: f64,
     pub zrvl: i32,
     pub onvl: i32,
     pub twvl: i32,
@@ -100,6 +105,8 @@ impl Default for MbbiRecord {
             ffsv: 0,
             unsv: 0,
             cosv: 0,
+            aftc: 0.0,
+            afvl: 0.0,
             zrvl: 0,
             onvl: 0,
             twvl: 0,
@@ -316,6 +323,16 @@ static MBBI_FIELDS: &[FieldDesc] = &[
         name: "COSV",
         dbf_type: DbFieldType::Short,
         read_only: false,
+    },
+    FieldDesc {
+        name: "AFTC",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "AFVL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
     },
     FieldDesc {
         name: "ZRVL",
@@ -561,6 +578,7 @@ impl Record for MbbiRecord {
             "EISV" => eisv: Short, "NISV" => nisv: Short, "TESV" => tesv: Short, "ELSV" => elsv: Short,
             "TVSV" => tvsv: Short, "TTSV" => ttsv: Short, "FTSV" => ftsv: Short, "FFSV" => ffsv: Short,
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
+            "AFTC" => aftc: Double, "AFVL" => afvl: Double,
             "ZRVL" => zrvl: Long, "ONVL" => onvl: Long, "TWVL" => twvl: Long, "THVL" => thvl: Long,
             "FRVL" => frvl: Long, "FVVL" => fvvl: Long, "SXVL" => sxvl: Long, "SVVL" => svvl: Long,
             "EIVL" => eivl: Long, "NIVL" => nivl: Long, "TEVL" => tevl: Long, "ELVL" => elvl: Long,
@@ -582,6 +600,7 @@ impl Record for MbbiRecord {
             "EISV" => eisv: Short, "NISV" => nisv: Short, "TESV" => tesv: Short, "ELSV" => elsv: Short,
             "TVSV" => tvsv: Short, "TTSV" => ttsv: Short, "FTSV" => ftsv: Short, "FFSV" => ffsv: Short,
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
+            "AFTC" => aftc: Double, "AFVL" => afvl: Double,
             "ZRVL" => zrvl: Long, "ONVL" => onvl: Long, "TWVL" => twvl: Long, "THVL" => thvl: Long,
             "FRVL" => frvl: Long, "FVVL" => fvvl: Long, "SXVL" => sxvl: Long, "SVVL" => svvl: Long,
             "EIVL" => eivl: Long, "NIVL" => nivl: Long, "TEVL" => tevl: Long, "ELVL" => elvl: Long,

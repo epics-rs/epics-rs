@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
+use std::time::SystemTime;
 
 use crate::runtime::sync::mpsc;
 
@@ -978,6 +979,52 @@ impl RecordInstance {
         }
     }
 
+    /// Apply the AFTC low-pass alarm filter (epics-base PR #817).
+    ///
+    /// Algorithm mirrors `biRecord.c`/`mbbiRecord.c::checkAlarms` after
+    /// PR #817: an exponential smoothing of integer alarm severity that
+    /// hysteresis-delays alarm reporting. `aftc <= 0` returns the raw
+    /// severity unchanged.
+    ///
+    /// `time_last` is the previous cycle's `common.time`; `time_now` is
+    /// the moment alarms are being evaluated. The caller updates
+    /// `record.AFVL` with the returned filter state.
+    fn aftc_filter(
+        raw_alarm: u16,
+        aftc: f64,
+        afvl_in: f64,
+        time_last: SystemTime,
+        time_now: SystemTime,
+    ) -> (u16, f64) {
+        const THRESHOLD: f64 = 0.6321; // 1 - 1/e
+        if aftc <= 0.0 {
+            return (raw_alarm, afvl_in);
+        }
+        if afvl_in == 0.0 {
+            // Initial sample: seed the accumulator without filtering.
+            return (raw_alarm, raw_alarm as f64);
+        }
+        // `dt >= 0` and `aftc > 0` so `dt + aftc > 0`. `dt = 0` collapses
+        // to alpha=1 which makes the update a no-op (matches base C
+        // behavior for two evaluations at the same instant).
+        let dt = time_now
+            .duration_since(time_last)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let alpha = aftc / (dt + aftc);
+        let mut afvl = alpha * afvl_in
+            + if afvl_in > 0.0 {
+                1.0 - alpha
+            } else {
+                alpha - 1.0
+            } * (raw_alarm as f64);
+        if afvl - afvl.floor() > THRESHOLD {
+            afvl = -afvl;
+        }
+        let alarm = afvl.floor().abs() as u16;
+        (alarm, afvl)
+    }
+
     /// Evaluate alarms based on record type and current value.
     /// Uses rec_gbl_set_sevr to accumulate into nsta/nsev.
     pub fn evaluate_alarms(&mut self) {
@@ -1054,7 +1101,36 @@ impl RecordInstance {
                 if val <= 1 {
                     // State alarm: ZSV for val==0, OSV for val==1
                     let state_sev = if val == 0 { zsv } else { osv };
-                    let sev = AlarmSeverity::from_u16(state_sev as u16);
+                    // AFTC low-pass filter on alarm severity (PR #817).
+                    // bi only carries AFTC for `bi`, not `bo`/`busy` —
+                    // skip filter for the latter two by checking rtype.
+                    let filtered_sev = if rtype == "bi" {
+                        let aftc = self
+                            .record
+                            .get_field("AFTC")
+                            .and_then(|v| v.to_f64())
+                            .unwrap_or(0.0);
+                        let afvl = self
+                            .record
+                            .get_field("AFVL")
+                            .and_then(|v| v.to_f64())
+                            .unwrap_or(0.0);
+                        let now = crate::runtime::general_time::get_current();
+                        let (out, new_afvl) = Self::aftc_filter(
+                            state_sev as u16,
+                            aftc,
+                            afvl,
+                            self.common.time,
+                            now,
+                        );
+                        let _ = self
+                            .record
+                            .put_field("AFVL", EpicsValue::Double(new_afvl));
+                        out as i16
+                    } else {
+                        state_sev
+                    };
+                    let sev = AlarmSeverity::from_u16(filtered_sev as u16);
                     if sev != AlarmSeverity::NoAlarm {
                         recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::STATE_ALARM, sev);
                     }
@@ -1133,7 +1209,35 @@ impl RecordInstance {
                     unsv
                 };
 
-                let sev = AlarmSeverity::from_u16(state_sev as u16);
+                // AFTC low-pass filter on alarm severity (PR #817).
+                // mbbi only — mbbo skipped, matching epics-base.
+                let filtered_state_sev = if rtype == "mbbi" {
+                    let aftc = self
+                        .record
+                        .get_field("AFTC")
+                        .and_then(|v| v.to_f64())
+                        .unwrap_or(0.0);
+                    let afvl = self
+                        .record
+                        .get_field("AFVL")
+                        .and_then(|v| v.to_f64())
+                        .unwrap_or(0.0);
+                    let now = crate::runtime::general_time::get_current();
+                    let (out, new_afvl) = Self::aftc_filter(
+                        state_sev as u16,
+                        aftc,
+                        afvl,
+                        self.common.time,
+                        now,
+                    );
+                    let _ = self
+                        .record
+                        .put_field("AFVL", EpicsValue::Double(new_afvl));
+                    out as i16
+                } else {
+                    state_sev
+                };
+                let sev = AlarmSeverity::from_u16(filtered_state_sev as u16);
                 if sev != AlarmSeverity::NoAlarm {
                     recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::STATE_ALARM, sev);
                 }
@@ -1902,5 +2006,76 @@ mod metadata_cache_tests {
         assert!(inst.metadata_cache.lock().unwrap().is_some());
         let _ = inst.process_local();
         assert!(inst.metadata_cache.lock().unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod aftc_filter_tests {
+    //! Tests for `RecordInstance::aftc_filter` (epics-base PR #817).
+    //! Pure-function tests: no record instance needed — the filter is
+    //! a stateless transform of (raw_alarm, aftc, afvl_in, t_last, t_now).
+
+    use super::*;
+    use std::time::Duration;
+
+    fn at(secs: f64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs)
+    }
+
+    #[test]
+    fn disabled_when_aftc_le_zero() {
+        // aftc=0 means filter disabled — pass-through.
+        let (out, afvl) = RecordInstance::aftc_filter(2, 0.0, 0.0, at(0.0), at(1.0));
+        assert_eq!(out, 2);
+        assert_eq!(afvl, 0.0);
+    }
+
+    #[test]
+    fn initial_sample_seeds_state_unchanged_alarm() {
+        // afvl=0 means first sample after enable — alarm passes through
+        // and accumulator seeds with the raw severity.
+        let (out, afvl) = RecordInstance::aftc_filter(2, 3.0, 0.0, at(0.0), at(0.5));
+        assert_eq!(out, 2);
+        assert_eq!(afvl, 2.0);
+    }
+
+    #[test]
+    fn raises_alarm_only_after_full_time_constant() {
+        // Single-step heuristic: with `aftc = 3s` and `dt = 0.1s`, alpha
+        // ≈ 0.967, so a one-shot raw_alarm=2 against afvl=0.0 should not
+        // produce alarm=2 yet — the filter must hold off until the
+        // accumulator crosses the threshold.
+        // Seed with afvl=0.01 (tiny prior, simulating "almost no alarm
+        // yet"); the filter must keep alarm at 0 after one short tick.
+        let (out, afvl) = RecordInstance::aftc_filter(2, 3.0, 0.01, at(0.0), at(0.1));
+        assert_eq!(out, 0, "filter should suppress alarm rise on a 0.1s tick");
+        assert!(afvl > 0.0 && afvl < 2.0);
+    }
+
+    #[test]
+    fn dt_zero_is_no_op() {
+        // Two evaluations at the same instant produce no filter advance.
+        let (out, afvl) = RecordInstance::aftc_filter(2, 3.0, 1.5, at(0.0), at(0.0));
+        assert_eq!(out, 1); // floor(|1.5|) = 1
+        assert_eq!(afvl, 1.5);
+    }
+
+    #[test]
+    fn long_steady_state_converges_to_alarm() {
+        // After many steps with raw_alarm=2 and dt much smaller than aftc,
+        // the accumulator must converge towards 2.
+        let aftc = 1.0;
+        let mut afvl = 0.0;
+        let mut last = at(0.0);
+        let mut alarm = 0;
+        for i in 1..=100 {
+            let now = at(i as f64 * 0.05);
+            let (out, new_afvl) = RecordInstance::aftc_filter(2, aftc, afvl, last, now);
+            alarm = out;
+            afvl = new_afvl;
+            last = now;
+        }
+        assert_eq!(alarm, 2, "after 5 s of steady raw=2 with aftc=1 s, output must reach 2");
+        assert!(afvl.abs() >= 1.99 && afvl.abs() <= 2.0);
     }
 }

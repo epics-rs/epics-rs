@@ -240,6 +240,65 @@ impl PvDatabase {
         s
     }
 
+    /// Wait for every PV opened by every registered [`LinkSet`] to
+    /// report `is_connected() == true`. Mirrors `dbCa: iocInit wait
+    /// for local CA links to connect` (epics-base PR #768/#856).
+    ///
+    /// Polls every 100 ms. Returns:
+    /// * `Ok(connected_count)` — the number of links that ended up
+    ///   connected. May be smaller than the registered total when
+    ///   the timeout expired before everyone was ready.
+    /// * The total link count — i.e. the size of the working set
+    ///   that was checked. `(connected, total)` lets the caller log
+    ///   "M/N CA links connected".
+    ///
+    /// Pure no-op when no link sets are registered, or when their
+    /// `link_names()` is empty (e.g. lazy-open lsets that haven't
+    /// observed any record link yet — record processing will create
+    /// the entries on first read, after iocInit returns).
+    pub async fn wait_for_external_links(&self, timeout: std::time::Duration) -> (usize, usize) {
+        let registry_snapshot: Vec<(String, link_set::DynLinkSet)> = {
+            let registry = self.inner.link_sets.read().await;
+            registry
+                .schemes()
+                .into_iter()
+                .filter_map(|s| registry.get(&s).map(|l| (s, l)))
+                .collect()
+        };
+        if registry_snapshot.is_empty() {
+            return (0, 0);
+        }
+        // Collect (scheme, name) pairs once. `link_names()` may grow
+        // as record processing opens new links, but iocInit's wait
+        // is bounded by the records loaded *before* Phase 3 — every
+        // such link is already opened by the time wire_device_support
+        // and setup_cp_links return.
+        let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
+        for (_scheme, lset) in &registry_snapshot {
+            for n in lset.link_names() {
+                targets.push((lset.clone(), n));
+            }
+        }
+        let total = targets.len();
+        if total == 0 {
+            return (0, 0);
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let connected = targets
+                .iter()
+                .filter(|(lset, name)| lset.is_connected(name))
+                .count();
+            if connected == total {
+                return (connected, total);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return (connected, total);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     /// Enumerate every link-shaped field on `record_name`. Returns
     /// `(field_name, link_string, parsed)` tuples for fields whose
     /// raw value parses as a non-trivial link via
@@ -480,5 +539,75 @@ mod tests {
         assert_eq!(select_link_indices(1, 10, 6), Vec::<usize>::new());
         // Mask: seln=5 = 0b101 -> indices 0 and 2
         assert_eq!(select_link_indices(2, 5, 6), vec![0, 2]);
+    }
+
+    /// Lset that flips to "connected" after a configurable delay.
+    /// Drives the wait_for_external_links time-budget tests below.
+    struct DelayedConnectLset {
+        names: Vec<String>,
+        connect_at: tokio::time::Instant,
+    }
+
+    impl link_set::LinkSet for DelayedConnectLset {
+        fn is_connected(&self, _: &str) -> bool {
+            tokio::time::Instant::now() >= self.connect_at
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            None
+        }
+        fn link_names(&self) -> Vec<String> {
+            self.names.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_external_links_returns_zero_zero_when_no_lsets() {
+        let db = PvDatabase::new();
+        let (c, t) = db
+            .wait_for_external_links(std::time::Duration::from_millis(50))
+            .await;
+        assert_eq!((c, t), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn wait_for_external_links_connected_quickly() {
+        let db = PvDatabase::new();
+        let lset = Arc::new(DelayedConnectLset {
+            names: vec!["pv:A".to_string(), "pv:B".to_string()],
+            connect_at: tokio::time::Instant::now(),
+        });
+        db.register_link_set("pva", lset).await;
+        let (c, t) = db
+            .wait_for_external_links(std::time::Duration::from_secs(1))
+            .await;
+        assert_eq!((c, t), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn wait_for_external_links_returns_partial_on_timeout() {
+        let db = PvDatabase::new();
+        // Connect-time well past the budget below; the wait must
+        // return (0, 1) instead of blocking.
+        let lset = Arc::new(DelayedConnectLset {
+            names: vec!["slow:pv".to_string()],
+            connect_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        });
+        db.register_link_set("ca", lset).await;
+        let started = tokio::time::Instant::now();
+        let (c, t) = db
+            .wait_for_external_links(std::time::Duration::from_millis(250))
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!((c, t), (0, 1));
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "wait must consume at least the configured budget, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "wait must not exceed the budget by much, got {:?}",
+            elapsed
+        );
     }
 }

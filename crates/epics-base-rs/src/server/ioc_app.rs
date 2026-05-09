@@ -348,6 +348,31 @@ impl IocApplication {
         let io_intr_count = setup_io_intr(db.clone()).await;
         db.setup_cp_links().await;
 
+        // Phase 2b.5: wait for external CA/PVA links to connect before
+        // PINI runs (epics-base PR #768/#856 — `dbCa: iocInit wait`).
+        // Default 10s timeout, override via `EPICS_RS_INIT_LINK_TIMEOUT`
+        // (seconds, fractional accepted). Pass-through when no LinkSet
+        // is registered.
+        let link_wait_secs = crate::runtime::env::get("EPICS_RS_INIT_LINK_TIMEOUT")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(10.0)
+            .max(0.0);
+        if link_wait_secs > 0.0 {
+            let (connected, total) = db
+                .wait_for_external_links(std::time::Duration::from_secs_f64(link_wait_secs))
+                .await;
+            if total > 0 {
+                if connected == total {
+                    eprintln!("iocInit: {connected}/{total} external links connected");
+                } else {
+                    eprintln!(
+                        "iocInit: {connected}/{total} external links connected after \
+                         {link_wait_secs}s — proceeding with unconnected links"
+                    );
+                }
+            }
+        }
+
         // Phase 2c: Pass1 restore (after device support wiring)
         for sav_path in &pass1_files {
             match autosave::restore_from_file(&db, sav_path).await {

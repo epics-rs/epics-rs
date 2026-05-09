@@ -369,6 +369,93 @@ mirror. Pre-2017 epics-base merged PRs are exclusively dbd POD doc
 work plus a single behavioural fix (#25, race in event delivery —
 inspected n/a; per-subscriber mpsc model).
 
+## J. Stability roll-up (cross-section)
+
+This section pulls every PR/issue from Sections A–I that addresses a
+**stability** concern — race, deadlock, hang, crash, leak, spin loop,
+panic, recovery, or shutdown ordering. The intent is operational: if a
+production-leaning user wants a "what's safe vs what isn't" snapshot,
+they read here. Feature additions are excluded.
+
+Tagging convention:
+
+- `equivalent`: the same defect class is structurally absent in
+  epics-rs (often via Rust ownership, type system, or async-runtime
+  semantics).
+- `applied`: an explicit fix lives in epics-rs.
+- `audit`: spot-check pending; needs a regression test or manual
+  trace.
+- `gap`: latent risk in epics-rs; warrants its own follow-up.
+
+### epics-rs already covers (equivalent / applied)
+
+| Upstream | Defect | epics-rs site |
+|---|---|---|
+| epics-base #571 | record process re-entry recursion | `record_instance.rs::processing: AtomicBool` + visited set in `process_record_with_links` (equivalent) |
+| epics-base #496 / #745 | UB pthread_join, epicsThread race | tokio task model, no equivalent unsafe path (equivalent) |
+| epics-base #432 / #324 | dbEvent double-cancel hang, eventsRemaining missed | `subscribers.lock().retain(\|s\| !s.tx.is_closed())` + bounded mpsc per subscriber (equivalent) |
+| epics-base #543 | std::unexpected deprecated | Rust panic / Result idioms (equivalent) |
+| epics-base #437 | Null-check callback in callbackRequest | typed `Option<Fn>` makes null callback impossible (equivalent) |
+| epics-base #559 | CP link RPRO during target-mid-process | `processing.rs:1318` sets `rpro=true` when target is processing (equivalent) |
+| epics-base #450 / #331 | rsrv `db_create_read_log` lock | `RwLock<RecordInstance>` per record (equivalent) |
+| epics-base #517 | `_FORTIFY_SOURCE=3` C buffer checks | Rust bounds-checks at runtime (equivalent) |
+| epics-base #211 | `fork()` safety | tokio + Rust drop order; no fork model (equivalent — out of scope) |
+| epics-base #485 | printfRecord SIZV>32767 segfault | `sizv: u16` field — i16 truncation absent (equivalent) |
+| epics-base #692 | CA link 0xffffffff truncation | `ParsedLink::Constant(String)` retains literal (equivalent) |
+| epics-base #423 | dbEvent double-cancel hang | mpsc + retain pattern (equivalent — fix-committed upstream) |
+| epics-base #495 | posix data race on `pthreadInfo->osiPriority` | tokio task priority model (equivalent — out of scope) |
+| epics-base #683 | `lockSetsActive` accessed without lock | epics-rs has no global lock-set table — different concurrency model (equivalent — out of scope) |
+| epics-base #758 | yajl `yajl_render_error_string` buffer overflow | `serde_json` (Rust, bounded-checked) (equivalent — different lib) |
+| epics-base #380 | `astac()` leaks resources | C-only; epics-rs ACF uses owned strings (equivalent) |
+| epics-base #444 | linux/ header in osdSockUnsentCount | C build; tokio sockets (equivalent) |
+| epics-base #25 | event-delivery race (2019) | per-subscriber mpsc + coalesce slot (equivalent) |
+| epics-rs commit acfa608 | `CaClient` / `ServerConnection` task abort on Drop | `client/mod.rs:954`, `client/transport.rs:130` — applied on this branch's history |
+| epics-rs commit df93e49 | Beacon EMA reset on TCP (re)connect | applied |
+| epics-rs / G1-G4 | server TCP send timeout, per-channel monitor cap, 64KB UDP buffer, CAS_USE_HOST_NAMES forward-DNS | applied (see kodex audit notes) |
+
+### epics-rs gaps under the stability lens
+
+These are the items where epics-rs may share — or has not been verified
+free of — the upstream defect. Each one needs an explicit regression
+test before it can move to "equivalent".
+
+| Upstream | Defect | epics-rs site to verify | Risk class |
+|---|---|---|---|
+| epics-base #455 | OS clock < EPICS epoch → CA client spin | client time-comparison loops; confirm no `while now < epoch` patterns | **medium** (production never runs with clock < epoch, but laptops on resume can) |
+| epics-base #438 | Test IOC w/ ACF hangs in `asCaStart()` after first run | ACF reload code path under repeated invocation | medium |
+| epics-base #477 | Application hangs 30 s after both ends destroy | `CaClient` Drop already aborts tasks (acfa608); but the 30 s window matches our `EPICS_CA_CONN_TMO` echo-watchdog default — needs reproduction | medium |
+| epics-base #190 | CA connections "stalled" after laptop suspend | echo heartbeat (P-G fix) should detect; verify under `pmset` suspend on macOS / `systemctl suspend` on Linux | medium |
+| epics-base #426 | CA nameserver + CA_V413 protocol mismatch | `EPICS_CA_NAME_SERVERS` TCP search handshake under v4.13 servers | low |
+| epics-base #469 | `iocshLoad` doesn't undo `IOCSH_STARTUP_SCRIPT` | `iocsh/mod.rs` env-restore on script-load nesting | low (UX rather than crash) |
+| epics-base #97 | Segfault reading from compress to aai | `records/compress.rs` size negotiation when target buffer < source | medium (bounded by Rust panic, not segfault) |
+| epics-base #557 | CP link inconsistency with async record | `processing.rs` async-record + CP-link interaction | low |
+| epics-base #471 | `iocshLoad` + `on error` bad interaction | iocsh error-state propagation in nested loads | low |
+| epics-base #194 | `CALC$` long string issue | `records/scalcout.rs` long-string handling; bounded under our `String` type | low |
+| asyn #34 | `asynPortDriver` segfault on duplicate port name | `PortManager::register_port[_with_config]` now returns `Result` and rejects duplicate names with `AsynError::PortAlreadyRegistered`. Tests: `duplicate_port_name_rejected`, `duplicate_after_unregister_succeeds` | **applied** |
+| asyn #80 / #56 | Deadlocks / race with `asyn:READBACK` on output records | adapter callback path; intersects with the deferred #208/#60 work | medium (depends on #208/#60) |
+| asyn #170 | Parallel callback queue overflow | `interrupt.rs` queue cap policy | medium |
+| asyn #99 | "main" blocks for `asynPortDriverCallback` thread to exit | port_actor join semantics on shutdown | low |
+| asyn #220 | `pasynOctetSyncIO->read` overwrites `pasynUser->timeout` | `sync_io.rs::read` timeout preservation | medium |
+| asyn #224 | autoConnect connects too early (before all init) | `port_actor.rs` startup ordering | medium |
+| asyn #105 / #93 | vxi11 buffer overflow / std::vector overrun | not in asyn-rs (no vxi11 driver) | n/a |
+
+### Recommendation
+
+The single outright **gap** found in this stability roll-up is now
+applied:
+
+- **asyn-rs duplicate-port-name** — `PortManager::register_port[_with_config]`
+  signature changed from `-> PortRuntimeHandle` to
+  `-> AsynResult<PortRuntimeHandle>`; the second registration with the
+  same name returns `AsynError::PortAlreadyRegistered` instead of
+  silently shadowing. Pre-flight check + post-spawn re-check closes the
+  TOCTOU window so a concurrent caller can't race past it.
+
+The remaining "**audit**" rows are individually small but each needs a
+reproducer (clock skew, NIC-suspend, repeated ACF reload, …) — those
+warrant their own PR or test-suite expansion rather than blind
+guarding.
+
 ## F. Refresh queries (run to update this doc)
 
 ```sh

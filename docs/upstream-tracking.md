@@ -39,7 +39,7 @@ Shape: PR# / merged date / what changed / epics-rs location to inspect / status 
 | [#678](https://github.com/epics-base/epics-base/pull/678) | 2025-11 | hex/octal strings in dbPut/dbGet | dbPut/dbGet string-to-numeric parser | not started |
 | [#655](https://github.com/epics-base/epics-base/pull/655) | 2025-08 | Extend `calc` inputs A–L → A–U | `crates/epics-base-rs/src/server/records/calc.rs` and `calcout.rs` | done — engine `CALC_NARGS = 21`, lexer A..U / AA..UU, `CalcRecord` + `CalcoutRecord` carry INPM..INPU + M..U + LM..LU; tests `test_extended_inputs_m_through_u`, `test_full_a_to_u_sum`, `test_double_letter_uu_parses` |
 | [#636](https://github.com/epics-base/epics-base/pull/636) | 2025-06 | `EPICS_DB_INCLUDE_PATH` for dbLoadTemplate | dbLoadTemplate in epics-base-rs | not started |
-| [#626](https://github.com/epics-base/epics-base/pull/626) | 2025-06 | `dbgrep` → `dbglob` (alias kept) | iocsh commands | not started |
+| [#626](https://github.com/epics-base/epics-base/pull/626) | 2025-06 | `dbgrep` → `dbglob` (alias kept) | `iocsh/commands.rs::cmd_dbglob` + `cmd_dbgrep` aliases of `dbsr`, share `dbsr_handler`. PR #613's `[fields]` argument also added | done |
 | [#608](https://github.com/epics-base/epics-base/pull/608) | 2025-10 | Warn to stderr when discarding CPP modifier for outlink | dblink/outlink parser | not started |
 | [#558](https://github.com/epics-base/epics-base/pull/558) | 2025-06 | iocsh `afterIocRunning` (≠ atInit/afterInit) | iocsh commands | not started |
 | [#359](https://github.com/epics-base/epics-base/pull/359) | 2026-02 | Fix undefined timestamp for NORD field | aao/aai/waveform NORD timestamp path | not started |
@@ -65,9 +65,9 @@ Shape: PR# / merged date / what changed / epics-rs location to inspect / status 
 | [#621](https://github.com/epics-base/epics-base/pull/621) | nameserver: force CA protocol version | `EPICS_CA_NAME_SERVERS` handshake version selection | not started |
 | [#507](https://github.com/epics-base/epics-base/pull/507) | iocsh local variables | iocsh interpreter | not started |
 | [#503](https://github.com/epics-base/epics-base/pull/503) | caget tolerates partial disconnect | `caget` tool behavior | not started |
-| [#497](https://github.com/epics-base/epics-base/pull/497) | iocsh `pushd`/`popd`/`dirs` | iocsh commands | not started |
+| [#497](https://github.com/epics-base/epics-base/pull/497) | iocsh `pushd`/`popd`/`dirs` | `iocsh/commands.rs::{cmd_pushd, cmd_popd, cmd_dirs}` with process-global `dir_stack` (OnceLock<Mutex<Vec<PathBuf>>>); failed `cd` restores popped entry | done |
 | [#475](https://github.com/epics-base/epics-base/pull/475) | asLib type-safety incompat | ACF library | not started |
-| [#459](https://github.com/epics-base/epics-base/pull/459) | iocsh history/file size limit | iocsh history | not started |
+| [#459](https://github.com/epics-base/epics-base/pull/459) | iocsh history/file size limit | `iocsh/mod.rs::run_repl` builds `rustyline::Config` with `max_history_size` from `EPICS_RS_IOCSH_HISTORY_SIZE` (default 500, floor 16) | done |
 | [#205](https://github.com/epics-base/epics-base/pull/205) | IPv6 part 1 | epics-ca-rs ADDR_LIST/BEACON multi-NIC is IPv4-only | not started |
 | [#154](https://github.com/epics-base/epics-base/pull/154) | DBR_VFIELD virtual field | CA DBR types | not started |
 | [#149](https://github.com/epics-base/epics-base/pull/149) | Address modifiers | dblink modifiers | not started |
@@ -173,7 +173,7 @@ fixes), #470/#519/#509 (C memory leaks), #461 (VSCode makefile),
 | [#520](https://github.com/epics-base/epics-base/pull/520) | 2024-08 | readline: keep history only in interactive sessions | `iocsh/mod.rs` rustyline — interactive default | inspected, equivalent |
 | [#516](https://github.com/epics-base/epics-base/pull/516) | 2024-06 | `RSRV_SERVER_PORT` > 9999 | server port stored as `u16` (0..65535) — no 4-digit format clip | inspected, equivalent |
 | [#508](https://github.com/epics-base/epics-base/pull/508) | 2025-02 | `iocshSetError` in more places | `iocsh/mod.rs:115` uses non-zero exit equivalent; broader instrumentation pending | inspected, partial |
-| [#505](https://github.com/epics-base/epics-base/pull/505) | 2024-08 | Allow record deletion at database creation | `db_loader` does not expose record-delete primitive | **not started** |
+| [#505](https://github.com/epics-base/epics-base/pull/505) | 2024-08 | Allow record deletion at database creation | `PvDatabase::remove_record(name) -> bool` cleans records map + scan_index + cp_links; iocsh `dbDeleteRecord <name>` exposes it | done |
 | [#501](https://github.com/epics-base/epics-base/pull/501) | 2024-10 | `asTrap` serverSpecific is `dbChannel` | ACF trap pipeline does not expose dbChannel handle | **not started** |
 | [#486](https://github.com/epics-base/epics-base/pull/486) | 2024-05 | `printf` record `sizv` fix | `records/printf.rs` — verify SIZV field bound | **not started** (audit) |
 | [#468](https://github.com/epics-base/epics-base/pull/468) | 2024-05 | compress record fix | `records/compress.rs` — verify reset/N=0 handling | **not started** (audit) |

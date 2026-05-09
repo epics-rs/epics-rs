@@ -174,7 +174,7 @@ mod tests {
 
     fn make_client() -> (PortManager, InProcessClient) {
         let mgr = PortManager::new();
-        let rt_handle = mgr.register_port(TestPort::new());
+        let rt_handle = mgr.register_port(TestPort::new()).unwrap();
         let client = InProcessClient::new(rt_handle.port_handle().clone());
         (mgr, client)
     }

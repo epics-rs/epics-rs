@@ -35,31 +35,59 @@ impl PortManager {
     /// Takes ownership of the driver. Spawns a runtime thread that exclusively
     /// owns the driver. Returns a [`PortRuntimeHandle`] with shutdown, events,
     /// and client access.
-    pub fn register_port<D: PortDriver>(&self, driver: D) -> PortRuntimeHandle {
+    ///
+    /// **Errors with `PortAlreadyRegistered`** if a port with the same name
+    /// is already in the registry. Mirrors asyn upstream issue #34
+    /// (`asynPortDriver` segfault on duplicate port name): a silent
+    /// overwrite would orphan the prior `PortRuntimeHandle` (its runtime
+    /// thread would keep running on a now-unreachable handle, leaking
+    /// resources and silently shadowing legitimate I/O). To replace a
+    /// port, call [`Self::unregister_port`] first.
+    pub fn register_port<D: PortDriver>(&self, driver: D) -> AsynResult<PortRuntimeHandle> {
         self.register_port_with_config(driver, RuntimeConfig::default())
     }
 
     /// Register a port driver with custom runtime config.
+    ///
+    /// See [`Self::register_port`] for the duplicate-name error contract.
     pub fn register_port_with_config<D: PortDriver>(
         &self,
         mut driver: D,
         config: RuntimeConfig,
-    ) -> PortRuntimeHandle {
+    ) -> AsynResult<PortRuntimeHandle> {
+        let name = driver.base().port_name.clone();
+        // Pre-flight under both locks: refuse before we spawn the
+        // runtime thread, so a rejected duplicate doesn't burn a
+        // thread + create a half-initialized PortRuntimeHandle.
+        {
+            let ph = self.port_handles.lock();
+            if ph.contains_key(&name) {
+                return Err(AsynError::PortAlreadyRegistered(name));
+            }
+        }
         driver.base_mut().exception_sink = Some(self.exceptions.clone());
         driver.base_mut().trace = Some(self.trace.clone());
-        let name = driver.base().port_name.clone();
 
         let (handle, _jh) = create_port_runtime(driver, config);
 
-        // Acquire both locks together to avoid inconsistent state between maps
+        // Re-check under the write lock to close the TOCTOU window
+        // between the pre-flight read and the actual insert. If a
+        // concurrent caller raced us in, drop the runtime we just
+        // built and report the duplicate.
         let mut ph = self.port_handles.lock();
         let mut rh = self.runtime_handles.lock();
+        if ph.contains_key(&name) {
+            drop(rh);
+            drop(ph);
+            handle.shutdown();
+            return Err(AsynError::PortAlreadyRegistered(name));
+        }
         ph.insert(name.clone(), handle.port_handle().clone());
         rh.insert(name, handle.clone());
         drop(rh);
         drop(ph);
 
-        handle
+        Ok(handle)
     }
 
     /// Find a port handle by name.
@@ -143,7 +171,7 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("port1");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv);
+        mgr.register_port(drv).unwrap();
 
         assert!(mgr.find_port_handle("port1").is_ok());
         assert!(mgr.find_port_handle("nope").is_err());
@@ -154,7 +182,7 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("testport");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        let handle = mgr.register_port(drv);
+        let handle = mgr.register_port(drv).unwrap();
 
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
         assert_eq!(handle.port_handle().read_int32_blocking(0, 0).unwrap(), 42);
@@ -165,7 +193,7 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("findme");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv);
+        mgr.register_port(drv).unwrap();
 
         let handle = mgr.find_port_handle("findme").unwrap();
         handle.write_int32_blocking(0, 0, 99).unwrap();
@@ -179,7 +207,7 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("rt_find");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv);
+        mgr.register_port(drv).unwrap();
 
         let handle = mgr.find_runtime_handle("rt_find").unwrap();
         handle.port_handle().write_int32_blocking(0, 0, 77).unwrap();
@@ -200,7 +228,7 @@ mod tests {
 
         let mut drv = DummyDriver::new("exctest");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv);
+        mgr.register_port(drv).unwrap();
 
         // The runtime sends a Started event but not via the exception manager.
         // Exception manager is injected for driver-level exceptions.
@@ -210,10 +238,40 @@ mod tests {
     #[test]
     fn test_unregister_port() {
         let mgr = PortManager::new();
-        mgr.register_port(DummyDriver::new("removeme"));
+        mgr.register_port(DummyDriver::new("removeme")).unwrap();
         assert!(mgr.find_port_handle("removeme").is_ok());
         mgr.unregister_port("removeme");
         assert!(mgr.find_port_handle("removeme").is_err());
+    }
+
+    #[test]
+    fn duplicate_port_name_rejected() {
+        // Mirrors asyn upstream issue #34: registering a second port
+        // with the same name must return PortAlreadyRegistered, not
+        // silently overwrite the prior PortRuntimeHandle.
+        let mgr = PortManager::new();
+        mgr.register_port(DummyDriver::new("dup")).unwrap();
+        match mgr.register_port(DummyDriver::new("dup")) {
+            Err(crate::error::AsynError::PortAlreadyRegistered(name)) => {
+                assert_eq!(name, "dup")
+            }
+            Err(other) => panic!("expected PortAlreadyRegistered, got {other:?}"),
+            Ok(_) => panic!("second registration must fail"),
+        }
+        // The original port is still reachable (no shadow/orphan).
+        assert!(mgr.find_port_handle("dup").is_ok());
+    }
+
+    #[test]
+    fn duplicate_after_unregister_succeeds() {
+        // Replace-via-unregister must work cleanly.
+        let mgr = PortManager::new();
+        mgr.register_port(DummyDriver::new("recycle")).unwrap();
+        mgr.unregister_port("recycle");
+        assert!(
+            mgr.register_port(DummyDriver::new("recycle")).is_ok(),
+            "re-register after unregister must succeed"
+        );
     }
 
     #[test]
@@ -221,7 +279,7 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("f64_port");
         drv.base.create_param("TEMP", ParamType::Float64).unwrap();
-        let handle = mgr.register_port(drv);
+        let handle = mgr.register_port(drv).unwrap();
 
         handle
             .port_handle()
@@ -235,7 +293,7 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("shutme");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        let handle = mgr.register_port(drv);
+        let handle = mgr.register_port(drv).unwrap();
 
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
         handle.shutdown_and_wait();

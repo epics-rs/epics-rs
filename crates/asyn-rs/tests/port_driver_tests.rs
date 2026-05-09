@@ -256,21 +256,21 @@ impl PortDriver for ErrorDriver {
 
 fn setup_scope() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
-    let rt = mgr.register_port(TestScopeDriver::new("SCOPE"));
+    let rt = mgr.register_port(TestScopeDriver::new("SCOPE")).unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
 }
 
 fn setup_echo() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
-    let rt = mgr.register_port(EchoDriver::new("ECHO"));
+    let rt = mgr.register_port(EchoDriver::new("ECHO")).unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
 }
 
 fn setup_error() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
-    let rt = mgr.register_port(ErrorDriver::new("ERRTEST"));
+    let rt = mgr.register_port(ErrorDriver::new("ERRTEST")).unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
 }

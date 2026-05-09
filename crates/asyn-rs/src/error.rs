@@ -18,6 +18,9 @@ pub enum AsynError {
     #[error("port not found: {0}")]
     PortNotFound(String),
 
+    #[error("port already registered: {0}")]
+    PortAlreadyRegistered(String),
+
     #[error("param not found: {0}")]
     ParamNotFound(String),
 

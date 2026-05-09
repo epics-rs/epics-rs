@@ -421,40 +421,57 @@ test before it can move to "equivalent".
 
 | Upstream | Defect | epics-rs site to verify | Risk class |
 |---|---|---|---|
-| epics-base #455 | OS clock < EPICS epoch → CA client spin | client time-comparison loops; confirm no `while now < epoch` patterns | **medium** (production never runs with clock < epoch, but laptops on resume can) |
-| epics-base #438 | Test IOC w/ ACF hangs in `asCaStart()` after first run | ACF reload code path under repeated invocation | medium |
-| epics-base #477 | Application hangs 30 s after both ends destroy | `CaClient` Drop already aborts tasks (acfa608); but the 30 s window matches our `EPICS_CA_CONN_TMO` echo-watchdog default — needs reproduction | medium |
-| epics-base #190 | CA connections "stalled" after laptop suspend | echo heartbeat (P-G fix) should detect; verify under `pmset` suspend on macOS / `systemctl suspend` on Linux | medium |
+| epics-base #455 | OS clock < EPICS epoch → CA client spin | `epics-ca-rs/src/client/{transport,beacon_monitor,circuit_breaker}.rs` use `tokio::time::Instant` / `std::time::Instant` (monotonic) for every deadline / freshness check; `SystemTime::now()` appears only as a one-shot snapshot timestamp in `subscription.rs:85` (no comparison). Wall-clock < epoch never enters a comparison path | inspected, equivalent |
+| epics-base #438 | Test IOC w/ ACF hangs in `asCaStart()` after first run | ACF reload code path under repeated invocation | medium (audit) |
+| epics-base #477 | Application hangs 30 s after both ends destroy | `ServerConnection::drop` aborts both pumps; `drop_aborts_read_and_write_tasks` test now also asserts the abort cascade completes within 500 ms — a regression toward "let echo timeout drain" surfaces immediately | inspected, equivalent (regression-guarded) |
+| epics-base #190 | CA connections "stalled" after laptop suspend | echo heartbeat (P-G fix) should detect; verify under `pmset` suspend on macOS / `systemctl suspend` on Linux | medium (environmental) |
 | epics-base #426 | CA nameserver + CA_V413 protocol mismatch | `EPICS_CA_NAME_SERVERS` TCP search handshake under v4.13 servers | low |
 | epics-base #469 | `iocshLoad` doesn't undo `IOCSH_STARTUP_SCRIPT` | `iocsh/mod.rs` env-restore on script-load nesting | low (UX rather than crash) |
-| epics-base #97 | Segfault reading from compress to aai | `records/compress.rs` size negotiation when target buffer < source | medium (bounded by Rust panic, not segfault) |
+| epics-base #97 | Segfault reading from compress to aai | epics-rs has no `aai` record at all; `records/compress.rs` outputs `Vec<f64>`. The base segfault depended on a stack-allocated dst buffer with fixed NELM; not reproducible in our model | inspected, n/a (no aai) |
 | epics-base #557 | CP link inconsistency with async record | `processing.rs` async-record + CP-link interaction | low |
 | epics-base #471 | `iocshLoad` + `on error` bad interaction | iocsh error-state propagation in nested loads | low |
 | epics-base #194 | `CALC$` long string issue | `records/scalcout.rs` long-string handling; bounded under our `String` type | low |
 | asyn #34 | `asynPortDriver` segfault on duplicate port name | `PortManager::register_port[_with_config]` now returns `Result` and rejects duplicate names with `AsynError::PortAlreadyRegistered`. Tests: `duplicate_port_name_rejected`, `duplicate_after_unregister_succeeds` | **applied** |
 | asyn #80 / #56 | Deadlocks / race with `asyn:READBACK` on output records | adapter callback path; intersects with the deferred #208/#60 work | medium (depends on #208/#60) |
-| asyn #170 | Parallel callback queue overflow | `interrupt.rs` queue cap policy | medium |
+| asyn #170 | Parallel callback queue overflow | `interrupt.rs` mailbox model: never drops, intermediates coalesce into a `latest` slot; broadcast lane (legacy) still has tokio capacity. Test: `mailbox_burst_coalesces_no_drop` (1 000 events → 1 observable, `coalesce_count == 999`) | inspected, equivalent (regression-guarded) |
 | asyn #99 | "main" blocks for `asynPortDriverCallback` thread to exit | port_actor join semantics on shutdown | low |
-| asyn #220 | `pasynOctetSyncIO->read` overwrites `pasynUser->timeout` | `sync_io.rs::read` timeout preservation | medium |
-| asyn #224 | autoConnect connects too early (before all init) | `port_actor.rs` startup ordering | medium |
-| asyn #105 / #93 | vxi11 buffer overflow / std::vector overrun | not in asyn-rs (no vxi11 driver) | n/a |
+| asyn #220 | `pasynOctetSyncIO->read` overwrites `pasynUser->timeout` | `SyncIOHandle::timeout` is `Copy + Duration`; `read_*`/`write_*` take `&self`. `pub fn timeout(&self) -> Duration` getter added; test `read_write_does_not_mutate_timeout_field` asserts the contract through 10× r/w rounds | inspected, equivalent (regression-guarded) |
+| asyn #224 | autoConnect connects too early (before all init) | `port_actor.rs` startup ordering | medium (audit) |
+| asyn #105 / #93 | vxi11 buffer overflow / std::vector overrun | not in asyn-rs (no vxi11 driver) | inspected, n/a |
 
-### Recommendation
+### Audit-round outcome
 
-The single outright **gap** found in this stability roll-up is now
-applied:
+This round closed a substantial fraction of the audit list:
 
-- **asyn-rs duplicate-port-name** — `PortManager::register_port[_with_config]`
-  signature changed from `-> PortRuntimeHandle` to
-  `-> AsynResult<PortRuntimeHandle>`; the second registration with the
-  same name returns `AsynError::PortAlreadyRegistered` instead of
-  silently shadowing. Pre-flight check + post-spawn re-check closes the
-  TOCTOU window so a concurrent caller can't race past it.
+- **applied**: asyn #34 duplicate port name (commit `bb080e0`)
+- **inspected, equivalent (regression-guarded)** — verified by a new
+  reproducer test pinning the contract:
+  - epics-base #477 — `drop_aborts_read_and_write_tasks` now asserts
+    the abort cascade completes within 500 ms; a regression toward the
+    upstream 30 s symptom would fail immediately.
+  - asyn #220 — `read_write_does_not_mutate_timeout_field` asserts the
+    timeout-preservation contract through 10× r/w rounds.
+  - asyn #170 — `mailbox_burst_coalesces_no_drop` asserts 1 000 events
+    → 1 observable + `coalesce_count == 999`.
+- **inspected, equivalent** (no test required — type / module choice):
+  - epics-base #455 — monotonic `Instant` everywhere; `SystemTime` only
+    in non-comparison snapshots.
+- **inspected, n/a** (precondition absent in epics-rs):
+  - epics-base #97 — `aai` record is not implemented; the base segfault
+    depended on a fixed-size NELM dst buffer that doesn't exist in our
+    `Vec<f64>`-based output.
+  - asyn #105 / #93 — no `vxi11` driver in asyn-rs.
 
-The remaining "**audit**" rows are individually small but each needs a
-reproducer (clock skew, NIC-suspend, repeated ACF reload, …) — those
-warrant their own PR or test-suite expansion rather than blind
-guarding.
+Remaining audit rows that still need an environmental or integration
+reproducer (deferred for individual follow-up):
+
+- epics-base #438 (ACF reload hang) — needs introspection
+  `/reload-acf` exercise loop.
+- epics-base #190 (CA stalled after suspend) — needs `pmset` /
+  `systemctl suspend` test harness.
+- asyn #224 (autoConnect connects too early) — needs a startup race
+  scenario with deliberate delay-injection.
+- asyn #80 / #56 (asyn:READBACK race) — depends on #208/#60 work.
 
 ## F. Refresh queries (run to update this doc)
 

@@ -545,6 +545,89 @@ GitHub PR / issue history begins at `2017-01-01` for epics-base and
 `2015-01-01` for asyn — earlier patches predate the migration and live
 on the upstream Launchpad mirrors.
 
+## L. Launchpad bug tracker (epics-base)
+
+epics-base maintains a separate bug tracker on Launchpad
+(<https://bugs.launchpad.net/epics-base>). asyn is GitHub-only
+(`https://bugs.launchpad.net/asyn` returns 404). The Launchpad bug
+list is **113 entries total**, oldest #541180 (2010), newest
+#2052814 (2024). Many GitHub PRs and issues already cite Launchpad
+bug numbers; this section is the authoritative roll-up.
+
+Audit method: pulled the full list (75 + 38 across two pages),
+then deep-dived the four entries that point at potentially
+production-affecting stability defects: **#1686787, #1577761,
+#1722540, #739789**.
+
+### Spot-checked stability defects
+
+| LP bug | Defect | epics-rs status |
+|---|---|---|
+| [#1686787](https://bugs.launchpad.net/epics-base/+bug/1686787) | Zero-length PV name in UDP search → infinite loop in `casDGClient::processDG()`; gateway "runs away" | `epics-ca-rs/src/server/udp.rs` advances the outer parse loop by `offset += msg_len` regardless of PV-name content; an empty name takes the `has_name("") == false` branch and falls through. No infinite-loop path | inspected, equivalent |
+| [#1577761](https://bugs.launchpad.net/epics-base/+bug/1577761) | Record-type **attributes** are per-type static values without locking → race when accessed concurrently | epics-rs records are per-instance `Box<dyn Record>`; the C "per-type attribute" concept does not exist as a separate shared mutable surface. The `Record` trait's static methods (e.g. `record_type()`) return immutable `&'static str` | inspected, equivalent (different model) |
+| [#1722540](https://bugs.launchpad.net/epics-base/+bug/1722540) | Undefined `ao` record processed after IOC reboot wrongly resets `UDF` to false (base unconditionally sets `udf = isnan(val)`) | `records/ao.rs::process` does not touch `udf` directly; UDF is cleared by `record_instance.rs::process_local` via the `Record::clears_udf()` trait method default. Need to verify `clears_udf()` for `ao` matches base's "UDF stays true until set explicitly" semantic — open audit task | medium (audit) |
+| [#739789](https://bugs.launchpad.net/epics-base/+bug/739789) | TCP name-resolver `sendQue.pushString` in libca grows unbounded when the TCP peer is unresponsive — process memory leak under nameserver stall | epics-rs had the **same defect class** in `client/search.rs::run_search_engine`: `nameserver_send_txs: Vec<mpsc::UnboundedSender<Vec<u8>>>` with three `let _ = ns_tx.send(...)` call sites in `fire_searches`. Now bounded: `mpsc::Sender` capped by `EPICS_CA_NAMESERVER_QUEUE_DEPTH` (default 256), with a new `ns_try_send` helper that drops + bumps the `ca_client_nameserver_queue_drops_total` counter on full. Tests: `nameserver_queue_drops_when_full_no_leak`, `nameserver_queue_handles_closed_receiver` | **applied** |
+
+### Already-mapped or duplicates of GitHub items
+
+| LP bug | GitHub equivalent | Status |
+|---|---|---|
+| #2052814 dbLoadRecords macros with defaults fail | merged PR **#463** | Section H — open audit |
+| #2031563 JSON input link with calc→pva not working | issue **#421** | Section I gap |
+| #2029482 pvget JSON error | covered by **#421** | Section I gap |
+| #1841634 CP link triggers lost on async record | issue **#557** | Section J audit |
+| #1712363 ao record SIMM=RAW | merged PR **#144** | Section H audit |
+| #1573462 Add alarm filtering to AO | feature class — same family as **#817** AFTC for bi/mbbi (done) | partially-applied |
+| #1532864 assert(this->pudpiiu) on TCP name resolution | nameserver TCP path — overlaps the lp #739789 fix | covered |
+| #1532328 caget slow to fail on missing nameserver | timeout policy — `EPICS_CA_NAME_SERVERS` task already has 5s connect-timeout + exp backoff | inspected, equivalent |
+| #1392516 OSI monotonic time source | `tokio::time::Instant` is monotonic by construction | inspected, equivalent |
+| #541353 epicsThreadSleepQuantum not accurate | `tokio::time::sleep` precision — different model | inspected, equivalent |
+| #1686787 zero-length PV (this section) | covered above | inspected, equivalent |
+| #1722540 ao UDF (this section) | covered above | medium (audit) |
+| #739789 TCP nameserver leak (this section) | **applied this round** | applied |
+
+### Lower-priority / niche items (~95 entries)
+
+The remaining ~95 Launchpad bugs split into:
+
+- **vxWorks / RTEMS / Windows / win32 specifics** (≈30): #2004463
+  iocsh on vxWorks, #1188026 iocLogServer on win32, #772471 win32
+  handle leak, #667474 CA tools on vxWorks/RTEMS, #608956 vxWorks
+  taskVarLib, #580748 WIN32 thread priority, #663592 NTP broadcasts
+  on RTEMS, etc. — N/A in epics-rs.
+- **build / makefile / packaging** (≈15): #2015234 genVersionHeader,
+  #1399301 makeBaseApp dirs, etc. — N/A.
+- **doc / POD / cosmetic** (≈10): #541297 manual error/warning
+  language, #1428339 TPRO context — UX, deferred.
+- **stability / behaviour items below the spot-check threshold** (≈25):
+  #1714447 (CA filter on long strings), #1706589 (MSI #line), #1630958
+  (record visibility), #1536987 (CAS log dropped updates), #1495843
+  (real-time CA API), #1495417 (final field types), #1462952 (dbpr
+  info items), #1424092 (epicsAssert message lost), #1398215 (output
+  records write-on-change), #1185928 (alarm monitoring of non-VAL),
+  #1182091 (TIME field directly accessible), #1052459 (iocShell
+  thread-id check), #954138 (caput truncate warning), #541396 (mbbi/o
+  initialize VAL with string), #541371 (assert in dbEvent.c — likely
+  superseded), #541350 (monitors on EGU when SEVR changes), #541324
+  (beacon "connection refused"), #541180 (numeric bounds on enums) —
+  each is a candidate for an individual audit follow-up but no single
+  one rises to "must-fix in this round".
+- **abandoned or wontfix** (≈15): #1012788 (CA SOCKS support, never
+  done), #1052459 (iocShell threadResume), #541318 (poolPoll), etc.
+
+### Audit horizon — final
+
+After this section the upstream-tracking doc covers:
+
+- **GitHub PRs** (epics-base, asyn): merged + open + closed-unmerged
+- **GitHub issues** (epics-base, asyn): open + closed
+- **Launchpad bugs** (epics-base): all 113 entries
+
+asyn has no Launchpad bug tracker (404). EPICS Base GitHub history
+begins 2017-01-01; Launchpad coverage extends back to 2010-09 via
+#541180. No older artifact source remains to audit at the public
+upstream layer.
+
 ## F. Refresh queries (run to update this doc)
 
 ```sh

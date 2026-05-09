@@ -7,6 +7,7 @@ mod scan_index;
 
 pub use link_set::{DynLinkSet, LinkSet, LinkSetRegistry};
 
+use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -88,6 +89,11 @@ struct PvDatabaseInner {
     scan_index: RwLock<HashMap<ScanType, BTreeSet<(i16, String)>>>,
     /// CP link index: maps source_record → list of target records to process when source changes.
     cp_links: RwLock<HashMap<String, Vec<String>>>,
+    /// Alias map: alternate-name → real-record-name. Mirrors epics-base
+    /// PR #336 (alias name validation + parsing). `find_entry` and
+    /// related lookups consult this map after the canonical record
+    /// table so an alias resolves transparently to its target.
+    aliases: RwLock<HashMap<String, String>>,
     /// Optional resolver for external PVs (ca://, pva:// links).
     external_resolver: RwLock<Option<ExternalPvResolver>>,
     /// Optional async resolver invoked on `has_name` misses (e.g. CA gateway).
@@ -144,6 +150,7 @@ impl PvDatabase {
                 records: RwLock::new(HashMap::new()),
                 scan_index: RwLock::new(HashMap::new()),
                 cp_links: RwLock::new(HashMap::new()),
+                aliases: RwLock::new(HashMap::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
@@ -496,7 +503,49 @@ impl PvDatabase {
         if let Some(rec) = self.inner.records.read().await.get(base) {
             return Some(PvEntry::Record(rec.clone()));
         }
+        // Alias resolve (epics-base PR #336): the alternate name maps
+        // to a canonical record name. Look up the real record after
+        // translating the base.
+        if let Some(target) = self.inner.aliases.read().await.get(base).cloned() {
+            if let Some(rec) = self.inner.records.read().await.get(&target) {
+                return Some(PvEntry::Record(rec.clone()));
+            }
+        }
         None
+    }
+
+    /// Register an alias `alias` for an existing record `target`.
+    /// Mirrors epics-base PR #336. Returns `Err(...)` when the target
+    /// does not exist or the alias name is already in use.
+    pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
+        if !self.inner.records.read().await.contains_key(target) {
+            return Err(CaError::ChannelNotFound(format!(
+                "alias target '{target}' is not a registered record"
+            )));
+        }
+        let mut aliases = self.inner.aliases.write().await;
+        if aliases.contains_key(alias) {
+            return Err(CaError::DbParseError {
+                line: 0,
+                column: 0,
+                message: format!("alias '{alias}' already registered"),
+            });
+        }
+        if self.inner.records.read().await.contains_key(alias) {
+            return Err(CaError::DbParseError {
+                line: 0,
+                column: 0,
+                message: format!("alias '{alias}' shadows an existing record"),
+            });
+        }
+        aliases.insert(alias.to_string(), target.to_string());
+        Ok(())
+    }
+
+    /// Resolve an alias to its target record name, or `None` when the
+    /// name is not an alias.
+    pub async fn resolve_alias(&self, name: &str) -> Option<String> {
+        self.inner.aliases.read().await.get(name).cloned()
     }
 
     /// Internal: synchronous existence check without resolver.
@@ -505,7 +554,15 @@ impl PvDatabase {
         if self.inner.simple_pvs.read().await.contains_key(name) {
             return true;
         }
-        self.inner.records.read().await.contains_key(base)
+        if self.inner.records.read().await.contains_key(base) {
+            return true;
+        }
+        // Alias entry exists and points to a live record
+        // (epics-base PR #336).
+        if let Some(target) = self.inner.aliases.read().await.get(base) {
+            return self.inner.records.read().await.contains_key(target);
+        }
+        false
     }
 
     /// Look up an entry by name. Supports "record.FIELD" syntax.

@@ -864,6 +864,18 @@ fn cmd_db_load_records() -> CommandDef {
                 ctx.block_on(async {
                     ctx.db().add_record(&def.name, record).await;
 
+                    // Register any aliases declared in the record body
+                    // (epics-base PR #336). Failures are reported but
+                    // don't abort the load — the record is already in.
+                    for alias in &def.aliases {
+                        if let Err(e) = ctx.db().add_alias(alias, &def.name).await {
+                            eprintln!(
+                                "dbLoadRecords: alias '{alias}' for '{}' rejected: {e}",
+                                def.name
+                            );
+                        }
+                    }
+
                     if let Some(rec_arc) = ctx.db().get_record(&def.name).await {
                         let mut instance = rec_arc.write().await;
                         for (name, value) in common_fields {

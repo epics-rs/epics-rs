@@ -37,6 +37,10 @@ pub struct DbRecordDef {
     pub record_type: String,
     pub name: String,
     pub fields: Vec<(String, String)>,
+    /// Aliases declared inside the record body (`alias("name")`).
+    /// Mirrors epics-base PR #336 — alias names are validated with
+    /// the same rules as record names.
+    pub aliases: Vec<String>,
 }
 
 /// Validate a record (or alias) name against epics-base PR #78 rules.
@@ -132,6 +136,7 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
         expect_char(&chars, &mut pos, &mut col, '{', line)?;
 
         let mut fields = Vec::new();
+        let mut aliases: Vec<String> = Vec::new();
         loop {
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             if pos >= chars.len() {
@@ -156,8 +161,20 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
                 });
             }
 
-            if kw == "info" || kw == "alias" {
-                // Skip info/alias: consume until matching ')'
+            if kw == "alias" {
+                // alias("name") — capture and validate per PR #336.
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                expect_char(&chars, &mut pos, &mut col, '(', line)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                let alias_name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+                validate_record_name(&alias_name, line, col)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                expect_char(&chars, &mut pos, &mut col, ')', line)?;
+                aliases.push(alias_name);
+                continue;
+            }
+            if kw == "info" {
+                // Skip info: consume until matching ')'
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 if pos < chars.len() && chars[pos] == '(' {
                     let mut depth = 1;
@@ -202,6 +219,7 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
             record_type: rec_type,
             name,
             fields,
+            aliases,
         });
     }
 
@@ -1171,11 +1189,13 @@ mod tests {
                     ("DTYP".to_string(), "oldDtyp".to_string()),
                     ("VAL".to_string(), "0".to_string()),
                 ],
+                aliases: Vec::new(),
             },
             DbRecordDef {
                 record_type: "ao".to_string(),
                 name: "REC_WITHOUT_DTYP".to_string(),
                 fields: vec![("VAL".to_string(), "1".to_string())],
+                aliases: Vec::new(),
             },
         ];
 
@@ -1274,5 +1294,37 @@ mod tests {
         let bad = r#"record(ai, "BAD NAME") { }"#;
         let res = parse_db(bad, &HashMap::new());
         assert!(matches!(res, Err(CaError::DbParseError { .. })));
+    }
+
+    // epics-base PR #336 — alias parsing + name validation.
+
+    #[test]
+    fn parse_db_captures_aliases() {
+        let src = r#"record(ai, "TARGET") {
+            alias("ALIAS1")
+            alias("ALIAS2")
+            field(VAL, 42)
+        }"#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "TARGET");
+        assert_eq!(recs[0].aliases, vec!["ALIAS1", "ALIAS2"]);
+        assert_eq!(recs[0].fields.len(), 1);
+    }
+
+    #[test]
+    fn parse_db_rejects_alias_with_bad_name() {
+        let src = r#"record(ai, "TARGET") {
+            alias("BAD ALIAS")
+        }"#;
+        let res = parse_db(src, &HashMap::new());
+        assert!(matches!(res, Err(CaError::DbParseError { .. })));
+    }
+
+    #[test]
+    fn parse_db_record_without_alias_has_empty_aliases() {
+        let src = r#"record(ai, "PLAIN") { field(VAL, 1) }"#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert!(recs[0].aliases.is_empty());
     }
 }

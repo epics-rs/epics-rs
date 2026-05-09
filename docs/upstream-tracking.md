@@ -473,6 +473,78 @@ reproducer (deferred for individual follow-up):
   scenario with deliberate delay-injection.
 - asyn #80 / #56 (asyn:READBACK race) — depends on #208/#60 work.
 
+## K. Closed-unmerged PRs (audit closure)
+
+`gh pr list --state closed --search "is:unmerged"` for both repos
+(epics-base ≈ 200 entries; asyn ≈ 30). The dominant outcome is
+**superseded by a later merged PR** — those rows fold into Sections G
+or H by the merged PR's number, no extra audit needed. The remainder
+are abandoned drafts, rejected redesigns, or build/CI proposals that
+never landed.
+
+### Already covered (superseded by merged PRs in earlier sections)
+
+| Closed-unmerged | Final fate |
+|---|---|
+| epics-base #570 | superseded by **#571** (Recursion bug v2 — Section G) |
+| epics-base #424 | superseded by **#432** (db event double cancel — Section G) |
+| epics-base #326 | superseded by **#324**-fix path (Section A/B) |
+| epics-base #287 | superseded by tracked open issue **#284** (Constant `INP*` to aSub — Section I) |
+| epics-base #196 | superseded by tracked open issue **#183** (DBF_MENU→DBF_STRING — Section I) |
+| epics-base #195 | superseded by tracked open issue **#194** (`CALC$` long string — Section I) |
+| epics-base #425 | superseded by tracked open issue **#426** (CA nameserver + CA_V413) |
+| epics-base #464 | superseded by tracked **#505** (record deletion at DB creation — Section G) |
+| epics-base #500 | superseded by **#501** (asTrap dbChannel) |
+| epics-base #263 | superseded by **#359** (Undefined ts on NORD first update — Section A) |
+| asyn #210 / #182 / #5 / #25 / #22 / #54 / #47 / #48 / #133 | superseded by later merged variants on the same defect class |
+
+### Stability-relevant closed-unmerged that map to existing epics-rs equivalents
+
+| PR | Topic | epics-rs status |
+|---|---|---|
+| epics-base [#335](https://github.com/epics-base/epics-base/pull/335) | Treat `""` as unset for links | `link.rs:149` already returns `ParsedLink::None` on empty inner — equivalent |
+| epics-base [#232](https://github.com/epics-base/epics-base/pull/232) | Add `FMOD` to calc | `calc/engine/numeric.rs::CoreOp::Fmod` already implemented — equivalent |
+| epics-base [#152](https://github.com/epics-base/epics-base/pull/152) / [#151](https://github.com/epics-base/epics-base/pull/151) | Race in `db_close_events()` | epics-rs uses `subscribers.lock()` + `is_closed()` retain pattern — equivalent class as the dbEvent cancel races already covered |
+| epics-base [#185](https://github.com/epics-base/epics-base/pull/185) | epicsTime rework | epics-rs time conversion lives in `runtime::general_time` + `SystemTime`/`Instant` — equivalent (different model) |
+| epics-base [#379](https://github.com/epics-base/epics-base/pull/379) | Discard search requests in CA client | already covered by AIMD search budget + RTT estimator (kodex audit notes) |
+| epics-base [#225](https://github.com/epics-base/epics-base/pull/225) | caRepeater socket-loss in `register_new_client` | epics-ca-rs uses in-process repeater fallback; the C socket-list manipulation has no analog |
+| epics-base [#311](https://github.com/epics-base/epics-base/pull/311) | sub record returns error on bad INP | `sub_record.rs` link-read failure path — verify on next audit pass |
+| epics-base [#283](https://github.com/epics-base/epics-base/pull/283) | `iocShutdown` always stop worker threads | tokio task abort cascade on Drop (commit acfa608 covers `CaClient`/`ServerConnection`) |
+
+### Stability-relevant closed-unmerged that point at gaps NOT in earlier sections
+
+| PR | Topic | epics-rs site |
+|---|---|---|
+| epics-base [#336](https://github.com/epics-base/epics-base/pull/336) | Validate target record name on alias | `db_loader::parse_db` skips `alias` body via brace counting (lines 159-160) — alias bodies are never parsed, so the name is neither captured nor validated. **N/A under current parser**, but if alias support is added, hook `validate_record_name` then |
+| epics-base [#618](https://github.com/epics-base/epics-base/pull/618) | TLS + cert-based access security | epics-ca-rs has the `cap-tokens` feature + signed beacons; pvxs-style cert ACF subject matching is **partial** (signed-beacon verifier, no TLS-cert ACF gateway) |
+| epics-base [#563](https://github.com/epics-base/epics-base/pull/563) | ACF METHOD/AUTHORITY + YAML | epics-rs ACF reads the legacy text format only; YAML + METHOD/AUTHORITY extensions deferred |
+| epics-base [#449](https://github.com/epics-base/epics-base/pull/449) | dbLoadTemplate error propagation | `db_loader::dbLoadTemplate` (if implemented) error path — verify |
+| epics-base [#677](https://github.com/epics-base/epics-base/pull/676) | dfanout IVOA | already covered by Section A #688 dfanout improvements |
+| epics-base [#502](https://github.com/epics-base/epics-base/pull/502) | dbAllocRecord buffer overflow fix | C-only; epics-rs allocates `Box<dyn Record>` per record so no equivalent overflow path |
+| asyn [#210](https://github.com/epics-modules/asyn/pull/210) | TCP connect long-timeout fix (closed) | superseded by current asyn-rs `connect_timeout` policy — verify under audit |
+
+### Rest
+
+The ~150 remaining closed-unmerged entries on epics-base and ~20 on
+asyn are: build/CI churn, doc/POD work, RTEMS / VxWorks / Windows /
+macOS host-specific tweaks, codeathon-tagged style cleanups,
+deprecated-language-feature fixes (auto_ptr → unique_ptr, etc.), or
+abandoned drafts. All N/A for epics-rs.
+
+### Closure
+
+PR audit horizon now covers:
+
+- **All merged PRs**, both repos (Sections A, G, H + roll-up).
+- **All open PRs**, both repos (Sections B + Section H asyn rows).
+- **All closed-unmerged PRs**, both repos (this section).
+- **All open issues**, both repos (Sections B/C).
+- **All closed issues**, both repos (Section I).
+
+GitHub PR / issue history begins at `2017-01-01` for epics-base and
+`2015-01-01` for asyn — earlier patches predate the migration and live
+on the upstream Launchpad mirrors.
+
 ## F. Refresh queries (run to update this doc)
 
 ```sh

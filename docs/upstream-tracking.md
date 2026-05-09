@@ -234,6 +234,81 @@ Substantive scope (own PR each):
   surface; one-shot API addition.
 - **Record-deletion at DB creation** (#505) — `db_loader` extension.
 
+## H. Even older PRs (2020-01 .. 2023-05, audit summary)
+
+Same audit pattern as Section G, against the 2020-01..2023-05-09 window
+plus an asyn 2015-2020 sweep. PR numbers in this range mix 7.0 / 3.15 /
+3.14 backports — the listing below is by behaviour, not by branch.
+
+### epics-base 2020-2023 — bulk N/A
+
+Build / RTEMS / Windows / VxWorks / docs typo / CI: #270 (SetThreadDescr),
+#262 (genVersion epoch), #210 (regressTest), #206 (RTEMS osdEvent),
+#201 (Win32 GetParam refactor), #198 (DEBUG flags), #182/#181 (osiSock vs
+osdSock), #179 (vxWorks 6.3 close()), #176 (RTEMS5 QEMU), #171/#150/#148
+(SONAME / DBCORE_API / -Z7), #163 (RELEASE validation), #146 (test
+timeouts), #132/#125 (epicsStrtod / OS strtod), #131 (Win32 waitable
+timers), #130 (msi.cpp typing), #105 (RTEMS5 rebases), #103 ("Command"
+build target), #91/#88 (READMEs/docs), #82 (RTEMS msgQ), #81 (SPDX),
+#79 (osdSockAddrReuse), #77/#73/#70/#74 (static-analysis / Makefile /
+doxy-libcom), #218 (epicsInt8 signedness), #214 (fork() warning, Rust
+N/A), #75 (sim doc), #26 (timestamp before outlink — rare path).
+
+### epics-base 2020-2023 — behaviour rows
+
+| PR | Merged | Change | Where in epics-rs | Status |
+|---|---|---|---|---|
+| [#199](https://github.com/epics-base/epics-base/pull/199) | 2021-10 | Cleanup `mbboDirect` bit field handling | `records/mbbo_direct.rs` — verify B0..BF bit-mask compose/decompose | **not started** (audit) |
+| [#193](https://github.com/epics-base/epics-base/pull/193) | 2022-01 | Clear `IP_MULTICAST_ALL` on Linux (drop unrelated multicast) | UDP responder socket options in `epics-ca-rs/src/server/udp.rs` and `epics-pva-rs/src/server_native/udp.rs` | **not started** — kernel default subscribes to all groups, can leak unrelated traffic on multi-group hosts |
+| [#191](https://github.com/epics-base/epics-base/pull/191) | 2021-08 | `int64in`: fix monitor delta test | `records/int64in.rs` MDEL/ADEL comparison vs i64 vs f64 | **not started** (audit) |
+| [#213](https://github.com/epics-base/epics-base/pull/213) | 2022-01 | Hex literals in hardware links (e.g. `@dev 0xFF`) | `record/link.rs` hardware-link parser does not split hex args | **not started** — hardware-link forms not parsed at all yet |
+| [#144](https://github.com/epics-base/epics-base/pull/144) | 2022-05 | Add `SIMM=RAW` to ao records | `records/ao.rs` SIMM stored but RAW menu not handled distinct from VAL | **not started** (audit) |
+| [#114](https://github.com/epics-base/epics-base/pull/114) | 2021-03 | Post array events against the field pointer, not the array pointer | `record_instance.rs::notify_field_written` keys events by field name, equivalent in spirit | inspected, equivalent |
+| [#112](https://github.com/epics-base/epics-base/pull/112) | 2021-02 | Limit auto-declaration of record types to `regRecDevDrv` only | `db_loader::register_record_type` requires explicit registration — equivalent | inspected, equivalent |
+| [#99](https://github.com/epics-base/epics-base/pull/99) | 2021-03 | Remove `dbfl_type_rec` (legacy direct-record dbflag) | epics-rs has no dbfl_type_rec equivalent — clean by construction | inspected, n/a |
+| [#86](https://github.com/epics-base/epics-base/pull/86) | 2021-01 | Add JSON5 support (trailing commas, hex, comments in db files) | `db_loader` JSON parsing — current parser is strict JSON; JSON5 features (trailing commas, hex literals, comments inside `{}`) likely missing | **not started** — verify under JSON-rich db (asub `info`, link options) |
+| [#78](https://github.com/epics-base/epics-base/pull/78) | 2020-07 | Restrict character set for record names (`[A-Za-z0-9_-:.[]<>;]`) | `db_loader` no explicit name validation — may accept names that base would reject | **not started** |
+
+### asyn 2015-2020 — behaviour rows
+
+Bulk N/A: build/typo/leak fixes, Windows port handling, USBTMC, VXI-11,
+GPIB, FTDI driver internals, Travis CI. Listed for receipt: #92, #91,
+#89, #84, #81, #78 (typo), #76, #74, #73, #71, #69 (XON/XOFF — IOC shell
+flow control), #61, #57, #55, #53, #45, #43, #40, #39, #38, #36, #33, #32,
+#27, #23, #21, #20, #19, #18, #17, #15, #13, #10, #8, #6, #4, #1.
+
+| PR | Merged | Change | asyn-rs status |
+|---|---|---|---|
+| [#88](https://github.com/epics-modules/asyn/pull/88) | 2019-10 | Add `drvAsynFTDIPort` | FTDI driver missing in asyn-rs — already covered by `feature = "ftdi"` PR queue elsewhere | **not started** |
+| [#84](https://github.com/epics-modules/asyn/pull/84) | 2019-08 | Shut down thread before destroying `asynPortDriver` | `port_actor` actor model joins on drop — already correct | inspected, equivalent |
+| [#76](https://github.com/epics-modules/asyn/pull/76) | 2019-01 | String options for `asynSetTrace*Mask` | `trace.rs` mask parsing — verify accepts string keys | **not started** (audit) |
+| [#66](https://github.com/epics-modules/asyn/pull/66) | 2017-12 | `devEpics`: ASLO/AOFF/SMOO conversion on ai/ao float64 | adapter `asyn_record/` — these slope/offset/smoothing transforms are not applied | **not started** |
+| [#60](https://github.com/epics-modules/asyn/pull/60) | 2017-11 | Process output records on `asyn:READBACK` callbacks | adapter does not implement `asyn:READBACK` info-tag handling | **not started** (related to #208 from later) |
+| [#13](https://github.com/epics-modules/asyn/pull/13) | 2016-02 | `asynOption` interface on drvAsynIPPort | `asynOption` registration in `interfaces/` — partial | **not started** (audit) |
+| [#6](https://github.com/epics-modules/asyn/pull/6) | 2015-10 | `drvAsynIPPort`: configurable disconnect on read timeout | transport read-timeout policy in asyn-rs — verify configurable | **not started** (audit) |
+
+### Section G+H roll-up — substantive items added to backlog
+
+| Class | Items | Reason for own-PR scope |
+|---|---|---|
+| Alarm-message string | #568 AMSG / #566 NAMSG | new field on `CommonFields`, MS-link plumbing, monitor metadata extension |
+| JSON5 db parsing | #86 | parser switch + extensive db-file regression suite |
+| Hardware-link parsing | #213 hex in HW links + the entire `@dev arg` form | epics-rs has no HW-link grammar yet |
+| `IP_MULTICAST_ALL` socket option | #193 | per-socket option set during UDP bind in CA + PVA |
+| ASLO/AOFF/SMOO on asyn | #66 | new transform layer in `asyn_record/` adapter |
+| asyn:READBACK | #208, #60 | output-record process-on-callback wiring in `asyn_record/` |
+| Record-name validation | #78 | parser-side gate + regression for legacy databases |
+
+### epics-base pre-2020 (2017-2020)
+
+Mostly POD/doc work (#33 compressRecord, #31 waveform/menuFtype, #43-48
+mbbi/mbboDirect/permissive/state/stringin POD); behaviourally relevant:
+
+- **#25 (2019-03)**: stripped-down fix for Launchpad bug 1816841 — record
+  monitor lockup under specific event delivery race. epics-rs uses
+  `tokio::mpsc` per subscriber + coalesce slot, no equivalent path.
+  Inspected, n/a.
+
 ## F. Refresh queries (run to update this doc)
 
 ```sh

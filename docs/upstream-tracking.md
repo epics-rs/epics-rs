@@ -266,8 +266,8 @@ N/A), #75 (sim doc), #26 (timestamp before outlink — rare path).
 | [#114](https://github.com/epics-base/epics-base/pull/114) | 2021-03 | Post array events against the field pointer, not the array pointer | `record_instance.rs::notify_field_written` keys events by field name, equivalent in spirit | inspected, equivalent |
 | [#112](https://github.com/epics-base/epics-base/pull/112) | 2021-02 | Limit auto-declaration of record types to `regRecDevDrv` only | `db_loader::register_record_type` requires explicit registration — equivalent | inspected, equivalent |
 | [#99](https://github.com/epics-base/epics-base/pull/99) | 2021-03 | Remove `dbfl_type_rec` (legacy direct-record dbflag) | epics-rs has no dbfl_type_rec equivalent — clean by construction | inspected, n/a |
-| [#86](https://github.com/epics-base/epics-base/pull/86) | 2021-01 | Add JSON5 support (trailing commas, hex, comments in db files) | `db_loader` JSON parsing — current parser is strict JSON; JSON5 features (trailing commas, hex literals, comments inside `{}`) likely missing | **not started** — verify under JSON-rich db (asub `info`, link options) |
-| [#78](https://github.com/epics-base/epics-base/pull/78) | 2020-07 | Restrict character set for record names (`[A-Za-z0-9_-:.[]<>;]`) | `db_loader` no explicit name validation — may accept names that base would reject | **not started** |
+| [#86](https://github.com/epics-base/epics-base/pull/86) | 2021-01 | Add JSON5 support (trailing commas, hex, comments in db files) | epics-rs `link.rs::parse_link_v2` does not parse inline JSON link options (`{ca: {pv:'foo'}}`) at all — JSON-link grammar itself is missing. JSON5 alone has nothing to apply to | **deferred** — needs the JSON-link grammar in `link.rs` first, then JSON5 leniency layered on top |
+| [#78](https://github.com/epics-base/epics-base/pull/78) | 2020-07 | Restrict character set for record names | `db_loader::validate_record_name` mirrors base `dbRecordNameValidate`: empty / space / `.` / `$` / quote → error; leading `-`/`+`/`[`/`{` and non-printable → warn. Tests: `name_validation_*` | done |
 
 ### asyn 2015-2020 — behaviour rows
 
@@ -289,15 +289,15 @@ flow control), #61, #57, #55, #53, #45, #43, #40, #39, #38, #36, #33, #32,
 
 ### Section G+H roll-up — substantive items added to backlog
 
-| Class | Items | Reason for own-PR scope |
-|---|---|---|
-| Alarm-message string | #568 AMSG / #566 NAMSG | new field on `CommonFields`, MS-link plumbing, monitor metadata extension |
-| JSON5 db parsing | #86 | parser switch + extensive db-file regression suite |
-| Hardware-link parsing | #213 hex in HW links + the entire `@dev arg` form | epics-rs has no HW-link grammar yet |
-| ~~`IP_MULTICAST_ALL` socket option~~ | ~~#193~~ | already applied — see Section H |
-| ASLO/AOFF/SMOO on asyn | #66 | new transform layer in `asyn_record/` adapter |
-| asyn:READBACK | #208, #60 | output-record process-on-callback wiring in `asyn_record/` |
-| Record-name validation | #78 | parser-side gate + regression for legacy databases |
+| Class | Items | Reason for own-PR scope | Status |
+|---|---|---|---|
+| Alarm-message string | #568 AMSG / #566 NAMSG | new field on `CommonFields`, MS-link plumbing, monitor metadata extension | deferred (substantive) |
+| JSON-link grammar + JSON5 | #86 | epics-rs `link.rs` lacks JSON-link parsing entirely; JSON5 leniency belongs on top | deferred (substantive) |
+| Hardware-link parsing | #213 hex in HW links + the entire `@dev arg` form | epics-rs has no HW-link grammar yet | deferred (substantive) |
+| ~~`IP_MULTICAST_ALL` socket option~~ | ~~#193~~ | already applied — see Section H | **done (already applied)** |
+| ASLO/AOFF/SMOO on asyn | #66 | new transform layer in `asyn_record/` adapter | deferred (substantive) |
+| asyn:READBACK | #208, #60 | output-record process-on-callback wiring in `asyn_record/` | deferred (substantive) |
+| Record-name validation | #78 | parser-side gate + regression for legacy databases | **done (this branch)** |
 
 ### epics-base pre-2020 (2017-2020)
 

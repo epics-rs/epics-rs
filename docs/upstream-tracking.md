@@ -138,6 +138,102 @@ Ranked by ratio of (epics-rs regression risk) to (verification cost):
 7. **Issue #488 DNS-changed disconnect** — validate client reconnect re-resolves DNS (gateway side already handled).
 8. **PR #641 secure pvaccess** — defer until upstream merges; mark for re-validation gate.
 
+## G. Older PRs (2023-05 .. 2025-05, audit summary)
+
+Snapshot from `gh pr list --search "merged:2023-05-10..2025-05-10"`. Bulk
+categorization first; individual rows only for items where the change has
+behavioural impact on epics-rs.
+
+### Bulk N/A — pure C / build / platform / docs
+
+These have no Rust counterpart and are listed here as an audit receipt
+rather than per-PR rows: #647 (RTEMS NVRAM warnings), #645 (Windows conda),
+#642/#591/#198/#173 (doc typos), #627 (32-bit `epicsStrtod`), #615/#403
+(VxWorks/RTEMS attrs), #612 (Pod→HTML), #611/#609/#606/#168 (CI),
+#604/#589 (Python LINKER_USE_RPATH), #599/#542 (extern C, isnan/isinf
+defines), #543 (`std::unexpected`), #540 (noreturn attr), #539 (genVersion
+submodules), #535/#534/#533/#530/#509 (warnings/leaks in C), #527 (FreeBSD
+arch), #523/#492/#465 (compiler/error messages), #517 (`-D_FORTIFY_SOURCE=3`),
+#511/#420 (SPDX/RTD), #496 (UB `pthread_join`), #482/#481/#484 (doc/test
+fixes), #470/#519/#509 (C memory leaks), #461 (VSCode makefile),
+#460 (WIN32 setThreadName), #458 (accept return type), #454 (Clang-15),
+#453/#452 (CodeQL/typed dbEvent typing), #451 (initMainThread), #448/#440
+(help text/RTEMS LDFLAGS), #437 (NULL callback — Rust types prevent),
+#447 (link types as text — debug only), #375 (RTEMS MVME2700).
+
+### Behaviour changes mapped to epics-rs
+
+| PR | Merged | Change | Where in epics-rs | Status |
+|---|---|---|---|---|
+| [#571](https://github.com/epics-base/epics-base/pull/571) | 2024-12 | Recursion bug v2 (record process re-entry) | `record_instance.rs::processing: AtomicBool` re-entrancy guard + `process_record_with_links` visited set | inspected, equivalent |
+| [#568](https://github.com/epics-base/epics-base/pull/568) | 2024-12 | Propagate `AMSG` (alarm message string) through MS links | `CommonFields` has no `amsg`/`namsg` | **not started** |
+| [#566](https://github.com/epics-base/epics-base/pull/566) | 2024-11 | Clear `NAMSG` together with NSTAT/NSEV | depends on #568 (no `amsg` field) | **not started** |
+| [#559](https://github.com/epics-base/epics-base/pull/559) | 2025-03 | CP link triggers RPRO during target processing | `processing.rs:1318` sets `rpro=true` when target is mid-process | inspected, equivalent |
+| [#544](https://github.com/epics-base/epics-base/pull/544) | 2024-11 | `DBE_PROPERTY` only when property field actually changed | `record_instance.rs::notify_field_written` invalidates metadata cache; verify PROPERTY event gating uses same comparison | **not started** (audit) |
+| [#520](https://github.com/epics-base/epics-base/pull/520) | 2024-08 | readline: keep history only in interactive sessions | `iocsh/mod.rs` rustyline — interactive default | inspected, equivalent |
+| [#516](https://github.com/epics-base/epics-base/pull/516) | 2024-06 | `RSRV_SERVER_PORT` > 9999 | server port stored as `u16` (0..65535) — no 4-digit format clip | inspected, equivalent |
+| [#508](https://github.com/epics-base/epics-base/pull/508) | 2025-02 | `iocshSetError` in more places | `iocsh/mod.rs:115` uses non-zero exit equivalent; broader instrumentation pending | inspected, partial |
+| [#505](https://github.com/epics-base/epics-base/pull/505) | 2024-08 | Allow record deletion at database creation | `db_loader` does not expose record-delete primitive | **not started** |
+| [#501](https://github.com/epics-base/epics-base/pull/501) | 2024-10 | `asTrap` serverSpecific is `dbChannel` | ACF trap pipeline does not expose dbChannel handle | **not started** |
+| [#486](https://github.com/epics-base/epics-base/pull/486) | 2024-05 | `printf` record `sizv` fix | `records/printf.rs` — verify SIZV field bound | **not started** (audit) |
+| [#468](https://github.com/epics-base/epics-base/pull/468) | 2024-05 | compress record fix | `records/compress.rs` — verify reset/N=0 handling | **not started** (audit) |
+| [#467](https://github.com/epics-base/epics-base/pull/467) | 2024-06 | Off-by-one in constant link fetch | `record/link.rs::ParsedLink::Constant` — verify offset/length math | **not started** (audit) |
+| [#463](https://github.com/epics-base/epics-base/pull/463) | 2024-02 | `dbLoadRecords` allows macros with defaults without substitutions | `db_loader::dbLoadRecords` — verify macro-default semantics | **not started** (audit) |
+| [#592](https://github.com/epics-base/epics-base/pull/592) | 2025-03 | `dbServerStats()` API | introspection module exposes counters; full `dbServerStats` shape pending | **not started** |
+| [#594](https://github.com/epics-base/epics-base/pull/594) | 2025-03 | `initHookRegister` idempotent + MustSucceed | epics-rs init hook registration — verify idempotency | **not started** (audit) |
+| [#581](https://github.com/epics-base/epics-base/pull/581) | 2025-02 | Post monitors from compress record on reset | `records/compress.rs` reset path — verify monitor fan-out | **not started** (audit) |
+| [#578](https://github.com/epics-base/epics-base/pull/578) | 2024-12 | Document UDFS field | `records/dbCommon` UDFS docs — Rust-side optional | inspected, equivalent (UDFS field present) |
+| [#551](https://github.com/epics-base/epics-base/pull/551) | 2025-02 | Null-check `IOCSH_STARTUP_SCRIPT` | `iocsh/mod.rs` script-loader env var | inspected, equivalent |
+| [#558](https://github.com/epics-base/epics-base/pull/558) (already in B) | 2025-06 | `afterIocRunning` iocsh command | iocsh commands | not started |
+| [#450](https://github.com/epics-base/epics-base/pull/450) | 2025-03 | Lock record for `db_create_read_log()` and `dbChannelGetField()` | dbChannel get path concurrency | inspected, equivalent (`RwLock<RecordInstance>`) |
+| [#439](https://github.com/epics-base/epics-base/pull/439) | 2023-11 | mbboDirect `B0..BF` fields ASL0 | `records/mbbo_direct.rs` — verify per-bit ACF level | **not started** (audit) |
+| [#434](https://github.com/epics-base/epics-base/pull/434) | 2023-11 | DB parser hint for unknown field name | `db_loader` parse error UX | **not started** |
+| [#432](https://github.com/epics-base/epics-base/pull/432) | 2023-11 | Avoid hang during concurrent `db_cancel_event()` | epics-rs uses `tokio::mpsc` + `subscribers.lock()` — drop semantics differ; no hang risk on cancel | inspected, equivalent |
+| [#371](https://github.com/epics-base/epics-base/pull/371) | 2023-11 | iocsh: trim multiple trailing newlines | iocsh output formatting | **not started** (audit) |
+
+### asyn (older — 2020 .. 2024)
+
+asyn upstream is dormant; the older PR set is mostly C-only, build, or
+docs. Only items with a behavioural counterpart in `crates/asyn-rs`:
+
+| PR | Merged | Change | asyn-rs status |
+|---|---|---|---|
+| [#208](https://github.com/epics-modules/asyn/pull/208) | 2024-06 | Fix `mbboDirect` asyn:READBACK | `asyn_record/` — verify mbboDirect readback path | **not started** |
+| [#200](https://github.com/epics-modules/asyn/pull/200) | 2024-02 | Connection cleanup avoids spurious errors at IOC exit | `port_actor`/`transport` shutdown — async drop semantics differ from C; verify quiet exit | inspected, equivalent (actor abort cascades) |
+| [#180](https://github.com/epics-modules/asyn/pull/180) | 2023-05 | Send serial break via option interface | drvAsynSerialPort missing in asyn-rs | **not started** |
+| [#171](https://github.com/epics-modules/asyn/pull/171) | 2024-11 | Destructible ports | actor model in asyn-rs makes ports destructible by construction | inspected, equivalent |
+| [#162](https://github.com/epics-modules/asyn/pull/162) | 2022-09 | Improve waveform device support, add aai/aao | `asyn_record/` AAI/AAO mapping missing | **not started** |
+| [#157](https://github.com/epics-modules/asyn/pull/157) | 2022-09 | `asynDisconnected`/`asynDisabled` strings | `error::AsynStatus` Display impl | inspected, equivalent |
+| [#148](https://github.com/epics-modules/asyn/pull/148) | 2022-04 | Bind interface for IP server port | `transport` IP-server bind options | **not started** |
+| [#109](https://github.com/epics-modules/asyn/pull/109) | 2020-05 | `tcp&`/`udp&` SO_REUSEPORT protocols | socket option support in transport | **not started** |
+| [#104](https://github.com/epics-modules/asyn/pull/104) | 2020-02 | Add lsi/lso/printf record support | `asyn_record/` lsi/lso/printf mapping | **not started** |
+| Older (#125, #123, #120, #117, #116, #115, #114, #107, #106, #102, #101, #100, #98, #97, #144, #142, #140, #128) | 2020..2022 | C++/build only / std-bound legacy | inspected, n/a |
+
+### Audit follow-up backlog
+
+The `**not started** (audit)` rows above are spot-checks that look
+plausible but were not exhaustively verified in this round. They sit at
+the front of the queue for a future audit pass:
+
+1. PROPERTY event gating (#544)
+2. printf SIZV (#486)
+3. compress record reset (#468, #581)
+4. constant link fetch off-by-one (#467)
+5. dbLoadRecords macro-default semantics (#463)
+6. mbboDirect B0..BF ASL0 (#439)
+7. iocsh trailing newline trim (#371)
+8. initHookRegister idempotency (#594)
+
+Substantive scope (own PR each):
+
+- **AMSG / NAMSG alarm message string** (#568, #566) — adds two new
+  fields to `CommonFields`, plumbs through MS link propagation, every
+  record's process path gains an `amsg` argument. Visible in CA/PVA
+  monitor metadata and ACF audit logs.
+- **dbServerStats / asTrap dbChannel** (#592, #501) — new introspection
+  surface; one-shot API addition.
+- **Record-deletion at DB creation** (#505) — `db_loader` extension.
+
 ## F. Refresh queries (run to update this doc)
 
 ```sh

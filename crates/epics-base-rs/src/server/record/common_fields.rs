@@ -9,9 +9,17 @@ pub struct CommonFields {
     // Alarm state (current/result)
     pub sevr: AlarmSeverity,
     pub stat: u16,
+    /// Alarm message string (current). Mirrors epics-base PR #568:
+    /// records may attach a human-readable explanation alongside
+    /// `stat`/`sevr`. Empty means "no message". Transferred from
+    /// `namsg` by `rec_gbl_reset_alarms`.
+    pub amsg: String,
     // New alarm state (pending, transferred by rec_gbl_reset_alarms)
     pub nsev: AlarmSeverity,
     pub nsta: u16,
+    /// Pending alarm message — set during process(), transferred to
+    /// `amsg` by `rec_gbl_reset_alarms` (epics-base PR #566).
+    pub namsg: String,
     // Alarm acknowledgement
     pub acks: AlarmSeverity,
     pub ackt: bool,
@@ -67,8 +75,10 @@ impl Default for CommonFields {
         Self {
             sevr: AlarmSeverity::NoAlarm,
             stat: 0,
+            amsg: String::new(),
             nsev: AlarmSeverity::NoAlarm,
             nsta: 0,
+            namsg: String::new(),
             acks: AlarmSeverity::NoAlarm,
             ackt: true,
             udf: true,

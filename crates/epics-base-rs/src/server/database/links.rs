@@ -8,10 +8,16 @@ use crate::types::EpicsValue;
 use super::{PvDatabase, select_link_indices};
 
 /// Alarm state from a link source, used for MS/NMS propagation.
-#[derive(Clone, Copy, Debug)]
+///
+/// `amsg` is the alarm-message string — propagated from the source
+/// record's `common.amsg` so a downstream MS link sees the same
+/// human-readable explanation. Empty when the source has no message
+/// or when the link source is not a DB record.
+#[derive(Clone, Debug)]
 pub(crate) struct LinkAlarm {
     pub stat: u16,
     pub sevr: AlarmSeverity,
+    pub amsg: String,
 }
 
 impl PvDatabase {
@@ -68,6 +74,7 @@ impl PvDatabase {
                     Some(LinkAlarm {
                         stat: inst.common.stat,
                         sevr: inst.common.sevr,
+                        amsg: inst.common.amsg.clone(),
                     })
                 } else {
                     None

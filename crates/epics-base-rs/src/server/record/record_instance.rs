@@ -562,6 +562,9 @@ impl RecordInstance {
             "STAT" => Some(EpicsValue::Short(self.common.stat as i16)),
             "NSEV" => Some(EpicsValue::Short(self.common.nsev as i16)),
             "NSTA" => Some(EpicsValue::Short(self.common.nsta as i16)),
+            // epics-base PR #568 / #566 — alarm message string.
+            "AMSG" => Some(EpicsValue::String(self.common.amsg.clone())),
+            "NAMSG" => Some(EpicsValue::String(self.common.namsg.clone())),
             "ACKS" => Some(EpicsValue::Short(self.common.acks as i16)),
             "ACKT" => Some(EpicsValue::Char(if self.common.ackt { 1 } else { 0 })),
             "UDF" => Some(EpicsValue::Char(if self.common.udf { 1 } else { 0 })),
@@ -680,6 +683,16 @@ impl RecordInstance {
             "NSTA" => {
                 if let EpicsValue::Short(v) = value {
                     self.common.nsta = v as u16;
+                }
+            }
+            "AMSG" => {
+                if let EpicsValue::String(s) = value {
+                    self.common.amsg = s;
+                }
+            }
+            "NAMSG" => {
+                if let EpicsValue::String(s) = value {
+                    self.common.namsg = s;
                 }
             }
             "ACKS" => {

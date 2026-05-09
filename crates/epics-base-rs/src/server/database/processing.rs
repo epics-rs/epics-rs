@@ -488,17 +488,29 @@ impl PvDatabase {
                 return Ok(());
             }
 
-            // MS/NMS alarm propagation from input links
+            // MS/NMS alarm propagation from input links. Mirrors
+            // epics-base PR #568: alarm message string (`amsg`)
+            // travels alongside stat/sevr through MS-class links.
             for (ms, alarm) in &link_alarms {
-                use crate::server::recgbl::rec_gbl_set_sevr;
+                use crate::server::recgbl::rec_gbl_set_sevr_msg;
                 use crate::server::record::MonitorSwitch;
                 match ms {
                     MonitorSwitch::Maximize | MonitorSwitch::MaximizeStatus => {
-                        rec_gbl_set_sevr(&mut instance.common, alarm.stat, alarm.sevr);
+                        rec_gbl_set_sevr_msg(
+                            &mut instance.common,
+                            alarm.stat,
+                            alarm.sevr,
+                            alarm.amsg.clone(),
+                        );
                     }
                     MonitorSwitch::MaximizeIfInvalid => {
                         if alarm.sevr == crate::server::record::AlarmSeverity::Invalid {
-                            rec_gbl_set_sevr(&mut instance.common, alarm.stat, alarm.sevr);
+                            rec_gbl_set_sevr_msg(
+                                &mut instance.common,
+                                alarm.stat,
+                                alarm.sevr,
+                                alarm.amsg.clone(),
+                            );
                         }
                     }
                     MonitorSwitch::NoMaximize => {} // NMS: do not propagate

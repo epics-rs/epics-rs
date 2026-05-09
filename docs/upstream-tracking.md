@@ -259,7 +259,7 @@ N/A), #75 (sim doc), #26 (timestamp before outlink — rare path).
 | PR | Merged | Change | Where in epics-rs | Status |
 |---|---|---|---|---|
 | [#199](https://github.com/epics-base/epics-base/pull/199) | 2021-10 | Cleanup `mbboDirect` bit field handling | `records/mbbo_direct.rs` — verify B0..BF bit-mask compose/decompose | **not started** (audit) |
-| [#193](https://github.com/epics-base/epics-base/pull/193) | 2022-01 | Clear `IP_MULTICAST_ALL` on Linux (drop unrelated multicast) | UDP responder socket options in `epics-ca-rs/src/server/udp.rs` and `epics-pva-rs/src/server_native/udp.rs` | **not started** — kernel default subscribes to all groups, can leak unrelated traffic on multi-group hosts |
+| [#193](https://github.com/epics-base/epics-base/pull/193) | 2022-01 | Clear `IP_MULTICAST_ALL` on Linux (drop unrelated multicast) | already applied: `epics-base-rs/src/net/async_udp_v4.rs:630`, `epics-ca-rs/src/server/udp.rs:87`, `epics-base-rs/src/net/loopback_mcast.rs:69` all call `socket.set_multicast_all_v4(false)`; `epics-pva-rs` server uses `AsyncUdpV4::bind` so it inherits the same option | inspected, equivalent (already applied) |
 | [#191](https://github.com/epics-base/epics-base/pull/191) | 2021-08 | `int64in`: fix monitor delta test | `records/int64in.rs` MDEL/ADEL comparison vs i64 vs f64 | **not started** (audit) |
 | [#213](https://github.com/epics-base/epics-base/pull/213) | 2022-01 | Hex literals in hardware links (e.g. `@dev 0xFF`) | `record/link.rs` hardware-link parser does not split hex args | **not started** — hardware-link forms not parsed at all yet |
 | [#144](https://github.com/epics-base/epics-base/pull/144) | 2022-05 | Add `SIMM=RAW` to ao records | `records/ao.rs` SIMM stored but RAW menu not handled distinct from VAL | **not started** (audit) |
@@ -294,7 +294,7 @@ flow control), #61, #57, #55, #53, #45, #43, #40, #39, #38, #36, #33, #32,
 | Alarm-message string | #568 AMSG / #566 NAMSG | new field on `CommonFields`, MS-link plumbing, monitor metadata extension |
 | JSON5 db parsing | #86 | parser switch + extensive db-file regression suite |
 | Hardware-link parsing | #213 hex in HW links + the entire `@dev arg` form | epics-rs has no HW-link grammar yet |
-| `IP_MULTICAST_ALL` socket option | #193 | per-socket option set during UDP bind in CA + PVA |
+| ~~`IP_MULTICAST_ALL` socket option~~ | ~~#193~~ | already applied — see Section H |
 | ASLO/AOFF/SMOO on asyn | #66 | new transform layer in `asyn_record/` adapter |
 | asyn:READBACK | #208, #60 | output-record process-on-callback wiring in `asyn_record/` |
 | Record-name validation | #78 | parser-side gate + regression for legacy databases |
@@ -308,6 +308,66 @@ mbbi/mbboDirect/permissive/state/stringin POD); behaviourally relevant:
   monitor lockup under specific event delivery race. epics-rs uses
   `tokio::mpsc` per subscriber + coalesce slot, no equivalent path.
   Inspected, n/a.
+
+## I. Closed issues audit (epics-base + asyn)
+
+`gh issue list --state closed`. Most closed issues reduce to "fixed by
+PR #N already in Sections A/B/G/H" — a roll-up rather than per-row
+duplication. Listed here are issues that introduced **new behaviour
+gaps** not yet captured in earlier sections, plus a correction list for
+items that turn out to be already-fixed in epics-rs.
+
+### Already-equivalent in epics-rs (audit corrections)
+
+Re-grepped during the closed-issue pass:
+
+| Issue | Original concern | Why epics-rs already covers it |
+|---|---|---|
+| [#485](https://github.com/epics-base/epics-base/issues/485) | IOC segfault when SIZV > 32767 in `printfRecord` | `crates/epics-base-rs/src/server/records/printf.rs::sizv: u16` (default 256, capped via `v.max(1) as u16`) — the i16 truncation that segfaulted base C is structurally absent |
+| [#692](https://github.com/epics-base/epics-base/issues/692) | CA link truncates `0xffffffff` to `0x7fffffff` | `record/link.rs::ParsedLink::Constant(String)` retains the literal as a string until typed parse — i32 truncation does not happen at parse time; downstream `to_f64()` round-trips through f64 |
+| [#174](https://github.com/epics-base/epics-base/issues/174) | Initial alarm STAT/SEVR of base record types | `CommonFields::default()` sets `sevr = NoAlarm` and `stat = NO_ALARM`; `udf = true` triggers `rec_gbl_check_udf` on first process — equivalent to base's "Initial NaN/UDF then resolve" |
+| [#361](https://github.com/epics-base/epics-base/issues/361) | `printf` record does not format `%%` correctly | `records/printf.rs:44` has a `%%` escape branch |
+| [#187](https://github.com/epics-base/epics-base/issues/187) | `waveformRecord` missing `PACT=true` during async | `RecordInstance::processing: AtomicBool` is the PACT equivalent; async device support sets it via `is_processing()` |
+| [#423](https://github.com/epics-base/epics-base/issues/423) | dbEvent: double cancel causes hang | `subscribers.lock().retain(|sub| !sub.tx.is_closed())` makes double-cancel a no-op |
+| [#9](https://github.com/epics-base/epics-base/issues/9) | compress record FIFO/LIFO not working (very old) | check `records/compress.rs` algo |
+
+### New gaps captured from closed issues
+
+| Issue | Gap | epics-rs site to revisit |
+|---|---|---|
+| [#564](https://github.com/epics-base/epics-base/issues/564) | DBR_ULONG negative-number handling | CA wire DBR_ULONG conversion (`epics-base-rs/src/types::EpicsValue::ULong` ↔ DBR conversion) — verify negative-as-i32 round-trip semantics |
+| [#421](https://github.com/epics-base/epics-base/issues/421) | Cannot put JSON links via pvput | `epics-pva-rs` PUT path JSON link handling — likely missing |
+| [#312](https://github.com/epics-base/epics-base/issues/312) | `dbLoadRecords` should warn/error on alias with field part | `db_loader` alias parser permissive |
+| [#284](https://github.com/epics-base/epics-base/issues/284) | Constant `INP*` to aSub | `records/asub_record.rs` constant link plumbing — verify each FT* type |
+| [#280](https://github.com/epics-base/epics-base/issues/280) | Timestamp when monitoring non-VAL field | `record_instance.rs::snapshot_for_field` — verify per-field timestamp source |
+| [#209](https://github.com/epics-base/epics-base/issues/209) | `ca_enable_preemptive_callback` gets no monitor updates | epics-rs CA client is preemptive by construction (tokio tasks); not applicable as a bug |
+| [#194](https://github.com/epics-base/epics-base/issues/194) | Long string `CALC$` issue | `records/scalcout.rs` `$` suffix handling — string-typed input |
+| [#190](https://github.com/epics-base/epics-base/issues/190) | CA connections "stalled" after sleeping (laptop suspend) | `ca-rs` echo watchdog (already P-G fix) — should detect; verify under the suspend path |
+| [#183](https://github.com/epics-base/epics-base/issues/183) | DB link `DBF_MENU` to `DBF_STRING` conversions broken | `database/links.rs::read_link_value` type-conversion table — verify menu→string |
+| [#106](https://github.com/epics-base/epics-base/issues/106) | Timers expire early | tokio::time uses monotonic clock; not subject to `epicsTimer` quantization issue |
+| [#97](https://github.com/epics-base/epics-base/issues/97) | Segfault reading from compress to aai | `records/{compress,aai}.rs` cross-record link read — verify size negotiation |
+
+### asyn closed issues — new gaps
+
+| Issue | Gap | asyn-rs site |
+|---|---|---|
+| [#231](https://github.com/epics-modules/asyn/issues/231) | UInt64 interface support | `interfaces/` lacks `asynUInt64` / `asynUInt64Array` |
+| [#136](https://github.com/epics-modules/asyn/issues/136) | Records with `asyn:READBACK` not setting STAT/SEVR correctly when UDF=0 | adapter callback path — same scope as #208 / #60 |
+| [#80](https://github.com/epics-modules/asyn/issues/80) | Deadlocks with `asyn:READBACK` on output records | actor model in asyn-rs naturally avoids synchronous deadlock — verify |
+| [#79](https://github.com/epics-modules/asyn/issues/79) | Add `asynInterposeDelay` and `asynInterposeEcho` | interpose chain extensions missing |
+| [#56](https://github.com/epics-modules/asyn/issues/56) | Race condition with info tag `asyn:READBACK` | adapter path |
+| [#46](https://github.com/epics-modules/asyn/issues/46) | Reporting parameter value change to driver | `param.rs` change-notify hook — verify direction (driver → record vs record → driver) |
+| [#30](https://github.com/epics-modules/asyn/issues/30) | Enhance `asynInt32Average` / `asynFloat64Average` device support | averaging device support not in asyn-rs |
+
+### Repo audit horizon reached
+
+`gh pr list --search "merged:<2017-01-01"` for `epics-base/epics-base`
+returns `[]`; `merged:<2015-01-01"` for `epics-modules/asyn` returns
+`[]`. The respective GitHub PR histories begin at 2017 and 2015 — older
+patches predate the GitHub migration and live only in the Launchpad
+mirror. Pre-2017 epics-base merged PRs are exclusively dbd POD doc
+work plus a single behavioural fix (#25, race in event delivery —
+inspected n/a; per-subscriber mpsc model).
 
 ## F. Refresh queries (run to update this doc)
 

@@ -14,6 +14,8 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_dbpf());
     registry.register(cmd_dbpr());
     registry.register(cmd_dbsr());
+    registry.register(cmd_dbglob());
+    registry.register(cmd_dbgrep());
     registry.register(cmd_scanppl());
     registry.register(cmd_post_event());
     registry.register(cmd_ioc_stats());
@@ -350,40 +352,121 @@ fn cmd_dbpr() -> CommandDef {
     )
 }
 
+/// Shared handler used by `dbsr`, `dbglob`, and `dbgrep`. Mirrors
+/// epics-base PR #626 (rename `dbgrep` → `dbglob` with alias) and
+/// PR #613 (add fields argument). The `fields` argument is comma-
+/// separated; when present each matching record additionally dumps
+/// the listed field values.
+fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
+    let pattern = args
+        .first()
+        .and_then(|a| {
+            if let ArgValue::String(s) = a {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or("*");
+    let fields: Vec<String> = args
+        .get(1)
+        .and_then(|a| {
+            if let ArgValue::String(s) = a {
+                Some(s.split(',').map(|f| f.trim().to_string()).collect())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    let mut names = ctx.block_on(ctx.db().all_record_names());
+    names.sort();
+
+    let mut count = 0;
+    for name in &names {
+        if !glob_match(pattern, name) {
+            continue;
+        }
+        ctx.println(name);
+        count += 1;
+        if fields.is_empty() {
+            continue;
+        }
+        // Dump each requested field for this record.
+        if let Some(rec_arc) = ctx.block_on(ctx.db().get_record(name)) {
+            let inst = ctx.block_on(rec_arc.read());
+            for fname in &fields {
+                let value = inst
+                    .record
+                    .get_field(fname)
+                    .map(|v| format!("{v:?}"))
+                    .unwrap_or_else(|| "<no field>".to_string());
+                ctx.println(&format!("  {fname:>8}: {value}"));
+            }
+        }
+    }
+    ctx.println(&format!("Total: {count} records"));
+    Ok(CommandOutcome::Continue)
+}
+
 fn cmd_dbsr() -> CommandDef {
     CommandDef::new(
         "dbsr",
-        vec![ArgDesc {
-            name: "pattern",
-            arg_type: ArgType::String,
-            optional: true,
-        }],
-        "dbsr [pattern] — Search records by name pattern (glob)",
-        |args: &[ArgValue], ctx: &CommandContext| {
-            let pattern = args
-                .first()
-                .and_then(|a| {
-                    if let ArgValue::String(s) = a {
-                        Some(s.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or("*");
+        vec![
+            ArgDesc {
+                name: "pattern",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "fields",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "dbsr [pattern] [fields] — Search records by name pattern; \
+         optional comma-separated fields list dumps each value",
+        dbsr_handler,
+    )
+}
 
-            let mut names = ctx.block_on(ctx.db().all_record_names());
-            names.sort();
+fn cmd_dbglob() -> CommandDef {
+    CommandDef::new(
+        "dbglob",
+        vec![
+            ArgDesc {
+                name: "pattern",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "fields",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "dbglob [pattern] [fields] — Alias of dbsr (epics-base PR #626)",
+        dbsr_handler,
+    )
+}
 
-            let mut count = 0;
-            for name in &names {
-                if glob_match(pattern, name) {
-                    ctx.println(name);
-                    count += 1;
-                }
-            }
-            ctx.println(&format!("Total: {count} records"));
-            Ok(CommandOutcome::Continue)
-        },
+fn cmd_dbgrep() -> CommandDef {
+    CommandDef::new(
+        "dbgrep",
+        vec![
+            ArgDesc {
+                name: "pattern",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "fields",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "dbgrep [pattern] [fields] — Legacy alias retained per epics-base PR #626",
+        dbsr_handler,
     )
 }
 

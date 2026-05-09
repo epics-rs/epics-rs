@@ -18,6 +18,7 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_post_event());
     registry.register(cmd_ioc_stats());
     registry.register(cmd_db_load_records());
+    registry.register(cmd_db_create_record());
     registry.register(cmd_epics_env_set());
     registry.register(cmd_ioc_init());
     registry.register(cmd_exit());
@@ -366,6 +367,68 @@ fn cmd_scanppl() -> CommandDef {
             if io_count > 0 {
                 ctx.println(&format!("I/O Intr: {io_count} records"));
             }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `dbCreateRecord <type> <name>` — create a new record at runtime.
+///
+/// Mirrors epics-base PR #812. Validates the name with the same rules
+/// as `parse_db` (PR #78), refuses duplicate names, and routes the
+/// instantiation through the same factory registry as `dbLoadRecords`.
+fn cmd_db_create_record() -> CommandDef {
+    CommandDef::new(
+        "dbCreateRecord",
+        vec![
+            ArgDesc {
+                name: "recordType",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "recordName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+        ],
+        "dbCreateRecord <type> <name> — Create a new record of <type> at runtime",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let rec_type = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => {
+                    ctx.println("dbCreateRecord: missing recordType");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            let name = match &args[1] {
+                ArgValue::String(s) => s.clone(),
+                _ => {
+                    ctx.println("dbCreateRecord: missing recordName");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if let Err(e) = db_loader::validate_record_name(&name, 0, 0) {
+                ctx.println(&format!("dbCreateRecord: {e}"));
+                return Ok(CommandOutcome::Continue);
+            }
+            if ctx.block_on(ctx.db().get_record(&name)).is_some() {
+                ctx.println(&format!(
+                    "dbCreateRecord: record '{name}' already exists"
+                ));
+                return Ok(CommandOutcome::Continue);
+            }
+            let record = match db_loader::create_record(&rec_type) {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.println(&format!("dbCreateRecord: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            ctx.block_on(ctx.db().add_record(&name, record));
+            ctx.println(&format!(
+                "dbCreateRecord: created '{name}' ({rec_type})"
+            ));
             Ok(CommandOutcome::Continue)
         },
     )

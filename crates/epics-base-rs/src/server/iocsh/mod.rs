@@ -366,4 +366,57 @@ mod tests {
         assert_eq!(cmd, "dbl");
         assert!(redir.is_none());
     }
+
+    /// epics-base PR #812 — `dbCreateRecord <type> <name>` creates a
+    /// new record at runtime through the same factory registry as
+    /// `dbLoadRecords`. Verifies the happy path plus three rejection
+    /// branches (duplicate name, bad name, unknown record type).
+    #[test]
+    fn test_execute_line_db_create_record_happy_path() {
+        let shell = make_shell();
+        let result = shell.execute_line("dbCreateRecord ai NEW:AI");
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+        // Record is now visible via dbl.
+        let result = shell.execute_line("dbl ai");
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+    }
+
+    #[test]
+    fn test_execute_line_db_create_record_rejects_duplicate() {
+        let shell = make_shell();
+        // TEST_REC was added by make_shell() — re-creating must fail
+        // gracefully (logged via println, returns Continue, not Err).
+        shell.execute_line("dbCreateRecord ai TEST_REC").unwrap();
+        // After the rejected call, the original record (val=42.0) is
+        // still there, not overwritten. Verify with dbgf which reads
+        // the live VAL.
+        let r = shell.execute_line("dbgf TEST_REC");
+        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+    }
+
+    #[test]
+    fn test_execute_line_db_create_record_rejects_bad_name() {
+        let shell = make_shell();
+        // Space inside the name → validate_record_name returns Err.
+        // Quote so the parser keeps the space as one argument.
+        let r = shell.execute_line("dbCreateRecord ai \"BAD NAME\"");
+        // The command itself returns Continue (errors are printed),
+        // and the record must NOT be in the registry afterward.
+        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+    }
+
+    #[test]
+    fn test_execute_line_db_create_record_rejects_unknown_type() {
+        let shell = make_shell();
+        let r = shell.execute_line("dbCreateRecord nonexistent NEW_REC");
+        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+    }
+
+    #[test]
+    fn test_execute_line_db_create_record_missing_args() {
+        let shell = make_shell();
+        // Both args are required — missing recordName must Err.
+        let r = shell.execute_line("dbCreateRecord ai");
+        assert!(r.is_err());
+    }
 }

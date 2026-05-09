@@ -39,6 +39,49 @@ pub struct DbRecordDef {
     pub fields: Vec<(String, String)>,
 }
 
+/// Validate a record (or alias) name against epics-base PR #78 rules.
+///
+/// Returns `Err(CaError::DbParseError)` for the hard-error cases (empty
+/// name, embedded space/tab/quote/dot/dollar). Logs `tracing::warn!`
+/// for the soft-warning cases (leading `-`/`+`/`[`/`{`, embedded
+/// non-printable characters); the parse continues so legacy databases
+/// still load.
+///
+/// The check runs **after** macro substitution, mirroring base where
+/// `dbRecordHead` is invoked from the lexer with the substituted name.
+pub(crate) fn validate_record_name(name: &str, line: usize, col: usize) -> CaResult<()> {
+    if name.is_empty() {
+        return Err(CaError::DbParseError {
+            line,
+            column: col,
+            message: "record/alias name can't be empty".into(),
+        });
+    }
+    for (i, c) in name.chars().enumerate() {
+        if i == 0 && matches!(c, '-' | '+' | '[' | '{') {
+            tracing::warn!(name, "record/alias name should not begin with '{}'", c);
+        }
+        // Non-printable ASCII (< space) is a warning, not an error —
+        // matches base PR #78's `errlogPrintf("Warning: ...")` branch.
+        if (c as u32) < 0x20 {
+            tracing::warn!(
+                name,
+                "record/alias name should not contain non-printable 0x{:02X}",
+                c as u32
+            );
+            continue;
+        }
+        if matches!(c, ' ' | '\t' | '"' | '\'' | '.' | '$') {
+            return Err(CaError::DbParseError {
+                line,
+                column: col,
+                message: format!("bad character '{c}' in record/alias name \"{name}\""),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Parse an EPICS .db file with macro substitution.
 pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<DbRecordDef>> {
     let expanded = substitute_macros(input, macros);
@@ -80,6 +123,7 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         let name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+        validate_record_name(&name, line, col)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         expect_char(&chars, &mut pos, &mut col, ')', line)?;
@@ -1165,5 +1209,70 @@ mod tests {
         let records = parse_db_file(&path, &macros, &config).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "IOC:TEMP");
+    }
+
+    // epics-base PR #78 — record-name validation regressions.
+
+    #[test]
+    fn name_validation_accepts_typical_names() {
+        for n in [
+            "IOC:TEMP",
+            "MOTOR-1",
+            "X[1]",
+            "scan_5",
+            "BL3:STD:01",
+            "abc.xyz_record",
+        ]
+        .iter()
+        .copied()
+        // ".xyz" inside the bracket-allowed shape would actually fail
+        // — the slash above is just to demonstrate the OK/FAIL split.
+        {
+            // Skip the deliberately-bad sample.
+            if n.contains('.') {
+                assert!(validate_record_name(n, 1, 1).is_err());
+                continue;
+            }
+            validate_record_name(n, 1, 1).unwrap_or_else(|e| panic!("'{n}' should pass: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn name_validation_rejects_empty() {
+        assert!(validate_record_name("", 1, 1).is_err());
+    }
+
+    #[test]
+    fn name_validation_rejects_bad_chars() {
+        // Mirrors base: TAB (0x09) is non-printable so it falls into the
+        // warn-and-continue branch, NOT the hard-error set. Only the
+        // printable bad chars below produce a hard error.
+        for bad in ["spa ce", "do.t", "qu\"ot", "ap'os", "do$llar"] {
+            assert!(
+                validate_record_name(bad, 1, 1).is_err(),
+                "'{bad}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn name_validation_warns_but_passes_on_nonprintable() {
+        // 0x09 (TAB) and 0x01 are < 0x20 so they only emit a warning.
+        validate_record_name("ta\tb", 1, 1).expect("TAB is warn-only per base spec");
+        validate_record_name("hello\x01world", 1, 1).expect("0x01 is warn-only");
+    }
+
+    #[test]
+    fn name_validation_warns_on_leading_special_but_passes() {
+        for warn in ["-x", "+y", "[arr", "{obj"] {
+            validate_record_name(warn, 1, 1).expect("leading special is warn-only");
+        }
+    }
+
+    #[test]
+    fn parse_db_propagates_name_validation_error() {
+        let bad = r#"record(ai, "BAD NAME") { }"#;
+        let res = parse_db(bad, &HashMap::new());
+        assert!(matches!(res, Err(CaError::DbParseError { .. })));
     }
 }

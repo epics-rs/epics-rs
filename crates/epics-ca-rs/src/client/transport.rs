@@ -1382,6 +1382,7 @@ mod server_connection_drop_tests {
 
         // tokio's abort schedules cancellation; let the runtime
         // drain it.
+        let drain_started = tokio::time::Instant::now();
         for _ in 0..50 {
             if read_abort.is_finished() && write_abort.is_finished() {
                 break;
@@ -1389,6 +1390,7 @@ mod server_connection_drop_tests {
             tokio::task::yield_now().await;
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+        let drain_elapsed = drain_started.elapsed();
 
         assert!(
             read_abort.is_finished(),
@@ -1397,6 +1399,18 @@ mod server_connection_drop_tests {
         assert!(
             write_abort.is_finished(),
             "ServerConnection::drop must abort _write_task"
+        );
+
+        // Reproducer guard for epics-base issue #477 (30s hang after
+        // both ends are destroyed): if Drop ever stops aborting the
+        // pumps, the test would loop the full 50 × 2 ms = 100 ms
+        // budget then fail above. Tighten the budget here so a
+        // regression toward "let echo timeout drain" (which would
+        // approach the upstream 30 s symptom) shows up immediately.
+        assert!(
+            drain_elapsed < Duration::from_millis(500),
+            "abort cascade took {drain_elapsed:?} — far over the \
+             tens-of-milliseconds budget (#477 reproducer)"
         );
     }
 }

@@ -53,6 +53,15 @@ impl SyncIOHandle {
             .with_timeout(self.timeout)
     }
 
+    /// Read the configured per-call timeout. The handle is `&self`-only
+    /// for I/O methods, so a `read_*` / `write_*` cannot mutate this
+    /// value — accessor exists primarily for asyn upstream issue #220
+    /// regression coverage (`pasynOctetSyncIO->read` mutated the
+    /// caller's `pasynUser->timeout`; we cannot, by construction).
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     pub fn read_int32(&self, reason: usize) -> AsynResult<i32> {
         self.handle.read_int32_blocking(reason, self.addr)
     }
@@ -245,5 +254,28 @@ mod tests {
         let sio = SyncIOHandle::connect(&mgr, "synctest", 0, Duration::from_secs(1)).unwrap();
         sio.write_int32(0, 100).unwrap();
         assert_eq!(sio.read_int32(0).unwrap(), 100);
+    }
+
+    /// Reproducer for asyn upstream issue #220: `pasynOctetSyncIO->read`
+    /// mutated the caller's `pasynUser->timeout`. In our actor model,
+    /// `SyncIOHandle::read_*` / `write_*` take `&self` and the timeout
+    /// is a `Copy` struct field — the type system forbids mutation.
+    /// This test pins that contract behaviourally so a future refactor
+    /// that takes `&mut self` would still have to leave the timeout
+    /// untouched (or break this assertion and own the consequence).
+    #[test]
+    fn read_write_does_not_mutate_timeout_field() {
+        let (sio, _rt) = make_sync_io();
+        let before = sio.timeout();
+        sio.write_int32(0, 5).unwrap();
+        assert_eq!(sio.timeout(), before, "write must preserve timeout");
+        let _ = sio.read_int32(0).unwrap();
+        assert_eq!(sio.timeout(), before, "read must preserve timeout");
+        // Several rounds of mixed I/O.
+        for i in 0..10 {
+            sio.write_int32(0, i).unwrap();
+            let _ = sio.read_int32(0).unwrap();
+        }
+        assert_eq!(sio.timeout(), before, "10× r/w must preserve timeout");
     }
 }

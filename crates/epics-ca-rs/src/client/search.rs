@@ -309,9 +309,22 @@ pub(crate) async fn run_search_engine(
     // queued via tcp_response_tx for the main loop to process through
     // the shared handle_udp_response parser.
     let (tcp_response_tx, mut tcp_response_rx) = mpsc::unbounded_channel::<ParsedDatagram>();
-    let mut nameserver_send_txs: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    // Reproducer for Launchpad bug #739789: pre-fix, this was an
+    // unbounded mpsc — when the nameserver TCP socket was unresponsive
+    // the per-tick search frames piled up indefinitely (each frame
+    // ~MAX_UDP_SEND bytes), eventually consuming process memory. Use
+    // a bounded mpsc so a stuck TCP peer drops messages instead of
+    // leaking. Cap is per-nameserver, not global. Override via
+    // EPICS_CA_NAMESERVER_QUEUE_DEPTH; default 256 is large enough to
+    // ride out a few-second TCP stall without observable search loss
+    // and small enough to bound RSS at a few MB worst-case.
+    let ns_queue_cap = epics_base_rs::runtime::env::get("EPICS_CA_NAMESERVER_QUEUE_DEPTH")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(256)
+        .max(8);
+    let mut nameserver_send_txs: Vec<mpsc::Sender<Vec<u8>>> = Vec::new();
     for addr in nameserver_addrs {
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(ns_queue_cap);
         nameserver_send_txs.push(tx);
         let resp_tx = tcp_response_tx.clone();
         epics_base_rs::runtime::task::spawn(async move {
@@ -393,7 +406,7 @@ pub(crate) async fn run_search_engine(
 /// failure.
 async fn run_nameserver_connection(
     addr: SocketAddr,
-    mut outgoing_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::UnboundedSender<ParsedDatagram>,
 ) {
     let mut backoff = Duration::from_secs(1);
@@ -825,7 +838,7 @@ async fn process_bucket(
     state: &mut SearchEngineState,
     addr_list: &[SocketAddr],
     socket: &AsyncUdpV4,
-    nameserver_txs: &[mpsc::UnboundedSender<Vec<u8>>],
+    nameserver_txs: &[mpsc::Sender<Vec<u8>>],
 ) {
     let now = Instant::now();
 
@@ -904,7 +917,7 @@ async fn fire_searches(
     cids: &[u32],
     addr_list: &[SocketAddr],
     socket: &AsyncUdpV4,
-    nameserver_txs: &[mpsc::UnboundedSender<Vec<u8>>],
+    nameserver_txs: &[mpsc::Sender<Vec<u8>>],
 ) {
     state.dgram_seq = state.dgram_seq.wrapping_add(1);
     let version_hdr = {
@@ -953,7 +966,7 @@ async fn fire_searches(
                 .await;
             }
             for ns_tx in nameserver_txs {
-                let _ = ns_tx.send(current_frame.clone());
+                ns_try_send(ns_tx, current_frame.clone());
             }
             current_frame.clear();
             current_frame.extend_from_slice(&version_hdr);
@@ -968,7 +981,7 @@ async fn fire_searches(
                 send_with_fanout(socket, &solo, *addr, "solo", &mut state.send_errors).await;
             }
             for ns_tx in nameserver_txs {
-                let _ = ns_tx.send(solo.clone());
+                ns_try_send(ns_tx, solo.clone());
             }
         } else {
             current_frame.extend_from_slice(&payload);
@@ -988,7 +1001,28 @@ async fn fire_searches(
             .await;
         }
         for ns_tx in nameserver_txs {
-            let _ = ns_tx.send(current_frame.clone());
+            ns_try_send(ns_tx, current_frame.clone());
+        }
+    }
+}
+
+/// Drop-on-full helper for nameserver TCP send queues. Mirrors libca
+/// behavior under TCP stall: bounded queue, drop excess, log + bump
+/// the metric so operators can see queue pressure. Lp #739789.
+fn ns_try_send(ns_tx: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>) {
+    use tokio::sync::mpsc::error::TrySendError;
+    match ns_tx.try_send(frame) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            metrics::counter!("ca_client_nameserver_queue_drops_total").increment(1);
+            tracing::warn!(
+                "EPICS_CA_NAME_SERVERS queue full — dropping search frame \
+                 (peer is slow/unresponsive; raise EPICS_CA_NAMESERVER_QUEUE_DEPTH \
+                 if the peer is healthy)"
+            );
+        }
+        Err(TrySendError::Closed(_)) => {
+            // Receiver task exited — nothing more we can do here.
         }
     }
 }
@@ -1032,6 +1066,40 @@ mod tests {
                 reason: SearchReason::Initial,
             },
         );
+    }
+
+    /// Reproducer for Launchpad bug #739789 (TCP nameserver send queue
+    /// memory leak): a stuck/slow TCP peer caused libca's `sendQue` to
+    /// grow unbounded as the UDP search agent kept pushing frames.
+    /// In epics-rs the nameserver-send channel is now bounded via
+    /// `EPICS_CA_NAMESERVER_QUEUE_DEPTH` (default 256), and
+    /// `ns_try_send` drops the frame instead of blocking or queuing.
+    /// This test exercises the helper directly: with a 2-slot channel
+    /// and no consumer, the third send must drop.
+    #[tokio::test]
+    async fn nameserver_queue_drops_when_full_no_leak() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2);
+        ns_try_send(&tx, vec![1, 2, 3]);
+        ns_try_send(&tx, vec![4, 5, 6]);
+        // Capacity is exhausted — third call must drop, not block.
+        ns_try_send(&tx, vec![7, 8, 9]);
+        // Drain: only the first two frames are present. The third was
+        // dropped, not queued — that is the regression guard.
+        assert_eq!(rx.try_recv().unwrap(), vec![1, 2, 3]);
+        assert_eq!(rx.try_recv().unwrap(), vec![4, 5, 6]);
+        assert!(
+            rx.try_recv().is_err(),
+            "third frame must be dropped, not queued (lp #739789)"
+        );
+    }
+
+    #[tokio::test]
+    async fn nameserver_queue_handles_closed_receiver() {
+        // Receiver dropped — ns_try_send must not panic.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(2);
+        drop(rx);
+        ns_try_send(&tx, vec![1, 2, 3]);
+        // Reaching this line means the call did not panic.
     }
 
     #[test]

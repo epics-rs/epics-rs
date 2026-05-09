@@ -20,8 +20,31 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_db_load_records());
     registry.register(cmd_db_create_record());
     registry.register(cmd_epics_env_set());
+    registry.register(cmd_pushd());
+    registry.register(cmd_popd());
+    registry.register(cmd_dirs());
     registry.register(cmd_ioc_init());
     registry.register(cmd_exit());
+}
+
+/// Process-global directory stack for `pushd`/`popd`/`dirs`.
+/// Mirrors epics-base PR #497 — bash-style directory navigation in
+/// iocsh. Stack is shared across IocShell instances within one
+/// process; iocsh is by convention single-instance.
+fn dir_stack() -> &'static std::sync::Mutex<Vec<std::path::PathBuf>> {
+    static STACK: std::sync::OnceLock<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+        std::sync::OnceLock::new();
+    STACK.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn print_stack(ctx: &CommandContext) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let stack = dir_stack().lock().unwrap();
+    // Bash convention: top-of-stack is leftmost, cwd is shown first.
+    let parts: Vec<String> = std::iter::once(cwd.display().to_string())
+        .chain(stack.iter().rev().map(|p| p.display().to_string()))
+        .collect();
+    ctx.println(&parts.join(" "));
 }
 
 fn cmd_help() -> CommandDef {
@@ -367,6 +390,93 @@ fn cmd_scanppl() -> CommandDef {
             if io_count > 0 {
                 ctx.println(&format!("I/O Intr: {io_count} records"));
             }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `pushd [dir]` — push the current directory onto the stack and `cd`.
+/// With no argument, swaps the current dir with the top of the stack.
+fn cmd_pushd() -> CommandDef {
+    CommandDef::new(
+        "pushd",
+        vec![ArgDesc {
+            name: "dir",
+            arg_type: ArgType::String,
+            optional: true,
+        }],
+        "pushd [dir] — push current dir onto stack and cd to <dir>",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let cwd = match std::env::current_dir() {
+                Ok(p) => p,
+                Err(e) => {
+                    ctx.println(&format!("pushd: cannot read cwd: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            match &args[0] {
+                ArgValue::String(dir) => {
+                    if let Err(e) = std::env::set_current_dir(dir) {
+                        ctx.println(&format!("pushd: {dir}: {e}"));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                    dir_stack().lock().unwrap().push(cwd);
+                }
+                _ => {
+                    // No arg: swap cwd with top of stack.
+                    let mut stack = dir_stack().lock().unwrap();
+                    let Some(top) = stack.pop() else {
+                        ctx.println("pushd: directory stack empty");
+                        return Ok(CommandOutcome::Continue);
+                    };
+                    if let Err(e) = std::env::set_current_dir(&top) {
+                        // Restore on failure.
+                        stack.push(top);
+                        ctx.println(&format!("pushd: {e}"));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                    stack.push(cwd);
+                }
+            }
+            print_stack(ctx);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `popd` — pop the top of the directory stack and `cd` to it.
+fn cmd_popd() -> CommandDef {
+    CommandDef::new(
+        "popd",
+        vec![],
+        "popd — pop top of directory stack and cd to it",
+        |_args: &[ArgValue], ctx: &CommandContext| {
+            let mut stack = dir_stack().lock().unwrap();
+            let Some(top) = stack.pop() else {
+                ctx.println("popd: directory stack empty");
+                return Ok(CommandOutcome::Continue);
+            };
+            if let Err(e) = std::env::set_current_dir(&top) {
+                // Restore the entry — failed cd must not lose stack state.
+                stack.push(top);
+                ctx.println(&format!("popd: {e}"));
+                return Ok(CommandOutcome::Continue);
+            }
+            drop(stack);
+            print_stack(ctx);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `dirs` — list the directory stack (cwd + saved entries).
+fn cmd_dirs() -> CommandDef {
+    CommandDef::new(
+        "dirs",
+        vec![],
+        "dirs — list the iocsh directory stack",
+        |_args: &[ArgValue], ctx: &CommandContext| {
+            print_stack(ctx);
             Ok(CommandOutcome::Continue)
         },
     )

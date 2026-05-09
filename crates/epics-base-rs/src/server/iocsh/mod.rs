@@ -138,7 +138,19 @@ impl IocShell {
 
     /// Run the interactive REPL. Blocks until exit or EOF.
     pub fn run_repl(&self) -> Result<(), String> {
-        let mut rl = rustyline::DefaultEditor::new()
+        // History capacity from `EPICS_RS_IOCSH_HISTORY_SIZE` (default
+        // 500). Mirrors epics-base PR #459 — bound the history so a
+        // long-running IOC shell session does not grow unbounded.
+        // Lower bound 16 keeps history useful even for hostile env values.
+        let history_size = crate::runtime::env::get("EPICS_RS_IOCSH_HISTORY_SIZE")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(500)
+            .max(16);
+        let config = rustyline::Config::builder()
+            .max_history_size(history_size)
+            .map_err(|e| format!("invalid rustyline history config: {e}"))?
+            .build();
+        let mut rl = rustyline::DefaultEditor::with_config(config)
             .map_err(|e| format!("failed to initialize readline: {e}"))?;
 
         loop {

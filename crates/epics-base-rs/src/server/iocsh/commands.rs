@@ -19,12 +19,44 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_ioc_stats());
     registry.register(cmd_db_load_records());
     registry.register(cmd_db_create_record());
+    registry.register(cmd_db_delete_record());
     registry.register(cmd_epics_env_set());
     registry.register(cmd_pushd());
     registry.register(cmd_popd());
     registry.register(cmd_dirs());
     registry.register(cmd_ioc_init());
     registry.register(cmd_exit());
+}
+
+/// `dbDeleteRecord <name>` — remove a record from the live database.
+/// Mirrors epics-base PR #505 (record deletion at DB creation).
+fn cmd_db_delete_record() -> CommandDef {
+    CommandDef::new(
+        "dbDeleteRecord",
+        vec![ArgDesc {
+            name: "recordName",
+            arg_type: ArgType::String,
+            optional: false,
+        }],
+        "dbDeleteRecord <name> — remove a record from the live database",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let name = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => {
+                    ctx.println("dbDeleteRecord: missing recordName");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if ctx.block_on(ctx.db().remove_record(&name)) {
+                ctx.println(&format!("dbDeleteRecord: removed '{name}'"));
+            } else {
+                ctx.println(&format!(
+                    "dbDeleteRecord: no record named '{name}'"
+                ));
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
 }
 
 /// Process-global directory stack for `pushd`/`popd`/`dirs`.

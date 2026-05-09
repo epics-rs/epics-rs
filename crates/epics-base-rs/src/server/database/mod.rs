@@ -442,6 +442,50 @@ impl PvDatabase {
         }
     }
 
+    /// Remove a record by name. Returns `true` if a record was removed,
+    /// `false` if no such name was registered. Mirrors epics-base PR
+    /// #505 — deletion at database creation, exposed here as a public
+    /// API so iocsh `dbDeleteRecord` and tests can drive it.
+    ///
+    /// The cleanup covers the three indices that `add_record` populates:
+    /// the records map, the scan index, and CP-link source/target lists.
+    /// Live subscribers on the removed record drop their `Sender` clone
+    /// when the `RecordInstance` is dropped — they observe `Closed` on
+    /// next recv, matching the existing dbEvent cancel flow.
+    pub async fn remove_record(&self, name: &str) -> bool {
+        // 1) Remove from main map; keep scan + phas for scan-index cleanup.
+        let removed = self.inner.records.write().await.remove(name);
+        let Some(rec_arc) = removed else {
+            return false;
+        };
+        let (scan, phas) = {
+            let inst = rec_arc.read().await;
+            (inst.common.scan, inst.common.phas)
+        };
+
+        // 2) Drop from scan index if it was scheduled.
+        if scan != ScanType::Passive {
+            let mut idx = self.inner.scan_index.write().await;
+            if let Some(set) = idx.get_mut(&scan) {
+                set.remove(&(phas, name.to_string()));
+                if set.is_empty() {
+                    idx.remove(&scan);
+                }
+            }
+        }
+
+        // 3) Drop from CP-link tables. Removed both as source (channel
+        // change → trigger targets) and as target (other channels'
+        // CP lists may still reference this name).
+        let mut cp = self.inner.cp_links.write().await;
+        cp.remove(name);
+        for targets in cp.values_mut() {
+            targets.retain(|t| t != name);
+        }
+
+        true
+    }
+
     /// Internal: synchronous lookup without invoking the search resolver.
     async fn find_entry_no_resolve(&self, name: &str) -> Option<PvEntry> {
         let (base, _field) = parse_pv_name(name);

@@ -40,8 +40,8 @@ pub use group::{AnyMonitor, GroupChannel, GroupMonitor};
 pub use group_config::GroupPvDef;
 pub use monitor::BridgeMonitor;
 pub use provider::{
-    AccessContext, AccessControl, AllowAllAccess, AnyChannel, BridgeProvider, Channel,
-    ChannelProvider, PvaMonitor,
+    AccessContext, AccessControl, AcfAccessControl, AllowAllAccess, AnyChannel, BridgeProvider,
+    Channel, ChannelProvider, PvaMonitor,
 };
 #[cfg(feature = "qsrv")]
 pub use pva_adapter::{

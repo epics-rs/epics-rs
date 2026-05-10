@@ -635,8 +635,31 @@ impl PvDatabase {
         None
     }
 
-    /// Get a record Arc by name.
+    /// Get a record Arc by name. Alias-aware (epics-base PR #336):
+    /// when `name` is not a canonical record but matches a registered
+    /// alias, the alias' target record is returned. Mirrors base
+    /// `dbNameToAddr` behaviour, so dbpf/dbpr/dbgf, CA channel lookup,
+    /// and DB-link target resolution all work transparently for
+    /// aliases.
+    ///
+    /// Use [`Self::get_record_no_resolve`] when the caller already
+    /// holds a canonical name and wants to suppress the alias path
+    /// (e.g. to detect alias collisions during builder wiring).
     pub async fn get_record(&self, name: &str) -> Option<Arc<RwLock<RecordInstance>>> {
+        if let Some(rec) = self.inner.records.read().await.get(name).cloned() {
+            return Some(rec);
+        }
+        let target = self.inner.aliases.read().await.get(name).cloned()?;
+        self.inner.records.read().await.get(&target).cloned()
+    }
+
+    /// Strict variant of [`Self::get_record`] — does NOT consult the
+    /// alias table. Returns `Some` only when a canonical record with
+    /// that exact name exists.
+    pub async fn get_record_no_resolve(
+        &self,
+        name: &str,
+    ) -> Option<Arc<RwLock<RecordInstance>>> {
         self.inner.records.read().await.get(name).cloned()
     }
 
@@ -782,6 +805,50 @@ mod tests {
         .await;
         let err = db.add_alias("EXISTING", "OTHER").await;
         assert!(err.is_err(), "alias name colliding with record must be rejected");
+    }
+
+    #[tokio::test]
+    async fn get_record_resolves_alias() {
+        // Round-7 regression: get_record must transparently resolve
+        // aliases so dbpf / dbgf / dbpr / CA put paths see the same
+        // record whether the caller uses the canonical name or the
+        // alias.
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_alias("ALIAS", "TARGET").await.unwrap();
+
+        let via_canonical = db.get_record("TARGET").await;
+        let via_alias = db.get_record("ALIAS").await;
+        assert!(via_canonical.is_some());
+        assert!(via_alias.is_some(), "get_record must resolve alias");
+        // Both calls return the same Arc (pointer equality).
+        assert!(Arc::ptr_eq(
+            &via_canonical.unwrap(),
+            &via_alias.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_record_no_resolve_skips_alias_table() {
+        // Strict variant must NOT see aliases — keeps the canonical
+        // distinction available for builder code paths.
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_alias("ALIAS", "TARGET").await.unwrap();
+
+        assert!(db.get_record_no_resolve("TARGET").await.is_some());
+        assert!(
+            db.get_record_no_resolve("ALIAS").await.is_none(),
+            "get_record_no_resolve must not follow alias table"
+        );
     }
 
     #[tokio::test]

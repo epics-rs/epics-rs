@@ -82,7 +82,11 @@ impl PvaServerBuilder {
 pub struct PvaServer {
     db: Arc<PvDatabase>,
     port: u16,
-    #[allow(dead_code)]
+    /// Access Security configuration. Forwarded to the default
+    /// `PvDatabaseSource` in `run()` so PVA PUTs are gated through
+    /// `check_access_method`. Callers that supply their own
+    /// ChannelSource via `run_with_source` must install ACF
+    /// themselves.
     acf: Arc<Option<access_security::AccessSecurityConfig>>,
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
@@ -126,8 +130,17 @@ impl PvaServer {
     }
 
     /// Run with the default [`PvDatabaseSource`].
+    ///
+    /// The default source is constructed with the builder-supplied
+    /// ACF (if any) so PUTs are gated through Access Security in
+    /// the same way as the CA server. Callers that supply their own
+    /// source via [`Self::run_with_source`] are responsible for
+    /// installing ACF themselves.
     pub async fn run(&self) -> CaResult<()> {
-        let source = Arc::new(PvDatabaseSource::new(self.db.clone()));
+        let source = Arc::new(PvDatabaseSource::new_with_acf(
+            self.db.clone(),
+            self.acf.clone(),
+        ));
         self.run_with_source(source).await
     }
 

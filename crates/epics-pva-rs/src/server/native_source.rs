@@ -12,6 +12,7 @@ use crate::client_native::context::PvGetResult; // not used; kept for re-export 
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use crate::server_native::ChannelSource;
 
+use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
@@ -19,15 +20,46 @@ use epics_base_rs::types::EpicsValue;
 /// Native `ChannelSource` over a `PvDatabase`.
 pub struct PvDatabaseSource {
     db: Arc<PvDatabase>,
+    /// Optional Access Security configuration. When set, every PUT
+    /// is gated through `check_access_method` using the connecting
+    /// peer's host/account/method (PVA `ChannelContext`). When None,
+    /// PUTs are unrestricted (legacy behaviour for callers that
+    /// build `PvDatabaseSource::new` without an ACF).
+    acf: Arc<Option<AccessSecurityConfig>>,
 }
 
 impl PvDatabaseSource {
     pub fn new(db: Arc<PvDatabase>) -> Self {
-        Self { db }
+        Self {
+            db,
+            acf: Arc::new(None),
+        }
+    }
+
+    /// Build with ACF enforcement. Mirrors what `PvaServer::run`
+    /// installs from its builder-supplied ACF — every PUT goes
+    /// through `check_access_method` against the record's `ASG`.
+    pub fn new_with_acf(db: Arc<PvDatabase>, acf: Arc<Option<AccessSecurityConfig>>) -> Self {
+        Self { db, acf }
     }
 
     pub fn database(&self) -> &Arc<PvDatabase> {
         &self.db
+    }
+
+    /// Resolve the ASG of the record backing `pv_name` (the part
+    /// before the optional `.FIELD` suffix). Returns "DEFAULT" for
+    /// simple PVs (no record-level ASG) or for unknown names; the
+    /// ACF defaults its `DEFAULT` ASG when no rule matches.
+    async fn resolve_asg(&self, pv_name: &str) -> String {
+        let (base, _field) = parse_pv_name(pv_name);
+        if let Some(rec) = self.db.get_record(base).await {
+            let inst = rec.read().await;
+            if !inst.common.asg.is_empty() {
+                return inst.common.asg.clone();
+            }
+        }
+        "DEFAULT".to_string()
     }
 }
 
@@ -403,6 +435,58 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
+    fn put_value_ctx(
+        &self,
+        name: &str,
+        value: PvField,
+        ctx: crate::server_native::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let db = self.db.clone();
+        let acf = self.acf.clone();
+        let name_s = name.to_string();
+        // Look up the record's ASG eagerly so the async block below
+        // doesn't have to borrow `&self`.
+        let resolve_fut = self.resolve_asg(name);
+        async move {
+            // ACF gate. Skipped when no AccessSecurityConfig is
+            // attached (legacy / opt-in behaviour for tests + simple
+            // tools); otherwise the PUT is denied unless the peer's
+            // (host, account, method) yields ReadWrite for the
+            // record's ASG.
+            if let Some(ref cfg) = *acf {
+                let asg = resolve_fut.await;
+                let level = cfg.check_access_method(
+                    &asg,
+                    &ctx.host,
+                    &ctx.account,
+                    0, // record-level ASL not threaded through PVA layer yet
+                    &ctx.method,
+                    "", // authority (cert issuer) not surfaced via PVA wire today
+                );
+                if level != AccessLevel::ReadWrite {
+                    return Err(format!(
+                        "PUT denied by access security: ASG '{asg}' from {host}/{account}/{method}",
+                        host = ctx.host,
+                        account = ctx.account,
+                        method = ctx.method,
+                    ));
+                }
+            }
+
+            // Reuse the standard PUT path for the actual write —
+            // identical to `put_value` so behaviour stays in sync
+            // when ACF is disabled.
+            let scalar = match &value {
+                PvField::Structure(s) => s.get_field("value").cloned(),
+                _ => Some(value),
+            };
+            let scalar = scalar.ok_or_else(|| "PUT missing 'value' field".to_string())?;
+            let epics = pv_field_to_epics(&scalar)
+                .ok_or_else(|| "PUT value not representable as EpicsValue".to_string())?;
+            db.put_pv(&name_s, epics).await.map_err(|e| e.to_string())
+        }
+    }
+
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
         let name = name.to_string();
@@ -518,3 +602,100 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
 use crate::error::PvaError;
 #[allow(unused_imports)]
 type _Pvr = PvGetResult;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server_native::ChannelContext;
+    use epics_base_rs::server::access_security::parse_acf;
+
+    fn make_ctx(host: &str, account: &str, method: &str) -> ChannelContext {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        ChannelContext {
+            peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+            account: account.to_string(),
+            method: method.to_string(),
+            host: host.to_string(),
+        }
+    }
+
+    fn pv_double(v: f64) -> PvField {
+        // Top-level scalar PvField — put_value / put_value_ctx accept
+        // both NTScalar and bare scalar.
+        PvField::Scalar(ScalarValue::Double(v))
+    }
+
+    /// Round-17 regression: PVA PUT must be gated through ACF when
+    /// the source was built with ACF enforcement. Pre-fix the PVA
+    /// server stored ACF only as `#[allow(dead_code)]` and never
+    /// called `check_access*` — every client could PUT regardless
+    /// of UAG/HAG/RULE configuration.
+    #[tokio::test]
+    async fn put_value_ctx_denies_when_acf_writeable_rule_unmet() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // ACF: only `admin` user on `host:lab` may WRITE.
+        let acf_text = r#"
+UAG(admins) { admin }
+HAG(lab) { lab-pc1 }
+ASG(SECURE) {
+    RULE(1, READ)
+    RULE(1, WRITE) { UAG(admins) HAG(lab) }
+}
+"#;
+        let acf = parse_acf(acf_text).unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:SECURE", Box::new(AiRecord::new(0.0))).await;
+        // Mark the record as belonging to the SECURE ASG.
+        let rec = db.get_record("AI:SECURE").await.unwrap();
+        rec.write().await.common.asg = "SECURE".to_string();
+
+        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(Some(acf)));
+
+        // Allowed: admin from lab-pc1 — must succeed.
+        source
+            .put_value_ctx(
+                "AI:SECURE",
+                pv_double(1.0),
+                make_ctx("lab-pc1", "admin", "anonymous"),
+            )
+            .await
+            .expect("admin/lab-pc1 must be allowed to PUT");
+
+        // Denied: regular user from a non-lab host — must fail with
+        // a recognisable error.
+        let err = source
+            .put_value_ctx(
+                "AI:SECURE",
+                pv_double(2.0),
+                make_ctx("intruder-pc", "guest", "anonymous"),
+            )
+            .await
+            .expect_err("non-admin must be denied");
+        assert!(
+            err.contains("denied by access security"),
+            "denial reason must be visible: {err:?}",
+        );
+    }
+
+    /// Round-17: when the source is built without ACF, behaviour
+    /// matches the old `put_value` path — every PUT succeeds.
+    #[tokio::test]
+    async fn put_value_ctx_allows_when_no_acf() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0))).await;
+
+        let source = PvDatabaseSource::new(db.clone());
+        source
+            .put_value_ctx(
+                "AI:OPEN",
+                pv_double(7.0),
+                make_ctx("anywhere", "anyone", "anonymous"),
+            )
+            .await
+            .expect("PUT must succeed when no ACF is attached");
+    }
+}

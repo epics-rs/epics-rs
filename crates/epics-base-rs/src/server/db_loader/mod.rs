@@ -182,10 +182,15 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
                 // info(tag, value) — capture for downstream consumers
                 // (asyn:READBACK, Q:form, etc.). PR #60 / #208 needs
                 // the asyn:READBACK tag in particular.
+                //
+                // Both `tag` and `value` accept quoted *or* unquoted
+                // tokens. Base's dbStaticLib parser tolerates either
+                // form and ad-core templates rely on the unquoted
+                // shape (`info(asyn:READBACK, "1")`).
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, '(', line)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let tag = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+                let tag = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ',', line)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
@@ -1328,5 +1333,38 @@ mod tests {
         let src = r#"record(ai, "PLAIN") { field(VAL, 1) }"#;
         let recs = parse_db(src, &HashMap::new()).unwrap();
         assert!(recs[0].aliases.is_empty());
+    }
+
+    /// Round-9 regression: `info(asyn:READBACK, "1")` (unquoted tag,
+    /// quoted value) is the form ad-core templates use. Base accepts
+    /// it; round-5's parser fix tightened the grammar to require a
+    /// quoted tag, which broke all NDOverlayN / NDFile / NDArrayBase
+    /// templates and the mini-beamline/xrt-beamline IOCs that load
+    /// commonPlugins.cmd.
+    #[test]
+    fn parse_db_info_accepts_unquoted_tag() {
+        let src = r#"
+record(ai, "REC") {
+    field(VAL, "0")
+    info(asyn:READBACK, "1")
+    info("Q:group", "demo")
+    info(autosaveFields, "VAL DESC")
+}
+"#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert_eq!(recs.len(), 1);
+        let tags = &recs[0].info_tags;
+        // Unquoted tag, quoted value.
+        assert!(
+            tags.iter().any(|(k, v)| k == "asyn:READBACK" && v == "1"),
+            "unquoted tag must parse: {tags:?}"
+        );
+        // Quoted tag, quoted value (existing form).
+        assert!(tags.iter().any(|(k, v)| k == "Q:group" && v == "demo"));
+        // Unquoted tag, unquoted multi-word value.
+        assert!(
+            tags.iter().any(|(k, v)| k == "autosaveFields" && v == "VAL DESC"),
+            "unquoted multi-word value must parse: {tags:?}"
+        );
     }
 }

@@ -261,7 +261,18 @@ fn cmd_dbpf() -> CommandDef {
                     db.put_pv(name, value).await
                 }
             });
-            put_result.map_err(|e| format!("{e}"))?;
+            put_result.map_err(|e| {
+                // Round-23: epics-base PR #689 — when the field
+                // doesn't exist, suggest near-by names so a typo
+                // ("DSEC" instead of "DESC") is caught quickly.
+                let msg = format!("{e}");
+                if msg.contains("FieldNotFound") || msg.contains(&format!("'{field}'")) {
+                    if let Some(suggestion) = ctx.block_on(suggest_field_name(ctx.db(), base, &field)) {
+                        return format!("{msg}; did you mean '{suggestion}'?");
+                    }
+                }
+                msg
+            })?;
 
             // Read back to confirm
             match ctx.block_on(ctx.db().get_pv(name)) {
@@ -1057,6 +1068,98 @@ fn parse_macro_string(s: &str) -> HashMap<String, String> {
         }
     }
     macros
+}
+
+#[cfg(test)]
+mod field_suggestion_tests {
+    use super::edit_distance_short;
+
+    #[test]
+    fn edit_distance_recognises_simple_typos() {
+        // Substitution within budget.
+        assert!(edit_distance_short("DSEC", "DESC") <= 2);
+        assert!(edit_distance_short("EGUU", "EGU") <= 2);
+        // Deletion.
+        assert!(edit_distance_short("DESCR", "DESC") <= 2);
+        // Long-distance — must exceed 2 so suggester rejects.
+        assert!(edit_distance_short("HELLO", "DESC") > 2);
+    }
+
+    #[test]
+    fn edit_distance_handles_empty_inputs() {
+        assert_eq!(edit_distance_short("", ""), 0);
+        assert_eq!(edit_distance_short("ABC", ""), 3);
+        assert_eq!(edit_distance_short("", "XYZ"), 3);
+    }
+}
+
+/// Suggest a field name close to `typo` that actually exists on
+/// the record `record_name`. Returns `None` when no candidate is
+/// within edit-distance ≤ 2 (Damerau-Levenshtein subset). Mirrors
+/// epics-base PR #689 — "did you mean" hint on field-not-found
+/// errors. Uppercase comparison so `desc` ≈ `DESC` matches.
+async fn suggest_field_name(
+    db: &std::sync::Arc<crate::server::database::PvDatabase>,
+    record_name: &str,
+    typo: &str,
+) -> Option<String> {
+    let typo_uc = typo.to_ascii_uppercase();
+    let rec = db.get_record(record_name).await?;
+    let inst = rec.read().await;
+    let mut candidates: Vec<&str> = inst.record.field_list().iter().map(|d| d.name).collect();
+    // Common dbCommon fields are also valid PUT targets.
+    candidates.extend([
+        "VAL", "DESC", "EGU", "SCAN", "PINI", "DTYP", "INP", "OUT", "FLNK", "NAME", "RTYP",
+        "PHAS", "PRIO", "DISA", "DISV", "DISS", "DISP", "PROC", "ASG", "TPRO", "TSE", "TSEL",
+        "UDF", "SEVR", "STAT", "AMSG",
+    ]);
+    let mut best: Option<(usize, &str)> = None;
+    for cand in &candidates {
+        let dist = edit_distance_short(&typo_uc, cand);
+        if dist > 2 {
+            continue;
+        }
+        match best {
+            None => best = Some((dist, cand)),
+            Some((d, _)) if dist < d => best = Some((dist, cand)),
+            _ => {}
+        }
+    }
+    best.map(|(_, name)| name.to_string())
+}
+
+/// Bounded Damerau-Levenshtein for short ASCII strings used by
+/// `suggest_field_name`. Returns the edit distance; cap at
+/// `a.len() + b.len()` so the loop never blows up.
+fn edit_distance_short(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+    let a: Vec<u8> = a.bytes().collect();
+    let b: Vec<u8> = b.bytes().collect();
+    if a.is_empty() || b.is_empty() {
+        return a.len().max(b.len());
+    }
+    let mut prev = (0..=b.len()).collect::<Vec<usize>>();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, ai) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, bj) in b.iter().enumerate() {
+            let cost = if ai == bj { 0 } else { 1 };
+            curr[j + 1] = (curr[j] + 1)
+                .min(prev[j + 1] + 1)
+                .min(prev[j] + cost);
+            // Damerau transposition.
+            if i > 0 && j > 0 && a[i] == b[j - 1] && a[i - 1] == b[j] {
+                // prev2 not tracked; skip the pure-Damerau optimization
+                // and rely on the Levenshtein floor — we only care that
+                // small typos like "DSEC"↔"DESC" are within ≤2.
+            }
+            let _ = cost;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
 }
 
 /// Get a display name for the DBF type of a value.

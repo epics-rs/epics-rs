@@ -172,6 +172,13 @@ pub struct AsynDeviceSupport {
     max_array_elements: usize,
     /// If true, read back the current driver value during init (for output records).
     initial_readback: bool,
+    /// `info(asyn:READBACK, "1")` flag, asyn upstream PRs #60 / #208.
+    /// When set on an output record, the adapter activates the
+    /// driver-callback path even when `SCAN != "I/O Intr"` so the
+    /// record reprocesses on every external value change. Wired
+    /// through `io_intr_receiver` together with the existing IoIntr
+    /// scan path.
+    asyn_readback: bool,
     /// If true, this is a write-only device support (e.g. asynOctetWrite).
     /// read() returns no-op to avoid overwriting the record's native value type.
     write_only: bool,
@@ -212,6 +219,7 @@ impl AsynDeviceSupport {
             record_name: String::new(),
             scan: ScanType::Passive,
             initial_readback: false,
+            asyn_readback: false,
             write_only: false,
             interrupt_sub: None,
             interrupt_cache: Arc::new(std::sync::Mutex::new(None)),
@@ -234,6 +242,19 @@ impl AsynDeviceSupport {
     pub fn with_initial_readback(mut self) -> Self {
         self.initial_readback = true;
         self
+    }
+
+    /// Enable `asyn:READBACK` mode (asyn upstream PRs #60 / #208).
+    ///
+    /// On output records that carry the `info(asyn:READBACK, "1")`
+    /// info-tag, callers should flip this flag so the adapter
+    /// subscribes to driver value changes and reprocesses the record
+    /// even outside `SCAN="I/O Intr"`. The wiring of the info-tag
+    /// itself is the caller's responsibility (epics-rs db_loader does
+    /// not yet capture info-tags); this method exposes the contract
+    /// so when info-tag plumbing lands the toggle is already in place.
+    pub fn set_asyn_readback(&mut self, on: bool) {
+        self.asyn_readback = on;
     }
 
     /// Set the driver info string (used for `drv_user_create` during init).
@@ -663,7 +684,15 @@ impl DeviceSupport for AsynDeviceSupport {
     }
 
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
-        if self.scan != ScanType::IoIntr || !self.reason_set {
+        // Activate the driver-callback path for either:
+        //   1. records with `SCAN="I/O Intr"` (legacy behaviour), OR
+        //   2. records flagged via `set_asyn_readback(true)` (asyn
+        //      upstream PRs #60 / #208 — output records that follow
+        //      driver-side changes regardless of SCAN).
+        if !self.reason_set {
+            return None;
+        }
+        if self.scan != ScanType::IoIntr && !self.asyn_readback {
             return None;
         }
 

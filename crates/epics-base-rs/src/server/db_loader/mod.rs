@@ -41,6 +41,10 @@ pub struct DbRecordDef {
     /// Mirrors epics-base PR #336 — alias names are validated with
     /// the same rules as record names.
     pub aliases: Vec<String>,
+    /// `info(tag, value)` pairs declared inside the record body.
+    /// Mirrors `info` directives in EPICS db files; common tags include
+    /// `asyn:READBACK` (asyn upstream PRs #60 / #208), `Q:form`, etc.
+    pub info_tags: Vec<(String, String)>,
 }
 
 /// Validate a record (or alias) name against epics-base PR #78 rules.
@@ -137,6 +141,7 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
 
         let mut fields = Vec::new();
         let mut aliases: Vec<String> = Vec::new();
+        let mut info_tags: Vec<(String, String)> = Vec::new();
         loop {
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             if pos >= chars.len() {
@@ -174,26 +179,20 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
                 continue;
             }
             if kw == "info" {
-                // Skip info: consume until matching ')'
+                // info(tag, value) — capture for downstream consumers
+                // (asyn:READBACK, Q:form, etc.). PR #60 / #208 needs
+                // the asyn:READBACK tag in particular.
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                if pos < chars.len() && chars[pos] == '(' {
-                    let mut depth = 1;
-                    pos += 1;
-                    col += 1;
-                    while pos < chars.len() && depth > 0 {
-                        match chars[pos] {
-                            '(' => depth += 1,
-                            ')' => depth -= 1,
-                            '\n' => {
-                                line += 1;
-                                col = 0;
-                            }
-                            _ => {}
-                        }
-                        pos += 1;
-                        col += 1;
-                    }
-                }
+                expect_char(&chars, &mut pos, &mut col, '(', line)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                let tag = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                expect_char(&chars, &mut pos, &mut col, ',', line)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                let value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                expect_char(&chars, &mut pos, &mut col, ')', line)?;
+                info_tags.push((tag, value));
                 continue;
             }
 
@@ -220,6 +219,7 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
             name,
             fields,
             aliases,
+            info_tags,
         });
     }
 
@@ -1190,12 +1190,14 @@ mod tests {
                     ("VAL".to_string(), "0".to_string()),
                 ],
                 aliases: Vec::new(),
+                info_tags: Vec::new(),
             },
             DbRecordDef {
                 record_type: "ao".to_string(),
                 name: "REC_WITHOUT_DTYP".to_string(),
                 fields: vec![("VAL".to_string(), "1".to_string())],
                 aliases: Vec::new(),
+                info_tags: Vec::new(),
             },
         ];
 

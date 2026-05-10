@@ -27,7 +27,33 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_popd());
     registry.register(cmd_dirs());
     registry.register(cmd_ioc_init());
+    registry.register(cmd_after_ioc_running());
     registry.register(cmd_exit());
+}
+
+/// `afterIocRunning <command>` — queue an iocsh command line to run
+/// after iocInit completes. Mirrors epics-base PR #558.
+fn cmd_after_ioc_running() -> CommandDef {
+    CommandDef::new(
+        "afterIocRunning",
+        vec![ArgDesc {
+            name: "command",
+            arg_type: ArgType::String,
+            optional: false,
+        }],
+        "afterIocRunning <command> — schedule a command for post-iocInit execution",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let line = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => {
+                    ctx.println("afterIocRunning: missing command");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            ctx.db().queue_after_ioc_running(line);
+            Ok(CommandOutcome::Continue)
+        },
+    )
 }
 
 /// `dbDeleteRecord <name>` — remove a record from the live database.

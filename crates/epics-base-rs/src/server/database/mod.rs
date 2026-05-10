@@ -94,6 +94,11 @@ struct PvDatabaseInner {
     /// related lookups consult this map after the canonical record
     /// table so an alias resolves transparently to its target.
     aliases: RwLock<HashMap<String, String>>,
+    /// Lines queued by the iocsh `afterIocRunning <command>` directive
+    /// (epics-base PR #558). Drained by the IOC application after PINI
+    /// completes, then re-executed through a fresh IocShell so the
+    /// commands run with the database in its post-init state.
+    after_ioc_running: std::sync::Mutex<Vec<String>>,
     /// Optional resolver for external PVs (ca://, pva:// links).
     external_resolver: RwLock<Option<ExternalPvResolver>>,
     /// Optional async resolver invoked on `has_name` misses (e.g. CA gateway).
@@ -151,6 +156,7 @@ impl PvDatabase {
                 scan_index: RwLock::new(HashMap::new()),
                 cp_links: RwLock::new(HashMap::new()),
                 aliases: RwLock::new(HashMap::new()),
+                after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
@@ -546,6 +552,24 @@ impl PvDatabase {
     /// name is not an alias.
     pub async fn resolve_alias(&self, name: &str) -> Option<String> {
         self.inner.aliases.read().await.get(name).cloned()
+    }
+
+    /// Queue an iocsh command line for post-PINI execution.
+    /// Mirrors epics-base PR #558 — `afterIocRunning <command>` lets
+    /// the startup script schedule actions that run after iocInit
+    /// completes (when the record set is fully wired up).
+    pub fn queue_after_ioc_running(&self, line: impl Into<String>) {
+        self.inner
+            .after_ioc_running
+            .lock()
+            .unwrap()
+            .push(line.into());
+    }
+
+    /// Drain the post-PINI iocsh command queue. Called by
+    /// `IocApplication::run` after PINI processing.
+    pub fn take_after_ioc_running(&self) -> Vec<String> {
+        std::mem::take(&mut *self.inner.after_ioc_running.lock().unwrap())
     }
 
     /// Internal: synchronous existence check without resolver.

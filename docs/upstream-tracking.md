@@ -6,6 +6,46 @@
 
 **Refresh procedure**: re-run the `gh` queries at the bottom of this file; diff against the lists below; update the status column.
 
+## 2026-05 self-review rounds (branch `feat/upstream-pr-fixes`, 27 rounds)
+
+Critical-self-review passes 1–27 closed a chain of dead-infrastructure
+defects discovered while landing the upstream items above. Each round
+recorded the anchor it grep'd, the same-defect / distinct sites, and
+the test added. Major defect families closed:
+
+- **Alias-aware lookup family** (rounds 7, 10, 11, 12, 13, 14, 15, 21).
+  Invariant established: every external record-name lookup MUST go
+  through `PvDatabase::get_record` / `find_entry` / `has_name`
+  (alias-aware). Fixed sites: `get_record` itself, the `field_io.rs`
+  PV-name entry-point family (5 sites), `process_record_with_links`,
+  `complete_async_record`, DB-link target lookup in `links.rs`,
+  CP-link registration canonicalisation, plus listing surfaces
+  (`dbsr`/`dbgrep`/`dbglob`, PVA `channelList`, qsrv `channel_list`,
+  `dbpr` ALIASES line). Documented on `PvDatabaseInner`.
+- **info()/aliases plumbing** (rounds 5, 6, 8, 9). `RecordInstance.info`
+  storage; `IocBuilder` and `wire_device_support` both call
+  `apply_record_info` after `set_record_info`; asyn adapter consumes
+  `asyn:READBACK`; IocBuilder gained `register_dynamic_device_support`
+  matching IocApplication; asyn-side helper
+  `register_asyn_device_support_for_builder` (round 22). db_loader
+  info() parser accepts unquoted tag (regression fix landed mid-loop).
+- **AMSG / NAMSG** (round 1). UDF + CALC alarms now actually populate
+  the alarm message via `rec_gbl_set_sevr_msg`.
+- **ACF METHOD/AUTHORITY** (round 4) + ACF→PVA enforcement (rounds 17,
+  18) + ACF→qsrv adapter `AcfAccessControl` (round 19).
+- **Broadcast opt-out** (rounds 25, 26). `EPICS_CA_AUTO_ADDR_LIST=NO`
+  and `EPICS_PVAS_AUTO_BEACON_ADDR_LIST=NO` now actually disable
+  broadcast even with empty list.
+- **iocsh post-init UX** (round 16). `CommandDef` is `Clone`; user-
+  registered shell commands are available in `afterIocRunning` queue.
+- **dbpf field-name suggestion** (round 23, PR #689 spirit).
+- **dbpr / dbsr surface coverage** (rounds 13, 14, 20, 21, 24): info()
+  tags, aliases, simple PVs all visible.
+
+Branch is `feat/upstream-pr-fixes`; tests on every commit
+(`cargo nextest run --workspace --all-features`); clippy clean
+(`-D warnings`); push pending user authorisation.
+
 ---
 
 ## How to read the status column

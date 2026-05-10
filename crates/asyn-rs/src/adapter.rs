@@ -649,6 +649,22 @@ impl DeviceSupport for AsynDeviceSupport {
         self.scan = scan;
     }
 
+    fn apply_record_info(&mut self, info: &std::collections::HashMap<String, String>) {
+        // asyn upstream PRs #60 / #208 — `info("asyn:READBACK", "1")`
+        // on output records causes them to follow driver-side changes
+        // even when SCAN is not "I/O Intr". Truthiness mirrors EPICS
+        // base: any non-empty value other than "0", "no", "false"
+        // (case-insensitive) enables the flag.
+        if let Some(raw) = info.get("asyn:READBACK") {
+            let v = raw.trim();
+            let on = !v.is_empty()
+                && !v.eq_ignore_ascii_case("0")
+                && !v.eq_ignore_ascii_case("no")
+                && !v.eq_ignore_ascii_case("false");
+            self.set_asyn_readback(on);
+        }
+    }
+
     fn write_begin(
         &mut self,
         record: &mut dyn Record,
@@ -1033,6 +1049,43 @@ mod tests {
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.reason, 0); // "VAL" is param index 0
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_record_info_enables_readback_for_truthy_value() {
+        // info("asyn:READBACK", "1") on a Passive output must allow
+        // io_intr_receiver to activate (asyn upstream PRs #60 / #208).
+        let mut ads = make_adapter(ScanType::Passive);
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        // Without the info tag, Passive scan keeps io_intr_receiver=None.
+        assert!(ads.io_intr_receiver().is_none());
+        // Apply the tag — adapter should now expose an Intr receiver.
+        let mut info = std::collections::HashMap::new();
+        info.insert("asyn:READBACK".to_string(), "1".to_string());
+        ads.apply_record_info(&info);
+        assert!(
+            ads.io_intr_receiver().is_some(),
+            "asyn:READBACK=1 must enable readback path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_record_info_falsey_values_do_not_enable_readback() {
+        let mut ads = make_adapter(ScanType::Passive);
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        for falsey in ["0", "no", "NO", "false", "False", ""] {
+            let mut info = std::collections::HashMap::new();
+            info.insert("asyn:READBACK".to_string(), falsey.to_string());
+            ads.apply_record_info(&info);
+            assert!(
+                ads.io_intr_receiver().is_none(),
+                "value {falsey:?} must not enable readback"
+            );
+        }
     }
 
     #[test]

@@ -216,6 +216,12 @@ impl IocBuilder {
                         let mut dev = factory();
                         let _ = dev.init(&mut *instance.record);
                         dev.set_record_info(&def.name, instance.common.scan);
+                        // Forward info(...) tags to the driver after
+                        // basic record info — drivers like asyn react
+                        // to `asyn:READBACK`, others to bus-specific
+                        // tags. No-op default keeps legacy device
+                        // support unaffected.
+                        dev.apply_record_info(&instance.info);
                         instance.device = Some(dev);
                     }
                 }

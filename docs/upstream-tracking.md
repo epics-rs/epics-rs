@@ -115,7 +115,7 @@ Upstream asyn merged in last 12 months: **0**. Project effectively dormant. Open
 | [#227](https://github.com/epics-modules/asyn/issues/227) | lockless asynPortDriver | actor model already addresses this; add note in README |
 | [#224](https://github.com/epics-modules/asyn/issues/224) | autoConnect connects too early | `port_actor.rs` startup ordering |
 | [#220](https://github.com/epics-modules/asyn/issues/220) | `pasynOctetSyncIO->read` overwrites `pasynUser->timeout` | `sync_io.rs::read` timeout handling |
-| [#218](https://github.com/epics-modules/asyn/issues/218) | Add `getLimits` to interfaces | `interfaces/` trait surface |
+| [#218](https://github.com/epics-modules/asyn/issues/218) | Add `getLimits` to interfaces | `AsynInt32::get_bounds` / `AsynInt64::get_bounds` already existed; `AsynFloat64::get_limits` added with `(NEG_INFINITY, INFINITY)` default | **done** |
 | [#215](https://github.com/epics-modules/asyn/issues/215) | Long-running scan period drift | tokio `interval` MissedTickBehavior policy |
 | [#170](https://github.com/epics-modules/asyn/issues/170) | Parallel callback queue overflow | `interrupt.rs` queue capacity |
 | [#167](https://github.com/epics-modules/asyn/issues/167) | AAI/AAO record support | `asyn_record/` mapping |
@@ -198,7 +198,7 @@ docs. Only items with a behavioural counterpart in `crates/asyn-rs`:
 
 | PR | Merged | Change | asyn-rs status |
 |---|---|---|---|
-| [#208](https://github.com/epics-modules/asyn/pull/208) | 2024-06 | Fix `mbboDirect` asyn:READBACK | `asyn_record/` — verify mbboDirect readback path | **not started** |
+| [#208](https://github.com/epics-modules/asyn/pull/208) | 2024-06 | Fix `mbboDirect` asyn:READBACK | `AsynDeviceSupport::asyn_readback` flag + `io_intr_receiver` activates the mailbox path when `SCAN != IoIntr` and the flag is set. Info-tag plumbing follow-up | **partial — Rust API done, info-tag capture follow-up** |
 | [#200](https://github.com/epics-modules/asyn/pull/200) | 2024-02 | Connection cleanup avoids spurious errors at IOC exit | `port_actor`/`transport` shutdown — async drop semantics differ from C; verify quiet exit | inspected, equivalent (actor abort cascades) |
 | [#180](https://github.com/epics-modules/asyn/pull/180) | 2023-05 | Send serial break via option interface | drvAsynSerialPort missing in asyn-rs | **not started** |
 | [#171](https://github.com/epics-modules/asyn/pull/171) | 2024-11 | Destructible ports | actor model in asyn-rs makes ports destructible by construction | inspected, equivalent |
@@ -283,7 +283,7 @@ flow control), #61, #57, #55, #53, #45, #43, #40, #39, #38, #36, #33, #32,
 | [#84](https://github.com/epics-modules/asyn/pull/84) | 2019-08 | Shut down thread before destroying `asynPortDriver` | `port_actor` actor model joins on drop — already correct | inspected, equivalent |
 | [#76](https://github.com/epics-modules/asyn/pull/76) | 2019-01 | String options for `asynSetTrace*Mask` | `trace.rs` mask parsing — verify accepts string keys | **not started** (audit) |
 | [#66](https://github.com/epics-modules/asyn/pull/66) | 2017-12 | `devEpics`: ASLO/AOFF/SMOO conversion on ai/ao float64 | epics-rs applies the slope/offset/smoothing transforms at the record layer — `records/ai.rs::process` and `records/ao.rs::process` already implement (val-eoff)/eslo + AOFF + ASLO + SMOO. asyn-rs adapter forwards raw values to record `set_val`; the record runs the transform. | inspected, equivalent (record-layer) |
-| [#60](https://github.com/epics-modules/asyn/pull/60) | 2017-11 | Process output records on `asyn:READBACK` callbacks | adapter does not implement `asyn:READBACK` info-tag handling | **not started** (related to #208 from later) |
+| [#60](https://github.com/epics-modules/asyn/pull/60) | 2017-11 | Process output records on `asyn:READBACK` callbacks | covered by the same `AsynDeviceSupport::asyn_readback` Rust-API plumbing as #208 | **partial — Rust API done, info-tag capture follow-up** |
 | [#13](https://github.com/epics-modules/asyn/pull/13) | 2016-02 | `asynOption` interface on drvAsynIPPort | `asynOption` registration in `interfaces/` — partial | **not started** (audit) |
 | [#6](https://github.com/epics-modules/asyn/pull/6) | 2015-10 | `drvAsynIPPort`: configurable disconnect on read timeout | transport read-timeout policy in asyn-rs — verify configurable | **not started** (audit) |
 
@@ -296,7 +296,7 @@ flow control), #61, #57, #55, #53, #45, #43, #40, #39, #38, #36, #33, #32,
 | Hardware-link parsing | #213 hex in HW links + `@dev arg` / `#Cn Sn` forms | `link.rs::ParsedLink::Hw(HwLink { kind, args, raw })` with `try_parse_hw_link`; preserves hex literals as full-token args. 4 tests | **done** |
 | ~~`IP_MULTICAST_ALL` socket option~~ | ~~#193~~ | already applied — see Section H | **done (already applied)** |
 | ASLO/AOFF/SMOO on asyn | #66 | record-layer transform in `records/ai.rs` + `ao.rs` already applies ASLO/AOFF/SMOO. asyn-rs adapter forwards raw values to `set_val`; record's `process()` runs the conversion. | **done (record-layer)** |
-| asyn:READBACK | #208, #60 | output-record process-on-callback wiring in `asyn_record/` | deferred (substantive) |
+| asyn:READBACK | #208, #60 | `AsynDeviceSupport::set_asyn_readback(true)` Rust-API toggle wired through `io_intr_receiver`. Info-tag auto-capture is the remaining follow-up | **partial — Rust API done** |
 | Record-name validation | #78 | parser-side gate + regression for legacy databases | **done (this branch)** |
 
 ### epics-base pre-2020 (2017-2020)
@@ -351,7 +351,7 @@ Re-grepped during the closed-issue pass:
 
 | Issue | Gap | asyn-rs site |
 |---|---|---|
-| [#231](https://github.com/epics-modules/asyn/issues/231) | UInt64 interface support | `interfaces/` lacks `asynUInt64` / `asynUInt64Array` |
+| [#231](https://github.com/epics-modules/asyn/issues/231) | UInt64 interface support | `interfaces/uint64.rs` adds `AsynUInt64` + `AsynUInt64Array` traits with default `get_bounds`. `InterfaceType::UInt64` registered. ParamValue / RequestOp plumbing through the actor protocol is the remaining follow-up | **partial — trait surface done** |
 | [#136](https://github.com/epics-modules/asyn/issues/136) | Records with `asyn:READBACK` not setting STAT/SEVR correctly when UDF=0 | adapter callback path — same scope as #208 / #60 |
 | [#80](https://github.com/epics-modules/asyn/issues/80) | Deadlocks with `asyn:READBACK` on output records | actor model in asyn-rs naturally avoids synchronous deadlock — verify |
 | [#79](https://github.com/epics-modules/asyn/issues/79) | Add `asynInterposeDelay` and `asynInterposeEcho` | both already in `asyn-rs/src/interpose/` (`delay.rs` `DelayInterpose` with per-character write delay; `echo.rs` `EchoInterpose` for half-duplex devices). inspected, equivalent (already implemented) |

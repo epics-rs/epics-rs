@@ -358,9 +358,11 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         chars.next();
     }
 
-    // Optional body with UAG/HAG
+    // Optional body with UAG/HAG/METHOD/AUTHORITY.
     let mut uag = Vec::new();
     let mut hag = Vec::new();
+    let mut method = Vec::new();
+    let mut authority = Vec::new();
 
     skip_ws_comments(chars);
     if chars.peek() == Some(&'{') {
@@ -381,7 +383,18 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
                     } else if kw == "HAG" {
                         let name = read_paren_name(chars)?;
                         hag.push(name);
+                    } else if kw == "METHOD" {
+                        // PR #563: METHOD("ca", "x509", ...)
+                        method.extend(read_paren_string_list(chars)?);
+                    } else if kw == "AUTHORITY" {
+                        // PR #563/#618: AUTHORITY("CA Issuer", ...)
+                        authority.extend(read_paren_string_list(chars)?);
+                    } else if kw.is_empty() {
+                        // Unknown punctuation — advance to avoid infinite loop.
+                        chars.next();
                     }
+                    // Unknown alphanumeric keywords are silently ignored
+                    // (forward-compat with future RULE body extensions).
                 }
                 None => break,
             }
@@ -393,9 +406,62 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         write,
         uag,
         hag,
-        method: Vec::new(),
-        authority: Vec::new(),
+        method,
+        authority,
     })
+}
+
+/// Parse `(item1, "item 2", ...)` — commas separate items, optional
+/// quotes around each item are stripped. Used for METHOD/AUTHORITY
+/// rule clauses (epics-base PR #563/#618). Whitespace inside an
+/// unquoted item is preserved verbatim *between* word characters but
+/// trimmed at the boundaries; the typical caller passes quoted strings.
+fn read_paren_string_list(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> CaResult<Vec<String>> {
+    skip_ws_comments(chars);
+    if chars.next() != Some('(') {
+        return Err(CaError::Protocol(
+            "ACF: expected '(' after METHOD/AUTHORITY".into(),
+        ));
+    }
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    loop {
+        match chars.peek() {
+            Some(&'"') => {
+                chars.next();
+                in_quotes = !in_quotes;
+            }
+            Some(&')') if !in_quotes => {
+                chars.next();
+                break;
+            }
+            Some(&',') if !in_quotes => {
+                chars.next();
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    items.push(trimmed);
+                }
+                current.clear();
+            }
+            Some(&c) => {
+                current.push(c);
+                chars.next();
+            }
+            None => {
+                return Err(CaError::Protocol(
+                    "ACF: unterminated METHOD/AUTHORITY list".into(),
+                ));
+            }
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        items.push(trimmed);
+    }
+    Ok(items)
 }
 
 #[cfg(test)]
@@ -505,5 +571,108 @@ ASG(DEFAULT) {
         let config = parse_acf(acf).unwrap();
         // Unknown user/host → conservative default
         assert_eq!(config.check_access("DEFAULT", "", ""), AccessLevel::Read);
+    }
+
+    // ----- epics-base PR #563/#618: METHOD / AUTHORITY -----
+
+    #[test]
+    fn parse_acf_captures_method_and_authority() {
+        let acf = r#"
+ASG(SECURE) {
+    RULE(1, WRITE) {
+        METHOD("ca", "x509")
+        AUTHORITY("ANL CA")
+    }
+    RULE(1, READ)
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        let asg = &config.asg["SECURE"];
+        assert_eq!(asg.rules.len(), 2);
+        assert_eq!(asg.rules[0].method, vec!["ca", "x509"]);
+        assert_eq!(asg.rules[0].authority, vec!["ANL CA"]);
+        assert!(
+            asg.rules[1].method.is_empty(),
+            "READ rule must not inherit METHOD list",
+        );
+        assert!(asg.rules[1].authority.is_empty());
+    }
+
+    #[test]
+    fn check_access_method_gates_on_method() {
+        let acf = r#"
+ASG(METHOD_GATED) {
+    RULE(1, WRITE) {
+        METHOD("x509")
+    }
+    RULE(1, READ)
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        // x509 method → WRITE matches.
+        assert_eq!(
+            config.check_access_method("METHOD_GATED", "h", "u", 0, "x509", ""),
+            AccessLevel::ReadWrite
+        );
+        // ca method → only the unconstrained READ rule matches.
+        assert_eq!(
+            config.check_access_method("METHOD_GATED", "h", "u", 0, "ca", ""),
+            AccessLevel::Read
+        );
+    }
+
+    #[test]
+    fn check_access_method_gates_on_authority() {
+        let acf = r#"
+ASG(AUTH_GATED) {
+    RULE(1, WRITE) {
+        AUTHORITY("Trusted Root")
+    }
+    RULE(1, READ)
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(
+            config.check_access_method("AUTH_GATED", "h", "u", 0, "x509", "Trusted Root"),
+            AccessLevel::ReadWrite
+        );
+        assert_eq!(
+            config.check_access_method("AUTH_GATED", "h", "u", 0, "x509", "Other CA"),
+            AccessLevel::Read
+        );
+    }
+
+    #[test]
+    fn check_access_asl_legacy_path_matches_when_method_empty() {
+        // Legacy ACF without METHOD/AUTHORITY clauses must continue
+        // to match every method/authority — exactly what
+        // `check_access_asl` forwards as ("", "").
+        let acf = r#"
+ASG(LEGACY) {
+    RULE(1, WRITE)
+    RULE(1, READ)
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(
+            config.check_access_asl("LEGACY", "h", "u", 0),
+            AccessLevel::ReadWrite
+        );
+    }
+
+    #[test]
+    fn check_access_method_match_is_case_insensitive() {
+        let acf = r#"
+ASG(MIXED_CASE) {
+    RULE(1, WRITE) {
+        METHOD("X509")
+    }
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(
+            config.check_access_method("MIXED_CASE", "h", "u", 0, "x509", ""),
+            AccessLevel::ReadWrite
+        );
     }
 }

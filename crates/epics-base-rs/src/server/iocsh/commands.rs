@@ -431,12 +431,17 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         })
         .unwrap_or_default();
 
-    // Walk both record names and aliases — base's dbFirstRecord
-    // iteration includes alias-form entries, so dbsr / dbgrep /
-    // dbglob must too. Field lookup via `get_record` already follows
-    // the alias to the canonical record (round 7).
+    // Walk record names + aliases + simple PVs. Base's
+    // `dbFirstRecord` iteration only sees records, but our
+    // PvDatabase also serves `add_pv`-registered simple PVs (CA
+    // gateway shadows, IOC-stat scratchpads). A user globbing for
+    // every channel name would be confused if simple PVs were
+    // hidden. Field lookup via `get_record` follows alias→canonical
+    // (round 7); for simple PVs the field-dump branch silently
+    // skips since they're not records.
     let mut names = ctx.block_on(ctx.db().all_record_names());
     names.extend(ctx.block_on(ctx.db().all_alias_names()));
+    names.extend(ctx.block_on(ctx.db().all_simple_pv_names()));
     names.sort();
     names.dedup();
 

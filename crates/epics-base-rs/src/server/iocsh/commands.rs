@@ -363,6 +363,15 @@ fn cmd_dbpr() -> CommandDef {
                         fields.push(("LLSV".to_string(), format!("{:?}", alarm.llsv)));
                     }
                     fields.push(("ASG".to_string(), inst.common.asg.clone()));
+                    // Round-20: surface info(...) tags so admins can
+                    // verify driver hints (asyn:READBACK, Q:group, …)
+                    // landed on the record. Sorted for stable output.
+                    let mut info_keys: Vec<&String> = inst.info.keys().collect();
+                    info_keys.sort();
+                    for key in info_keys {
+                        let val = inst.info.get(key).cloned().unwrap_or_default();
+                        fields.push((format!("info({key})"), val));
+                    }
                 }
 
                 fields

@@ -354,7 +354,7 @@ Re-grepped during the closed-issue pass:
 | [#231](https://github.com/epics-modules/asyn/issues/231) | UInt64 interface support | `interfaces/` lacks `asynUInt64` / `asynUInt64Array` |
 | [#136](https://github.com/epics-modules/asyn/issues/136) | Records with `asyn:READBACK` not setting STAT/SEVR correctly when UDF=0 | adapter callback path — same scope as #208 / #60 |
 | [#80](https://github.com/epics-modules/asyn/issues/80) | Deadlocks with `asyn:READBACK` on output records | actor model in asyn-rs naturally avoids synchronous deadlock — verify |
-| [#79](https://github.com/epics-modules/asyn/issues/79) | Add `asynInterposeDelay` and `asynInterposeEcho` | interpose chain extensions missing |
+| [#79](https://github.com/epics-modules/asyn/issues/79) | Add `asynInterposeDelay` and `asynInterposeEcho` | both already in `asyn-rs/src/interpose/` (`delay.rs` `DelayInterpose` with per-character write delay; `echo.rs` `EchoInterpose` for half-duplex devices). inspected, equivalent (already implemented) |
 | [#56](https://github.com/epics-modules/asyn/issues/56) | Race condition with info tag `asyn:READBACK` | adapter path |
 | [#46](https://github.com/epics-modules/asyn/issues/46) | Reporting parameter value change to driver | `param.rs` change-notify hook — verify direction (driver → record vs record → driver) |
 | [#30](https://github.com/epics-modules/asyn/issues/30) | Enhance `asynInt32Average` / `asynFloat64Average` device support | averaging device support not in asyn-rs |

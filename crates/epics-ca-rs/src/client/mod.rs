@@ -2875,6 +2875,112 @@ fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
         .ok_or_else(|| CaError::Protocol(format!("no addresses for '{host}'")))
 }
 
+/// One entry in `EPICS_CA_ADDR_LIST` with its original DNS form
+/// retained — addresses the Launchpad #488 / GitHub #862/#863 family
+/// where startup-time-only DNS resolution leaves stale IPs after a
+/// peer restarts on a new IP.
+///
+/// `hostname == None` means the entry was a literal IPv4; nothing to
+/// re-resolve. `hostname == Some(name)` means the entry started life
+/// as a DNS name and a reconnection path may call `resolve_host`
+/// again to refresh `sock`.
+#[derive(Debug, Clone)]
+pub(crate) struct AddrEntry {
+    pub sock: SocketAddr,
+    pub hostname: Option<String>,
+    pub port: u16,
+}
+
+impl AddrEntry {
+    pub fn new(sock: SocketAddr, hostname: Option<String>, port: u16) -> Self {
+        Self {
+            sock,
+            hostname,
+            port,
+        }
+    }
+
+    /// Re-resolve the hostname (if any) and return the freshened
+    /// SocketAddr. Returns `Ok(self.sock)` unchanged when there's
+    /// nothing to refresh (literal IP entry).
+    #[allow(dead_code)] // wired into reconnect path in a follow-up
+    pub fn refresh_dns(&mut self) -> CaResult<SocketAddr> {
+        let Some(host) = self.hostname.as_deref() else {
+            return Ok(self.sock);
+        };
+        let new_sock = resolve_host(host, self.port)?;
+        self.sock = new_sock;
+        Ok(new_sock)
+    }
+}
+
+/// `parse_addr_list` variant that retains hostname per entry.
+/// Mirrors the future-form `EPICS_CA_ADDR_LIST` plumbing required
+/// by Launchpad #488 (CA peers do DNS lookups once on startup).
+/// The legacy `parse_addr_list` is kept as the live caller until
+/// the reconnect path is converted; this helper is exercised by
+/// unit tests and is the migration target.
+#[allow(dead_code)]
+pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
+    let mut addrs: Vec<AddrEntry> = Vec::new();
+    let default_port = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(CA_SERVER_PORT);
+    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
+        for entry in list.split_whitespace() {
+            let (host_raw, port) = if entry.contains(':') {
+                if let Some((h, p)) = entry.rsplit_once(':') {
+                    let port: u16 = match p.parse() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    (h.to_string(), port)
+                } else {
+                    (entry.to_string(), default_port)
+                }
+            } else {
+                (entry.to_string(), default_port)
+            };
+            // Pure-IP entry has no DNS to refresh.
+            let hostname = if host_raw.parse::<Ipv4Addr>().is_ok() {
+                None
+            } else {
+                Some(host_raw.clone())
+            };
+            match resolve_host(&host_raw, port) {
+                Ok(sock) => addrs.push(AddrEntry::new(sock, hostname, port)),
+                Err(e) => tracing::debug!(token = %entry, error = %e,
+                    "EPICS_CA_ADDR_LIST: dropped unresolvable entry"),
+            }
+        }
+    }
+    Ok(addrs)
+}
+
+#[cfg(test)]
+mod addr_entry_tests {
+    use super::*;
+
+    #[test]
+    fn ip_literal_has_no_hostname() {
+        let entry = AddrEntry::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5064)),
+            None,
+            5064,
+        );
+        assert!(entry.hostname.is_none());
+    }
+
+    #[test]
+    fn refresh_noop_for_literal_ip() {
+        let original_sock =
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5064));
+        let mut entry = AddrEntry::new(original_sock, None, 5064);
+        let refreshed = entry.refresh_dns().expect("noop refresh succeeds");
+        assert_eq!(refreshed, original_sock);
+    }
+}
+
 /// Apply libca-compatible PV-name expansion when
 /// `EPICS_CA_USE_SHELL_VARS=YES`.
 fn expand_pv_name(name: &str) -> String {

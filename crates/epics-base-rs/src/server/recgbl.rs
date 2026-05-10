@@ -147,7 +147,12 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
 /// Check UDF alarm: if record is still undefined, raise UDF_ALARM with UDFS severity.
 pub fn rec_gbl_check_udf(common: &mut CommonFields) {
     if common.udf {
-        rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
+        rec_gbl_set_sevr_msg(
+            common,
+            alarm_status::UDF_ALARM,
+            common.udfs,
+            "UDF: record not initialized",
+        );
     }
 }
 

@@ -1051,10 +1051,11 @@ impl RecordInstance {
         if rtype == "calc" || rtype == "calcout" || rtype == "scalcout" {
             // calc_alarm is exposed as a boolean field - check it
             if let Some(EpicsValue::Char(1)) = self.record.get_field("CALC_ALARM") {
-                recgbl::rec_gbl_set_sevr(
+                recgbl::rec_gbl_set_sevr_msg(
                     &mut self.common,
                     alarm_status::CALC_ALARM,
                     crate::server::record::AlarmSeverity::Invalid,
+                    "CALC expression evaluation failed",
                 );
             }
         }

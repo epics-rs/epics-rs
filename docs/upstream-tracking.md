@@ -291,9 +291,9 @@ flow control), #61, #57, #55, #53, #45, #43, #40, #39, #38, #36, #33, #32,
 
 | Class | Items | Reason for own-PR scope | Status |
 |---|---|---|---|
-| Alarm-message string | #568 AMSG / #566 NAMSG | new field on `CommonFields`, MS-link plumbing, monitor metadata extension | deferred (substantive) |
-| JSON-link grammar + JSON5 | #86 | epics-rs `link.rs` lacks JSON-link parsing entirely; JSON5 leniency belongs on top | deferred (substantive) |
-| Hardware-link parsing | #213 hex in HW links + the entire `@dev arg` form | epics-rs has no HW-link grammar yet | deferred (substantive) |
+| Alarm-message string | #568 AMSG / #566 NAMSG | `CommonFields::{amsg, namsg}` + `recgbl::rec_gbl_set_sevr_msg` + `rec_gbl_reset_alarms` transfer + MS-link `LinkAlarm::amsg` propagation in `processing.rs` + AMSG/NAMSG getters/setters in `record_instance.rs`. Tests: 4 `recgbl` cases | **done** |
+| JSON-link grammar | #86 | `link.rs::try_parse_json_link` recognizes `{const: …}`, `{ca: { pv: "…" }}`, `{pva: { pv: "…" }}` (unquoted-key + single-quote tolerant). 7 tests | **done (JSON5 leniency on inline db files still deferred)** |
+| Hardware-link parsing | #213 hex in HW links + `@dev arg` / `#Cn Sn` forms | `link.rs::ParsedLink::Hw(HwLink { kind, args, raw })` with `try_parse_hw_link`; preserves hex literals as full-token args. 4 tests | **done** |
 | ~~`IP_MULTICAST_ALL` socket option~~ | ~~#193~~ | already applied — see Section H | **done (already applied)** |
 | ASLO/AOFF/SMOO on asyn | #66 | new transform layer in `asyn_record/` adapter | deferred (substantive) |
 | asyn:READBACK | #208, #60 | output-record process-on-callback wiring in `asyn_record/` | deferred (substantive) |
@@ -515,7 +515,7 @@ never landed.
 
 | PR | Topic | epics-rs site |
 |---|---|---|
-| epics-base [#336](https://github.com/epics-base/epics-base/pull/336) | Validate target record name on alias | `db_loader::parse_db` skips `alias` body via brace counting (lines 159-160) — alias bodies are never parsed, so the name is neither captured nor validated. **N/A under current parser**, but if alias support is added, hook `validate_record_name` then |
+| epics-base [#336](https://github.com/epics-base/epics-base/pull/336) | Validate target record name on alias | `db_loader::parse_db` now parses `alias("name")` inside record bodies, runs each through `validate_record_name`, attaches to `DbRecordDef::aliases`. `PvDatabase::add_alias / resolve_alias` + alias-aware lookup in `find_entry_no_resolve` / `has_name_no_resolve`. iocsh `dbLoadRecords` registers each parsed alias post-`add_record`. Tests: 3 cases | **done** |
 | epics-base [#618](https://github.com/epics-base/epics-base/pull/618) | TLS + cert-based access security | epics-ca-rs has the `cap-tokens` feature + signed beacons; pvxs-style cert ACF subject matching is **partial** (signed-beacon verifier, no TLS-cert ACF gateway) |
 | epics-base [#563](https://github.com/epics-base/epics-base/pull/563) | ACF METHOD/AUTHORITY + YAML | epics-rs ACF reads the legacy text format only; YAML + METHOD/AUTHORITY extensions deferred |
 | epics-base [#449](https://github.com/epics-base/epics-base/pull/449) | dbLoadTemplate error propagation | `db_loader::dbLoadTemplate` (if implemented) error path — verify |

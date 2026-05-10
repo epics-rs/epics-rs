@@ -567,6 +567,11 @@ impl ChannelProvider for BridgeProvider {
 
     async fn channel_list(&self) -> Vec<String> {
         let mut names = self.db.all_record_names().await;
+        // PR #336 aliases are independently addressable channel
+        // names — a PVA client running channelList expects them so
+        // it can connect by alias. `channel_find` / `create_channel`
+        // already resolve aliases via has_name/get_record (round 7).
+        names.extend(self.db.all_alias_names().await);
         names.extend(self.groups.read().keys().cloned());
         names.sort();
         names

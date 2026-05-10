@@ -347,6 +347,11 @@ impl ChannelSource for PvDatabaseSource {
         async move {
             let mut names = db.all_record_names().await;
             names.extend(db.all_simple_pv_names().await);
+            // Aliases are independently addressable channel names —
+            // a PVA client doing channelList must see them so it can
+            // connect by alias. has_name and find_entry already
+            // resolve aliases on the server side (round 7).
+            names.extend(db.all_alias_names().await);
             names
         }
     }

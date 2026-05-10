@@ -11,12 +11,23 @@ pub enum AccessLevel {
 }
 
 /// A single access rule within an ASG.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AccessRule {
     pub level: u8,
     pub write: bool, // true = WRITE rule, false = READ rule
     pub uag: Vec<String>,
     pub hag: Vec<String>,
+    /// Authentication method scope (epics-base PR #563). When set,
+    /// the rule only applies when the requesting client authenticated
+    /// via one of the listed methods. Common values: `"anonymous"`,
+    /// `"ca"`, `"x509"`, `"cap-token"`. Empty vector means "any method".
+    pub method: Vec<String>,
+    /// Cert authority / issuer scope (epics-base PR #563 + #618).
+    /// When set, the rule only applies when the client's authenticator
+    /// was vouched by one of the listed authorities — e.g. an
+    /// X.509 issuer DN, or the cap-token issuer ID. Empty means "any
+    /// authority".
+    pub authority: Vec<String>,
 }
 
 /// Access Security Group.
@@ -44,6 +55,74 @@ impl AccessSecurityConfig {
     /// disable a rule whose level is below the record's ASL.
     pub fn check_access(&self, asg_name: &str, host: &str, user: &str) -> AccessLevel {
         self.check_access_asl(asg_name, host, user, 0)
+    }
+
+    /// Method/authority-aware access check. Mirrors epics-base PR
+    /// #563 (METHOD/AUTHORITY) and PR #618 (cert-based ACF). When
+    /// `method` and `authority` are provided, rules with non-empty
+    /// `method`/`authority` lists are gated on a literal match.
+    /// Rules with empty `method`/`authority` ignore those scopes
+    /// (legacy behaviour preserved).
+    pub fn check_access_method(
+        &self,
+        asg_name: &str,
+        host: &str,
+        user: &str,
+        record_asl: u8,
+        method: &str,
+        authority: &str,
+    ) -> AccessLevel {
+        let asg = match self.asg.get(asg_name) {
+            Some(a) => a,
+            None => match self.asg.get("DEFAULT") {
+                Some(a) => a,
+                None => return AccessLevel::ReadWrite,
+            },
+        };
+        if user.is_empty() || host.is_empty() {
+            return self.unknown_access;
+        }
+        let mut can_read = false;
+        let mut can_write = false;
+        for rule in &asg.rules {
+            if record_asl > rule.level {
+                continue;
+            }
+            let user_match = rule.uag.is_empty()
+                || rule.uag.iter().any(|g| {
+                    self.uag
+                        .get(g)
+                        .map(|members| members.iter().any(|m| m == user))
+                        .unwrap_or(false)
+                });
+            let host_match = rule.hag.is_empty()
+                || rule.hag.iter().any(|g| {
+                    self.hag
+                        .get(g)
+                        .map(|members| members.iter().any(|m| m == host))
+                        .unwrap_or(false)
+                });
+            let method_match = rule.method.is_empty()
+                || rule.method.iter().any(|m| m.eq_ignore_ascii_case(method));
+            let authority_match = rule.authority.is_empty()
+                || rule
+                    .authority
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(authority));
+            if user_match && host_match && method_match && authority_match {
+                if rule.write {
+                    can_write = true;
+                    can_read = true;
+                } else {
+                    can_read = true;
+                }
+            }
+        }
+        match (can_read, can_write) {
+            (_, true) => AccessLevel::ReadWrite,
+            (true, false) => AccessLevel::Read,
+            _ => AccessLevel::NoAccess,
+        }
     }
 
     /// Check access taking the per-record ASL into account.
@@ -371,6 +450,8 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         write,
         uag,
         hag,
+        method: Vec::new(),
+        authority: Vec::new(),
     })
 }
 

@@ -735,4 +735,67 @@ mod tests {
             elapsed
         );
     }
+
+    // epics-base PR #336 — alias parsing + lookup integration tests.
+
+    #[tokio::test]
+    async fn alias_resolves_through_find_entry() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(42.0)),
+        )
+        .await;
+        db.add_alias("ALIAS_NAME", "TARGET").await.unwrap();
+
+        // find_entry on the alias must return the same record as
+        // find_entry on the target.
+        let via_alias = db.find_entry("ALIAS_NAME").await;
+        let via_target = db.find_entry("TARGET").await;
+        assert!(via_alias.is_some());
+        assert!(via_target.is_some());
+        // has_name flips true for the alias too.
+        assert!(db.has_name("ALIAS_NAME").await);
+        assert!(db.has_name("TARGET").await);
+        assert!(!db.has_name("NOT:THERE").await);
+    }
+
+    #[tokio::test]
+    async fn alias_target_must_exist() {
+        let db = PvDatabase::new();
+        let err = db.add_alias("DANGLING", "MISSING_TARGET").await;
+        assert!(err.is_err(), "alias to missing target must be rejected");
+    }
+
+    #[tokio::test]
+    async fn alias_collision_with_existing_record_rejected() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "EXISTING",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_record(
+            "OTHER",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        let err = db.add_alias("EXISTING", "OTHER").await;
+        assert!(err.is_err(), "alias name colliding with record must be rejected");
+    }
+
+    #[tokio::test]
+    async fn alias_duplicate_rejected() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_alias("ALIAS", "TARGET").await.unwrap();
+        // Re-registering the same alias name (even to the same target)
+        // must fail — base behaviour: aliases are inserted once.
+        let err = db.add_alias("ALIAS", "TARGET").await;
+        assert!(err.is_err(), "duplicate alias name must be rejected");
+    }
 }

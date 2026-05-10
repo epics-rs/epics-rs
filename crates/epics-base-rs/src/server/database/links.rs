@@ -493,11 +493,27 @@ impl PvDatabase {
     }
 
     /// Register a CP link: when source_record changes, process target_record.
+    ///
+    /// Both names are normalised to canonical form so the cp_links
+    /// map's key/value always match the canonical record name that
+    /// `dispatch_cp_targets` uses for lookup. Without this, a user
+    /// who wrote `INP="ALIAS_NAME CP"` in their .db file would
+    /// register the CP edge under the alias key and then never see
+    /// the target processed (the source record's canonical-name
+    /// dispatch would miss).
     pub async fn register_cp_link(&self, source_record: &str, target_record: &str) {
+        let source = self
+            .resolve_alias(source_record)
+            .await
+            .unwrap_or_else(|| source_record.to_string());
+        let target = self
+            .resolve_alias(target_record)
+            .await
+            .unwrap_or_else(|| target_record.to_string());
         let mut cp = self.inner.cp_links.write().await;
-        let targets = cp.entry(source_record.to_string()).or_default();
-        if !targets.contains(&target_record.to_string()) {
-            targets.push(target_record.to_string());
+        let targets = cp.entry(source).or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
         }
     }
 

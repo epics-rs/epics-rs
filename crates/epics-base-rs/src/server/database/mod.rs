@@ -888,6 +888,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_cp_link_normalises_alias_to_canonical() {
+        // Round-15 regression: CP link registration must store the
+        // canonical record names. dispatch_cp_targets looks up by
+        // canonical, so an alias-keyed entry is functionally dead.
+        let db = PvDatabase::new();
+        db.add_record(
+            "SRC_REAL",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_record(
+            "DST_REAL",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_alias("SRC_ALIAS", "SRC_REAL").await.unwrap();
+        db.add_alias("DST_ALIAS", "DST_REAL").await.unwrap();
+
+        // Register using the alias forms.
+        db.register_cp_link("SRC_ALIAS", "DST_ALIAS").await;
+
+        // Lookup must succeed via the canonical source name.
+        let targets = db.get_cp_targets("SRC_REAL").await;
+        assert_eq!(targets, vec!["DST_REAL".to_string()]);
+        // Alias-keyed lookup must NOT have been registered.
+        let alias_lookup = db.get_cp_targets("SRC_ALIAS").await;
+        assert!(alias_lookup.is_empty());
+    }
+
+    #[tokio::test]
     async fn all_alias_names_returns_registered_aliases() {
         let db = PvDatabase::new();
         db.add_record(

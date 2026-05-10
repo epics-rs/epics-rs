@@ -52,6 +52,11 @@ impl PvDatabase {
                 };
                 self.get_pv(&pv_name).await.ok()
             }
+            // Hardware links are dispatched by device support directly
+            // — there's no canonical "value" available from a generic
+            // read; return None so the framework treats the link as
+            // unresolvable for value-read purposes.
+            crate::server::record::ParsedLink::Hw(_) => None,
         }
     }
 

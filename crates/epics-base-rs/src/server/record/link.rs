@@ -18,6 +18,36 @@ pub struct LinkAddress {
     pub policy: LinkProcessPolicy,
 }
 
+/// Hardware-link bus kind. Mirrors epics-base `link.h` bus enum.
+/// We only carry kinds we can identify from the leading character or
+/// a leading `@` token; the actual driver dispatch is by raw arg
+/// string so unknown buses still land somewhere useful.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HwLinkKind {
+    /// `@dev arg1 arg2 ...` — INST_IO. The most common form, used by
+    /// asyn-based device support.
+    InstIo,
+    /// `#Cn Sn @parm` — VME_IO. C/S = card/signal, parm = optional.
+    VmeIo,
+    /// Other / unrecognized — payload kept verbatim.
+    Other,
+}
+
+/// Hardware link as parsed from a record's INP/OUT field. Mirrors
+/// epics-base PR #213 — accepts the `@dev arg1 ...` and `#C S` forms
+/// directly so device-support adapters get a structured handle
+/// instead of having to re-parse the raw string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HwLink {
+    pub kind: HwLinkKind,
+    /// Whitespace-tokenized argument list (after the leading `@` or
+    /// `#…` discriminator). Empty when the link is just `@`.
+    pub args: Vec<String>,
+    /// Original verbatim payload (for drivers that prefer to do
+    /// their own parsing — `dev arg1 0x1A` etc.).
+    pub raw: String,
+}
+
 /// Parsed link — distinguishes constants, DB links, CA/PVA links, and empty.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ParsedLink {
@@ -26,6 +56,8 @@ pub enum ParsedLink {
     Db(DbLink),
     Ca(String),
     Pva(String),
+    /// `@dev arg1 …` or `#Cn Sn` hardware link (epics-base PR #213).
+    Hw(HwLink),
 }
 
 /// Monitor propagation policy for links.
@@ -67,6 +99,11 @@ impl ParsedLink {
 
     pub fn is_db(&self) -> bool {
         matches!(self, ParsedLink::Db(_))
+    }
+
+    /// True iff this link is a hardware (`@dev …` / `#Cn Sn`) link.
+    pub fn is_hw(&self) -> bool {
+        matches!(self, ParsedLink::Hw(_))
     }
 }
 
@@ -150,12 +187,47 @@ fn extract_pv_from_subobject(body: &str) -> Option<String> {
     None
 }
 
+/// Recognize a hardware (`@dev …` / `#Cn Sn`) link. Mirrors epics-base
+/// PR #213. Hex literals in args are kept as-is — `@dev 0x1A` survives
+/// tokenization with `0x1A` as a single arg, since base's #213 was
+/// specifically about preserving such literals through the args list.
+fn try_parse_hw_link(s: &str) -> Option<ParsedLink> {
+    if s.is_empty() {
+        return None;
+    }
+    let first = s.as_bytes()[0];
+    if first == b'@' {
+        let raw = s[1..].trim().to_string();
+        let args: Vec<String> = raw.split_whitespace().map(|t| t.to_string()).collect();
+        return Some(ParsedLink::Hw(HwLink {
+            kind: HwLinkKind::InstIo,
+            args,
+            raw,
+        }));
+    }
+    if first == b'#' {
+        let raw = s[1..].trim().to_string();
+        let args: Vec<String> = raw.split_whitespace().map(|t| t.to_string()).collect();
+        return Some(ParsedLink::Hw(HwLink {
+            kind: HwLinkKind::VmeIo,
+            args,
+            raw,
+        }));
+    }
+    None
+}
+
 /// Parse a link string into a ParsedLink (v2 — distinguishes constants from DB links).
 pub fn parse_link_v2(s: &str) -> ParsedLink {
     let s = s.trim();
     // JSON-style links (epics-base PR #86) — try first so a leading
     // `{` is not mistaken for a leading-special record-name warning.
     if let Some(parsed) = try_parse_json_link(s) {
+        return parsed;
+    }
+    // Hardware link (epics-base PR #213). `@` starts INST_IO; `#`
+    // starts VME_IO. Everything else falls through to legacy parsing.
+    if let Some(parsed) = try_parse_hw_link(s) {
         return parsed;
     }
     if s.is_empty() {
@@ -324,6 +396,61 @@ mod json_link_tests {
             parse_link_v2(r#"{ca: { pv: 'BAR' }}"#),
             ParsedLink::Ca("BAR".to_string())
         );
+    }
+
+    // epics-base PR #213 — hardware-link parsing.
+
+    #[test]
+    fn hw_link_inst_io() {
+        let parsed = parse_link_v2("@simDriver 0 INPUT");
+        match parsed {
+            ParsedLink::Hw(hw) => {
+                assert_eq!(hw.kind, HwLinkKind::InstIo);
+                assert_eq!(hw.args, vec!["simDriver", "0", "INPUT"]);
+                assert_eq!(hw.raw, "simDriver 0 INPUT");
+            }
+            other => panic!("expected Hw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hw_link_inst_io_with_hex() {
+        // PR #213 specifically: hex literals in HW-link args must
+        // survive tokenization intact.
+        let parsed = parse_link_v2("@dev 0xFF mask=0x1A");
+        match parsed {
+            ParsedLink::Hw(hw) => {
+                assert_eq!(hw.kind, HwLinkKind::InstIo);
+                assert_eq!(hw.args, vec!["dev", "0xFF", "mask=0x1A"]);
+            }
+            other => panic!("expected Hw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hw_link_vme_io() {
+        let parsed = parse_link_v2("#C0 S2");
+        match parsed {
+            ParsedLink::Hw(hw) => {
+                assert_eq!(hw.kind, HwLinkKind::VmeIo);
+                assert_eq!(hw.args, vec!["C0", "S2"]);
+            }
+            other => panic!("expected Hw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hw_link_inst_io_empty_args() {
+        // `@` alone — kind set, args empty, raw empty.
+        let parsed = parse_link_v2("@");
+        match parsed {
+            ParsedLink::Hw(hw) => {
+                assert_eq!(hw.kind, HwLinkKind::InstIo);
+                assert!(hw.args.is_empty());
+                assert!(hw.raw.is_empty());
+            }
+            other => panic!("expected Hw, got {other:?}"),
+        }
     }
 
     #[test]

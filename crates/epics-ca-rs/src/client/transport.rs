@@ -146,6 +146,7 @@ impl Drop for ServerConnection {
 /// so `ca_receive_watchdog_delay` stays accurate even for read-only
 /// or write-only workloads whose responses no longer reach the
 /// coordinator.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_transport_manager(
     mut command_rx: mpsc::UnboundedReceiver<TransportCommand>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,

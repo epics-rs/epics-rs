@@ -704,6 +704,26 @@ impl PvDatabase {
         self.inner.aliases.read().await.keys().cloned().collect()
     }
 
+    /// Return every alias that points at `canonical`. Sorted for
+    /// stable output; empty when the record has no aliases. Used by
+    /// `dbpr` to surface alias-form names so admins can see how
+    /// clients may reach the record.
+    pub async fn aliases_for_record(&self, canonical: &str) -> Vec<String> {
+        let aliases = self.inner.aliases.read().await;
+        let mut hits: Vec<String> = aliases
+            .iter()
+            .filter_map(|(alias, target)| {
+                if target == canonical {
+                    Some(alias.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        hits.sort();
+        hits
+    }
+
     /// Get all simple PV names.
     pub async fn all_simple_pv_names(&self) -> Vec<String> {
         self.inner.simple_pvs.read().await.keys().cloned().collect()
@@ -915,6 +935,37 @@ mod tests {
         // Alias-keyed lookup must NOT have been registered.
         let alias_lookup = db.get_cp_targets("SRC_ALIAS").await;
         assert!(alias_lookup.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aliases_for_record_returns_sorted_targets_only() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_record(
+            "OTHER",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_alias("ZZ", "TARGET").await.unwrap();
+        db.add_alias("AA", "TARGET").await.unwrap();
+        db.add_alias("MM", "OTHER").await.unwrap();
+
+        // Sorted, only TARGET's aliases.
+        assert_eq!(
+            db.aliases_for_record("TARGET").await,
+            vec!["AA".to_string(), "ZZ".to_string()]
+        );
+        // OTHER's alone.
+        assert_eq!(
+            db.aliases_for_record("OTHER").await,
+            vec!["MM".to_string()]
+        );
+        // Unknown record → empty, not None.
+        assert!(db.aliases_for_record("MISSING").await.is_empty());
     }
 
     #[tokio::test]

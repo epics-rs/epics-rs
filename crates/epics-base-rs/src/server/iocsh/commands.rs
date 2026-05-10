@@ -313,8 +313,14 @@ fn cmd_dbpr() -> CommandDef {
                 let inst = rec.read().await;
                 let mut fields = Vec::new();
 
-                // Level 0: NAME, RTYP, VAL
+                // Level 0: NAME, RTYP, VAL (+ alias names if any —
+                // base's dbpr surfaces aliases here so admins know
+                // every spelling that resolves to this record).
                 fields.push(("NAME".to_string(), inst.name.clone()));
+                let aliases = ctx.db().aliases_for_record(&inst.name).await;
+                if !aliases.is_empty() {
+                    fields.push(("ALIASES".to_string(), aliases.join(", ")));
+                }
                 fields.push(("RTYP".to_string(), inst.record.record_type().to_string()));
                 if let Some(val) = inst.record.val() {
                     fields.push(("VAL".to_string(), format!("{val}")));

@@ -10,11 +10,9 @@ use super::{PvDatabase, apply_timestamp};
 
 impl PvDatabase {
     /// Process a record by name (process_local + notify).
+    /// Alias-aware (epics-base PR #336).
     pub async fn process_record(&self, name: &str) -> CaResult<()> {
-        let rec = {
-            let records = self.inner.records.read().await;
-            records.get(name).cloned()
-        };
+        let rec = self.get_record(name).await;
 
         if let Some(rec) = rec {
             let snapshot = {
@@ -52,6 +50,18 @@ impl PvDatabase {
     ) -> CaResult<()> {
         const MAX_LINK_DEPTH: usize = 16;
         const MAX_LINK_OPS: usize = 256;
+
+        // Normalise to the canonical record name once at entry — both
+        // for cycle-detection (`visited` would otherwise treat alias
+        // and canonical as distinct entries) and for the records-map
+        // lookup below. Mirrors epics-base PR #336.
+        let canonical_owned;
+        let name: &str = if let Some(target) = self.resolve_alias(name).await {
+            canonical_owned = target;
+            &canonical_owned
+        } else {
+            name
+        };
 
         if depth >= MAX_LINK_DEPTH {
             eprintln!("link chain depth limit reached at record {name}");

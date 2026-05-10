@@ -852,6 +852,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_record_accepts_alias() {
+        // Round-11 regression: process_record must accept an alias
+        // name. Pre-fix it walked `inner.records` directly.
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_alias("ALIAS", "TARGET").await.unwrap();
+
+        // Both should succeed and reach the same record.
+        db.process_record("TARGET").await.unwrap();
+        db.process_record("ALIAS").await.unwrap();
+
+        // A bogus name still errors.
+        assert!(db.process_record("MISSING").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn process_record_with_links_accepts_alias_and_avoids_cycle() {
+        // Round-11 regression: process_record_with_links normalises
+        // the alias so that (a) the records-map lookup hits and
+        // (b) the cycle-detection set doesn't treat alias and
+        // canonical as two distinct entries (which would let a
+        // self-loop slip past the visited check).
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_alias("ALIAS", "TARGET").await.unwrap();
+
+        let mut visited = std::collections::HashSet::new();
+        db.process_record_with_links("ALIAS", &mut visited, 0)
+            .await
+            .unwrap();
+
+        // visited should contain the *canonical* name only.
+        assert!(
+            visited.contains("TARGET"),
+            "visited must record the canonical name: {visited:?}",
+        );
+        assert!(
+            !visited.contains("ALIAS"),
+            "visited must NOT record the alias form: {visited:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn alias_duplicate_rejected() {
         let db = PvDatabase::new();
         db.add_record(

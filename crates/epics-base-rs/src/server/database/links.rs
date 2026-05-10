@@ -73,8 +73,10 @@ impl PvDatabase {
                     format!("{}.{}", db.record, db.field)
                 };
                 let value = self.get_pv(&pv_name).await.ok();
-                // Read source record's alarm state
-                let alarm = if let Some(rec) = self.inner.records.read().await.get(&db.record) {
+                // Read source record's alarm state — alias-aware
+                // (epics-base PR #336) so a link target spelled with
+                // an alias still propagates MS/NMS alarm correctly.
+                let alarm = if let Some(rec) = self.get_record(&db.record).await {
                     let inst = rec.read().await;
                     Some(LinkAlarm {
                         stat: inst.common.stat,
@@ -146,7 +148,10 @@ impl PvDatabase {
         let _ = self.put_pv(&target_name, value).await;
 
         if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
-            if let Some(target_rec) = self.inner.records.read().await.get(&link.record) {
+            // Alias-aware lookup: the link's target may be the alias
+            // form. `process_record_with_links` itself also resolves
+            // aliases at entry, so passing `link.record` raw is safe.
+            if let Some(target_rec) = self.get_record(&link.record).await {
                 let target_scan = target_rec.read().await.common.scan;
                 if target_scan == ScanType::Passive {
                     let _ = self

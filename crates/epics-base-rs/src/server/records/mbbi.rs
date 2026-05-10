@@ -627,6 +627,23 @@ impl Record for MbbiRecord {
                 self.val = v;
                 return Ok(());
             }
+            // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING.
+            // Match the string against ZRST..FFST and store the
+            // corresponding state index.
+            EpicsValue::String(s) => {
+                let strs: [&String; 16] = [
+                    &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst,
+                    &self.sxst, &self.svst, &self.eist, &self.nist, &self.test, &self.elst,
+                    &self.tvst, &self.ttst, &self.ftst, &self.ffst,
+                ];
+                if let Some(idx) = strs.iter().position(|st| **st == s) {
+                    self.val = idx as u16;
+                    return Ok(());
+                }
+                return Err(CaError::TypeMismatch(format!(
+                    "mbbi VAL: '{s}' matches no ZRST..FFST state string"
+                )));
+            }
             _ => return Err(CaError::TypeMismatch("VAL".into())),
         };
         self.rval = raw;

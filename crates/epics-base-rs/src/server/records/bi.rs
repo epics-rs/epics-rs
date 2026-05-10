@@ -230,6 +230,23 @@ impl Record for BiRecord {
                     self.val = v as u16;
                     Ok(())
                 }
+                // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING.
+                // Accept the ZNAM/ONAM string and convert to the
+                // enum index. Mirrors the upstream fix that lets a
+                // bi VAL be written from a string-typed source link.
+                EpicsValue::String(s) => {
+                    if s == self.znam {
+                        self.val = 0;
+                        Ok(())
+                    } else if s == self.onam {
+                        self.val = 1;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch(format!(
+                            "bi VAL: '{s}' matches neither ZNAM nor ONAM"
+                        )))
+                    }
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "RVAL" => match value {

@@ -304,6 +304,20 @@ impl Record for BoRecord {
                     self.val = v as u16;
                     Ok(())
                 }
+                // PR/issue #183 — accept ZNAM/ONAM string.
+                EpicsValue::String(s) => {
+                    if s == self.znam {
+                        self.val = 0;
+                        Ok(())
+                    } else if s == self.onam {
+                        self.val = 1;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch(format!(
+                            "bo VAL: '{s}' matches neither ZNAM nor ONAM"
+                        )))
+                    }
+                }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "RVAL" => match value {

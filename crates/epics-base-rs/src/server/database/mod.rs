@@ -696,6 +696,14 @@ impl PvDatabase {
         self.inner.records.read().await.keys().cloned().collect()
     }
 
+    /// Get all alias names registered against existing records.
+    /// Mirrors the alias-half of base's `dbFirstRecord` iteration —
+    /// `dbgrep` / `dbglob` / `dbsr` walk both record names and
+    /// aliases when matching a glob.
+    pub async fn all_alias_names(&self) -> Vec<String> {
+        self.inner.aliases.read().await.keys().cloned().collect()
+    }
+
     /// Get all simple PV names.
     pub async fn all_simple_pv_names(&self) -> Vec<String> {
         self.inner.simple_pvs.read().await.keys().cloned().collect()
@@ -877,6 +885,24 @@ mod tests {
             db.get_record_no_resolve("ALIAS").await.is_none(),
             "get_record_no_resolve must not follow alias table"
         );
+    }
+
+    #[tokio::test]
+    async fn all_alias_names_returns_registered_aliases() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_alias("ALIAS_A", "TARGET").await.unwrap();
+        db.add_alias("ALIAS_B", "TARGET").await.unwrap();
+
+        let mut aliases = db.all_alias_names().await;
+        aliases.sort();
+        assert_eq!(aliases, vec!["ALIAS_A".to_string(), "ALIAS_B".to_string()]);
+        // Canonical names are NOT returned here.
+        assert!(!aliases.contains(&"TARGET".to_string()));
     }
 
     #[tokio::test]

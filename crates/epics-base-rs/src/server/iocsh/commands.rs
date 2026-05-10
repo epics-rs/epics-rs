@@ -405,8 +405,14 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         })
         .unwrap_or_default();
 
+    // Walk both record names and aliases — base's dbFirstRecord
+    // iteration includes alias-form entries, so dbsr / dbgrep /
+    // dbglob must too. Field lookup via `get_record` already follows
+    // the alias to the canonical record (round 7).
     let mut names = ctx.block_on(ctx.db().all_record_names());
+    names.extend(ctx.block_on(ctx.db().all_alias_names()));
     names.sort();
+    names.dedup();
 
     let mut count = 0;
     for name in &names {

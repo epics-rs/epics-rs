@@ -13,6 +13,7 @@ use crate::types::EpicsValue;
 
 use super::database::PvDatabase;
 use super::device_support;
+use super::ioc_app::{DeviceSupportContext, DynamicDeviceSupportFactory};
 use super::{DeviceSupportFactory, RecordFactory};
 use super::{autosave, db_loader};
 
@@ -25,6 +26,12 @@ pub struct IocBuilder {
     records: Vec<(String, Box<dyn Record>)>,
     db_defs: Vec<db_loader::DbRecordDef>,
     device_factories: HashMap<String, DeviceSupportFactory>,
+    /// Fallback factory consulted when the static `device_factories`
+    /// map has no entry for a record's DTYP. Mirrors
+    /// `IocApplication::register_dynamic_device_support` so universal
+    /// drivers (asyn `universal_asyn_factory`, areaDetector plugin
+    /// dispatch) work in both build paths.
+    dynamic_device_factory: Option<DynamicDeviceSupportFactory>,
     record_factories: HashMap<String, RecordFactory>,
     subroutine_registry: HashMap<String, Arc<SubroutineFn>>,
     autosave_config: Option<autosave::SaveSetConfig>,
@@ -38,6 +45,7 @@ impl IocBuilder {
             records: Vec::new(),
             db_defs: Vec::new(),
             device_factories: HashMap::new(),
+            dynamic_device_factory: None,
             record_factories: HashMap::new(),
             subroutine_registry: HashMap::new(),
             autosave_config: None,
@@ -94,6 +102,33 @@ impl IocBuilder {
     {
         self.record_factories
             .insert(type_name.to_string(), Box::new(factory));
+        self
+    }
+
+    /// Register a dynamic device support factory.
+    ///
+    /// Called as a fallback when a record's DTYP doesn't match any
+    /// statically registered factory. Multiple calls are chained:
+    /// the new factory is tried first, then the previously registered
+    /// one. Mirrors
+    /// [`crate::server::ioc_app::IocApplication::register_dynamic_device_support`]
+    /// so universal drivers (asyn `universal_asyn_factory`,
+    /// areaDetector plugin dispatch) attach correctly in both build
+    /// paths.
+    pub fn register_dynamic_device_support<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(&DeviceSupportContext) -> Option<Box<dyn device_support::DeviceSupport>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        if let Some(existing) = self.dynamic_device_factory.take() {
+            self.dynamic_device_factory = Some(Box::new(move |ctx: &DeviceSupportContext| {
+                factory(ctx).or_else(|| existing(ctx))
+            }));
+        } else {
+            self.dynamic_device_factory = Some(Box::new(factory));
+        }
         self
     }
 
@@ -212,8 +247,22 @@ impl IocBuilder {
                 // Device support based on DTYP
                 let dtyp = instance.common.dtyp.clone();
                 if !crate::server::device_support::is_soft_dtyp(&dtyp) {
-                    if let Some(factory) = self.device_factories.get(&dtyp) {
-                        let mut dev = factory();
+                    let dev_opt = if let Some(factory) = self.device_factories.get(&dtyp) {
+                        Some(factory())
+                    } else if let Some(ref dyn_factory) = self.dynamic_device_factory {
+                        // Same fallback shape as
+                        // `ioc_app::wire_device_support` — universal
+                        // drivers (asyn etc.) need this to attach.
+                        let ctx = DeviceSupportContext {
+                            dtyp: &dtyp,
+                            inp: &instance.common.inp,
+                            out: &instance.common.out,
+                        };
+                        dyn_factory(&ctx)
+                    } else {
+                        None
+                    };
+                    if let Some(mut dev) = dev_opt {
                         let _ = dev.init(&mut *instance.record);
                         dev.set_record_info(&def.name, instance.common.scan);
                         // Forward info(...) tags to the driver after
@@ -361,5 +410,132 @@ record(ai, "AI:WITH:INFO") {
         assert_eq!(inst.get_info("asyn:READBACK"), Some("1"));
         assert_eq!(inst.get_info("Q:group"), Some("myGroup"));
         assert_eq!(inst.get_info("missing"), None);
+    }
+
+    /// Round-9 regression: IocBuilder must consult the dynamic
+    /// device-support factory when no static factory matches the
+    /// record's DTYP — otherwise universal drivers (asyn
+    /// `universal_asyn_factory`, areaDetector plugin dispatch) only
+    /// attach when records are loaded through IocApplication's
+    /// startup-script path, never the pure-Rust IocBuilder path.
+    #[tokio::test]
+    async fn dynamic_device_factory_attaches_when_static_missing() {
+        use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
+        use crate::server::record::ScanType;
+
+        struct UniversalDev;
+        impl DeviceSupport for UniversalDev {
+            fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+                Ok(())
+            }
+            fn dtyp(&self) -> &str {
+                "asynInt32"
+            }
+            fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+                Ok(DeviceReadOutcome::ok())
+            }
+            fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
+        }
+
+        let db_content = r#"
+record(ai, "AI:DYN") {
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(PORT,0)VAL")
+}
+"#;
+        let (db, _) = IocBuilder::new()
+            .register_record_type("ai", ai_factory)
+            .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+                if ctx.dtyp.starts_with("asyn") {
+                    Some(Box::new(UniversalDev))
+                } else {
+                    None
+                }
+            })
+            .db_string(db_content, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let rec = db.get_record("AI:DYN").await.unwrap();
+        let inst = rec.read().await;
+        assert!(
+            inst.device.is_some(),
+            "dynamic factory must attach when static factories miss"
+        );
+    }
+
+    /// Round-9: chaining preserves earlier dynamic factories. Newest
+    /// factory wins for matching DTYPs; non-matching DTYPs fall
+    /// through to previously registered factories. Mirrors
+    /// `IocApplication::register_dynamic_device_support` chaining.
+    #[tokio::test]
+    async fn dynamic_factories_chain_lifo_with_fallthrough() {
+        use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
+        use crate::server::record::ScanType;
+
+        struct DevA;
+        struct DevB;
+        impl DeviceSupport for DevA {
+            fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+                Ok(())
+            }
+            fn dtyp(&self) -> &str {
+                "DTA"
+            }
+            fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+                Ok(DeviceReadOutcome::ok())
+            }
+            fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
+        }
+        impl DeviceSupport for DevB {
+            fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+                Ok(())
+            }
+            fn dtyp(&self) -> &str {
+                "DTB"
+            }
+            fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+                Ok(DeviceReadOutcome::ok())
+            }
+            fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
+        }
+
+        let db_a = r#"
+record(ai, "REC:A") { field(DTYP, "DTA") }
+record(ai, "REC:B") { field(DTYP, "DTB") }
+"#;
+        let (db, _) = IocBuilder::new()
+            .register_record_type("ai", ai_factory)
+            .register_dynamic_device_support(|ctx| {
+                if ctx.dtyp == "DTA" {
+                    Some(Box::new(DevA))
+                } else {
+                    None
+                }
+            })
+            .register_dynamic_device_support(|ctx| {
+                if ctx.dtyp == "DTB" {
+                    Some(Box::new(DevB))
+                } else {
+                    None
+                }
+            })
+            .db_string(db_a, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        // Both records should have a device attached — proves the
+        // newer factory passes through DTA to the older factory.
+        for name in ["REC:A", "REC:B"] {
+            let rec = db.get_record(name).await.unwrap();
+            assert!(
+                rec.read().await.device.is_some(),
+                "factory chaining failed for {name}"
+            );
+        }
     }
 }

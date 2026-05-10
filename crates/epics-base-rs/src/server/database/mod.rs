@@ -82,6 +82,34 @@ pub type SearchResolver = Arc<
         + Sync,
 >;
 
+/// Internal state of [`PvDatabase`].
+///
+/// # Invariant — alias-aware lookup (epics-base PR #336)
+///
+/// **MUST**: every record-name lookup that originates from an
+/// external API (CA/PVA server, link processing, iocsh, bridge
+/// providers) MUST go through [`PvDatabase::get_record`] /
+/// [`PvDatabase::find_entry`] / [`PvDatabase::has_name`], never
+/// `inner.records.read().await.get(...)` directly.
+///
+/// **MUST NOT**: a function that takes an arbitrary record-name
+/// `&str` and reads `inner.records` directly, unless one of:
+/// - the function is itself an alias-management primitive
+///   (`add_record`, `remove_record`, `add_alias`,
+///   `find_entry_no_resolve`, `has_name_no_resolve`,
+///   `get_record_no_resolve`, `all_record_names`), OR
+/// - the name has been normalised to canonical earlier in the
+///   same scope (the `let canonical_owned; let name: &str = ...`
+///   pattern in `process_record_with_links_inner` /
+///   `complete_async_record_inner` / `put_record_field_from_ca` /
+///   `put_pv`).
+///
+/// **Owner/Gate:** `PvDatabase::get_record` (alias-aware path).
+///
+/// New code that adds a record-name entry point should call
+/// `get_record` first OR run the canonical-normalisation snippet
+/// at function entry. Direct `inner.records` access is reserved
+/// for the alias-management primitives listed above.
 struct PvDatabaseInner {
     simple_pvs: RwLock<HashMap<String, Arc<ProcessVariable>>>,
     records: RwLock<HashMap<String, Arc<RwLock<RecordInstance>>>>,
@@ -849,6 +877,27 @@ mod tests {
             db.get_record_no_resolve("ALIAS").await.is_none(),
             "get_record_no_resolve must not follow alias table"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_async_record_accepts_alias() {
+        // Round-12 invariant audit: complete_async_record (the
+        // entry point used by async device-support callbacks to
+        // finish processing) must accept an alias name. Pre-fix it
+        // walked `inner.records` directly and would
+        // `ChannelNotFound` if the original name was an alias.
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await;
+        db.add_alias("ALIAS", "TARGET").await.unwrap();
+
+        // Use complete_async_record by alias — must not error.
+        db.complete_async_record("ALIAS").await.unwrap();
+        // And by canonical too — keeps existing behaviour.
+        db.complete_async_record("TARGET").await.unwrap();
     }
 
     #[tokio::test]

@@ -1042,6 +1042,20 @@ impl PvDatabase {
         visited: &mut HashSet<String>,
         depth: usize,
     ) -> CaResult<()> {
+        // Alias-aware entry — same pattern as
+        // `process_record_with_links_inner`. `name` may arrive as an
+        // alias from an async device-support callback that captured
+        // the original record name; normalise to canonical so the
+        // records-map lookup, the `visited` cycle set, and downstream
+        // FLNK/OUT dispatches all see the same canonical name.
+        let canonical_owned;
+        let name: &str = if let Some(target) = self.resolve_alias(name).await {
+            canonical_owned = target;
+            &canonical_owned
+        } else {
+            name
+        };
+
         let rec = {
             let records = self.inner.records.read().await;
             records

@@ -418,23 +418,24 @@ impl IocApplication {
         // Phase 2e: drain `afterIocRunning` queue (epics-base PR #558).
         // Each line is an iocsh command queued by the startup script;
         // execute through a fresh shell so post-init state (including
-        // PINI side effects) is visible.
+        // PINI side effects) is visible. Both built-in iocsh commands
+        // AND every user-registered `shell_commands` entry are
+        // re-registered on this shell (CommandDef now `Clone`-able)
+        // so site-specific names like `motorReport` are addressable
+        // from the post-init queue.
         let pending = db.take_after_ioc_running();
         if !pending.is_empty() {
             let db1 = db.clone();
             let h1 = handle.clone();
+            let shell_cmds_clone = shell_commands.clone();
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             std::thread::Builder::new()
                 .name("iocsh-after-ioc-running".into())
                 .spawn(move || {
                     let shell = iocsh::IocShell::new(db1, h1);
-                    // Only built-in iocsh commands are available here
-                    // — user-registered shell commands aren't passed
-                    // through (CommandDef not Clone). The afterIocRunning
-                    // queue is intended for built-in operations like
-                    // dbpf / dbpr / dbCreateRecord; site-specific
-                    // commands should be invoked through the regular
-                    // post-init hook channel.
+                    for cmd in shell_cmds_clone {
+                        shell.register(cmd);
+                    }
                     let mut errs: Vec<String> = Vec::new();
                     for line in pending {
                         if let Err(e) = shell.execute_line(&line) {

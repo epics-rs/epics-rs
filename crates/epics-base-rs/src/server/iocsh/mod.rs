@@ -262,6 +262,44 @@ mod tests {
         IocShell::new(db, handle)
     }
 
+    /// Round-16 regression: a CommandDef must be cloneable so the
+    /// post-init `afterIocRunning` shell can re-register
+    /// site-specific user commands. Pre-fix the handler was
+    /// `Box<dyn CommandHandler>` and CommandDef itself was not
+    /// Clone — `IocApplication::run` skipped user commands when
+    /// spawning the post-init shell, leaving them dead.
+    #[test]
+    fn command_def_is_clone_and_handler_shared() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let cmd = CommandDef::new(
+            "myCmd",
+            vec![],
+            "myCmd — count invocations",
+            move |_args: &[ArgValue], _ctx: &CommandContext| {
+                calls_clone.fetch_add(1, Ordering::Relaxed);
+                Ok(CommandOutcome::Continue)
+            },
+        );
+
+        // Cloning the CommandDef shares the same handler counter —
+        // the Arc<dyn CommandHandler> is what enables the round-16
+        // afterIocRunning re-registration.
+        let cmd_dup = cmd.clone();
+
+        let shell = make_shell();
+        shell.register(cmd);
+        shell.execute_line("myCmd").unwrap();
+
+        let shell2 = make_shell();
+        shell2.register(cmd_dup);
+        shell2.execute_line("myCmd").unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn test_execute_line_dbl() {
         let shell = make_shell();

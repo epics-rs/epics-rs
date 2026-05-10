@@ -53,11 +53,19 @@ where
 }
 
 /// A registered command definition.
+///
+/// `handler` is `Arc`-backed so a `CommandDef` can be cloned and
+/// re-registered on a fresh `IocShell` (used by the
+/// `afterIocRunning` post-init shell — without Clone, custom
+/// site-specific commands registered via
+/// `IocApplication::register_shell_command` would be unavailable
+/// in the post-init queue).
+#[derive(Clone)]
 pub struct CommandDef {
     pub name: String,
     pub args: Vec<ArgDesc>,
     pub usage: String,
-    pub handler: Box<dyn CommandHandler>,
+    pub handler: Arc<dyn CommandHandler>,
 }
 
 impl CommandDef {
@@ -71,7 +79,7 @@ impl CommandDef {
             name: name.into(),
             args,
             usage: usage.into(),
-            handler: Box::new(handler),
+            handler: Arc::new(handler),
         }
     }
 }

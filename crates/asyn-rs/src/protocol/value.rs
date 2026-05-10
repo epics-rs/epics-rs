@@ -37,6 +37,7 @@ impl From<&EnumEntry> for param::EnumEntry {
 pub enum ParamValue {
     Int32(i32),
     Int64(i64),
+    UInt64(u64),
     Float64(f64),
     Octet(String),
     UInt32Digital(u32),
@@ -44,6 +45,7 @@ pub enum ParamValue {
     Int16Array(Vec<i16>),
     Int32Array(Vec<i32>),
     Int64Array(Vec<i64>),
+    UInt64Array(Vec<u64>),
     Float32Array(Vec<f32>),
     Float64Array(Vec<f64>),
     Enum {
@@ -58,6 +60,7 @@ impl From<&param::ParamValue> for ParamValue {
         match v {
             param::ParamValue::Int32(n) => Self::Int32(*n),
             param::ParamValue::Int64(n) => Self::Int64(*n),
+            param::ParamValue::UInt64(n) => Self::UInt64(*n),
             param::ParamValue::Float64(n) => Self::Float64(*n),
             param::ParamValue::Octet(s) => Self::Octet(s.clone()),
             param::ParamValue::UInt32Digital(n) => Self::UInt32Digital(*n),
@@ -65,6 +68,7 @@ impl From<&param::ParamValue> for ParamValue {
             param::ParamValue::Int16Array(a) => Self::Int16Array(a.to_vec()),
             param::ParamValue::Int32Array(a) => Self::Int32Array(a.to_vec()),
             param::ParamValue::Int64Array(a) => Self::Int64Array(a.to_vec()),
+            param::ParamValue::UInt64Array(a) => Self::UInt64Array(a.to_vec()),
             param::ParamValue::Float32Array(a) => Self::Float32Array(a.to_vec()),
             param::ParamValue::Float64Array(a) => Self::Float64Array(a.to_vec()),
             param::ParamValue::Enum { index, choices } => Self::Enum {
@@ -88,6 +92,7 @@ impl From<&ParamValue> for param::ParamValue {
         match v {
             ParamValue::Int32(n) => Self::Int32(*n),
             ParamValue::Int64(n) => Self::Int64(*n),
+            ParamValue::UInt64(n) => Self::UInt64(*n),
             ParamValue::Float64(n) => Self::Float64(*n),
             ParamValue::Octet(s) => Self::Octet(s.clone()),
             ParamValue::UInt32Digital(n) => Self::UInt32Digital(*n),
@@ -95,6 +100,7 @@ impl From<&ParamValue> for param::ParamValue {
             ParamValue::Int16Array(a) => Self::Int16Array(Arc::from(a.as_slice())),
             ParamValue::Int32Array(a) => Self::Int32Array(Arc::from(a.as_slice())),
             ParamValue::Int64Array(a) => Self::Int64Array(Arc::from(a.as_slice())),
+            ParamValue::UInt64Array(a) => Self::UInt64Array(Arc::from(a.as_slice())),
             ParamValue::Float32Array(a) => Self::Float32Array(Arc::from(a.as_slice())),
             ParamValue::Float64Array(a) => Self::Float64Array(Arc::from(a.as_slice())),
             ParamValue::Enum { index, choices } => Self::Enum {

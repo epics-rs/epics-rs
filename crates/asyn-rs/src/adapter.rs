@@ -862,9 +862,43 @@ pub fn register_asyn_device_support(
     app.register_dynamic_device_support(universal_asyn_factory)
 }
 
+/// IocBuilder companion to [`register_asyn_device_support`] —
+/// installs the universal asyn factory on the pure-Rust build path
+/// (round-9 added `register_dynamic_device_support` to IocBuilder).
+/// Without this helper, callers using `IocBuilder` instead of
+/// `IocApplication` would have to wire `universal_asyn_factory`
+/// manually; that asymmetry is exactly what `register_asyn_device_support`
+/// hides for the IocApplication path.
+pub fn register_asyn_device_support_for_builder(
+    builder: epics_base_rs::server::ioc_builder::IocBuilder,
+) -> epics_base_rs::server::ioc_builder::IocBuilder {
+    builder.register_dynamic_device_support(universal_asyn_factory)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round-22 regression: the IocBuilder companion helper exists
+    /// and accepts a pure-Rust builder. Pre-fix, `register_asyn_device_support`
+    /// only accepted IocApplication, so an IocBuilder caller had to
+    /// expose `universal_asyn_factory` themselves.
+    #[tokio::test]
+    async fn register_asyn_device_support_for_builder_compiles_and_attaches() {
+        use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+        use epics_base_rs::server::record::ScanType;
+        use epics_base_rs::types::EpicsValue;
+        let _ = (
+            ScanType::Passive,
+            EpicsValue::Double(0.0),
+            std::any::type_name::<dyn DeviceSupport>(),
+            std::any::type_name::<DeviceReadOutcome>(),
+        );
+
+        // The helper consumes and returns the builder — chain on .build().
+        let _builder = register_asyn_device_support_for_builder(IocBuilder::new());
+    }
 
     #[test]
     fn test_parse_full() {

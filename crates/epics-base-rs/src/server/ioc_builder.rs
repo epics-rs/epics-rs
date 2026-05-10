@@ -148,6 +148,28 @@ impl IocBuilder {
 
             db.add_record(&def.name, record).await;
 
+            // info(...) tags — populate before `init_record` so device
+            // support reading them from `instance.info` sees the values.
+            if !def.info_tags.is_empty() {
+                if let Some(rec_arc) = db.get_record(&def.name).await {
+                    let mut instance = rec_arc.write().await;
+                    for (k, v) in &def.info_tags {
+                        instance.set_info(k, v);
+                    }
+                }
+            }
+
+            // alias(...) directives — register before init so links
+            // resolved during init can reach this record by alias.
+            for alias in &def.aliases {
+                if let Err(e) = db.add_alias(alias, &def.name).await {
+                    eprintln!(
+                        "alias({alias}) for {target} rejected: {e}",
+                        target = def.name
+                    );
+                }
+            }
+
             // Apply common fields and device support to the RecordInstance
             if let Some(rec_arc) = db.get_record(&def.name).await {
                 let mut instance = rec_arc.write().await;
@@ -267,5 +289,71 @@ impl IocBuilder {
 impl Default for IocBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ai_factory() -> Box<dyn Record> {
+        Box::new(crate::server::records::ai::AiRecord::new(0.0))
+    }
+
+    /// Round-5 regression: an `alias("ALT")` directive in a .db file
+    /// loaded through `IocBuilder::db_string` must be registered as
+    /// an alias on the resulting `PvDatabase` so that lookup by the
+    /// alias resolves to the same record as lookup by the canonical
+    /// name. Pre-fix, `ioc_builder` discarded `def.aliases`.
+    #[tokio::test]
+    async fn db_string_registers_aliases() {
+        let db_content = r#"
+record(ai, "REAL:NAME") {
+    field(VAL, "1.0")
+    alias("PRETTY:NAME")
+}
+"#;
+        let (db, _) = IocBuilder::new()
+            .register_record_type("ai", ai_factory)
+            .db_string(db_content, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(db.has_name("REAL:NAME").await);
+        assert!(
+            db.has_name("PRETTY:NAME").await,
+            "alias must be registered on the database",
+        );
+        assert!(db.find_entry("PRETTY:NAME").await.is_some());
+    }
+
+    /// Round-5 regression: `info("key", "value")` directives must be
+    /// stored on the resulting RecordInstance. Pre-fix, no consumer
+    /// existed for `def.info_tags` — every record's `info` map was
+    /// silently empty after build.
+    #[tokio::test]
+    async fn db_string_populates_info_tags() {
+        let db_content = r#"
+record(ai, "AI:WITH:INFO") {
+    field(VAL, "0.0")
+    info("asyn:READBACK", "1")
+    info("Q:group", "myGroup")
+}
+"#;
+        let (db, _) = IocBuilder::new()
+            .register_record_type("ai", ai_factory)
+            .db_string(db_content, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let rec = db.get_record("AI:WITH:INFO").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(inst.get_info("asyn:READBACK"), Some("1"));
+        assert_eq!(inst.get_info("Q:group"), Some("myGroup"));
+        assert_eq!(inst.get_info("missing"), None);
     }
 }

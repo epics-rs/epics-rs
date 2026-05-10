@@ -904,6 +904,13 @@ fn cmd_db_load_records() -> CommandDef {
 
                     if let Some(rec_arc) = ctx.db().get_record(&def.name).await {
                         let mut instance = rec_arc.write().await;
+                        // info(key, value) directives — last write
+                        // wins. Populated before common-field application
+                        // so device support seeing `init_record` can
+                        // observe info tags.
+                        for (k, v) in &def.info_tags {
+                            instance.set_info(k, v);
+                        }
                         for (name, value) in common_fields {
                             use crate::server::record::CommonFieldPutResult;
                             match instance.put_common_field(&name, value) {

@@ -106,6 +106,12 @@ pub struct RecordInstance {
     /// Bumped each process cycle. Spawned timers check this to avoid
     /// stale re-processes from accumulated timers.
     pub reprocess_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-record info tags from `info("key", "value")` directives in
+    /// the .db file (epics-base info(...) grammar). Consumers include
+    /// asyn (`asyn:READBACK`), record-as-PV bridge tags
+    /// (`Q:group`, `Q:form`), and IOC-specific extensions. Empty for
+    /// records loaded without info(...) clauses.
+    pub info: HashMap<String, String>,
     /// Cached metadata (display/control/enums) — `None` means stale or
     /// not yet built. Populated lazily by `snapshot_for_field` /
     /// `make_monitor_snapshot` and invalidated by `invalidate_metadata_cache`
@@ -183,8 +189,22 @@ impl RecordInstance {
             put_notify_tx: None,
             last_posted: HashMap::new(),
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            info: HashMap::new(),
             metadata_cache: StdMutex::new(None),
         }
+    }
+
+    /// Set a single `info("key", "value")` tag on this record. Last
+    /// write wins. Used by the .db loader (`info(...)` directive) and
+    /// `dbpf`-style tools.
+    pub fn set_info(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.info.insert(key.into(), value.into());
+    }
+
+    /// Look up a single info tag. Returns `None` when the record has
+    /// no tag with that key.
+    pub fn get_info(&self, key: &str) -> Option<&str> {
+        self.info.get(key).map(|s| s.as_str())
     }
 
     /// Invalidate the metadata cache. Called after writing any

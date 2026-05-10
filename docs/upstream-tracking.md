@@ -282,7 +282,7 @@ flow control), #61, #57, #55, #53, #45, #43, #40, #39, #38, #36, #33, #32,
 | [#88](https://github.com/epics-modules/asyn/pull/88) | 2019-10 | Add `drvAsynFTDIPort` | FTDI driver missing in asyn-rs — already covered by `feature = "ftdi"` PR queue elsewhere | **not started** |
 | [#84](https://github.com/epics-modules/asyn/pull/84) | 2019-08 | Shut down thread before destroying `asynPortDriver` | `port_actor` actor model joins on drop — already correct | inspected, equivalent |
 | [#76](https://github.com/epics-modules/asyn/pull/76) | 2019-01 | String options for `asynSetTrace*Mask` | `trace.rs` mask parsing — verify accepts string keys | **not started** (audit) |
-| [#66](https://github.com/epics-modules/asyn/pull/66) | 2017-12 | `devEpics`: ASLO/AOFF/SMOO conversion on ai/ao float64 | adapter `asyn_record/` — these slope/offset/smoothing transforms are not applied | **not started** |
+| [#66](https://github.com/epics-modules/asyn/pull/66) | 2017-12 | `devEpics`: ASLO/AOFF/SMOO conversion on ai/ao float64 | epics-rs applies the slope/offset/smoothing transforms at the record layer — `records/ai.rs::process` and `records/ao.rs::process` already implement (val-eoff)/eslo + AOFF + ASLO + SMOO. asyn-rs adapter forwards raw values to record `set_val`; the record runs the transform. | inspected, equivalent (record-layer) |
 | [#60](https://github.com/epics-modules/asyn/pull/60) | 2017-11 | Process output records on `asyn:READBACK` callbacks | adapter does not implement `asyn:READBACK` info-tag handling | **not started** (related to #208 from later) |
 | [#13](https://github.com/epics-modules/asyn/pull/13) | 2016-02 | `asynOption` interface on drvAsynIPPort | `asynOption` registration in `interfaces/` — partial | **not started** (audit) |
 | [#6](https://github.com/epics-modules/asyn/pull/6) | 2015-10 | `drvAsynIPPort`: configurable disconnect on read timeout | transport read-timeout policy in asyn-rs — verify configurable | **not started** (audit) |
@@ -295,7 +295,7 @@ flow control), #61, #57, #55, #53, #45, #43, #40, #39, #38, #36, #33, #32,
 | JSON-link grammar | #86 | `link.rs::try_parse_json_link` recognizes `{const: …}`, `{ca: { pv: "…" }}`, `{pva: { pv: "…" }}` (unquoted-key + single-quote tolerant). 7 tests | **done (JSON5 leniency on inline db files still deferred)** |
 | Hardware-link parsing | #213 hex in HW links + `@dev arg` / `#Cn Sn` forms | `link.rs::ParsedLink::Hw(HwLink { kind, args, raw })` with `try_parse_hw_link`; preserves hex literals as full-token args. 4 tests | **done** |
 | ~~`IP_MULTICAST_ALL` socket option~~ | ~~#193~~ | already applied — see Section H | **done (already applied)** |
-| ASLO/AOFF/SMOO on asyn | #66 | new transform layer in `asyn_record/` adapter | deferred (substantive) |
+| ASLO/AOFF/SMOO on asyn | #66 | record-layer transform in `records/ai.rs` + `ao.rs` already applies ASLO/AOFF/SMOO. asyn-rs adapter forwards raw values to `set_val`; record's `process()` runs the conversion. | **done (record-layer)** |
 | asyn:READBACK | #208, #60 | output-record process-on-callback wiring in `asyn_record/` | deferred (substantive) |
 | Record-name validation | #78 | parser-side gate + regression for legacy databases | **done (this branch)** |
 

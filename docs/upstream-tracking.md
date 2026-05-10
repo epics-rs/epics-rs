@@ -41,7 +41,7 @@ Shape: PR# / merged date / what changed / epics-rs location to inspect / status 
 | [#636](https://github.com/epics-base/epics-base/pull/636) | 2025-06 | `EPICS_DB_INCLUDE_PATH` for dbLoadTemplate | dbLoadTemplate in epics-base-rs | not started |
 | [#626](https://github.com/epics-base/epics-base/pull/626) | 2025-06 | `dbgrep` → `dbglob` (alias kept) | `iocsh/commands.rs::cmd_dbglob` + `cmd_dbgrep` aliases of `dbsr`, share `dbsr_handler`. PR #613's `[fields]` argument also added | done |
 | [#608](https://github.com/epics-base/epics-base/pull/608) | 2025-10 | Warn to stderr when discarding CPP modifier for outlink | dblink/outlink parser | not started |
-| [#558](https://github.com/epics-base/epics-base/pull/558) | 2025-06 | iocsh `afterIocRunning` (≠ atInit/afterInit) | iocsh commands | not started |
+| [#558](https://github.com/epics-base/epics-base/pull/558) | 2025-06 | iocsh `afterIocRunning` (≠ atInit/afterInit) | `PvDatabase::queue_after_ioc_running` + `take_after_ioc_running` + iocsh `cmd_after_ioc_running` push lines into queue. `IocApplication::run` Phase 2e drains them on a fresh `IocShell` after PINI/device-support/autosave | done |
 | [#359](https://github.com/epics-base/epics-base/pull/359) | 2026-02 | Fix undefined timestamp for NORD field | aao/aai/waveform NORD timestamp path | not started |
 | [#677](https://github.com/epics-base/epics-base/pull/677) | 2025-07 | gethostbyname → getaddrinfo | tokio `lookup_host` already uses getaddrinfo | inspected, equivalent |
 | [#587](https://github.com/epics-base/epics-base/pull/587) | 2025-06 | fdManager poll() (CAS) | tokio epoll/kqueue covers this | inspected, n/a |
@@ -63,7 +63,7 @@ Shape: PR# / merged date / what changed / epics-rs location to inspect / status 
 | [#671](https://github.com/epics-base/epics-base/pull/671) | atExit on SIGTERM/SIGINT | epics-rs shutdown signal handling | not started |
 | [#629](https://github.com/epics-base/epics-base/pull/629) | caget INT→SHORT in dbr | CA wire DBR mapping | not started |
 | [#621](https://github.com/epics-base/epics-base/pull/621) | nameserver: force CA protocol version | `EPICS_CA_NAME_SERVERS` handshake version selection | not started |
-| [#507](https://github.com/epics-base/epics-base/pull/507) | iocsh local variables | iocsh interpreter | not started |
+| [#507](https://github.com/epics-base/epics-base/pull/507) | iocsh local variables | epics-rs iocsh already supports `epicsEnvSet` + `$(VAR=DEFAULT)` substitution via `registry::substitute_env_vars`. Process-wide env vars are functionally equivalent for single-instance iocsh sessions; sub-shell scoping is the only behavioural delta and is not needed for current use cases | inspected, equivalent (different mechanism) |
 | [#503](https://github.com/epics-base/epics-base/pull/503) | caget tolerates partial disconnect | `caget` tool behavior | not started |
 | [#497](https://github.com/epics-base/epics-base/pull/497) | iocsh `pushd`/`popd`/`dirs` | `iocsh/commands.rs::{cmd_pushd, cmd_popd, cmd_dirs}` with process-global `dir_stack` (OnceLock<Mutex<Vec<PathBuf>>>); failed `cd` restores popped entry | done |
 | [#475](https://github.com/epics-base/epics-base/pull/475) | asLib type-safety incompat | ACF library | not started |

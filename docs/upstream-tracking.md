@@ -176,12 +176,12 @@ fixes), #470/#519/#509 (C memory leaks), #461 (VSCode makefile),
 | [#505](https://github.com/epics-base/epics-base/pull/505) | 2024-08 | Allow record deletion at database creation | `PvDatabase::remove_record(name) -> bool` cleans records map + scan_index + cp_links; iocsh `dbDeleteRecord <name>` exposes it | done |
 | [#501](https://github.com/epics-base/epics-base/pull/501) | 2024-10 | `asTrap` serverSpecific is `dbChannel` | ACF trap pipeline does not expose dbChannel handle | **not started** |
 | [#486](https://github.com/epics-base/epics-base/pull/486) | 2024-05 | `printf` record `sizv` fix | `records/printf.rs` — verify SIZV field bound | **not started** (audit) |
-| [#468](https://github.com/epics-base/epics-base/pull/468) | 2024-05 | compress record fix | `records/compress.rs` — verify reset/N=0 handling | **not started** (audit) |
+| [#468](https://github.com/epics-base/epics-base/pull/468) | 2024-05 | compress record fix | `records/compress.rs::process` re-zeroes `val` + clears `nuse`/`off` when RES != 0; framework's process-then-monitor flow fans the zeroed buffer out as a regular VAL change. Equivalent to base's "fix issue with compress record" | inspected, equivalent |
 | [#467](https://github.com/epics-base/epics-base/pull/467) | 2024-06 | Off-by-one in constant link fetch | `record/link.rs::ParsedLink::Constant` — verify offset/length math | **not started** (audit) |
 | [#463](https://github.com/epics-base/epics-base/pull/463) | 2024-02 | `dbLoadRecords` allows macros with defaults without substitutions | `db_loader::dbLoadRecords` — verify macro-default semantics | **not started** (audit) |
 | [#592](https://github.com/epics-base/epics-base/pull/592) | 2025-03 | `dbServerStats()` API | introspection module exposes counters; full `dbServerStats` shape pending | **not started** |
 | [#594](https://github.com/epics-base/epics-base/pull/594) | 2025-03 | `initHookRegister` idempotent + MustSucceed | epics-rs init hook registration — verify idempotency | **not started** (audit) |
-| [#581](https://github.com/epics-base/epics-base/pull/581) | 2025-02 | Post monitors from compress record on reset | `records/compress.rs` reset path — verify monitor fan-out | **not started** (audit) |
+| [#581](https://github.com/epics-base/epics-base/pull/581) | 2025-02 | Post monitors from compress record on reset | covered by `records/compress.rs::process` re-running through the framework's monitor fan-out path; reset writes `val[*] = 0.0` and the `notify_subscribers` step handles the rest | inspected, equivalent |
 | [#578](https://github.com/epics-base/epics-base/pull/578) | 2024-12 | Document UDFS field | `records/dbCommon` UDFS docs — Rust-side optional | inspected, equivalent (UDFS field present) |
 | [#551](https://github.com/epics-base/epics-base/pull/551) | 2025-02 | Null-check `IOCSH_STARTUP_SCRIPT` | `iocsh/mod.rs` script-loader env var | inspected, equivalent |
 | [#558](https://github.com/epics-base/epics-base/pull/558) (already in B) | 2025-06 | `afterIocRunning` iocsh command | iocsh commands | not started |
@@ -335,11 +335,11 @@ Re-grepped during the closed-issue pass:
 
 | Issue | Gap | epics-rs site to revisit |
 |---|---|---|
-| [#564](https://github.com/epics-base/epics-base/issues/564) | DBR_ULONG negative-number handling | CA wire DBR_ULONG conversion (`epics-base-rs/src/types::EpicsValue::ULong` ↔ DBR conversion) — verify negative-as-i32 round-trip semantics |
+| [#564](https://github.com/epics-base/epics-base/issues/564) | DBR_ULONG negative-number handling | epics-rs CA wire does not expose `DbFieldType::ULong` / `EpicsValue::ULong` as a usable type — `DBR_LONG` (i32) is the supported integer-32 form; unsigned interpretation is the receiver's responsibility via bit-cast. The base defect (negative i32 written into u32 path) cannot reach our codebase | inspected, n/a |
 | [#421](https://github.com/epics-base/epics-base/issues/421) | Cannot put JSON links via pvput | `epics-pva-rs` PUT path JSON link handling — likely missing |
 | [#312](https://github.com/epics-base/epics-base/issues/312) | `dbLoadRecords` should warn/error on alias with field part | `db_loader` alias parser permissive |
 | [#284](https://github.com/epics-base/epics-base/issues/284) | Constant `INP*` to aSub | `records/asub_record.rs` constant link plumbing — verify each FT* type |
-| [#280](https://github.com/epics-base/epics-base/issues/280) | Timestamp when monitoring non-VAL field | `record_instance.rs::snapshot_for_field` — verify per-field timestamp source |
+| [#280](https://github.com/epics-base/epics-base/issues/280) | Timestamp when monitoring non-VAL field | `record_instance.rs::snapshot_for_field` (line 269) sets `Snapshot::ts = self.common.time` for **every** field — VAL or otherwise — so non-VAL monitor updates carry the same timestamp as the record. The base "undef on first non-VAL update" defect is structurally absent | inspected, equivalent |
 | [#209](https://github.com/epics-base/epics-base/issues/209) | `ca_enable_preemptive_callback` gets no monitor updates | epics-rs CA client is preemptive by construction (tokio tasks); not applicable as a bug |
 | [#194](https://github.com/epics-base/epics-base/issues/194) | Long string `CALC$` issue | `records/scalcout.rs` `$` suffix handling — string-typed input |
 | [#190](https://github.com/epics-base/epics-base/issues/190) | CA connections "stalled" after sleeping (laptop suspend) | `ca-rs` echo watchdog (already P-G fix) — should detect; verify under the suspend path |

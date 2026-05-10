@@ -79,6 +79,13 @@ impl AccessSecurityConfig {
                 None => return AccessLevel::ReadWrite,
             },
         };
+        // Empty rule set: ASG declared but no RULE — legacy semantics
+        // grant ReadWrite (matching `check_access_asl`'s pre-PR #563
+        // behaviour). The C-G6 fix (record-ASL gate) does not apply
+        // when no rules exist to gate.
+        if asg.rules.is_empty() {
+            return AccessLevel::ReadWrite;
+        }
         if user.is_empty() || host.is_empty() {
             return self.unknown_access;
         }
@@ -140,77 +147,13 @@ impl AccessSecurityConfig {
         user: &str,
         record_asl: u8,
     ) -> AccessLevel {
-        let asg = match self.asg.get(asg_name) {
-            Some(a) => a,
-            None => {
-                // Fall back to DEFAULT ASG
-                match self.asg.get("DEFAULT") {
-                    Some(a) => a,
-                    None => return AccessLevel::ReadWrite, // No ACF = full access
-                }
-            }
-        };
-
-        // If user or host unknown, use conservative default
-        if user.is_empty() || host.is_empty() {
-            return self.unknown_access;
-        }
-
-        let mut can_read = false;
-        let mut can_write = false;
-
-        for rule in &asg.rules {
-            // ASL gate: a rule only applies when its level is at
-            // least the record's ASL. (epics-base treats the rule
-            // level as a *ceiling* on what it grants — record_asl
-            // greater than rule.level disables that rule.)
-            if record_asl > rule.level {
-                continue;
-            }
-            let user_match = if rule.uag.is_empty() {
-                true // No UAG restriction = all users
-            } else {
-                rule.uag.iter().any(|uag_name| {
-                    self.uag
-                        .get(uag_name)
-                        .map(|members| members.iter().any(|m| m == user))
-                        .unwrap_or(false)
-                })
-            };
-
-            let host_match = if rule.hag.is_empty() {
-                true // No HAG restriction = all hosts
-            } else {
-                rule.hag.iter().any(|hag_name| {
-                    self.hag
-                        .get(hag_name)
-                        .map(|members| members.iter().any(|m| m == host))
-                        .unwrap_or(false)
-                })
-            };
-
-            if user_match && host_match {
-                if rule.write {
-                    can_write = true;
-                    can_read = true;
-                } else {
-                    can_read = true;
-                }
-            }
-        }
-
-        // If no rules at all, default to ReadWrite
-        if asg.rules.is_empty() {
-            return AccessLevel::ReadWrite;
-        }
-
-        if can_write {
-            AccessLevel::ReadWrite
-        } else if can_read {
-            AccessLevel::Read
-        } else {
-            AccessLevel::NoAccess
-        }
+        // Forward to the method-aware path with default scopes
+        // (any method, any authority). Mirrors epics-base PR #563:
+        // legacy ACF rules without `METHOD`/`AUTHORITY` clauses match
+        // every authentication method and authority. New code should
+        // call `check_access_method` directly when method/authority
+        // negotiation is observable.
+        self.check_access_method(asg_name, host, user, record_asl, "", "")
     }
 }
 

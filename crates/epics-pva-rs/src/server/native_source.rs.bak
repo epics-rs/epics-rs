@@ -718,7 +718,7 @@ ASG(SECURE) {
         let rec = db.get_record("AI:SECURE").await.unwrap();
         rec.write().await.common.asg = "SECURE".to_string();
 
-        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(tokio::sync::RwLock::new(Some(acf))));
+        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(Some(acf)));
 
         // Allowed: admin from lab-pc1 — must succeed.
         source
@@ -769,7 +769,7 @@ ASG(LOCKED) {
         let rec = db.get_record("AI:LOCKED").await.unwrap();
         rec.write().await.common.asg = "LOCKED".to_string();
 
-        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(tokio::sync::RwLock::new(Some(acf))));
+        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(Some(acf)));
 
         // alice gets a value back.
         let v = source
@@ -804,7 +804,7 @@ ASG(LOCKED) {
         let rec = db.get_record("AI:MON").await.unwrap();
         rec.write().await.common.asg = "LOCKED".to_string();
 
-        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(tokio::sync::RwLock::new(Some(acf))));
+        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(Some(acf)));
 
         let rx = source
             .subscribe_ctx("AI:MON", make_ctx("h", "alice", "anonymous"))
@@ -815,69 +815,6 @@ ASG(LOCKED) {
             .subscribe_ctx("AI:MON", make_ctx("h", "intruder", "anonymous"))
             .await;
         assert!(rx.is_none(), "intruder MONITOR must be denied");
-    }
-
-    /// Round-28 regression: AcfCell swap takes effect on the next
-    /// ACF check. A subsequent PUT after the swap must use the new
-    /// policy. Proves the RwLock-backed reload path actually
-    /// influences the source's behaviour (round-28 plumbed
-    /// `PvaServer::reload_acf_from` to write into this cell).
-    #[tokio::test]
-    async fn acf_swap_takes_effect_on_next_put() {
-        use epics_base_rs::server::records::ai::AiRecord;
-
-        // Initial: deny everyone.
-        let lockdown = parse_acf(
-            r#"
-ASG(SECURE) {
-    RULE(1, READ)
-}
-"#,
-        )
-        .unwrap();
-        let cell: AcfCell = Arc::new(RwLock::new(Some(lockdown)));
-
-        let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0))).await;
-        let rec = db.get_record("AI:LIVE").await.unwrap();
-        rec.write().await.common.asg = "SECURE".to_string();
-
-        let source = PvDatabaseSource::new_with_acf(db.clone(), cell.clone());
-
-        // First put: denied (READ-only ASG).
-        assert!(
-            source
-                .put_value_ctx(
-                    "AI:LIVE",
-                    pv_double(1.0),
-                    make_ctx("h", "anyone", "anonymous"),
-                )
-                .await
-                .is_err(),
-            "initial policy must deny PUT"
-        );
-
-        // Hot-swap: open up WRITE for everyone.
-        let permissive = parse_acf(
-            r#"
-ASG(SECURE) {
-    RULE(1, READ)
-    RULE(1, WRITE)
-}
-"#,
-        )
-        .unwrap();
-        *cell.write().await = Some(permissive);
-
-        // Second put: succeeds under the new policy.
-        source
-            .put_value_ctx(
-                "AI:LIVE",
-                pv_double(2.0),
-                make_ctx("h", "anyone", "anonymous"),
-            )
-            .await
-            .expect("post-swap policy must allow PUT");
     }
 
     /// Round-17: when the source is built without ACF, behaviour

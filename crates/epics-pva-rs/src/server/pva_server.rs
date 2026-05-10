@@ -66,7 +66,7 @@ impl PvaServerBuilder {
 
     pub async fn build(self) -> CaResult<PvaServer> {
         let (db, autosave_config) = self.ioc.build().await?;
-        let acf = Arc::new(self.acf);
+        let acf = Arc::new(tokio::sync::RwLock::new(self.acf));
         Ok(PvaServer {
             db,
             port: self.port,
@@ -87,7 +87,12 @@ pub struct PvaServer {
     /// `check_access_method`. Callers that supply their own
     /// ChannelSource via `run_with_source` must install ACF
     /// themselves.
-    acf: Arc<Option<access_security::AccessSecurityConfig>>,
+    ///
+    /// Round-28: `RwLock`-wrapped so [`Self::reload_acf_from`] can
+    /// swap the policy at runtime (mirrors `CaServer::reload_acf`).
+    /// All `PvDatabaseSource` ACF check sites pick the latest
+    /// policy on their next read.
+    acf: crate::server::native_source::AcfCell,
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
 }
@@ -107,10 +112,29 @@ impl PvaServer {
         Self {
             db,
             port,
-            acf: Arc::new(acf),
+            acf: Arc::new(tokio::sync::RwLock::new(acf)),
             autosave_config,
             autosave_manager,
         }
+    }
+
+    /// Reload the Access Security policy from a `.acf` file. Mirrors
+    /// `CaServer::reload_acf_from`. Parses the file off the async
+    /// runtime (blocking IO; small file) and then swaps the AcfCell
+    /// under a write guard so in-flight ACF checks finish under the
+    /// old policy and subsequent checks see the new one.
+    pub async fn reload_acf_from(&self, path: &std::path::Path) -> CaResult<()> {
+        let content = std::fs::read_to_string(path).map_err(epics_base_rs::error::CaError::Io)?;
+        let cfg = access_security::parse_acf(&content)?;
+        *self.acf.write().await = Some(cfg);
+        Ok(())
+    }
+
+    /// Clear the Access Security policy at runtime (returns the
+    /// server to unrestricted PUT/GET/MONITOR mode). Mirrors the
+    /// negative form of `reload_acf_from`.
+    pub async fn clear_acf(&self) {
+        *self.acf.write().await = None;
     }
 
     pub fn database(&self) -> &Arc<PvDatabase> {

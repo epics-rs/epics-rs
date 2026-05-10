@@ -435,6 +435,57 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
+    fn get_value_ctx(
+        &self,
+        name: &str,
+        ctx: crate::server_native::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        let acf = self.acf.clone();
+        let resolve_fut = self.resolve_asg(name);
+        let get_fut = self.get_value(name);
+        async move {
+            // ACF gate for READ. When ACF is attached, the peer must
+            // have at least Read access on the record's ASG; without
+            // it (or NoAccess) the GET returns None — same shape as
+            // an unknown PV, so the wire layer surfaces an
+            // ECA_NORDACCESS-equivalent.
+            if let Some(ref cfg) = *acf {
+                let asg = resolve_fut.await;
+                let level =
+                    cfg.check_access_method(&asg, &ctx.host, &ctx.account, 0, &ctx.method, "");
+                if level == AccessLevel::NoAccess {
+                    return None;
+                }
+            }
+            get_fut.await
+        }
+    }
+
+    fn subscribe_ctx(
+        &self,
+        name: &str,
+        ctx: crate::server_native::ChannelContext,
+    ) -> impl std::future::Future<
+        Output = Option<tokio::sync::mpsc::Receiver<PvField>>,
+    > + Send {
+        let acf = self.acf.clone();
+        let resolve_fut = self.resolve_asg(name);
+        let sub_fut = self.subscribe(name);
+        async move {
+            // ACF gate for MONITOR — same Read requirement as
+            // get_value_ctx.
+            if let Some(ref cfg) = *acf {
+                let asg = resolve_fut.await;
+                let level =
+                    cfg.check_access_method(&asg, &ctx.host, &ctx.account, 0, &ctx.method, "");
+                if level == AccessLevel::NoAccess {
+                    return None;
+                }
+            }
+            sub_fut.await
+        }
+    }
+
     fn put_value_ctx(
         &self,
         name: &str,
@@ -677,6 +728,77 @@ ASG(SECURE) {
             err.contains("denied by access security"),
             "denial reason must be visible: {err:?}",
         );
+    }
+
+    /// Round-18 regression: ACF must also gate READ. A peer with
+    /// NoAccess on the record's ASG must observe the same shape as
+    /// "PV not found" (None) — the wire layer surfaces this as
+    /// ECA_NORDACCESS-equivalent.
+    #[tokio::test]
+    async fn get_value_ctx_denies_when_acf_no_access() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // ACF: only members of `ops` UAG may READ, denying everyone
+        // else (no fall-through RULE).
+        let acf_text = r#"
+UAG(ops) { alice }
+ASG(LOCKED) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#;
+        let acf = parse_acf(acf_text).unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0))).await;
+        let rec = db.get_record("AI:LOCKED").await.unwrap();
+        rec.write().await.common.asg = "LOCKED".to_string();
+
+        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(Some(acf)));
+
+        // alice gets a value back.
+        let v = source
+            .get_value_ctx("AI:LOCKED", make_ctx("h", "alice", "anonymous"))
+            .await;
+        assert!(v.is_some(), "alice must be allowed to read");
+
+        // intruder gets None — same shape as unknown PV, surfaced as
+        // an access-denied at the wire layer.
+        let v = source
+            .get_value_ctx("AI:LOCKED", make_ctx("h", "intruder", "anonymous"))
+            .await;
+        assert!(v.is_none(), "intruder must be denied at READ time");
+    }
+
+    /// Round-18: subscribe_ctx must also deny when peer has
+    /// NoAccess.
+    #[tokio::test]
+    async fn subscribe_ctx_denies_when_acf_no_access() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let acf_text = r#"
+UAG(ops) { alice }
+ASG(LOCKED) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#;
+        let acf = parse_acf(acf_text).unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:MON", Box::new(AiRecord::new(0.0))).await;
+        let rec = db.get_record("AI:MON").await.unwrap();
+        rec.write().await.common.asg = "LOCKED".to_string();
+
+        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(Some(acf)));
+
+        let rx = source
+            .subscribe_ctx("AI:MON", make_ctx("h", "alice", "anonymous"))
+            .await;
+        assert!(rx.is_some(), "alice MONITOR must be allowed");
+
+        let rx = source
+            .subscribe_ctx("AI:MON", make_ctx("h", "intruder", "anonymous"))
+            .await;
+        assert!(rx.is_none(), "intruder MONITOR must be denied");
     }
 
     /// Round-17: when the source is built without ACF, behaviour

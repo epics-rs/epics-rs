@@ -1339,7 +1339,15 @@ async fn handle_op(
 
     match kind {
         OpKind::Get => {
-            let value = match source.get_value(&ch.name).await {
+            // ACF-aware GET: forward the peer's credentials. Sources
+            // without ACF default to the legacy `get_value` path.
+            let ctx = crate::server_native::source::ChannelContext {
+                peer,
+                account: cred.account.clone(),
+                method: cred.method.clone(),
+                host: cred.host.clone(),
+            };
+            let value = match source.get_value_ctx(&ch.name, ctx).await {
                 Some(v) => v,
                 None => {
                     send_op_error(tx, OpKind::Get, ioid, "PV not found", order).await?;
@@ -1477,6 +1485,16 @@ async fn handle_op(
                 let src = source.clone();
                 let queue_depth = config.monitor_queue_depth;
                 let high_watermark = config.monitor_high_watermark;
+                // ACF-aware MONITOR: capture the peer's credentials
+                // so the spawned task can consult ctx-aware
+                // subscribe/get_value paths. Sources without ACF
+                // delegate to the legacy methods.
+                let mon_ctx = crate::server_native::source::ChannelContext {
+                    peer,
+                    account: cred.account.clone(),
+                    method: cred.method.clone(),
+                    host: cred.host.clone(),
+                };
                 // Snapshot the window + notify so the spawned task can
                 // share state with this dispatch path's ACK handler.
                 let (window, window_notify, paused_flag) = ch
@@ -1562,12 +1580,15 @@ async fn handle_op(
                         return;
                     }
 
-                    let Some(mut rx) = src.subscribe(&pv_name).await else {
+                    let Some(mut rx) = src.subscribe_ctx(&pv_name, mon_ctx.clone()).await else {
                         return;
                     };
                     let mut over_high = false;
-                    // Emit initial snapshot.
-                    if let Some(initial) = src.get_value(&pv_name).await {
+                    // Emit initial snapshot via the ACF-aware path —
+                    // a peer with NoAccess on the record's ASG sees
+                    // nothing; legacy sources fall through to
+                    // `get_value` via the trait default.
+                    if let Some(initial) = src.get_value_ctx(&pv_name, mon_ctx.clone()).await {
                         // pvxs e9ab67a (2025-10): the first update is
                         // mask-bypassed so the client receives a
                         // *complete* prototype regardless of its

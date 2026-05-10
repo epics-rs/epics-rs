@@ -49,6 +49,19 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// Fetch the current value of a PV.
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
 
+    /// Fetch the current value of a PV with the downstream peer's
+    /// [`ChannelContext`]. Default impl ignores the context and
+    /// forwards to [`Self::get_value`]; ACF-aware sources override
+    /// this so READ may be denied per epics-base PR #563/#618.
+    fn get_value_ctx(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        let _ = ctx;
+        self.get_value(name)
+    }
+
     /// Apply a PUT.
     fn put_value(
         &self,
@@ -80,6 +93,18 @@ pub trait ChannelSource: Send + Sync + 'static {
         &self,
         name: &str,
     ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send;
+
+    /// Context-aware subscribe. Default impl delegates to
+    /// [`Self::subscribe`]; ACF-aware sources override to deny
+    /// MONITOR when the peer has no READ access.
+    fn subscribe_ctx(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        let _ = ctx;
+        self.subscribe(name)
+    }
 
     /// Optional **raw-frame subscribe** (F-G12). When the source can
     /// hand the server pre-encoded MONITOR DATA payloads (e.g. the
@@ -185,6 +210,11 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
+    fn get_value_ctx<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
     fn put_value<'a>(
         &'a self,
         name: &'a str,
@@ -203,6 +233,13 @@ pub trait ChannelSourceObj: Send + Sync {
     fn subscribe<'a>(
         &'a self,
         name: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+    >;
+    fn subscribe_ctx<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
     >;
@@ -248,6 +285,13 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::get_value(self, name))
     }
+    fn get_value_ctx<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::get_value_ctx(self, name, ctx))
+    }
     fn put_value<'a>(
         &'a self,
         name: &'a str,
@@ -278,6 +322,15 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe(self, name))
+    }
+    fn subscribe_ctx<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_ctx(self, name, ctx))
     }
     fn subscribe_raw<'a>(
         &'a self,

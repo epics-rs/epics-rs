@@ -3178,7 +3178,14 @@ fn parse_addr_list() -> CaResult<Vec<SocketAddr>> {
 
     let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
 
-    if auto_addr.eq_ignore_ascii_case("YES") || addrs.is_empty() {
+    // base behaviour (libca configMain.c): when AUTO_ADDR_LIST=NO
+    // the user has explicitly opted out of broadcast discovery, so
+    // honour that even if EPICS_CA_ADDR_LIST is empty. The empty-
+    // list fallback only applies when AUTO_ADDR_LIST is YES (the
+    // default) — that's the "no overrides at all, give me sane
+    // defaults" path. Pre-fix, NO was silently overridden whenever
+    // ADDR_LIST happened to be empty.
+    if auto_addr.eq_ignore_ascii_case("YES") {
         // Add the per-NIC broadcast address for every up, non-loopback
         // interface so multi-NIC clients reach IOCs on every attached
         // subnet (matches libca osiSockDiscoverBroadcastAddresses).

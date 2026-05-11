@@ -1780,7 +1780,22 @@ async fn handle_op(
             };
             let pv_name = ch.name.clone();
             let _ = intro; // INIT pvRequest descriptor — no longer used here.
-            let result = source.rpc(&pv_name, req_desc, req_value).await;
+            // R37-G1 / Round 37: ACF-aware RPC dispatch. The
+            // round-29 / round-32A ACL gates covered GET / PUT /
+            // MONITOR (decoded + raw); RPC was left ungated until
+            // now. Build a ChannelContext from the connecting
+            // peer's credentials and let ACF-aware sources deny.
+            // Sources without ACF fall back to the legacy `rpc`
+            // path via the trait default.
+            let rpc_ctx_val = crate::server_native::source::ChannelContext {
+                peer,
+                account: cred.account.clone(),
+                method: cred.method.clone(),
+                host: cred.host.clone(),
+            };
+            let result = source
+                .rpc_ctx(&pv_name, req_desc, req_value, rpc_ctx_val)
+                .await;
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);

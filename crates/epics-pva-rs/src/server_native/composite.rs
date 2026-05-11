@@ -219,6 +219,29 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    // R37-G1 / Round 37: forward ctx through composite dispatch so
+    // the resolved source's ACF gate runs on RPC.
+    fn rpc_ctx(
+        &self,
+        name: &str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+        let name = name.to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    return src
+                        .rpc_ctx(&name, request_desc, request_value, ctx)
+                        .await;
+                }
+            }
+            Err(format!("no source serves '{name}'"))
+        }
+    }
+
     // F-G6-1: explicitly forward the trait methods that have default
     // impls so the composite doesn't shadow per-source overrides.
     // Round-2 caught the same pattern in the middleware Layer wrappers

@@ -355,6 +355,37 @@ impl ChannelSource for GatewayChannelSource {
     /// parity gap (review §1). With this override, RPC requests pass
     /// through transparently — `pvrpc` reuses the cached channel
     /// connection-pool entry so we don't pay a fresh search per call.
+    /// R37-G1 / Round 37: ACF-aware RPC. Pre-fix the gateway
+    /// forwarded every RPC upstream without consulting the
+    /// gateway-side ACF — a `NoAccess` peer's RPC reached the
+    /// upstream IOC carrying the gateway's identity, completely
+    /// bypassing the gateway's policy. Now an `acl_level !=
+    /// NoAccess` is required before the upstream call.
+    async fn rpc_ctx(
+        &self,
+        name: &str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: ChannelContext,
+    ) -> Result<(FieldDesc, PvField), String> {
+        if self.acl_level(name, &ctx).await == AccessLevel::NoAccess {
+            tracing::debug!(
+                pv = %name,
+                account = %ctx.account,
+                method = %ctx.method,
+                "pva-gateway: RPC denied by gateway ACF"
+            );
+            return Err(format!(
+                "RPC denied by gateway access security: \
+                 PV '{name}' from {host}/{account}/{method}",
+                host = ctx.host,
+                account = ctx.account,
+                method = ctx.method,
+            ));
+        }
+        self.rpc(name, request_desc, request_value).await
+    }
+
     async fn rpc(
         &self,
         name: &str,
@@ -876,6 +907,41 @@ ASG(LOCKED) {
         // Swap back to default.
         src.set_asg_resolver(None).await;
         assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::ReadWrite);
+    }
+
+    /// Round-37 (R37-G1): RPC must consult the gateway ACF too.
+    /// Pre-fix every PVA RPC reached the upstream IOC carrying the
+    /// gateway's identity; a `NoAccess` peer could trigger
+    /// archiver-control RPCs, custom-record state changes, or any
+    /// upstream action RPC.
+    #[tokio::test]
+    async fn rpc_ctx_denies_when_acf_no_access() {
+        use epics_pva_rs::pvdata::{FieldDesc, PvField};
+        let src = make_source();
+        let cfg = parse_acf(
+            r#"
+UAG(ops) { alice }
+ASG(DEFAULT) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        let result = src
+            .rpc_ctx(
+                "some:rpc",
+                FieldDesc::Variant,
+                PvField::Null,
+                make_ctx("anyhost", "intruder", "anonymous"),
+            )
+            .await;
+        let err = result.expect_err("RPC must be denied for NoAccess peer");
+        assert!(
+            err.contains("denied by gateway access security"),
+            "denial message must name the gateway as enforcer: {err:?}",
+        );
     }
 
     /// Round-32A (R31-G6): the F-G12 raw-frame fast path must consult

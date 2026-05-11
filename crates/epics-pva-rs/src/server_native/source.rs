@@ -158,6 +158,25 @@ pub trait ChannelSource: Send + Sync + 'static {
         async move { Err("RPC not supported by this source".to_string()) }
     }
 
+    /// Context-aware RPC dispatch. Round-37 (R37-G1) audit found
+    /// that PVA RPC bypassed every gateway ACF gate: the round-29
+    /// ACL covered GET / PUT / MONITOR (and round-32A covered the
+    /// raw-frame fast path), but tcp.rs's `OpKind::Rpc` branch
+    /// called the legacy `rpc()` — letting a `NoAccess` peer
+    /// invoke action RPCs (archiver controls, custom records,
+    /// gateway-proxied RPCs) without authentication-aware gating.
+    /// Default impl delegates; ACF-aware sources MUST override.
+    fn rpc_ctx(
+        &self,
+        name: &str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+        let _ = ctx;
+        self.rpc(name, request_desc, request_value)
+    }
+
     /// Notify the source that the per-connection monitor outbox for
     /// `name` just crossed UP through its high watermark. Producers
     /// can throttle their post() rate in response. Default impl is
@@ -281,6 +300,15 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
     >;
+    fn rpc_ctx<'a>(
+        &'a self,
+        name: &'a str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
+    >;
     fn notify_watermark_high(&self, name: &str);
     fn notify_watermark_low(&self, name: &str);
 }
@@ -386,6 +414,23 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
             name,
             request_desc,
             request_value,
+        ))
+    }
+    fn rpc_ctx<'a>(
+        &'a self,
+        name: &'a str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::rpc_ctx(
+            self,
+            name,
+            request_desc,
+            request_value,
+            ctx,
         ))
     }
     fn notify_watermark_high(&self, name: &str) {

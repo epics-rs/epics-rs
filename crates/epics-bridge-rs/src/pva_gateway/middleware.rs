@@ -111,6 +111,17 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Result<(FieldDesc, PvField), String> {
         self.inner.rpc(name, request_desc, request_value).await
     }
+    // R37-G1 / Round 37: forward ctx so the inner gateway's ACF
+    // check runs on RPC dispatch too.
+    async fn rpc_ctx(
+        &self,
+        name: &str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> Result<(FieldDesc, PvField), String> {
+        self.inner.rpc_ctx(name, request_desc, request_value, ctx).await
+    }
     fn notify_watermark_high(&self, name: &str) {
         self.inner.notify_watermark_high(name);
     }
@@ -265,6 +276,20 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             return Err(format!("ACL: PV '{name}' denied"));
         }
         self.inner.rpc(name, request_desc, request_value).await
+    }
+    // R37-G1 / Round 37: mirror the allowlist restriction AND
+    // forward ctx so the inner gateway's ACF check runs.
+    async fn rpc_ctx(
+        &self,
+        name: &str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> Result<(FieldDesc, PvField), String> {
+        if !self.config.allowed(name) {
+            return Err(format!("ACL: PV '{name}' denied"));
+        }
+        self.inner.rpc_ctx(name, request_desc, request_value, ctx).await
     }
     fn notify_watermark_high(&self, name: &str) {
         self.inner.notify_watermark_high(name);
@@ -655,6 +680,33 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
                 Err(e) => Err(e.clone()),
             };
             let mut ev = make_audit_event(name, "", "", &outcome);
+            ev.event = AuditEventKind::Rpc;
+            self.sink.record(ev);
+        }
+        result
+    }
+    // R37-G1 / Round 37: ctx-aware audit + RPC dispatch. Populates
+    // the audit row with the downstream peer's credentials and
+    // forwards ctx so the inner gateway's ACF check runs.
+    async fn rpc_ctx(
+        &self,
+        name: &str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> Result<(FieldDesc, PvField), String> {
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self
+            .inner
+            .rpc_ctx(name, request_desc, request_value, ctx)
+            .await;
+        if self.audit_rpc {
+            let outcome: Result<(), String> = match &result {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.clone()),
+            };
+            let mut ev = make_audit_event(name, &user, &host, &outcome);
             ev.event = AuditEventKind::Rpc;
             self.sink.record(ev);
         }

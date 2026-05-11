@@ -43,7 +43,7 @@ pub struct PvDatabaseSource {
 impl PvDatabaseSource {
     pub fn new(db: Arc<PvDatabase>) -> Self {
         let acf: AcfCell = Arc::new(RwLock::new(None));
-        let gate = Self::build_gate(db.clone(), acf);
+        let gate = Self::build_gate(db.clone(), acf, None);
         Self { db, gate }
     }
 
@@ -51,13 +51,29 @@ impl PvDatabaseSource {
     /// installs from its builder-supplied ACF — every PUT goes
     /// through `check_access_method` against the record's `ASG`.
     pub fn new_with_acf(db: Arc<PvDatabase>, acf: AcfCell) -> Self {
-        let gate = Self::build_gate(db.clone(), acf);
+        let gate = Self::build_gate(db.clone(), acf, None);
+        Self { db, gate }
+    }
+
+    /// Round 48 (R48-G3): build with an externally-supplied
+    /// `acl_version` counter. `PvaServer` shares the same `Arc` so
+    /// its `reload_acf_from` / `clear_acf` can bump the version
+    /// that this source's gate exposes, forcing monitor tasks
+    /// spawned on top of this source to re-check on their next
+    /// event.
+    pub fn new_with_acf_and_version(
+        db: Arc<PvDatabase>,
+        acf: AcfCell,
+        acl_version: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let gate = Self::build_gate(db.clone(), acf, Some(acl_version));
         Self { db, gate }
     }
 
     fn build_gate(
         db: Arc<PvDatabase>,
         acf: AcfCell,
+        acl_version: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> epics_base_rs::server::access_security::AccessGate {
         use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver};
         let resolver: AsgAslResolver = Arc::new(move |pv_name| {
@@ -76,7 +92,10 @@ impl PvDatabaseSource {
                 ("DEFAULT".to_string(), 0u8)
             })
         });
-        AccessGate::required(acf, resolver)
+        match acl_version {
+            Some(v) => AccessGate::required_with_version(acf, resolver, v),
+            None => AccessGate::required(acf, resolver),
+        }
     }
 
     pub fn database(&self) -> &Arc<PvDatabase> {

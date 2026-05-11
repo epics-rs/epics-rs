@@ -77,6 +77,16 @@ impl AccessChecked {
 ///   network). All checks return a `ReadWrite` token.
 pub struct AccessGate {
     inner: AccessGateInner,
+    /// Round 48 (R48-G3): monotonic counter bumped whenever the
+    /// gate's underlying ACF policy changes (reload / clear / hot
+    /// swap). Long-lived consumers (PVA monitor tasks spawned at
+    /// SUBSCRIBE time, gateway bridge tasks) capture the value at
+    /// spawn and compare on each event; a mismatch forces a fresh
+    /// `check()` so a peer that was allowed at subscribe time but
+    /// is now `NoAccess` under the new policy sees its subscription
+    /// torn down on the next event (matching the round-39 CA-side
+    /// `reeval_access_rights` semantics).
+    acl_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Asynchronous closure that resolves `pv_name → (ASG, ASL)` for a
@@ -105,13 +115,34 @@ enum AccessGateInner {
 
 impl AccessGate {
     /// Build a gate that consults an ACF cell + a per-name
-    /// `(ASG, ASL)` resolver.
+    /// `(ASG, ASL)` resolver. Allocates a fresh `acl_version`
+    /// counter; use [`Self::required_with_version`] to share the
+    /// counter with the owning server (so its `reload_acf_from`
+    /// can signal the same generation bump this gate observes).
     pub fn required(
         acf: std::sync::Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
         resolver: AsgAslResolver,
     ) -> Self {
+        Self::required_with_version(
+            acf,
+            resolver,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    }
+
+    /// Build a gate with an externally-supplied `acl_version`
+    /// counter. The owning server (e.g. `PvaServer`) keeps the
+    /// same `Arc` and `fetch_add`s on every `reload_acf_from` /
+    /// `clear_acf` so monitor tasks holding the gate observe a
+    /// version bump on their next event.
+    pub fn required_with_version(
+        acf: std::sync::Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+        resolver: AsgAslResolver,
+        acl_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
         Self {
             inner: AccessGateInner::Required { acf, resolver },
+            acl_version,
         }
     }
 
@@ -121,7 +152,25 @@ impl AccessGate {
     pub fn open() -> Self {
         Self {
             inner: AccessGateInner::Open,
+            acl_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Current ACL generation. Monitor / subscription tasks capture
+    /// this at spawn time and compare on each event. A bump (via
+    /// [`Self::bump_acl_version`]) signals "the underlying ACF
+    /// changed — re-check before forwarding the next event".
+    pub fn acl_version(&self) -> u64 {
+        self.acl_version
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Bump the ACL generation. Called by the owning server after
+    /// swapping the ACF policy. Long-lived consumers detect the
+    /// change on their next event and re-check.
+    pub fn bump_acl_version(&self) {
+        self.acl_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Perform the access check for `pv_name` under the connecting

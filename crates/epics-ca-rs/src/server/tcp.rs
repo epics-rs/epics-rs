@@ -338,34 +338,36 @@ impl ClientState {
                     .find(|fd| fd.name == f.as_str())
                     .map(|fd| fd.read_only)
                     .unwrap_or(false);
-                if is_ro {
-                    1
+                // R48-G2 (Round 48): read-only field-ness must AND
+                // with ACF, never replace it. Pre-fix the read-only
+                // branch returned `Read`(1) unconditionally — a
+                // peer whose ACF resolved to `NoAccess` could still
+                // READ / EVENT_ADD on every read-only field because
+                // the cached access_rights skipped the ACF check
+                // entirely. Now ACF runs first; the read-only flag
+                // only strips the WRITE bit from the result.
+                let guard = self.acf.read().await;
+                let acf_level = if let Some(ref acf_cfg) = *guard {
+                    // Round-33A (R33-G4): thread the per-record
+                    // ASL into the ACF check so `RULE(N, …)`
+                    // gates correctly disable rules whose level
+                    // is below the record's ASL.
+                    let asg = &instance.common.asg;
+                    let asl = instance.common.asl;
+                    acf_cfg.check_access_asl(
+                        asg,
+                        &self.hostname,
+                        &self.username,
+                        asl,
+                    )
                 } else {
-                    let guard = self.acf.read().await;
-                    if let Some(ref acf_cfg) = *guard {
-                        // Round-33A (R33-G4): thread the per-record
-                        // ASL into the ACF check so `RULE(N, …)`
-                        // gates correctly disable rules whose level
-                        // is below the record's ASL. Pre-fix every
-                        // CA-served record was treated as ASL=0,
-                        // so a `RULE(1, WRITE)` was applied to ALL
-                        // records — including those with `ASL=0`
-                        // that the C IOC would lock down.
-                        let asg = &instance.common.asg;
-                        let asl = instance.common.asl;
-                        match acf_cfg.check_access_asl(
-                            asg,
-                            &self.hostname,
-                            &self.username,
-                            asl,
-                        ) {
-                            AccessLevel::ReadWrite => 3,
-                            AccessLevel::Read => 1,
-                            AccessLevel::NoAccess => 0,
-                        }
-                    } else {
-                        3
-                    }
+                    AccessLevel::ReadWrite
+                };
+                match (acf_level, is_ro) {
+                    (AccessLevel::NoAccess, _) => 0,
+                    (AccessLevel::Read, _) => 1,
+                    (AccessLevel::ReadWrite, true) => 1,
+                    (AccessLevel::ReadWrite, false) => 3,
                 }
             }
         }

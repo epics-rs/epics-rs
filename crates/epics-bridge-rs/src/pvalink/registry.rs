@@ -73,10 +73,34 @@ impl PvaLinkRegistry {
 
         if !claim {
             // Loser path: wait for the winner to finish, then read
-            // the cached entry. If the winner errored, the entry
-            // is absent — fall through to a fresh open under our
-            // own claim (rare).
-            notify.notified().await;
+            // the cached entry.
+            //
+            // R48-G1: must register as a waiter BEFORE re-checking
+            // the map. Tokio `Notify::notify_waiters()` does not
+            // buffer permits, so the winner's guard drop can wake
+            // every currently-registered waiter and then leave a
+            // late `.notified().await` first-poll permanently
+            // pending. The fix mirrors the
+            // `enable()`-then-recheck-then-await pattern in
+            // `epics-pva-rs/src/server_native/tcp.rs` (and the
+            // tokio Notify docs): pin the future, call
+            // `enable()` to register the waker synchronously, then
+            // re-read the map. A wake that fires between the pin
+            // and the await is now safely observed.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(existing) = self.map.read().get(&key).cloned() {
+                return Ok(existing);
+            }
+            // Winner may have already finished + cleared the
+            // pending slot; in that case the map should hold the
+            // entry (just re-checked above). If we get here the
+            // winner errored and the entry is absent — recurse.
+            if !self.pending.read().contains_key(&key) {
+                return Box::pin(self.get_or_open(config)).await;
+            }
+            notified.await;
             if let Some(existing) = self.map.read().get(&key).cloned() {
                 return Ok(existing);
             }

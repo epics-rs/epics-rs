@@ -1553,6 +1553,21 @@ async fn handle_op(
                     .access_gate()
                     .check(&pv_name, &mon_ctx.host, &mon_ctx.account, &mon_ctx.method, "")
                     .await;
+                // R48-G3: capture the gate's ACL generation at
+                // spawn time. The forwarding loop compares this to
+                // the live generation on every event; on a bump
+                // (caused by `PvaServer::reload_acf_from` /
+                // `clear_acf`) the task re-checks ACL and tears
+                // down the subscription with a MONITOR FINISH
+                // frame if the new policy denies the peer.
+                // Wrapped in AtomicU64 so the spawned forwarding
+                // loop can resync on a successful re-check (the
+                // surviving peer's "current" generation moves
+                // forward without triggering re-check on every
+                // subsequent event).
+                let mon_acl_version_at_subscribe_cell = Arc::new(
+                    std::sync::atomic::AtomicU64::new(source.access_gate().acl_version()),
+                );
                 // Snapshot the window + notify so the spawned task can
                 // share state with this dispatch path's ACK handler.
                 let (window, window_notify, paused_flag) = ch
@@ -1626,6 +1641,38 @@ async fn handle_op(
                             }
                         }
                         while let Some(ev) = rx_raw.recv().await {
+                            // R48-G3: ACL re-check on policy reload.
+                            // If the gate's ACL generation has bumped
+                            // since subscribe time, the operator hot-
+                            // swapped the ACF; re-mint AccessChecked
+                            // and tear down if the new policy denies
+                            // this peer.
+                            let live_v = src.access_gate().acl_version();
+                            if live_v
+                                != mon_acl_version_at_subscribe_cell
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                let re_checked = src
+                                    .access_gate()
+                                    .check(
+                                        &pv_name,
+                                        &mon_ctx.host,
+                                        &mon_ctx.account,
+                                        &mon_ctx.method,
+                                        "",
+                                    )
+                                    .await;
+                                if !re_checked.allows_read() {
+                                    let finish = build_monitor_finish(ioid, order);
+                                    let _ = tx_clone.send(finish).await;
+                                    return;
+                                }
+                                // Survive — resync the version so we
+                                // don't re-check on every event under
+                                // the new policy.
+                                mon_acl_version_at_subscribe_cell
+                                    .store(live_v, std::sync::atomic::Ordering::Release);
+                            }
                             // Refuse the fast path on byte-order
                             // mismatch (cross-host gateway, rare).
                             // Falling back means re-decoding to
@@ -1692,6 +1739,35 @@ async fn handle_op(
                     // value if more than `queue_depth` events stack up.
                     let mut squashing = false;
                     while let Some(mut value) = rx.recv().await {
+                        // R48-G3: ACL re-check on policy reload (same
+                        // shape as the raw-fast-path branch above).
+                        // The gate's `acl_version` bumps on every
+                        // PvaServer ACF swap; on mismatch we
+                        // re-mint AccessChecked and tear down with
+                        // a MONITOR FINISH if the new policy denies.
+                        let live_v = src.access_gate().acl_version();
+                        if live_v
+                            != mon_acl_version_at_subscribe_cell
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            let re_checked = src
+                                .access_gate()
+                                .check(
+                                    &pv_name,
+                                    &mon_ctx.host,
+                                    &mon_ctx.account,
+                                    &mon_ctx.method,
+                                    "",
+                                )
+                                .await;
+                            if !re_checked.allows_read() {
+                                let finish = build_monitor_finish(ioid, order);
+                                let _ = tx_clone.send(finish).await;
+                                return;
+                            }
+                            mon_acl_version_at_subscribe_cell
+                                .store(live_v, std::sync::atomic::Ordering::Release);
+                        }
                         // Drain extras; keep the latest.
                         let mut squashed = 0usize;
                         loop {

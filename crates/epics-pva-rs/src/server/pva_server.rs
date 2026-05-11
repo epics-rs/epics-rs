@@ -71,6 +71,7 @@ impl PvaServerBuilder {
             db,
             port: self.port,
             acf,
+            acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager: None,
         })
@@ -93,6 +94,13 @@ pub struct PvaServer {
     /// All `PvDatabaseSource` ACF check sites pick the latest
     /// policy on their next read.
     acf: crate::server::native_source::AcfCell,
+    /// Round 48 (R48-G3): monotonic ACL generation. Bumped by
+    /// `reload_acf_from` / `clear_acf`. The default
+    /// `PvDatabaseSource` constructed in `run()` shares this `Arc`
+    /// via `AccessGate::required_with_version`, so monitor tasks
+    /// observe the bump on their next event and tear down
+    /// subscriptions that the new policy denies.
+    acl_version: Arc<std::sync::atomic::AtomicU64>,
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
 }
@@ -113,6 +121,7 @@ impl PvaServer {
             db,
             port,
             acf: Arc::new(tokio::sync::RwLock::new(acf)),
+            acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager,
         }
@@ -127,6 +136,15 @@ impl PvaServer {
         let content = std::fs::read_to_string(path).map_err(epics_base_rs::error::CaError::Io)?;
         let cfg = access_security::parse_acf(&content)?;
         *self.acf.write().await = Some(cfg);
+        // R48-G3: bump the shared ACL generation so monitor tasks
+        // spawned on the default `PvDatabaseSource` (which captured
+        // this counter at spawn time) detect the change on their
+        // next event and re-check ACL — peers that the new policy
+        // denies see their subscriptions torn down with a MONITOR
+        // FINISH frame, matching the round-39 CA `reeval_access_rights`
+        // semantics.
+        self.acl_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -135,6 +153,8 @@ impl PvaServer {
     /// negative form of `reload_acf_from`.
     pub async fn clear_acf(&self) {
         *self.acf.write().await = None;
+        self.acl_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     pub fn database(&self) -> &Arc<PvDatabase> {
@@ -161,9 +181,10 @@ impl PvaServer {
     /// source via [`Self::run_with_source`] are responsible for
     /// installing ACF themselves.
     pub async fn run(&self) -> CaResult<()> {
-        let source = Arc::new(PvDatabaseSource::new_with_acf(
+        let source = Arc::new(PvDatabaseSource::new_with_acf_and_version(
             self.db.clone(),
             self.acf.clone(),
+            self.acl_version.clone(),
         ));
         self.run_with_source(source).await
     }

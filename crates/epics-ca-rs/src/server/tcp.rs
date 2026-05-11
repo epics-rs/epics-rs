@@ -1181,6 +1181,34 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
+            // R38-G2 / Round 38: CA READ must consult access_rights.
+            // Pre-fix any client could read any channel regardless of
+            // the ASG/ASL gate computed at CREATE_CHAN — the round-33A
+            // ASL plumbing only surfaced in the access_rights mask sent
+            // to the client (advisory) and in the WRITE enforcement
+            // path. The C IOC's `read_NoAccess` (camessage.c) refuses
+            // GET on NoAccess channels with ECA_NORDACCESS; mirror it.
+            // Default missing entries to `NoAccess` so a corrupted
+            // channel-table state cannot leak data.
+            let read_access = state
+                .channel_access
+                .get(&sid)
+                .copied()
+                .unwrap_or(AccessLevel::NoAccess);
+            if read_access == AccessLevel::NoAccess {
+                if is_notify {
+                    send_cmd_error(
+                        writer,
+                        CA_PROTO_READ_NOTIFY,
+                        requested_type,
+                        ECA_NORDACCESS,
+                        ioid,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+
             let snapshot = get_full_snapshot(&entry.target).await;
             let Some(mut snapshot) = snapshot else {
                 if is_notify {
@@ -1391,12 +1419,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            // Check access level
+            // Check access level. Round-38 (R38-G1): the missing-
+            // entry fallback used to grant `ReadWrite`, which would
+            // permit a WRITE in any path that landed an entry in
+            // `state.channels` without landing one in
+            // `state.channel_access`. Default to `NoAccess` so a
+            // bookkeeping defect can never silently grant WRITE.
             let access = state
                 .channel_access
                 .get(&sid)
                 .copied()
-                .unwrap_or(AccessLevel::ReadWrite);
+                .unwrap_or(AccessLevel::NoAccess);
             if access != AccessLevel::ReadWrite {
                 if is_notify {
                     let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
@@ -1584,6 +1617,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     return Ok(());
                 }
             };
+
+            // R38-G3 / Round 38: EVENT_ADD must also consult the
+            // channel's access_rights. A NoAccess peer mounting a
+            // subscription would receive every value update —
+            // identical leak to the round-32A `subscribe_raw` ACF
+            // bypass on the PVA side. C IOC's `event_add_NoAccess`
+            // returns ECA_NORDACCESS for the same reason.
+            let sub_access = state
+                .channel_access
+                .get(&sid)
+                .copied()
+                .unwrap_or(AccessLevel::NoAccess);
+            if sub_access == AccessLevel::NoAccess {
+                send_cmd_error(
+                    writer,
+                    CA_PROTO_EVENT_ADD,
+                    requested_type,
+                    ECA_NORDACCESS,
+                    sub_id,
+                )
+                .await?;
+                return Ok(());
+            }
 
             // Refuse a duplicate sub_id on the same connection. Without
             // this, two EVENT_ADDs with identical sub_id leave both

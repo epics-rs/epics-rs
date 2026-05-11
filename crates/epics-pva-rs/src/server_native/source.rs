@@ -127,6 +127,23 @@ pub trait ChannelSource: Send + Sync + 'static {
         async { None }
     }
 
+    /// Context-aware raw-frame subscribe. Round-30A audit (R31-G6)
+    /// found that the round-29 ACF gate covered the decoded
+    /// `subscribe_ctx` path but NOT the raw-frame fast path: a
+    /// gateway peer with `NoAccess` on a PV's ASG could still mount
+    /// the raw `subscribe_raw` subscription and receive every
+    /// upstream MONITOR event verbatim. Default impl delegates to
+    /// the legacy `subscribe_raw`; ACF-aware sources MUST override
+    /// to deny when the peer lacks READ.
+    fn subscribe_raw_ctx(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+        let _ = ctx;
+        self.subscribe_raw(name)
+    }
+
     /// Dispatch an RPC. The default impl returns "RPC not supported";
     /// implementors can override to provide actual RPC behaviour.
     ///
@@ -249,6 +266,13 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
     >;
+    fn subscribe_raw_ctx<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+    >;
     fn rpc<'a>(
         &'a self,
         name: &'a str,
@@ -339,6 +363,15 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_raw(self, name))
+    }
+    fn subscribe_raw_ctx<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_raw_ctx(self, name, ctx))
     }
     fn rpc<'a>(
         &'a self,

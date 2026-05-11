@@ -101,7 +101,13 @@ pub struct GatewayChannelSource {
     /// PV→ASG resolver. Defaults to `DEFAULT` for every name; sites
     /// that want per-PV ASG granularity replace this via
     /// [`set_asg_resolver`].
-    asg_resolver: AsgResolver,
+    ///
+    /// Round-32D (R31-G8): wrapped in `RwLock` so the resolver can
+    /// be hot-swapped at runtime — the gateway is typically handed
+    /// off to `PvaServer` behind an `Arc` (or its trait-object
+    /// equivalent), so a `&mut self` setter is unreachable after
+    /// installation. Mirrors the `acf` cell's hot-swap pattern.
+    asg_resolver: Arc<RwLock<AsgResolver>>,
 }
 
 impl GatewayChannelSource {
@@ -115,18 +121,22 @@ impl GatewayChannelSource {
             subscriber_count: Arc::new(AtomicUsize::new(0)),
             upstream_pool: Arc::new(Mutex::new(HashMap::new())),
             acf: Arc::new(RwLock::new(None)),
-            asg_resolver: default_asg_resolver(),
+            asg_resolver: Arc::new(RwLock::new(default_asg_resolver())),
         }
     }
 
-    /// Install a custom PV→ASG resolver. Mirrors the C IOC's
+    /// Install (or hot-swap) the PV→ASG resolver. Mirrors the C IOC's
     /// per-record `ASG` field: each downstream channel name maps to
     /// the ASG that gates GET / PUT / MONITOR for that PV. The
     /// resolver is called on every op so should be O(1) on average
     /// — typically a pre-built `HashMap` or compiled-regex table.
     /// Pass `None` to reset to the `DEFAULT`-everywhere default.
-    pub fn set_asg_resolver(&mut self, resolver: Option<AsgResolver>) {
-        self.asg_resolver = resolver.unwrap_or_else(default_asg_resolver);
+    ///
+    /// Round-32D: takes `&self` and writes through `RwLock`, so the
+    /// resolver may be replaced after the source has been handed to
+    /// `PvaServer` behind an `Arc`.
+    pub async fn set_asg_resolver(&self, resolver: Option<AsgResolver>) {
+        *self.asg_resolver.write().await = resolver.unwrap_or_else(default_asg_resolver);
     }
 
     /// Install (or hot-swap) the gateway-side ACF policy. None
@@ -156,7 +166,13 @@ impl GatewayChannelSource {
         match *guard {
             None => AccessLevel::ReadWrite,
             Some(ref cfg) => {
-                let asg = (self.asg_resolver)(pv);
+                // Round-32D: read-lock the resolver cell; the closure
+                // runs while the read lock is held so the swap is
+                // serialized vs. in-flight evaluations. The closure
+                // itself should be O(1) — comment on `AsgResolver`
+                // documents this.
+                let resolver = self.asg_resolver.read().await;
+                let asg = (resolver)(pv);
                 cfg.check_access_method(
                     &asg,
                     &ctx.host,
@@ -437,6 +453,31 @@ impl ChannelSource for GatewayChannelSource {
             return None;
         }
         self.subscribe(name).await
+    }
+
+    /// Round-32A (R31-G6): ACF-aware raw-frame MONITOR. The
+    /// round-29 ACL gate covered `subscribe_ctx` only; the F-G12
+    /// raw fast path went straight to `subscribe_raw`, letting a
+    /// `NoAccess` peer mount a wire-byte-forwarded subscription
+    /// that bypassed every downstream re-encode and every ACF
+    /// hook. Denying here causes the tcp.rs MONITOR handler to
+    /// fall through to `subscribe_ctx`, which also denies — so
+    /// no events leak to the peer.
+    async fn subscribe_raw_ctx(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+        if self.acl_level(name, &ctx).await == AccessLevel::NoAccess {
+            tracing::debug!(
+                pv = %name,
+                account = %ctx.account,
+                method = %ctx.method,
+                "pva-gateway: raw MONITOR denied by gateway ACF"
+            );
+            return None;
+        }
+        self.subscribe_raw(name).await
     }
 
     async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
@@ -754,7 +795,7 @@ ASG(DEFAULT) {
     /// behaviour of a C IOC.
     #[tokio::test]
     async fn acl_level_uses_per_pv_asg_resolver() {
-        let mut src = make_source();
+        let src = make_source();
         // Two PV namespaces — `set:*` lives under WRITE-restricted
         // OPERATOR; `dev:*` lives under READ-only LOCKED. A peer
         // without WRITE on OPERATOR may still PUT to DEFAULT.
@@ -785,7 +826,7 @@ ASG(LOCKED) {
             } else {
                 "DEFAULT".to_string()
             }
-        })));
+        }))).await;
 
         let guest = make_ctx("anyhost", "guest", "anonymous");
         let admin = make_ctx("anyhost", "admin", "anonymous");
@@ -800,5 +841,73 @@ ASG(LOCKED) {
         // LOCKED-routed PV: everyone READ-only (no WRITE rule).
         assert_eq!(src.acl_level("dev:hwid", &admin).await, AccessLevel::Read);
         assert_eq!(src.acl_level("dev:hwid", &guest).await, AccessLevel::Read);
+    }
+
+    /// Round-32D (R31-G8): the resolver must be hot-swappable after
+    /// the gateway is wrapped behind an Arc / handed to PvaServer.
+    /// Pre-fix `set_asg_resolver(&mut self)` was unreachable in the
+    /// production path; this confirms the `&self` + RwLock swap
+    /// works and the new policy is observed on subsequent ACL checks.
+    #[tokio::test]
+    async fn asg_resolver_swap_takes_effect_on_next_acl_check() {
+        let src = make_source();
+        let cfg = parse_acf(
+            r#"
+ASG(DEFAULT) {
+    RULE(1, READ)
+    RULE(1, WRITE)
+}
+ASG(LOCKED) {
+    RULE(1, READ)
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        // Initial resolver: everything is DEFAULT (RW).
+        let ctx = make_ctx("h", "anyone", "anonymous");
+        assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::ReadWrite);
+
+        // Hot-swap: route everything to LOCKED (read-only).
+        src.set_asg_resolver(Some(Arc::new(|_pv| "LOCKED".to_string()))).await;
+        assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::Read);
+
+        // Swap back to default.
+        src.set_asg_resolver(None).await;
+        assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::ReadWrite);
+    }
+
+    /// Round-32A (R31-G6): the F-G12 raw-frame fast path must consult
+    /// the same ACF gate as the decoded `subscribe_ctx` path. Pre-fix
+    /// a NoAccess peer could mount a `subscribe_raw` subscription
+    /// (since the round-29 gate covered `subscribe_ctx` only) and
+    /// receive every upstream MONITOR event byte-for-byte.
+    #[tokio::test]
+    async fn subscribe_raw_ctx_denies_when_acf_no_access() {
+        let src = make_source();
+        // ASG with no fall-through rule — every UAG-less peer hits
+        // NoAccess.
+        let cfg = parse_acf(
+            r#"
+UAG(ops) { alice }
+ASG(DEFAULT) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        let rx = src
+            .subscribe_raw_ctx(
+                "any:pv",
+                make_ctx("anyhost", "intruder", "anonymous"),
+            )
+            .await;
+        assert!(
+            rx.is_none(),
+            "raw subscribe must be denied for a NoAccess peer"
+        );
     }
 }

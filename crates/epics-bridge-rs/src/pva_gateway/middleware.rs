@@ -91,6 +91,18 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     async fn subscribe_raw(&self, name: &str) -> Option<mpsc::Receiver<RawMonitorEvent>> {
         self.inner.subscribe_raw(name).await
     }
+    // R31-G6 / Round-32A: forward ctx so the inner source's ACF
+    // gate runs on the raw fast path too. Without this override the
+    // trait default would drop ctx and call back into our
+    // `subscribe_raw(name)` — letting a `NoAccess` peer mount a
+    // raw subscription that completely bypasses the gateway ACL.
+    async fn subscribe_raw_ctx(
+        &self,
+        name: &str,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+        self.inner.subscribe_raw_ctx(name, ctx).await
+    }
     async fn rpc(
         &self,
         name: &str,
@@ -228,6 +240,20 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             return None;
         }
         self.inner.subscribe_raw(name).await
+    }
+    // R31-G6 / Round-32A: mirror `subscribe_raw`'s allowlist
+    // restriction AND forward ctx so the inner source's ACF gate
+    // runs on the raw fast path. Acl's static allowlist and the
+    // gateway's per-PV ASG must both apply.
+    async fn subscribe_raw_ctx(
+        &self,
+        name: &str,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+        if !self.config.allowed(name) {
+            return None;
+        }
+        self.inner.subscribe_raw_ctx(name, ctx).await
     }
     async fn rpc(
         &self,
@@ -587,6 +613,30 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
                 Err(format!("PV '{name}' not subscribable (raw)"))
             };
             let mut ev = make_audit_event(name, "", "", &outcome);
+            ev.event = AuditEventKind::Subscribe;
+            self.sink.record(ev);
+        }
+        result
+    }
+    // R31-G6 / Round-32A: ctx-aware audit + raw-frame subscribe.
+    // Same audit shape as `subscribe_raw` but populates the user /
+    // host columns from the downstream credentials, and forwards
+    // ctx so the inner gateway's ACF check runs.
+    async fn subscribe_raw_ctx(
+        &self,
+        name: &str,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.subscribe_raw_ctx(name, ctx).await;
+        if self.audit_subscribe {
+            let outcome: Result<(), String> = if result.is_some() {
+                Ok(())
+            } else {
+                Err(format!("PV '{name}' not subscribable (raw)"))
+            };
+            let mut ev = make_audit_event(name, &user, &host, &outcome);
             ev.event = AuditEventKind::Subscribe;
             self.sink.record(ev);
         }

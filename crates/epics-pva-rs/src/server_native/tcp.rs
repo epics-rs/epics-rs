@@ -1398,7 +1398,6 @@ async fn handle_op(
             payload.put_u8(0x00);
             match result {
                 Ok(()) => {
-                    Status::ok().write_into(order, &mut payload);
                     // PUT_GET (subcmd bit 0x40 set on the request): client
                     // wants the post-put value back. Per pvxs serverget.cpp:103
                     // the response carries `bitset + partial value` after the
@@ -1406,11 +1405,36 @@ async fn handle_op(
                     // with READ-only or NoAccess on its ASG does not see
                     // a leaked value through the PUT_GET return path.
                     if subcmd & 0x40 != 0 {
-                        if let Some(v) = source.get_value_ctx(&pv_name, ctx).await {
-                            let bits = BitSet::all_set(intro.total_bits());
-                            bits.write_into(order, &mut payload);
-                            encode_pv_field(&v, &intro, order, &mut payload);
+                        // R31-G7 / Round-32B: build the readback FIRST,
+                        // then write status. If get_value_ctx returns
+                        // None (ACF denies READ even though PUT was
+                        // allowed — e.g. WRITE-only ASG), we MUST NOT
+                        // emit `status_ok` followed by no bytes — that
+                        // truncates the wire and the client decoder
+                        // expects a bitset+value to follow. Instead,
+                        // emit an all-zero bitset (no fields changed)
+                        // alongside the OK status: client decodes
+                        // zero fields, no value bytes consumed, PUT
+                        // reported successful — same wire shape as a
+                        // "put committed but no field deltas to
+                        // report" response.
+                        match source.get_value_ctx(&pv_name, ctx).await {
+                            Some(v) => {
+                                Status::ok().write_into(order, &mut payload);
+                                let bits = BitSet::all_set(intro.total_bits());
+                                bits.write_into(order, &mut payload);
+                                encode_pv_field(&v, &intro, order, &mut payload);
+                            }
+                            None => {
+                                Status::ok().write_into(order, &mut payload);
+                                let empty = BitSet::with_capacity(intro.total_bits());
+                                empty.write_into(order, &mut payload);
+                                // No encode_pv_field — bitset.count()==0
+                                // means zero partial fields follow.
+                            }
                         }
+                    } else {
+                        Status::ok().write_into(order, &mut payload);
                     }
                 }
                 Err(msg) => Status::error(msg).write_into(order, &mut payload),
@@ -1535,7 +1559,16 @@ async fn handle_op(
                     // forward. Falls back to the decoded path on
                     // byte-order mismatch or when the source returns
                     // None.
-                    if raw_path_eligible && let Some(mut rx_raw) = src.subscribe_raw(&pv_name).await
+                    // R31-G6 / Round-32A: raw fast path must consult
+                    // the ACF too. The round-29 ACL gate covered
+                    // `subscribe_ctx` only; ACF-aware sources can now
+                    // override `subscribe_raw_ctx` to deny when the
+                    // peer lacks READ. When the gateway denies (returns
+                    // None), we fall through to the decoded
+                    // `subscribe_ctx` below — which is also ACF-gated
+                    // and will likewise return None.
+                    if raw_path_eligible
+                        && let Some(mut rx_raw) = src.subscribe_raw_ctx(&pv_name, mon_ctx.clone()).await
                     {
                         // Emit initial snapshot via the regular
                         // encode path (no raw bytes for the

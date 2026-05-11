@@ -260,6 +260,26 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    // R31-G6 / Round-32A: forward ctx through the composite dispatch
+    // so the resolved source sees the downstream credentials on the
+    // raw fast path too.
+    fn subscribe_raw_ctx(
+        &self,
+        name: &str,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+        let name = name.to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    return src.subscribe_raw_ctx(&name, ctx).await;
+                }
+            }
+            None
+        }
+    }
+
     fn notify_watermark_high(&self, name: &str) {
         for src in self.snapshot() {
             // No has_pv check — fire on every source that registered.

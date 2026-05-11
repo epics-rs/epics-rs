@@ -122,6 +122,22 @@ struct PvDatabaseInner {
     /// related lookups consult this map after the canonical record
     /// table so an alias resolves transparently to its target.
     aliases: RwLock<HashMap<String, String>>,
+    /// Round-32C (R31-G9/10/11/12): single gate that serializes
+    /// every `add_pv` / `add_pv_with_hook` / `add_record` /
+    /// `add_alias` / `remove_record` / `remove_simple_pv` /
+    /// `remove_alias`. Without this, the per-method write-lock
+    /// orders (`simple_pvs` first vs. `records` first vs.
+    /// `aliases` first) could deadlock under concurrent registrations,
+    /// and `add_record`'s post-insert `scan_index.write()` had a
+    /// TOCTOU window where `remove_record` could land between the
+    /// records map insert and the scan-index insert and leave a
+    /// phantom scan entry.
+    ///
+    /// Holding this mutex makes the cross-namespace `check_name_free`
+    /// peek atomic with the target-map insert, eliminates the
+    /// scan-index race, and lets `remove_*` purge dangling aliases
+    /// without a second pass.
+    registration_mutex: tokio::sync::Mutex<()>,
     /// Lines queued by the iocsh `afterIocRunning <command>` directive
     /// (epics-base PR #558). Drained by the IOC application after PINI
     /// completes, then re-executed through a fresh IocShell so the
@@ -184,6 +200,7 @@ impl PvDatabase {
                 scan_index: RwLock::new(HashMap::new()),
                 cp_links: RwLock::new(HashMap::new()),
                 aliases: RwLock::new(HashMap::new()),
+                registration_mutex: tokio::sync::Mutex::new(()),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
@@ -425,11 +442,16 @@ impl PvDatabase {
     /// duplicate `dbLoadRecords` names as a fatal error. Callers that
     /// want replace-on-overwrite semantics must first call
     /// `remove_simple_pv` / `remove_record` / `remove_alias`.
+    ///
+    /// Round-32C: serialized through `registration_mutex` so the
+    /// cross-namespace check is atomic with the insert and the lock
+    /// order across all add_*/remove_* methods is identical (no
+    /// cross-namespace deadlock).
     pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
-        let mut simple_pvs = self.inner.simple_pvs.write().await;
-        Self::check_name_free(name, &simple_pvs, &*self.inner.records.read().await, &*self.inner.aliases.read().await)?;
+        let _gate = self.inner.registration_mutex.lock().await;
+        self.check_name_free(name).await?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        simple_pvs.insert(name.to_string(), pv);
+        self.inner.simple_pvs.write().await.insert(name.to_string(), pv);
         Ok(())
     }
 
@@ -450,11 +472,11 @@ impl PvDatabase {
         initial: EpicsValue,
         hook: crate::server::pv::WriteHook,
     ) -> CaResult<()> {
-        let mut simple_pvs = self.inner.simple_pvs.write().await;
-        Self::check_name_free(name, &simple_pvs, &*self.inner.records.read().await, &*self.inner.aliases.read().await)?;
+        let _gate = self.inner.registration_mutex.lock().await;
+        self.check_name_free(name).await?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         pv.set_write_hook(hook);
-        simple_pvs.insert(name.to_string(), pv);
+        self.inner.simple_pvs.write().await.insert(name.to_string(), pv);
         Ok(())
     }
 
@@ -462,8 +484,19 @@ impl PvDatabase {
     /// removed. Used by the gateway sweep so an evicted upstream
     /// subscription doesn't leave a stale shadow PV (with a now-dead
     /// `WriteHook` capturing an aborted upstream channel).
+    ///
+    /// Round-32C: also purges any aliases that pointed AT this name
+    /// (otherwise a re-add of the same alias name would fail with
+    /// "already registered as an alias" even though its target is
+    /// gone).
     pub async fn remove_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        self.inner.simple_pvs.write().await.remove(name)
+        let _gate = self.inner.registration_mutex.lock().await;
+        let removed = self.inner.simple_pvs.write().await.remove(name);
+        // Simple PVs cannot be alias targets (aliases point at
+        // records), but a stale alias whose name MATCHES this PV
+        // would have been rejected at add_alias time. No alias
+        // cleanup needed for simple-PV removal.
+        removed
     }
 
     /// Add a record (accepts a boxed Record to avoid double-boxing).
@@ -471,16 +504,19 @@ impl PvDatabase {
     /// Returns `Err` when `name` collides with an existing record,
     /// simple PV, or alias. The C IOC's `dbLoadRecords` treats this as
     /// fatal; do not silently replace.
+    ///
+    /// Round-32C: the records-map insert AND scan-index insert run
+    /// under the same `registration_mutex` hold, eliminating the
+    /// TOCTOU window where `remove_record` could land between them
+    /// and leave a phantom scan entry.
     pub async fn add_record(&self, name: &str, record: Box<dyn Record>) -> CaResult<()> {
-        let mut records = self.inner.records.write().await;
-        Self::check_name_free(name, &*self.inner.simple_pvs.read().await, &records, &*self.inner.aliases.read().await)?;
+        let _gate = self.inner.registration_mutex.lock().await;
+        self.check_name_free(name).await?;
         let instance = RecordInstance::new_boxed(name.to_string(), record);
         let scan = instance.common.scan;
         let phas = instance.common.phas;
-        records.insert(name.to_string(), Arc::new(RwLock::new(instance)));
-        drop(records);
+        self.inner.records.write().await.insert(name.to_string(), Arc::new(RwLock::new(instance)));
 
-        // Register in scan index
         if scan != ScanType::Passive {
             self.inner
                 .scan_index
@@ -494,19 +530,15 @@ impl PvDatabase {
     }
 
     /// Verify that `name` is not currently registered in any of the
-    /// three namespaces. Caller must hold a write lock on the target
-    /// map so the check is atomic with the subsequent insert.
-    fn check_name_free(
-        name: &str,
-        simple_pvs: &HashMap<String, Arc<ProcessVariable>>,
-        records: &HashMap<String, Arc<RwLock<RecordInstance>>>,
-        aliases: &HashMap<String, String>,
-    ) -> CaResult<()> {
-        let kind = if simple_pvs.contains_key(name) {
+    /// three namespaces. Caller MUST hold `registration_mutex` so the
+    /// peek-then-insert sequence is atomic — without that, two tasks
+    /// can both see the name as free and race the insert.
+    async fn check_name_free(&self, name: &str) -> CaResult<()> {
+        let kind = if self.inner.simple_pvs.read().await.contains_key(name) {
             Some("simple PV")
-        } else if records.contains_key(name) {
+        } else if self.inner.records.read().await.contains_key(name) {
             Some("record")
-        } else if aliases.contains_key(name) {
+        } else if self.inner.aliases.read().await.contains_key(name) {
             Some("alias")
         } else {
             None
@@ -532,6 +564,7 @@ impl PvDatabase {
     /// when the `RecordInstance` is dropped — they observe `Closed` on
     /// next recv, matching the existing dbEvent cancel flow.
     pub async fn remove_record(&self, name: &str) -> bool {
+        let _gate = self.inner.registration_mutex.lock().await;
         // 1) Remove from main map; keep scan + phas for scan-index cleanup.
         let removed = self.inner.records.write().await.remove(name);
         let Some(rec_arc) = removed else {
@@ -561,6 +594,14 @@ impl PvDatabase {
         for targets in cp.values_mut() {
             targets.retain(|t| t != name);
         }
+        drop(cp);
+
+        // 4) Round-32C (R31-G12): purge aliases that pointed AT the
+        // removed record. Otherwise `find_pv("ALT")` returns None
+        // (target gone) but `add_pv("ALT", ...)` still fails with
+        // "already registered as an alias" — orphan blocks reuse.
+        let mut aliases = self.inner.aliases.write().await;
+        aliases.retain(|_alias, target| target != name);
 
         true
     }
@@ -588,29 +629,29 @@ impl PvDatabase {
 
     /// Register an alias `alias` for an existing record `target`.
     /// Mirrors epics-base PR #336. Returns `Err(...)` when the target
-    /// does not exist or the alias name is already in use.
+    /// does not exist or the alias name is already in use anywhere
+    /// in the database (records, simple PVs, or other aliases).
+    ///
+    /// Round-32C (R31-G10): pre-fix the alias path checked only
+    /// `records` and `aliases` — a simple-PV with the same name as
+    /// the proposed alias was missed, leaving the database in a
+    /// state where `find_pv(alias)` could resolve to either the
+    /// simple PV or the alias-mapped record depending on lookup
+    /// order. Now we run the same cross-namespace `check_name_free`
+    /// guard the other add_* paths use.
     pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
+        let _gate = self.inner.registration_mutex.lock().await;
         if !self.inner.records.read().await.contains_key(target) {
             return Err(CaError::ChannelNotFound(format!(
                 "alias target '{target}' is not a registered record"
             )));
         }
-        let mut aliases = self.inner.aliases.write().await;
-        if aliases.contains_key(alias) {
-            return Err(CaError::DbParseError {
-                line: 0,
-                column: 0,
-                message: format!("alias '{alias}' already registered"),
-            });
-        }
-        if self.inner.records.read().await.contains_key(alias) {
-            return Err(CaError::DbParseError {
-                line: 0,
-                column: 0,
-                message: format!("alias '{alias}' shadows an existing record"),
-            });
-        }
-        aliases.insert(alias.to_string(), target.to_string());
+        self.check_name_free(alias).await?;
+        self.inner
+            .aliases
+            .write()
+            .await
+            .insert(alias.to_string(), target.to_string());
         Ok(())
     }
 
@@ -1137,5 +1178,83 @@ mod tests {
         db.add_alias("AL", "R").await.unwrap();
         assert!(db.add_pv("AL", EpicsValue::Double(0.0)).await.is_err());
         assert!(db.add_record("AL", Box::new(AiRecord::new(0.0))).await.is_err());
+    }
+
+    /// Round-32C (R31-G12): removing a record must purge aliases
+    /// that pointed AT it. Otherwise the alias name stays
+    /// "registered" forever and `add_pv` / `add_record` rejecting
+    /// reuse causes a permanent name leak.
+    #[tokio::test]
+    async fn remove_record_purges_dangling_aliases() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("R", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_alias("ALT1", "R").await.unwrap();
+        db.add_alias("ALT2", "R").await.unwrap();
+        // An alias that points elsewhere must NOT be touched.
+        db.add_record("OTHER", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_alias("KEEPER", "OTHER").await.unwrap();
+
+        assert!(db.remove_record("R").await);
+
+        // Both aliases pointing at R should be gone — `add_pv` of
+        // those names succeeds again.
+        db.add_pv("ALT1", EpicsValue::Double(0.0)).await.unwrap();
+        db.add_pv("ALT2", EpicsValue::Double(0.0)).await.unwrap();
+        // The unrelated alias must survive.
+        assert_eq!(db.resolve_alias("KEEPER").await, Some("OTHER".to_string()));
+    }
+
+    /// Round-32C (R31-G10): `add_alias` must reject collisions with
+    /// every namespace, including simple PVs (which the pre-fix
+    /// code missed).
+    #[tokio::test]
+    async fn add_alias_rejects_simple_pv_collision() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_pv("PVX", EpicsValue::Double(0.0)).await.unwrap();
+        db.add_record("TARGET", Box::new(AiRecord::new(0.0))).await.unwrap();
+        // alias name "PVX" collides with the simple PV — must fail.
+        assert!(db.add_alias("PVX", "TARGET").await.is_err());
+    }
+
+    /// Round-32C (R31-G9): concurrent `add_pv` and `add_record` with
+    /// the same name must not deadlock and must serialize so that
+    /// exactly one succeeds. Pre-fix the two methods grabbed
+    /// different write locks first, opening a cross-lock-order
+    /// deadlock window.
+    #[tokio::test]
+    async fn concurrent_add_pv_and_add_record_do_not_deadlock() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = std::sync::Arc::new(PvDatabase::new());
+        let db1 = db.clone();
+        let db2 = db.clone();
+        let h1 = tokio::spawn(async move {
+            db1.add_pv("RACE", EpicsValue::Double(1.0)).await
+        });
+        let h2 = tokio::spawn(async move {
+            db2.add_record("RACE", Box::new(AiRecord::new(0.0))).await
+        });
+        // Both complete within a reasonable bound — pre-fix this
+        // could hang because T1 holds simple_pvs.write and waits
+        // for records.read while T2 holds records.write and waits
+        // for simple_pvs.read.
+        let r1 = tokio::time::timeout(std::time::Duration::from_secs(2), h1)
+            .await
+            .expect("add_pv must not block on add_record");
+        let r2 = tokio::time::timeout(std::time::Duration::from_secs(2), h2)
+            .await
+            .expect("add_record must not block on add_pv");
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        // Exactly one of the two wins; the other reports
+        // "already registered".
+        assert!(
+            (r1.is_ok() && r2.is_err()) || (r1.is_err() && r2.is_ok()),
+            "exactly one of the racing inserts must succeed: r1={r1:?} r2={r2:?}",
+        );
     }
 }

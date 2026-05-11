@@ -39,13 +39,25 @@ pub(crate) enum BeaconControl {
 /// circuit, and an extra EchoProbe under load just risks tripping the
 /// 5-s echo timeout in `transport.rs`.
 ///
-/// `IdMismatch` and `PeriodCollapse` are real restart signals and
-/// warrant the full treatment (search wake-up + EchoProbe to
-/// operational circuits, so a half-dead TCP gets surfaced fast).
+/// `IdMismatch` is the sole real-restart signal and warrants the full
+/// treatment (search wake-up + EchoProbe to operational circuits, so
+/// a half-dead TCP gets surfaced fast).
+///
+/// `PeriodCollapse` is retired: see the `handle_beacon` classify
+/// chain. In practice every site that would have produced it was the
+/// IOC's `beacon_emitter` ramp-up cascade after some peer's TCP
+/// accept, NOT a real restart. Real restarts reset beacon_id and trip
+/// `IdMismatch`; circuits that dropped for the restart receive
+/// `BeaconControl::ResetServer` from the coordinator before the
+/// cascade arrives. The variant remains for the retained match-arm
+/// shape in negative-assertion tests and in case a future
+/// distinguishing signature lets us reintroduce a different
+/// PeriodCollapse trigger; it is intentionally never produced today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BeaconAnomalyKind {
     FirstSighting,
     IdMismatch,
+    #[allow(dead_code)]
     PeriodCollapse,
 }
 
@@ -535,9 +547,33 @@ fn handle_beacon(
     const MIN_PERIOD_COLLAPSE_INTERVAL: Duration = Duration::from_millis(50);
     // Classify in priority order: FirstSighting wins because there's
     // no prior `last_id` / `period_estimate` to make the other two
-    // checks meaningful. IdMismatch beats PeriodCollapse because a
-    // real restart (id reset to 1) is the dispositive signal even if
-    // the inter-beacon interval also happens to be sub-period.
+    // checks meaningful. IdMismatch beats the period-collapse branch
+    // because a real restart (id reset to 1) is the dispositive
+    // signal even if the inter-beacon interval also happens to be
+    // sub-period.
+    //
+    // The period-collapse branch (id monotonic + interval suddenly
+    // dropped below `period_estimate / 3`) does NOT fire
+    // `PeriodCollapse` any more. That signature in practice
+    // identifies the IOC's `rsrv online_notify_task` ramp-up restart
+    // (`server/beacon.rs:124`, `tcp.rs:450`: `beacon_reset.notify_one`
+    // on every TCP accept/disconnect), NOT a real server restart.
+    // Real restarts reset beacon_id to 0 and trip `IdMismatch` above;
+    // any client whose own circuit broke for the restart also gets a
+    // `BeaconControl::ResetServer` from the coordinator
+    // (`apply_reset_server`) which clears the EMA pre-emptively. The
+    // remaining cases the period-collapse heuristic used to catch
+    // were ALL false positives: another client on the network
+    // connected to the same IOC and our beacon_monitor saw the
+    // resulting ramp-up cascade against our mature ~15 s EMA. That
+    // produced a stream of `tracing::warn!("IOC may have restarted")`
+    // + transport-watchdog sticky flags + reconnect cascades for
+    // healthy circuits.
+    //
+    // Self-reset path: clear `period_estimate` and `count` so the
+    // ramp-up cascade reseeds the EMA from the live cadence (same
+    // post-condition as `apply_reset_server`). The state-update
+    // block below runs unchanged.
     let anomaly_kind = if first_sighting {
         Some(BeaconAnomalyKind::FirstSighting)
     } else if beacon_id != expected_next_id {
@@ -548,7 +584,9 @@ fn handle_beacon(
             .period_estimate
             .is_some_and(|est| actual_interval < est / 3)
     {
-        Some(BeaconAnomalyKind::PeriodCollapse)
+        entry.period_estimate = None;
+        entry.count = 0;
+        None
     } else {
         None
     };
@@ -765,15 +803,25 @@ mod tests {
         );
     }
 
-    /// Period collapse with monotonic ids (e.g. an IOC abruptly
-    /// switching from 15-s steady-state to 200-ms fast-beacon mode
-    /// without resetting the id counter) must classify as
-    /// `PeriodCollapse`, not `FirstSighting` or `IdMismatch`. The
-    /// coordinator routes this to the EchoProbe path because a real
-    /// restart sometimes manifests this way (re-IOC scripts that
-    /// preserve the counter across restarts).
+    /// Period collapse with monotonic ids (id continues normally
+    /// while the inter-beacon interval drops far below the EMA — the
+    /// signature of the IOC's `rsrv online_notify_task` `beacon_reset`
+    /// being notified on a TCP accept/disconnect, NOT of a real
+    /// restart) must NOT fire `PeriodCollapse` any more. Instead, the
+    /// monitor self-resets `period_estimate` + `count` so the
+    /// resulting ramp-up cascade reseeds the EMA from the live
+    /// cadence, exactly like `apply_reset_server` does when the
+    /// coordinator routes a `BeaconControl::ResetServer` for our own
+    /// circuit. Real ID-preserving restart hypothesis: if our circuit
+    /// broke for the restart, the transport-event path issues
+    /// ResetServer pre-emptively (see
+    /// `reset_on_connect_breaks_period_collapse_cascade_after_reconnect`
+    /// below). The case that remained — another client on the
+    /// network connecting and triggering OUR beacon_monitor's
+    /// PeriodCollapse against a stale EMA — is silently absorbed
+    /// here.
     #[test]
-    fn period_collapse_classifies_as_period_collapse() {
+    fn monotonic_id_sub_period_clears_ema_no_anomaly() {
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
         let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
 
@@ -796,15 +844,34 @@ mod tests {
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
         hdr.cid = 100; // monotonic — rules out IdMismatch
         handle_beacon(hdr, &mut servers, &tx);
+        // No `ForceRescanServer` — the cascade is server-side reset,
+        // not a restart. `BeaconArrival { anomaly: false }` IS emitted
+        // (healthy-beacon refresh path) and that is fine.
+        while let Ok(msg) = rx.try_recv() {
+            if let CoordRequest::ForceRescanServer { kind, .. } = msg {
+                panic!(
+                    "monotonic-id, sub-period interval must NOT fire \
+                     ForceRescanServer ({kind:?}) — it is the IOC's \
+                     `beacon_reset` ramp-up cascade triggered by some \
+                     peer's TCP accept, not a real restart"
+                );
+            }
+        }
+        // EMA + count cleared so the subsequent ramp-up beacons
+        // reseed the estimate from the live cadence. Mirrors
+        // `apply_reset_server`'s post-condition.
+        let s = servers.get(&server).expect("entry");
         assert!(
-            matches!(
-                rx.try_recv(),
-                Ok(CoordRequest::ForceRescanServer {
-                    kind: BeaconAnomalyKind::PeriodCollapse,
-                    ..
-                })
-            ),
-            "monotonic-id, sub-period interval must classify as PeriodCollapse"
+            s.period_estimate.is_none(),
+            "self-reset must clear period_estimate"
+        );
+        assert_eq!(
+            s.count, 1,
+            "self-reset zeros count, then +1 for this beacon"
+        );
+        assert_eq!(
+            s.last_id, 100,
+            "last_id advanced normally — the beacon was accepted"
         );
     }
 
@@ -1213,6 +1280,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Peer-client-triggered cascade: an existing CA client with a
+    /// mature steady-state EMA (~15 s) must NOT fire a stream of
+    /// `PeriodCollapse` warnings when a DIFFERENT client on the
+    /// network connects to the same IOC. The peer's TCP accept fires
+    /// the IOC's `beacon_reset` notify (`server/tcp.rs:450`), which
+    /// restarts the `beacon_emitter` ramp-up cycle. Our circuit
+    /// stayed up the whole time, so the coordinator does NOT issue
+    /// `BeaconControl::ResetServer` for us. Before the
+    /// `handle_beacon` self-reset fix, every ramp-up beacon past the
+    /// 50 ms floor satisfied `actual_interval < 15 s / 3 = 5 s` and
+    /// fired a WARN log + transport-watchdog sticky flag + search
+    /// rescan — the symptom the user reported. After the fix the
+    /// monitor recognises the signature (id monotonic + interval
+    /// suddenly << EMA) as a server-side reset cascade, clears its
+    /// own EMA, and stays silent.
+    #[test]
+    fn peer_connect_ramp_up_does_not_fire_period_collapse() {
+        let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+        let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+
+        // Existing long-lived client: 1000 beacons in, EMA at 15 s,
+        // last_id=999. Our circuit is up (so the coordinator never
+        // issued ResetServer for us).
+        servers.insert(
+            server,
+            BeaconState {
+                last_id: 999,
+                last_seen: Instant::now(),
+                period_estimate: Some(Duration::from_secs(15)),
+                count: 1000,
+            },
+        );
+
+        // A peer client connects to the IOC. The IOC's
+        // `beacon_emitter` interval resets to 20 ms and ramps up
+        // through 20, 40, 80, 160, 320, 640, 1280, 2560, 5120,
+        // 10240 ms before stabilising at 15 s. beacon_id keeps
+        // counting monotonically (the IOC didn't restart).
+        let intervals_ms = [20u64, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.count = 5064;
+        hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
+
+        for (i, &ms) in intervals_ms.iter().enumerate() {
+            let s = servers.get_mut(&server).expect("entry");
+            s.last_seen = Instant::now() - Duration::from_millis(ms);
+            hdr.cid = 1000 + (i as u32);
+            handle_beacon(hdr, &mut servers, &tx);
+
+            while let Ok(msg) = rx.try_recv() {
+                if let CoordRequest::ForceRescanServer { kind, .. } = msg {
+                    assert_ne!(
+                        kind,
+                        BeaconAnomalyKind::PeriodCollapse,
+                        "peer-connect ramp-up beacon #{} (interval={} ms) \
+                         must NOT classify as PeriodCollapse — \
+                         the self-reset path in handle_beacon absorbs it",
+                        i + 1,
+                        ms
+                    );
+                }
+            }
+        }
+
+        // After the cascade, the EMA has been reseeded from the
+        // ramp-up. It must be > 0 (we processed beacons) and the
+        // last_id must reflect the latest beacon. The exact value
+        // depends on alpha=0.25 over the doubling sequence; assert
+        // structural correctness, not a numeric tolerance.
+        let s = servers.get(&server).expect("entry");
+        assert_eq!(s.last_id, 1009, "last_id must track ramp-up ids");
+        assert!(
+            s.period_estimate.is_some(),
+            "EMA must be reseeded after the cascade"
+        );
     }
 
     /// `apply_reset_server` for an unknown server is a no-op — the

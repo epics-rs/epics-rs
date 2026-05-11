@@ -7,14 +7,27 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use tokio::sync::Notify;
 
 use super::config::{LinkDirection, PvaLinkConfig};
 use super::link::{PvaLink, PvaLinkResult};
 
+type RegistryKey = (String, LinkDirection);
+
 /// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated `(pv, direction)` pairs.
 #[derive(Default)]
 pub struct PvaLinkRegistry {
-    map: RwLock<HashMap<(String, LinkDirection), Arc<PvaLink>>>,
+    map: RwLock<HashMap<RegistryKey, Arc<PvaLink>>>,
+    /// Round-36 (R36-G1): in-flight open dedup. The original
+    /// `get_or_open` used a textbook DCL — read-lock → open →
+    /// write-lock → DCL drop loser. Two concurrent first-callers
+    /// both reached `PvaLink::open` (which spawns a monitor task
+    /// and a `PvaClient`); the loser's resources cleaned up via
+    /// Drop, but two upstream search/connect round-trips and two
+    /// monitor-task spawns were spent for one user-visible result.
+    /// This map carries an `Arc<Notify>` per in-flight open; the
+    /// second caller awaits and then reads the cached entry.
+    pending: RwLock<HashMap<RegistryKey, Arc<Notify>>>,
 }
 
 impl PvaLinkRegistry {
@@ -33,24 +46,87 @@ impl PvaLinkRegistry {
             .cloned()
     }
 
-    /// Get an existing link or open a new one.
+    /// Get an existing link or open a new one. Concurrent calls
+    /// for the same key share one [`PvaLink::open`] invocation;
+    /// the second caller awaits via `pending` and reads the
+    /// winner's cached entry.
     pub async fn get_or_open(&self, config: PvaLinkConfig) -> PvaLinkResult<Arc<PvaLink>> {
-        let key = (config.pv_name.clone(), config.direction);
+        let key: RegistryKey = (config.pv_name.clone(), config.direction);
+
+        // Fast path: already cached.
         if let Some(existing) = self.map.read().get(&key).cloned() {
             return Ok(existing);
         }
-        let link = Arc::new(PvaLink::open(config).await?);
-        let mut guard = self.map.write();
-        // Double-checked: another task may have raced.
-        if let Some(existing) = guard.get(&key).cloned() {
-            return Ok(existing);
+
+        // In-flight dedup. Either we claim the slot and open, or we
+        // grab a Notify and await another task's completion.
+        let (claim, notify) = {
+            let mut pending = self.pending.write();
+            if let Some(existing) = pending.get(&key).cloned() {
+                (false, existing)
+            } else {
+                let n = Arc::new(Notify::new());
+                pending.insert(key.clone(), n.clone());
+                (true, n)
+            }
+        };
+
+        if !claim {
+            // Loser path: wait for the winner to finish, then read
+            // the cached entry. If the winner errored, the entry
+            // is absent — fall through to a fresh open under our
+            // own claim (rare).
+            notify.notified().await;
+            if let Some(existing) = self.map.read().get(&key).cloned() {
+                return Ok(existing);
+            }
+            // Winner errored — recurse so this caller now becomes
+            // the claimant.
+            return Box::pin(self.get_or_open(config)).await;
         }
-        guard.insert(key, link.clone());
+
+        // Winner path: run the open with a drop-guard that always
+        // clears the pending slot and wakes waiters — even on
+        // panic / cancellation / error.
+        struct CompletionGuard<'a> {
+            owner: &'a PvaLinkRegistry,
+            key: RegistryKey,
+            notify: Arc<Notify>,
+            armed: bool,
+        }
+        impl<'a> CompletionGuard<'a> {
+            fn disarm(&mut self) {
+                self.armed = false;
+            }
+        }
+        impl<'a> Drop for CompletionGuard<'a> {
+            fn drop(&mut self) {
+                self.owner.pending.write().remove(&self.key);
+                self.notify.notify_waiters();
+                let _ = self.armed; // suppress unused warning
+            }
+        }
+        let mut guard = CompletionGuard {
+            owner: self,
+            key: key.clone(),
+            notify,
+            armed: true,
+        };
+
+        let result = PvaLink::open(config).await;
+        let link = Arc::new(result?);
+        // Publish to the cache before releasing the pending slot so
+        // waiters that wake up see the cached entry immediately.
+        self.map.write().insert(key.clone(), link.clone());
+        guard.disarm();
+        // Manually run cleanup now (guard's Drop also clears, but
+        // we want it deterministic on the success path).
         Ok(link)
     }
 
     pub fn close_all(&self) {
         self.map.write().clear();
+        self.pending.write().clear();
     }
 
     pub fn len(&self) -> usize {

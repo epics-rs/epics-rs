@@ -185,21 +185,31 @@ impl GatewayChannelSource {
         self.gate.bump_acl_version();
     }
 
-    /// Shared AcfCell handle — exposed so a `PvaServer::reload_acf_from`-style
-    /// hot reload can write into the same cell the gateway reads.
-    pub fn acf_cell(&self) -> AcfCell {
-        self.acf.clone()
-    }
+    // Round 49 follow-up: the `acf_cell()` accessor was removed. It
+    // returned a clone of the inner `Arc<RwLock<Option<...>>>` so an
+    // external coordinator (e.g. a multi-source PvaServer) could
+    // hot-swap the policy by writing the cell directly — but that
+    // path bypassed `gate.bump_acl_version()`, leaving monitor
+    // tasks observing this gate at the pre-swap version forever.
+    // Single-owner closure on the ACL-change transition: every
+    // policy mutation MUST flow through `set_acf` or
+    // `set_asg_resolver`, both of which bump the gate's version.
+    // If a future requirement needs shared-AcfCell semantics across
+    // multiple sources, the API will return a wrapper that wires
+    // the version-bump into the write path.
 
-    /// Internal: evaluate the gateway-side ACL for a single op.
-    /// Returns the resolved [`AccessLevel`]; when no ACF is
-    /// attached we report `ReadWrite` so the pass-through fast
-    /// path stays hot.
+    /// Test-only ACL introspection: evaluate the gateway-side ACL
+    /// for `(pv, ctx)` and return the resolved [`AccessLevel`].
+    /// Mirrors what the production `AccessGate::check` path would
+    /// produce, but returns the bare level instead of an
+    /// `AccessChecked` token so tests can inspect ACF behaviour
+    /// without committing to a typed call.
     ///
-    /// Round-30D: the ASG name is now resolved per channel via
-    /// [`AsgResolver`] instead of being hard-coded to `DEFAULT`. The
-    /// resolver default still returns `DEFAULT` for every PV, so
-    /// behaviour is unchanged for callers that never set a resolver.
+    /// Round 49 follow-up: gated on `#[cfg(test)]` so production
+    /// code physically cannot bypass the gate by calling this
+    /// alternate ACL path — the single owner of an ACL evaluation
+    /// in a non-test build is `self.gate`.
+    #[cfg(test)]
     async fn acl_level(&self, pv: &str, ctx: &ChannelContext) -> AccessLevel {
         let guard = self.acf.read().await;
         match *guard {

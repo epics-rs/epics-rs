@@ -77,7 +77,7 @@ impl AccessChecked {
 ///   network). All checks return a `ReadWrite` token.
 pub struct AccessGate {
     inner: AccessGateInner,
-    /// Round 48 (R48-G3): monotonic counter bumped whenever the
+    /// Round 48 (R48-G3): generation counter bumped whenever the
     /// gate's underlying ACF policy changes (reload / clear / hot
     /// swap). Long-lived consumers (PVA monitor tasks spawned at
     /// SUBSCRIBE time, gateway bridge tasks) capture the value at
@@ -86,7 +86,26 @@ pub struct AccessGate {
     /// is now `NoAccess` under the new policy sees its subscription
     /// torn down on the next event (matching the round-39 CA-side
     /// `reeval_access_rights` semantics).
-    acl_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ///
+    /// Round 50 (R50-G1): two backing shapes —
+    /// * `Atomic`: owned `AtomicU64` for terminal gates
+    ///   (`Required`, `Open`). `bump_acl_version` `fetch_add`s.
+    /// * `Aggregator`: a closure that returns a derived version
+    ///   from sub-gates. `CompositeSource` uses this to expose a
+    ///   gate whose `acl_version()` is the `max` of its inner
+    ///   sources' versions, so a bump on any inner (e.g. a
+    ///   `GatewayChannelSource::set_acf` on a child) is visible at
+    ///   the composite's top-level gate. Pre-fix the composite
+    ///   inherited the default `Open` gate (version=0 forever) and
+    ///   tcp.rs's monitor loop compared against that stale value,
+    ///   missing every inner reload.
+    acl_version: AclVersionSource,
+}
+
+#[derive(Clone)]
+enum AclVersionSource {
+    Atomic(std::sync::Arc<std::sync::atomic::AtomicU64>),
+    Aggregator(std::sync::Arc<dyn Fn() -> u64 + Send + Sync>),
 }
 
 /// Asynchronous closure that resolves `pv_name → (ASG, ASL)` for a
@@ -142,7 +161,7 @@ impl AccessGate {
     ) -> Self {
         Self {
             inner: AccessGateInner::Required { acf, resolver },
-            acl_version,
+            acl_version: AclVersionSource::Atomic(acl_version),
         }
     }
 
@@ -152,7 +171,29 @@ impl AccessGate {
     pub fn open() -> Self {
         Self {
             inner: AccessGateInner::Open,
-            acl_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            acl_version: AclVersionSource::Atomic(std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            )),
+        }
+    }
+
+    /// Build a permissive gate whose `acl_version()` is derived
+    /// from a caller-supplied closure. Used by `CompositeSource`
+    /// to aggregate inner sub-gates' versions — the closure
+    /// typically returns `max(inner.access_gate().acl_version())`
+    /// so a bump on any sub-source surfaces at the composite's
+    /// top-level gate, which is the version that tcp.rs's monitor
+    /// loop tracks.
+    ///
+    /// `bump_acl_version()` on an `Aggregator` gate is a no-op:
+    /// the version is derived, not owned. The aggregator's
+    /// underlying gates own their own counters.
+    pub fn open_with_aggregator(
+        f: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner: AccessGateInner::Open,
+            acl_version: AclVersionSource::Aggregator(f),
         }
     }
 
@@ -161,16 +202,23 @@ impl AccessGate {
     /// [`Self::bump_acl_version`]) signals "the underlying ACF
     /// changed — re-check before forwarding the next event".
     pub fn acl_version(&self) -> u64 {
-        self.acl_version
-            .load(std::sync::atomic::Ordering::Acquire)
+        match &self.acl_version {
+            AclVersionSource::Atomic(a) => a.load(std::sync::atomic::Ordering::Acquire),
+            AclVersionSource::Aggregator(f) => f(),
+        }
     }
 
     /// Bump the ACL generation. Called by the owning server after
     /// swapping the ACF policy. Long-lived consumers detect the
     /// change on their next event and re-check.
+    ///
+    /// On an `Aggregator`-backed gate this is a no-op — the
+    /// version is read-through to the underlying gates, which own
+    /// their own counters.
     pub fn bump_acl_version(&self) {
-        self.acl_version
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        if let AclVersionSource::Atomic(a) = &self.acl_version {
+            a.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Perform the access check for `pv_name` under the connecting

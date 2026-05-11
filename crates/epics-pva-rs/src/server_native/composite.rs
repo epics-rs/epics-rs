@@ -31,13 +31,35 @@ pub struct SourceEntry {
 /// Multi-source registry. Wrap with `Arc` and feed to
 /// [`crate::server_native::PvaServer::start`].
 pub struct CompositeSource {
-    entries: parking_lot::RwLock<Vec<SourceEntry>>,
+    entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>>,
+    /// Round 50 (R50-G1): the composite's gate is an aggregator
+    /// whose `acl_version()` returns `max(inner.access_gate().acl_version())`.
+    /// Pre-fix the composite inherited the default `Open` gate
+    /// (version=0 forever), so tcp.rs's monitor loop captured `0`
+    /// at subscribe and compared against `0` on every event —
+    /// missing every reload bump on the matched inner source. The
+    /// aggregator surfaces inner bumps at the top-level gate the
+    /// monitor task tracks.
+    access_gate: epics_base_rs::server::access_security::AccessGate,
 }
 
 impl Default for CompositeSource {
     fn default() -> Self {
+        use epics_base_rs::server::access_security::AccessGate;
+        let entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>> =
+            Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let entries_for_version = entries.clone();
+        let access_gate = AccessGate::open_with_aggregator(Arc::new(move || {
+            entries_for_version
+                .read()
+                .iter()
+                .map(|e| e.source.access_gate().acl_version())
+                .max()
+                .unwrap_or(0)
+        }));
         Self {
-            entries: parking_lot::RwLock::new(Vec::new()),
+            entries,
+            access_gate,
         }
     }
 }
@@ -100,6 +122,10 @@ impl CompositeSource {
 }
 
 impl ChannelSource for CompositeSource {
+    fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
+        &self.access_gate
+    }
+
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
         let sources = self.snapshot();
         async move {
@@ -427,6 +453,88 @@ mod tests {
         ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
             async { None }
         }
+    }
+
+    /// Round 50 (R50-G1): composite's top-level gate must reflect
+    /// inner sub-gate version bumps. Pre-fix the composite inherited
+    /// the default `Open` gate (always version=0); tcp.rs's monitor
+    /// loop compared against that stale value and missed every
+    /// `GatewayChannelSource::set_acf` reload on a child. The
+    /// aggregator gate returns `max(inner.access_gate().acl_version())`
+    /// so a bump on ANY inner is observed at the composite.
+    #[tokio::test]
+    async fn aggregator_gate_observes_inner_bumps() {
+        use epics_base_rs::server::access_security::AccessGate;
+        struct VersionedSrc {
+            gate: AccessGate,
+        }
+        impl ChannelSource for VersionedSrc {
+            fn access(&self) -> &AccessGate {
+                &self.gate
+            }
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { Vec::new() }
+            }
+            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn get_introspection(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                _: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                async { Err("n/a".into()) }
+            }
+            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let resolver: epics_base_rs::server::access_security::AsgAslResolver =
+            Arc::new(|_| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
+        let inner1 = Arc::new(VersionedSrc {
+            gate: AccessGate::required(acf.clone(), resolver.clone()),
+        });
+        let inner2 = Arc::new(VersionedSrc {
+            gate: AccessGate::required(acf, resolver),
+        });
+
+        let comp = CompositeSource::new();
+        comp.add_source("a", inner1.clone() as DynSource, 0).unwrap();
+        comp.add_source("b", inner2.clone() as DynSource, 1).unwrap();
+
+        let v0 = comp.access().acl_version();
+        // Bump inner1 — composite must observe the new max.
+        inner1.gate.bump_acl_version();
+        let v1 = comp.access().acl_version();
+        assert!(v1 > v0, "composite gate must surface inner1 bump: {v0} -> {v1}");
+
+        // Bump inner2 separately — composite must reflect the
+        // higher of the two.
+        inner2.gate.bump_acl_version();
+        inner2.gate.bump_acl_version();
+        let v2 = comp.access().acl_version();
+        assert!(v2 > v1, "composite gate must track inner2 bumps too: {v1} -> {v2}");
     }
 
     #[tokio::test]

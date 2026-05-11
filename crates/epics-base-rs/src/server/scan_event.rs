@@ -78,24 +78,26 @@ impl ScanSchedulerV2 {
         // Process PINI records at startup
         self.process_pini().await;
 
-        // Spawn periodic scan tasks
-        let mut handles = Vec::new();
+        // Spawn periodic scan tasks into a JoinSet. Round 45:
+        // tokio's JoinHandle drops without abort, so the previous
+        // `handles.into_iter().next()` pattern orphaned every non-
+        // first periodic scan task on scheduler shutdown. JoinSet
+        // aborts each member on drop, so the future's cancellation
+        // tears down the periodic loops cleanly.
+        let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         for &scan_type in PERIODIC_SCANS {
             if let Some(duration) = scan_type.interval() {
                 let db = self.db.clone();
                 let max_concurrent = self.config.max_concurrent;
-                let handle = crate::runtime::task::spawn(async move {
+                join_set.spawn(async move {
                     Self::periodic_scan_loop(db, scan_type, duration, max_concurrent).await;
                 });
-                handles.push(handle);
             }
         }
-
-        // Wait forever
-        if let Some(first) = handles.into_iter().next() {
-            let _ = first.await;
-        } else {
+        if join_set.is_empty() {
             std::future::pending::<()>().await;
+        } else {
+            while join_set.join_next().await.is_some() {}
         }
     }
 

@@ -76,12 +76,20 @@ impl ScanScheduler {
             return;
         }
 
-        // Spawn a task for each periodic scan rate (first caller only).
-        let mut handles = Vec::new();
+        // Spawn a task per periodic scan rate into a `JoinSet`.
+        // Round 45: the pre-fix code kept `handles.into_iter().next()`
+        // and dropped the remaining JoinHandles — Tokio's
+        // `JoinHandle::drop` does NOT abort, it detaches. So 6 of
+        // the 7 periodic scan tasks orphaned on every scheduler
+        // shutdown. `JoinSet::drop` aborts every still-running
+        // member, so cancelling `run_with_hooks` (via tokio::select!
+        // or runtime teardown) now tears down every periodic scan
+        // cleanly.
+        let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         for &scan_type in PERIODIC_SCANS {
             if let Some(duration) = scan_type.interval() {
                 let db = self.db.clone();
-                let handle = crate::runtime::task::spawn(async move {
+                join_set.spawn(async move {
                     let mut interval = tokio::time::interval(duration);
                     loop {
                         interval.tick().await;
@@ -92,16 +100,16 @@ impl ScanScheduler {
                         }
                     }
                 });
-                handles.push(handle);
             }
         }
 
-        // Wait forever (scan tasks run indefinitely)
-        if let Some(first) = handles.into_iter().next() {
-            let _ = first.await;
-        } else {
-            // No periodic scans, just sleep forever
+        if join_set.is_empty() {
             std::future::pending::<()>().await;
+        } else {
+            // Drain — periodic scans never return naturally, so this
+            // suspends forever. On cancellation the JoinSet drops
+            // and aborts every member.
+            while join_set.join_next().await.is_some() {}
         }
     }
 }

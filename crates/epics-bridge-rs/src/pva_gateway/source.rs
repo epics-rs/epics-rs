@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_pva_rs::client::PvaClient;
@@ -222,14 +222,7 @@ impl GatewayChannelSource {
                 // documents this.
                 let resolver = self.asg_resolver.read().await;
                 let asg = (resolver)(pv);
-                cfg.check_access_method(
-                    &asg,
-                    &ctx.host,
-                    &ctx.account,
-                    0,
-                    &ctx.method,
-                    "",
-                )
+                cfg.check_access_method(&asg, &ctx.host, &ctx.account, 0, &ctx.method, "")
             }
         }
     }
@@ -452,9 +445,7 @@ impl ChannelSource for GatewayChannelSource {
         // warning. Mirror the decoded subscribe's cap check + RAII
         // decrement here too so raw subscriptions count against
         // the same ceiling.
-        let prev = self
-            .subscriber_count
-            .fetch_add(1, Ordering::Relaxed);
+        let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
         if prev >= self.max_subscribers {
             self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
             tracing::warn!(
@@ -715,7 +706,9 @@ mod tests {
     #[tokio::test]
     async fn acl_level_no_acf_is_readwrite() {
         let src = make_source();
-        let level = src.acl_level("any:pv", &make_ctx("h", "anyone", "anonymous")).await;
+        let level = src
+            .acl_level("any:pv", &make_ctx("h", "anyone", "anonymous"))
+            .await;
         assert!(matches!(level, AccessLevel::ReadWrite));
     }
 
@@ -743,7 +736,11 @@ ASG(DEFAULT) {
         // upstream lookup needed).
         let dummy_value = PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0));
         let err = src
-            .put_value_ctx("any:pv", dummy_value, make_ctx("h", "intruder", "anonymous"))
+            .put_value_ctx(
+                "any:pv",
+                dummy_value,
+                make_ctx("h", "intruder", "anonymous"),
+            )
             .await
             .expect_err("PUT must be denied for non-admin under DEFAULT ASG");
         assert!(
@@ -803,9 +800,7 @@ ASG(DEFAULT) {
         // upstream `cache.lookup` which fails (no upstream IOC in
         // test), so the error is a lookup/timeout — NOT the gateway
         // ACL denial. We assert the denial string is gone.
-        let result = src
-            .put_value_ctx("any:pv", dummy_value, ctx)
-            .await;
+        let result = src.put_value_ctx("any:pv", dummy_value, ctx).await;
         if let Err(msg) = result {
             assert!(
                 !msg.contains("denied by gateway access security"),
@@ -851,17 +846,27 @@ ASG(LOCKED) {
             } else {
                 "DEFAULT".to_string()
             }
-        }))).await;
+        })))
+        .await;
 
         let guest = make_ctx("anyhost", "guest", "anonymous");
         let admin = make_ctx("anyhost", "admin", "anonymous");
 
         // DEFAULT-routed PV: open to everyone for RW.
-        assert_eq!(src.acl_level("other:val", &guest).await, AccessLevel::ReadWrite);
+        assert_eq!(
+            src.acl_level("other:val", &guest).await,
+            AccessLevel::ReadWrite
+        );
 
         // OPERATOR-routed PV: guest READ-only, admin RW.
-        assert_eq!(src.acl_level("set:current", &guest).await, AccessLevel::Read);
-        assert_eq!(src.acl_level("set:current", &admin).await, AccessLevel::ReadWrite);
+        assert_eq!(
+            src.acl_level("set:current", &guest).await,
+            AccessLevel::Read
+        );
+        assert_eq!(
+            src.acl_level("set:current", &admin).await,
+            AccessLevel::ReadWrite
+        );
 
         // LOCKED-routed PV: everyone READ-only (no WRITE rule).
         assert_eq!(src.acl_level("dev:hwid", &admin).await, AccessLevel::Read);
@@ -895,7 +900,8 @@ ASG(LOCKED) {
         assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::ReadWrite);
 
         // Hot-swap: route everything to LOCKED (read-only).
-        src.set_asg_resolver(Some(Arc::new(|_pv| "LOCKED".to_string()))).await;
+        src.set_asg_resolver(Some(Arc::new(|_pv| "LOCKED".to_string())))
+            .await;
         assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::Read);
 
         // Swap back to default.
@@ -960,10 +966,7 @@ ASG(DEFAULT) {
         src.set_acf(Some(cfg)).await;
 
         let rx = src
-            .subscribe_raw_ctx(
-                "any:pv",
-                make_ctx("anyhost", "intruder", "anonymous"),
-            )
+            .subscribe_raw_ctx("any:pv", make_ctx("anyhost", "intruder", "anonymous"))
             .await;
         assert!(
             rx.is_none(),

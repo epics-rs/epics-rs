@@ -1363,7 +1363,8 @@ record(ai, "REC") {
         assert!(tags.iter().any(|(k, v)| k == "Q:group" && v == "demo"));
         // Unquoted tag, unquoted multi-word value.
         assert!(
-            tags.iter().any(|(k, v)| k == "autosaveFields" && v == "VAL DESC"),
+            tags.iter()
+                .any(|(k, v)| k == "autosaveFields" && v == "VAL DESC"),
             "unquoted multi-word value must parse: {tags:?}"
         );
     }

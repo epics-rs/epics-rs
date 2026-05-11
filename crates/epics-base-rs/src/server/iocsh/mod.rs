@@ -256,7 +256,8 @@ mod tests {
         let handle = rt.handle().clone();
         rt.block_on(async {
             db.add_record("TEST_REC", Box::new(AiRecord::new(42.0)))
-                .await.unwrap();
+                .await
+                .unwrap();
         });
         std::mem::forget(rt);
         IocShell::new(db, handle)

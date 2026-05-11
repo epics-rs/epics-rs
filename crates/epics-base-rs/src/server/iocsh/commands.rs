@@ -78,9 +78,7 @@ fn cmd_db_delete_record() -> CommandDef {
             if ctx.block_on(ctx.db().remove_record(&name)) {
                 ctx.println(&format!("dbDeleteRecord: removed '{name}'"));
             } else {
-                ctx.println(&format!(
-                    "dbDeleteRecord: no record named '{name}'"
-                ));
+                ctx.println(&format!("dbDeleteRecord: no record named '{name}'"));
             }
             Ok(CommandOutcome::Continue)
         },
@@ -267,7 +265,9 @@ fn cmd_dbpf() -> CommandDef {
                 // ("DSEC" instead of "DESC") is caught quickly.
                 let msg = format!("{e}");
                 if msg.contains("FieldNotFound") || msg.contains(&format!("'{field}'")) {
-                    if let Some(suggestion) = ctx.block_on(suggest_field_name(ctx.db(), base, &field)) {
+                    if let Some(suggestion) =
+                        ctx.block_on(suggest_field_name(ctx.db(), base, &field))
+                    {
                         return format!("{msg}; did you mean '{suggestion}'?");
                     }
                 }
@@ -701,9 +701,7 @@ fn cmd_db_create_record() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             if ctx.block_on(ctx.db().get_record(&name)).is_some() {
-                ctx.println(&format!(
-                    "dbCreateRecord: record '{name}' already exists"
-                ));
+                ctx.println(&format!("dbCreateRecord: record '{name}' already exists"));
                 return Ok(CommandOutcome::Continue);
             }
             let record = match db_loader::create_record(&rec_type) {
@@ -717,9 +715,7 @@ fn cmd_db_create_record() -> CommandDef {
                 ctx.println(&format!("dbCreateRecord: {e}"));
                 return Ok(CommandOutcome::Continue);
             }
-            ctx.println(&format!(
-                "dbCreateRecord: created '{name}' ({rec_type})"
-            ));
+            ctx.println(&format!("dbCreateRecord: created '{name}' ({rec_type})"));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -929,10 +925,7 @@ fn cmd_db_load_records() -> CommandDef {
 
                 let added: Result<(), String> = ctx.block_on(async {
                     if let Err(e) = ctx.db().add_record(&def.name, record).await {
-                        return Err(format!(
-                            "dbLoadRecords: '{}' rejected: {e}",
-                            def.name
-                        ));
+                        return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
                     }
 
                     // Register any aliases declared in the record body
@@ -1127,9 +1120,9 @@ async fn suggest_field_name(
     let mut candidates: Vec<&str> = inst.record.field_list().iter().map(|d| d.name).collect();
     // Common dbCommon fields are also valid PUT targets.
     candidates.extend([
-        "VAL", "DESC", "EGU", "SCAN", "PINI", "DTYP", "INP", "OUT", "FLNK", "NAME", "RTYP",
-        "PHAS", "PRIO", "DISA", "DISV", "DISS", "DISP", "PROC", "ASG", "TPRO", "TSE", "TSEL",
-        "UDF", "SEVR", "STAT", "AMSG",
+        "VAL", "DESC", "EGU", "SCAN", "PINI", "DTYP", "INP", "OUT", "FLNK", "NAME", "RTYP", "PHAS",
+        "PRIO", "DISA", "DISV", "DISS", "DISP", "PROC", "ASG", "TPRO", "TSE", "TSEL", "UDF",
+        "SEVR", "STAT", "AMSG",
     ]);
     let mut best: Option<(usize, &str)> = None;
     for cand in &candidates {
@@ -1164,9 +1157,7 @@ fn edit_distance_short(a: &str, b: &str) -> usize {
         curr[0] = i + 1;
         for (j, bj) in b.iter().enumerate() {
             let cost = if ai == bj { 0 } else { 1 };
-            curr[j + 1] = (curr[j] + 1)
-                .min(prev[j + 1] + 1)
-                .min(prev[j] + cost);
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
             // Damerau transposition.
             if i > 0 && j > 0 && a[i] == b[j - 1] && a[i - 1] == b[j] {
                 // prev2 not tracked; skip the pure-Damerau optimization
@@ -1279,8 +1270,12 @@ mod tests {
     fn test_dbl() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("REC_A", Box::new(AiRecord::new(1.0))).await.unwrap();
-            db.add_record("REC_B", Box::new(AiRecord::new(2.0))).await.unwrap();
+            db.add_record("REC_A", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
+            db.add_record("REC_B", Box::new(AiRecord::new(2.0)))
+                .await
+                .unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -1295,7 +1290,9 @@ mod tests {
     fn test_dbgf() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("TEMP", Box::new(AiRecord::new(25.0))).await.unwrap();
+            db.add_record("TEMP", Box::new(AiRecord::new(25.0)))
+                .await
+                .unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -1324,7 +1321,9 @@ mod tests {
     fn test_dbpf_and_readback() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("TEMP", Box::new(AiRecord::new(0.0))).await.unwrap();
+            db.add_record("TEMP", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -1349,7 +1348,9 @@ mod tests {
     fn test_dbpr_levels() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("TEMP", Box::new(AiRecord::new(25.0))).await.unwrap();
+            db.add_record("TEMP", Box::new(AiRecord::new(25.0)))
+                .await
+                .unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -1368,12 +1369,15 @@ mod tests {
     fn test_dbl_filter_by_type() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("AI_REC", Box::new(AiRecord::new(1.0))).await.unwrap();
+            db.add_record("AI_REC", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
             db.add_record(
                 "BO_REC",
                 Box::new(crate::server::records::bo::BoRecord::new(0)),
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         });
 
         let mut registry = CommandRegistry::new();

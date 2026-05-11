@@ -87,8 +87,7 @@ impl AcfAccessControl {
     }
 
     fn resolve_asg_blocking(&self, channel: &str) -> String {
-        let (record_name, _field) =
-            epics_base_rs::server::database::parse_pv_name(channel);
+        let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(channel);
         let db = self.db.clone();
         let name = record_name.to_string();
         let lookup = async move {
@@ -779,7 +778,9 @@ ASG(SECURE) {
         let cfg = parse_acf(acf_text).unwrap();
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:SEC", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("AI:SEC", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         let rec = db.get_record("AI:SEC").await.unwrap();
         rec.write().await.common.asg = "SECURE".to_string();
 

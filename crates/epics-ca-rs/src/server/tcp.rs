@@ -315,12 +315,7 @@ impl ClientState {
                     // them as ASL=0 so the most-restrictive rule
                     // applies. Matches the C IOC's behaviour for
                     // names that never went through `dbAddMember`.
-                    match acf_cfg.check_access_asl(
-                        "DEFAULT",
-                        &self.hostname,
-                        &self.username,
-                        0,
-                    ) {
+                    match acf_cfg.check_access_asl("DEFAULT", &self.hostname, &self.username, 0) {
                         AccessLevel::ReadWrite => 3,
                         AccessLevel::Read => 1,
                         AccessLevel::NoAccess => 0,
@@ -354,12 +349,7 @@ impl ClientState {
                     // is below the record's ASL.
                     let asg = &instance.common.asg;
                     let asl = instance.common.asl;
-                    acf_cfg.check_access_asl(
-                        asg,
-                        &self.hostname,
-                        &self.username,
-                        asl,
-                    )
+                    acf_cfg.check_access_asl(asg, &self.hostname, &self.username, asl)
                 } else {
                     AccessLevel::ReadWrite
                 };

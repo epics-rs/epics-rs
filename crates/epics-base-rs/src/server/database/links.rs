@@ -225,31 +225,27 @@ impl PvDatabase {
                     // before), 1 = don't drive (suppress all OUT*),
                     // 2 = set outputs to IVOV.
                     let raw_val = instance.record.val();
-                    let val = if instance.common.sevr
-                        == crate::server::record::AlarmSeverity::Invalid
-                    {
-                        let ivoa = instance
-                            .record
-                            .get_field("IVOA")
-                            .and_then(|v| {
-                                if let EpicsValue::Short(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(0);
-                        match ivoa {
-                            1 => None, // suppress drive
-                            2 => instance
+                    let val =
+                        if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid {
+                            let ivoa = instance
                                 .record
-                                .get_field("IVOV")
-                                .or(raw_val),
-                            _ => raw_val, // 0 or unknown — Continue
-                        }
-                    } else {
-                        raw_val
-                    };
+                                .get_field("IVOA")
+                                .and_then(|v| {
+                                    if let EpicsValue::Short(s) = v {
+                                        Some(s)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            match ivoa {
+                                1 => None, // suppress drive
+                                2 => instance.record.get_field("IVOV").or(raw_val),
+                                _ => raw_val, // 0 or unknown — Continue
+                            }
+                        } else {
+                            raw_val
+                        };
                     let links: Vec<String> = [
                         "OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH", "OUTI",
                         "OUTJ", "OUTK", "OUTL", "OUTM", "OUTN", "OUTO", "OUTP",

@@ -975,10 +975,7 @@ impl Drop for CaClient {
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {
                 let (tx, rx) = oneshot::channel();
-                if coord_tx
-                    .send(CoordRequest::Shutdown { reply: tx })
-                    .is_ok()
-                {
+                if coord_tx.send(CoordRequest::Shutdown { reply: tx }).is_ok() {
                     // Bounded so a wedged coordinator doesn't keep
                     // the cleanup task alive indefinitely.
                     let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
@@ -3018,8 +3015,7 @@ mod addr_entry_tests {
 
     #[test]
     fn refresh_noop_for_literal_ip() {
-        let original_sock =
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5064));
+        let original_sock = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5064));
         let mut entry = AddrEntry::new(original_sock, None, 5064);
         let refreshed = entry.refresh_dns().expect("noop refresh succeeds");
         assert_eq!(refreshed, original_sock);

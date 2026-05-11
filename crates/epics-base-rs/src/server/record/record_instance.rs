@@ -1169,16 +1169,9 @@ impl RecordInstance {
                             .and_then(|v| v.to_f64())
                             .unwrap_or(0.0);
                         let now = crate::runtime::general_time::get_current();
-                        let (out, new_afvl) = Self::aftc_filter(
-                            state_sev as u16,
-                            aftc,
-                            afvl,
-                            self.common.time,
-                            now,
-                        );
-                        let _ = self
-                            .record
-                            .put_field("AFVL", EpicsValue::Double(new_afvl));
+                        let (out, new_afvl) =
+                            Self::aftc_filter(state_sev as u16, aftc, afvl, self.common.time, now);
+                        let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
                         out as i16
                     } else {
                         state_sev
@@ -1276,16 +1269,9 @@ impl RecordInstance {
                         .and_then(|v| v.to_f64())
                         .unwrap_or(0.0);
                     let now = crate::runtime::general_time::get_current();
-                    let (out, new_afvl) = Self::aftc_filter(
-                        state_sev as u16,
-                        aftc,
-                        afvl,
-                        self.common.time,
-                        now,
-                    );
-                    let _ = self
-                        .record
-                        .put_field("AFVL", EpicsValue::Double(new_afvl));
+                    let (out, new_afvl) =
+                        Self::aftc_filter(state_sev as u16, aftc, afvl, self.common.time, now);
+                    let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
                     out as i16
                 } else {
                     state_sev
@@ -2136,7 +2122,10 @@ mod aftc_filter_tests {
             afvl = new_afvl;
             last = now;
         }
-        assert_eq!(alarm, 2, "after 5 s of steady raw=2 with aftc=1 s, output must reach 2");
+        assert_eq!(
+            alarm, 2,
+            "after 5 s of steady raw=2 with aftc=1 s, output must reach 2"
+        );
         assert!(afvl.abs() >= 1.99 && afvl.abs() <= 2.0);
     }
 }

@@ -609,11 +609,15 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = PvDatabase::new();
-        db.add_record("CANON", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("CANON", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         db.add_alias("ALT", "CANON").await.unwrap();
 
         // get_pv via alias
-        db.put_pv("CANON.VAL", EpicsValue::Double(1.5)).await.unwrap();
+        db.put_pv("CANON.VAL", EpicsValue::Double(1.5))
+            .await
+            .unwrap();
         let v = db.get_pv("ALT.VAL").await.unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 1.5));
 
@@ -647,7 +651,9 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = PvDatabase::new();
-        db.add_record("CANON", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("CANON", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         db.add_alias("ALT", "CANON").await.unwrap();
 
         // Put VAL via the alias name.

@@ -703,12 +703,17 @@ ASG(SECURE) {
         let acf = parse_acf(acf_text).unwrap();
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:SECURE", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("AI:SECURE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         // Mark the record as belonging to the SECURE ASG.
         let rec = db.get_record("AI:SECURE").await.unwrap();
         rec.write().await.common.asg = "SECURE".to_string();
 
-        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(tokio::sync::RwLock::new(Some(acf))));
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
 
         // Allowed: admin from lab-pc1 — must succeed.
         source
@@ -755,11 +760,16 @@ ASG(LOCKED) {
         let acf = parse_acf(acf_text).unwrap();
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         let rec = db.get_record("AI:LOCKED").await.unwrap();
         rec.write().await.common.asg = "LOCKED".to_string();
 
-        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(tokio::sync::RwLock::new(Some(acf))));
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
 
         // alice gets a value back.
         let v = source
@@ -790,11 +800,16 @@ ASG(LOCKED) {
         let acf = parse_acf(acf_text).unwrap();
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:MON", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("AI:MON", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         let rec = db.get_record("AI:MON").await.unwrap();
         rec.write().await.common.asg = "LOCKED".to_string();
 
-        let source = PvDatabaseSource::new_with_acf(db.clone(), Arc::new(tokio::sync::RwLock::new(Some(acf))));
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
 
         let rx = source
             .subscribe_ctx("AI:MON", make_ctx("h", "alice", "anonymous"))
@@ -828,7 +843,9 @@ ASG(SECURE) {
         let cell: AcfCell = Arc::new(RwLock::new(Some(lockdown)));
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         let rec = db.get_record("AI:LIVE").await.unwrap();
         rec.write().await.common.asg = "SECURE".to_string();
 
@@ -877,7 +894,9 @@ ASG(SECURE) {
         use epics_base_rs::server::records::ai::AiRecord;
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
 
         let source = PvDatabaseSource::new(db.clone());
         source
@@ -897,8 +916,8 @@ ASG(SECURE) {
     /// ACF check by hand — now the trait method signature forces it.
     #[tokio::test]
     async fn get_value_checked_denies_when_no_access() {
-        use epics_base_rs::server::records::ai::AiRecord;
         use crate::server_native::source::ChannelSource;
+        use epics_base_rs::server::records::ai::AiRecord;
 
         let acf = parse_acf(
             r#"
@@ -911,8 +930,16 @@ ASG(LOCKED) {
         .unwrap();
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5))).await.unwrap();
-        db.get_record("AI:LOCKED").await.unwrap().write().await.common.asg = "LOCKED".into();
+        db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5)))
+            .await
+            .unwrap();
+        db.get_record("AI:LOCKED")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .common
+            .asg = "LOCKED".into();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -978,7 +1005,13 @@ ASG(DEFAULT) {
         // ASL is a u8; the parser clamps to 0/1 via put_common_field,
         // but the underlying field accepts any u8 — set it directly
         // for the test to exercise the gate above C's 0/1 range.
-        db.get_record("AI:LOCKED").await.unwrap().write().await.common.asl = 3;
+        db.get_record("AI:LOCKED")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .common
+            .asl = 3;
 
         db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0)))
             .await
@@ -994,7 +1027,11 @@ ASG(DEFAULT) {
         // so only READ applies — PUT must be denied.
         assert!(
             source
-                .put_value_ctx("AI:LOCKED", pv_double(1.0), make_ctx("h", "anyone", "anonymous"))
+                .put_value_ctx(
+                    "AI:LOCKED",
+                    pv_double(1.0),
+                    make_ctx("h", "anyone", "anonymous")
+                )
                 .await
                 .is_err(),
             "ASL=3 record must NOT match RULE(2, WRITE)",
@@ -1003,7 +1040,11 @@ ASG(DEFAULT) {
         // Open: WRITE rule applies (record_asl 0 ≤ rule.level 2),
         // so PUT succeeds.
         source
-            .put_value_ctx("AI:OPEN", pv_double(2.0), make_ctx("h", "anyone", "anonymous"))
+            .put_value_ctx(
+                "AI:OPEN",
+                pv_double(2.0),
+                make_ctx("h", "anyone", "anonymous"),
+            )
             .await
             .expect("ASL=0 record must match RULE(2, WRITE)");
     }

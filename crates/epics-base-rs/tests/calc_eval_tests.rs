@@ -516,11 +516,7 @@ fn test_full_a_to_u_sum() {
     // A..U all set to 1; expression is the sum of all 21 inputs.
     // Verifies the engine accepts all 21 letters in a single expression.
     let inputs: Vec<(u8, f64)> = (0..21).map(|i| (i, 1.0)).collect();
-    assert_calc(
-        "A+B+C+D+E+F+G+H+I+J+K+L+M+N+O+P+Q+R+S+T+U",
-        &inputs,
-        21.0,
-    );
+    assert_calc("A+B+C+D+E+F+G+H+I+J+K+L+M+N+O+P+Q+R+S+T+U", &inputs, 21.0);
 }
 
 #[test]

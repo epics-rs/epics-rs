@@ -386,8 +386,7 @@ async fn run_beacon_monitor_inner(
 /// IOC on that port.
 fn apply_reset_server(servers: &mut HashMap<SocketAddr, BeaconState>, circuit_addr: SocketAddr) {
     let port = circuit_addr.port();
-    let inaddr_any =
-        SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port));
+    let inaddr_any = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port));
 
     if let Some(s) = servers.get_mut(&circuit_addr) {
         s.period_estimate = None;

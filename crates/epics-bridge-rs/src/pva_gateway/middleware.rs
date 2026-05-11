@@ -135,7 +135,9 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         request_value: PvField,
         ctx: ChannelContext,
     ) -> Result<(FieldDesc, PvField), String> {
-        self.inner.rpc_checked(checked, request_desc, request_value, ctx).await
+        self.inner
+            .rpc_checked(checked, request_desc, request_value, ctx)
+            .await
     }
     fn notify_watermark_high(&self, name: &str) {
         self.inner.notify_watermark_high(name);

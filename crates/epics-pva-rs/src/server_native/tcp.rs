@@ -1569,7 +1569,13 @@ async fn handle_op(
                 );
                 let mon_checked = source
                     .access_gate()
-                    .check(&pv_name, &mon_ctx.host, &mon_ctx.account, &mon_ctx.method, "")
+                    .check(
+                        &pv_name,
+                        &mon_ctx.host,
+                        &mon_ctx.account,
+                        &mon_ctx.method,
+                        "",
+                    )
                     .await;
                 // Snapshot the window + notify so the spawned task can
                 // share state with this dispatch path's ACK handler.
@@ -1966,7 +1972,13 @@ async fn handle_op(
             };
             let rpc_checked = source
                 .access_gate()
-                .check(&pv_name, &rpc_ctx_val.host, &rpc_ctx_val.account, &rpc_ctx_val.method, "")
+                .check(
+                    &pv_name,
+                    &rpc_ctx_val.host,
+                    &rpc_ctx_val.account,
+                    &rpc_ctx_val.method,
+                    "",
+                )
                 .await;
             let result = source
                 .rpc_checked(rpc_checked, req_desc, req_value, rpc_ctx_val)

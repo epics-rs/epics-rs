@@ -593,20 +593,28 @@ mod tests {
         });
 
         let comp = CompositeSource::new();
-        comp.add_source("a", inner1.clone() as DynSource, 0).unwrap();
-        comp.add_source("b", inner2.clone() as DynSource, 1).unwrap();
+        comp.add_source("a", inner1.clone() as DynSource, 0)
+            .unwrap();
+        comp.add_source("b", inner2.clone() as DynSource, 1)
+            .unwrap();
 
         let v0 = comp.access().acl_version();
         // Bump inner1 — composite aggregate must change.
         inner1.gate.bump_acl_version();
         let v1 = comp.access().acl_version();
-        assert!(v1 != v0, "composite gate must surface inner1 bump: {v0} -> {v1}");
+        assert!(
+            v1 != v0,
+            "composite gate must surface inner1 bump: {v0} -> {v1}"
+        );
 
         // Bump inner2 separately — composite aggregate must change again.
         inner2.gate.bump_acl_version();
         inner2.gate.bump_acl_version();
         let v2 = comp.access().acl_version();
-        assert!(v2 != v1, "composite gate must track inner2 bumps too: {v1} -> {v2}");
+        assert!(
+            v2 != v1,
+            "composite gate must track inner2 bumps too: {v1} -> {v2}"
+        );
     }
 
     /// Round 50 follow-up (audit): pre-fix the composite used
@@ -687,8 +695,10 @@ mod tests {
         assert_eq!(inner_b.gate.acl_version(), 0);
 
         let comp = CompositeSource::new();
-        comp.add_source("a", inner_a.clone() as DynSource, 0).unwrap();
-        comp.add_source("b", inner_b.clone() as DynSource, 1).unwrap();
+        comp.add_source("a", inner_a.clone() as DynSource, 0)
+            .unwrap();
+        comp.add_source("b", inner_b.clone() as DynSource, 1)
+            .unwrap();
 
         let v0 = comp.access().acl_version();
         // Bump only B by one — B(0)→B(1). With `max` aggregator

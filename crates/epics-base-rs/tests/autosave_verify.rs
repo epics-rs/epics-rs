@@ -6,9 +6,15 @@ use epics_base_rs::server::autosave::verify::{MatchResult, format_verify_report,
 
 async fn setup_db() -> PvDatabase {
     let db = PvDatabase::new();
-    db.add_record("PV1", Box::new(AoRecord::new(10.0))).await.unwrap();
-    db.add_record("PV2", Box::new(AoRecord::new(20.0))).await.unwrap();
-    db.add_record("PV3", Box::new(AoRecord::new(30.0))).await.unwrap();
+    db.add_record("PV1", Box::new(AoRecord::new(10.0)))
+        .await
+        .unwrap();
+    db.add_record("PV2", Box::new(AoRecord::new(20.0)))
+        .await
+        .unwrap();
+    db.add_record("PV3", Box::new(AoRecord::new(30.0)))
+        .await
+        .unwrap();
     db
 }
 

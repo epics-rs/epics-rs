@@ -41,7 +41,9 @@ use epics_pva_rs::server_native::{
 /// delivered.
 struct VersionedChildSource {
     gate: AccessGate,
-    acf_cell: Arc<tokio::sync::RwLock<Option<epics_base_rs::server::access_security::AccessSecurityConfig>>>,
+    acf_cell: Arc<
+        tokio::sync::RwLock<Option<epics_base_rs::server::access_security::AccessSecurityConfig>>,
+    >,
     tx_holder: Arc<Mutex<Option<mpsc::Sender<PvField>>>>,
 }
 

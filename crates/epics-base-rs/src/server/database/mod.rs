@@ -451,7 +451,11 @@ impl PvDatabase {
         let _gate = self.inner.registration_mutex.lock().await;
         self.check_name_free(name).await?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        self.inner.simple_pvs.write().await.insert(name.to_string(), pv);
+        self.inner
+            .simple_pvs
+            .write()
+            .await
+            .insert(name.to_string(), pv);
         Ok(())
     }
 
@@ -476,7 +480,11 @@ impl PvDatabase {
         self.check_name_free(name).await?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         pv.set_write_hook(hook);
-        self.inner.simple_pvs.write().await.insert(name.to_string(), pv);
+        self.inner
+            .simple_pvs
+            .write()
+            .await
+            .insert(name.to_string(), pv);
         Ok(())
     }
 
@@ -515,7 +523,11 @@ impl PvDatabase {
         let instance = RecordInstance::new_boxed(name.to_string(), record);
         let scan = instance.common.scan;
         let phas = instance.common.phas;
-        self.inner.records.write().await.insert(name.to_string(), Arc::new(RwLock::new(instance)));
+        self.inner
+            .records
+            .write()
+            .await
+            .insert(name.to_string(), Arc::new(RwLock::new(instance)));
 
         if scan != ScanType::Passive {
             self.inner
@@ -763,10 +775,7 @@ impl PvDatabase {
     /// Strict variant of [`Self::get_record`] — does NOT consult the
     /// alias table. Returns `Some` only when a canonical record with
     /// that exact name exists.
-    pub async fn get_record_no_resolve(
-        &self,
-        name: &str,
-    ) -> Option<Arc<RwLock<RecordInstance>>> {
+    pub async fn get_record_no_resolve(&self, name: &str) -> Option<Arc<RwLock<RecordInstance>>> {
         self.inner.records.read().await.get(name).cloned()
     }
 
@@ -903,7 +912,8 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(42.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("ALIAS_NAME", "TARGET").await.unwrap();
 
         // find_entry on the alias must return the same record as
@@ -932,14 +942,19 @@ mod tests {
             "EXISTING",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_record(
             "OTHER",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         let err = db.add_alias("EXISTING", "OTHER").await;
-        assert!(err.is_err(), "alias name colliding with record must be rejected");
+        assert!(
+            err.is_err(),
+            "alias name colliding with record must be rejected"
+        );
     }
 
     #[tokio::test]
@@ -953,7 +968,8 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         let via_canonical = db.get_record("TARGET").await;
@@ -961,10 +977,7 @@ mod tests {
         assert!(via_canonical.is_some());
         assert!(via_alias.is_some(), "get_record must resolve alias");
         // Both calls return the same Arc (pointer equality).
-        assert!(Arc::ptr_eq(
-            &via_canonical.unwrap(),
-            &via_alias.unwrap()
-        ));
+        assert!(Arc::ptr_eq(&via_canonical.unwrap(), &via_alias.unwrap()));
     }
 
     #[tokio::test]
@@ -976,7 +989,8 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         assert!(db.get_record_no_resolve("TARGET").await.is_some());
@@ -996,12 +1010,14 @@ mod tests {
             "SRC_REAL",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_record(
             "DST_REAL",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("SRC_ALIAS", "SRC_REAL").await.unwrap();
         db.add_alias("DST_ALIAS", "DST_REAL").await.unwrap();
 
@@ -1023,12 +1039,14 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_record(
             "OTHER",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("ZZ", "TARGET").await.unwrap();
         db.add_alias("AA", "TARGET").await.unwrap();
         db.add_alias("MM", "OTHER").await.unwrap();
@@ -1039,10 +1057,7 @@ mod tests {
             vec!["AA".to_string(), "ZZ".to_string()]
         );
         // OTHER's alone.
-        assert_eq!(
-            db.aliases_for_record("OTHER").await,
-            vec!["MM".to_string()]
-        );
+        assert_eq!(db.aliases_for_record("OTHER").await, vec!["MM".to_string()]);
         // Unknown record → empty, not None.
         assert!(db.aliases_for_record("MISSING").await.is_empty());
     }
@@ -1054,7 +1069,8 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("ALIAS_A", "TARGET").await.unwrap();
         db.add_alias("ALIAS_B", "TARGET").await.unwrap();
 
@@ -1077,7 +1093,8 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         // Use complete_async_record by alias — must not error.
@@ -1095,7 +1112,8 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         // Both should succeed and reach the same record.
@@ -1118,7 +1136,8 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         let mut visited = std::collections::HashSet::new();
@@ -1144,7 +1163,8 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
         // Re-registering the same alias name (even to the same target)
         // must fail — base behaviour: aliases are inserted once.
@@ -1166,18 +1186,36 @@ mod tests {
         assert!(db.add_pv("A", EpicsValue::Double(2.0)).await.is_err());
         let noop_hook: crate::server::pv::WriteHook =
             std::sync::Arc::new(|_v, _ctx| Box::pin(async { Ok(()) }));
-        assert!(db.add_pv_with_hook("A", EpicsValue::Double(2.0), noop_hook).await.is_err());
-        assert!(db.add_record("A", Box::new(AiRecord::new(0.0))).await.is_err());
+        assert!(
+            db.add_pv_with_hook("A", EpicsValue::Double(2.0), noop_hook)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.add_record("A", Box::new(AiRecord::new(0.0)))
+                .await
+                .is_err()
+        );
         assert!(db.add_alias("A", "A").await.is_err());
 
-        db.add_record("R", Box::new(AiRecord::new(0.0))).await.unwrap();
-        assert!(db.add_record("R", Box::new(AiRecord::new(1.0))).await.is_err());
+        db.add_record("R", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        assert!(
+            db.add_record("R", Box::new(AiRecord::new(1.0)))
+                .await
+                .is_err()
+        );
         assert!(db.add_pv("R", EpicsValue::Double(0.0)).await.is_err());
         assert!(db.add_alias("R", "R").await.is_err());
 
         db.add_alias("AL", "R").await.unwrap();
         assert!(db.add_pv("AL", EpicsValue::Double(0.0)).await.is_err());
-        assert!(db.add_record("AL", Box::new(AiRecord::new(0.0))).await.is_err());
+        assert!(
+            db.add_record("AL", Box::new(AiRecord::new(0.0)))
+                .await
+                .is_err()
+        );
     }
 
     /// Round-32C (R31-G12): removing a record must purge aliases
@@ -1189,11 +1227,15 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = PvDatabase::new();
-        db.add_record("R", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("R", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         db.add_alias("ALT1", "R").await.unwrap();
         db.add_alias("ALT2", "R").await.unwrap();
         // An alias that points elsewhere must NOT be touched.
-        db.add_record("OTHER", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("OTHER", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         db.add_alias("KEEPER", "OTHER").await.unwrap();
 
         assert!(db.remove_record("R").await);
@@ -1215,7 +1257,9 @@ mod tests {
 
         let db = PvDatabase::new();
         db.add_pv("PVX", EpicsValue::Double(0.0)).await.unwrap();
-        db.add_record("TARGET", Box::new(AiRecord::new(0.0))).await.unwrap();
+        db.add_record("TARGET", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
         // alias name "PVX" collides with the simple PV — must fail.
         assert!(db.add_alias("PVX", "TARGET").await.is_err());
     }
@@ -1232,12 +1276,9 @@ mod tests {
         let db = std::sync::Arc::new(PvDatabase::new());
         let db1 = db.clone();
         let db2 = db.clone();
-        let h1 = tokio::spawn(async move {
-            db1.add_pv("RACE", EpicsValue::Double(1.0)).await
-        });
-        let h2 = tokio::spawn(async move {
-            db2.add_record("RACE", Box::new(AiRecord::new(0.0))).await
-        });
+        let h1 = tokio::spawn(async move { db1.add_pv("RACE", EpicsValue::Double(1.0)).await });
+        let h2 =
+            tokio::spawn(async move { db2.add_record("RACE", Box::new(AiRecord::new(0.0))).await });
         // Both complete within a reasonable bound — pre-fix this
         // could hang because T1 holds simple_pvs.write and waits
         // for records.read while T2 holds records.write and waits

@@ -256,7 +256,8 @@ pub trait ChannelSource: Send + Sync + 'static {
                     ctx.method,
                 ));
             }
-            self.rpc(checked.pv_name(), request_desc, request_value).await
+            self.rpc(checked.pv_name(), request_desc, request_value)
+                .await
         }
     }
 
@@ -438,7 +439,9 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>> {
-        Box::pin(<Self as ChannelSource>::get_value_checked(self, checked, ctx))
+        Box::pin(<Self as ChannelSource>::get_value_checked(
+            self, checked, ctx,
+        ))
     }
     fn access_gate<'a>(&'a self) -> &'a AccessGate {
         <Self as ChannelSource>::access(self)

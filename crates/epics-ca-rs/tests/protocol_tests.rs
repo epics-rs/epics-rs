@@ -353,7 +353,10 @@ async fn server_add_pv_at_runtime() {
     assert!(server.get("RUNTIME:PV").await.is_err());
 
     // Add it
-    server.add_pv("RUNTIME:PV", EpicsValue::Double(42.0)).await.unwrap();
+    server
+        .add_pv("RUNTIME:PV", EpicsValue::Double(42.0))
+        .await
+        .unwrap();
 
     // Now it exists
     assert_eq!(

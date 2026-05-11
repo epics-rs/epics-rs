@@ -200,9 +200,7 @@ impl AccessGate {
     /// `bump_acl_version()` on an `Aggregator` gate is a no-op:
     /// the version is derived, not owned. The aggregator's
     /// underlying gates own their own counters.
-    pub fn open_with_aggregator(
-        f: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
-    ) -> Self {
+    pub fn open_with_aggregator(f: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
         Self {
             inner: AccessGateInner::Open,
             acl_version: AclVersionSource::Aggregator(f),
@@ -284,9 +282,8 @@ mod access_checked_tests {
     #[tokio::test]
     async fn required_gate_with_no_acf_attached_is_permissive() {
         let cell = Arc::new(tokio::sync::RwLock::new(None));
-        let resolver: AsgAslResolver = Arc::new(|_pv| {
-            Box::pin(async { ("DEFAULT".to_string(), 0u8) })
-        });
+        let resolver: AsgAslResolver =
+            Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         let gate = AccessGate::required(cell, resolver);
         let checked = gate.check("any:pv", "h", "u", "anonymous", "").await;
         assert_eq!(checked.level(), AccessLevel::ReadWrite);
@@ -304,9 +301,8 @@ ASG(DEFAULT) {
         )
         .unwrap();
         let cell = Arc::new(tokio::sync::RwLock::new(Some(cfg)));
-        let resolver: AsgAslResolver = Arc::new(|_pv| {
-            Box::pin(async { ("DEFAULT".to_string(), 0u8) })
-        });
+        let resolver: AsgAslResolver =
+            Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         let gate = AccessGate::required(cell, resolver);
 
         let allowed = gate.check("x", "h", "alice", "anonymous", "").await;

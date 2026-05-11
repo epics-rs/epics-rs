@@ -779,7 +779,7 @@ ASG(SECURE) {
         let cfg = parse_acf(acf_text).unwrap();
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:SEC", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("AI:SEC", Box::new(AiRecord::new(0.0))).await.unwrap();
         let rec = db.get_record("AI:SEC").await.unwrap();
         rec.write().await.common.asg = "SECURE".to_string();
 

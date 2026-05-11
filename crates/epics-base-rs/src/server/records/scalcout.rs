@@ -393,6 +393,12 @@ impl Record for ScalcoutRecord {
         "scalcout"
     }
 
+    // C recScalcout.c IVOA=set_to_IVOV: oval = ivov (and osv = isvv
+    // for string output side, but OUT writeback only reads OVAL).
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        self.put_field("OVAL", ivov)
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         self.prev_val = self.val;
         self.prev_sval = self.sval.clone();

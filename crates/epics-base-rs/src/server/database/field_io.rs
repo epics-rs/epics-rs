@@ -586,7 +586,7 @@ mod tests {
     #[tokio::test]
     async fn put_pv_and_post_handles_simple_pv() {
         let db = PvDatabase::new();
-        db.add_pv("gw:test", EpicsValue::Double(0.0)).await;
+        db.add_pv("gw:test", EpicsValue::Double(0.0)).await.unwrap();
 
         // Should NOT return ChannelNotFound.
         db.put_pv_and_post("gw:test", EpicsValue::Double(42.0))
@@ -609,7 +609,7 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = PvDatabase::new();
-        db.add_record("CANON", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("CANON", Box::new(AiRecord::new(0.0))).await.unwrap();
         db.add_alias("ALT", "CANON").await.unwrap();
 
         // get_pv via alias
@@ -647,7 +647,7 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = PvDatabase::new();
-        db.add_record("CANON", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("CANON", Box::new(AiRecord::new(0.0))).await.unwrap();
         db.add_alias("ALT", "CANON").await.unwrap();
 
         // Put VAL via the alias name.

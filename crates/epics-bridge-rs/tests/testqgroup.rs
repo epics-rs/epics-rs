@@ -38,18 +38,18 @@ fn empty_request() -> PvStructure {
 async fn make_db() -> Arc<PvDatabase> {
     let db = Arc::new(PvDatabase::new());
     db.add_record("TEST:level", Box::new(AiRecord::new(1.5)))
-        .await;
+        .await.unwrap();
     db.add_record("TEST:count", Box::new(LonginRecord::new(7)))
-        .await;
+        .await.unwrap();
     db
 }
 
 async fn make_db_na() -> Arc<PvDatabase> {
     let db = Arc::new(PvDatabase::new());
     db.add_record("TEST:level_na", Box::new(AiRecord::new(0.0)))
-        .await;
+        .await.unwrap();
     db.add_record("TEST:count_na", Box::new(LonginRecord::new(0)))
-        .await;
+        .await.unwrap();
     db
 }
 

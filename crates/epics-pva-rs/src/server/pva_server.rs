@@ -141,8 +141,8 @@ impl PvaServer {
         &self.db
     }
 
-    pub async fn add_pv(&self, name: &str, initial: EpicsValue) {
-        self.db.add_pv(name, initial).await;
+    pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
+        self.db.add_pv(name, initial).await
     }
 
     pub async fn put(&self, name: &str, value: EpicsValue) -> CaResult<()> {

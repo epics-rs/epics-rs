@@ -141,6 +141,12 @@ impl Record for LsoRecord {
         LSO_FIELDS
     }
 
+    // C recLso.c IVOA=set_to_IVOV: oval = ivov (string copy); val = oval.
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        self.put_field("OVAL", ivov.clone())?;
+        self.put_field("VAL", ivov)
+    }
+
     fn uses_monitor_deadband(&self) -> bool {
         false
     }

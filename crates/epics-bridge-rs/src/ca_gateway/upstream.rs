@@ -311,9 +311,21 @@ impl UpstreamManager {
             asl,
             self.write_env.clone(),
         );
-        self.shadow_db
+        // If a prior subscribe attempt left a stale shadow entry (it
+        // would have been cleaned up by the failure path, but a hot
+        // restart or a crashed task could orphan it), drop it before
+        // re-registering. A genuine collision with a non-gateway
+        // record/alias surfaces as `Err` and we propagate.
+        self.shadow_db.remove_simple_pv(upstream_name).await;
+        if let Err(e) = self
+            .shadow_db
             .add_pv_with_hook(upstream_name, initial_value, hook)
-            .await;
+            .await
+        {
+            return Err(BridgeError::PutRejected(format!(
+                "shadow PV register failed: {e}"
+            )));
+        }
 
         // Subscribe (monitor receiver is independent of the channel handle).
         // On failure we MUST also remove the just-added shadow PV — otherwise

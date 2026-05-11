@@ -276,7 +276,7 @@ impl IocApplication {
 
         // Add inline records (Phase 7 declarative builder)
         for (name, record) in inline_records {
-            db.add_record(&name, record).await;
+            db.add_record(&name, record).await?;
         }
 
         // Phase 1: Execute startup script in a separate std::thread.
@@ -609,7 +609,7 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("TEST", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("TEST", Box::new(AiRecord::new(0.0))).await.unwrap();
 
         let factories = HashMap::new();
         let count = wire_device_support(&db, &factories, &None).await.unwrap();
@@ -667,7 +667,7 @@ mod tests {
         );
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:WITH:INFO", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("AI:WITH:INFO", Box::new(AiRecord::new(0.0))).await.unwrap();
         // Populate the record's info map — exactly what
         // IocBuilder/iocsh now do after loading info(...) directives.
         let rec = db.get_record("AI:WITH:INFO").await.unwrap();

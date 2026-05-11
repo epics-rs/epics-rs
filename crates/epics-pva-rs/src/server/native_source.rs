@@ -713,7 +713,7 @@ ASG(SECURE) {
         let acf = parse_acf(acf_text).unwrap();
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:SECURE", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("AI:SECURE", Box::new(AiRecord::new(0.0))).await.unwrap();
         // Mark the record as belonging to the SECURE ASG.
         let rec = db.get_record("AI:SECURE").await.unwrap();
         rec.write().await.common.asg = "SECURE".to_string();
@@ -765,7 +765,7 @@ ASG(LOCKED) {
         let acf = parse_acf(acf_text).unwrap();
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0))).await.unwrap();
         let rec = db.get_record("AI:LOCKED").await.unwrap();
         rec.write().await.common.asg = "LOCKED".to_string();
 
@@ -800,7 +800,7 @@ ASG(LOCKED) {
         let acf = parse_acf(acf_text).unwrap();
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:MON", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("AI:MON", Box::new(AiRecord::new(0.0))).await.unwrap();
         let rec = db.get_record("AI:MON").await.unwrap();
         rec.write().await.common.asg = "LOCKED".to_string();
 
@@ -838,7 +838,7 @@ ASG(SECURE) {
         let cell: AcfCell = Arc::new(RwLock::new(Some(lockdown)));
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0))).await.unwrap();
         let rec = db.get_record("AI:LIVE").await.unwrap();
         rec.write().await.common.asg = "SECURE".to_string();
 
@@ -887,7 +887,7 @@ ASG(SECURE) {
         use epics_base_rs::server::records::ai::AiRecord;
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0))).await.unwrap();
 
         let source = PvDatabaseSource::new(db.clone());
         source

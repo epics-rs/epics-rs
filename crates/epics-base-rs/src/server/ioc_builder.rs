@@ -166,12 +166,12 @@ impl IocBuilder {
 
         // 1. Simple PVs
         for (name, value) in self.pvs {
-            db.add_pv(&name, value).await;
+            db.add_pv(&name, value).await?;
         }
 
         // 2. Inline records
         for (name, record) in self.records {
-            db.add_record(&name, record).await;
+            db.add_record(&name, record).await?;
         }
 
         // 3. .db definitions — create records, apply fields, init, wire device support & subs
@@ -181,7 +181,7 @@ impl IocBuilder {
             let mut common_fields = Vec::new();
             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)?;
 
-            db.add_record(&def.name, record).await;
+            db.add_record(&def.name, record).await?;
 
             // info(...) tags — populate before `init_record` so device
             // support reading them from `instance.info` sees the values.

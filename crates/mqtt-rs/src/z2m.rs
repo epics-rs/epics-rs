@@ -74,7 +74,10 @@ fn load_records(prefix: &str, dev: &str, port: &str, records: &[RecordDef], ctx:
                             continue;
                         }
                         ctx.block_on(async {
-                            ctx.db().add_record(&def.name, record).await;
+                            if let Err(e) = ctx.db().add_record(&def.name, record).await {
+                                eprintln!("z2m: register '{}' skipped: {e}", def.name);
+                                return;
+                            }
                             if let Some(rec_arc) = ctx.db().get_record(&def.name).await {
                                 let mut instance = rec_arc.write().await;
                                 for (name, value) in common_fields {

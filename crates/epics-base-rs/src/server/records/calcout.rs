@@ -625,6 +625,12 @@ impl Record for CalcoutRecord {
         "calcout"
     }
 
+    // C recCalcout.c IVOA=set_to_IVOV: oval = ivov; the OUT writeback
+    // then sends OVAL. VAL is the calc *result* and remains intact.
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        self.put_field("OVAL", ivov)
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             if !self.calc.is_empty() {

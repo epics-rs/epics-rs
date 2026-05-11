@@ -213,6 +213,18 @@ impl Record for BoRecord {
         "bo"
     }
 
+    // C recBo.c IVOA=set_to_IVOV: val = ivov; rval = ivov.
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        // RVAL is Long; IVOV is Enum on this record. Coerce to Long.
+        let rval = match &ivov {
+            EpicsValue::Enum(e) => EpicsValue::Long(*e as i32),
+            EpicsValue::Short(s) => EpicsValue::Long(*s as i32),
+            other => other.clone(),
+        };
+        self.put_field("RVAL", rval)?;
+        self.put_field("VAL", ivov)
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             // DOL constant initialization: normalize to 0/1 (like C: !!ival)

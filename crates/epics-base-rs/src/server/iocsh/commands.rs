@@ -713,7 +713,10 @@ fn cmd_db_create_record() -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            ctx.block_on(ctx.db().add_record(&name, record));
+            if let Err(e) = ctx.block_on(ctx.db().add_record(&name, record)) {
+                ctx.println(&format!("dbCreateRecord: {e}"));
+                return Ok(CommandOutcome::Continue);
+            }
             ctx.println(&format!(
                 "dbCreateRecord: created '{name}' ({rec_type})"
             ));
@@ -924,8 +927,13 @@ fn cmd_db_load_records() -> CommandDef {
                 db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
                     .map_err(|e| format!("{e}"))?;
 
-                ctx.block_on(async {
-                    ctx.db().add_record(&def.name, record).await;
+                let added: Result<(), String> = ctx.block_on(async {
+                    if let Err(e) = ctx.db().add_record(&def.name, record).await {
+                        return Err(format!(
+                            "dbLoadRecords: '{}' rejected: {e}",
+                            def.name
+                        ));
+                    }
 
                     // Register any aliases declared in the record body
                     // (epics-base PR #336). Failures are reported but
@@ -994,7 +1002,12 @@ fn cmd_db_load_records() -> CommandDef {
                             eprintln!("init_record(1) failed for {}: {e}", def.name);
                         }
                     }
+                    Ok(())
                 });
+                if let Err(e) = added {
+                    ctx.println(&e);
+                    return Ok(CommandOutcome::Continue);
+                }
             }
 
             ctx.println(&format!("Loaded {count} record(s) from {path}"));
@@ -1266,8 +1279,8 @@ mod tests {
     fn test_dbl() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("REC_A", Box::new(AiRecord::new(1.0))).await;
-            db.add_record("REC_B", Box::new(AiRecord::new(2.0))).await;
+            db.add_record("REC_A", Box::new(AiRecord::new(1.0))).await.unwrap();
+            db.add_record("REC_B", Box::new(AiRecord::new(2.0))).await.unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -1282,7 +1295,7 @@ mod tests {
     fn test_dbgf() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("TEMP", Box::new(AiRecord::new(25.0))).await;
+            db.add_record("TEMP", Box::new(AiRecord::new(25.0))).await.unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -1311,7 +1324,7 @@ mod tests {
     fn test_dbpf_and_readback() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("TEMP", Box::new(AiRecord::new(0.0))).await;
+            db.add_record("TEMP", Box::new(AiRecord::new(0.0))).await.unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -1336,7 +1349,7 @@ mod tests {
     fn test_dbpr_levels() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("TEMP", Box::new(AiRecord::new(25.0))).await;
+            db.add_record("TEMP", Box::new(AiRecord::new(25.0))).await.unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -1355,12 +1368,12 @@ mod tests {
     fn test_dbl_filter_by_type() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("AI_REC", Box::new(AiRecord::new(1.0))).await;
+            db.add_record("AI_REC", Box::new(AiRecord::new(1.0))).await.unwrap();
             db.add_record(
                 "BO_REC",
                 Box::new(crate::server::records::bo::BoRecord::new(0)),
             )
-            .await;
+            .await.unwrap();
         });
 
         let mut registry = CommandRegistry::new();

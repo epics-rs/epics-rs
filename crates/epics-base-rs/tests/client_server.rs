@@ -26,7 +26,7 @@ fn free_port() -> u16 {
 async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::CaClient> {
     let db = Arc::new(PvDatabase::new());
     for (name, val) in pvs {
-        db.add_pv(name, val).await;
+        db.add_pv(name, val).await.unwrap();
     }
 
     let acf = Arc::new(tokio::sync::RwLock::new(None));

@@ -250,6 +250,13 @@ impl Record for MbboDirectRecord {
         MBBO_DIRECT_FIELDS
     }
 
+    // C recMbboDirect.c IVOA=set_to_IVOV: val = ivov; rval = ivov.
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        // IVOV is Long on mbboDirect; both VAL and RVAL accept Long.
+        self.put_field("RVAL", ivov.clone())?;
+        self.put_field("VAL", ivov)
+    }
+
     fn uses_monitor_deadband(&self) -> bool {
         false
     }

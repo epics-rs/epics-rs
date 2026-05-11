@@ -576,16 +576,20 @@ impl PvDatabase {
                 match ivoa {
                     1 => true, // Don't drive outputs
                     2 => {
-                        // Set output to IVOV
-                        // For calcout records, IVOV should be written to OVAL (the
-                        // output value), not VAL. C: prec->oval = prec->ivov
+                        // Set output to IVOV. Each record type knows
+                        // which field its OUT writeback consumes — see
+                        // [`Record::apply_invalid_output_value`]. The
+                        // pre-Round-30C path special-cased `calcout`
+                        // (OVAL) and fell back to `set_val` (VAL) for
+                        // every other record. That hid a real bug:
+                        // ao/lso/bo/mbbo/busy left their OVAL/RVAL
+                        // staging field stale, so the OUT writeback —
+                        // which reads `OVAL.or(VAL)` — sent the
+                        // pre-IVOA value to the linked record. Per-type
+                        // overrides now apply IVOV to the field that
+                        // matches the C convention.
                         if let Some(ivov) = instance.record.get_field("IVOV") {
-                            let rtype = instance.record.record_type();
-                            if rtype == "calcout" {
-                                let _ = instance.record.put_field("OVAL", ivov);
-                            } else {
-                                let _ = instance.record.set_val(ivov);
-                            }
+                            let _ = instance.record.apply_invalid_output_value(ivov);
                         }
                         false
                     }
@@ -1182,13 +1186,13 @@ impl PvDatabase {
                 match ivoa {
                     1 => true,
                     2 => {
+                        // See Round-30C comment in
+                        // `process_record_with_links_inner` — IVOA=2
+                        // delegates to the per-record
+                        // `apply_invalid_output_value` so OVAL/RVAL/VAL
+                        // get the C-convention values.
                         if let Some(ivov) = instance.record.get_field("IVOV") {
-                            let rtype = instance.record.record_type();
-                            if rtype == "calcout" {
-                                let _ = instance.record.put_field("OVAL", ivov);
-                            } else {
-                                let _ = instance.record.set_val(ivov);
-                            }
+                            let _ = instance.record.apply_invalid_output_value(ivov);
                         }
                         false
                     }

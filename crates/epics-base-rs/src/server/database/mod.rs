@@ -419,13 +419,18 @@ impl PvDatabase {
     }
 
     /// Add a simple PV with an initial value.
-    pub async fn add_pv(&self, name: &str, initial: EpicsValue) {
+    ///
+    /// Returns `Err` when `name` is already registered as a simple PV,
+    /// a record, or an alias — mirroring epics-base C IOC which treats
+    /// duplicate `dbLoadRecords` names as a fatal error. Callers that
+    /// want replace-on-overwrite semantics must first call
+    /// `remove_simple_pv` / `remove_record` / `remove_alias`.
+    pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
+        let mut simple_pvs = self.inner.simple_pvs.write().await;
+        Self::check_name_free(name, &simple_pvs, &*self.inner.records.read().await, &*self.inner.aliases.read().await)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        self.inner
-            .simple_pvs
-            .write()
-            .await
-            .insert(name.to_string(), pv);
+        simple_pvs.insert(name.to_string(), pv);
+        Ok(())
     }
 
     /// Add a simple PV that already has a [`WriteHook`] installed.
@@ -437,19 +442,20 @@ impl PvDatabase {
     /// where a downstream client could (in principle) `CREATE_CHAN` +
     /// `WRITE_NOTIFY` between the two awaits and hit the local
     /// `pv.set()` fallback path before the hook landed.
+    ///
+    /// Returns `Err` on duplicate name (see [`add_pv`]).
     pub async fn add_pv_with_hook(
         &self,
         name: &str,
         initial: EpicsValue,
         hook: crate::server::pv::WriteHook,
-    ) {
+    ) -> CaResult<()> {
+        let mut simple_pvs = self.inner.simple_pvs.write().await;
+        Self::check_name_free(name, &simple_pvs, &*self.inner.records.read().await, &*self.inner.aliases.read().await)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         pv.set_write_hook(hook);
-        self.inner
-            .simple_pvs
-            .write()
-            .await
-            .insert(name.to_string(), pv);
+        simple_pvs.insert(name.to_string(), pv);
+        Ok(())
     }
 
     /// Remove a simple PV by name. Returns `Some(pv)` if a PV was
@@ -461,15 +467,18 @@ impl PvDatabase {
     }
 
     /// Add a record (accepts a boxed Record to avoid double-boxing).
-    pub async fn add_record(&self, name: &str, record: Box<dyn Record>) {
+    ///
+    /// Returns `Err` when `name` collides with an existing record,
+    /// simple PV, or alias. The C IOC's `dbLoadRecords` treats this as
+    /// fatal; do not silently replace.
+    pub async fn add_record(&self, name: &str, record: Box<dyn Record>) -> CaResult<()> {
+        let mut records = self.inner.records.write().await;
+        Self::check_name_free(name, &*self.inner.simple_pvs.read().await, &records, &*self.inner.aliases.read().await)?;
         let instance = RecordInstance::new_boxed(name.to_string(), record);
         let scan = instance.common.scan;
         let phas = instance.common.phas;
-        self.inner
-            .records
-            .write()
-            .await
-            .insert(name.to_string(), Arc::new(RwLock::new(instance)));
+        records.insert(name.to_string(), Arc::new(RwLock::new(instance)));
+        drop(records);
 
         // Register in scan index
         if scan != ScanType::Passive {
@@ -481,6 +490,35 @@ impl PvDatabase {
                 .or_default()
                 .insert((phas, name.to_string()));
         }
+        Ok(())
+    }
+
+    /// Verify that `name` is not currently registered in any of the
+    /// three namespaces. Caller must hold a write lock on the target
+    /// map so the check is atomic with the subsequent insert.
+    fn check_name_free(
+        name: &str,
+        simple_pvs: &HashMap<String, Arc<ProcessVariable>>,
+        records: &HashMap<String, Arc<RwLock<RecordInstance>>>,
+        aliases: &HashMap<String, String>,
+    ) -> CaResult<()> {
+        let kind = if simple_pvs.contains_key(name) {
+            Some("simple PV")
+        } else if records.contains_key(name) {
+            Some("record")
+        } else if aliases.contains_key(name) {
+            Some("alias")
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return Err(CaError::DbParseError {
+                line: 0,
+                column: 0,
+                message: format!("name '{name}' is already registered as a {kind}"),
+            });
+        }
+        Ok(())
     }
 
     /// Remove a record by name. Returns `true` if a record was removed,
@@ -824,7 +862,7 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(42.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("ALIAS_NAME", "TARGET").await.unwrap();
 
         // find_entry on the alias must return the same record as
@@ -853,12 +891,12 @@ mod tests {
             "EXISTING",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_record(
             "OTHER",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         let err = db.add_alias("EXISTING", "OTHER").await;
         assert!(err.is_err(), "alias name colliding with record must be rejected");
     }
@@ -874,7 +912,7 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         let via_canonical = db.get_record("TARGET").await;
@@ -897,7 +935,7 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         assert!(db.get_record_no_resolve("TARGET").await.is_some());
@@ -917,12 +955,12 @@ mod tests {
             "SRC_REAL",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_record(
             "DST_REAL",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("SRC_ALIAS", "SRC_REAL").await.unwrap();
         db.add_alias("DST_ALIAS", "DST_REAL").await.unwrap();
 
@@ -944,12 +982,12 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_record(
             "OTHER",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("ZZ", "TARGET").await.unwrap();
         db.add_alias("AA", "TARGET").await.unwrap();
         db.add_alias("MM", "OTHER").await.unwrap();
@@ -975,7 +1013,7 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("ALIAS_A", "TARGET").await.unwrap();
         db.add_alias("ALIAS_B", "TARGET").await.unwrap();
 
@@ -998,7 +1036,7 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         // Use complete_async_record by alias — must not error.
@@ -1016,7 +1054,7 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         // Both should succeed and reach the same record.
@@ -1039,7 +1077,7 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
         let mut visited = std::collections::HashSet::new();
@@ -1065,11 +1103,39 @@ mod tests {
             "TARGET",
             Box::new(crate::server::records::ai::AiRecord::new(0.0)),
         )
-        .await;
+        .await.unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
         // Re-registering the same alias name (even to the same target)
         // must fail — base behaviour: aliases are inserted once.
         let err = db.add_alias("ALIAS", "TARGET").await;
         assert!(err.is_err(), "duplicate alias name must be rejected");
+    }
+
+    /// Round-30B: `add_pv`, `add_pv_with_hook`, and `add_record` must
+    /// refuse to silently replace an existing registration. Mirrors
+    /// epics-base C IOC which treats a duplicate `dbLoadRecords` name
+    /// as a fatal load error.
+    #[tokio::test]
+    async fn add_pv_and_add_record_reject_duplicates_across_namespaces() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_pv("A", EpicsValue::Double(1.0)).await.unwrap();
+        // Same name as simple_pv — every namespace must see it.
+        assert!(db.add_pv("A", EpicsValue::Double(2.0)).await.is_err());
+        let noop_hook: crate::server::pv::WriteHook =
+            std::sync::Arc::new(|_v, _ctx| Box::pin(async { Ok(()) }));
+        assert!(db.add_pv_with_hook("A", EpicsValue::Double(2.0), noop_hook).await.is_err());
+        assert!(db.add_record("A", Box::new(AiRecord::new(0.0))).await.is_err());
+        assert!(db.add_alias("A", "A").await.is_err());
+
+        db.add_record("R", Box::new(AiRecord::new(0.0))).await.unwrap();
+        assert!(db.add_record("R", Box::new(AiRecord::new(1.0))).await.is_err());
+        assert!(db.add_pv("R", EpicsValue::Double(0.0)).await.is_err());
+        assert!(db.add_alias("R", "R").await.is_err());
+
+        db.add_alias("AL", "R").await.unwrap();
+        assert!(db.add_pv("AL", EpicsValue::Double(0.0)).await.is_err());
+        assert!(db.add_record("AL", Box::new(AiRecord::new(0.0))).await.is_err());
     }
 }

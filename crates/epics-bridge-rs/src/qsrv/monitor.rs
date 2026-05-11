@@ -145,7 +145,7 @@ mod tests {
     async fn monitor_stop_releases_subscription() {
         let db = Arc::new(PvDatabase::new());
         db.add_record("MON_LIFECYCLE", Box::new(AiRecord::new(1.0)))
-            .await;
+            .await.unwrap();
 
         let mut mon = BridgeMonitor::new(db.clone(), "MON_LIFECYCLE".into(), NtType::Scalar);
         mon.start().await.expect("start ok");

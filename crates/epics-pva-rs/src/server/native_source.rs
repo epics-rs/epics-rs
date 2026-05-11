@@ -12,7 +12,7 @@ use crate::client_native::context::PvGetResult; // not used; kept for re-export 
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use crate::server_native::ChannelSource;
 
-use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
+use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
@@ -30,34 +30,29 @@ pub type AcfCell = Arc<RwLock<Option<AccessSecurityConfig>>>;
 /// Native `ChannelSource` over a `PvDatabase`.
 pub struct PvDatabaseSource {
     db: Arc<PvDatabase>,
-    /// Optional Access Security configuration. When set, every PUT
-    /// is gated through `check_access_method` using the connecting
-    /// peer's host/account/method (PVA `ChannelContext`). When None,
-    /// PUTs are unrestricted (legacy behaviour for callers that
-    /// build `PvDatabaseSource::new` without an ACF).
-    acf: AcfCell,
-    /// Round 41: type-state-enforced access gate. Holds the same
-    /// AcfCell as `self.acf` plus a per-name `(ASG, ASL)` resolver
-    /// closure that captures `Arc<PvDatabase>` to read `common.asg`
-    /// and `common.asl` off the live record. The wire layer mints
-    /// [`AccessChecked`] tokens via this gate; the typed
-    /// `*_checked` op methods refuse to proceed without one.
+    /// Round 41/43: the type-state access gate is the only ACF
+    /// surface on this source. The gate holds an `Arc` clone of
+    /// the caller's `AcfCell` (so hot-swap via that cell is
+    /// visible) plus a per-name `(ASG, ASL)` resolver that reads
+    /// the live record's `common.asg` / `common.asl`. Wire-layer
+    /// `*_checked` ops cannot run without an `AccessChecked` minted
+    /// here.
     gate: epics_base_rs::server::access_security::AccessGate,
 }
 
 impl PvDatabaseSource {
     pub fn new(db: Arc<PvDatabase>) -> Self {
         let acf: AcfCell = Arc::new(RwLock::new(None));
-        let gate = Self::build_gate(db.clone(), acf.clone());
-        Self { db, acf, gate }
+        let gate = Self::build_gate(db.clone(), acf);
+        Self { db, gate }
     }
 
     /// Build with ACF enforcement. Mirrors what `PvaServer::run`
     /// installs from its builder-supplied ACF — every PUT goes
     /// through `check_access_method` against the record's `ASG`.
     pub fn new_with_acf(db: Arc<PvDatabase>, acf: AcfCell) -> Self {
-        let gate = Self::build_gate(db.clone(), acf.clone());
-        Self { db, acf, gate }
+        let gate = Self::build_gate(db.clone(), acf);
+        Self { db, gate }
     }
 
     fn build_gate(

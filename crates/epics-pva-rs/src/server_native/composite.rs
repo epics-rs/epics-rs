@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField};
 
-use super::source::{AccessChecked, ChannelContext, ChannelSource, DynSource, RawMonitorEvent};
+use super::source::{AccessChecked, ChannelSource, DynSource, RawMonitorEvent};
 
 /// One entry in the registry.
 #[derive(Clone)]

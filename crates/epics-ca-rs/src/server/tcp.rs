@@ -291,6 +291,20 @@ impl ClientState {
         self.free_sids.push(sid);
     }
 
+    /// Round 44: return the type-state-wrapped access token for a
+    /// SID. Op handlers MUST consult this — direct reads of the
+    /// underlying `channel_access` HashMap bypass the typed gate
+    /// and recreate the missed-path defects fixed in rounds 38-39.
+    /// Missing SIDs map to a "denied" token so a corrupted
+    /// channel-table state can never silently grant access.
+    fn lookup_access(&self, sid: u32) -> crate::server::access_token::CaAccessChecked {
+        use crate::server::access_token::CaAccessChecked;
+        match self.channel_access.get(&sid).copied() {
+            Some(level) => CaAccessChecked::from_level(level),
+            None => CaAccessChecked::denied(),
+        }
+    }
+
     /// Compute access rights bits for a channel target.
     async fn compute_access(&self, target: &ChannelTarget) -> u32 {
         match target {
@@ -1181,33 +1195,28 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            // R38-G2 / Round 38: CA READ must consult access_rights.
-            // Pre-fix any client could read any channel regardless of
-            // the ASG/ASL gate computed at CREATE_CHAN — the round-33A
-            // ASL plumbing only surfaced in the access_rights mask sent
-            // to the client (advisory) and in the WRITE enforcement
-            // path. The C IOC's `read_NoAccess` (camessage.c) refuses
-            // GET on NoAccess channels with ECA_NORDACCESS; mirror it.
-            // Default missing entries to `NoAccess` so a corrupted
-            // channel-table state cannot leak data.
-            let read_access = state
-                .channel_access
-                .get(&sid)
-                .copied()
-                .unwrap_or(AccessLevel::NoAccess);
-            if read_access == AccessLevel::NoAccess {
-                if is_notify {
-                    send_cmd_error(
-                        writer,
-                        CA_PROTO_READ_NOTIFY,
-                        requested_type,
-                        ECA_NORDACCESS,
-                        ioid,
-                    )
-                    .await?;
+            // R38-G2 / Round 38, Round 44 type-state:
+            // `state.lookup_access(sid)` is the only path to the
+            // access cache. `require_read()` returns a witness on
+            // success and an `AccessDenied` carrying the matching
+            // ECA code on failure — no `if access ==` ad-hoc
+            // comparison, no missing-entry default to argue about.
+            let _read_grant = match state.lookup_access(sid).require_read() {
+                Ok(g) => g,
+                Err(denied) => {
+                    if is_notify {
+                        send_cmd_error(
+                            writer,
+                            CA_PROTO_READ_NOTIFY,
+                            requested_type,
+                            denied.eca_code(),
+                            ioid,
+                        )
+                        .await?;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
+            };
 
             let snapshot = get_full_snapshot(&entry.target).await;
             let Some(mut snapshot) = snapshot else {
@@ -1341,23 +1350,25 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // state — a `NoAccess` peer could silence alarms on
                 // any record they could open. Mirror the regular
                 // WRITE gate.
-                let ack_access = state
-                    .channel_access
-                    .get(&sid)
-                    .copied()
-                    .unwrap_or(AccessLevel::NoAccess);
-                if ack_access != AccessLevel::ReadWrite {
-                    if is_notify {
-                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                        resp.data_type = hdr.data_type;
-                        resp.count = hdr.count;
-                        resp.cid = ECA_NOWTACCESS;
-                        resp.available = ioid;
-                        let mut w = writer.lock().await;
-                        w.write_all(&resp.to_bytes()).await?;
+                // R39-G1 / Round 44 type-state: alarm-ack PUTs go
+                // through the same gate as regular WRITE. Token's
+                // `require_write` returns the matching ECA code on
+                // denial.
+                let _write_grant = match state.lookup_access(sid).require_write() {
+                    Ok(g) => g,
+                    Err(denied) => {
+                        if is_notify {
+                            let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+                            resp.data_type = hdr.data_type;
+                            resp.count = hdr.count;
+                            resp.cid = denied.eca_code();
+                            resp.available = ioid;
+                            let mut w = writer.lock().await;
+                            w.write_all(&resp.to_bytes()).await?;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
+                };
                 let value_u16 = if payload.len() >= 2 {
                     u16::from_be_bytes([payload[0], payload[1]])
                 } else {
@@ -1443,31 +1454,25 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            // Check access level. Round-38 (R38-G1): the missing-
-            // entry fallback used to grant `ReadWrite`, which would
-            // permit a WRITE in any path that landed an entry in
-            // `state.channels` without landing one in
-            // `state.channel_access`. Default to `NoAccess` so a
-            // bookkeeping defect can never silently grant WRITE.
-            let access = state
-                .channel_access
-                .get(&sid)
-                .copied()
-                .unwrap_or(AccessLevel::NoAccess);
-            if access != AccessLevel::ReadWrite {
-                if is_notify {
-                    let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                    resp.data_type = write_type as u16;
-                    resp.count = hdr.count;
-                    resp.cid = ECA_NOWTACCESS;
-                    resp.available = ioid;
-                    let mut w = writer.lock().await;
-                    w.write_all(&resp.to_bytes()).await?;
-                    // flush deferred to handle_client outer loop (batched)
+            // Round 44 type-state WRITE gate. `lookup_access` is
+            // the only path to the cache; the witness type ensures
+            // the matching ECA code reaches the wire.
+            let _write_grant = match state.lookup_access(sid).require_write() {
+                Ok(g) => g,
+                Err(denied) => {
+                    if is_notify {
+                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+                        resp.data_type = write_type as u16;
+                        resp.count = hdr.count;
+                        resp.cid = denied.eca_code();
+                        resp.available = ioid;
+                        let mut w = writer.lock().await;
+                        w.write_all(&resp.to_bytes()).await?;
+                    }
+                    state.audit("caput", &audit_pv, "", "denied").await;
+                    return Ok(());
                 }
-                state.audit("caput", &audit_pv, "", "denied").await;
-                return Ok(());
-            }
+            };
 
             let count = hdr.actual_count() as usize;
             let write_count = hdr.count; // Echo back in response (matches C EPICS)
@@ -1648,22 +1653,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // identical leak to the round-32A `subscribe_raw` ACF
             // bypass on the PVA side. C IOC's `event_add_NoAccess`
             // returns ECA_NORDACCESS for the same reason.
-            let sub_access = state
-                .channel_access
-                .get(&sid)
-                .copied()
-                .unwrap_or(AccessLevel::NoAccess);
-            if sub_access == AccessLevel::NoAccess {
-                send_cmd_error(
-                    writer,
-                    CA_PROTO_EVENT_ADD,
-                    requested_type,
-                    ECA_NORDACCESS,
-                    sub_id,
-                )
-                .await?;
-                return Ok(());
-            }
+            // Round 44 type-state EVENT_ADD gate. R38-G3 closed the
+            // missing per-op check; the typed `require_read` shape
+            // is the path every future MONITOR-class op should
+            // mirror.
+            let _read_grant = match state.lookup_access(sid).require_read() {
+                Ok(g) => g,
+                Err(denied) => {
+                    send_cmd_error(
+                        writer,
+                        CA_PROTO_EVENT_ADD,
+                        requested_type,
+                        denied.eca_code(),
+                        sub_id,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
 
             // Refuse a duplicate sub_id on the same connection. Without
             // this, two EVENT_ADDs with identical sub_id leave both

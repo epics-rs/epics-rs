@@ -34,6 +34,23 @@ pub struct RawEvent {
     pub byte_order: epics_pva_rs::proto::ByteOrder,
 }
 
+/// PV-name → ASG-name resolver. Returns the ASG that the gateway
+/// should consult for the given downstream channel. Default impl
+/// (see `default_asg_resolver`) returns `"DEFAULT"` for every name —
+/// matching the legacy pre-Round-30D behaviour. Sites that want
+/// per-PV granularity (e.g. `set:.*` → `OPERATOR`, `dev:.*` → `DEV`)
+/// install a custom resolver via [`GatewayChannelSource::set_asg_resolver`].
+///
+/// MUST be cheap: this is called on every ACL check, which is on the
+/// hot path of every GET / PUT / MONITOR. Avoid regex recompilation
+/// or hashmap allocation per call — capture pre-built tables in the
+/// closure.
+pub type AsgResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+fn default_asg_resolver() -> AsgResolver {
+    Arc::new(|_pv| "DEFAULT".to_string())
+}
+
 /// `ChannelSource` impl handed to the downstream `PvaServer`. Cheap
 /// to clone (Arc-backed cache + a couple of `Duration`s).
 #[derive(Clone)]
@@ -81,6 +98,10 @@ pub struct GatewayChannelSource {
     /// pre-round-29 behaviour) — pvxs `pva2pva` parity for sites
     /// that delegate all ACL to upstream.
     acf: AcfCell,
+    /// PV→ASG resolver. Defaults to `DEFAULT` for every name; sites
+    /// that want per-PV ASG granularity replace this via
+    /// [`set_asg_resolver`].
+    asg_resolver: AsgResolver,
 }
 
 impl GatewayChannelSource {
@@ -94,7 +115,18 @@ impl GatewayChannelSource {
             subscriber_count: Arc::new(AtomicUsize::new(0)),
             upstream_pool: Arc::new(Mutex::new(HashMap::new())),
             acf: Arc::new(RwLock::new(None)),
+            asg_resolver: default_asg_resolver(),
         }
+    }
+
+    /// Install a custom PV→ASG resolver. Mirrors the C IOC's
+    /// per-record `ASG` field: each downstream channel name maps to
+    /// the ASG that gates GET / PUT / MONITOR for that PV. The
+    /// resolver is called on every op so should be O(1) on average
+    /// — typically a pre-built `HashMap` or compiled-regex table.
+    /// Pass `None` to reset to the `DEFAULT`-everywhere default.
+    pub fn set_asg_resolver(&mut self, resolver: Option<AsgResolver>) {
+        self.asg_resolver = resolver.unwrap_or_else(default_asg_resolver);
     }
 
     /// Install (or hot-swap) the gateway-side ACF policy. None
@@ -114,17 +146,19 @@ impl GatewayChannelSource {
     /// Returns the resolved [`AccessLevel`]; when no ACF is
     /// attached we report `ReadWrite` so the pass-through fast
     /// path stays hot.
-    async fn acl_level(&self, ctx: &ChannelContext) -> AccessLevel {
+    ///
+    /// Round-30D: the ASG name is now resolved per channel via
+    /// [`AsgResolver`] instead of being hard-coded to `DEFAULT`. The
+    /// resolver default still returns `DEFAULT` for every PV, so
+    /// behaviour is unchanged for callers that never set a resolver.
+    async fn acl_level(&self, pv: &str, ctx: &ChannelContext) -> AccessLevel {
         let guard = self.acf.read().await;
         match *guard {
             None => AccessLevel::ReadWrite,
             Some(ref cfg) => {
-                // The gateway has no record-level ASG concept; route
-                // every downstream op through `DEFAULT`. Sites that
-                // need per-PV granularity can wrap this method or
-                // extend the ACF parser to consult a name pattern.
+                let asg = (self.asg_resolver)(pv);
                 cfg.check_access_method(
-                    "DEFAULT",
+                    &asg,
                     &ctx.host,
                     &ctx.account,
                     0,
@@ -205,7 +239,7 @@ impl ChannelSource for GatewayChannelSource {
     /// channel and never appears in upstream audit logs as the
     /// gateway.
     async fn get_value_ctx(&self, name: &str, ctx: ChannelContext) -> Option<PvField> {
-        if self.acl_level(&ctx).await == AccessLevel::NoAccess {
+        if self.acl_level(name, &ctx).await == AccessLevel::NoAccess {
             tracing::debug!(
                 pv = %name,
                 account = %ctx.account,
@@ -251,7 +285,7 @@ impl ChannelSource for GatewayChannelSource {
         // upstream lookup so a forbidden write never reaches the
         // upstream IOC. The downstream sees a denial message that
         // names the gateway as the enforcement point.
-        if self.acl_level(&ctx).await != AccessLevel::ReadWrite {
+        if self.acl_level(name, &ctx).await != AccessLevel::ReadWrite {
             tracing::debug!(
                 pv = %name,
                 account = %ctx.account,
@@ -393,7 +427,7 @@ impl ChannelSource for GatewayChannelSource {
         name: &str,
         ctx: ChannelContext,
     ) -> Option<mpsc::Receiver<PvField>> {
-        if self.acl_level(&ctx).await == AccessLevel::NoAccess {
+        if self.acl_level(name, &ctx).await == AccessLevel::NoAccess {
             tracing::debug!(
                 pv = %name,
                 account = %ctx.account,
@@ -615,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn acl_level_no_acf_is_readwrite() {
         let src = make_source();
-        let level = src.acl_level(&make_ctx("h", "anyone", "anonymous")).await;
+        let level = src.acl_level("any:pv", &make_ctx("h", "anyone", "anonymous")).await;
         assert!(matches!(level, AccessLevel::ReadWrite));
     }
 
@@ -712,5 +746,59 @@ ASG(DEFAULT) {
                 "post-swap PUT must NOT be ACL-denied: {msg:?}",
             );
         }
+    }
+
+    /// Round-30D: the gateway no longer hard-codes the ASG name to
+    /// `DEFAULT`. An installed [`AsgResolver`] routes each channel
+    /// through its own ASG, mirroring the per-record `ASG` field
+    /// behaviour of a C IOC.
+    #[tokio::test]
+    async fn acl_level_uses_per_pv_asg_resolver() {
+        let mut src = make_source();
+        // Two PV namespaces — `set:*` lives under WRITE-restricted
+        // OPERATOR; `dev:*` lives under READ-only LOCKED. A peer
+        // without WRITE on OPERATOR may still PUT to DEFAULT.
+        let cfg = parse_acf(
+            r#"
+UAG(admins) { admin }
+ASG(DEFAULT) {
+    RULE(1, READ)
+    RULE(1, WRITE)
+}
+ASG(OPERATOR) {
+    RULE(1, READ)
+    RULE(1, WRITE) { UAG(admins) }
+}
+ASG(LOCKED) {
+    RULE(1, READ)
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        src.set_asg_resolver(Some(Arc::new(|pv: &str| {
+            if pv.starts_with("set:") {
+                "OPERATOR".to_string()
+            } else if pv.starts_with("dev:") {
+                "LOCKED".to_string()
+            } else {
+                "DEFAULT".to_string()
+            }
+        })));
+
+        let guest = make_ctx("anyhost", "guest", "anonymous");
+        let admin = make_ctx("anyhost", "admin", "anonymous");
+
+        // DEFAULT-routed PV: open to everyone for RW.
+        assert_eq!(src.acl_level("other:val", &guest).await, AccessLevel::ReadWrite);
+
+        // OPERATOR-routed PV: guest READ-only, admin RW.
+        assert_eq!(src.acl_level("set:current", &guest).await, AccessLevel::Read);
+        assert_eq!(src.acl_level("set:current", &admin).await, AccessLevel::ReadWrite);
+
+        // LOCKED-routed PV: everyone READ-only (no WRITE rule).
+        assert_eq!(src.acl_level("dev:hwid", &admin).await, AccessLevel::Read);
+        assert_eq!(src.acl_level("dev:hwid", &guest).await, AccessLevel::Read);
     }
 }

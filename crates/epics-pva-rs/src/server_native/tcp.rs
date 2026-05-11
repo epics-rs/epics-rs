@@ -1390,17 +1390,22 @@ async fn handle_op(
             let value = decode_pv_field(&intro, &mut cur, order)
                 .map_err(|e| PvaError::Decode(e.to_string()))?;
             let pv_name = ch.name.clone();
-            // PG-G10: forward the downstream peer's credentials to
-            // the source so gateways can route the put through a
-            // per-credential upstream client pool. Default trait impl
-            // ignores the ctx so non-gateway sources are unaffected.
+            // Round 42: type-state PUT gate. The token's
+            // `allows_write()` is checked by `put_value_checked`;
+            // adding a new PUT-equivalent handler without taking a
+            // token through `source.access().check(...)` is a compile
+            // error on the trait method signature.
             let ctx = crate::server_native::source::ChannelContext {
                 peer,
                 account: cred.account.clone(),
                 method: cred.method.clone(),
                 host: cred.host.clone(),
             };
-            let result = source.put_value_ctx(&pv_name, value, ctx.clone()).await;
+            let checked = source
+                .access_gate()
+                .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            let result = source.put_value_checked(checked, value, ctx.clone()).await;
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
@@ -1415,10 +1420,10 @@ async fn handle_op(
                     // a leaked value through the PUT_GET return path.
                     if subcmd & 0x40 != 0 {
                         // R31-G7 / Round-32B: build the readback FIRST,
-                        // then write status. If get_value_ctx returns
-                        // None (ACF denies READ even though PUT was
-                        // allowed — e.g. WRITE-only ASG), we MUST NOT
-                        // emit `status_ok` followed by no bytes — that
+                        // then write status. If the READ check fails
+                        // (ACF denies READ even though PUT was allowed —
+                        // e.g. WRITE-only ASG), we MUST NOT emit
+                        // `status_ok` followed by no bytes — that
                         // truncates the wire and the client decoder
                         // expects a bitset+value to follow. Instead,
                         // emit an all-zero bitset (no fields changed)
@@ -1427,7 +1432,16 @@ async fn handle_op(
                         // reported successful — same wire shape as a
                         // "put committed but no field deltas to
                         // report" response.
-                        match source.get_value_ctx(&pv_name, ctx).await {
+                        //
+                        // Round 42 type-state: re-check via the gate
+                        // for the READ leg. The PUT's token was
+                        // consumed by `put_value_checked`; we mint a
+                        // fresh one against the SAME `(pv, ctx)`.
+                        let read_checked = source
+                            .access_gate()
+                            .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+                            .await;
+                        match source.get_value_checked(read_checked, ctx).await {
                             Some(v) => {
                                 Status::ok().write_into(order, &mut payload);
                                 let bits = BitSet::all_set(intro.total_bits());
@@ -1530,6 +1544,15 @@ async fn handle_op(
                     method: cred.method.clone(),
                     host: cred.host.clone(),
                 };
+                // Round 42: type-state MONITOR gate. Mint the token
+                // once before spawning so both the raw and decoded
+                // sub-paths share the same check. Clones are cheap
+                // (`AccessChecked` carries only the name String + a
+                // Copy AccessLevel).
+                let mon_checked = source
+                    .access_gate()
+                    .check(&pv_name, &mon_ctx.host, &mon_ctx.account, &mon_ctx.method, "")
+                    .await;
                 // Snapshot the window + notify so the spawned task can
                 // share state with this dispatch path's ACK handler.
                 let (window, window_notify, paused_flag) = ch
@@ -1577,7 +1600,9 @@ async fn handle_op(
                     // `subscribe_ctx` below — which is also ACF-gated
                     // and will likewise return None.
                     if raw_path_eligible
-                        && let Some(mut rx_raw) = src.subscribe_raw_ctx(&pv_name, mon_ctx.clone()).await
+                        && let Some(mut rx_raw) = src
+                            .subscribe_raw_checked(mon_checked.clone(), mon_ctx.clone())
+                            .await
                     {
                         // Emit initial snapshot via the regular
                         // encode path (no raw bytes for the
@@ -1585,7 +1610,10 @@ async fn handle_op(
                         // them yet). ACF-aware: a peer with NoAccess
                         // on this PV's ASG sees no initial frame
                         // through the raw fast path either.
-                        if let Some(initial) = src.get_value_ctx(&pv_name, mon_ctx.clone()).await {
+                        if let Some(initial) = src
+                            .get_value_checked(mon_checked.clone(), mon_ctx.clone())
+                            .await
+                        {
                             let payload = build_monitor_payload(
                                 ioid,
                                 &intro_clone,
@@ -1626,7 +1654,10 @@ async fn handle_op(
                         return;
                     }
 
-                    let Some(mut rx) = src.subscribe_ctx(&pv_name, mon_ctx.clone()).await else {
+                    let Some(mut rx) = src
+                        .subscribe_checked(mon_checked.clone(), mon_ctx.clone())
+                        .await
+                    else {
                         return;
                     };
                     let mut over_high = false;
@@ -1634,7 +1665,10 @@ async fn handle_op(
                     // a peer with NoAccess on the record's ASG sees
                     // nothing; legacy sources fall through to
                     // `get_value` via the trait default.
-                    if let Some(initial) = src.get_value_ctx(&pv_name, mon_ctx.clone()).await {
+                    if let Some(initial) = src
+                        .get_value_checked(mon_checked.clone(), mon_ctx.clone())
+                        .await
+                    {
                         // pvxs e9ab67a (2025-10): the first update is
                         // mask-bypassed so the client receives a
                         // *complete* prototype regardless of its
@@ -1789,21 +1823,23 @@ async fn handle_op(
             };
             let pv_name = ch.name.clone();
             let _ = intro; // INIT pvRequest descriptor — no longer used here.
-            // R37-G1 / Round 37: ACF-aware RPC dispatch. The
-            // round-29 / round-32A ACL gates covered GET / PUT /
-            // MONITOR (decoded + raw); RPC was left ungated until
-            // now. Build a ChannelContext from the connecting
-            // peer's credentials and let ACF-aware sources deny.
-            // Sources without ACF fall back to the legacy `rpc`
-            // path via the trait default.
+            // Round 42 type-state RPC dispatch. The wire layer mints
+            // the AccessChecked token via the gate; the typed
+            // `rpc_checked` refuses `NoAccess` tokens. Adding a new
+            // RPC-equivalent handler without going through the gate
+            // is now a compile error on the trait method signature.
             let rpc_ctx_val = crate::server_native::source::ChannelContext {
                 peer,
                 account: cred.account.clone(),
                 method: cred.method.clone(),
                 host: cred.host.clone(),
             };
+            let rpc_checked = source
+                .access_gate()
+                .check(&pv_name, &rpc_ctx_val.host, &rpc_ctx_val.account, &rpc_ctx_val.method, "")
+                .await;
             let result = source
-                .rpc_ctx(&pv_name, req_desc, req_value, rpc_ctx_val)
+                .rpc_checked(rpc_checked, req_desc, req_value, rpc_ctx_val)
                 .await;
 
             let mut payload = Vec::new();

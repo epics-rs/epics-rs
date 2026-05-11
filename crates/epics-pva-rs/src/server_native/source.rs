@@ -126,6 +126,30 @@ pub trait ChannelSource: Send + Sync + 'static {
         self.put_value(name, value)
     }
 
+    /// Round 42: type-state-enforced PUT. Refuses non-`ReadWrite`
+    /// tokens and otherwise delegates to `put_value_ctx`. The wire
+    /// layer mints the token once per op so a PUT cannot reach the
+    /// source without an ACF check having run on its credentials.
+    fn put_value_checked(
+        &self,
+        checked: AccessChecked,
+        value: PvField,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async move {
+            if !checked.allows_write() {
+                return Err(format!(
+                    "PUT denied by access security: '{}' from {}/{}/{}",
+                    checked.pv_name(),
+                    ctx.host,
+                    ctx.account,
+                    ctx.method,
+                ));
+            }
+            self.put_value_ctx(checked.pv_name(), value, ctx).await
+        }
+    }
+
     /// True iff PUT is allowed against this PV (for ACL gating).
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
 
@@ -145,6 +169,21 @@ pub trait ChannelSource: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
         let _ = ctx;
         self.subscribe(name)
+    }
+
+    /// Round 42: type-state-enforced MONITOR. Refuses `NoAccess`
+    /// tokens; otherwise delegates to the legacy `subscribe_ctx`.
+    fn subscribe_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        async move {
+            if !checked.allows_read() {
+                return None;
+            }
+            self.subscribe_ctx(checked.pv_name(), ctx).await
+        }
     }
 
     /// Optional **raw-frame subscribe** (F-G12). When the source can
@@ -185,6 +224,20 @@ pub trait ChannelSource: Send + Sync + 'static {
         self.subscribe_raw(name)
     }
 
+    /// Round 42: type-state-enforced raw MONITOR fast path.
+    fn subscribe_raw_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+        async move {
+            if !checked.allows_read() {
+                return None;
+            }
+            self.subscribe_raw_ctx(checked.pv_name(), ctx).await
+        }
+    }
+
     /// Dispatch an RPC. The default impl returns "RPC not supported";
     /// implementors can override to provide actual RPC behaviour.
     ///
@@ -216,6 +269,30 @@ pub trait ChannelSource: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
         let _ = ctx;
         self.rpc(name, request_desc, request_value)
+    }
+
+    /// Round 42: type-state-enforced RPC. pvxs treats RPC as
+    /// READ-class for ACF purposes; refuse `NoAccess` tokens with
+    /// an error and otherwise delegate to `rpc_ctx`.
+    fn rpc_checked(
+        &self,
+        checked: AccessChecked,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+        async move {
+            if !checked.allows_read() {
+                return Err(format!(
+                    "RPC denied by access security: '{}' from {}/{}/{}",
+                    checked.pv_name(),
+                    ctx.host,
+                    ctx.account,
+                    ctx.method,
+                ));
+            }
+            self.rpc_ctx(checked.pv_name(), request_desc, request_value, ctx).await
+        }
     }
 
     /// Notify the source that the per-connection monitor outbox for
@@ -311,6 +388,13 @@ pub trait ChannelSourceObj: Send + Sync {
         value: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Round 42: dyn forwarder for type-state PUT.
+    fn put_value_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        value: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
     fn is_writable<'a>(
         &'a self,
         name: &'a str,
@@ -328,6 +412,14 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
     >;
+    /// Round 42: dyn forwarder for type-state MONITOR.
+    fn subscribe_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+    >;
     fn subscribe_raw<'a>(
         &'a self,
         name: &'a str,
@@ -337,6 +429,14 @@ pub trait ChannelSourceObj: Send + Sync {
     fn subscribe_raw_ctx<'a>(
         &'a self,
         name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+    >;
+    /// Round 42: dyn forwarder for type-state raw MONITOR.
+    fn subscribe_raw_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
@@ -352,6 +452,16 @@ pub trait ChannelSourceObj: Send + Sync {
     fn rpc_ctx<'a>(
         &'a self,
         name: &'a str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
+    >;
+    /// Round 42: dyn forwarder for type-state RPC.
+    fn rpc_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
@@ -420,6 +530,16 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
             self, name, value, ctx,
         ))
     }
+    fn put_value_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        value: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::put_value_checked(
+            self, checked, value, ctx,
+        ))
+    }
     fn is_writable<'a>(
         &'a self,
         name: &'a str,
@@ -443,6 +563,17 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     > {
         Box::pin(<Self as ChannelSource>::subscribe_ctx(self, name, ctx))
     }
+    fn subscribe_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_checked(
+            self, checked, ctx,
+        ))
+    }
     fn subscribe_raw<'a>(
         &'a self,
         name: &'a str,
@@ -459,6 +590,17 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_raw_ctx(self, name, ctx))
+    }
+    fn subscribe_raw_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::subscribe_raw_checked(
+            self, checked, ctx,
+        ))
     }
     fn rpc<'a>(
         &'a self,
@@ -487,6 +629,23 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         Box::pin(<Self as ChannelSource>::rpc_ctx(
             self,
             name,
+            request_desc,
+            request_value,
+            ctx,
+        ))
+    }
+    fn rpc_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::rpc_checked(
+            self,
+            checked,
             request_desc,
             request_value,
             ctx,

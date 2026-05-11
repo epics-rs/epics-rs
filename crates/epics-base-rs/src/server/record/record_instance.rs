@@ -839,15 +839,24 @@ impl RecordInstance {
                     self.common.asg = s;
                 }
             }
-            "ASL" => match value {
+            "ASL" => {
                 // C dbCommon.ASL is `epicsUInt32` in the .dbd but
                 // only ever 0 or 1; accept Char / Short / Long for
-                // the common put paths and clamp to {0, 1}.
-                EpicsValue::Char(v) => self.common.asl = if v != 0 { 1 } else { 0 },
-                EpicsValue::Short(v) => self.common.asl = if v != 0 { 1 } else { 0 },
-                EpicsValue::Long(v) => self.common.asl = if v != 0 { 1 } else { 0 },
-                _ => {}
-            },
+                // the common put paths and clamp to {0, 1}. R34-G1:
+                // db_loader feeds every common field as
+                // `EpicsValue::String`; also accept that so a
+                // `.db` `field(ASL, "1")` directive isn't silently
+                // ignored at IOC load.
+                let n: i64 = match value {
+                    EpicsValue::Char(v) => v as i64,
+                    EpicsValue::Short(v) => v as i64,
+                    EpicsValue::Long(v) => v as i64,
+                    EpicsValue::Int64(v) => v,
+                    EpicsValue::String(s) => s.trim().parse().unwrap_or(0),
+                    _ => return Ok(CommonFieldPutResult::NoChange),
+                };
+                self.common.asl = if n != 0 { 1 } else { 0 };
+            }
             "DESC" => {
                 if let EpicsValue::String(s) = value {
                     self.common.desc = s;

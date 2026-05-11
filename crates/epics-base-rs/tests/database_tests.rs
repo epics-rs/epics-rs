@@ -193,6 +193,48 @@ async fn test_ao_ivoa_dont_drive() {
 /// back to `set_val` (VAL) — every other output record left OVAL/RVAL
 /// stale, so the soft-channel OUT writeback (which reads `OVAL.or(VAL)`)
 /// shipped the pre-IVOA value instead of IVOV.
+/// Round-34 (R34-G1): a `.db` file's `field(ASL, "1")` directive must
+/// land in `common.asl`. `db_loader::apply_fields` feeds every common
+/// field as `EpicsValue::String`; the ASL handler must parse string
+/// numerics or the directive is silently dropped at IOC load.
+#[tokio::test]
+async fn test_db_load_records_asl_field() {
+    use epics_base_rs::server::db_loader;
+    use epics_base_rs::server::records::ai::AiRecord;
+
+    let defs = db_loader::parse_db(
+        r#"
+record(ai, "ASLT:HIGH") {
+    field(ASL, "1")
+}
+record(ai, "ASLT:LOW") {
+}
+"#,
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+
+    let db = PvDatabase::new();
+    for def in defs {
+        let mut record: Box<dyn epics_base_rs::server::record::Record> =
+            Box::new(AiRecord::new(0.0));
+        let mut common_fields = Vec::new();
+        db_loader::apply_fields(&mut record, &def.fields, &mut common_fields).unwrap();
+        db.add_record(&def.name, record).await.unwrap();
+        if let Some(rec) = db.get_record(&def.name).await {
+            let mut inst = rec.write().await;
+            for (n, v) in common_fields {
+                let _ = inst.put_common_field(&n, v);
+            }
+        }
+    }
+
+    let high = db.get_record("ASLT:HIGH").await.unwrap();
+    let low = db.get_record("ASLT:LOW").await.unwrap();
+    assert_eq!(high.read().await.common.asl, 1, "field(ASL, \"1\") must set ASL=1");
+    assert_eq!(low.read().await.common.asl, 0, "absent ASL defaults to 0");
+}
+
 #[tokio::test]
 async fn test_ao_ivoa_set_to_ivov_writes_oval() {
     use epics_base_rs::server::records::ao::AoRecord;

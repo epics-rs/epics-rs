@@ -1334,6 +1334,30 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         return Ok(());
                     }
                 };
+                // R39-G1 / Round 39: alarm-acknowledge PUTs travel
+                // the same WRITE wire opcodes but pre-fix bypassed
+                // the access_rights check that the regular WRITE
+                // path performs below. ACKT/ACKS mutate alarm-handler
+                // state — a `NoAccess` peer could silence alarms on
+                // any record they could open. Mirror the regular
+                // WRITE gate.
+                let ack_access = state
+                    .channel_access
+                    .get(&sid)
+                    .copied()
+                    .unwrap_or(AccessLevel::NoAccess);
+                if ack_access != AccessLevel::ReadWrite {
+                    if is_notify {
+                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+                        resp.data_type = hdr.data_type;
+                        resp.count = hdr.count;
+                        resp.cid = ECA_NOWTACCESS;
+                        resp.available = ioid;
+                        let mut w = writer.lock().await;
+                        w.write_all(&resp.to_bytes()).await?;
+                    }
+                    return Ok(());
+                }
                 let value_u16 = if payload.len() >= 2 {
                     u16::from_be_bytes([payload[0], payload[1]])
                 } else {
@@ -2041,6 +2065,15 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
 
 /// Re-evaluate and re-send CA_PROTO_ACCESS_RIGHTS for all open channels.
 /// Called when hostname or username changes.
+///
+/// Round-39 (R39-G2): when a sid's new access flips to `NoAccess`,
+/// any subscriptions currently mounted on that sid must be torn
+/// down. Pre-fix the reeval only updated `channel_access` (and
+/// notified the client) — active EVENT_ADD subscribers kept
+/// receiving every update on the now-denied channel until the
+/// client noticed the access drop and issued EVENT_CANCEL. The C
+/// IOC cancels subscriptions in the same situation (see
+/// `cas_access_rights_change_callback`).
 async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
     state: &mut ClientState,
     writer: &Arc<Mutex<BufWriter<W>>>,
@@ -2048,28 +2081,56 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
     if state.channels.is_empty() {
         return Ok(());
     }
-    // Collect channel info first to avoid borrow conflict with compute_access
     let chan_info: Vec<(u32, u32, ChannelTarget)> = state
         .channels
         .iter()
         .map(|(&sid, entry)| (sid, entry.cid, entry.target.clone()))
         .collect();
 
-    let mut w = writer.lock().await;
-    for (sid, cid, target) in chan_info {
-        let new_access = state.compute_access(&target).await;
-        let new_level = match new_access {
-            3 => AccessLevel::ReadWrite,
-            1 => AccessLevel::Read,
-            _ => AccessLevel::NoAccess,
-        };
-        state.channel_access.insert(sid, new_level);
-        let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
-        ar.cid = cid;
-        ar.available = new_access;
-        w.write_all(&ar.to_bytes()).await?;
+    let mut denied_sids: Vec<u32> = Vec::new();
+    {
+        let mut w = writer.lock().await;
+        for (sid, cid, target) in chan_info {
+            let new_access = state.compute_access(&target).await;
+            let new_level = match new_access {
+                3 => AccessLevel::ReadWrite,
+                1 => AccessLevel::Read,
+                _ => AccessLevel::NoAccess,
+            };
+            state.channel_access.insert(sid, new_level);
+            if new_level == AccessLevel::NoAccess {
+                denied_sids.push(sid);
+            }
+            let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
+            ar.cid = cid;
+            ar.available = new_access;
+            w.write_all(&ar.to_bytes()).await?;
+        }
+        w.flush().await?;
     }
-    w.flush().await?;
+
+    // Tear down every subscription rooted in a now-denied channel.
+    if !denied_sids.is_empty() {
+        let revoked: Vec<u32> = state
+            .subscriptions
+            .iter()
+            .filter(|(_, s)| denied_sids.contains(&s.channel_sid))
+            .map(|(&id, _)| id)
+            .collect();
+        for sub_id in revoked {
+            if let Some(sub) = state.subscriptions.remove(&sub_id) {
+                sub.task.abort();
+                match &sub.target {
+                    ChannelTarget::SimplePv(pv) => {
+                        pv.remove_subscriber(sub.sub_id).await;
+                    }
+                    ChannelTarget::RecordField { record, .. } => {
+                        record.write().await.remove_subscriber(sub.sub_id);
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

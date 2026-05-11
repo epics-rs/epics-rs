@@ -57,19 +57,29 @@ impl PvDatabaseSource {
         &self.db
     }
 
-    /// Resolve the ASG of the record backing `pv_name` (the part
-    /// before the optional `.FIELD` suffix). Returns "DEFAULT" for
-    /// simple PVs (no record-level ASG) or for unknown names; the
-    /// ACF defaults its `DEFAULT` ASG when no rule matches.
-    async fn resolve_asg(&self, pv_name: &str) -> String {
+    /// Resolve the ASG and ASL of the record backing `pv_name`
+    /// (the part before the optional `.FIELD` suffix). Returns
+    /// `("DEFAULT", 0)` for simple PVs (no record-level ASG/ASL)
+    /// or for unknown names; the ACF defaults its `DEFAULT` ASG
+    /// when no rule matches.
+    ///
+    /// Round-33A (R33-G4): previously this only returned the ASG
+    /// string and every ACF call site hard-coded `record_asl=0`,
+    /// silently disabling the `RULE(N, …)` ASL gate for every
+    /// record. Now the ASL is read from `common.asl` and threaded
+    /// through to `check_access_method`.
+    async fn resolve_asg(&self, pv_name: &str) -> (String, u8) {
         let (base, _field) = parse_pv_name(pv_name);
         if let Some(rec) = self.db.get_record(base).await {
             let inst = rec.read().await;
-            if !inst.common.asg.is_empty() {
-                return inst.common.asg.clone();
-            }
+            let asg = if !inst.common.asg.is_empty() {
+                inst.common.asg.clone()
+            } else {
+                "DEFAULT".to_string()
+            };
+            return (asg, inst.common.asl);
         }
-        "DEFAULT".to_string()
+        ("DEFAULT".to_string(), 0)
     }
 }
 
@@ -461,9 +471,9 @@ impl ChannelSource for PvDatabaseSource {
             // ECA_NORDACCESS-equivalent.
             let acf_guard = acf.read().await;
             if let Some(ref cfg) = *acf_guard {
-                let asg = resolve_fut.await;
+                let (asg, asl) = resolve_fut.await;
                 let level =
-                    cfg.check_access_method(&asg, &ctx.host, &ctx.account, 0, &ctx.method, "");
+                    cfg.check_access_method(&asg, &ctx.host, &ctx.account, asl, &ctx.method, "");
                 if level == AccessLevel::NoAccess {
                     return None;
                 }
@@ -488,9 +498,9 @@ impl ChannelSource for PvDatabaseSource {
             // get_value_ctx.
             let acf_guard = acf.read().await;
             if let Some(ref cfg) = *acf_guard {
-                let asg = resolve_fut.await;
+                let (asg, asl) = resolve_fut.await;
                 let level =
-                    cfg.check_access_method(&asg, &ctx.host, &ctx.account, 0, &ctx.method, "");
+                    cfg.check_access_method(&asg, &ctx.host, &ctx.account, asl, &ctx.method, "");
                 if level == AccessLevel::NoAccess {
                     return None;
                 }
@@ -520,12 +530,12 @@ impl ChannelSource for PvDatabaseSource {
             // record's ASG.
             let acf_guard = acf.read().await;
             if let Some(ref cfg) = *acf_guard {
-                let asg = resolve_fut.await;
+                let (asg, asl) = resolve_fut.await;
                 let level = cfg.check_access_method(
                     &asg,
                     &ctx.host,
                     &ctx.account,
-                    0, // record-level ASL not threaded through PVA layer yet
+                    asl,
                     &ctx.method,
                     "", // authority (cert issuer) not surfaced via PVA wire today
                 );
@@ -898,5 +908,71 @@ ASG(SECURE) {
             )
             .await
             .expect("PUT must succeed when no ACF is attached");
+    }
+
+    /// Round-33A (R33-G4): the per-record ASL must gate `RULE(N, …)`
+    /// rules. With `RULE(0, READ) RULE(1, WRITE)`, an ASL=0 record
+    /// must be read-only (the WRITE rule does NOT apply when
+    /// `record_asl < 1`), and an ASL=1 record must be writable.
+    /// Pre-fix every record was treated as ASL=0 by the PVA path,
+    /// so even an ASL=1 record fell under WRITE… but more subtly,
+    /// an ASL=0 record ALSO got WRITE because `record_asl=0 ≤
+    /// rule.level=1`. The fix doesn't change the equality bound;
+    /// it threads the real ASL so `RULE(N, …)` with `record_asl > N`
+    /// now skips the rule.
+    #[tokio::test]
+    async fn asl_gate_skips_rules_above_record_asl() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // RULE(2, WRITE) — only applies when record_asl ≤ 2.
+        // RULE(0, READ) — always applies.
+        let acf = parse_acf(
+            r#"
+ASG(DEFAULT) {
+    RULE(0, READ)
+    RULE(2, WRITE)
+}
+"#,
+        )
+        .unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        // High-ASL record: should be locked out of WRITE because
+        // record_asl(3) > rule.level(2). Pre-fix the call site
+        // always passed 0 and the rule was always applicable.
+        db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // ASL is a u8; the parser clamps to 0/1 via put_common_field,
+        // but the underlying field accepts any u8 — set it directly
+        // for the test to exercise the gate above C's 0/1 range.
+        db.get_record("AI:LOCKED").await.unwrap().write().await.common.asl = 3;
+
+        db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // OPEN keeps the default ASL=0; the WRITE rule applies.
+
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
+
+        // Locked: WRITE rule skipped (record_asl 3 > rule.level 2),
+        // so only READ applies — PUT must be denied.
+        assert!(
+            source
+                .put_value_ctx("AI:LOCKED", pv_double(1.0), make_ctx("h", "anyone", "anonymous"))
+                .await
+                .is_err(),
+            "ASL=3 record must NOT match RULE(2, WRITE)",
+        );
+
+        // Open: WRITE rule applies (record_asl 0 ≤ rule.level 2),
+        // so PUT succeeds.
+        source
+            .put_value_ctx("AI:OPEN", pv_double(2.0), make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("ASL=0 record must match RULE(2, WRITE)");
     }
 }

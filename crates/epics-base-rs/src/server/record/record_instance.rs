@@ -601,6 +601,7 @@ impl RecordInstance {
             "TSE" => Some(EpicsValue::Short(self.common.tse)),
             "TSEL" => Some(EpicsValue::String(self.common.tsel.clone())),
             "ASG" => Some(EpicsValue::String(self.common.asg.clone())),
+            "ASL" => Some(EpicsValue::Char(self.common.asl)),
             "DESC" => Some(EpicsValue::String(self.common.desc.clone())),
             "PHAS" => Some(EpicsValue::Short(self.common.phas)),
             "EVNT" => Some(EpicsValue::Short(self.common.evnt)),
@@ -838,6 +839,15 @@ impl RecordInstance {
                     self.common.asg = s;
                 }
             }
+            "ASL" => match value {
+                // C dbCommon.ASL is `epicsUInt32` in the .dbd but
+                // only ever 0 or 1; accept Char / Short / Long for
+                // the common put paths and clamp to {0, 1}.
+                EpicsValue::Char(v) => self.common.asl = if v != 0 { 1 } else { 0 },
+                EpicsValue::Short(v) => self.common.asl = if v != 0 { 1 } else { 0 },
+                EpicsValue::Long(v) => self.common.asl = if v != 0 { 1 } else { 0 },
+                _ => {}
+            },
             "DESC" => {
                 if let EpicsValue::String(s) = value {
                     self.common.desc = s;

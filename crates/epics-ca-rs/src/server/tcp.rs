@@ -297,7 +297,16 @@ impl ClientState {
             ChannelTarget::SimplePv(_) => {
                 let guard = self.acf.read().await;
                 if let Some(ref acf_cfg) = *guard {
-                    match acf_cfg.check_access("DEFAULT", &self.hostname, &self.username) {
+                    // Simple PVs have no per-record ASL field; treat
+                    // them as ASL=0 so the most-restrictive rule
+                    // applies. Matches the C IOC's behaviour for
+                    // names that never went through `dbAddMember`.
+                    match acf_cfg.check_access_asl(
+                        "DEFAULT",
+                        &self.hostname,
+                        &self.username,
+                        0,
+                    ) {
                         AccessLevel::ReadWrite => 3,
                         AccessLevel::Read => 1,
                         AccessLevel::NoAccess => 0,
@@ -320,8 +329,22 @@ impl ClientState {
                 } else {
                     let guard = self.acf.read().await;
                     if let Some(ref acf_cfg) = *guard {
+                        // Round-33A (R33-G4): thread the per-record
+                        // ASL into the ACF check so `RULE(N, …)`
+                        // gates correctly disable rules whose level
+                        // is below the record's ASL. Pre-fix every
+                        // CA-served record was treated as ASL=0,
+                        // so a `RULE(1, WRITE)` was applied to ALL
+                        // records — including those with `ASL=0`
+                        // that the C IOC would lock down.
                         let asg = &instance.common.asg;
-                        match acf_cfg.check_access(asg, &self.hostname, &self.username) {
+                        let asl = instance.common.asl;
+                        match acf_cfg.check_access_asl(
+                            asg,
+                            &self.hostname,
+                            &self.username,
+                            asl,
+                        ) {
                             AccessLevel::ReadWrite => 3,
                             AccessLevel::Read => 1,
                             AccessLevel::NoAccess => 0,

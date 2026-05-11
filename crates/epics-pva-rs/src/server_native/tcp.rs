@@ -1391,7 +1391,7 @@ async fn handle_op(
                 method: cred.method.clone(),
                 host: cred.host.clone(),
             };
-            let result = source.put_value_ctx(&pv_name, value, ctx).await;
+            let result = source.put_value_ctx(&pv_name, value, ctx.clone()).await;
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
@@ -1402,9 +1402,11 @@ async fn handle_op(
                     // PUT_GET (subcmd bit 0x40 set on the request): client
                     // wants the post-put value back. Per pvxs serverget.cpp:103
                     // the response carries `bitset + partial value` after the
-                    // status.
+                    // status. Readback must be credential-aware so a peer
+                    // with READ-only or NoAccess on its ASG does not see
+                    // a leaked value through the PUT_GET return path.
                     if subcmd & 0x40 != 0 {
-                        if let Some(v) = source.get_value(&pv_name).await {
+                        if let Some(v) = source.get_value_ctx(&pv_name, ctx).await {
                             let bits = BitSet::all_set(intro.total_bits());
                             bits.write_into(order, &mut payload);
                             encode_pv_field(&v, &intro, order, &mut payload);
@@ -1538,8 +1540,10 @@ async fn handle_op(
                         // Emit initial snapshot via the regular
                         // encode path (no raw bytes for the
                         // first-event seed; the cache may not have
-                        // them yet).
-                        if let Some(initial) = src.get_value(&pv_name).await {
+                        // them yet). ACF-aware: a peer with NoAccess
+                        // on this PV's ASG sees no initial frame
+                        // through the raw fast path either.
+                        if let Some(initial) = src.get_value_ctx(&pv_name, mon_ctx.clone()).await {
                             let payload = build_monitor_payload(
                                 ioid,
                                 &intro_clone,

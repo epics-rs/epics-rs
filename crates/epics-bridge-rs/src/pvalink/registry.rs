@@ -60,8 +60,25 @@ impl PvaLinkRegistry {
 
         // In-flight dedup. Either we claim the slot and open, or we
         // grab a Notify and await another task's completion.
+        //
+        // R49-G3: re-check the cache UNDER the `pending.write()`
+        // lock. The fast path (line 56-58) reads `self.map` without
+        // any synchronization vs. the winner's publish-then-clear
+        // sequence: a late caller could see a fast-path miss, then
+        // by the time it reaches `pending.write()` the winner has
+        // already published to the map AND removed the pending slot.
+        // Without this re-check the late caller would find pending
+        // empty, claim the slot itself, and run `PvaLink::open` a
+        // second time — defeating the singleflight invariant. The
+        // map read is held inside the same critical section as the
+        // pending lookup, so the only path that can publish to the
+        // map between the two checks (winner publish at line ~155
+        // BEFORE clearing pending) is now observable.
         let (claim, notify) = {
             let mut pending = self.pending.write();
+            if let Some(existing) = self.map.read().get(&key).cloned() {
+                return Ok(existing);
+            }
             if let Some(existing) = pending.get(&key).cloned() {
                 (false, existing)
             } else {

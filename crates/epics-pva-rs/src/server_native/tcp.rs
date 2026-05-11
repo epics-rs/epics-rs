@@ -1544,30 +1544,33 @@ async fn handle_op(
                     method: cred.method.clone(),
                     host: cred.host.clone(),
                 };
-                // Round 42: type-state MONITOR gate. Mint the token
-                // once before spawning so both the raw and decoded
-                // sub-paths share the same check. Clones are cheap
-                // (`AccessChecked` carries only the name String + a
-                // Copy AccessLevel).
+                // Round 42 + R49-G1: type-state MONITOR gate.
+                //
+                // Capture the ACL generation BEFORE the check.
+                // This guarantees the captured version is `≤` the
+                // version under which the resulting `AccessChecked`
+                // was minted: if a reload bumps the version between
+                // the capture and the check, the check runs under
+                // the new policy and the captured (older) version
+                // is below the live version, so the forwarding loop
+                // detects the mismatch on its next event and
+                // re-checks. The reverse order (check then capture)
+                // could combine an "old allow" token with a "new
+                // version", causing the loop to think it was
+                // already synced under the new policy and never
+                // re-check.
+                //
+                // Wrapped in `Arc<AtomicU64>` so a successful
+                // re-check inside the spawned loop can advance the
+                // surviving peer's "current" generation without
+                // re-checking on every subsequent event.
+                let mon_acl_version_at_subscribe_cell = Arc::new(
+                    std::sync::atomic::AtomicU64::new(source.access_gate().acl_version()),
+                );
                 let mon_checked = source
                     .access_gate()
                     .check(&pv_name, &mon_ctx.host, &mon_ctx.account, &mon_ctx.method, "")
                     .await;
-                // R48-G3: capture the gate's ACL generation at
-                // spawn time. The forwarding loop compares this to
-                // the live generation on every event; on a bump
-                // (caused by `PvaServer::reload_acf_from` /
-                // `clear_acf`) the task re-checks ACL and tears
-                // down the subscription with a MONITOR FINISH
-                // frame if the new policy denies the peer.
-                // Wrapped in AtomicU64 so the spawned forwarding
-                // loop can resync on a successful re-check (the
-                // surviving peer's "current" generation moves
-                // forward without triggering re-check on every
-                // subsequent event).
-                let mon_acl_version_at_subscribe_cell = Arc::new(
-                    std::sync::atomic::AtomicU64::new(source.access_gate().acl_version()),
-                );
                 // Snapshot the window + notify so the spawned task can
                 // share state with this dispatch path's ACK handler.
                 let (window, window_notify, paused_flag) = ch
@@ -1619,6 +1622,37 @@ async fn handle_op(
                             .subscribe_raw_checked(mon_checked.clone(), mon_ctx.clone())
                             .await
                     {
+                        // R49-G1: revalidate ACL BEFORE sending the
+                        // initial snapshot. Between the spawn's
+                        // initial `check()` and reaching this point
+                        // a reload could have flipped the peer to
+                        // NoAccess; without this gate the initial
+                        // would be emitted under stale policy. The
+                        // recv loop below performs the same check
+                        // on every subsequent event.
+                        let live_v0 = src.access_gate().acl_version();
+                        if live_v0
+                            != mon_acl_version_at_subscribe_cell
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            let re = src
+                                .access_gate()
+                                .check(
+                                    &pv_name,
+                                    &mon_ctx.host,
+                                    &mon_ctx.account,
+                                    &mon_ctx.method,
+                                    "",
+                                )
+                                .await;
+                            if !re.allows_read() {
+                                let finish = build_monitor_finish(ioid, order);
+                                let _ = tx_clone.send(finish).await;
+                                return;
+                            }
+                            mon_acl_version_at_subscribe_cell
+                                .store(live_v0, std::sync::atomic::Ordering::Release);
+                        }
                         // Emit initial snapshot via the regular
                         // encode path (no raw bytes for the
                         // first-event seed; the cache may not have
@@ -1708,6 +1742,33 @@ async fn handle_op(
                         return;
                     };
                     let mut over_high = false;
+                    // R49-G1: revalidate ACL BEFORE sending the
+                    // initial snapshot on the decoded path.
+                    {
+                        let live_v0 = src.access_gate().acl_version();
+                        if live_v0
+                            != mon_acl_version_at_subscribe_cell
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            let re = src
+                                .access_gate()
+                                .check(
+                                    &pv_name,
+                                    &mon_ctx.host,
+                                    &mon_ctx.account,
+                                    &mon_ctx.method,
+                                    "",
+                                )
+                                .await;
+                            if !re.allows_read() {
+                                let finish = build_monitor_finish(ioid, order);
+                                let _ = tx_clone.send(finish).await;
+                                return;
+                            }
+                            mon_acl_version_at_subscribe_cell
+                                .store(live_v0, std::sync::atomic::Ordering::Release);
+                        }
+                    }
                     // Emit initial snapshot via the ACF-aware path —
                     // a peer with NoAccess on the record's ASG sees
                     // nothing; legacy sources fall through to

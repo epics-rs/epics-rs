@@ -165,6 +165,14 @@ impl GatewayChannelSource {
     /// `PvaServer` behind an `Arc`.
     pub async fn set_asg_resolver(&self, resolver: Option<AsgResolver>) {
         *self.asg_resolver.write().await = resolver.unwrap_or_else(default_asg_resolver);
+        // R49-G2: bump the gate's ACL generation so monitor tasks
+        // observing this gate detect the policy swap on their next
+        // event and re-check. Without this, gateway monitors after
+        // a resolver hot-swap kept running under the prior ASG
+        // mapping forever (the version compared the same value at
+        // every event because the private counter on
+        // `AccessGate::required()` never moved).
+        self.gate.bump_acl_version();
     }
 
     /// Install (or hot-swap) the gateway-side ACF policy. None
@@ -172,6 +180,9 @@ impl GatewayChannelSource {
     /// pass-through (upstream IOC remains the sole authority).
     pub async fn set_acf(&self, cfg: Option<AccessSecurityConfig>) {
         *self.acf.write().await = cfg;
+        // R49-G2: bump the gate's ACL generation — see comment on
+        // `set_asg_resolver`.
+        self.gate.bump_acl_version();
     }
 
     /// Shared AcfCell handle — exposed so a `PvaServer::reload_acf_from`-style
@@ -421,7 +432,36 @@ impl ChannelSource for GatewayChannelSource {
                 return None;
             }
         }
-        let entry = self.cache.lookup(name, self.connect_timeout).await.ok()?;
+        // R49-G4: bump the gateway-wide subscriber count BEFORE
+        // spawning the forwarder. Pre-fix the raw path skipped the
+        // increment but the spawned CounterGuard's Drop still
+        // performed the decrement, underflowing the counter on
+        // every raw subscription teardown; subsequent decoded
+        // subscribes would then read the wrapped-around `usize` and
+        // refuse new subscribers under a false "cap reached"
+        // warning. Mirror the decoded subscribe's cap check + RAII
+        // decrement here too so raw subscriptions count against
+        // the same ceiling.
+        let prev = self
+            .subscriber_count
+            .fetch_add(1, Ordering::Relaxed);
+        if prev >= self.max_subscribers {
+            self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+            tracing::warn!(
+                pv = %name,
+                live = prev,
+                cap = self.max_subscribers,
+                "pva-gateway: raw subscriber cap reached, refusing"
+            );
+            return None;
+        }
+        let entry = match self.cache.lookup(name, self.connect_timeout).await {
+            Ok(e) => e,
+            Err(_) => {
+                self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+                return None;
+            }
+        };
         let mut bcast = entry.subscribe_raw();
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);

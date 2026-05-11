@@ -286,7 +286,7 @@ impl SearchEngineState {
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn run_search_engine(
-    mut addr_list: Vec<SocketAddr>,
+    mut addr_list: Vec<super::AddrEntry>,
     nameserver_addrs: Vec<SocketAddr>,
     mut request_rx: mpsc::UnboundedReceiver<SearchRequest>,
     response_tx: mpsc::UnboundedSender<SearchResponse>,
@@ -342,6 +342,22 @@ pub(crate) async fn run_search_engine(
     tick.tick().await; // skip immediate fire
     let mut tick_is_fast = false;
 
+    // Round 50 (R50-G2): periodic DNS refresh for `EPICS_CA_ADDR_LIST`
+    // entries whose `hostname` was set at startup (i.e. non-IP-literal
+    // entries). On each tick the engine walks `addr_list` and calls
+    // `AddrEntry::refresh_dns`; a changed resolution updates the
+    // entry's `sock` so subsequent `fire_searches` use the new IP.
+    // Period is operator-tunable via `EPICS_CA_DNS_REFRESH_SECS`;
+    // default 60 s balances responsiveness against DNS load. Literal
+    // IP entries (`hostname == None`) short-circuit inside
+    // `refresh_dns` so the cost is bounded by hostname count.
+    let dns_refresh_secs: u64 = epics_base_rs::runtime::env::get("EPICS_CA_DNS_REFRESH_SECS")
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u64| n > 0)
+        .unwrap_or(60);
+    let mut dns_refresh = interval(Duration::from_secs(dns_refresh_secs));
+    dns_refresh.tick().await; // skip immediate fire
+
     loop {
         tokio::select! {
             req = request_rx.recv() => {
@@ -380,6 +396,37 @@ pub(crate) async fn run_search_engine(
                 process_bucket(&mut state, &addr_list, &socket, &nameserver_send_txs).await;
                 if state.fast_ticks_remaining > 0 {
                     state.fast_ticks_remaining -= 1;
+                }
+            }
+
+            _ = dns_refresh.tick() => {
+                // R50-G2: re-resolve every hostname entry. The
+                // `refresh_dns()` call is a no-op for IP-literal
+                // entries; for DNS entries it does a fresh
+                // `to_socket_addrs()` and replaces the cached IP
+                // when it differs. We log changes at info-level so
+                // operators can correlate an IOC migration with
+                // the client's discovery of the new address.
+                for entry in addr_list.iter_mut() {
+                    let prev_sock = entry.sock;
+                    match entry.refresh_dns() {
+                        Ok(new_sock) if new_sock != prev_sock => {
+                            tracing::info!(
+                                hostname = ?entry.hostname,
+                                old = %prev_sock,
+                                new = %new_sock,
+                                "ca-rs: EPICS_CA_ADDR_LIST entry re-resolved"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                hostname = ?entry.hostname,
+                                error = %e,
+                                "ca-rs: DNS refresh failed; keeping cached IP"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -556,22 +603,42 @@ async fn run_nameserver_connection(
 /// Wrapper that handles the address-list mutation variants
 /// inline (they need mutable access to `addr_list` which
 /// `handle_request` doesn't have) and delegates everything else.
+///
+/// Round 50 (R50-G2): `addr_list` is `Vec<AddrEntry>` so the
+/// engine carries the original hostname (if any) for DNS
+/// re-resolution. Programmatic adds via `SearchRequest::AddAddress`
+/// arrive as `SocketAddr` (no hostname context) and are wrapped
+/// as `AddrEntry` with `hostname=None` — they're effectively IP
+/// literals on the wire.
 fn handle_request_or_addr(
     state: &mut SearchEngineState,
-    addr_list: &mut Vec<SocketAddr>,
+    addr_list: &mut Vec<super::AddrEntry>,
     req: SearchRequest,
 ) -> Option<u32> {
     match req {
         SearchRequest::AddAddress(addr) => {
-            if !addr_list.contains(&addr) {
-                addr_list.push(addr);
+            if !addr_list.iter().any(|e| e.sock == addr) {
+                let port = match addr {
+                    SocketAddr::V4(a) => a.port(),
+                    SocketAddr::V6(a) => a.port(),
+                };
+                addr_list.push(super::AddrEntry::new(addr, None, port));
                 tracing::info!(?addr, "ca-rs: addr_list += (programmatic)");
             }
             None
         }
         SearchRequest::SetAddressList(list) => {
             tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
-            *addr_list = list;
+            *addr_list = list
+                .into_iter()
+                .map(|sock| {
+                    let port = match sock {
+                        SocketAddr::V4(a) => a.port(),
+                        SocketAddr::V6(a) => a.port(),
+                    };
+                    super::AddrEntry::new(sock, None, port)
+                })
+                .collect();
             None
         }
         other => handle_request(state, other),
@@ -836,7 +903,7 @@ fn handle_udp_response(
 /// the fact; the bucket scheduler prevents storms by construction.
 async fn process_bucket(
     state: &mut SearchEngineState,
-    addr_list: &[SocketAddr],
+    addr_list: &[super::AddrEntry],
     socket: &AsyncUdpV4,
     nameserver_txs: &[mpsc::Sender<Vec<u8>>],
 ) {
@@ -915,7 +982,7 @@ async fn process_bucket(
 async fn fire_searches(
     state: &mut SearchEngineState,
     cids: &[u32],
-    addr_list: &[SocketAddr],
+    addr_list: &[super::AddrEntry],
     socket: &AsyncUdpV4,
     nameserver_txs: &[mpsc::Sender<Vec<u8>>],
 ) {
@@ -955,11 +1022,11 @@ async fn fire_searches(
         if current_frame.len() + payload.len() > MAX_UDP_SEND
             && current_frame.len() > CaHeader::SIZE
         {
-            for addr in addr_list {
+            for entry in addr_list {
                 send_with_fanout(
                     socket,
                     &current_frame,
-                    *addr,
+                    entry.sock,
                     "bucket",
                     &mut state.send_errors,
                 )
@@ -977,8 +1044,8 @@ async fn fire_searches(
             let mut solo = Vec::with_capacity(CaHeader::SIZE + payload.len());
             solo.extend_from_slice(&version_hdr);
             solo.extend_from_slice(&payload);
-            for addr in addr_list {
-                send_with_fanout(socket, &solo, *addr, "solo", &mut state.send_errors).await;
+            for entry in addr_list {
+                send_with_fanout(socket, &solo, entry.sock, "solo", &mut state.send_errors).await;
             }
             for ns_tx in nameserver_txs {
                 ns_try_send(ns_tx, solo.clone());
@@ -990,11 +1057,11 @@ async fn fire_searches(
 
     // Flush the final frame.
     if current_frame.len() > CaHeader::SIZE {
-        for addr in addr_list {
+        for entry in addr_list {
             send_with_fanout(
                 socket,
                 &current_frame,
-                *addr,
+                entry.sock,
                 "flush",
                 &mut state.send_errors,
             )
@@ -1469,7 +1536,11 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine_handle = tokio::spawn(run_search_engine(
-            vec![sniffer_addr],
+            vec![crate::client::AddrEntry::new(
+                sniffer_addr,
+                None,
+                sniffer_addr.port(),
+            )],
             Vec::new(),
             req_rx,
             resp_tx,
@@ -1550,7 +1621,11 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine_handle = tokio::spawn(run_search_engine(
-            vec![sniffer_addr],
+            vec![crate::client::AddrEntry::new(
+                sniffer_addr,
+                None,
+                sniffer_addr.port(),
+            )],
             Vec::new(),
             req_rx,
             resp_tx,

@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.16.1 — 2026-05-11
+
+Beacon-monitor false-positive fix on the CA client side. Long-lived
+CA clients with a mature steady-state EMA were firing a stream of
+`PeriodCollapse` warnings — `tracing::warn!("IOC may have restarted")`
++ transport-watchdog sticky flags + search/EchoProbe cascades — every
+time an unrelated peer client connected to the same IOC. The
+signature (id monotonic + interval suddenly far below the EMA) was
+never a real restart: it identifies the IOC's `rsrv online_notify_task`
+`beacon_reset` ramp-up cascade kicked off by any peer's TCP
+accept/disconnect (`server/beacon.rs:124`, `tcp.rs:450`), not a
+server restart. Real restarts reset `beacon_id` to 0 and trip
+`IdMismatch` instead, and our own broken circuits already get
+`BeaconControl::ResetServer` pre-emptively from the coordinator.
+
+### epics-ca-rs (client)
+
+- **fix**: retire the `PeriodCollapse` classification path in
+  `beacon_monitor::handle_beacon`. The branch (id monotonic +
+  `actual_interval < period_estimate / 3` past the 50 ms floor)
+  now self-resets `period_estimate` + `count` and returns `None`
+  instead of emitting `BeaconAnomalyKind::PeriodCollapse`. The
+  post-condition mirrors `apply_reset_server`, so the ramp-up
+  cascade reseeds the EMA from the live cadence without waking
+  search or firing EchoProbes on healthy circuits. `IdMismatch`
+  remains the sole real-restart classification; the
+  `PeriodCollapse` variant is retained (`#[allow(dead_code)]`) for
+  the negative-assertion test surface and future
+  distinguishing-signature work.
+- **test**: rename
+  `period_collapse_classifies_as_period_collapse` →
+  `monotonic_id_sub_period_clears_ema_no_anomaly`. The new test
+  asserts that no `ForceRescanServer` is emitted on the
+  monotonic-id sub-period beacon and that `period_estimate` is
+  cleared and `count` zeroed (then +1 for the accepted beacon).
+- **test**: add `peer_connect_ramp_up_does_not_fire_period_collapse`
+  — drives a mature steady-state EMA (1000 beacons, 15 s estimate)
+  through the IOC's documented 20/40/80/…/10240 ms ramp-up cascade
+  with monotonic ids and asserts no PeriodCollapse fires on any
+  ramp-up step. Captures the exact production symptom that prompted
+  the fix.
+
 ## v0.16.0 — 2026-05-11
 
 Access-security as a closed invariant: every wire op (CA + PVA) now

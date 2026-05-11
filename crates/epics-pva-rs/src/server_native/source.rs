@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField};
+pub use epics_base_rs::server::access_security::{AccessChecked, AccessGate};
 
 /// Per-operation context surfaced to [`ChannelSource`] implementors
 /// that need the downstream peer's identity (audit, ACL, gateway
@@ -34,6 +35,23 @@ pub struct ChannelContext {
 /// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
 /// set of named PVs.
 pub trait ChannelSource: Send + Sync + 'static {
+    /// Per-source access policy. Returns the [`AccessGate`] used by
+    /// the wire layer to mint [`AccessChecked`] tokens for the typed
+    /// op methods (`*_checked` family). Default impl returns a
+    /// process-wide singleton `Open` gate — sources that need ACF
+    /// enforcement override to install a `Required` gate wrapping
+    /// their `AcfCell`.
+    ///
+    /// Round 40 (type-state ACF gate): the typed op methods take
+    /// `AccessChecked` instead of `name: &str + ctx`. Because
+    /// `AccessChecked` is unforgeable outside this gate's `check`,
+    /// every wire op MUST flow through it — closing the missed-path
+    /// pattern that surfaced across rounds 32-39.
+    fn access(&self) -> &AccessGate {
+        static OPEN_GATE: std::sync::OnceLock<AccessGate> = std::sync::OnceLock::new();
+        OPEN_GATE.get_or_init(AccessGate::open)
+    }
+
     /// Enumerate every PV name this source can serve.
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send;
 
@@ -60,6 +78,29 @@ pub trait ChannelSource: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let _ = ctx;
         self.get_value(name)
+    }
+
+    /// Type-state-enforced GET. The wire layer mints `checked` via
+    /// `self.access().check(...)` once per op; the source then
+    /// inspects `checked.allows_read()` and dispatches.
+    ///
+    /// Round 41: this is the migration replacement for the
+    /// legacy `get_value` + `get_value_ctx` pair. The default impl
+    /// short-circuits on `NoAccess`, then delegates to
+    /// `get_value_ctx` so existing implementors stay correct
+    /// without override. New code SHOULD override this directly
+    /// when it has source-specific READ logic.
+    fn get_value_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        async move {
+            if !checked.allows_read() {
+                return None;
+            }
+            self.get_value_ctx(checked.pv_name(), ctx).await
+        }
     }
 
     /// Apply a PUT.
@@ -251,6 +292,14 @@ pub trait ChannelSourceObj: Send + Sync {
         name: &'a str,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
+    /// Round 41: type-state-gated GET. Dyn forwarder.
+    fn get_value_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
+    /// Round 41: per-source access gate. Dyn forwarder.
+    fn access_gate<'a>(&'a self) -> &'a AccessGate;
     fn put_value<'a>(
         &'a self,
         name: &'a str,
@@ -343,6 +392,16 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::get_value_ctx(self, name, ctx))
+    }
+    fn get_value_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::get_value_checked(self, checked, ctx))
+    }
+    fn access_gate<'a>(&'a self) -> &'a AccessGate {
+        <Self as ChannelSource>::access(self)
     }
     fn put_value<'a>(
         &'a self,

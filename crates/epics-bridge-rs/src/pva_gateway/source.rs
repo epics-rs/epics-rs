@@ -108,10 +108,21 @@ pub struct GatewayChannelSource {
     /// equivalent), so a `&mut self` setter is unreachable after
     /// installation. Mirrors the `acf` cell's hot-swap pattern.
     asg_resolver: Arc<RwLock<AsgResolver>>,
+    /// Round 41: type-state-enforced access gate. The closure
+    /// captures the `asg_resolver` cell so a hot-swap of the
+    /// resolver via [`set_asg_resolver`] is visible on the next
+    /// `check`. ASL is fixed at 0 for gateway-side checks — the
+    /// upstream record's ASL is not visible to the gateway and the
+    /// site policy on the gateway is expected to use UAG/HAG
+    /// gating rather than per-record ASL.
+    gate: epics_base_rs::server::access_security::AccessGate,
 }
 
 impl GatewayChannelSource {
     pub fn new(cache: Arc<ChannelCache>) -> Self {
+        let acf: AcfCell = Arc::new(RwLock::new(None));
+        let asg_resolver = Arc::new(RwLock::new(default_asg_resolver()));
+        let gate = Self::build_gate(acf.clone(), asg_resolver.clone());
         Self {
             cache,
             connect_timeout: Duration::from_secs(5),
@@ -120,9 +131,26 @@ impl GatewayChannelSource {
             max_subscribers: 100_000,
             subscriber_count: Arc::new(AtomicUsize::new(0)),
             upstream_pool: Arc::new(Mutex::new(HashMap::new())),
-            acf: Arc::new(RwLock::new(None)),
-            asg_resolver: Arc::new(RwLock::new(default_asg_resolver())),
+            acf,
+            asg_resolver,
+            gate,
         }
+    }
+
+    fn build_gate(
+        acf: AcfCell,
+        asg_resolver: Arc<RwLock<AsgResolver>>,
+    ) -> epics_base_rs::server::access_security::AccessGate {
+        use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver};
+        let resolver: AsgAslResolver = Arc::new(move |pv_name| {
+            let asg_resolver = asg_resolver.clone();
+            Box::pin(async move {
+                let g = asg_resolver.read().await;
+                let asg = (g)(&pv_name);
+                (asg, 0u8)
+            })
+        });
+        AccessGate::required(acf, resolver)
     }
 
     /// Install (or hot-swap) the PV→ASG resolver. Mirrors the C IOC's
@@ -226,6 +254,10 @@ impl GatewayChannelSource {
 }
 
 impl ChannelSource for GatewayChannelSource {
+    fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
+        &self.gate
+    }
+
     async fn list_pvs(&self) -> Vec<String> {
         self.cache.names().await
     }

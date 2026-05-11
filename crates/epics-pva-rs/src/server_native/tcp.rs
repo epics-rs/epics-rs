@@ -1339,15 +1339,24 @@ async fn handle_op(
 
     match kind {
         OpKind::Get => {
-            // ACF-aware GET: forward the peer's credentials. Sources
-            // without ACF default to the legacy `get_value` path.
+            // Round 41: type-state ACF gate. The wire layer mints the
+            // [`AccessChecked`] token via the source's per-instance
+            // [`AccessGate`]; the source's `get_value_checked` then
+            // refuses to proceed when the level is `NoAccess`. The
+            // token is unforgeable outside the gate, so adding a new
+            // wire op without going through the gate is a compile
+            // error against the trait method signature.
             let ctx = crate::server_native::source::ChannelContext {
                 peer,
                 account: cred.account.clone(),
                 method: cred.method.clone(),
                 host: cred.host.clone(),
             };
-            let value = match source.get_value_ctx(&ch.name, ctx).await {
+            let checked = source
+                .access_gate()
+                .check(&ch.name, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            let value = match source.get_value_checked(checked, ctx).await {
                 Some(v) => v,
                 None => {
                     send_op_error(tx, OpKind::Get, ioid, "PV not found", order).await?;

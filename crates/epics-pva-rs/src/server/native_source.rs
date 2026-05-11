@@ -36,21 +36,52 @@ pub struct PvDatabaseSource {
     /// PUTs are unrestricted (legacy behaviour for callers that
     /// build `PvDatabaseSource::new` without an ACF).
     acf: AcfCell,
+    /// Round 41: type-state-enforced access gate. Holds the same
+    /// AcfCell as `self.acf` plus a per-name `(ASG, ASL)` resolver
+    /// closure that captures `Arc<PvDatabase>` to read `common.asg`
+    /// and `common.asl` off the live record. The wire layer mints
+    /// [`AccessChecked`] tokens via this gate; the typed
+    /// `*_checked` op methods refuse to proceed without one.
+    gate: epics_base_rs::server::access_security::AccessGate,
 }
 
 impl PvDatabaseSource {
     pub fn new(db: Arc<PvDatabase>) -> Self {
-        Self {
-            db,
-            acf: Arc::new(RwLock::new(None)),
-        }
+        let acf: AcfCell = Arc::new(RwLock::new(None));
+        let gate = Self::build_gate(db.clone(), acf.clone());
+        Self { db, acf, gate }
     }
 
     /// Build with ACF enforcement. Mirrors what `PvaServer::run`
     /// installs from its builder-supplied ACF — every PUT goes
     /// through `check_access_method` against the record's `ASG`.
     pub fn new_with_acf(db: Arc<PvDatabase>, acf: AcfCell) -> Self {
-        Self { db, acf }
+        let gate = Self::build_gate(db.clone(), acf.clone());
+        Self { db, acf, gate }
+    }
+
+    fn build_gate(
+        db: Arc<PvDatabase>,
+        acf: AcfCell,
+    ) -> epics_base_rs::server::access_security::AccessGate {
+        use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver};
+        let resolver: AsgAslResolver = Arc::new(move |pv_name| {
+            let db = db.clone();
+            Box::pin(async move {
+                let (base, _field) = parse_pv_name(&pv_name);
+                if let Some(rec) = db.get_record(base).await {
+                    let inst = rec.read().await;
+                    let asg = if !inst.common.asg.is_empty() {
+                        inst.common.asg.clone()
+                    } else {
+                        "DEFAULT".to_string()
+                    };
+                    return (asg, inst.common.asl);
+                }
+                ("DEFAULT".to_string(), 0u8)
+            })
+        });
+        AccessGate::required(acf, resolver)
     }
 
     pub fn database(&self) -> &Arc<PvDatabase> {
@@ -394,6 +425,10 @@ async fn snapshot_for(db: &PvDatabase, name: &str) -> Option<Snapshot> {
 }
 
 impl ChannelSource for PvDatabaseSource {
+    fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
+        &self.gate
+    }
+
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
         let db = self.db.clone();
         async move {
@@ -908,6 +943,58 @@ ASG(SECURE) {
             )
             .await
             .expect("PUT must succeed when no ACF is attached");
+    }
+
+    /// Round-41: type-state-gated GET. The wire-layer flow mints an
+    /// [`AccessChecked`] via `source.access().check(...)`; the source
+    /// then sees `NoAccess` in the token level and returns `None`.
+    /// Pre-Round-40 every GET handler had to *remember* to call the
+    /// ACF check by hand — now the trait method signature forces it.
+    #[tokio::test]
+    async fn get_value_checked_denies_when_no_access() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use crate::server_native::source::ChannelSource;
+
+        let acf = parse_acf(
+            r#"
+UAG(ops) { alice }
+ASG(LOCKED) {
+    RULE(0, READ) { UAG(ops) }
+}
+"#,
+        )
+        .unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5))).await.unwrap();
+        db.get_record("AI:LOCKED").await.unwrap().write().await.common.asg = "LOCKED".into();
+
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
+
+        // Allowed peer: gate mints a ReadWrite/Read token → source
+        // returns the value.
+        let checked_ok = source
+            .access()
+            .check("AI:LOCKED", "anyhost", "alice", "anonymous", "")
+            .await;
+        let val = source
+            .get_value_checked(checked_ok, make_ctx("anyhost", "alice", "anonymous"))
+            .await;
+        assert!(val.is_some(), "alice must see the value");
+
+        // Denied peer: gate mints a NoAccess token → source returns
+        // None even though the underlying PV exists.
+        let checked_deny = source
+            .access()
+            .check("AI:LOCKED", "anyhost", "intruder", "anonymous", "")
+            .await;
+        let val = source
+            .get_value_checked(checked_deny, make_ctx("anyhost", "intruder", "anonymous"))
+            .await;
+        assert!(val.is_none(), "intruder must be denied via type-state gate");
     }
 
     /// Round-33A (R33-G4): the per-record ASL must gate `RULE(N, …)`

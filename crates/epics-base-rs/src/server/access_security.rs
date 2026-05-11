@@ -92,10 +92,17 @@ pub struct AccessGate {
     ///   (`Required`, `Open`). `bump_acl_version` `fetch_add`s.
     /// * `Aggregator`: a closure that returns a derived version
     ///   from sub-gates. `CompositeSource` uses this to expose a
-    ///   gate whose `acl_version()` is the `max` of its inner
-    ///   sources' versions, so a bump on any inner (e.g. a
+    ///   gate whose `acl_version()` is the `wrapping_sum` of its
+    ///   inner sources' versions (NOT `max` — see the round-50
+    ///   audit follow-up: max produced false negatives when an
+    ///   inner bumped to a value still under the existing peak),
+    ///   so a bump on any inner (e.g. a
     ///   `GatewayChannelSource::set_acf` on a child) is visible at
-    ///   the composite's top-level gate. Pre-fix the composite
+    ///   the composite's top-level gate. Note: this gate is only a
+    ///   **change signal** — the allow/deny authority remains the
+    ///   matched inner source's gate; see
+    ///   `ChannelSource::revalidate_read` for the owner path the
+    ///   monitor reload loop uses. Pre-fix the composite
     ///   inherited the default `Open` gate (version=0 forever) and
     ///   tcp.rs's monitor loop compared against that stale value,
     ///   missing every inner reload.
@@ -180,10 +187,15 @@ impl AccessGate {
     /// Build a permissive gate whose `acl_version()` is derived
     /// from a caller-supplied closure. Used by `CompositeSource`
     /// to aggregate inner sub-gates' versions — the closure
-    /// typically returns `max(inner.access_gate().acl_version())`
-    /// so a bump on any sub-source surfaces at the composite's
-    /// top-level gate, which is the version that tcp.rs's monitor
-    /// loop tracks.
+    /// returns `wrapping_sum(inner.access_gate().acl_version())`
+    /// so a bump on any sub-source moves the aggregate (every
+    /// per-inner version is monotonic via `fetch_add`, so the sum
+    /// changes iff some inner moved). NOT `max(...)` — that shape
+    /// produced false negatives when a smaller inner bumped under
+    /// the existing peak (see round-50 audit). This gate is only
+    /// a **change signal** for the monitor reload loop; the
+    /// allow/deny authority is the matched inner source's gate,
+    /// reached via `ChannelSource::revalidate_read`.
     ///
     /// `bump_acl_version()` on an `Aggregator` gate is a no-op:
     /// the version is derived, not owned. The aggregator's

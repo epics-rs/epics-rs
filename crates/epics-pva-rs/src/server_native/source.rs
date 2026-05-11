@@ -67,6 +67,44 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// Fetch the current value of a PV.
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
 
+    /// Round 50 follow-up (audit, R50-G3): re-check READ access for
+    /// `(pv_name, ctx)` through the SOURCE-SPECIFIC ACL gate that
+    /// served the original subscription. Returns `Some(token)` on
+    /// allow, `None` on deny.
+    ///
+    /// Invariant (closed by this method): every monitor event
+    /// after an ACL version mismatch MUST re-check READ through
+    /// the same gate that originally produced its `AccessChecked`.
+    /// For terminal sources (`PvDatabaseSource`,
+    /// `GatewayChannelSource`) `self.access()` IS that gate, so the
+    /// default impl below is correct. For `CompositeSource` the
+    /// top-level `access()` is an `open_with_aggregator` —
+    /// permissive on every call — and the override MUST resolve
+    /// the matched inner source and route the check through THAT
+    /// source's gate. Without the override, a monitor whose
+    /// subscribe-time inner-gate said allow would re-check against
+    /// the composite's Open gate on reload and keep streaming
+    /// after the inner flipped to deny.
+    fn revalidate_read(
+        &self,
+        pv_name: &str,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<AccessChecked>> + Send {
+        let gate = self.access();
+        let host = ctx.host.clone();
+        let account = ctx.account.clone();
+        let method = ctx.method.clone();
+        let name = pv_name.to_string();
+        async move {
+            let checked = gate.check(&name, &host, &account, &method, "").await;
+            if checked.allows_read() {
+                Some(checked)
+            } else {
+                None
+            }
+        }
+    }
+
     /// Type-state-enforced GET. The wire layer mints `checked` via
     /// `self.access().check(...)` once per op; the source then
     /// inspects `checked.allows_read()` and dispatches. Round 43
@@ -299,6 +337,12 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
     /// Round 41: per-source access gate. Dyn forwarder.
     fn access_gate<'a>(&'a self) -> &'a AccessGate;
+    /// Round 50 follow-up: monitor reload revalidation owner.
+    fn revalidate_read<'a>(
+        &'a self,
+        pv_name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<AccessChecked>> + Send + 'a>>;
     fn put_value<'a>(
         &'a self,
         name: &'a str,
@@ -398,6 +442,14 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn access_gate<'a>(&'a self) -> &'a AccessGate {
         <Self as ChannelSource>::access(self)
+    }
+    fn revalidate_read<'a>(
+        &'a self,
+        pv_name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<AccessChecked>> + Send + 'a>>
+    {
+        Box::pin(<Self as ChannelSource>::revalidate_read(self, pv_name, ctx))
     }
     fn put_value<'a>(
         &'a self,

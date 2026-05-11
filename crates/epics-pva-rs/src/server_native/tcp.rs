@@ -1635,17 +1635,19 @@ async fn handle_op(
                             != mon_acl_version_at_subscribe_cell
                                 .load(std::sync::atomic::Ordering::Acquire)
                         {
-                            let re = src
-                                .access_gate()
-                                .check(
-                                    &pv_name,
-                                    &mon_ctx.host,
-                                    &mon_ctx.account,
-                                    &mon_ctx.method,
-                                    "",
-                                )
-                                .await;
-                            if !re.allows_read() {
+                            // R50 audit-3: route the re-check
+                            // through the source's
+                            // `revalidate_read` owner so composite
+                            // sources resolve to the MATCHED inner
+                            // source's gate (the one that served
+                            // the original subscription), not the
+                            // composite's permissive aggregator
+                            // gate.
+                            if src
+                                .revalidate_read(&pv_name, mon_ctx.clone())
+                                .await
+                                .is_none()
+                            {
                                 let finish = build_monitor_finish(ioid, order);
                                 let _ = tx_clone.send(finish).await;
                                 return;
@@ -1675,28 +1677,25 @@ async fn handle_op(
                             }
                         }
                         while let Some(ev) = rx_raw.recv().await {
-                            // R48-G3: ACL re-check on policy reload.
-                            // If the gate's ACL generation has bumped
-                            // since subscribe time, the operator hot-
-                            // swapped the ACF; re-mint AccessChecked
-                            // and tear down if the new policy denies
-                            // this peer.
+                            // R48-G3 + R50 audit-3: ACL re-check on
+                            // policy reload. The version compare uses
+                            // the source's aggregate (composite =
+                            // wrapping-sum of inner versions); the
+                            // re-check is routed through
+                            // `revalidate_read` so composite sources
+                            // resolve to the matched inner gate
+                            // instead of the permissive aggregator
+                            // gate.
                             let live_v = src.access_gate().acl_version();
                             if live_v
                                 != mon_acl_version_at_subscribe_cell
                                     .load(std::sync::atomic::Ordering::Acquire)
                             {
-                                let re_checked = src
-                                    .access_gate()
-                                    .check(
-                                        &pv_name,
-                                        &mon_ctx.host,
-                                        &mon_ctx.account,
-                                        &mon_ctx.method,
-                                        "",
-                                    )
-                                    .await;
-                                if !re_checked.allows_read() {
+                                if src
+                                    .revalidate_read(&pv_name, mon_ctx.clone())
+                                    .await
+                                    .is_none()
+                                {
                                     let finish = build_monitor_finish(ioid, order);
                                     let _ = tx_clone.send(finish).await;
                                     return;
@@ -1742,25 +1741,22 @@ async fn handle_op(
                         return;
                     };
                     let mut over_high = false;
-                    // R49-G1: revalidate ACL BEFORE sending the
-                    // initial snapshot on the decoded path.
+                    // R49-G1 + R50 audit-3: revalidate ACL BEFORE
+                    // sending the initial snapshot on the decoded
+                    // path. The re-check is routed through
+                    // `revalidate_read` so composite sources resolve
+                    // to the matched inner gate.
                     {
                         let live_v0 = src.access_gate().acl_version();
                         if live_v0
                             != mon_acl_version_at_subscribe_cell
                                 .load(std::sync::atomic::Ordering::Acquire)
                         {
-                            let re = src
-                                .access_gate()
-                                .check(
-                                    &pv_name,
-                                    &mon_ctx.host,
-                                    &mon_ctx.account,
-                                    &mon_ctx.method,
-                                    "",
-                                )
-                                .await;
-                            if !re.allows_read() {
+                            if src
+                                .revalidate_read(&pv_name, mon_ctx.clone())
+                                .await
+                                .is_none()
+                            {
                                 let finish = build_monitor_finish(ioid, order);
                                 let _ = tx_clone.send(finish).await;
                                 return;
@@ -1806,22 +1802,19 @@ async fn handle_op(
                         // PvaServer ACF swap; on mismatch we
                         // re-mint AccessChecked and tear down with
                         // a MONITOR FINISH if the new policy denies.
+                        // R48-G3 + R50 audit-3: decoded recv-loop
+                        // re-check, routed through `revalidate_read`
+                        // for composite-source correctness.
                         let live_v = src.access_gate().acl_version();
                         if live_v
                             != mon_acl_version_at_subscribe_cell
                                 .load(std::sync::atomic::Ordering::Acquire)
                         {
-                            let re_checked = src
-                                .access_gate()
-                                .check(
-                                    &pv_name,
-                                    &mon_ctx.host,
-                                    &mon_ctx.account,
-                                    &mon_ctx.method,
-                                    "",
-                                )
-                                .await;
-                            if !re_checked.allows_read() {
+                            if src
+                                .revalidate_read(&pv_name, mon_ctx.clone())
+                                .await
+                                .is_none()
+                            {
                                 let finish = build_monitor_finish(ioid, order);
                                 let _ = tx_clone.send(finish).await;
                                 return;

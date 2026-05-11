@@ -32,14 +32,19 @@ pub struct SourceEntry {
 /// [`crate::server_native::PvaServer::start`].
 pub struct CompositeSource {
     entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>>,
-    /// Round 50 (R50-G1): the composite's gate is an aggregator
-    /// whose `acl_version()` returns `max(inner.access_gate().acl_version())`.
-    /// Pre-fix the composite inherited the default `Open` gate
-    /// (version=0 forever), so tcp.rs's monitor loop captured `0`
-    /// at subscribe and compared against `0` on every event —
-    /// missing every reload bump on the matched inner source. The
-    /// aggregator surfaces inner bumps at the top-level gate the
-    /// monitor task tracks.
+    /// Round 50 (R50-G1, audit-followups): the composite's gate is
+    /// an aggregator whose `acl_version()` is the `wrapping_sum`
+    /// of every inner gate's version (NOT `max(...)` — see the
+    /// round-50 audit; a max-based aggregate produced false
+    /// negatives when a smaller inner bumped under the existing
+    /// peak). The aggregate is a **change signal only**: a tcp.rs
+    /// monitor task compares the captured-at-subscribe version
+    /// against the live aggregate on every event; on mismatch it
+    /// re-checks READ access through the matched inner source's
+    /// gate via `ChannelSource::revalidate_read` (the
+    /// authoritative owner — the composite's own `access()` gate
+    /// is permissive and is NOT consulted for allow/deny on the
+    /// reload path).
     access_gate: epics_base_rs::server::access_security::AccessGate,
 }
 
@@ -139,6 +144,54 @@ impl CompositeSource {
 impl ChannelSource for CompositeSource {
     fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
         &self.access_gate
+    }
+
+    /// Round 50 follow-up (audit, R50-G3): monitor-reload READ
+    /// revalidation owner for composite sources.
+    ///
+    /// The composite's `access()` gate is an `open_with_aggregator`
+    /// — its `acl_version()` correctly reports "some inner moved"
+    /// (R50-G1 wrapping-sum aggregate), but its `check()` is the
+    /// permissive `Open` variant and is NOT authoritative for
+    /// allow/deny. Pre-fix tcp.rs's monitor reload loop called
+    /// `src.access_gate().check(...)` on the composite after a
+    /// version mismatch and always got `ReadWrite`, so a child's
+    /// `set_acf` flipping to deny was detected (version) but not
+    /// honoured (still served events).
+    ///
+    /// Closure: re-resolve the matched inner source by name (same
+    /// shape as `get_value_checked` / `subscribe_checked`) and
+    /// route the check through its gate — that's the gate that
+    /// served the subscription and is the single authoritative
+    /// owner of the allow/deny transition.
+    fn revalidate_read(
+        &self,
+        pv_name: &str,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<
+        Output = Option<epics_base_rs::server::access_security::AccessChecked>,
+    > + Send {
+        let name = pv_name.to_string();
+        let snapshot = self.snapshot();
+        async move {
+            for src in snapshot {
+                if src.has_pv(&name).await {
+                    let host = ctx.host.clone();
+                    let account = ctx.account.clone();
+                    let method = ctx.method.clone();
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &host, &account, &method, "")
+                        .await;
+                    return if inner_checked.allows_read() {
+                        Some(inner_checked)
+                    } else {
+                        None
+                    };
+                }
+            }
+            None
+        }
     }
 
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
@@ -470,13 +523,18 @@ mod tests {
         }
     }
 
-    /// Round 50 (R50-G1): composite's top-level gate must reflect
-    /// inner sub-gate version bumps. Pre-fix the composite inherited
-    /// the default `Open` gate (always version=0); tcp.rs's monitor
-    /// loop compared against that stale value and missed every
-    /// `GatewayChannelSource::set_acf` reload on a child. The
-    /// aggregator gate returns `max(inner.access_gate().acl_version())`
-    /// so a bump on ANY inner is observed at the composite.
+    /// Round 50 (R50-G1, audit-followups): composite's top-level
+    /// gate must reflect inner sub-gate version bumps. Pre-fix the
+    /// composite inherited the default `Open` gate (always
+    /// version=0); tcp.rs's monitor loop compared against that
+    /// stale value and missed every `GatewayChannelSource::set_acf`
+    /// reload on a child. The aggregator gate uses `wrapping_sum`
+    /// of every inner's version (a later audit replaced the original
+    /// `max(...)` shape — see `aggregator_detects_inner_bump_below_max`).
+    /// The aggregate is **change-signal only**: re-check of allow/deny
+    /// must go through the matched inner source's gate via
+    /// `ChannelSource::revalidate_read`, not the composite's own
+    /// permissive `access()` gate.
     #[tokio::test]
     async fn aggregator_gate_observes_inner_bumps() {
         use epics_base_rs::server::access_security::AccessGate;
@@ -539,17 +597,16 @@ mod tests {
         comp.add_source("b", inner2.clone() as DynSource, 1).unwrap();
 
         let v0 = comp.access().acl_version();
-        // Bump inner1 — composite must observe the new max.
+        // Bump inner1 — composite aggregate must change.
         inner1.gate.bump_acl_version();
         let v1 = comp.access().acl_version();
-        assert!(v1 > v0, "composite gate must surface inner1 bump: {v0} -> {v1}");
+        assert!(v1 != v0, "composite gate must surface inner1 bump: {v0} -> {v1}");
 
-        // Bump inner2 separately — composite must reflect the
-        // higher of the two.
+        // Bump inner2 separately — composite aggregate must change again.
         inner2.gate.bump_acl_version();
         inner2.gate.bump_acl_version();
         let v2 = comp.access().acl_version();
-        assert!(v2 > v1, "composite gate must track inner2 bumps too: {v1} -> {v2}");
+        assert!(v2 != v1, "composite gate must track inner2 bumps too: {v1} -> {v2}");
     }
 
     /// Round 50 follow-up (audit): pre-fix the composite used

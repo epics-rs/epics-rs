@@ -453,7 +453,8 @@ impl Record for TransformRecord {
         // Evaluate each calc expression A-P
         for i in 0..NUM_CHANNELS {
             if let Some(ref compiled) = self.compiled[i] {
-                let mut inputs = NumericInputs { vars: self.vals };
+                let mut inputs = NumericInputs::new();
+                inputs.vars[..NUM_CHANNELS].copy_from_slice(&self.vals);
                 match eval(compiled, &mut inputs) {
                     Ok(result) => {
                         self.vals[i] = result;

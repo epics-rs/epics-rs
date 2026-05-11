@@ -172,6 +172,13 @@ pub struct AsynDeviceSupport {
     max_array_elements: usize,
     /// If true, read back the current driver value during init (for output records).
     initial_readback: bool,
+    /// `info(asyn:READBACK, "1")` flag, asyn upstream PRs #60 / #208.
+    /// When set on an output record, the adapter activates the
+    /// driver-callback path even when `SCAN != "I/O Intr"` so the
+    /// record reprocesses on every external value change. Wired
+    /// through `io_intr_receiver` together with the existing IoIntr
+    /// scan path.
+    asyn_readback: bool,
     /// If true, this is a write-only device support (e.g. asynOctetWrite).
     /// read() returns no-op to avoid overwriting the record's native value type.
     write_only: bool,
@@ -212,6 +219,7 @@ impl AsynDeviceSupport {
             record_name: String::new(),
             scan: ScanType::Passive,
             initial_readback: false,
+            asyn_readback: false,
             write_only: false,
             interrupt_sub: None,
             interrupt_cache: Arc::new(std::sync::Mutex::new(None)),
@@ -234,6 +242,19 @@ impl AsynDeviceSupport {
     pub fn with_initial_readback(mut self) -> Self {
         self.initial_readback = true;
         self
+    }
+
+    /// Enable `asyn:READBACK` mode (asyn upstream PRs #60 / #208).
+    ///
+    /// On output records that carry the `info(asyn:READBACK, "1")`
+    /// info-tag, callers should flip this flag so the adapter
+    /// subscribes to driver value changes and reprocesses the record
+    /// even outside `SCAN="I/O Intr"`. The wiring of the info-tag
+    /// itself is the caller's responsibility (epics-rs db_loader does
+    /// not yet capture info-tags); this method exposes the contract
+    /// so when info-tag plumbing lands the toggle is already in place.
+    pub fn set_asyn_readback(&mut self, on: bool) {
+        self.asyn_readback = on;
     }
 
     /// Set the driver info string (used for `drv_user_create` during init).
@@ -628,6 +649,22 @@ impl DeviceSupport for AsynDeviceSupport {
         self.scan = scan;
     }
 
+    fn apply_record_info(&mut self, info: &std::collections::HashMap<String, String>) {
+        // asyn upstream PRs #60 / #208 — `info("asyn:READBACK", "1")`
+        // on output records causes them to follow driver-side changes
+        // even when SCAN is not "I/O Intr". Truthiness mirrors EPICS
+        // base: any non-empty value other than "0", "no", "false"
+        // (case-insensitive) enables the flag.
+        if let Some(raw) = info.get("asyn:READBACK") {
+            let v = raw.trim();
+            let on = !v.is_empty()
+                && !v.eq_ignore_ascii_case("0")
+                && !v.eq_ignore_ascii_case("no")
+                && !v.eq_ignore_ascii_case("false");
+            self.set_asyn_readback(on);
+        }
+    }
+
     fn write_begin(
         &mut self,
         record: &mut dyn Record,
@@ -663,7 +700,15 @@ impl DeviceSupport for AsynDeviceSupport {
     }
 
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
-        if self.scan != ScanType::IoIntr || !self.reason_set {
+        // Activate the driver-callback path for either:
+        //   1. records with `SCAN="I/O Intr"` (legacy behaviour), OR
+        //   2. records flagged via `set_asyn_readback(true)` (asyn
+        //      upstream PRs #60 / #208 — output records that follow
+        //      driver-side changes regardless of SCAN).
+        if !self.reason_set {
+            return None;
+        }
+        if self.scan != ScanType::IoIntr && !self.asyn_readback {
             return None;
         }
 
@@ -817,9 +862,43 @@ pub fn register_asyn_device_support(
     app.register_dynamic_device_support(universal_asyn_factory)
 }
 
+/// IocBuilder companion to [`register_asyn_device_support`] —
+/// installs the universal asyn factory on the pure-Rust build path
+/// (round-9 added `register_dynamic_device_support` to IocBuilder).
+/// Without this helper, callers using `IocBuilder` instead of
+/// `IocApplication` would have to wire `universal_asyn_factory`
+/// manually; that asymmetry is exactly what `register_asyn_device_support`
+/// hides for the IocApplication path.
+pub fn register_asyn_device_support_for_builder(
+    builder: epics_base_rs::server::ioc_builder::IocBuilder,
+) -> epics_base_rs::server::ioc_builder::IocBuilder {
+    builder.register_dynamic_device_support(universal_asyn_factory)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round-22 regression: the IocBuilder companion helper exists
+    /// and accepts a pure-Rust builder. Pre-fix, `register_asyn_device_support`
+    /// only accepted IocApplication, so an IocBuilder caller had to
+    /// expose `universal_asyn_factory` themselves.
+    #[tokio::test]
+    async fn register_asyn_device_support_for_builder_compiles_and_attaches() {
+        use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+        use epics_base_rs::server::record::ScanType;
+        use epics_base_rs::types::EpicsValue;
+        let _ = (
+            ScanType::Passive,
+            EpicsValue::Double(0.0),
+            std::any::type_name::<dyn DeviceSupport>(),
+            std::any::type_name::<DeviceReadOutcome>(),
+        );
+
+        // The helper consumes and returns the builder — chain on .build().
+        let _builder = register_asyn_device_support_for_builder(IocBuilder::new());
+    }
 
     #[test]
     fn test_parse_full() {
@@ -1004,6 +1083,43 @@ mod tests {
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.reason, 0); // "VAL" is param index 0
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_record_info_enables_readback_for_truthy_value() {
+        // info("asyn:READBACK", "1") on a Passive output must allow
+        // io_intr_receiver to activate (asyn upstream PRs #60 / #208).
+        let mut ads = make_adapter(ScanType::Passive);
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        // Without the info tag, Passive scan keeps io_intr_receiver=None.
+        assert!(ads.io_intr_receiver().is_none());
+        // Apply the tag — adapter should now expose an Intr receiver.
+        let mut info = std::collections::HashMap::new();
+        info.insert("asyn:READBACK".to_string(), "1".to_string());
+        ads.apply_record_info(&info);
+        assert!(
+            ads.io_intr_receiver().is_some(),
+            "asyn:READBACK=1 must enable readback path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_record_info_falsey_values_do_not_enable_readback() {
+        let mut ads = make_adapter(ScanType::Passive);
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        for falsey in ["0", "no", "NO", "false", "False", ""] {
+            let mut info = std::collections::HashMap::new();
+            info.insert("asyn:READBACK".to_string(), falsey.to_string());
+            ads.apply_record_info(&info);
+            assert!(
+                ads.io_intr_receiver().is_none(),
+                "value {falsey:?} must not enable readback"
+            );
+        }
     }
 
     #[test]

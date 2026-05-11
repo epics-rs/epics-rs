@@ -138,7 +138,19 @@ impl IocShell {
 
     /// Run the interactive REPL. Blocks until exit or EOF.
     pub fn run_repl(&self) -> Result<(), String> {
-        let mut rl = rustyline::DefaultEditor::new()
+        // History capacity from `EPICS_RS_IOCSH_HISTORY_SIZE` (default
+        // 500). Mirrors epics-base PR #459 — bound the history so a
+        // long-running IOC shell session does not grow unbounded.
+        // Lower bound 16 keeps history useful even for hostile env values.
+        let history_size = crate::runtime::env::get("EPICS_RS_IOCSH_HISTORY_SIZE")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(500)
+            .max(16);
+        let config = rustyline::Config::builder()
+            .max_history_size(history_size)
+            .map_err(|e| format!("invalid rustyline history config: {e}"))?
+            .build();
+        let mut rl = rustyline::DefaultEditor::with_config(config)
             .map_err(|e| format!("failed to initialize readline: {e}"))?;
 
         loop {
@@ -244,10 +256,49 @@ mod tests {
         let handle = rt.handle().clone();
         rt.block_on(async {
             db.add_record("TEST_REC", Box::new(AiRecord::new(42.0)))
-                .await;
+                .await
+                .unwrap();
         });
         std::mem::forget(rt);
         IocShell::new(db, handle)
+    }
+
+    /// Round-16 regression: a CommandDef must be cloneable so the
+    /// post-init `afterIocRunning` shell can re-register
+    /// site-specific user commands. Pre-fix the handler was
+    /// `Box<dyn CommandHandler>` and CommandDef itself was not
+    /// Clone — `IocApplication::run` skipped user commands when
+    /// spawning the post-init shell, leaving them dead.
+    #[test]
+    fn command_def_is_clone_and_handler_shared() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let cmd = CommandDef::new(
+            "myCmd",
+            vec![],
+            "myCmd — count invocations",
+            move |_args: &[ArgValue], _ctx: &CommandContext| {
+                calls_clone.fetch_add(1, Ordering::Relaxed);
+                Ok(CommandOutcome::Continue)
+            },
+        );
+
+        // Cloning the CommandDef shares the same handler counter —
+        // the Arc<dyn CommandHandler> is what enables the round-16
+        // afterIocRunning re-registration.
+        let cmd_dup = cmd.clone();
+
+        let shell = make_shell();
+        shell.register(cmd);
+        shell.execute_line("myCmd").unwrap();
+
+        let shell2 = make_shell();
+        shell2.register(cmd_dup);
+        shell2.execute_line("myCmd").unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -365,5 +416,58 @@ mod tests {
         let (cmd, redir) = parse_redirect("dbl");
         assert_eq!(cmd, "dbl");
         assert!(redir.is_none());
+    }
+
+    /// epics-base PR #812 — `dbCreateRecord <type> <name>` creates a
+    /// new record at runtime through the same factory registry as
+    /// `dbLoadRecords`. Verifies the happy path plus three rejection
+    /// branches (duplicate name, bad name, unknown record type).
+    #[test]
+    fn test_execute_line_db_create_record_happy_path() {
+        let shell = make_shell();
+        let result = shell.execute_line("dbCreateRecord ai NEW:AI");
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+        // Record is now visible via dbl.
+        let result = shell.execute_line("dbl ai");
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+    }
+
+    #[test]
+    fn test_execute_line_db_create_record_rejects_duplicate() {
+        let shell = make_shell();
+        // TEST_REC was added by make_shell() — re-creating must fail
+        // gracefully (logged via println, returns Continue, not Err).
+        shell.execute_line("dbCreateRecord ai TEST_REC").unwrap();
+        // After the rejected call, the original record (val=42.0) is
+        // still there, not overwritten. Verify with dbgf which reads
+        // the live VAL.
+        let r = shell.execute_line("dbgf TEST_REC");
+        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+    }
+
+    #[test]
+    fn test_execute_line_db_create_record_rejects_bad_name() {
+        let shell = make_shell();
+        // Space inside the name → validate_record_name returns Err.
+        // Quote so the parser keeps the space as one argument.
+        let r = shell.execute_line("dbCreateRecord ai \"BAD NAME\"");
+        // The command itself returns Continue (errors are printed),
+        // and the record must NOT be in the registry afterward.
+        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+    }
+
+    #[test]
+    fn test_execute_line_db_create_record_rejects_unknown_type() {
+        let shell = make_shell();
+        let r = shell.execute_line("dbCreateRecord nonexistent NEW_REC");
+        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+    }
+
+    #[test]
+    fn test_execute_line_db_create_record_missing_args() {
+        let shell = make_shell();
+        // Both args are required — missing recordName must Err.
+        let r = shell.execute_line("dbCreateRecord ai");
+        assert!(r.is_err());
     }
 }

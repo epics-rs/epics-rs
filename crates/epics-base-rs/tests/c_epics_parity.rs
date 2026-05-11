@@ -474,8 +474,12 @@ async fn db_link_alarm_propagation() {
     let db = Arc::new(PvDatabase::new());
 
     // Create source (ai) and target (ao) records
-    db.add_record("target", Box::new(AoRecord::new(42.0))).await;
-    db.add_record("src", Box::new(AiRecord::new(0.0))).await;
+    db.add_record("target", Box::new(AoRecord::new(42.0)))
+        .await
+        .unwrap();
+    db.add_record("src", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
 
     // Set target alarm state
     if let Some(rec) = db.get_record("target").await {
@@ -607,8 +611,11 @@ async fn soft_input_reads_from_db_link() {
 
     let db = Arc::new(PvDatabase::new());
     db.add_record("source", Box::new(LonginRecord::new(0)))
-        .await;
-    db.add_record("reader", Box::new(AiRecord::new(0.0))).await;
+        .await
+        .unwrap();
+    db.add_record("reader", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
 
     // Set source value
     db.put_pv("source", EpicsValue::Long(42)).await.unwrap();
@@ -639,7 +646,9 @@ async fn soft_output_writes_to_db() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("dest", Box::new(AoRecord::new(0.0))).await;
+    db.add_record("dest", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
 
     // Direct put simulates output record writing
     db.put_pv("dest", EpicsValue::Double(42.5)).await.unwrap();
@@ -1249,11 +1258,18 @@ async fn database_multiple_records() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("ai1", Box::new(AiRecord::new(1.0))).await;
-    db.add_record("ai2", Box::new(AiRecord::new(2.0))).await;
-    db.add_record("bo1", Box::new(BoRecord::new(0))).await;
+    db.add_record("ai1", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("ai2", Box::new(AiRecord::new(2.0)))
+        .await
+        .unwrap();
+    db.add_record("bo1", Box::new(BoRecord::new(0)))
+        .await
+        .unwrap();
     db.add_record("lo1", Box::new(LongoutRecord::new(100)))
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(db.get_pv("ai1").await.unwrap(), EpicsValue::Double(1.0));
     assert_eq!(db.get_pv("ai2").await.unwrap(), EpicsValue::Double(2.0));
@@ -1284,7 +1300,9 @@ async fn database_put_record_field() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("myrec", Box::new(AoRecord::new(0.0))).await;
+    db.add_record("myrec", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
 
     // Put to EGU field
     if let Some(rec) = db.get_record("myrec").await {
@@ -1312,7 +1330,8 @@ async fn database_disp_blocks_ca_put() {
 
     let db = Arc::new(PvDatabase::new());
     db.add_record("disp_rec", Box::new(AoRecord::new(0.0)))
-        .await;
+        .await
+        .unwrap();
 
     // Set DISP=1
     if let Some(rec) = db.get_record("disp_rec").await {
@@ -1335,7 +1354,8 @@ async fn database_proc_triggers_processing() {
 
     let db = Arc::new(PvDatabase::new());
     db.add_record("proc_rec", Box::new(AoRecord::new(5.0)))
-        .await;
+        .await
+        .unwrap();
 
     // PROC should trigger processing
     let result = db
@@ -1357,9 +1377,15 @@ async fn database_all_record_names() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("rec_a", Box::new(AiRecord::new(0.0))).await;
-    db.add_record("rec_b", Box::new(AoRecord::new(0.0))).await;
-    db.add_record("rec_c", Box::new(BiRecord::new(0))).await;
+    db.add_record("rec_a", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("rec_b", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("rec_c", Box::new(BiRecord::new(0)))
+        .await
+        .unwrap();
 
     let names = db.all_record_names().await;
     assert_eq!(names.len(), 3);
@@ -1632,7 +1658,9 @@ async fn database_init_cleanup_cycle() {
     // Cycle 1: create, populate, verify, drop
     {
         let db = Arc::new(PvDatabase::new());
-        db.add_record("cycle1", Box::new(AoRecord::new(1.0))).await;
+        db.add_record("cycle1", Box::new(AoRecord::new(1.0)))
+            .await
+            .unwrap();
         assert_eq!(db.get_pv("cycle1").await.unwrap(), EpicsValue::Double(1.0));
     }
 
@@ -1643,7 +1671,9 @@ async fn database_init_cleanup_cycle() {
             db.get_pv("cycle1").await.is_err(),
             "Old record should not exist"
         );
-        db.add_record("cycle2", Box::new(AoRecord::new(2.0))).await;
+        db.add_record("cycle2", Box::new(AoRecord::new(2.0)))
+            .await
+            .unwrap();
         assert_eq!(db.get_pv("cycle2").await.unwrap(), EpicsValue::Double(2.0));
     }
 }
@@ -1671,8 +1701,12 @@ async fn flnk_chain_processes_target() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
     let db = Arc::new(PvDatabase::new());
-    db.add_record("src", Box::new(AoRecord::new(0.0))).await;
-    db.add_record("dst", Box::new(AiRecord::new(0.0))).await;
+    db.add_record("src", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("dst", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
 
     // Set FLNK: src → dst
     if let Some(rec) = db.get_record("src").await {
@@ -1704,8 +1738,12 @@ async fn flnk_loop_does_not_infinite_loop() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("loop_a", Box::new(AoRecord::new(0.0))).await;
-    db.add_record("loop_b", Box::new(AoRecord::new(0.0))).await;
+    db.add_record("loop_a", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("loop_b", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
 
     // Create circular FLNK: loop_a → loop_b → loop_a
     if let Some(rec) = db.get_record("loop_a").await {
@@ -1739,7 +1777,8 @@ async fn rpro_reprocessing() {
 
     let db = Arc::new(PvDatabase::new());
     db.add_record("rpro_rec", Box::new(AoRecord::new(0.0)))
-        .await;
+        .await
+        .unwrap();
 
     // Set RPRO flag
     if let Some(rec) = db.get_record("rpro_rec").await {
@@ -1770,7 +1809,9 @@ async fn rapid_puts_to_same_record() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("rapid", Box::new(AoRecord::new(0.0))).await;
+    db.add_record("rapid", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
 
     // Multiple rapid puts — last value should stick
     for i in 0..10 {
@@ -1799,7 +1840,8 @@ async fn process_record_clears_udf() {
 
     let db = Arc::new(PvDatabase::new());
     db.add_record("scan_rec", Box::new(AoRecord::new(5.0)))
-        .await;
+        .await
+        .unwrap();
 
     // UDF should be true initially
     if let Some(rec) = db.get_record("scan_rec").await {
@@ -1825,7 +1867,8 @@ async fn pini_flag() {
 
     let db = Arc::new(PvDatabase::new());
     db.add_record("pini_rec", Box::new(AoRecord::new(0.0)))
-        .await;
+        .await
+        .unwrap();
 
     // Set PINI
     if let Some(rec) = db.get_record("pini_rec").await {
@@ -1851,8 +1894,12 @@ async fn independent_records_no_interference() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    db.add_record("iso_a", Box::new(AoRecord::new(1.0))).await;
-    db.add_record("iso_b", Box::new(AoRecord::new(2.0))).await;
+    db.add_record("iso_a", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("iso_b", Box::new(AoRecord::new(2.0)))
+        .await
+        .unwrap();
 
     // Process A shouldn't affect B
     db.process_record("iso_a").await.unwrap();
@@ -1875,7 +1922,8 @@ async fn process_chain_depth_limit() {
     // Create long chain: rec0 → rec1 → rec2 → ... → rec19
     for i in 0..20 {
         db.add_record(&format!("chain{i}"), Box::new(AoRecord::new(i as f64)))
-            .await;
+            .await
+            .unwrap();
     }
     for i in 0..19 {
         if let Some(rec) = db.get_record(&format!("chain{i}")).await {

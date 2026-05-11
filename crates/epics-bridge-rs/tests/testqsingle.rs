@@ -40,7 +40,9 @@ fn extract_value(s: &PvStructure) -> Option<&PvField> {
 #[tokio::test]
 async fn get_ai_scalar_returns_current_value() {
     let db = Arc::new(PvDatabase::new());
-    db.add_record("TEST:ai", Box::new(AiRecord::new(2.5))).await;
+    db.add_record("TEST:ai", Box::new(AiRecord::new(2.5)))
+        .await
+        .unwrap();
     let ch = BridgeChannel::from_cached(db, "TEST:ai".into(), NtType::Scalar, DbFieldType::Double);
 
     let result = ch.get(&empty_request()).await.expect("get");
@@ -53,7 +55,8 @@ async fn get_ai_scalar_returns_current_value() {
 async fn put_then_get_round_trips_double() {
     let db = Arc::new(PvDatabase::new());
     db.add_record("TEST:ai_rt", Box::new(AiRecord::new(0.0)))
-        .await;
+        .await
+        .unwrap();
     let ch = BridgeChannel::from_cached(
         db.clone(),
         "TEST:ai_rt".into(),
@@ -81,7 +84,8 @@ async fn put_then_get_round_trips_double() {
 async fn put_then_get_round_trips_long() {
     let db = Arc::new(PvDatabase::new());
     db.add_record("TEST:longin", Box::new(LonginRecord::new(0)))
-        .await;
+        .await
+        .unwrap();
     let ch = BridgeChannel::from_cached(
         db.clone(),
         "TEST:longin".into(),
@@ -107,7 +111,8 @@ async fn put_then_get_round_trips_long() {
 async fn put_then_get_round_trips_string() {
     let db = Arc::new(PvDatabase::new());
     db.add_record("TEST:str", Box::new(StringinRecord::new("init")))
-        .await;
+        .await
+        .unwrap();
     let ch = BridgeChannel::from_cached(
         db.clone(),
         "TEST:str".into(),
@@ -144,7 +149,8 @@ async fn waveform_array_round_trips() {
         "TEST:wf",
         Box::new(WaveformRecord::new(8, DbFieldType::Double)),
     )
-    .await;
+    .await
+    .unwrap();
     // Seed an initial array via direct DB put.
     db.put_pv("TEST:wf", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
         .await

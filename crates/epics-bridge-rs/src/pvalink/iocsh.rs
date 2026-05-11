@@ -77,6 +77,7 @@ pub fn pvxrefdiff_command(resolver: PvaLinkResolver) -> CommandDef {
 /// and dumps connection / value / alarm / time state for each
 /// `pva://...` or `ca://...` link via the registered
 /// [`epics_base_rs::server::database::LinkSet`].
+#[allow(unused_variables)]
 pub fn dbpvxr_command(resolver: PvaLinkResolver) -> CommandDef {
     CommandDef::new(
         "dbpvxr",
@@ -150,6 +151,12 @@ pub fn dbpvxr_command(resolver: PvaLinkResolver) -> CommandDef {
                                 ctx.println(&format!("    {field}={raw:?}  constant {c:?}"));
                             }
                             epics_base_rs::server::record::ParsedLink::None => {}
+                            epics_base_rs::server::record::ParsedLink::Hw(hw) => {
+                                ctx.println(&format!(
+                                    "    {field}={raw:?}  hw link {:?} args={:?}",
+                                    hw.kind, hw.args
+                                ));
+                            }
                         }
                     }
                 }

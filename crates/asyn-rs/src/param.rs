@@ -19,6 +19,7 @@ pub struct EnumEntry {
 pub enum ParamType {
     Int32,
     Int64,
+    UInt64,
     Float64,
     Octet,
     UInt32Digital,
@@ -26,6 +27,7 @@ pub enum ParamType {
     Int16Array,
     Int32Array,
     Int64Array,
+    UInt64Array,
     Float32Array,
     Float64Array,
     Enum,
@@ -38,6 +40,8 @@ pub enum ParamType {
 pub enum ParamValue {
     Int32(i32),
     Int64(i64),
+    /// Unsigned 64-bit integer (asyn upstream issue #231).
+    UInt64(u64),
     Float64(f64),
     Octet(String),
     UInt32Digital(u32),
@@ -45,6 +49,8 @@ pub enum ParamValue {
     Int16Array(Arc<[i16]>),
     Int32Array(Arc<[i32]>),
     Int64Array(Arc<[i64]>),
+    /// Unsigned 64-bit integer array (asyn upstream issue #231).
+    UInt64Array(Arc<[u64]>),
     Float32Array(Arc<[f32]>),
     Float64Array(Arc<[f64]>),
     Enum {
@@ -60,6 +66,7 @@ impl fmt::Debug for ParamValue {
         match self {
             Self::Int32(v) => write!(f, "Int32({v:?})"),
             Self::Int64(v) => write!(f, "Int64({v:?})"),
+            Self::UInt64(v) => write!(f, "UInt64({v:?})"),
             Self::Float64(v) => write!(f, "Float64({v:?})"),
             Self::Octet(v) => write!(f, "Octet({v:?})"),
             Self::UInt32Digital(v) => write!(f, "UInt32Digital({v:?})"),
@@ -67,6 +74,7 @@ impl fmt::Debug for ParamValue {
             Self::Int16Array(v) => write!(f, "Int16Array({v:?})"),
             Self::Int32Array(v) => write!(f, "Int32Array({v:?})"),
             Self::Int64Array(v) => write!(f, "Int64Array({v:?})"),
+            Self::UInt64Array(v) => write!(f, "UInt64Array({v:?})"),
             Self::Float32Array(v) => write!(f, "Float32Array({v:?})"),
             Self::Float64Array(v) => write!(f, "Float64Array({v:?})"),
             Self::Enum { index, choices } => write!(f, "Enum(index={index}, choices={choices:?})"),
@@ -81,6 +89,7 @@ impl ParamValue {
         match self {
             Self::Int32(_) => "Int32",
             Self::Int64(_) => "Int64",
+            Self::UInt64(_) => "UInt64",
             Self::Float64(_) => "Float64",
             Self::Octet(_) => "Octet",
             Self::UInt32Digital(_) => "UInt32Digital",
@@ -88,6 +97,7 @@ impl ParamValue {
             Self::Int16Array(_) => "Int16Array",
             Self::Int32Array(_) => "Int32Array",
             Self::Int64Array(_) => "Int64Array",
+            Self::UInt64Array(_) => "UInt64Array",
             Self::Float32Array(_) => "Float32Array",
             Self::Float64Array(_) => "Float64Array",
             Self::Enum { .. } => "Enum",
@@ -123,6 +133,7 @@ impl ParamEntry {
         let value = match param_type {
             ParamType::Int32 => ParamValue::Int32(0),
             ParamType::Int64 => ParamValue::Int64(0),
+            ParamType::UInt64 => ParamValue::UInt64(0),
             ParamType::Float64 => ParamValue::Float64(0.0),
             ParamType::Octet => ParamValue::Octet(String::new()),
             ParamType::UInt32Digital => ParamValue::UInt32Digital(0),
@@ -130,6 +141,7 @@ impl ParamEntry {
             ParamType::Int16Array => ParamValue::Int16Array(Arc::from([] as [i16; 0])),
             ParamType::Int32Array => ParamValue::Int32Array(Arc::from([] as [i32; 0])),
             ParamType::Int64Array => ParamValue::Int64Array(Arc::from([] as [i64; 0])),
+            ParamType::UInt64Array => ParamValue::UInt64Array(Arc::from([] as [u64; 0])),
             ParamType::Float32Array => ParamValue::Float32Array(Arc::from([] as [f32; 0])),
             ParamType::Float64Array => ParamValue::Float64Array(Arc::from([] as [f64; 0])),
             ParamType::Enum => ParamValue::Enum {

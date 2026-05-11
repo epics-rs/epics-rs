@@ -25,11 +25,15 @@ fn quick_backup() -> BackupConfig {
 
 async fn setup_db() -> Arc<PvDatabase> {
     let db = Arc::new(PvDatabase::new());
-    db.add_record("TEMP", Box::new(AoRecord::new(25.5))).await;
+    db.add_record("TEMP", Box::new(AoRecord::new(25.5)))
+        .await
+        .unwrap();
     db.add_record("PRESS", Box::new(AoRecord::new(1013.0)))
-        .await;
+        .await
+        .unwrap();
     db.add_record("MSG", Box::new(StringinRecord::new("hello")))
-        .await;
+        .await
+        .unwrap();
     db
 }
 

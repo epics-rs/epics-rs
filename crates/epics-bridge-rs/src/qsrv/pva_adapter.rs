@@ -354,7 +354,8 @@ mod tests {
         use epics_pva_rs::server_native::ChannelSource;
         let db = Arc::new(PvDatabase::new());
         db.add_pv("TEST:X", epics_base_rs::types::EpicsValue::Double(1.0))
-            .await;
+            .await
+            .unwrap();
         let provider = Arc::new(BridgeProvider::new(db));
         let store = QsrvPvStore::new(provider);
         assert!(store.has_pv("TEST:X").await);

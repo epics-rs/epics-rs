@@ -12,23 +12,99 @@ use crate::client_native::context::PvGetResult; // not used; kept for re-export 
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use crate::server_native::ChannelSource;
 
+use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
+use tokio::sync::RwLock;
+
+/// Shared, mutable ACF cell. Round-28: changed from
+/// `Arc<Option<AccessSecurityConfig>>` to `Arc<RwLock<...>>` so
+/// `PvaServer::reload_acf_from` can swap the policy at runtime
+/// (mirrors `CaServer::reload_acf`). All `PvDatabaseSource` ACF
+/// check sites acquire a read guard; the `/reload-acf` introspection
+/// endpoint and any future site-policy SIGHUP handler acquire a
+/// write guard via `PvaServer::reload_acf_from`.
+pub type AcfCell = Arc<RwLock<Option<AccessSecurityConfig>>>;
 
 /// Native `ChannelSource` over a `PvDatabase`.
 pub struct PvDatabaseSource {
     db: Arc<PvDatabase>,
+    /// Round 41/43: the type-state access gate is the only ACF
+    /// surface on this source. The gate holds an `Arc` clone of
+    /// the caller's `AcfCell` (so hot-swap via that cell is
+    /// visible) plus a per-name `(ASG, ASL)` resolver that reads
+    /// the live record's `common.asg` / `common.asl`. Wire-layer
+    /// `*_checked` ops cannot run without an `AccessChecked` minted
+    /// here.
+    gate: epics_base_rs::server::access_security::AccessGate,
 }
 
 impl PvDatabaseSource {
     pub fn new(db: Arc<PvDatabase>) -> Self {
-        Self { db }
+        let acf: AcfCell = Arc::new(RwLock::new(None));
+        let gate = Self::build_gate(db.clone(), acf, None);
+        Self { db, gate }
+    }
+
+    /// Build with ACF enforcement. Mirrors what `PvaServer::run`
+    /// installs from its builder-supplied ACF — every PUT goes
+    /// through `check_access_method` against the record's `ASG`.
+    pub fn new_with_acf(db: Arc<PvDatabase>, acf: AcfCell) -> Self {
+        let gate = Self::build_gate(db.clone(), acf, None);
+        Self { db, gate }
+    }
+
+    /// Round 48 (R48-G3): build with an externally-supplied
+    /// `acl_version` counter. `PvaServer` shares the same `Arc` so
+    /// its `reload_acf_from` / `clear_acf` can bump the version
+    /// that this source's gate exposes, forcing monitor tasks
+    /// spawned on top of this source to re-check on their next
+    /// event.
+    pub fn new_with_acf_and_version(
+        db: Arc<PvDatabase>,
+        acf: AcfCell,
+        acl_version: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let gate = Self::build_gate(db.clone(), acf, Some(acl_version));
+        Self { db, gate }
+    }
+
+    fn build_gate(
+        db: Arc<PvDatabase>,
+        acf: AcfCell,
+        acl_version: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> epics_base_rs::server::access_security::AccessGate {
+        use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver};
+        let resolver: AsgAslResolver = Arc::new(move |pv_name| {
+            let db = db.clone();
+            Box::pin(async move {
+                let (base, _field) = parse_pv_name(&pv_name);
+                if let Some(rec) = db.get_record(base).await {
+                    let inst = rec.read().await;
+                    let asg = if !inst.common.asg.is_empty() {
+                        inst.common.asg.clone()
+                    } else {
+                        "DEFAULT".to_string()
+                    };
+                    return (asg, inst.common.asl);
+                }
+                ("DEFAULT".to_string(), 0u8)
+            })
+        });
+        match acl_version {
+            Some(v) => AccessGate::required_with_version(acf, resolver, v),
+            None => AccessGate::required(acf, resolver),
+        }
     }
 
     pub fn database(&self) -> &Arc<PvDatabase> {
         &self.db
     }
+
+    // Round 43: the ASG/ASL resolution moved into the AccessGate
+    // builder (`Self::build_gate`). The duplicate `resolve_asg`
+    // method that the deleted `*_ctx` overrides used is now gone.
 }
 
 // ── EpicsValue → PvField (NTScalar / NTScalarArray) ─────────────────────
@@ -342,11 +418,20 @@ async fn snapshot_for(db: &PvDatabase, name: &str) -> Option<Snapshot> {
 }
 
 impl ChannelSource for PvDatabaseSource {
+    fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
+        &self.gate
+    }
+
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
         let db = self.db.clone();
         async move {
             let mut names = db.all_record_names().await;
             names.extend(db.all_simple_pv_names().await);
+            // Aliases are independently addressable channel names —
+            // a PVA client doing channelList must see them so it can
+            // connect by alias. has_name and find_entry already
+            // resolve aliases on the server side (round 7).
+            names.extend(db.all_alias_names().await);
             names
         }
     }
@@ -397,6 +482,14 @@ impl ChannelSource for PvDatabaseSource {
             db.put_pv(&name, epics).await.map_err(|e| e.to_string())
         }
     }
+
+    // Round 43: the legacy `get_value_ctx` / `subscribe_ctx` /
+    // `put_value_ctx` overrides were deleted. The trait's
+    // `*_checked` defaults already enforce the AccessChecked level
+    // before delegating to the ctx-less variants here, and the
+    // gate (built by `Self::build_gate`) reads the ASG/ASL from
+    // the record itself — so this source no longer carries any
+    // duplicate ACF logic.
 
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
@@ -513,3 +606,446 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
 use crate::error::PvaError;
 #[allow(unused_imports)]
 type _Pvr = PvGetResult;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server_native::ChannelContext;
+    use epics_base_rs::server::access_security::parse_acf;
+
+    fn make_ctx(host: &str, account: &str, method: &str) -> ChannelContext {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        ChannelContext {
+            peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+            account: account.to_string(),
+            method: method.to_string(),
+            host: host.to_string(),
+        }
+    }
+
+    /// Round 43: test-only compat layer that reproduces the
+    /// pre-Round-43 `*_ctx` shape on top of the new gate +
+    /// `*_checked` typed API. Production callers in `tcp.rs` go
+    /// through the gate directly; only these regression tests
+    /// retain the legacy call shape for clarity.
+    trait PvaSourceTestExt {
+        async fn put_value_ctx(
+            &self,
+            pv: &str,
+            value: PvField,
+            ctx: ChannelContext,
+        ) -> Result<(), String>;
+        async fn get_value_ctx(&self, pv: &str, ctx: ChannelContext) -> Option<PvField>;
+        async fn subscribe_ctx(
+            &self,
+            pv: &str,
+            ctx: ChannelContext,
+        ) -> Option<tokio::sync::mpsc::Receiver<PvField>>;
+    }
+
+    impl PvaSourceTestExt for PvDatabaseSource {
+        async fn put_value_ctx(
+            &self,
+            pv: &str,
+            value: PvField,
+            ctx: ChannelContext,
+        ) -> Result<(), String> {
+            let checked = self
+                .access()
+                .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            self.put_value_checked(checked, value, ctx).await
+        }
+        async fn get_value_ctx(&self, pv: &str, ctx: ChannelContext) -> Option<PvField> {
+            let checked = self
+                .access()
+                .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            self.get_value_checked(checked, ctx).await
+        }
+        async fn subscribe_ctx(
+            &self,
+            pv: &str,
+            ctx: ChannelContext,
+        ) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+            let checked = self
+                .access()
+                .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            self.subscribe_checked(checked, ctx).await
+        }
+    }
+
+    fn pv_double(v: f64) -> PvField {
+        // Top-level scalar PvField — put_value / put_value_ctx accept
+        // both NTScalar and bare scalar.
+        PvField::Scalar(ScalarValue::Double(v))
+    }
+
+    /// Round-17 regression: PVA PUT must be gated through ACF when
+    /// the source was built with ACF enforcement. Pre-fix the PVA
+    /// server stored ACF only as `#[allow(dead_code)]` and never
+    /// called `check_access*` — every client could PUT regardless
+    /// of UAG/HAG/RULE configuration.
+    #[tokio::test]
+    async fn put_value_ctx_denies_when_acf_writeable_rule_unmet() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // ACF: only `admin` user on `host:lab` may WRITE.
+        let acf_text = r#"
+UAG(admins) { admin }
+HAG(lab) { lab-pc1 }
+ASG(SECURE) {
+    RULE(1, READ)
+    RULE(1, WRITE) { UAG(admins) HAG(lab) }
+}
+"#;
+        let acf = parse_acf(acf_text).unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:SECURE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // Mark the record as belonging to the SECURE ASG.
+        let rec = db.get_record("AI:SECURE").await.unwrap();
+        rec.write().await.common.asg = "SECURE".to_string();
+
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
+
+        // Allowed: admin from lab-pc1 — must succeed.
+        source
+            .put_value_ctx(
+                "AI:SECURE",
+                pv_double(1.0),
+                make_ctx("lab-pc1", "admin", "anonymous"),
+            )
+            .await
+            .expect("admin/lab-pc1 must be allowed to PUT");
+
+        // Denied: regular user from a non-lab host — must fail with
+        // a recognisable error.
+        let err = source
+            .put_value_ctx(
+                "AI:SECURE",
+                pv_double(2.0),
+                make_ctx("intruder-pc", "guest", "anonymous"),
+            )
+            .await
+            .expect_err("non-admin must be denied");
+        assert!(
+            err.contains("denied by access security"),
+            "denial reason must be visible: {err:?}",
+        );
+    }
+
+    /// Round-18 regression: ACF must also gate READ. A peer with
+    /// NoAccess on the record's ASG must observe the same shape as
+    /// "PV not found" (None) — the wire layer surfaces this as
+    /// ECA_NORDACCESS-equivalent.
+    #[tokio::test]
+    async fn get_value_ctx_denies_when_acf_no_access() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // ACF: only members of `ops` UAG may READ, denying everyone
+        // else (no fall-through RULE).
+        let acf_text = r#"
+UAG(ops) { alice }
+ASG(LOCKED) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#;
+        let acf = parse_acf(acf_text).unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:LOCKED").await.unwrap();
+        rec.write().await.common.asg = "LOCKED".to_string();
+
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
+
+        // alice gets a value back.
+        let v = source
+            .get_value_ctx("AI:LOCKED", make_ctx("h", "alice", "anonymous"))
+            .await;
+        assert!(v.is_some(), "alice must be allowed to read");
+
+        // intruder gets None — same shape as unknown PV, surfaced as
+        // an access-denied at the wire layer.
+        let v = source
+            .get_value_ctx("AI:LOCKED", make_ctx("h", "intruder", "anonymous"))
+            .await;
+        assert!(v.is_none(), "intruder must be denied at READ time");
+    }
+
+    /// Round-18: subscribe_ctx must also deny when peer has
+    /// NoAccess.
+    #[tokio::test]
+    async fn subscribe_ctx_denies_when_acf_no_access() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let acf_text = r#"
+UAG(ops) { alice }
+ASG(LOCKED) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#;
+        let acf = parse_acf(acf_text).unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:MON", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:MON").await.unwrap();
+        rec.write().await.common.asg = "LOCKED".to_string();
+
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
+
+        let rx = source
+            .subscribe_ctx("AI:MON", make_ctx("h", "alice", "anonymous"))
+            .await;
+        assert!(rx.is_some(), "alice MONITOR must be allowed");
+
+        let rx = source
+            .subscribe_ctx("AI:MON", make_ctx("h", "intruder", "anonymous"))
+            .await;
+        assert!(rx.is_none(), "intruder MONITOR must be denied");
+    }
+
+    /// Round-28 regression: AcfCell swap takes effect on the next
+    /// ACF check. A subsequent PUT after the swap must use the new
+    /// policy. Proves the RwLock-backed reload path actually
+    /// influences the source's behaviour (round-28 plumbed
+    /// `PvaServer::reload_acf_from` to write into this cell).
+    #[tokio::test]
+    async fn acf_swap_takes_effect_on_next_put() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // Initial: deny everyone.
+        let lockdown = parse_acf(
+            r#"
+ASG(SECURE) {
+    RULE(1, READ)
+}
+"#,
+        )
+        .unwrap();
+        let cell: AcfCell = Arc::new(RwLock::new(Some(lockdown)));
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:LIVE").await.unwrap();
+        rec.write().await.common.asg = "SECURE".to_string();
+
+        let source = PvDatabaseSource::new_with_acf(db.clone(), cell.clone());
+
+        // First put: denied (READ-only ASG).
+        assert!(
+            source
+                .put_value_ctx(
+                    "AI:LIVE",
+                    pv_double(1.0),
+                    make_ctx("h", "anyone", "anonymous"),
+                )
+                .await
+                .is_err(),
+            "initial policy must deny PUT"
+        );
+
+        // Hot-swap: open up WRITE for everyone.
+        let permissive = parse_acf(
+            r#"
+ASG(SECURE) {
+    RULE(1, READ)
+    RULE(1, WRITE)
+}
+"#,
+        )
+        .unwrap();
+        *cell.write().await = Some(permissive);
+
+        // Second put: succeeds under the new policy.
+        source
+            .put_value_ctx(
+                "AI:LIVE",
+                pv_double(2.0),
+                make_ctx("h", "anyone", "anonymous"),
+            )
+            .await
+            .expect("post-swap policy must allow PUT");
+    }
+
+    /// Round-17: when the source is built without ACF, behaviour
+    /// matches the old `put_value` path — every PUT succeeds.
+    #[tokio::test]
+    async fn put_value_ctx_allows_when_no_acf() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+
+        let source = PvDatabaseSource::new(db.clone());
+        source
+            .put_value_ctx(
+                "AI:OPEN",
+                pv_double(7.0),
+                make_ctx("anywhere", "anyone", "anonymous"),
+            )
+            .await
+            .expect("PUT must succeed when no ACF is attached");
+    }
+
+    /// Round-41: type-state-gated GET. The wire-layer flow mints an
+    /// [`AccessChecked`] via `source.access().check(...)`; the source
+    /// then sees `NoAccess` in the token level and returns `None`.
+    /// Pre-Round-40 every GET handler had to *remember* to call the
+    /// ACF check by hand — now the trait method signature forces it.
+    #[tokio::test]
+    async fn get_value_checked_denies_when_no_access() {
+        use crate::server_native::source::ChannelSource;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let acf = parse_acf(
+            r#"
+UAG(ops) { alice }
+ASG(LOCKED) {
+    RULE(0, READ) { UAG(ops) }
+}
+"#,
+        )
+        .unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5)))
+            .await
+            .unwrap();
+        db.get_record("AI:LOCKED")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .common
+            .asg = "LOCKED".into();
+
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
+
+        // Allowed peer: gate mints a ReadWrite/Read token → source
+        // returns the value.
+        let checked_ok = source
+            .access()
+            .check("AI:LOCKED", "anyhost", "alice", "anonymous", "")
+            .await;
+        let val = source
+            .get_value_checked(checked_ok, make_ctx("anyhost", "alice", "anonymous"))
+            .await;
+        assert!(val.is_some(), "alice must see the value");
+
+        // Denied peer: gate mints a NoAccess token → source returns
+        // None even though the underlying PV exists.
+        let checked_deny = source
+            .access()
+            .check("AI:LOCKED", "anyhost", "intruder", "anonymous", "")
+            .await;
+        let val = source
+            .get_value_checked(checked_deny, make_ctx("anyhost", "intruder", "anonymous"))
+            .await;
+        assert!(val.is_none(), "intruder must be denied via type-state gate");
+    }
+
+    /// Round-33A (R33-G4): the per-record ASL must gate `RULE(N, …)`
+    /// rules. With `RULE(0, READ) RULE(1, WRITE)`, an ASL=0 record
+    /// must be read-only (the WRITE rule does NOT apply when
+    /// `record_asl < 1`), and an ASL=1 record must be writable.
+    /// Pre-fix every record was treated as ASL=0 by the PVA path,
+    /// so even an ASL=1 record fell under WRITE… but more subtly,
+    /// an ASL=0 record ALSO got WRITE because `record_asl=0 ≤
+    /// rule.level=1`. The fix doesn't change the equality bound;
+    /// it threads the real ASL so `RULE(N, …)` with `record_asl > N`
+    /// now skips the rule.
+    #[tokio::test]
+    async fn asl_gate_skips_rules_above_record_asl() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // RULE(2, WRITE) — only applies when record_asl ≤ 2.
+        // RULE(0, READ) — always applies.
+        let acf = parse_acf(
+            r#"
+ASG(DEFAULT) {
+    RULE(0, READ)
+    RULE(2, WRITE)
+}
+"#,
+        )
+        .unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        // High-ASL record: should be locked out of WRITE because
+        // record_asl(3) > rule.level(2). Pre-fix the call site
+        // always passed 0 and the rule was always applicable.
+        db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // ASL is a u8; the parser clamps to 0/1 via put_common_field,
+        // but the underlying field accepts any u8 — set it directly
+        // for the test to exercise the gate above C's 0/1 range.
+        db.get_record("AI:LOCKED")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .common
+            .asl = 3;
+
+        db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // OPEN keeps the default ASL=0; the WRITE rule applies.
+
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+        );
+
+        // Locked: WRITE rule skipped (record_asl 3 > rule.level 2),
+        // so only READ applies — PUT must be denied.
+        assert!(
+            source
+                .put_value_ctx(
+                    "AI:LOCKED",
+                    pv_double(1.0),
+                    make_ctx("h", "anyone", "anonymous")
+                )
+                .await
+                .is_err(),
+            "ASL=3 record must NOT match RULE(2, WRITE)",
+        );
+
+        // Open: WRITE rule applies (record_asl 0 ≤ rule.level 2),
+        // so PUT succeeds.
+        source
+            .put_value_ctx(
+                "AI:OPEN",
+                pv_double(2.0),
+                make_ctx("h", "anyone", "anonymous"),
+            )
+            .await
+            .expect("ASL=0 record must match RULE(2, WRITE)");
+    }
+}

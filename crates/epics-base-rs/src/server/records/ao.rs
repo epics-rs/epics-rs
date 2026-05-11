@@ -307,6 +307,12 @@ impl Record for AoRecord {
         "ao"
     }
 
+    // C recAo.c IVOA=set_to_IVOV: oval = ivov; val = oval; writeValue.
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        self.put_field("OVAL", ivov.clone())?;
+        self.put_field("VAL", ivov)
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             // Legacy compatibility: if eslo==1.0 && eoff==0.0, set eoff from egul

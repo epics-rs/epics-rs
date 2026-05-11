@@ -550,4 +550,46 @@ mod tests {
             panic!("expected Int32");
         }
     }
+
+    /// Reproducer for asyn upstream issue #170: parallel callback
+    /// processing overflows a fixed callback queue, dropping events.
+    ///
+    /// Our mailbox subscription model never drops: a burst of N events
+    /// with a slow consumer collapses to a single observable value
+    /// (the latest), and `coalesce_count` reflects the overwrites.
+    /// This pins that contract — a regression toward bounded mpsc
+    /// without coalesce slot would lose events under burst.
+    #[tokio::test]
+    async fn mailbox_burst_coalesces_no_drop() {
+        let im = InterruptManager::new(16);
+        let (_sub, mut rx) = im.register_interrupt_user(InterruptFilter::default());
+
+        let n: usize = 1000;
+        for i in 0..n {
+            im.notify(InterruptValue {
+                reason: 0,
+                addr: 0,
+                value: ParamValue::Int32(i as i32),
+                timestamp: SystemTime::now(),
+                uint32_changed_mask: 0,
+            });
+        }
+
+        // The first (and only observable) recv must yield the LAST
+        // event in the burst. All intermediates were coalesced.
+        let v = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("recv must complete within 100ms")
+            .expect("active subscription must yield a value");
+        match v.value {
+            ParamValue::Int32(x) => {
+                assert_eq!(x, (n - 1) as i32, "must coalesce to the latest event")
+            }
+            other => panic!("expected Int32, got {other:?}"),
+        }
+
+        assert_eq!(im.notify_count(), n as u64);
+        // n-1 overwrites of the slot before the consumer drained it.
+        assert_eq!(im.coalesce_count(), (n - 1) as u64);
+    }
 }

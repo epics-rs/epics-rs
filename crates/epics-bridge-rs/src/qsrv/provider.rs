@@ -43,6 +43,91 @@ pub trait AccessControl: Send + Sync {
 pub struct AllowAllAccess;
 impl AccessControl for AllowAllAccess {}
 
+/// AccessControl backed by an epics-base [`AccessSecurityConfig`].
+///
+/// Bridges qsrv's per-channel access checks to epics-base ACF
+/// (UAG/HAG/RULE/METHOD/AUTHORITY) so a `BridgeProvider` configured
+/// from an `.acf` file enforces the same policy as the CA / PVA
+/// servers. Looks up each record's `ASG` field via the database;
+/// simple PVs (no record-level ASG) and unknown names fall back to
+/// the `DEFAULT` ASG, matching the CA server's behaviour
+/// (tcp.rs:300).
+pub struct AcfAccessControl {
+    db: Arc<epics_base_rs::server::database::PvDatabase>,
+    cfg: Arc<epics_base_rs::server::access_security::AccessSecurityConfig>,
+}
+
+impl AcfAccessControl {
+    pub fn new(
+        db: Arc<epics_base_rs::server::database::PvDatabase>,
+        cfg: epics_base_rs::server::access_security::AccessSecurityConfig,
+    ) -> Self {
+        Self {
+            db,
+            cfg: Arc::new(cfg),
+        }
+    }
+
+    fn level_for(&self, channel: &str, user: &str, host: &str) -> AccessLevelLite {
+        // qsrv's AccessControl is sync; resolve the record's ASG via
+        // the runtime's current handle. We're on a tokio worker (the
+        // PVA server task pool) so block_in_place + block_on is
+        // safe; for callers outside a runtime, fall back to DEFAULT.
+        let asg = self.resolve_asg_blocking(channel);
+        let level = self
+            .cfg
+            .check_access_method(&asg, host, user, 0, "anonymous", "");
+        match level {
+            epics_base_rs::server::access_security::AccessLevel::ReadWrite => {
+                AccessLevelLite::ReadWrite
+            }
+            epics_base_rs::server::access_security::AccessLevel::Read => AccessLevelLite::Read,
+            _ => AccessLevelLite::None,
+        }
+    }
+
+    fn resolve_asg_blocking(&self, channel: &str) -> String {
+        let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(channel);
+        let db = self.db.clone();
+        let name = record_name.to_string();
+        let lookup = async move {
+            if let Some(rec) = db.get_record(&name).await {
+                let inst = rec.read().await;
+                if !inst.common.asg.is_empty() {
+                    return inst.common.asg.clone();
+                }
+            }
+            "DEFAULT".to_string()
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(lookup))
+                }
+                _ => "DEFAULT".to_string(),
+            },
+            Err(_) => "DEFAULT".to_string(),
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum AccessLevelLite {
+    None,
+    Read,
+    ReadWrite,
+}
+
+impl AccessControl for AcfAccessControl {
+    fn can_read(&self, channel: &str, user: &str, host: &str) -> bool {
+        self.level_for(channel, user, host) != AccessLevelLite::None
+    }
+
+    fn can_write(&self, channel: &str, user: &str, host: &str) -> bool {
+        self.level_for(channel, user, host) == AccessLevelLite::ReadWrite
+    }
+}
+
 /// Per-channel client identity used for access enforcement.
 ///
 /// Carries the access control policy plus the user/host of whichever
@@ -567,6 +652,11 @@ impl ChannelProvider for BridgeProvider {
 
     async fn channel_list(&self) -> Vec<String> {
         let mut names = self.db.all_record_names().await;
+        // PR #336 aliases are independently addressable channel
+        // names — a PVA client running channelList expects them so
+        // it can connect by alias. `channel_find` / `create_channel`
+        // already resolve aliases via has_name/get_record (round 7).
+        names.extend(self.db.all_alias_names().await);
         names.extend(self.groups.read().keys().cloned());
         names.sort();
         names
@@ -661,6 +751,46 @@ mod tests {
         fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
             channel != self.0
         }
+    }
+
+    /// Round-19 regression: AcfAccessControl bridges qsrv's
+    /// `AccessControl` trait to epics-base ACF so a BridgeProvider
+    /// configured from a parsed `.acf` file enforces the same
+    /// policy as the CA / PVA servers. Pre-fix, qsrv's AccessControl
+    /// was independent of ACF: a site that loaded an .acf file at
+    /// CA-server level still had to write a custom AccessControl
+    /// impl for qsrv channels, otherwise PVA-side QSRV was
+    /// effectively allow-all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acf_access_control_gates_qsrv_channels() {
+        use epics_base_rs::server::access_security::parse_acf;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // Only `admin` may WRITE; everyone may READ.
+        let acf_text = r#"
+UAG(admins) { admin }
+ASG(SECURE) {
+    RULE(1, READ)
+    RULE(1, WRITE) { UAG(admins) }
+}
+"#;
+        let cfg = parse_acf(acf_text).unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:SEC", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:SEC").await.unwrap();
+        rec.write().await.common.asg = "SECURE".to_string();
+
+        let acl = AcfAccessControl::new(db.clone(), cfg);
+        // Anyone can read.
+        assert!(acl.can_read("AI:SEC", "guest", "anywhere"));
+        assert!(acl.can_read("AI:SEC", "admin", "anywhere"));
+        // Only admin can write.
+        assert!(acl.can_write("AI:SEC", "admin", "anywhere"));
+        assert!(!acl.can_write("AI:SEC", "guest", "anywhere"));
     }
 
     #[test]

@@ -323,7 +323,7 @@ impl<'a> Tokenizer<'a> {
         if rem.len() >= 2 {
             let first = rem[0];
             let second = rem[1];
-            if first == second && first >= b'A' && first <= b'L' {
+            if first == second && first >= b'A' && first <= b'U' {
                 // Make sure it's not a longer keyword
                 let is_keyword = keywords.iter().any(|(kw, _)| {
                     kw.len() > 2 && rem.len() >= kw.len() && rem[..kw.len()] == **kw
@@ -349,8 +349,8 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
-        // Single-letter variables (A..P)
-        if rem[0] >= b'A' && rem[0] <= b'P' {
+        // Single-letter variables (A..U)
+        if rem[0] >= b'A' && rem[0] <= b'U' {
             self.pos += 1;
             return Some(Token::Var((rem[0] - b'A') as u8));
         }

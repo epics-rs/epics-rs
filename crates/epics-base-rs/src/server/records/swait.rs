@@ -59,10 +59,7 @@ impl SwaitRecord {
     }
 
     fn build_inputs(&self) -> StringInputs {
-        let mut inputs = StringInputs {
-            num_vars: [0.0; 16],
-            str_vars: Default::default(),
-        };
+        let mut inputs = StringInputs::new();
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
         }

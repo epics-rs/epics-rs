@@ -11,10 +11,11 @@
 //! [`SharedSource`] (collection mapping name → SharedPV).
 //!
 //! Flow control: the per-monitor `mpsc::Sender` is bounded; `try_post`
-//! never blocks but may drop updates when the consumer is slow. The
-//! mailbox semantics — squash to last value — are achieved by always
-//! sending the freshest value; if the channel is full, callers can use
-//! `force_post` which drains then re-sends.
+//! never blocks but may drop updates when the consumer is slow.
+//! Tokio `mpsc` exposes no "drop oldest" primitive, so an over-budget
+//! subscriber sees its event lost — the next `try_post` will deliver
+//! the freshest value, which is the standard mailbox-on-channel
+//! degradation when the consumer cannot keep up.
 //!
 //! Watermarks (low/high) are advisory hints stored on the SharedPV and
 //! consulted by op_monitor when it decides whether to acknowledge a
@@ -212,34 +213,6 @@ impl SharedPV {
             }
             Err(mpsc::error::TrySendError::Full(_)) => true, // keep, drop update
             Err(mpsc::error::TrySendError::Closed(_)) => false,
-        });
-        delivered
-    }
-
-    /// Push a new value to all subscribers; if an outbox is full,
-    /// drop the oldest queued update and try again. Mailbox semantics
-    /// (squash to latest). Always delivers to live subscribers.
-    pub fn force_post(&self, value: PvField) -> usize {
-        let mut g = self.inner.lock();
-        if !g.is_open {
-            return 0;
-        }
-        g.value = Some(value.clone());
-        let mut delivered = 0;
-        g.subscribers.retain(|tx| {
-            // Best-effort: try once; if full, the slow consumer is
-            // expected to fall behind — we don't have a way to evict
-            // from inside an mpsc, so we just retain. The "force"
-            // semantics rely on the consumer being able to keep up
-            // most of the time.
-            match tx.try_send(value.clone()) {
-                Ok(()) => {
-                    delivered += 1;
-                    true
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => true,
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-            }
         });
         delivered
     }

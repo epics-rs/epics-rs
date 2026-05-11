@@ -38,10 +38,10 @@ impl CalcExpression {
         calc::eval(&self.compiled, &mut inputs).unwrap_or(0.0)
     }
 
-    /// Evaluate with the full variable set (A through L and beyond).
+    /// Evaluate with the full variable set (A through U).
     ///
-    /// `vars` is indexed 0=A, 1=B, 2=C, ... 11=L, up to 15=P.
-    pub fn evaluate_vars(&self, vars: &[f64; 16]) -> f64 {
+    /// `vars` is indexed 0=A, 1=B, 2=C, ... up to `CALC_NARGS - 1` = U.
+    pub fn evaluate_vars(&self, vars: &[f64; calc::CALC_NARGS]) -> f64 {
         let mut inputs = calc::NumericInputs::with_vars(*vars);
         calc::eval(&self.compiled, &mut inputs).unwrap_or(0.0)
     }
@@ -188,7 +188,7 @@ impl CircularBuffer {
                     .unwrap_or(f64::NAN);
                 // C++ passes: A=attrValueA, B=attrValueB, C=preTrigger,
                 // D=postTrigger, E=currentImage, F=triggered
-                let mut vars = [0.0f64; 16];
+                let mut vars = [0.0f64; calc::CALC_NARGS];
                 vars[0] = a; // A
                 vars[1] = b; // B
                 vars[2] = self.pre_count as f64; // C
@@ -692,7 +692,7 @@ mod tests {
 
         // Test variables C through F using evaluate_vars
         let expr = CalcExpression::parse("A>5&&C>0").unwrap();
-        let mut vars = [0.0f64; 16];
+        let mut vars = [0.0f64; calc::CALC_NARGS];
         vars[0] = 6.0; // A
         vars[2] = 1.0; // C
         assert_eq!(expr.evaluate_vars(&vars), 1.0);

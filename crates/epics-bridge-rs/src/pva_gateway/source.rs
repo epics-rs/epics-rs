@@ -14,11 +14,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
+use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
-use epics_pva_rs::server_native::source::{ChannelContext, ChannelSource};
+use epics_pva_rs::server::native_source::AcfCell;
+use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource};
 
 use super::channel_cache::ChannelCache;
 
@@ -29,6 +32,23 @@ use super::channel_cache::ChannelCache;
 pub struct RawEvent {
     pub body: bytes::Bytes,
     pub byte_order: epics_pva_rs::proto::ByteOrder,
+}
+
+/// PV-name → ASG-name resolver. Returns the ASG that the gateway
+/// should consult for the given downstream channel. Default impl
+/// (see `default_asg_resolver`) returns `"DEFAULT"` for every name —
+/// matching the legacy pre-Round-30D behaviour. Sites that want
+/// per-PV granularity (e.g. `set:.*` → `OPERATOR`, `dev:.*` → `DEV`)
+/// install a custom resolver via [`GatewayChannelSource::set_asg_resolver`].
+///
+/// MUST be cheap: this is called on every ACL check, which is on the
+/// hot path of every GET / PUT / MONITOR. Avoid regex recompilation
+/// or hashmap allocation per call — capture pre-built tables in the
+/// closure.
+pub type AsgResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+fn default_asg_resolver() -> AsgResolver {
+    Arc::new(|_pv| "DEFAULT".to_string())
 }
 
 /// `ChannelSource` impl handed to the downstream `PvaServer`. Cheap
@@ -68,10 +88,41 @@ pub struct GatewayChannelSource {
     /// the gateway. Empty string keys (`("", "anonymous")`) reuse
     /// the cache's shared client.
     upstream_pool: Arc<Mutex<HashMap<(String, String), Arc<PvaClient>>>>,
+    /// Optional gateway-side ACF policy (round 29). When set, every
+    /// downstream GET / PUT / MONITOR is gated through
+    /// `check_access_method` BEFORE the upstream forward, so the
+    /// gateway can deny clients that the upstream IOC would also
+    /// deny (or apply site-local policy on top of the upstream
+    /// rules). Wrapped in an AcfCell so policy may be hot-swapped
+    /// at runtime via `set_acf`. None means pass-through (legacy
+    /// pre-round-29 behaviour) — pvxs `pva2pva` parity for sites
+    /// that delegate all ACL to upstream.
+    acf: AcfCell,
+    /// PV→ASG resolver. Defaults to `DEFAULT` for every name; sites
+    /// that want per-PV ASG granularity replace this via
+    /// [`set_asg_resolver`].
+    ///
+    /// Round-32D (R31-G8): wrapped in `RwLock` so the resolver can
+    /// be hot-swapped at runtime — the gateway is typically handed
+    /// off to `PvaServer` behind an `Arc` (or its trait-object
+    /// equivalent), so a `&mut self` setter is unreachable after
+    /// installation. Mirrors the `acf` cell's hot-swap pattern.
+    asg_resolver: Arc<RwLock<AsgResolver>>,
+    /// Round 41: type-state-enforced access gate. The closure
+    /// captures the `asg_resolver` cell so a hot-swap of the
+    /// resolver via [`set_asg_resolver`] is visible on the next
+    /// `check`. ASL is fixed at 0 for gateway-side checks — the
+    /// upstream record's ASL is not visible to the gateway and the
+    /// site policy on the gateway is expected to use UAG/HAG
+    /// gating rather than per-record ASL.
+    gate: epics_base_rs::server::access_security::AccessGate,
 }
 
 impl GatewayChannelSource {
     pub fn new(cache: Arc<ChannelCache>) -> Self {
+        let acf: AcfCell = Arc::new(RwLock::new(None));
+        let asg_resolver = Arc::new(RwLock::new(default_asg_resolver()));
+        let gate = Self::build_gate(acf.clone(), asg_resolver.clone());
         Self {
             cache,
             connect_timeout: Duration::from_secs(5),
@@ -80,6 +131,99 @@ impl GatewayChannelSource {
             max_subscribers: 100_000,
             subscriber_count: Arc::new(AtomicUsize::new(0)),
             upstream_pool: Arc::new(Mutex::new(HashMap::new())),
+            acf,
+            asg_resolver,
+            gate,
+        }
+    }
+
+    fn build_gate(
+        acf: AcfCell,
+        asg_resolver: Arc<RwLock<AsgResolver>>,
+    ) -> epics_base_rs::server::access_security::AccessGate {
+        use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver};
+        let resolver: AsgAslResolver = Arc::new(move |pv_name| {
+            let asg_resolver = asg_resolver.clone();
+            Box::pin(async move {
+                let g = asg_resolver.read().await;
+                let asg = (g)(&pv_name);
+                (asg, 0u8)
+            })
+        });
+        AccessGate::required(acf, resolver)
+    }
+
+    /// Install (or hot-swap) the PV→ASG resolver. Mirrors the C IOC's
+    /// per-record `ASG` field: each downstream channel name maps to
+    /// the ASG that gates GET / PUT / MONITOR for that PV. The
+    /// resolver is called on every op so should be O(1) on average
+    /// — typically a pre-built `HashMap` or compiled-regex table.
+    /// Pass `None` to reset to the `DEFAULT`-everywhere default.
+    ///
+    /// Round-32D: takes `&self` and writes through `RwLock`, so the
+    /// resolver may be replaced after the source has been handed to
+    /// `PvaServer` behind an `Arc`.
+    pub async fn set_asg_resolver(&self, resolver: Option<AsgResolver>) {
+        *self.asg_resolver.write().await = resolver.unwrap_or_else(default_asg_resolver);
+        // R49-G2: bump the gate's ACL generation so monitor tasks
+        // observing this gate detect the policy swap on their next
+        // event and re-check. Without this, gateway monitors after
+        // a resolver hot-swap kept running under the prior ASG
+        // mapping forever (the version compared the same value at
+        // every event because the private counter on
+        // `AccessGate::required()` never moved).
+        self.gate.bump_acl_version();
+    }
+
+    /// Install (or hot-swap) the gateway-side ACF policy. None
+    /// disables gateway-level enforcement and falls back to
+    /// pass-through (upstream IOC remains the sole authority).
+    pub async fn set_acf(&self, cfg: Option<AccessSecurityConfig>) {
+        *self.acf.write().await = cfg;
+        // R49-G2: bump the gate's ACL generation — see comment on
+        // `set_asg_resolver`.
+        self.gate.bump_acl_version();
+    }
+
+    // Round 49 follow-up: the `acf_cell()` accessor was removed. It
+    // returned a clone of the inner `Arc<RwLock<Option<...>>>` so an
+    // external coordinator (e.g. a multi-source PvaServer) could
+    // hot-swap the policy by writing the cell directly — but that
+    // path bypassed `gate.bump_acl_version()`, leaving monitor
+    // tasks observing this gate at the pre-swap version forever.
+    // Single-owner closure on the ACL-change transition: every
+    // policy mutation MUST flow through `set_acf` or
+    // `set_asg_resolver`, both of which bump the gate's version.
+    // If a future requirement needs shared-AcfCell semantics across
+    // multiple sources, the API will return a wrapper that wires
+    // the version-bump into the write path.
+
+    /// Test-only ACL introspection: evaluate the gateway-side ACL
+    /// for `(pv, ctx)` and return the resolved [`AccessLevel`].
+    /// Mirrors what the production `AccessGate::check` path would
+    /// produce, but returns the bare level instead of an
+    /// `AccessChecked` token so tests can inspect ACF behaviour
+    /// without committing to a typed call.
+    ///
+    /// Round 49 follow-up: gated on `#[cfg(test)]` so production
+    /// code physically cannot bypass the gate by calling this
+    /// alternate ACL path — the single owner of an ACL evaluation
+    /// in a non-test build is `self.gate`.
+    #[cfg(test)]
+    async fn acl_level(&self, pv: &str, ctx: &ChannelContext) -> AccessLevel {
+        let guard = self.acf.read().await;
+        match *guard {
+            None => AccessLevel::ReadWrite,
+            Some(ref cfg) => {
+                // Round-32D: read-lock the resolver cell; the closure
+                // runs while the read lock is held so the swap is
+                // serialized vs. in-flight evaluations. The closure
+                // itself should be O(1) — comment on `AsgResolver`
+                // documents this.
+                let resolver = self.asg_resolver.read().await;
+                let asg = (resolver)(pv);
+                cfg.check_access_method(&asg, &ctx.host, &ctx.account, 0, &ctx.method, "")
+            }
         }
     }
 
@@ -124,6 +268,10 @@ impl GatewayChannelSource {
 }
 
 impl ChannelSource for GatewayChannelSource {
+    fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
+        &self.gate
+    }
+
     async fn list_pvs(&self) -> Vec<String> {
         self.cache.names().await
     }
@@ -147,6 +295,11 @@ impl ChannelSource for GatewayChannelSource {
         entry.snapshot()
     }
 
+    /// Round-29: gateway-side ACF gate for GET. Denies with `None`
+    /// (wire layer surfaces ECA_NORDACCESS-equivalent) before the
+    /// upstream lookup, so a denied client never opens an upstream
+    /// channel and never appears in upstream audit logs as the
+    /// gateway.
     async fn put_value(&self, name: &str, value: PvField) -> Result<(), String> {
         // Look up the entry to keep the upstream channel alive (and
         // confirm the PV exists) before issuing the PUT through the
@@ -166,17 +319,38 @@ impl ChannelSource for GatewayChannelSource {
             .map_err(|e| e.to_string())
     }
 
-    /// Credential-aware PUT (PG-G10). Routes the put through a
-    /// per-(account, method) upstream PvaClient so the upstream IOC's
-    /// ASG rules see the *real* downstream identity instead of the
-    /// gateway's. Anonymous / empty-account peers fall back to the
-    /// shared client.
-    async fn put_value_ctx(
+    /// Credential-aware PUT (PG-G10) — Round 43 migration to the
+    /// type-state API. Routes the put through a per-(account,
+    /// method) upstream PvaClient so the upstream IOC's ASG rules
+    /// see the real downstream identity instead of the gateway's.
+    /// Anonymous / empty-account peers fall back to the shared
+    /// client. The AccessChecked token gates entry — `NoAccess` or
+    /// `Read`-only peers receive the same gateway-identifying error
+    /// the default put_value_checked would produce.
+    async fn put_value_checked(
         &self,
-        name: &str,
+        checked: AccessChecked,
         value: PvField,
         ctx: ChannelContext,
     ) -> Result<(), String> {
+        if !checked.allows_write() {
+            tracing::debug!(
+                pv = %checked.pv_name(),
+                account = %ctx.account,
+                method = %ctx.method,
+                "pva-gateway: PUT denied by gateway ACF"
+            );
+            return Err(format!(
+                "PUT denied by gateway access security: \
+                 PV '{pv}' from {host}/{account}/{method}",
+                pv = checked.pv_name(),
+                host = ctx.host,
+                account = ctx.account,
+                method = ctx.method,
+            ));
+        }
+
+        let name = checked.pv_name();
         let _entry = self
             .cache
             .lookup(name, self.connect_timeout)
@@ -261,7 +435,34 @@ impl ChannelSource for GatewayChannelSource {
                 return None;
             }
         }
-        let entry = self.cache.lookup(name, self.connect_timeout).await.ok()?;
+        // R49-G4: bump the gateway-wide subscriber count BEFORE
+        // spawning the forwarder. Pre-fix the raw path skipped the
+        // increment but the spawned CounterGuard's Drop still
+        // performed the decrement, underflowing the counter on
+        // every raw subscription teardown; subsequent decoded
+        // subscribes would then read the wrapped-around `usize` and
+        // refuse new subscribers under a false "cap reached"
+        // warning. Mirror the decoded subscribe's cap check + RAII
+        // decrement here too so raw subscriptions count against
+        // the same ceiling.
+        let prev = self.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        if prev >= self.max_subscribers {
+            self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+            tracing::warn!(
+                pv = %name,
+                live = prev,
+                cap = self.max_subscribers,
+                "pva-gateway: raw subscriber cap reached, refusing"
+            );
+            return None;
+        }
+        let entry = match self.cache.lookup(name, self.connect_timeout).await {
+            Ok(e) => e,
+            Err(_) => {
+                self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+                return None;
+            }
+        };
         let mut bcast = entry.subscribe_raw();
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
@@ -475,5 +676,301 @@ fn scalar_to_string(sv: &epics_pva_rs::pvdata::ScalarValue) -> String {
         Float(x) => x.to_string(),
         Double(x) => x.to_string(),
         String(s) => s.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_base_rs::server::access_security::parse_acf;
+
+    fn make_ctx(host: &str, account: &str, method: &str) -> ChannelContext {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        ChannelContext {
+            peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+            account: account.to_string(),
+            method: method.to_string(),
+            host: host.to_string(),
+        }
+    }
+
+    fn make_source() -> GatewayChannelSource {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        GatewayChannelSource::new(cache)
+    }
+
+    /// Round-29 baseline: with no ACF attached, `acl_level` reports
+    /// `ReadWrite` so the gateway's pre-existing pass-through fast
+    /// path stays hot. Pre-round-29 was the only behaviour.
+    #[tokio::test]
+    async fn acl_level_no_acf_is_readwrite() {
+        let src = make_source();
+        let level = src
+            .acl_level("any:pv", &make_ctx("h", "anyone", "anonymous"))
+            .await;
+        assert!(matches!(level, AccessLevel::ReadWrite));
+    }
+
+    /// Round-29: with an ACF attached, downstream peers must match
+    /// the DEFAULT ASG's rules. PUT is denied for callers not in
+    /// the WRITE rule; GET still goes through when READ is granted
+    /// (none of these tests hit `cache.lookup` because the ACL
+    /// check runs first and returns Err/None).
+    #[tokio::test]
+    async fn put_value_ctx_denied_when_acf_no_write() {
+        let src = make_source();
+        let cfg = parse_acf(
+            r#"
+UAG(admins) { admin }
+ASG(DEFAULT) {
+    RULE(1, READ)
+    RULE(1, WRITE) { UAG(admins) }
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        // PUT as non-admin → must be denied at the gateway (no
+        // upstream lookup needed).
+        let dummy_value = PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0));
+        let err = src
+            .put_value_ctx(
+                "any:pv",
+                dummy_value,
+                make_ctx("h", "intruder", "anonymous"),
+            )
+            .await
+            .expect_err("PUT must be denied for non-admin under DEFAULT ASG");
+        assert!(
+            err.contains("denied by gateway access security"),
+            "denial reason must name the gateway as enforcement point: {err:?}",
+        );
+    }
+
+    /// Round-29: a NoAccess rule denies GET and MONITOR (returns
+    /// None — same shape as unknown PV at the wire layer).
+    #[tokio::test]
+    async fn get_and_subscribe_denied_when_acf_no_access() {
+        let src = make_source();
+        let cfg = parse_acf(
+            r#"
+UAG(ops) { alice }
+ASG(DEFAULT) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        let ctx = make_ctx("h", "intruder", "anonymous");
+        assert!(
+            src.get_value_ctx("any:pv", ctx.clone()).await.is_none(),
+            "GET must be denied for non-ops"
+        );
+        assert!(
+            src.subscribe_ctx("any:pv", ctx).await.is_none(),
+            "MONITOR must be denied for non-ops"
+        );
+    }
+
+    /// Round-29: hot-swapping the ACF cell takes effect on the next
+    /// op. Mirrors the round-28 PVA-server-side AcfCell test.
+    #[tokio::test]
+    async fn acf_swap_takes_effect_on_next_op() {
+        let src = make_source();
+        let deny = parse_acf(r#"ASG(DEFAULT) { RULE(1, READ) }"#).unwrap();
+        src.set_acf(Some(deny)).await;
+
+        let dummy_value = PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0));
+        let ctx = make_ctx("h", "anyone", "anonymous");
+        assert!(
+            src.put_value_ctx("any:pv", dummy_value.clone(), ctx.clone())
+                .await
+                .is_err(),
+            "initial deny-WRITE policy must reject PUT"
+        );
+
+        let permissive = parse_acf(r#"ASG(DEFAULT) { RULE(1, READ) RULE(1, WRITE) }"#).unwrap();
+        src.set_acf(Some(permissive)).await;
+
+        // After swap the ACL check passes; the call now reaches the
+        // upstream `cache.lookup` which fails (no upstream IOC in
+        // test), so the error is a lookup/timeout — NOT the gateway
+        // ACL denial. We assert the denial string is gone.
+        let result = src.put_value_ctx("any:pv", dummy_value, ctx).await;
+        if let Err(msg) = result {
+            assert!(
+                !msg.contains("denied by gateway access security"),
+                "post-swap PUT must NOT be ACL-denied: {msg:?}",
+            );
+        }
+    }
+
+    /// Round-30D: the gateway no longer hard-codes the ASG name to
+    /// `DEFAULT`. An installed [`AsgResolver`] routes each channel
+    /// through its own ASG, mirroring the per-record `ASG` field
+    /// behaviour of a C IOC.
+    #[tokio::test]
+    async fn acl_level_uses_per_pv_asg_resolver() {
+        let src = make_source();
+        // Two PV namespaces — `set:*` lives under WRITE-restricted
+        // OPERATOR; `dev:*` lives under READ-only LOCKED. A peer
+        // without WRITE on OPERATOR may still PUT to DEFAULT.
+        let cfg = parse_acf(
+            r#"
+UAG(admins) { admin }
+ASG(DEFAULT) {
+    RULE(1, READ)
+    RULE(1, WRITE)
+}
+ASG(OPERATOR) {
+    RULE(1, READ)
+    RULE(1, WRITE) { UAG(admins) }
+}
+ASG(LOCKED) {
+    RULE(1, READ)
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        src.set_asg_resolver(Some(Arc::new(|pv: &str| {
+            if pv.starts_with("set:") {
+                "OPERATOR".to_string()
+            } else if pv.starts_with("dev:") {
+                "LOCKED".to_string()
+            } else {
+                "DEFAULT".to_string()
+            }
+        })))
+        .await;
+
+        let guest = make_ctx("anyhost", "guest", "anonymous");
+        let admin = make_ctx("anyhost", "admin", "anonymous");
+
+        // DEFAULT-routed PV: open to everyone for RW.
+        assert_eq!(
+            src.acl_level("other:val", &guest).await,
+            AccessLevel::ReadWrite
+        );
+
+        // OPERATOR-routed PV: guest READ-only, admin RW.
+        assert_eq!(
+            src.acl_level("set:current", &guest).await,
+            AccessLevel::Read
+        );
+        assert_eq!(
+            src.acl_level("set:current", &admin).await,
+            AccessLevel::ReadWrite
+        );
+
+        // LOCKED-routed PV: everyone READ-only (no WRITE rule).
+        assert_eq!(src.acl_level("dev:hwid", &admin).await, AccessLevel::Read);
+        assert_eq!(src.acl_level("dev:hwid", &guest).await, AccessLevel::Read);
+    }
+
+    /// Round-32D (R31-G8): the resolver must be hot-swappable after
+    /// the gateway is wrapped behind an Arc / handed to PvaServer.
+    /// Pre-fix `set_asg_resolver(&mut self)` was unreachable in the
+    /// production path; this confirms the `&self` + RwLock swap
+    /// works and the new policy is observed on subsequent ACL checks.
+    #[tokio::test]
+    async fn asg_resolver_swap_takes_effect_on_next_acl_check() {
+        let src = make_source();
+        let cfg = parse_acf(
+            r#"
+ASG(DEFAULT) {
+    RULE(1, READ)
+    RULE(1, WRITE)
+}
+ASG(LOCKED) {
+    RULE(1, READ)
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        // Initial resolver: everything is DEFAULT (RW).
+        let ctx = make_ctx("h", "anyone", "anonymous");
+        assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::ReadWrite);
+
+        // Hot-swap: route everything to LOCKED (read-only).
+        src.set_asg_resolver(Some(Arc::new(|_pv| "LOCKED".to_string())))
+            .await;
+        assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::Read);
+
+        // Swap back to default.
+        src.set_asg_resolver(None).await;
+        assert_eq!(src.acl_level("X", &ctx).await, AccessLevel::ReadWrite);
+    }
+
+    /// Round-37 (R37-G1): RPC must consult the gateway ACF too.
+    /// Pre-fix every PVA RPC reached the upstream IOC carrying the
+    /// gateway's identity; a `NoAccess` peer could trigger
+    /// archiver-control RPCs, custom-record state changes, or any
+    /// upstream action RPC.
+    #[tokio::test]
+    async fn rpc_ctx_denies_when_acf_no_access() {
+        use epics_pva_rs::pvdata::{FieldDesc, PvField};
+        let src = make_source();
+        let cfg = parse_acf(
+            r#"
+UAG(ops) { alice }
+ASG(DEFAULT) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        let result = src
+            .rpc_ctx(
+                "some:rpc",
+                FieldDesc::Variant,
+                PvField::Null,
+                make_ctx("anyhost", "intruder", "anonymous"),
+            )
+            .await;
+        let err = result.expect_err("RPC must be denied for NoAccess peer");
+        assert!(
+            err.contains("denied by gateway access security"),
+            "denial message must name the gateway as enforcer: {err:?}",
+        );
+    }
+
+    /// Round-32A (R31-G6): the F-G12 raw-frame fast path must consult
+    /// the same ACF gate as the decoded `subscribe_ctx` path. Pre-fix
+    /// a NoAccess peer could mount a `subscribe_raw` subscription
+    /// (since the round-29 gate covered `subscribe_ctx` only) and
+    /// receive every upstream MONITOR event byte-for-byte.
+    #[tokio::test]
+    async fn subscribe_raw_ctx_denies_when_acf_no_access() {
+        let src = make_source();
+        // ASG with no fall-through rule — every UAG-less peer hits
+        // NoAccess.
+        let cfg = parse_acf(
+            r#"
+UAG(ops) { alice }
+ASG(DEFAULT) {
+    RULE(1, READ) { UAG(ops) }
+}
+"#,
+        )
+        .unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        let rx = src
+            .subscribe_raw_ctx("any:pv", make_ctx("anyhost", "intruder", "anonymous"))
+            .await;
+        assert!(
+            rx.is_none(),
+            "raw subscribe must be denied for a NoAccess peer"
+        );
     }
 }

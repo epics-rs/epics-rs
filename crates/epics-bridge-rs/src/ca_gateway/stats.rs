@@ -161,7 +161,14 @@ impl Stats {
             ("disconnected", EpicsValue::Long(0)),
             ("clientEventRate", EpicsValue::Double(0.0)),
         ] {
-            db.add_pv(&format!("{p}{suffix}"), init).await;
+            let pv = format!("{p}{suffix}");
+            if let Err(e) = db.add_pv(&pv, init).await {
+                tracing::warn!(
+                    pv = %pv,
+                    error = %e,
+                    "ca_gateway stats: pre-register skipped (name already in use)"
+                );
+            }
         }
     }
 

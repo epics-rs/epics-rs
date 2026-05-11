@@ -16,6 +16,14 @@ pub struct BiRecord {
     pub zsv: i16,
     pub osv: i16,
     pub cosv: i16,
+    /// Alarm filter time constant (seconds). 0 = filter disabled.
+    /// Mirrors epics-base PR #817: a low-pass filter on alarm severity
+    /// that delays reporting until the signal has been in the alarm
+    /// range for AFTC seconds.
+    pub aftc: f64,
+    /// Alarm filter accumulator. Carries low-pass filter state between
+    /// process cycles; 0 means "initial sample, no prior filter state".
+    pub afvl: f64,
     pub lalm: u16, // last alarm value (for COS alarm)
     // Monitor
     pub mlst: u16, // last monitored value
@@ -40,6 +48,8 @@ impl Default for BiRecord {
             zsv: 0,
             osv: 0,
             cosv: 0,
+            aftc: 0.0,
+            afvl: 0.0,
             lalm: 0,
             mlst: 0,
             simm: 0,
@@ -105,6 +115,16 @@ static FIELDS: &[FieldDesc] = &[
         name: "COSV",
         dbf_type: DbFieldType::Short,
         read_only: false,
+    },
+    FieldDesc {
+        name: "AFTC",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "AFVL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
     },
     FieldDesc {
         name: "LALM",
@@ -183,6 +203,8 @@ impl Record for BiRecord {
             "ZSV" => Some(EpicsValue::Short(self.zsv)),
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
+            "AFTC" => Some(EpicsValue::Double(self.aftc)),
+            "AFVL" => Some(EpicsValue::Double(self.afvl)),
             "LALM" => Some(EpicsValue::Enum(self.lalm)),
             "MLST" => Some(EpicsValue::Enum(self.mlst)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -207,6 +229,23 @@ impl Record for BiRecord {
                 EpicsValue::Short(v) => {
                     self.val = v as u16;
                     Ok(())
+                }
+                // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING.
+                // Accept the ZNAM/ONAM string and convert to the
+                // enum index. Mirrors the upstream fix that lets a
+                // bi VAL be written from a string-typed source link.
+                EpicsValue::String(s) => {
+                    if s == self.znam {
+                        self.val = 0;
+                        Ok(())
+                    } else if s == self.onam {
+                        self.val = 1;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch(format!(
+                            "bi VAL: '{s}' matches neither ZNAM nor ONAM"
+                        )))
+                    }
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
@@ -258,6 +297,34 @@ impl Record for BiRecord {
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "AFTC" => match value {
+                EpicsValue::Double(v) => {
+                    self.aftc = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.aftc = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch(name.into()))
+                    }
+                }
+            },
+            "AFVL" => match value {
+                EpicsValue::Double(v) => {
+                    self.afvl = v;
+                    Ok(())
+                }
+                v => {
+                    if let Some(f) = v.to_f64() {
+                        self.afvl = f;
+                        Ok(())
+                    } else {
+                        Err(CaError::TypeMismatch(name.into()))
+                    }
+                }
             },
             "LALM" => match value {
                 EpicsValue::Enum(v) => {

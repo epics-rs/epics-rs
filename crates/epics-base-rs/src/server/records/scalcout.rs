@@ -72,10 +72,7 @@ impl ScalcoutRecord {
     }
 
     fn build_inputs(&self) -> StringInputs {
-        let mut inputs = StringInputs {
-            num_vars: [0.0; 16],
-            str_vars: Default::default(),
-        };
+        let mut inputs = StringInputs::new();
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
             inputs.str_vars[i] = self.str_vals[i].clone();
@@ -394,6 +391,12 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
 impl Record for ScalcoutRecord {
     fn record_type(&self) -> &'static str {
         "scalcout"
+    }
+
+    // C recScalcout.c IVOA=set_to_IVOV: oval = ivov (and osv = isvv
+    // for string output side, but OUT writeback only reads OVAL).
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        self.put_field("OVAL", ivov)
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

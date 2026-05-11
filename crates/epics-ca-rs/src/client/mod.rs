@@ -436,7 +436,13 @@ impl CaClient {
         // Run repeater registration in background — don't block client startup.
         epics_base_rs::runtime::task::spawn(async { repeater::ensure_repeater().await });
 
-        let mut addr_list = parse_addr_list()?;
+        // Round 50 (R50-G2): build the address list with hostname
+        // info preserved so the search-engine refresh task can
+        // re-resolve entries whose DNS name maps to a different IP
+        // after IOC migration. Pre-fix `parse_addr_list()` returned
+        // bare `Vec<SocketAddr>` resolved exactly once at startup,
+        // permanently pinning the client to the first-resolved IPs.
+        let mut addr_list = parse_addr_list_with_hostnames()?;
 
         // Service discovery: explicit config wins; otherwise honour
         // EPICS_CA_DISCOVERY env var. Custom `extra_backends` are then
@@ -465,8 +471,15 @@ impl CaClient {
                 );
             }
             for addr in discovered {
-                if !addr_list.contains(&addr) {
-                    addr_list.push(addr);
+                if !addr_list.iter().any(|e| e.sock == addr) {
+                    let port = match addr {
+                        SocketAddr::V4(a) => a.port(),
+                        SocketAddr::V6(a) => a.port(),
+                    };
+                    // Backend-discovered addresses have no DNS name
+                    // attached — store them as IP literals (no
+                    // refresh).
+                    addr_list.push(AddrEntry::new(addr, None, port));
                 }
             }
         }
@@ -962,10 +975,7 @@ impl Drop for CaClient {
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {
                 let (tx, rx) = oneshot::channel();
-                if coord_tx
-                    .send(CoordRequest::Shutdown { reply: tx })
-                    .is_ok()
-                {
+                if coord_tx.send(CoordRequest::Shutdown { reply: tx }).is_ok() {
                     // Bounded so a wedged coordinator doesn't keep
                     // the cleanup task alive indefinitely.
                     let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
@@ -2875,6 +2885,143 @@ fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
         .ok_or_else(|| CaError::Protocol(format!("no addresses for '{host}'")))
 }
 
+/// One entry in `EPICS_CA_ADDR_LIST` with its original DNS form
+/// retained — addresses the Launchpad #488 / GitHub #862/#863 family
+/// where startup-time-only DNS resolution leaves stale IPs after a
+/// peer restarts on a new IP.
+///
+/// `hostname == None` means the entry was a literal IPv4; nothing to
+/// re-resolve. `hostname == Some(name)` means the entry started life
+/// as a DNS name and a reconnection path may call `resolve_host`
+/// again to refresh `sock`.
+#[derive(Debug, Clone)]
+pub(crate) struct AddrEntry {
+    pub sock: SocketAddr,
+    pub hostname: Option<String>,
+    pub port: u16,
+}
+
+impl AddrEntry {
+    pub fn new(sock: SocketAddr, hostname: Option<String>, port: u16) -> Self {
+        Self {
+            sock,
+            hostname,
+            port,
+        }
+    }
+
+    /// Re-resolve the hostname (if any) and return the freshened
+    /// SocketAddr. Returns `Ok(self.sock)` unchanged when there's
+    /// nothing to refresh (literal IP entry).
+    ///
+    /// Round 50 (R50-G2): wired into the search engine's periodic
+    /// refresh task. The task runs every `EPICS_CA_DNS_REFRESH_SECS`
+    /// (default 60 s) and calls this on every `AddrEntry`; a
+    /// changed resolution updates `self.sock` so the next
+    /// `fire_searches` batch uses the fresh IP.
+    pub fn refresh_dns(&mut self) -> CaResult<SocketAddr> {
+        let Some(host) = self.hostname.as_deref() else {
+            return Ok(self.sock);
+        };
+        let new_sock = resolve_host(host, self.port)?;
+        self.sock = new_sock;
+        Ok(new_sock)
+    }
+}
+
+/// `parse_addr_list` variant that retains hostname per entry.
+/// Round 50 (R50-G2): this is the live caller from
+/// `new_with_config()`; the search engine periodically calls
+/// `AddrEntry::refresh_dns` on each entry so that an
+/// `EPICS_CA_ADDR_LIST` hostname whose DNS resolution changes
+/// (e.g. an IOC migrates between hosts) is picked up at runtime
+/// instead of permanently pinning the client to the first-resolved
+/// IP. Closes the long-standing upstream-tracking item for
+/// epics-base#488.
+pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
+    let mut addrs: Vec<AddrEntry> = Vec::new();
+    let default_port = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(CA_SERVER_PORT);
+    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
+        for entry in list.split_whitespace() {
+            let (host_raw, port) = if entry.contains(':') {
+                if let Some((h, p)) = entry.rsplit_once(':') {
+                    let port: u16 = match p.parse() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    (h.to_string(), port)
+                } else {
+                    (entry.to_string(), default_port)
+                }
+            } else {
+                (entry.to_string(), default_port)
+            };
+            // Pure-IP entry has no DNS to refresh.
+            let hostname = if host_raw.parse::<Ipv4Addr>().is_ok() {
+                None
+            } else {
+                Some(host_raw.clone())
+            };
+            match resolve_host(&host_raw, port) {
+                Ok(sock) => addrs.push(AddrEntry::new(sock, hostname, port)),
+                Err(e) => tracing::debug!(token = %entry, error = %e,
+                    "EPICS_CA_ADDR_LIST: dropped unresolvable entry"),
+            }
+        }
+    }
+
+    // Round 50 (R50-G2): mirror the legacy `parse_addr_list`'s
+    // AUTO_ADDR_LIST + broadcast-fallback behaviour. Without these
+    // the new live caller would silently drop UDP broadcast
+    // discovery for multi-NIC clients and the limited-broadcast
+    // last-resort fallback. The added entries are IP literals
+    // (`hostname = None`) so the periodic refresh task short-
+    // circuits them.
+    let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
+    if auto_addr.eq_ignore_ascii_case("YES") {
+        let server_port = default_port;
+        for bcast in crate::server::addr_list::discover_broadcast_addrs() {
+            let sock = SocketAddr::V4(SocketAddrV4::new(bcast, server_port));
+            if !addrs.iter().any(|e| e.sock == sock) {
+                addrs.push(AddrEntry::new(sock, None, server_port));
+            }
+        }
+        // Limited broadcast as a last-resort fallback (multi-NIC
+        // enumeration may have returned nothing useful — e.g. on
+        // point-to-point links).
+        let fallback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, server_port));
+        if !addrs.iter().any(|e| e.sock == fallback) {
+            addrs.push(AddrEntry::new(fallback, None, server_port));
+        }
+    }
+    Ok(addrs)
+}
+
+#[cfg(test)]
+mod addr_entry_tests {
+    use super::*;
+
+    #[test]
+    fn ip_literal_has_no_hostname() {
+        let entry = AddrEntry::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5064)),
+            None,
+            5064,
+        );
+        assert!(entry.hostname.is_none());
+    }
+
+    #[test]
+    fn refresh_noop_for_literal_ip() {
+        let original_sock = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 5064));
+        let mut entry = AddrEntry::new(original_sock, None, 5064);
+        let refreshed = entry.refresh_dns().expect("noop refresh succeeds");
+        assert_eq!(refreshed, original_sock);
+    }
+}
+
 /// Apply libca-compatible PV-name expansion when
 /// `EPICS_CA_USE_SHELL_VARS=YES`.
 fn expand_pv_name(name: &str) -> String {
@@ -3035,65 +3182,12 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     out
 }
 
-fn parse_addr_list() -> CaResult<Vec<SocketAddr>> {
-    let mut addrs = Vec::new();
-
-    // Default port for unqualified entries follows EPICS_CA_SERVER_PORT
-    // (matches libca: addAddrToChannelAccessAddressList).
-    let default_port = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(CA_SERVER_PORT);
-
-    if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
-        for entry in list.split_whitespace() {
-            // Per-token failures (bad port, unresolvable hostname) are
-            // logged and dropped — a single broken entry must not take
-            // down the whole client. libca's
-            // `addAddrToChannelAccessAddressList` (configMain.c) follows
-            // the same drop-and-continue policy.
-            let parsed: Result<SocketAddr, CaError> = if entry.contains(':') {
-                entry.parse::<SocketAddr>().or_else(|_| {
-                    let (host, port_str) = entry.rsplit_once(':').unwrap();
-                    let port: u16 = port_str
-                        .parse()
-                        .map_err(|e| CaError::Protocol(format!("bad port in '{entry}': {e}")))?;
-                    resolve_host(host, port)
-                })
-            } else {
-                resolve_host(entry, default_port)
-            };
-            match parsed {
-                Ok(addr) => addrs.push(addr),
-                Err(e) => tracing::debug!(token = %entry, error = %e,
-                    "EPICS_CA_ADDR_LIST: dropped unresolvable entry"),
-            }
-        }
-    }
-
-    let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
-
-    if auto_addr.eq_ignore_ascii_case("YES") || addrs.is_empty() {
-        // Add the per-NIC broadcast address for every up, non-loopback
-        // interface so multi-NIC clients reach IOCs on every attached
-        // subnet (matches libca osiSockDiscoverBroadcastAddresses).
-        let server_port = default_port;
-        for bcast in crate::server::addr_list::discover_broadcast_addrs() {
-            let entry = SocketAddr::V4(SocketAddrV4::new(bcast, server_port));
-            if !addrs.contains(&entry) {
-                addrs.push(entry);
-            }
-        }
-        // Always include the limited broadcast as a last-resort fallback,
-        // for hosts where interface enumeration fails or has no usable
-        // broadcast (e.g. point-to-point links).
-        let fallback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, server_port));
-        if !addrs.contains(&fallback) {
-            addrs.push(fallback);
-        }
-    }
-
-    Ok(addrs)
-}
+// Round 50 (R50-G2): legacy `parse_addr_list() -> Vec<SocketAddr>`
+// removed. The hostname-preserving `parse_addr_list_with_hostnames()`
+// (line ~2944) is the only live caller — it carries DNS context
+// for the search engine's periodic refresh loop and matches the
+// legacy function's AUTO_ADDR_LIST + per-NIC broadcast + limited-
+// broadcast fallback semantics.
 
 #[cfg(test)]
 mod beacon_arrival_routing_tests {

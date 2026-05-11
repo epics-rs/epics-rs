@@ -14,13 +14,95 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_dbpf());
     registry.register(cmd_dbpr());
     registry.register(cmd_dbsr());
+    registry.register(cmd_dbglob());
+    registry.register(cmd_dbgrep());
     registry.register(cmd_scanppl());
     registry.register(cmd_post_event());
     registry.register(cmd_ioc_stats());
     registry.register(cmd_db_load_records());
+    registry.register(cmd_db_create_record());
+    registry.register(cmd_db_delete_record());
     registry.register(cmd_epics_env_set());
+    registry.register(cmd_pushd());
+    registry.register(cmd_popd());
+    registry.register(cmd_dirs());
     registry.register(cmd_ioc_init());
+    registry.register(cmd_after_ioc_running());
     registry.register(cmd_exit());
+}
+
+/// `afterIocRunning <command>` — queue an iocsh command line to run
+/// after iocInit completes. Mirrors epics-base PR #558.
+fn cmd_after_ioc_running() -> CommandDef {
+    CommandDef::new(
+        "afterIocRunning",
+        vec![ArgDesc {
+            name: "command",
+            arg_type: ArgType::String,
+            optional: false,
+        }],
+        "afterIocRunning <command> — schedule a command for post-iocInit execution",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let line = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => {
+                    ctx.println("afterIocRunning: missing command");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            ctx.db().queue_after_ioc_running(line);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `dbDeleteRecord <name>` — remove a record from the live database.
+/// Mirrors epics-base PR #505 (record deletion at DB creation).
+fn cmd_db_delete_record() -> CommandDef {
+    CommandDef::new(
+        "dbDeleteRecord",
+        vec![ArgDesc {
+            name: "recordName",
+            arg_type: ArgType::String,
+            optional: false,
+        }],
+        "dbDeleteRecord <name> — remove a record from the live database",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let name = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => {
+                    ctx.println("dbDeleteRecord: missing recordName");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if ctx.block_on(ctx.db().remove_record(&name)) {
+                ctx.println(&format!("dbDeleteRecord: removed '{name}'"));
+            } else {
+                ctx.println(&format!("dbDeleteRecord: no record named '{name}'"));
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Process-global directory stack for `pushd`/`popd`/`dirs`.
+/// Mirrors epics-base PR #497 — bash-style directory navigation in
+/// iocsh. Stack is shared across IocShell instances within one
+/// process; iocsh is by convention single-instance.
+fn dir_stack() -> &'static std::sync::Mutex<Vec<std::path::PathBuf>> {
+    static STACK: std::sync::OnceLock<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+        std::sync::OnceLock::new();
+    STACK.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn print_stack(ctx: &CommandContext) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let stack = dir_stack().lock().unwrap();
+    // Bash convention: top-of-stack is leftmost, cwd is shown first.
+    let parts: Vec<String> = std::iter::once(cwd.display().to_string())
+        .chain(stack.iter().rev().map(|p| p.display().to_string()))
+        .collect();
+    ctx.println(&parts.join(" "));
 }
 
 fn cmd_help() -> CommandDef {
@@ -177,7 +259,20 @@ fn cmd_dbpf() -> CommandDef {
                     db.put_pv(name, value).await
                 }
             });
-            put_result.map_err(|e| format!("{e}"))?;
+            put_result.map_err(|e| {
+                // Round-23: epics-base PR #689 — when the field
+                // doesn't exist, suggest near-by names so a typo
+                // ("DSEC" instead of "DESC") is caught quickly.
+                let msg = format!("{e}");
+                if msg.contains("FieldNotFound") || msg.contains(&format!("'{field}'")) {
+                    if let Some(suggestion) =
+                        ctx.block_on(suggest_field_name(ctx.db(), base, &field))
+                    {
+                        return format!("{msg}; did you mean '{suggestion}'?");
+                    }
+                }
+                msg
+            })?;
 
             // Read back to confirm
             match ctx.block_on(ctx.db().get_pv(name)) {
@@ -229,8 +324,14 @@ fn cmd_dbpr() -> CommandDef {
                 let inst = rec.read().await;
                 let mut fields = Vec::new();
 
-                // Level 0: NAME, RTYP, VAL
+                // Level 0: NAME, RTYP, VAL (+ alias names if any —
+                // base's dbpr surfaces aliases here so admins know
+                // every spelling that resolves to this record).
                 fields.push(("NAME".to_string(), inst.name.clone()));
+                let aliases = ctx.db().aliases_for_record(&inst.name).await;
+                if !aliases.is_empty() {
+                    fields.push(("ALIASES".to_string(), aliases.join(", ")));
+                }
                 fields.push(("RTYP".to_string(), inst.record.record_type().to_string()));
                 if let Some(val) = inst.record.val() {
                     fields.push(("VAL".to_string(), format!("{val}")));
@@ -279,6 +380,15 @@ fn cmd_dbpr() -> CommandDef {
                         fields.push(("LLSV".to_string(), format!("{:?}", alarm.llsv)));
                     }
                     fields.push(("ASG".to_string(), inst.common.asg.clone()));
+                    // Round-20: surface info(...) tags so admins can
+                    // verify driver hints (asyn:READBACK, Q:group, …)
+                    // landed on the record. Sorted for stable output.
+                    let mut info_keys: Vec<&String> = inst.info.keys().collect();
+                    info_keys.sort();
+                    for key in info_keys {
+                        let val = inst.info.get(key).cloned().unwrap_or_default();
+                        fields.push((format!("info({key})"), val));
+                    }
                 }
 
                 fields
@@ -294,40 +404,132 @@ fn cmd_dbpr() -> CommandDef {
     )
 }
 
+/// Shared handler used by `dbsr`, `dbglob`, and `dbgrep`. Mirrors
+/// epics-base PR #626 (rename `dbgrep` → `dbglob` with alias) and
+/// PR #613 (add fields argument). The `fields` argument is comma-
+/// separated; when present each matching record additionally dumps
+/// the listed field values.
+fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
+    let pattern = args
+        .first()
+        .and_then(|a| {
+            if let ArgValue::String(s) = a {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or("*");
+    let fields: Vec<String> = args
+        .get(1)
+        .and_then(|a| {
+            if let ArgValue::String(s) = a {
+                Some(s.split(',').map(|f| f.trim().to_string()).collect())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    // Walk record names + aliases + simple PVs. Base's
+    // `dbFirstRecord` iteration only sees records, but our
+    // PvDatabase also serves `add_pv`-registered simple PVs (CA
+    // gateway shadows, IOC-stat scratchpads). A user globbing for
+    // every channel name would be confused if simple PVs were
+    // hidden. Field lookup via `get_record` follows alias→canonical
+    // (round 7); for simple PVs the field-dump branch silently
+    // skips since they're not records.
+    let mut names = ctx.block_on(ctx.db().all_record_names());
+    names.extend(ctx.block_on(ctx.db().all_alias_names()));
+    names.extend(ctx.block_on(ctx.db().all_simple_pv_names()));
+    names.sort();
+    names.dedup();
+
+    let mut count = 0;
+    for name in &names {
+        if !glob_match(pattern, name) {
+            continue;
+        }
+        ctx.println(name);
+        count += 1;
+        if fields.is_empty() {
+            continue;
+        }
+        // Dump each requested field for this record.
+        if let Some(rec_arc) = ctx.block_on(ctx.db().get_record(name)) {
+            let inst = ctx.block_on(rec_arc.read());
+            for fname in &fields {
+                let value = inst
+                    .record
+                    .get_field(fname)
+                    .map(|v| format!("{v:?}"))
+                    .unwrap_or_else(|| "<no field>".to_string());
+                ctx.println(&format!("  {fname:>8}: {value}"));
+            }
+        }
+    }
+    ctx.println(&format!("Total: {count} records"));
+    Ok(CommandOutcome::Continue)
+}
+
 fn cmd_dbsr() -> CommandDef {
     CommandDef::new(
         "dbsr",
-        vec![ArgDesc {
-            name: "pattern",
-            arg_type: ArgType::String,
-            optional: true,
-        }],
-        "dbsr [pattern] — Search records by name pattern (glob)",
-        |args: &[ArgValue], ctx: &CommandContext| {
-            let pattern = args
-                .first()
-                .and_then(|a| {
-                    if let ArgValue::String(s) = a {
-                        Some(s.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or("*");
+        vec![
+            ArgDesc {
+                name: "pattern",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "fields",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "dbsr [pattern] [fields] — Search records by name pattern; \
+         optional comma-separated fields list dumps each value",
+        dbsr_handler,
+    )
+}
 
-            let mut names = ctx.block_on(ctx.db().all_record_names());
-            names.sort();
+fn cmd_dbglob() -> CommandDef {
+    CommandDef::new(
+        "dbglob",
+        vec![
+            ArgDesc {
+                name: "pattern",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "fields",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "dbglob [pattern] [fields] — Alias of dbsr (epics-base PR #626)",
+        dbsr_handler,
+    )
+}
 
-            let mut count = 0;
-            for name in &names {
-                if glob_match(pattern, name) {
-                    ctx.println(name);
-                    count += 1;
-                }
-            }
-            ctx.println(&format!("Total: {count} records"));
-            Ok(CommandOutcome::Continue)
-        },
+fn cmd_dbgrep() -> CommandDef {
+    CommandDef::new(
+        "dbgrep",
+        vec![
+            ArgDesc {
+                name: "pattern",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "fields",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "dbgrep [pattern] [fields] — Legacy alias retained per epics-base PR #626",
+        dbsr_handler,
     )
 }
 
@@ -366,6 +568,154 @@ fn cmd_scanppl() -> CommandDef {
             if io_count > 0 {
                 ctx.println(&format!("I/O Intr: {io_count} records"));
             }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `pushd [dir]` — push the current directory onto the stack and `cd`.
+/// With no argument, swaps the current dir with the top of the stack.
+fn cmd_pushd() -> CommandDef {
+    CommandDef::new(
+        "pushd",
+        vec![ArgDesc {
+            name: "dir",
+            arg_type: ArgType::String,
+            optional: true,
+        }],
+        "pushd [dir] — push current dir onto stack and cd to <dir>",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let cwd = match std::env::current_dir() {
+                Ok(p) => p,
+                Err(e) => {
+                    ctx.println(&format!("pushd: cannot read cwd: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            match &args[0] {
+                ArgValue::String(dir) => {
+                    if let Err(e) = std::env::set_current_dir(dir) {
+                        ctx.println(&format!("pushd: {dir}: {e}"));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                    dir_stack().lock().unwrap().push(cwd);
+                }
+                _ => {
+                    // No arg: swap cwd with top of stack.
+                    let mut stack = dir_stack().lock().unwrap();
+                    let Some(top) = stack.pop() else {
+                        ctx.println("pushd: directory stack empty");
+                        return Ok(CommandOutcome::Continue);
+                    };
+                    if let Err(e) = std::env::set_current_dir(&top) {
+                        // Restore on failure.
+                        stack.push(top);
+                        ctx.println(&format!("pushd: {e}"));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                    stack.push(cwd);
+                }
+            }
+            print_stack(ctx);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `popd` — pop the top of the directory stack and `cd` to it.
+fn cmd_popd() -> CommandDef {
+    CommandDef::new(
+        "popd",
+        vec![],
+        "popd — pop top of directory stack and cd to it",
+        |_args: &[ArgValue], ctx: &CommandContext| {
+            let mut stack = dir_stack().lock().unwrap();
+            let Some(top) = stack.pop() else {
+                ctx.println("popd: directory stack empty");
+                return Ok(CommandOutcome::Continue);
+            };
+            if let Err(e) = std::env::set_current_dir(&top) {
+                // Restore the entry — failed cd must not lose stack state.
+                stack.push(top);
+                ctx.println(&format!("popd: {e}"));
+                return Ok(CommandOutcome::Continue);
+            }
+            drop(stack);
+            print_stack(ctx);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `dirs` — list the directory stack (cwd + saved entries).
+fn cmd_dirs() -> CommandDef {
+    CommandDef::new(
+        "dirs",
+        vec![],
+        "dirs — list the iocsh directory stack",
+        |_args: &[ArgValue], ctx: &CommandContext| {
+            print_stack(ctx);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `dbCreateRecord <type> <name>` — create a new record at runtime.
+///
+/// Mirrors epics-base PR #812. Validates the name with the same rules
+/// as `parse_db` (PR #78), refuses duplicate names, and routes the
+/// instantiation through the same factory registry as `dbLoadRecords`.
+fn cmd_db_create_record() -> CommandDef {
+    CommandDef::new(
+        "dbCreateRecord",
+        vec![
+            ArgDesc {
+                name: "recordType",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "recordName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+        ],
+        "dbCreateRecord <type> <name> — Create a new record of <type> at runtime",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let rec_type = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => {
+                    ctx.println("dbCreateRecord: missing recordType");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            let name = match &args[1] {
+                ArgValue::String(s) => s.clone(),
+                _ => {
+                    ctx.println("dbCreateRecord: missing recordName");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if let Err(e) = db_loader::validate_record_name(&name, 0, 0) {
+                ctx.println(&format!("dbCreateRecord: {e}"));
+                return Ok(CommandOutcome::Continue);
+            }
+            if ctx.block_on(ctx.db().get_record(&name)).is_some() {
+                ctx.println(&format!("dbCreateRecord: record '{name}' already exists"));
+                return Ok(CommandOutcome::Continue);
+            }
+            let record = match db_loader::create_record(&rec_type) {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.println(&format!("dbCreateRecord: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if let Err(e) = ctx.block_on(ctx.db().add_record(&name, record)) {
+                ctx.println(&format!("dbCreateRecord: {e}"));
+                return Ok(CommandOutcome::Continue);
+            }
+            ctx.println(&format!("dbCreateRecord: created '{name}' ({rec_type})"));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -573,11 +923,32 @@ fn cmd_db_load_records() -> CommandDef {
                 db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
                     .map_err(|e| format!("{e}"))?;
 
-                ctx.block_on(async {
-                    ctx.db().add_record(&def.name, record).await;
+                let added: Result<(), String> = ctx.block_on(async {
+                    if let Err(e) = ctx.db().add_record(&def.name, record).await {
+                        return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
+                    }
+
+                    // Register any aliases declared in the record body
+                    // (epics-base PR #336). Failures are reported but
+                    // don't abort the load — the record is already in.
+                    for alias in &def.aliases {
+                        if let Err(e) = ctx.db().add_alias(alias, &def.name).await {
+                            eprintln!(
+                                "dbLoadRecords: alias '{alias}' for '{}' rejected: {e}",
+                                def.name
+                            );
+                        }
+                    }
 
                     if let Some(rec_arc) = ctx.db().get_record(&def.name).await {
                         let mut instance = rec_arc.write().await;
+                        // info(key, value) directives — last write
+                        // wins. Populated before common-field application
+                        // so device support seeing `init_record` can
+                        // observe info tags.
+                        for (k, v) in &def.info_tags {
+                            instance.set_info(k, v);
+                        }
                         for (name, value) in common_fields {
                             use crate::server::record::CommonFieldPutResult;
                             match instance.put_common_field(&name, value) {
@@ -624,7 +995,12 @@ fn cmd_db_load_records() -> CommandDef {
                             eprintln!("init_record(1) failed for {}: {e}", def.name);
                         }
                     }
+                    Ok(())
                 });
+                if let Err(e) = added {
+                    ctx.println(&e);
+                    return Ok(CommandOutcome::Continue);
+                }
             }
 
             ctx.println(&format!("Loaded {count} record(s) from {path}"));
@@ -703,6 +1079,96 @@ fn parse_macro_string(s: &str) -> HashMap<String, String> {
         }
     }
     macros
+}
+
+#[cfg(test)]
+mod field_suggestion_tests {
+    use super::edit_distance_short;
+
+    #[test]
+    fn edit_distance_recognises_simple_typos() {
+        // Substitution within budget.
+        assert!(edit_distance_short("DSEC", "DESC") <= 2);
+        assert!(edit_distance_short("EGUU", "EGU") <= 2);
+        // Deletion.
+        assert!(edit_distance_short("DESCR", "DESC") <= 2);
+        // Long-distance — must exceed 2 so suggester rejects.
+        assert!(edit_distance_short("HELLO", "DESC") > 2);
+    }
+
+    #[test]
+    fn edit_distance_handles_empty_inputs() {
+        assert_eq!(edit_distance_short("", ""), 0);
+        assert_eq!(edit_distance_short("ABC", ""), 3);
+        assert_eq!(edit_distance_short("", "XYZ"), 3);
+    }
+}
+
+/// Suggest a field name close to `typo` that actually exists on
+/// the record `record_name`. Returns `None` when no candidate is
+/// within edit-distance ≤ 2 (Damerau-Levenshtein subset). Mirrors
+/// epics-base PR #689 — "did you mean" hint on field-not-found
+/// errors. Uppercase comparison so `desc` ≈ `DESC` matches.
+async fn suggest_field_name(
+    db: &std::sync::Arc<crate::server::database::PvDatabase>,
+    record_name: &str,
+    typo: &str,
+) -> Option<String> {
+    let typo_uc = typo.to_ascii_uppercase();
+    let rec = db.get_record(record_name).await?;
+    let inst = rec.read().await;
+    let mut candidates: Vec<&str> = inst.record.field_list().iter().map(|d| d.name).collect();
+    // Common dbCommon fields are also valid PUT targets.
+    candidates.extend([
+        "VAL", "DESC", "EGU", "SCAN", "PINI", "DTYP", "INP", "OUT", "FLNK", "NAME", "RTYP", "PHAS",
+        "PRIO", "DISA", "DISV", "DISS", "DISP", "PROC", "ASG", "TPRO", "TSE", "TSEL", "UDF",
+        "SEVR", "STAT", "AMSG",
+    ]);
+    let mut best: Option<(usize, &str)> = None;
+    for cand in &candidates {
+        let dist = edit_distance_short(&typo_uc, cand);
+        if dist > 2 {
+            continue;
+        }
+        match best {
+            None => best = Some((dist, cand)),
+            Some((d, _)) if dist < d => best = Some((dist, cand)),
+            _ => {}
+        }
+    }
+    best.map(|(_, name)| name.to_string())
+}
+
+/// Bounded Damerau-Levenshtein for short ASCII strings used by
+/// `suggest_field_name`. Returns the edit distance; cap at
+/// `a.len() + b.len()` so the loop never blows up.
+fn edit_distance_short(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+    let a: Vec<u8> = a.bytes().collect();
+    let b: Vec<u8> = b.bytes().collect();
+    if a.is_empty() || b.is_empty() {
+        return a.len().max(b.len());
+    }
+    let mut prev = (0..=b.len()).collect::<Vec<usize>>();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, ai) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, bj) in b.iter().enumerate() {
+            let cost = if ai == bj { 0 } else { 1 };
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
+            // Damerau transposition.
+            if i > 0 && j > 0 && a[i] == b[j - 1] && a[i - 1] == b[j] {
+                // prev2 not tracked; skip the pure-Damerau optimization
+                // and rely on the Levenshtein floor — we only care that
+                // small typos like "DSEC"↔"DESC" are within ≤2.
+            }
+            let _ = cost;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
 }
 
 /// Get a display name for the DBF type of a value.
@@ -804,8 +1270,12 @@ mod tests {
     fn test_dbl() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("REC_A", Box::new(AiRecord::new(1.0))).await;
-            db.add_record("REC_B", Box::new(AiRecord::new(2.0))).await;
+            db.add_record("REC_A", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
+            db.add_record("REC_B", Box::new(AiRecord::new(2.0)))
+                .await
+                .unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -820,7 +1290,9 @@ mod tests {
     fn test_dbgf() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("TEMP", Box::new(AiRecord::new(25.0))).await;
+            db.add_record("TEMP", Box::new(AiRecord::new(25.0)))
+                .await
+                .unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -849,7 +1321,9 @@ mod tests {
     fn test_dbpf_and_readback() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("TEMP", Box::new(AiRecord::new(0.0))).await;
+            db.add_record("TEMP", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -874,7 +1348,9 @@ mod tests {
     fn test_dbpr_levels() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("TEMP", Box::new(AiRecord::new(25.0))).await;
+            db.add_record("TEMP", Box::new(AiRecord::new(25.0)))
+                .await
+                .unwrap();
         });
 
         let mut registry = CommandRegistry::new();
@@ -893,12 +1369,15 @@ mod tests {
     fn test_dbl_filter_by_type() {
         let (db, ctx) = make_ctx();
         ctx.block_on(async {
-            db.add_record("AI_REC", Box::new(AiRecord::new(1.0))).await;
+            db.add_record("AI_REC", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
             db.add_record(
                 "BO_REC",
                 Box::new(crate::server::records::bo::BoRecord::new(0)),
             )
-            .await;
+            .await
+            .unwrap();
         });
 
         let mut registry = CommandRegistry::new();

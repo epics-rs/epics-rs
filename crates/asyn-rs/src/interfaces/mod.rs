@@ -10,12 +10,14 @@ pub mod motor;
 pub mod octet;
 pub mod option;
 pub mod uint32_digital;
+pub mod uint64;
 
 /// Type-safe interface type enum replacing string-based dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InterfaceType {
     Int32,
     Int64,
+    UInt64,
     Float64,
     Octet,
     UInt32Digital,
@@ -39,6 +41,7 @@ impl InterfaceType {
         match name {
             "asynInt32" => Some(Self::Int32),
             "asynInt64" => Some(Self::Int64),
+            "asynUInt64" => Some(Self::UInt64),
             "asynFloat64" => Some(Self::Float64),
             "asynOctet" => Some(Self::Octet),
             "asynUInt32Digital" => Some(Self::UInt32Digital),
@@ -63,6 +66,7 @@ impl InterfaceType {
         match self {
             Self::Int32 => "asynInt32",
             Self::Int64 => "asynInt64",
+            Self::UInt64 => "asynUInt64",
             Self::Float64 => "asynFloat64",
             Self::Octet => "asynOctet",
             Self::UInt32Digital => "asynUInt32Digital",

@@ -234,6 +234,23 @@ pub trait Record: Send + Sync + 'static {
         }
     }
 
+    /// Apply IVOA=2 ("set outputs to IVOV") semantics: copy the
+    /// IVOV value into whatever output staging field the OUT
+    /// writeback consumes for this record type. Mirrors the
+    /// per-record C `recXxx.c` behaviour:
+    ///
+    /// - `ao`/`lso`: `OVAL = IVOV; VAL = OVAL`
+    /// - `bo`/`busy`/`mbbo`/`mbboDirect`: `RVAL = IVOV; VAL = IVOV`
+    /// - `calcout`/`scalcout`: `OVAL = IVOV` (VAL is calc input, not
+    ///   touched on invalid-output)
+    /// - `dfanout`: `VAL = IVOV` (the broadcast value)
+    ///
+    /// Default uses [`Record::set_val`] for records whose OUT path
+    /// reads VAL only.
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        self.set_val(ivov)
+    }
+
     /// Whether this record type supports device write (output records only).
     fn can_device_write(&self) -> bool {
         matches!(

@@ -119,6 +119,13 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// Called after init() with the record name and scan type.
     fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
 
+    /// Forward parsed `info("key", "value")` directives from the .db
+    /// file to the device support. Default is a no-op; drivers that
+    /// react to specific tags (asyn `asyn:READBACK`, EtherCAT terminal
+    /// hints, etc.) override this. Called once after `set_record_info`
+    /// during builder wiring; not called again at runtime.
+    fn apply_record_info(&mut self, _info: &std::collections::HashMap<String, String>) {}
+
     /// Return a receiver for I/O Intr scan notifications.
     /// Only called for records with SCAN=I/O Intr.
     fn io_intr_receiver(&mut self) -> Option<crate::runtime::sync::mpsc::Receiver<()>> {

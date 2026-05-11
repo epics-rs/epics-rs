@@ -30,17 +30,25 @@ pub struct CompiledExpr {
     pub loop_pairs: Vec<(usize, usize)>,
 }
 
+/// Number of named scalar inputs accepted by the calc engine.
+/// Mirrors `CALCPERFORM_NARGS` in epics-base after PR #655 (12 → 21,
+/// fields A..U). Doubled-letter previous-value slots (LA..LU) and any
+/// per-record array slots scale to the same size.
+pub const CALC_NARGS: usize = 21;
+
 #[derive(Debug, Clone)]
 pub struct NumericInputs {
-    pub vars: [f64; 16],
+    pub vars: [f64; CALC_NARGS],
 }
 
 impl NumericInputs {
     pub fn new() -> Self {
-        NumericInputs { vars: [0.0; 16] }
+        NumericInputs {
+            vars: [0.0; CALC_NARGS],
+        }
     }
 
-    pub fn with_vars(vars: [f64; 16]) -> Self {
+    pub fn with_vars(vars: [f64; CALC_NARGS]) -> Self {
         NumericInputs { vars }
     }
 }
@@ -53,14 +61,14 @@ impl Default for NumericInputs {
 
 #[derive(Debug, Clone)]
 pub struct StringInputs {
-    pub num_vars: [f64; 16],    // A..P
-    pub str_vars: [String; 12], // AA..LL
+    pub num_vars: [f64; CALC_NARGS],    // A..U
+    pub str_vars: [String; CALC_NARGS], // AA..UU
 }
 
 impl StringInputs {
     pub fn new() -> Self {
         StringInputs {
-            num_vars: [0.0; 16],
+            num_vars: [0.0; CALC_NARGS],
             str_vars: std::array::from_fn(|_| String::new()),
         }
     }
@@ -74,16 +82,16 @@ impl Default for StringInputs {
 
 #[derive(Debug, Clone)]
 pub struct ArrayInputs {
-    pub num_vars: [f64; 16],
-    pub arrays: Vec<Vec<f64>>, // len 12 (AA..LL)
+    pub num_vars: [f64; CALC_NARGS],
+    pub arrays: Vec<Vec<f64>>, // len CALC_NARGS (AA..UU)
     pub array_size: usize,
 }
 
 impl ArrayInputs {
     pub fn new(array_size: usize) -> Self {
         ArrayInputs {
-            num_vars: [0.0; 16],
-            arrays: vec![Vec::new(); 12],
+            num_vars: [0.0; CALC_NARGS],
+            arrays: vec![Vec::new(); CALC_NARGS],
             array_size,
         }
     }

@@ -80,6 +80,8 @@ pub struct AlarmResetResult {
     pub alarm_changed: bool,
     pub prev_sevr: AlarmSeverity,
     pub prev_stat: u16,
+    /// True iff `amsg` value changed in this reset cycle (epics-base PR #568).
+    pub amsg_changed: bool,
 }
 
 /// Set new alarm severity if it's higher than current nsta/nsev.
@@ -91,33 +93,66 @@ pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverit
     }
 }
 
+/// Set new alarm severity AND attach an alarm message (epics-base PR
+/// #568 `recGblSetSevrMsg`). Same "raise only" rule as `rec_gbl_set_sevr`;
+/// when the new severity raises the pending state, both `nsta`/`nsev`
+/// AND `namsg` are written together. Empty `msg` clears the pending
+/// message — non-empty replaces it.
+pub fn rec_gbl_set_sevr_msg(
+    common: &mut CommonFields,
+    stat: u16,
+    sevr: AlarmSeverity,
+    msg: impl Into<String>,
+) {
+    if (sevr as u16) > (common.nsev as u16) {
+        common.nsta = stat;
+        common.nsev = sevr;
+        common.namsg = msg.into();
+    }
+}
+
 /// Transfer nsta/nsev to stat/sevr, detect alarm change, reset nsta/nsev.
 /// Matches EPICS recGblResetAlarms. Call at end of process cycle.
+///
+/// Mirrors epics-base PR #566 — the alarm-message string (`amsg`) is
+/// transferred from `namsg` alongside the severity / status, and
+/// `namsg` is cleared for the next cycle. Records that did not call
+/// `rec_gbl_set_sevr_msg` this cycle end up with an empty `amsg`.
 pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     let prev_sevr = common.sevr;
     let prev_stat = common.stat;
+    let prev_amsg = std::mem::take(&mut common.amsg);
 
     // Transfer new alarm state
     common.sevr = common.nsev;
     common.stat = common.nsta;
+    common.amsg = std::mem::take(&mut common.namsg);
 
     // Reset for next cycle
     common.nsev = AlarmSeverity::NoAlarm;
     common.nsta = alarm_status::NO_ALARM;
+    // common.namsg already cleared by `mem::take` above.
 
     let alarm_changed = common.sevr != prev_sevr || common.stat != prev_stat;
+    let amsg_changed = common.amsg != prev_amsg;
 
     AlarmResetResult {
         alarm_changed,
         prev_sevr,
         prev_stat,
+        amsg_changed,
     }
 }
 
 /// Check UDF alarm: if record is still undefined, raise UDF_ALARM with UDFS severity.
 pub fn rec_gbl_check_udf(common: &mut CommonFields) {
     if common.udf {
-        rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
+        rec_gbl_set_sevr_msg(
+            common,
+            alarm_status::UDF_ALARM,
+            common.udfs,
+            "UDF: record not initialized",
+        );
     }
 }
 
@@ -204,6 +239,76 @@ mod tests {
     fn test_check_udf_default_udfs_is_invalid() {
         let common = CommonFields::default();
         assert_eq!(common.udfs, AlarmSeverity::Invalid);
+    }
+
+    // ----- AMSG / NAMSG (epics-base PR #568 / #566) -----
+
+    #[test]
+    fn set_sevr_msg_writes_namsg_when_raised() {
+        let mut common = CommonFields::default();
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::HIGH_ALARM,
+            AlarmSeverity::Minor,
+            "above HIGH threshold",
+        );
+        assert_eq!(common.nsev, AlarmSeverity::Minor);
+        assert_eq!(common.nsta, alarm_status::HIGH_ALARM);
+        assert_eq!(common.namsg, "above HIGH threshold");
+    }
+
+    #[test]
+    fn set_sevr_msg_keeps_higher_message() {
+        let mut common = CommonFields::default();
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::HIHI_ALARM,
+            AlarmSeverity::Major,
+            "above HIHI",
+        );
+        // Lower-severity follow-up must NOT overwrite the message.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::HIGH_ALARM,
+            AlarmSeverity::Minor,
+            "would-be lower message",
+        );
+        assert_eq!(common.nsev, AlarmSeverity::Major);
+        assert_eq!(common.namsg, "above HIHI");
+    }
+
+    #[test]
+    fn reset_alarms_transfers_amsg_and_clears_namsg() {
+        let mut common = CommonFields::default();
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::HIHI_ALARM,
+            AlarmSeverity::Major,
+            "above HIHI",
+        );
+        let result = rec_gbl_reset_alarms(&mut common);
+        assert!(result.alarm_changed);
+        assert!(result.amsg_changed);
+        assert_eq!(common.amsg, "above HIHI");
+        assert_eq!(common.namsg, "");
+    }
+
+    #[test]
+    fn reset_alarms_clears_amsg_when_no_new_message() {
+        let mut common = CommonFields::default();
+        // First cycle: raise an alarm with message.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::HIGH_ALARM,
+            AlarmSeverity::Minor,
+            "first cycle",
+        );
+        rec_gbl_reset_alarms(&mut common);
+        assert_eq!(common.amsg, "first cycle");
+        // Second cycle: no new alarm, no new message — amsg must clear.
+        let result = rec_gbl_reset_alarms(&mut common);
+        assert!(result.amsg_changed);
+        assert_eq!(common.amsg, "");
     }
 
     #[test]

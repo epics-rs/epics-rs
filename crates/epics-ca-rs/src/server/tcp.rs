@@ -291,13 +291,31 @@ impl ClientState {
         self.free_sids.push(sid);
     }
 
+    /// Round 44: return the type-state-wrapped access token for a
+    /// SID. Op handlers MUST consult this — direct reads of the
+    /// underlying `channel_access` HashMap bypass the typed gate
+    /// and recreate the missed-path defects fixed in rounds 38-39.
+    /// Missing SIDs map to a "denied" token so a corrupted
+    /// channel-table state can never silently grant access.
+    fn lookup_access(&self, sid: u32) -> crate::server::access_token::CaAccessChecked {
+        use crate::server::access_token::CaAccessChecked;
+        match self.channel_access.get(&sid).copied() {
+            Some(level) => CaAccessChecked::from_level(level),
+            None => CaAccessChecked::denied(),
+        }
+    }
+
     /// Compute access rights bits for a channel target.
     async fn compute_access(&self, target: &ChannelTarget) -> u32 {
         match target {
             ChannelTarget::SimplePv(_) => {
                 let guard = self.acf.read().await;
                 if let Some(ref acf_cfg) = *guard {
-                    match acf_cfg.check_access("DEFAULT", &self.hostname, &self.username) {
+                    // Simple PVs have no per-record ASL field; treat
+                    // them as ASL=0 so the most-restrictive rule
+                    // applies. Matches the C IOC's behaviour for
+                    // names that never went through `dbAddMember`.
+                    match acf_cfg.check_access_asl("DEFAULT", &self.hostname, &self.username, 0) {
                         AccessLevel::ReadWrite => 3,
                         AccessLevel::Read => 1,
                         AccessLevel::NoAccess => 0,
@@ -315,20 +333,31 @@ impl ClientState {
                     .find(|fd| fd.name == f.as_str())
                     .map(|fd| fd.read_only)
                     .unwrap_or(false);
-                if is_ro {
-                    1
+                // R48-G2 (Round 48): read-only field-ness must AND
+                // with ACF, never replace it. Pre-fix the read-only
+                // branch returned `Read`(1) unconditionally — a
+                // peer whose ACF resolved to `NoAccess` could still
+                // READ / EVENT_ADD on every read-only field because
+                // the cached access_rights skipped the ACF check
+                // entirely. Now ACF runs first; the read-only flag
+                // only strips the WRITE bit from the result.
+                let guard = self.acf.read().await;
+                let acf_level = if let Some(ref acf_cfg) = *guard {
+                    // Round-33A (R33-G4): thread the per-record
+                    // ASL into the ACF check so `RULE(N, …)`
+                    // gates correctly disable rules whose level
+                    // is below the record's ASL.
+                    let asg = &instance.common.asg;
+                    let asl = instance.common.asl;
+                    acf_cfg.check_access_asl(asg, &self.hostname, &self.username, asl)
                 } else {
-                    let guard = self.acf.read().await;
-                    if let Some(ref acf_cfg) = *guard {
-                        let asg = &instance.common.asg;
-                        match acf_cfg.check_access(asg, &self.hostname, &self.username) {
-                            AccessLevel::ReadWrite => 3,
-                            AccessLevel::Read => 1,
-                            AccessLevel::NoAccess => 0,
-                        }
-                    } else {
-                        3
-                    }
+                    AccessLevel::ReadWrite
+                };
+                match (acf_level, is_ro) {
+                    (AccessLevel::NoAccess, _) => 0,
+                    (AccessLevel::Read, _) => 1,
+                    (AccessLevel::ReadWrite, true) => 1,
+                    (AccessLevel::ReadWrite, false) => 3,
                 }
             }
         }
@@ -1158,6 +1187,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
+            // R38-G2 / Round 38, Round 44 type-state:
+            // `state.lookup_access(sid)` is the only path to the
+            // access cache. `require_read()` returns a witness on
+            // success and an `AccessDenied` carrying the matching
+            // ECA code on failure — no `if access ==` ad-hoc
+            // comparison, no missing-entry default to argue about.
+            let _read_grant = match state.lookup_access(sid).require_read() {
+                Ok(g) => g,
+                Err(denied) => {
+                    if is_notify {
+                        send_cmd_error(
+                            writer,
+                            CA_PROTO_READ_NOTIFY,
+                            requested_type,
+                            denied.eca_code(),
+                            ioid,
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
+            };
+
             let snapshot = get_full_snapshot(&entry.target).await;
             let Some(mut snapshot) = snapshot else {
                 if is_notify {
@@ -1283,6 +1335,32 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         return Ok(());
                     }
                 };
+                // R39-G1 / Round 39: alarm-acknowledge PUTs travel
+                // the same WRITE wire opcodes but pre-fix bypassed
+                // the access_rights check that the regular WRITE
+                // path performs below. ACKT/ACKS mutate alarm-handler
+                // state — a `NoAccess` peer could silence alarms on
+                // any record they could open. Mirror the regular
+                // WRITE gate.
+                // R39-G1 / Round 44 type-state: alarm-ack PUTs go
+                // through the same gate as regular WRITE. Token's
+                // `require_write` returns the matching ECA code on
+                // denial.
+                let _write_grant = match state.lookup_access(sid).require_write() {
+                    Ok(g) => g,
+                    Err(denied) => {
+                        if is_notify {
+                            let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+                            resp.data_type = hdr.data_type;
+                            resp.count = hdr.count;
+                            resp.cid = denied.eca_code();
+                            resp.available = ioid;
+                            let mut w = writer.lock().await;
+                            w.write_all(&resp.to_bytes()).await?;
+                        }
+                        return Ok(());
+                    }
+                };
                 let value_u16 = if payload.len() >= 2 {
                     u16::from_be_bytes([payload[0], payload[1]])
                 } else {
@@ -1368,26 +1446,25 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            // Check access level
-            let access = state
-                .channel_access
-                .get(&sid)
-                .copied()
-                .unwrap_or(AccessLevel::ReadWrite);
-            if access != AccessLevel::ReadWrite {
-                if is_notify {
-                    let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                    resp.data_type = write_type as u16;
-                    resp.count = hdr.count;
-                    resp.cid = ECA_NOWTACCESS;
-                    resp.available = ioid;
-                    let mut w = writer.lock().await;
-                    w.write_all(&resp.to_bytes()).await?;
-                    // flush deferred to handle_client outer loop (batched)
+            // Round 44 type-state WRITE gate. `lookup_access` is
+            // the only path to the cache; the witness type ensures
+            // the matching ECA code reaches the wire.
+            let _write_grant = match state.lookup_access(sid).require_write() {
+                Ok(g) => g,
+                Err(denied) => {
+                    if is_notify {
+                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+                        resp.data_type = write_type as u16;
+                        resp.count = hdr.count;
+                        resp.cid = denied.eca_code();
+                        resp.available = ioid;
+                        let mut w = writer.lock().await;
+                        w.write_all(&resp.to_bytes()).await?;
+                    }
+                    state.audit("caput", &audit_pv, "", "denied").await;
+                    return Ok(());
                 }
-                state.audit("caput", &audit_pv, "", "denied").await;
-                return Ok(());
-            }
+            };
 
             let count = hdr.actual_count() as usize;
             let write_count = hdr.count; // Echo back in response (matches C EPICS)
@@ -1555,6 +1632,31 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         CA_PROTO_EVENT_ADD,
                         requested_type,
                         ECA_BADCHID,
+                        sub_id,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            // R38-G3 / Round 38: EVENT_ADD must also consult the
+            // channel's access_rights. A NoAccess peer mounting a
+            // subscription would receive every value update —
+            // identical leak to the round-32A `subscribe_raw` ACF
+            // bypass on the PVA side. C IOC's `event_add_NoAccess`
+            // returns ECA_NORDACCESS for the same reason.
+            // Round 44 type-state EVENT_ADD gate. R38-G3 closed the
+            // missing per-op check; the typed `require_read` shape
+            // is the path every future MONITOR-class op should
+            // mirror.
+            let _read_grant = match state.lookup_access(sid).require_read() {
+                Ok(g) => g,
+                Err(denied) => {
+                    send_cmd_error(
+                        writer,
+                        CA_PROTO_EVENT_ADD,
+                        requested_type,
+                        denied.eca_code(),
                         sub_id,
                     )
                     .await?;
@@ -1962,6 +2064,15 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
 
 /// Re-evaluate and re-send CA_PROTO_ACCESS_RIGHTS for all open channels.
 /// Called when hostname or username changes.
+///
+/// Round-39 (R39-G2): when a sid's new access flips to `NoAccess`,
+/// any subscriptions currently mounted on that sid must be torn
+/// down. Pre-fix the reeval only updated `channel_access` (and
+/// notified the client) — active EVENT_ADD subscribers kept
+/// receiving every update on the now-denied channel until the
+/// client noticed the access drop and issued EVENT_CANCEL. The C
+/// IOC cancels subscriptions in the same situation (see
+/// `cas_access_rights_change_callback`).
 async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
     state: &mut ClientState,
     writer: &Arc<Mutex<BufWriter<W>>>,
@@ -1969,28 +2080,56 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
     if state.channels.is_empty() {
         return Ok(());
     }
-    // Collect channel info first to avoid borrow conflict with compute_access
     let chan_info: Vec<(u32, u32, ChannelTarget)> = state
         .channels
         .iter()
         .map(|(&sid, entry)| (sid, entry.cid, entry.target.clone()))
         .collect();
 
-    let mut w = writer.lock().await;
-    for (sid, cid, target) in chan_info {
-        let new_access = state.compute_access(&target).await;
-        let new_level = match new_access {
-            3 => AccessLevel::ReadWrite,
-            1 => AccessLevel::Read,
-            _ => AccessLevel::NoAccess,
-        };
-        state.channel_access.insert(sid, new_level);
-        let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
-        ar.cid = cid;
-        ar.available = new_access;
-        w.write_all(&ar.to_bytes()).await?;
+    let mut denied_sids: Vec<u32> = Vec::new();
+    {
+        let mut w = writer.lock().await;
+        for (sid, cid, target) in chan_info {
+            let new_access = state.compute_access(&target).await;
+            let new_level = match new_access {
+                3 => AccessLevel::ReadWrite,
+                1 => AccessLevel::Read,
+                _ => AccessLevel::NoAccess,
+            };
+            state.channel_access.insert(sid, new_level);
+            if new_level == AccessLevel::NoAccess {
+                denied_sids.push(sid);
+            }
+            let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
+            ar.cid = cid;
+            ar.available = new_access;
+            w.write_all(&ar.to_bytes()).await?;
+        }
+        w.flush().await?;
     }
-    w.flush().await?;
+
+    // Tear down every subscription rooted in a now-denied channel.
+    if !denied_sids.is_empty() {
+        let revoked: Vec<u32> = state
+            .subscriptions
+            .iter()
+            .filter(|(_, s)| denied_sids.contains(&s.channel_sid))
+            .map(|(&id, _)| id)
+            .collect();
+        for sub_id in revoked {
+            if let Some(sub) = state.subscriptions.remove(&sub_id) {
+                sub.task.abort();
+                match &sub.target {
+                    ChannelTarget::SimplePv(pv) => {
+                        pv.remove_subscriber(sub.sub_id).await;
+                    }
+                    ChannelTarget::RecordField { record, .. } => {
+                        record.write().await.remove_subscriber(sub.sub_id);
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

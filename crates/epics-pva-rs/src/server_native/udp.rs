@@ -125,13 +125,18 @@ pub async fn run_udp_responder_with_config(
     // Resolve beacon destinations once at startup. pvxs re-resolves
     // on interface change but we keep it static for now; restart the
     // server to pick up new NICs.
+    //
+    // Round 26: when `auto_beacon=false` AND `destinations` is empty,
+    // the operator has explicitly opted out of broadcast beaconing
+    // (matching pvxs `EPICS_PVAS_AUTO_BEACON_ADDR_LIST=NO` semantics).
+    // Pre-fix this branch fell through to limited broadcast, leaking
+    // beacon frames against site policy. Mirror round-25 CA fix.
     let beacon_destinations: Vec<SocketAddr> = if !destinations.is_empty() {
         destinations
     } else if auto_beacon {
         crate::config::env::list_broadcast_addresses(udp_port)
     } else {
-        // Final fallback: limited broadcast.
-        vec![format!("255.255.255.255:{}", udp_port).parse().unwrap()]
+        Vec::new()
     };
     debug!(
         ?beacon_destinations,

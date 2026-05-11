@@ -7,6 +7,17 @@ license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true
 
+[lints.clippy]
+# `collapsible_if` is the dominant lint hit on bridge code — nested
+# `if let Some(...)` guards read naturally and chaining via `&&`
+# obscures intent. `field_reassign_with_default` and `type_complexity`
+# are isolated cases. Applied at Cargo.toml level so bin targets get
+# the same allows as the lib (lib.rs `#![allow]` does not propagate
+# to bin crates).
+collapsible_if = "allow"
+field_reassign_with_default = "allow"
+type_complexity = "allow"
+
 [features]
 default = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin"]
 # Record ↔ pvAccess channels (C++ QSRV equivalent)

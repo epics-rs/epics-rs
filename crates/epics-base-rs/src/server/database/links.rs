@@ -8,10 +8,16 @@ use crate::types::EpicsValue;
 use super::{PvDatabase, select_link_indices};
 
 /// Alarm state from a link source, used for MS/NMS propagation.
-#[derive(Clone, Copy, Debug)]
+///
+/// `amsg` is the alarm-message string — propagated from the source
+/// record's `common.amsg` so a downstream MS link sees the same
+/// human-readable explanation. Empty when the source has no message
+/// or when the link source is not a DB record.
+#[derive(Clone, Debug)]
 pub(crate) struct LinkAlarm {
     pub stat: u16,
     pub sevr: AlarmSeverity,
+    pub amsg: String,
 }
 
 impl PvDatabase {
@@ -46,6 +52,11 @@ impl PvDatabase {
                 };
                 self.get_pv(&pv_name).await.ok()
             }
+            // Hardware links are dispatched by device support directly
+            // — there's no canonical "value" available from a generic
+            // read; return None so the framework treats the link as
+            // unresolvable for value-read purposes.
+            crate::server::record::ParsedLink::Hw(_) => None,
         }
     }
 
@@ -62,12 +73,15 @@ impl PvDatabase {
                     format!("{}.{}", db.record, db.field)
                 };
                 let value = self.get_pv(&pv_name).await.ok();
-                // Read source record's alarm state
-                let alarm = if let Some(rec) = self.inner.records.read().await.get(&db.record) {
+                // Read source record's alarm state — alias-aware
+                // (epics-base PR #336) so a link target spelled with
+                // an alias still propagates MS/NMS alarm correctly.
+                let alarm = if let Some(rec) = self.get_record(&db.record).await {
                     let inst = rec.read().await;
                     Some(LinkAlarm {
                         stat: inst.common.stat,
                         sevr: inst.common.sevr,
+                        amsg: inst.common.amsg.clone(),
                     })
                 } else {
                     None
@@ -134,7 +148,10 @@ impl PvDatabase {
         let _ = self.put_pv(&target_name, value).await;
 
         if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
-            if let Some(target_rec) = self.inner.records.read().await.get(&link.record) {
+            // Alias-aware lookup: the link's target may be the alias
+            // form. `process_record_with_links` itself also resolves
+            // aliases at entry, so passing `link.record` raw is safe.
+            if let Some(target_rec) = self.get_record(&link.record).await {
                 let target_scan = target_rec.read().await.common.scan;
                 if target_scan == ScanType::Passive {
                     let _ = self
@@ -202,7 +219,33 @@ impl PvDatabase {
                         .get_field("SELN")
                         .and_then(|v| v.to_f64())
                         .unwrap_or(0.0) as i16;
-                    let val = instance.record.val();
+                    // IVOA / IVOV — invalid output handling, mirrors
+                    // epics-base PR #688. When the record's SEVR is
+                    // INVALID, IVOA selects: 0 = continue (use VAL as
+                    // before), 1 = don't drive (suppress all OUT*),
+                    // 2 = set outputs to IVOV.
+                    let raw_val = instance.record.val();
+                    let val =
+                        if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid {
+                            let ivoa = instance
+                                .record
+                                .get_field("IVOA")
+                                .and_then(|v| {
+                                    if let EpicsValue::Short(s) = v {
+                                        Some(s)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            match ivoa {
+                                1 => None, // suppress drive
+                                2 => instance.record.get_field("IVOV").or(raw_val),
+                                _ => raw_val, // 0 or unknown — Continue
+                            }
+                        } else {
+                            raw_val
+                        };
                     let links: Vec<String> = [
                         "OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH", "OUTI",
                         "OUTJ", "OUTK", "OUTL", "OUTM", "OUTN", "OUTO", "OUTP",
@@ -446,11 +489,27 @@ impl PvDatabase {
     }
 
     /// Register a CP link: when source_record changes, process target_record.
+    ///
+    /// Both names are normalised to canonical form so the cp_links
+    /// map's key/value always match the canonical record name that
+    /// `dispatch_cp_targets` uses for lookup. Without this, a user
+    /// who wrote `INP="ALIAS_NAME CP"` in their .db file would
+    /// register the CP edge under the alias key and then never see
+    /// the target processed (the source record's canonical-name
+    /// dispatch would miss).
     pub async fn register_cp_link(&self, source_record: &str, target_record: &str) {
+        let source = self
+            .resolve_alias(source_record)
+            .await
+            .unwrap_or_else(|| source_record.to_string());
+        let target = self
+            .resolve_alias(target_record)
+            .await
+            .unwrap_or_else(|| target_record.to_string());
         let mut cp = self.inner.cp_links.write().await;
-        let targets = cp.entry(source_record.to_string()).or_default();
-        if !targets.contains(&target_record.to_string()) {
-            targets.push(target_record.to_string());
+        let targets = cp.entry(source).or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
         }
     }
 

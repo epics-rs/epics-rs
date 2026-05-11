@@ -37,8 +37,8 @@ impl PvDatabase {
             return Ok(pv.get().await);
         }
 
-        // Check records — use resolve_field for 3-level priority
-        if let Some(rec) = self.inner.records.read().await.get(base) {
+        // Records — alias-aware via `get_record` (epics-base PR #336).
+        if let Some(rec) = self.get_record(base).await {
             let instance = rec.read().await;
             return instance
                 .resolve_field(&field)
@@ -60,8 +60,14 @@ impl PvDatabase {
             return Ok(());
         }
 
-        // Check records
-        if let Some(rec) = self.inner.records.read().await.get(base) {
+        // Records — alias-aware (epics-base PR #336).
+        if let Some(rec) = self.get_record(base).await {
+            // `base` may be an alias; resolve to the canonical record
+            // name so scan-index updates target the right entry.
+            let canonical_base: String = self
+                .resolve_alias(base)
+                .await
+                .unwrap_or_else(|| base.to_string());
             let mut instance = rec.write().await;
 
             // Coerce value to field's native type
@@ -119,7 +125,7 @@ impl PvDatabase {
                     phas,
                 } => {
                     drop(instance);
-                    self.update_scan_index(base, old_scan, new_scan, phas, phas)
+                    self.update_scan_index(&canonical_base, old_scan, new_scan, phas, phas)
                         .await;
                 }
                 CommonFieldPutResult::PhasChanged {
@@ -128,7 +134,8 @@ impl PvDatabase {
                     new_phas,
                 } => {
                     drop(instance);
-                    self.update_scan_index(base, s, s, old_phas, new_phas).await;
+                    self.update_scan_index(&canonical_base, s, s, old_phas, new_phas)
+                        .await;
                 }
                 CommonFieldPutResult::NoChange => {}
             }
@@ -192,7 +199,7 @@ impl PvDatabase {
             return Ok(());
         }
 
-        if let Some(rec) = self.inner.records.read().await.get(base) {
+        if let Some(rec) = self.get_record(base).await {
             let mut instance = rec.write().await;
 
             // Type coercion
@@ -282,13 +289,24 @@ impl PvDatabase {
     ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
         let field = field.to_ascii_uppercase();
 
-        // Get record Arc
-        let rec = {
-            let records = self.inner.records.read().await;
-            records
-                .get(record_name)
-                .cloned()
-                .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?
+        // Get record Arc — alias-aware (epics-base PR #336) so a CA
+        // client that connects via an alias name can put fields on
+        // the canonical record.
+        let rec = self
+            .get_record(record_name)
+            .await
+            .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
+        // Normalise to the canonical name for the rest of this
+        // function — every subsequent call (PACT/LCNT lookup,
+        // `process_record_with_links`, `update_scan_index`) uses the
+        // raw records map and would miss when `record_name` is an
+        // alias. Resolve once up front.
+        let canonical_owned;
+        let record_name: &str = if let Some(target) = self.resolve_alias(record_name).await {
+            canonical_owned = target;
+            &canonical_owned
+        } else {
+            record_name
         };
 
         // Special field intercepts (read lock, then drop)
@@ -534,7 +552,8 @@ impl PvDatabase {
             return Ok(());
         }
 
-        if let Some(rec) = self.inner.records.read().await.get(base) {
+        // Records — alias-aware (epics-base PR #336).
+        if let Some(rec) = self.get_record(base).await {
             let mut instance = rec.write().await;
             match instance.record.put_field(&field, value.clone()) {
                 Ok(()) => {}
@@ -567,7 +586,7 @@ mod tests {
     #[tokio::test]
     async fn put_pv_and_post_handles_simple_pv() {
         let db = PvDatabase::new();
-        db.add_pv("gw:test", EpicsValue::Double(0.0)).await;
+        db.add_pv("gw:test", EpicsValue::Double(0.0)).await.unwrap();
 
         // Should NOT return ChannelNotFound.
         db.put_pv_and_post("gw:test", EpicsValue::Double(42.0))
@@ -577,5 +596,75 @@ mod tests {
         // Value actually landed.
         let pv = db.find_pv("gw:test").await.expect("PV exists");
         assert!(matches!(pv.get().await, EpicsValue::Double(v) if v == 42.0));
+    }
+
+    /// Round-10 regression: `get_pv`, `put_pv`, `put_pv_and_post`,
+    /// and `put_pv_no_process` all bypassed `get_record` and walked
+    /// `self.inner.records` directly, so alias names from epics-base
+    /// PR #336 silently returned `ChannelNotFound`. Round-7 closed
+    /// `get_record` but the same defect was hiding in field_io.rs.
+    /// All four CA-server-and-bridge entry points must accept aliases.
+    #[tokio::test]
+    async fn field_io_entry_points_accept_aliases() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("CANON", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_alias("ALT", "CANON").await.unwrap();
+
+        // get_pv via alias
+        db.put_pv("CANON.VAL", EpicsValue::Double(1.5))
+            .await
+            .unwrap();
+        let v = db.get_pv("ALT.VAL").await.unwrap();
+        assert!(matches!(v, EpicsValue::Double(x) if x == 1.5));
+
+        // put_pv via alias
+        db.put_pv("ALT.VAL", EpicsValue::Double(7.0)).await.unwrap();
+        let v = db.get_pv("CANON.VAL").await.unwrap();
+        assert!(matches!(v, EpicsValue::Double(x) if x == 7.0));
+
+        // put_pv_and_post via alias
+        db.put_pv_and_post("ALT.VAL", EpicsValue::Double(11.0))
+            .await
+            .unwrap();
+        let v = db.get_pv("CANON.VAL").await.unwrap();
+        assert!(matches!(v, EpicsValue::Double(x) if x == 11.0));
+
+        // put_pv_no_process via alias
+        db.put_pv_no_process("ALT.VAL", EpicsValue::Double(13.0))
+            .await
+            .unwrap();
+        let v = db.get_pv("ALT.VAL").await.unwrap();
+        assert!(matches!(v, EpicsValue::Double(x) if x == 13.0));
+    }
+
+    /// Round-10 regression: `put_record_field_from_ca` (the CA
+    /// server's main put fast path) must accept aliases. Pre-fix it
+    /// only consulted `inner.records` directly. Also exercises the
+    /// canonical-name normalisation that protects subsequent
+    /// `process_record_with_links` / `update_scan_index` calls.
+    #[tokio::test]
+    async fn put_record_field_from_ca_accepts_alias() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("CANON", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_alias("ALT", "CANON").await.unwrap();
+
+        // Put VAL via the alias name.
+        let _ = db
+            .put_record_field_from_ca("ALT", "VAL", EpicsValue::Double(2.5))
+            .await
+            .expect("put via alias must succeed");
+
+        // Read back via canonical to confirm the value landed on the
+        // right record.
+        let v = db.get_pv("CANON.VAL").await.unwrap();
+        assert!(matches!(v, EpicsValue::Double(x) if x == 2.5));
     }
 }

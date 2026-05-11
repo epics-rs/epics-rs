@@ -286,7 +286,7 @@ impl SearchEngineState {
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn run_search_engine(
-    mut addr_list: Vec<SocketAddr>,
+    mut addr_list: Vec<super::AddrEntry>,
     nameserver_addrs: Vec<SocketAddr>,
     mut request_rx: mpsc::UnboundedReceiver<SearchRequest>,
     response_tx: mpsc::UnboundedSender<SearchResponse>,
@@ -309,9 +309,22 @@ pub(crate) async fn run_search_engine(
     // queued via tcp_response_tx for the main loop to process through
     // the shared handle_udp_response parser.
     let (tcp_response_tx, mut tcp_response_rx) = mpsc::unbounded_channel::<ParsedDatagram>();
-    let mut nameserver_send_txs: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
+    // Reproducer for Launchpad bug #739789: pre-fix, this was an
+    // unbounded mpsc — when the nameserver TCP socket was unresponsive
+    // the per-tick search frames piled up indefinitely (each frame
+    // ~MAX_UDP_SEND bytes), eventually consuming process memory. Use
+    // a bounded mpsc so a stuck TCP peer drops messages instead of
+    // leaking. Cap is per-nameserver, not global. Override via
+    // EPICS_CA_NAMESERVER_QUEUE_DEPTH; default 256 is large enough to
+    // ride out a few-second TCP stall without observable search loss
+    // and small enough to bound RSS at a few MB worst-case.
+    let ns_queue_cap = epics_base_rs::runtime::env::get("EPICS_CA_NAMESERVER_QUEUE_DEPTH")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(256)
+        .max(8);
+    let mut nameserver_send_txs: Vec<mpsc::Sender<Vec<u8>>> = Vec::new();
     for addr in nameserver_addrs {
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(ns_queue_cap);
         nameserver_send_txs.push(tx);
         let resp_tx = tcp_response_tx.clone();
         epics_base_rs::runtime::task::spawn(async move {
@@ -328,6 +341,22 @@ pub(crate) async fn run_search_engine(
     let mut tick = interval(NORMAL_TICK);
     tick.tick().await; // skip immediate fire
     let mut tick_is_fast = false;
+
+    // Round 50 (R50-G2): periodic DNS refresh for `EPICS_CA_ADDR_LIST`
+    // entries whose `hostname` was set at startup (i.e. non-IP-literal
+    // entries). On each tick the engine walks `addr_list` and calls
+    // `AddrEntry::refresh_dns`; a changed resolution updates the
+    // entry's `sock` so subsequent `fire_searches` use the new IP.
+    // Period is operator-tunable via `EPICS_CA_DNS_REFRESH_SECS`;
+    // default 60 s balances responsiveness against DNS load. Literal
+    // IP entries (`hostname == None`) short-circuit inside
+    // `refresh_dns` so the cost is bounded by hostname count.
+    let dns_refresh_secs: u64 = epics_base_rs::runtime::env::get("EPICS_CA_DNS_REFRESH_SECS")
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u64| n > 0)
+        .unwrap_or(60);
+    let mut dns_refresh = interval(Duration::from_secs(dns_refresh_secs));
+    dns_refresh.tick().await; // skip immediate fire
 
     loop {
         tokio::select! {
@@ -369,6 +398,37 @@ pub(crate) async fn run_search_engine(
                     state.fast_ticks_remaining -= 1;
                 }
             }
+
+            _ = dns_refresh.tick() => {
+                // R50-G2: re-resolve every hostname entry. The
+                // `refresh_dns()` call is a no-op for IP-literal
+                // entries; for DNS entries it does a fresh
+                // `to_socket_addrs()` and replaces the cached IP
+                // when it differs. We log changes at info-level so
+                // operators can correlate an IOC migration with
+                // the client's discovery of the new address.
+                for entry in addr_list.iter_mut() {
+                    let prev_sock = entry.sock;
+                    match entry.refresh_dns() {
+                        Ok(new_sock) if new_sock != prev_sock => {
+                            tracing::info!(
+                                hostname = ?entry.hostname,
+                                old = %prev_sock,
+                                new = %new_sock,
+                                "ca-rs: EPICS_CA_ADDR_LIST entry re-resolved"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                hostname = ?entry.hostname,
+                                error = %e,
+                                "ca-rs: DNS refresh failed; keeping cached IP"
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Tick-cadence transitions are evaluated outside the select! arm so
@@ -393,7 +453,7 @@ pub(crate) async fn run_search_engine(
 /// failure.
 async fn run_nameserver_connection(
     addr: SocketAddr,
-    mut outgoing_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::UnboundedSender<ParsedDatagram>,
 ) {
     let mut backoff = Duration::from_secs(1);
@@ -543,22 +603,42 @@ async fn run_nameserver_connection(
 /// Wrapper that handles the address-list mutation variants
 /// inline (they need mutable access to `addr_list` which
 /// `handle_request` doesn't have) and delegates everything else.
+///
+/// Round 50 (R50-G2): `addr_list` is `Vec<AddrEntry>` so the
+/// engine carries the original hostname (if any) for DNS
+/// re-resolution. Programmatic adds via `SearchRequest::AddAddress`
+/// arrive as `SocketAddr` (no hostname context) and are wrapped
+/// as `AddrEntry` with `hostname=None` — they're effectively IP
+/// literals on the wire.
 fn handle_request_or_addr(
     state: &mut SearchEngineState,
-    addr_list: &mut Vec<SocketAddr>,
+    addr_list: &mut Vec<super::AddrEntry>,
     req: SearchRequest,
 ) -> Option<u32> {
     match req {
         SearchRequest::AddAddress(addr) => {
-            if !addr_list.contains(&addr) {
-                addr_list.push(addr);
+            if !addr_list.iter().any(|e| e.sock == addr) {
+                let port = match addr {
+                    SocketAddr::V4(a) => a.port(),
+                    SocketAddr::V6(a) => a.port(),
+                };
+                addr_list.push(super::AddrEntry::new(addr, None, port));
                 tracing::info!(?addr, "ca-rs: addr_list += (programmatic)");
             }
             None
         }
         SearchRequest::SetAddressList(list) => {
             tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
-            *addr_list = list;
+            *addr_list = list
+                .into_iter()
+                .map(|sock| {
+                    let port = match sock {
+                        SocketAddr::V4(a) => a.port(),
+                        SocketAddr::V6(a) => a.port(),
+                    };
+                    super::AddrEntry::new(sock, None, port)
+                })
+                .collect();
             None
         }
         other => handle_request(state, other),
@@ -823,9 +903,9 @@ fn handle_udp_response(
 /// the fact; the bucket scheduler prevents storms by construction.
 async fn process_bucket(
     state: &mut SearchEngineState,
-    addr_list: &[SocketAddr],
+    addr_list: &[super::AddrEntry],
     socket: &AsyncUdpV4,
-    nameserver_txs: &[mpsc::UnboundedSender<Vec<u8>>],
+    nameserver_txs: &[mpsc::Sender<Vec<u8>>],
 ) {
     let now = Instant::now();
 
@@ -902,9 +982,9 @@ async fn process_bucket(
 async fn fire_searches(
     state: &mut SearchEngineState,
     cids: &[u32],
-    addr_list: &[SocketAddr],
+    addr_list: &[super::AddrEntry],
     socket: &AsyncUdpV4,
-    nameserver_txs: &[mpsc::UnboundedSender<Vec<u8>>],
+    nameserver_txs: &[mpsc::Sender<Vec<u8>>],
 ) {
     state.dgram_seq = state.dgram_seq.wrapping_add(1);
     let version_hdr = {
@@ -942,18 +1022,18 @@ async fn fire_searches(
         if current_frame.len() + payload.len() > MAX_UDP_SEND
             && current_frame.len() > CaHeader::SIZE
         {
-            for addr in addr_list {
+            for entry in addr_list {
                 send_with_fanout(
                     socket,
                     &current_frame,
-                    *addr,
+                    entry.sock,
                     "bucket",
                     &mut state.send_errors,
                 )
                 .await;
             }
             for ns_tx in nameserver_txs {
-                let _ = ns_tx.send(current_frame.clone());
+                ns_try_send(ns_tx, current_frame.clone());
             }
             current_frame.clear();
             current_frame.extend_from_slice(&version_hdr);
@@ -964,11 +1044,11 @@ async fn fire_searches(
             let mut solo = Vec::with_capacity(CaHeader::SIZE + payload.len());
             solo.extend_from_slice(&version_hdr);
             solo.extend_from_slice(&payload);
-            for addr in addr_list {
-                send_with_fanout(socket, &solo, *addr, "solo", &mut state.send_errors).await;
+            for entry in addr_list {
+                send_with_fanout(socket, &solo, entry.sock, "solo", &mut state.send_errors).await;
             }
             for ns_tx in nameserver_txs {
-                let _ = ns_tx.send(solo.clone());
+                ns_try_send(ns_tx, solo.clone());
             }
         } else {
             current_frame.extend_from_slice(&payload);
@@ -977,18 +1057,39 @@ async fn fire_searches(
 
     // Flush the final frame.
     if current_frame.len() > CaHeader::SIZE {
-        for addr in addr_list {
+        for entry in addr_list {
             send_with_fanout(
                 socket,
                 &current_frame,
-                *addr,
+                entry.sock,
                 "flush",
                 &mut state.send_errors,
             )
             .await;
         }
         for ns_tx in nameserver_txs {
-            let _ = ns_tx.send(current_frame.clone());
+            ns_try_send(ns_tx, current_frame.clone());
+        }
+    }
+}
+
+/// Drop-on-full helper for nameserver TCP send queues. Mirrors libca
+/// behavior under TCP stall: bounded queue, drop excess, log + bump
+/// the metric so operators can see queue pressure. Lp #739789.
+fn ns_try_send(ns_tx: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>) {
+    use tokio::sync::mpsc::error::TrySendError;
+    match ns_tx.try_send(frame) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            metrics::counter!("ca_client_nameserver_queue_drops_total").increment(1);
+            tracing::warn!(
+                "EPICS_CA_NAME_SERVERS queue full — dropping search frame \
+                 (peer is slow/unresponsive; raise EPICS_CA_NAMESERVER_QUEUE_DEPTH \
+                 if the peer is healthy)"
+            );
+        }
+        Err(TrySendError::Closed(_)) => {
+            // Receiver task exited — nothing more we can do here.
         }
     }
 }
@@ -1032,6 +1133,40 @@ mod tests {
                 reason: SearchReason::Initial,
             },
         );
+    }
+
+    /// Reproducer for Launchpad bug #739789 (TCP nameserver send queue
+    /// memory leak): a stuck/slow TCP peer caused libca's `sendQue` to
+    /// grow unbounded as the UDP search agent kept pushing frames.
+    /// In epics-rs the nameserver-send channel is now bounded via
+    /// `EPICS_CA_NAMESERVER_QUEUE_DEPTH` (default 256), and
+    /// `ns_try_send` drops the frame instead of blocking or queuing.
+    /// This test exercises the helper directly: with a 2-slot channel
+    /// and no consumer, the third send must drop.
+    #[tokio::test]
+    async fn nameserver_queue_drops_when_full_no_leak() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2);
+        ns_try_send(&tx, vec![1, 2, 3]);
+        ns_try_send(&tx, vec![4, 5, 6]);
+        // Capacity is exhausted — third call must drop, not block.
+        ns_try_send(&tx, vec![7, 8, 9]);
+        // Drain: only the first two frames are present. The third was
+        // dropped, not queued — that is the regression guard.
+        assert_eq!(rx.try_recv().unwrap(), vec![1, 2, 3]);
+        assert_eq!(rx.try_recv().unwrap(), vec![4, 5, 6]);
+        assert!(
+            rx.try_recv().is_err(),
+            "third frame must be dropped, not queued (lp #739789)"
+        );
+    }
+
+    #[tokio::test]
+    async fn nameserver_queue_handles_closed_receiver() {
+        // Receiver dropped — ns_try_send must not panic.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(2);
+        drop(rx);
+        ns_try_send(&tx, vec![1, 2, 3]);
+        // Reaching this line means the call did not panic.
     }
 
     #[test]
@@ -1401,7 +1536,11 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine_handle = tokio::spawn(run_search_engine(
-            vec![sniffer_addr],
+            vec![crate::client::AddrEntry::new(
+                sniffer_addr,
+                None,
+                sniffer_addr.port(),
+            )],
             Vec::new(),
             req_rx,
             resp_tx,
@@ -1482,7 +1621,11 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine_handle = tokio::spawn(run_search_engine(
-            vec![sniffer_addr],
+            vec![crate::client::AddrEntry::new(
+                sniffer_addr,
+                None,
+                sniffer_addr.port(),
+            )],
             Vec::new(),
             req_rx,
             resp_tx,

@@ -276,7 +276,7 @@ impl IocApplication {
 
         // Add inline records (Phase 7 declarative builder)
         for (name, record) in inline_records {
-            db.add_record(&name, record).await;
+            db.add_record(&name, record).await?;
         }
 
         // Phase 1: Execute startup script in a separate std::thread.
@@ -348,6 +348,31 @@ impl IocApplication {
         let io_intr_count = setup_io_intr(db.clone()).await;
         db.setup_cp_links().await;
 
+        // Phase 2b.5: wait for external CA/PVA links to connect before
+        // PINI runs (epics-base PR #768/#856 — `dbCa: iocInit wait`).
+        // Default 10s timeout, override via `EPICS_RS_INIT_LINK_TIMEOUT`
+        // (seconds, fractional accepted). Pass-through when no LinkSet
+        // is registered.
+        let link_wait_secs = crate::runtime::env::get("EPICS_RS_INIT_LINK_TIMEOUT")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(10.0)
+            .max(0.0);
+        if link_wait_secs > 0.0 {
+            let (connected, total) = db
+                .wait_for_external_links(std::time::Duration::from_secs_f64(link_wait_secs))
+                .await;
+            if total > 0 {
+                if connected == total {
+                    eprintln!("iocInit: {connected}/{total} external links connected");
+                } else {
+                    eprintln!(
+                        "iocInit: {connected}/{total} external links connected after \
+                         {link_wait_secs}s — proceeding with unconnected links"
+                    );
+                }
+            }
+        }
+
         // Phase 2c: Pass1 restore (after device support wiring)
         for sav_path in &pass1_files {
             match autosave::restore_from_file(&db, sav_path).await {
@@ -390,6 +415,43 @@ impl IocApplication {
             "iocInit: {total_records} records, {record_count} with device support, {io_intr_count} I/O Intr"
         );
 
+        // Phase 2e: drain `afterIocRunning` queue (epics-base PR #558).
+        // Each line is an iocsh command queued by the startup script;
+        // execute through a fresh shell so post-init state (including
+        // PINI side effects) is visible. Both built-in iocsh commands
+        // AND every user-registered `shell_commands` entry are
+        // re-registered on this shell (CommandDef now `Clone`-able)
+        // so site-specific names like `motorReport` are addressable
+        // from the post-init queue.
+        let pending = db.take_after_ioc_running();
+        if !pending.is_empty() {
+            let db1 = db.clone();
+            let h1 = handle.clone();
+            let shell_cmds_clone = shell_commands.clone();
+            let (tx, rx) = crate::runtime::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("iocsh-after-ioc-running".into())
+                .spawn(move || {
+                    let shell = iocsh::IocShell::new(db1, h1);
+                    for cmd in shell_cmds_clone {
+                        shell.register(cmd);
+                    }
+                    let mut errs: Vec<String> = Vec::new();
+                    for line in pending {
+                        if let Err(e) = shell.execute_line(&line) {
+                            errs.push(format!("{line}: {e}"));
+                        }
+                    }
+                    let _ = tx.send(errs);
+                })
+                .expect("failed to spawn afterIocRunning thread");
+            if let Ok(errs) = rx.await {
+                for e in errs {
+                    eprintln!("afterIocRunning: {e}");
+                }
+            }
+        }
+
         // Phase 3: Hand off to protocol runner
         let config = IocRunConfig {
             db,
@@ -431,6 +493,13 @@ pub(crate) async fn wire_device_support(
                 };
                 if let Some(mut dev) = dev_opt {
                     dev.set_record_info(&name, instance.common.scan);
+                    // Forward info(...) tags to the driver — mirrors
+                    // the IocBuilder build path (round-6 fix). Without
+                    // this, IocApplication startup-script flows that
+                    // load records via iocsh `dbLoadRecords` and rely
+                    // on this batch wiring stage drop tags like
+                    // `asyn:READBACK` on the floor.
+                    dev.apply_record_info(&instance.info);
                     let init_ok = dev.init(&mut *instance.record).is_ok();
                     // Clear UDF if init successfully set a value (e.g. initial readback)
                     if init_ok && instance.record.val().is_some() {
@@ -540,10 +609,87 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("TEST", Box::new(AiRecord::new(0.0))).await;
+        db.add_record("TEST", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
 
         let factories = HashMap::new();
         let count = wire_device_support(&db, &factories, &None).await.unwrap();
         assert_eq!(count, 0); // No DTYP set, so no wiring
+    }
+
+    /// Round-8 regression: `wire_device_support` (the IocApplication
+    /// startup-script device-support attach path) MUST forward
+    /// info(...) tags to the driver via `apply_record_info`. Round-6
+    /// only patched the IocBuilder path; without this fix, IOCs
+    /// loaded entirely through iocsh `dbLoadRecords` lose every
+    /// `info()` tag the driver depends on (e.g. asyn `asyn:READBACK`).
+    #[tokio::test]
+    async fn wire_device_support_forwards_info_tags_to_driver() {
+        use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
+        use crate::server::record::ScanType;
+        use crate::server::records::ai::AiRecord;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        // Recording device support — captures the info map it received
+        // via apply_record_info so the test can assert on its contents.
+        struct RecordingDev {
+            seen: StdArc<StdMutex<HashMap<String, String>>>,
+        }
+        impl DeviceSupport for RecordingDev {
+            fn write(&mut self, _record: &mut dyn crate::server::record::Record) -> CaResult<()> {
+                Ok(())
+            }
+            fn dtyp(&self) -> &str {
+                "TestRecording"
+            }
+            fn read(
+                &mut self,
+                _record: &mut dyn crate::server::record::Record,
+            ) -> CaResult<DeviceReadOutcome> {
+                Ok(DeviceReadOutcome::ok())
+            }
+            fn apply_record_info(&mut self, info: &HashMap<String, String>) {
+                let mut g = self.seen.lock().unwrap();
+                *g = info.clone();
+            }
+            fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
+        }
+
+        let seen = StdArc::new(StdMutex::new(HashMap::<String, String>::new()));
+        let seen_factory = seen.clone();
+        let mut factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
+        factories.insert(
+            "TestRecording".to_string(),
+            Box::new(move || {
+                Box::new(RecordingDev {
+                    seen: seen_factory.clone(),
+                })
+            }),
+        );
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:WITH:INFO", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // Populate the record's info map — exactly what
+        // IocBuilder/iocsh now do after loading info(...) directives.
+        let rec = db.get_record("AI:WITH:INFO").await.unwrap();
+        {
+            let mut inst = rec.write().await;
+            inst.common.dtyp = "TestRecording".to_string();
+            inst.set_info("asyn:READBACK", "1");
+            inst.set_info("Q:group", "demo");
+        }
+
+        let count = wire_device_support(&db, &factories, &None).await.unwrap();
+        assert_eq!(count, 1, "device support must have attached");
+
+        // The recording driver should have observed both tags via
+        // apply_record_info — proves the round-6 hook fires from the
+        // IocApplication batch-wiring path too.
+        let observed = seen.lock().unwrap().clone();
+        assert_eq!(observed.get("asyn:READBACK").map(String::as_str), Some("1"));
+        assert_eq!(observed.get("Q:group").map(String::as_str), Some("demo"));
     }
 }

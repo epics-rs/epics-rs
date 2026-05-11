@@ -1339,7 +1339,24 @@ async fn handle_op(
 
     match kind {
         OpKind::Get => {
-            let value = match source.get_value(&ch.name).await {
+            // Round 41: type-state ACF gate. The wire layer mints the
+            // [`AccessChecked`] token via the source's per-instance
+            // [`AccessGate`]; the source's `get_value_checked` then
+            // refuses to proceed when the level is `NoAccess`. The
+            // token is unforgeable outside the gate, so adding a new
+            // wire op without going through the gate is a compile
+            // error against the trait method signature.
+            let ctx = crate::server_native::source::ChannelContext {
+                peer,
+                account: cred.account.clone(),
+                method: cred.method.clone(),
+                host: cred.host.clone(),
+            };
+            let checked = source
+                .access_gate()
+                .check(&ch.name, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            let value = match source.get_value_checked(checked, ctx).await {
                 Some(v) => v,
                 None => {
                     send_op_error(tx, OpKind::Get, ioid, "PV not found", order).await?;
@@ -1373,34 +1390,74 @@ async fn handle_op(
             let value = decode_pv_field(&intro, &mut cur, order)
                 .map_err(|e| PvaError::Decode(e.to_string()))?;
             let pv_name = ch.name.clone();
-            // PG-G10: forward the downstream peer's credentials to
-            // the source so gateways can route the put through a
-            // per-credential upstream client pool. Default trait impl
-            // ignores the ctx so non-gateway sources are unaffected.
+            // Round 42: type-state PUT gate. The token's
+            // `allows_write()` is checked by `put_value_checked`;
+            // adding a new PUT-equivalent handler without taking a
+            // token through `source.access().check(...)` is a compile
+            // error on the trait method signature.
             let ctx = crate::server_native::source::ChannelContext {
                 peer,
                 account: cred.account.clone(),
                 method: cred.method.clone(),
                 host: cred.host.clone(),
             };
-            let result = source.put_value_ctx(&pv_name, value, ctx).await;
+            let checked = source
+                .access_gate()
+                .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            let result = source.put_value_checked(checked, value, ctx.clone()).await;
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
             payload.put_u8(0x00);
             match result {
                 Ok(()) => {
-                    Status::ok().write_into(order, &mut payload);
                     // PUT_GET (subcmd bit 0x40 set on the request): client
                     // wants the post-put value back. Per pvxs serverget.cpp:103
                     // the response carries `bitset + partial value` after the
-                    // status.
+                    // status. Readback must be credential-aware so a peer
+                    // with READ-only or NoAccess on its ASG does not see
+                    // a leaked value through the PUT_GET return path.
                     if subcmd & 0x40 != 0 {
-                        if let Some(v) = source.get_value(&pv_name).await {
-                            let bits = BitSet::all_set(intro.total_bits());
-                            bits.write_into(order, &mut payload);
-                            encode_pv_field(&v, &intro, order, &mut payload);
+                        // R31-G7 / Round-32B: build the readback FIRST,
+                        // then write status. If the READ check fails
+                        // (ACF denies READ even though PUT was allowed —
+                        // e.g. WRITE-only ASG), we MUST NOT emit
+                        // `status_ok` followed by no bytes — that
+                        // truncates the wire and the client decoder
+                        // expects a bitset+value to follow. Instead,
+                        // emit an all-zero bitset (no fields changed)
+                        // alongside the OK status: client decodes
+                        // zero fields, no value bytes consumed, PUT
+                        // reported successful — same wire shape as a
+                        // "put committed but no field deltas to
+                        // report" response.
+                        //
+                        // Round 42 type-state: re-check via the gate
+                        // for the READ leg. The PUT's token was
+                        // consumed by `put_value_checked`; we mint a
+                        // fresh one against the SAME `(pv, ctx)`.
+                        let read_checked = source
+                            .access_gate()
+                            .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+                            .await;
+                        match source.get_value_checked(read_checked, ctx).await {
+                            Some(v) => {
+                                Status::ok().write_into(order, &mut payload);
+                                let bits = BitSet::all_set(intro.total_bits());
+                                bits.write_into(order, &mut payload);
+                                encode_pv_field(&v, &intro, order, &mut payload);
+                            }
+                            None => {
+                                Status::ok().write_into(order, &mut payload);
+                                let empty = BitSet::with_capacity(intro.total_bits());
+                                empty.write_into(order, &mut payload);
+                                // No encode_pv_field — bitset.count()==0
+                                // means zero partial fields follow.
+                            }
                         }
+                    } else {
+                        Status::ok().write_into(order, &mut payload);
                     }
                 }
                 Err(msg) => Status::error(msg).write_into(order, &mut payload),
@@ -1477,6 +1534,49 @@ async fn handle_op(
                 let src = source.clone();
                 let queue_depth = config.monitor_queue_depth;
                 let high_watermark = config.monitor_high_watermark;
+                // ACF-aware MONITOR: capture the peer's credentials
+                // so the spawned task can consult ctx-aware
+                // subscribe/get_value paths. Sources without ACF
+                // delegate to the legacy methods.
+                let mon_ctx = crate::server_native::source::ChannelContext {
+                    peer,
+                    account: cred.account.clone(),
+                    method: cred.method.clone(),
+                    host: cred.host.clone(),
+                };
+                // Round 42 + R49-G1: type-state MONITOR gate.
+                //
+                // Capture the ACL generation BEFORE the check.
+                // This guarantees the captured version is `≤` the
+                // version under which the resulting `AccessChecked`
+                // was minted: if a reload bumps the version between
+                // the capture and the check, the check runs under
+                // the new policy and the captured (older) version
+                // is below the live version, so the forwarding loop
+                // detects the mismatch on its next event and
+                // re-checks. The reverse order (check then capture)
+                // could combine an "old allow" token with a "new
+                // version", causing the loop to think it was
+                // already synced under the new policy and never
+                // re-check.
+                //
+                // Wrapped in `Arc<AtomicU64>` so a successful
+                // re-check inside the spawned loop can advance the
+                // surviving peer's "current" generation without
+                // re-checking on every subsequent event.
+                let mon_acl_version_at_subscribe_cell = Arc::new(
+                    std::sync::atomic::AtomicU64::new(source.access_gate().acl_version()),
+                );
+                let mon_checked = source
+                    .access_gate()
+                    .check(
+                        &pv_name,
+                        &mon_ctx.host,
+                        &mon_ctx.account,
+                        &mon_ctx.method,
+                        "",
+                    )
+                    .await;
                 // Snapshot the window + notify so the spawned task can
                 // share state with this dispatch path's ACK handler.
                 let (window, window_notify, paused_flag) = ch
@@ -1515,13 +1615,62 @@ async fn handle_op(
                     // forward. Falls back to the decoded path on
                     // byte-order mismatch or when the source returns
                     // None.
-                    if raw_path_eligible && let Some(mut rx_raw) = src.subscribe_raw(&pv_name).await
+                    // R31-G6 / Round-32A: raw fast path must consult
+                    // the ACF too. The round-29 ACL gate covered
+                    // `subscribe_ctx` only; ACF-aware sources can now
+                    // override `subscribe_raw_ctx` to deny when the
+                    // peer lacks READ. When the gateway denies (returns
+                    // None), we fall through to the decoded
+                    // `subscribe_ctx` below — which is also ACF-gated
+                    // and will likewise return None.
+                    if raw_path_eligible
+                        && let Some(mut rx_raw) = src
+                            .subscribe_raw_checked(mon_checked.clone(), mon_ctx.clone())
+                            .await
                     {
+                        // R49-G1: revalidate ACL BEFORE sending the
+                        // initial snapshot. Between the spawn's
+                        // initial `check()` and reaching this point
+                        // a reload could have flipped the peer to
+                        // NoAccess; without this gate the initial
+                        // would be emitted under stale policy. The
+                        // recv loop below performs the same check
+                        // on every subsequent event.
+                        let live_v0 = src.access_gate().acl_version();
+                        if live_v0
+                            != mon_acl_version_at_subscribe_cell
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            // R50 audit-3: route the re-check
+                            // through the source's
+                            // `revalidate_read` owner so composite
+                            // sources resolve to the MATCHED inner
+                            // source's gate (the one that served
+                            // the original subscription), not the
+                            // composite's permissive aggregator
+                            // gate.
+                            if src
+                                .revalidate_read(&pv_name, mon_ctx.clone())
+                                .await
+                                .is_none()
+                            {
+                                let finish = build_monitor_finish(ioid, order);
+                                let _ = tx_clone.send(finish).await;
+                                return;
+                            }
+                            mon_acl_version_at_subscribe_cell
+                                .store(live_v0, std::sync::atomic::Ordering::Release);
+                        }
                         // Emit initial snapshot via the regular
                         // encode path (no raw bytes for the
                         // first-event seed; the cache may not have
-                        // them yet).
-                        if let Some(initial) = src.get_value(&pv_name).await {
+                        // them yet). ACF-aware: a peer with NoAccess
+                        // on this PV's ASG sees no initial frame
+                        // through the raw fast path either.
+                        if let Some(initial) = src
+                            .get_value_checked(mon_checked.clone(), mon_ctx.clone())
+                            .await
+                        {
                             let payload = build_monitor_payload(
                                 ioid,
                                 &intro_clone,
@@ -1534,6 +1683,35 @@ async fn handle_op(
                             }
                         }
                         while let Some(ev) = rx_raw.recv().await {
+                            // R48-G3 + R50 audit-3: ACL re-check on
+                            // policy reload. The version compare uses
+                            // the source's aggregate (composite =
+                            // wrapping-sum of inner versions); the
+                            // re-check is routed through
+                            // `revalidate_read` so composite sources
+                            // resolve to the matched inner gate
+                            // instead of the permissive aggregator
+                            // gate.
+                            let live_v = src.access_gate().acl_version();
+                            if live_v
+                                != mon_acl_version_at_subscribe_cell
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                if src
+                                    .revalidate_read(&pv_name, mon_ctx.clone())
+                                    .await
+                                    .is_none()
+                                {
+                                    let finish = build_monitor_finish(ioid, order);
+                                    let _ = tx_clone.send(finish).await;
+                                    return;
+                                }
+                                // Survive — resync the version so we
+                                // don't re-check on every event under
+                                // the new policy.
+                                mon_acl_version_at_subscribe_cell
+                                    .store(live_v, std::sync::atomic::Ordering::Release);
+                            }
                             // Refuse the fast path on byte-order
                             // mismatch (cross-host gateway, rare).
                             // Falling back means re-decoding to
@@ -1562,12 +1740,45 @@ async fn handle_op(
                         return;
                     }
 
-                    let Some(mut rx) = src.subscribe(&pv_name).await else {
+                    let Some(mut rx) = src
+                        .subscribe_checked(mon_checked.clone(), mon_ctx.clone())
+                        .await
+                    else {
                         return;
                     };
                     let mut over_high = false;
-                    // Emit initial snapshot.
-                    if let Some(initial) = src.get_value(&pv_name).await {
+                    // R49-G1 + R50 audit-3: revalidate ACL BEFORE
+                    // sending the initial snapshot on the decoded
+                    // path. The re-check is routed through
+                    // `revalidate_read` so composite sources resolve
+                    // to the matched inner gate.
+                    {
+                        let live_v0 = src.access_gate().acl_version();
+                        if live_v0
+                            != mon_acl_version_at_subscribe_cell
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            if src
+                                .revalidate_read(&pv_name, mon_ctx.clone())
+                                .await
+                                .is_none()
+                            {
+                                let finish = build_monitor_finish(ioid, order);
+                                let _ = tx_clone.send(finish).await;
+                                return;
+                            }
+                            mon_acl_version_at_subscribe_cell
+                                .store(live_v0, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    // Emit initial snapshot via the ACF-aware path —
+                    // a peer with NoAccess on the record's ASG sees
+                    // nothing; legacy sources fall through to
+                    // `get_value` via the trait default.
+                    if let Some(initial) = src
+                        .get_value_checked(mon_checked.clone(), mon_ctx.clone())
+                        .await
+                    {
                         // pvxs e9ab67a (2025-10): the first update is
                         // mask-bypassed so the client receives a
                         // *complete* prototype regardless of its
@@ -1591,6 +1802,32 @@ async fn handle_op(
                     // value if more than `queue_depth` events stack up.
                     let mut squashing = false;
                     while let Some(mut value) = rx.recv().await {
+                        // R48-G3: ACL re-check on policy reload (same
+                        // shape as the raw-fast-path branch above).
+                        // The gate's `acl_version` bumps on every
+                        // PvaServer ACF swap; on mismatch we
+                        // re-mint AccessChecked and tear down with
+                        // a MONITOR FINISH if the new policy denies.
+                        // R48-G3 + R50 audit-3: decoded recv-loop
+                        // re-check, routed through `revalidate_read`
+                        // for composite-source correctness.
+                        let live_v = src.access_gate().acl_version();
+                        if live_v
+                            != mon_acl_version_at_subscribe_cell
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            if src
+                                .revalidate_read(&pv_name, mon_ctx.clone())
+                                .await
+                                .is_none()
+                            {
+                                let finish = build_monitor_finish(ioid, order);
+                                let _ = tx_clone.send(finish).await;
+                                return;
+                            }
+                            mon_acl_version_at_subscribe_cell
+                                .store(live_v, std::sync::atomic::Ordering::Release);
+                        }
                         // Drain extras; keep the latest.
                         let mut squashed = 0usize;
                         loop {
@@ -1722,7 +1959,30 @@ async fn handle_op(
             };
             let pv_name = ch.name.clone();
             let _ = intro; // INIT pvRequest descriptor — no longer used here.
-            let result = source.rpc(&pv_name, req_desc, req_value).await;
+            // Round 42 type-state RPC dispatch. The wire layer mints
+            // the AccessChecked token via the gate; the typed
+            // `rpc_checked` refuses `NoAccess` tokens. Adding a new
+            // RPC-equivalent handler without going through the gate
+            // is now a compile error on the trait method signature.
+            let rpc_ctx_val = crate::server_native::source::ChannelContext {
+                peer,
+                account: cred.account.clone(),
+                method: cred.method.clone(),
+                host: cred.host.clone(),
+            };
+            let rpc_checked = source
+                .access_gate()
+                .check(
+                    &pv_name,
+                    &rpc_ctx_val.host,
+                    &rpc_ctx_val.account,
+                    &rpc_ctx_val.method,
+                    "",
+                )
+                .await;
+            let result = source
+                .rpc_checked(rpc_checked, req_desc, req_value, rpc_ctx_val)
+                .await;
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);

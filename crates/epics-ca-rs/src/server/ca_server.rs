@@ -680,14 +680,15 @@ impl CaServer {
         }
     }
 
-    /// Add a simple PV at runtime.
-    pub async fn add_pv(&self, name: &str, initial: EpicsValue) {
-        self.db.add_pv(name, initial).await;
+    /// Add a simple PV at runtime. Returns `Err` when the name is
+    /// already registered as a simple PV, record, or alias.
+    pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
+        self.db.add_pv(name, initial).await
     }
 
-    /// Add a record at runtime.
-    pub async fn add_record(&self, name: &str, record: impl Record) {
-        self.db.add_record(name, Box::new(record)).await;
+    /// Add a record at runtime. Returns `Err` on duplicate name.
+    pub async fn add_record(&self, name: &str, record: impl Record) -> CaResult<()> {
+        self.db.add_record(name, Box::new(record)).await
     }
 
     /// Set a PV value (notifies subscribers).

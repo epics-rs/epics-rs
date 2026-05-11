@@ -13,7 +13,7 @@ pub struct CalcoutRecord {
     pub oval: f64,
     pub ivoa: i16, // Invalid Output Action: 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: f64,
-    // Input links
+    // Input links (INPA..INPU)
     pub inpa: String,
     pub inpb: String,
     pub inpc: String,
@@ -26,7 +26,16 @@ pub struct CalcoutRecord {
     pub inpj: String,
     pub inpk: String,
     pub inpl: String,
-    // Input values
+    pub inpm: String,
+    pub inpn: String,
+    pub inpo: String,
+    pub inpp: String,
+    pub inpq: String,
+    pub inpr: String,
+    pub inps: String,
+    pub inpt: String,
+    pub inpu: String,
+    // Input values (A..U)
     pub a: f64,
     pub b: f64,
     pub c: f64,
@@ -39,7 +48,16 @@ pub struct CalcoutRecord {
     pub j: f64,
     pub k: f64,
     pub l: f64,
-    // Previous values LA-LL
+    pub m: f64,
+    pub n: f64,
+    pub o: f64,
+    pub p: f64,
+    pub q: f64,
+    pub r: f64,
+    pub s: f64,
+    pub t: f64,
+    pub u: f64,
+    // Previous values LA..LU
     pub la: f64,
     pub lb: f64,
     pub lc: f64,
@@ -52,6 +70,15 @@ pub struct CalcoutRecord {
     pub lj: f64,
     pub lk: f64,
     pub ll: f64,
+    pub lm: f64,
+    pub ln: f64,
+    pub lo: f64,
+    pub lp: f64,
+    pub lq: f64,
+    pub lr: f64,
+    pub ls: f64,
+    pub lt: f64,
+    pub lu: f64,
     // Display/engineering
     pub egu: String,
     pub prec: i16,
@@ -96,6 +123,15 @@ impl Default for CalcoutRecord {
             inpj: String::new(),
             inpk: String::new(),
             inpl: String::new(),
+            inpm: String::new(),
+            inpn: String::new(),
+            inpo: String::new(),
+            inpp: String::new(),
+            inpq: String::new(),
+            inpr: String::new(),
+            inps: String::new(),
+            inpt: String::new(),
+            inpu: String::new(),
             a: 0.0,
             b: 0.0,
             c: 0.0,
@@ -108,6 +144,15 @@ impl Default for CalcoutRecord {
             j: 0.0,
             k: 0.0,
             l: 0.0,
+            m: 0.0,
+            n: 0.0,
+            o: 0.0,
+            p: 0.0,
+            q: 0.0,
+            r: 0.0,
+            s: 0.0,
+            t: 0.0,
+            u: 0.0,
             la: 0.0,
             lb: 0.0,
             lc: 0.0,
@@ -120,6 +165,15 @@ impl Default for CalcoutRecord {
             lj: 0.0,
             lk: 0.0,
             ll: 0.0,
+            lm: 0.0,
+            ln: 0.0,
+            lo: 0.0,
+            lp: 0.0,
+            lq: 0.0,
+            lr: 0.0,
+            ls: 0.0,
+            lt: 0.0,
+            lu: 0.0,
             egu: String::new(),
             prec: 0,
             hopr: 0.0,
@@ -138,10 +192,10 @@ impl Default for CalcoutRecord {
 }
 
 impl CalcoutRecord {
-    fn get_vars(&self) -> [f64; 12] {
+    fn get_vars(&self) -> [f64; 21] {
         [
             self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
-            self.l,
+            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
         ]
     }
 
@@ -310,6 +364,51 @@ static CALCOUT_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        name: "INPM",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPO",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPP",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPQ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPR",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPS",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPT",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INPU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
         name: "A",
         dbf_type: DbFieldType::Double,
         read_only: false,
@@ -366,6 +465,51 @@ static CALCOUT_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "L",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "M",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "N",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "O",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "P",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "Q",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "R",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "S",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "T",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "U",
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
@@ -429,11 +573,62 @@ static CALCOUT_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: true,
     },
+    FieldDesc {
+        name: "LM",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LN",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LO",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LP",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LQ",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LR",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LS",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LT",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LU",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
 ];
 
 impl Record for CalcoutRecord {
     fn record_type(&self) -> &'static str {
         "calcout"
+    }
+
+    // C recCalcout.c IVOA=set_to_IVOV: oval = ivov; the OUT writeback
+    // then sends OVAL. VAL is the calc *result* and remains intact.
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        self.put_field("OVAL", ivov)
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -459,9 +654,7 @@ impl Record for CalcoutRecord {
 
         // Evaluate CALC using cached RPCL
         if let Some(ref compiled) = self.rpcl {
-            let vars = self.get_vars();
-            let mut inputs = crate::calc::NumericInputs::new();
-            inputs.vars[..12].copy_from_slice(&vars);
+            let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
             match crate::calc::eval(compiled, &mut inputs) {
                 Ok(v) => {
                     self.val = v;
@@ -478,9 +671,7 @@ impl Record for CalcoutRecord {
             if self.dopt == 1 {
                 // Use OCAL
                 if let Some(ref compiled) = self.orpc {
-                    let vars = self.get_vars();
-                    let mut inputs = crate::calc::NumericInputs::new();
-                    inputs.vars[..12].copy_from_slice(&vars);
+                    let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
                     match crate::calc::eval(compiled, &mut inputs) {
                         Ok(v) => self.oval = v,
                         Err(_) => self.calc_alarm = true,
@@ -490,7 +681,7 @@ impl Record for CalcoutRecord {
                 self.oval = self.val;
             }
         }
-        // Save current values to LA-LL for next cycle
+        // Save current values to LA-LU for next cycle
         self.la = self.a;
         self.lb = self.b;
         self.lc = self.c;
@@ -503,6 +694,15 @@ impl Record for CalcoutRecord {
         self.lj = self.j;
         self.lk = self.k;
         self.ll = self.l;
+        self.lm = self.m;
+        self.ln = self.n;
+        self.lo = self.o;
+        self.lp = self.p;
+        self.lq = self.q;
+        self.lr = self.r;
+        self.ls = self.s;
+        self.lt = self.t;
+        self.lu = self.u;
 
         // Cache should_output result BEFORE updating pval, because
         // framework calls should_output() after process() returns,
@@ -548,6 +748,15 @@ impl Record for CalcoutRecord {
             "INPJ" => Some(EpicsValue::String(self.inpj.clone())),
             "INPK" => Some(EpicsValue::String(self.inpk.clone())),
             "INPL" => Some(EpicsValue::String(self.inpl.clone())),
+            "INPM" => Some(EpicsValue::String(self.inpm.clone())),
+            "INPN" => Some(EpicsValue::String(self.inpn.clone())),
+            "INPO" => Some(EpicsValue::String(self.inpo.clone())),
+            "INPP" => Some(EpicsValue::String(self.inpp.clone())),
+            "INPQ" => Some(EpicsValue::String(self.inpq.clone())),
+            "INPR" => Some(EpicsValue::String(self.inpr.clone())),
+            "INPS" => Some(EpicsValue::String(self.inps.clone())),
+            "INPT" => Some(EpicsValue::String(self.inpt.clone())),
+            "INPU" => Some(EpicsValue::String(self.inpu.clone())),
             "A" => Some(EpicsValue::Double(self.a)),
             "B" => Some(EpicsValue::Double(self.b)),
             "C" => Some(EpicsValue::Double(self.c)),
@@ -560,6 +769,15 @@ impl Record for CalcoutRecord {
             "J" => Some(EpicsValue::Double(self.j)),
             "K" => Some(EpicsValue::Double(self.k)),
             "L" => Some(EpicsValue::Double(self.l)),
+            "M" => Some(EpicsValue::Double(self.m)),
+            "N" => Some(EpicsValue::Double(self.n)),
+            "O" => Some(EpicsValue::Double(self.o)),
+            "P" => Some(EpicsValue::Double(self.p)),
+            "Q" => Some(EpicsValue::Double(self.q)),
+            "R" => Some(EpicsValue::Double(self.r)),
+            "S" => Some(EpicsValue::Double(self.s)),
+            "T" => Some(EpicsValue::Double(self.t)),
+            "U" => Some(EpicsValue::Double(self.u)),
             "LA" => Some(EpicsValue::Double(self.la)),
             "LB" => Some(EpicsValue::Double(self.lb)),
             "LC" => Some(EpicsValue::Double(self.lc)),
@@ -572,6 +790,15 @@ impl Record for CalcoutRecord {
             "LJ" => Some(EpicsValue::Double(self.lj)),
             "LK" => Some(EpicsValue::Double(self.lk)),
             "LL" => Some(EpicsValue::Double(self.ll)),
+            "LM" => Some(EpicsValue::Double(self.lm)),
+            "LN" => Some(EpicsValue::Double(self.ln)),
+            "LO" => Some(EpicsValue::Double(self.lo)),
+            "LP" => Some(EpicsValue::Double(self.lp)),
+            "LQ" => Some(EpicsValue::Double(self.lq)),
+            "LR" => Some(EpicsValue::Double(self.lr)),
+            "LS" => Some(EpicsValue::Double(self.ls)),
+            "LT" => Some(EpicsValue::Double(self.lt)),
+            "LU" => Some(EpicsValue::Double(self.lu)),
             _ => None,
         }
     }
@@ -783,7 +1010,71 @@ impl Record for CalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("INPL".into())),
             },
-            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" => {
+            "INPM" => match value {
+                EpicsValue::String(s) => {
+                    self.inpm = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPM".into())),
+            },
+            "INPN" => match value {
+                EpicsValue::String(s) => {
+                    self.inpn = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPN".into())),
+            },
+            "INPO" => match value {
+                EpicsValue::String(s) => {
+                    self.inpo = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPO".into())),
+            },
+            "INPP" => match value {
+                EpicsValue::String(s) => {
+                    self.inpp = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPP".into())),
+            },
+            "INPQ" => match value {
+                EpicsValue::String(s) => {
+                    self.inpq = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPQ".into())),
+            },
+            "INPR" => match value {
+                EpicsValue::String(s) => {
+                    self.inpr = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPR".into())),
+            },
+            "INPS" => match value {
+                EpicsValue::String(s) => {
+                    self.inps = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPS".into())),
+            },
+            "INPT" => match value {
+                EpicsValue::String(s) => {
+                    self.inpt = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPT".into())),
+            },
+            "INPU" => match value {
+                EpicsValue::String(s) => {
+                    self.inpu = s;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INPU".into())),
+            },
+            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" | "M" | "N"
+            | "O" | "P" | "Q" | "R" | "S" | "T" | "U" => {
                 let v = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
@@ -800,6 +1091,15 @@ impl Record for CalcoutRecord {
                     "J" => self.j = v,
                     "K" => self.k = v,
                     "L" => self.l = v,
+                    "M" => self.m = v,
+                    "N" => self.n = v,
+                    "O" => self.o = v,
+                    "P" => self.p = v,
+                    "Q" => self.q = v,
+                    "R" => self.r = v,
+                    "S" => self.s = v,
+                    "T" => self.t = v,
+                    "U" => self.u = v,
                     _ => unreachable!(),
                 }
                 Ok(())
@@ -826,6 +1126,15 @@ impl Record for CalcoutRecord {
             ("INPJ", "J"),
             ("INPK", "K"),
             ("INPL", "L"),
+            ("INPM", "M"),
+            ("INPN", "N"),
+            ("INPO", "O"),
+            ("INPP", "P"),
+            ("INPQ", "Q"),
+            ("INPR", "R"),
+            ("INPS", "S"),
+            ("INPT", "T"),
+            ("INPU", "U"),
         ]
     }
 

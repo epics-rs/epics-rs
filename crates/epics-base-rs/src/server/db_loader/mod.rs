@@ -37,6 +37,57 @@ pub struct DbRecordDef {
     pub record_type: String,
     pub name: String,
     pub fields: Vec<(String, String)>,
+    /// Aliases declared inside the record body (`alias("name")`).
+    /// Mirrors epics-base PR #336 — alias names are validated with
+    /// the same rules as record names.
+    pub aliases: Vec<String>,
+    /// `info(tag, value)` pairs declared inside the record body.
+    /// Mirrors `info` directives in EPICS db files; common tags include
+    /// `asyn:READBACK` (asyn upstream PRs #60 / #208), `Q:form`, etc.
+    pub info_tags: Vec<(String, String)>,
+}
+
+/// Validate a record (or alias) name against epics-base PR #78 rules.
+///
+/// Returns `Err(CaError::DbParseError)` for the hard-error cases (empty
+/// name, embedded space/tab/quote/dot/dollar). Logs `tracing::warn!`
+/// for the soft-warning cases (leading `-`/`+`/`[`/`{`, embedded
+/// non-printable characters); the parse continues so legacy databases
+/// still load.
+///
+/// The check runs **after** macro substitution, mirroring base where
+/// `dbRecordHead` is invoked from the lexer with the substituted name.
+pub(crate) fn validate_record_name(name: &str, line: usize, col: usize) -> CaResult<()> {
+    if name.is_empty() {
+        return Err(CaError::DbParseError {
+            line,
+            column: col,
+            message: "record/alias name can't be empty".into(),
+        });
+    }
+    for (i, c) in name.chars().enumerate() {
+        if i == 0 && matches!(c, '-' | '+' | '[' | '{') {
+            tracing::warn!(name, "record/alias name should not begin with '{}'", c);
+        }
+        // Non-printable ASCII (< space) is a warning, not an error —
+        // matches base PR #78's `errlogPrintf("Warning: ...")` branch.
+        if (c as u32) < 0x20 {
+            tracing::warn!(
+                name,
+                "record/alias name should not contain non-printable 0x{:02X}",
+                c as u32
+            );
+            continue;
+        }
+        if matches!(c, ' ' | '\t' | '"' | '\'' | '.' | '$') {
+            return Err(CaError::DbParseError {
+                line,
+                column: col,
+                message: format!("bad character '{c}' in record/alias name \"{name}\""),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Parse an EPICS .db file with macro substitution.
@@ -80,6 +131,7 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         let name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+        validate_record_name(&name, line, col)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         expect_char(&chars, &mut pos, &mut col, ')', line)?;
@@ -88,6 +140,8 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
         expect_char(&chars, &mut pos, &mut col, '{', line)?;
 
         let mut fields = Vec::new();
+        let mut aliases: Vec<String> = Vec::new();
+        let mut info_tags: Vec<(String, String)> = Vec::new();
         loop {
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             if pos >= chars.len() {
@@ -112,27 +166,38 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
                 });
             }
 
-            if kw == "info" || kw == "alias" {
-                // Skip info/alias: consume until matching ')'
+            if kw == "alias" {
+                // alias("name") — capture and validate per PR #336.
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                if pos < chars.len() && chars[pos] == '(' {
-                    let mut depth = 1;
-                    pos += 1;
-                    col += 1;
-                    while pos < chars.len() && depth > 0 {
-                        match chars[pos] {
-                            '(' => depth += 1,
-                            ')' => depth -= 1,
-                            '\n' => {
-                                line += 1;
-                                col = 0;
-                            }
-                            _ => {}
-                        }
-                        pos += 1;
-                        col += 1;
-                    }
-                }
+                expect_char(&chars, &mut pos, &mut col, '(', line)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                let alias_name = read_quoted_string(&chars, &mut pos, &mut line, &mut col)?;
+                validate_record_name(&alias_name, line, col)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                expect_char(&chars, &mut pos, &mut col, ')', line)?;
+                aliases.push(alias_name);
+                continue;
+            }
+            if kw == "info" {
+                // info(tag, value) — capture for downstream consumers
+                // (asyn:READBACK, Q:form, etc.). PR #60 / #208 needs
+                // the asyn:READBACK tag in particular.
+                //
+                // Both `tag` and `value` accept quoted *or* unquoted
+                // tokens. Base's dbStaticLib parser tolerates either
+                // form and ad-core templates rely on the unquoted
+                // shape (`info(asyn:READBACK, "1")`).
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                expect_char(&chars, &mut pos, &mut col, '(', line)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                let tag = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                expect_char(&chars, &mut pos, &mut col, ',', line)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                let value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                expect_char(&chars, &mut pos, &mut col, ')', line)?;
+                info_tags.push((tag, value));
                 continue;
             }
 
@@ -158,6 +223,8 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
             record_type: rec_type,
             name,
             fields,
+            aliases,
+            info_tags,
         });
     }
 
@@ -1127,11 +1194,15 @@ mod tests {
                     ("DTYP".to_string(), "oldDtyp".to_string()),
                     ("VAL".to_string(), "0".to_string()),
                 ],
+                aliases: Vec::new(),
+                info_tags: Vec::new(),
             },
             DbRecordDef {
                 record_type: "ao".to_string(),
                 name: "REC_WITHOUT_DTYP".to_string(),
                 fields: vec![("VAL".to_string(), "1".to_string())],
+                aliases: Vec::new(),
+                info_tags: Vec::new(),
             },
         ];
 
@@ -1165,5 +1236,136 @@ mod tests {
         let records = parse_db_file(&path, &macros, &config).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "IOC:TEMP");
+    }
+
+    // epics-base PR #78 — record-name validation regressions.
+
+    #[test]
+    fn name_validation_accepts_typical_names() {
+        for n in [
+            "IOC:TEMP",
+            "MOTOR-1",
+            "X[1]",
+            "scan_5",
+            "BL3:STD:01",
+            "abc.xyz_record",
+        ]
+        .iter()
+        .copied()
+        // ".xyz" inside the bracket-allowed shape would actually fail
+        // — the slash above is just to demonstrate the OK/FAIL split.
+        {
+            // Skip the deliberately-bad sample.
+            if n.contains('.') {
+                assert!(validate_record_name(n, 1, 1).is_err());
+                continue;
+            }
+            validate_record_name(n, 1, 1).unwrap_or_else(|e| panic!("'{n}' should pass: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn name_validation_rejects_empty() {
+        assert!(validate_record_name("", 1, 1).is_err());
+    }
+
+    #[test]
+    fn name_validation_rejects_bad_chars() {
+        // Mirrors base: TAB (0x09) is non-printable so it falls into the
+        // warn-and-continue branch, NOT the hard-error set. Only the
+        // printable bad chars below produce a hard error.
+        for bad in ["spa ce", "do.t", "qu\"ot", "ap'os", "do$llar"] {
+            assert!(
+                validate_record_name(bad, 1, 1).is_err(),
+                "'{bad}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn name_validation_warns_but_passes_on_nonprintable() {
+        // 0x09 (TAB) and 0x01 are < 0x20 so they only emit a warning.
+        validate_record_name("ta\tb", 1, 1).expect("TAB is warn-only per base spec");
+        validate_record_name("hello\x01world", 1, 1).expect("0x01 is warn-only");
+    }
+
+    #[test]
+    fn name_validation_warns_on_leading_special_but_passes() {
+        for warn in ["-x", "+y", "[arr", "{obj"] {
+            validate_record_name(warn, 1, 1).expect("leading special is warn-only");
+        }
+    }
+
+    #[test]
+    fn parse_db_propagates_name_validation_error() {
+        let bad = r#"record(ai, "BAD NAME") { }"#;
+        let res = parse_db(bad, &HashMap::new());
+        assert!(matches!(res, Err(CaError::DbParseError { .. })));
+    }
+
+    // epics-base PR #336 — alias parsing + name validation.
+
+    #[test]
+    fn parse_db_captures_aliases() {
+        let src = r#"record(ai, "TARGET") {
+            alias("ALIAS1")
+            alias("ALIAS2")
+            field(VAL, 42)
+        }"#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "TARGET");
+        assert_eq!(recs[0].aliases, vec!["ALIAS1", "ALIAS2"]);
+        assert_eq!(recs[0].fields.len(), 1);
+    }
+
+    #[test]
+    fn parse_db_rejects_alias_with_bad_name() {
+        let src = r#"record(ai, "TARGET") {
+            alias("BAD ALIAS")
+        }"#;
+        let res = parse_db(src, &HashMap::new());
+        assert!(matches!(res, Err(CaError::DbParseError { .. })));
+    }
+
+    #[test]
+    fn parse_db_record_without_alias_has_empty_aliases() {
+        let src = r#"record(ai, "PLAIN") { field(VAL, 1) }"#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert!(recs[0].aliases.is_empty());
+    }
+
+    /// Round-9 regression: `info(asyn:READBACK, "1")` (unquoted tag,
+    /// quoted value) is the form ad-core templates use. Base accepts
+    /// it; round-5's parser fix tightened the grammar to require a
+    /// quoted tag, which broke all NDOverlayN / NDFile / NDArrayBase
+    /// templates and the mini-beamline/xrt-beamline IOCs that load
+    /// commonPlugins.cmd.
+    #[test]
+    fn parse_db_info_accepts_unquoted_tag() {
+        let src = r#"
+record(ai, "REC") {
+    field(VAL, "0")
+    info(asyn:READBACK, "1")
+    info("Q:group", "demo")
+    info(autosaveFields, "VAL DESC")
+}
+"#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        assert_eq!(recs.len(), 1);
+        let tags = &recs[0].info_tags;
+        // Unquoted tag, quoted value.
+        assert!(
+            tags.iter().any(|(k, v)| k == "asyn:READBACK" && v == "1"),
+            "unquoted tag must parse: {tags:?}"
+        );
+        // Quoted tag, quoted value (existing form).
+        assert!(tags.iter().any(|(k, v)| k == "Q:group" && v == "demo"));
+        // Unquoted tag, unquoted multi-word value.
+        assert!(
+            tags.iter()
+                .any(|(k, v)| k == "autosaveFields" && v == "VAL DESC"),
+            "unquoted multi-word value must parse: {tags:?}"
+        );
     }
 }

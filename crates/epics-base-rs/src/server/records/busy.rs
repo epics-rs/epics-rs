@@ -307,6 +307,18 @@ impl Record for BusyRecord {
         "busy"
     }
 
+    // C recBusy.c IVOA=set_to_IVOV: val = ivov; rval = ivov; oval = ivov.
+    fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        let rval = match &ivov {
+            EpicsValue::Enum(e) => EpicsValue::Long(*e as i32),
+            EpicsValue::Short(s) => EpicsValue::Long(*s as i32),
+            other => other.clone(),
+        };
+        self.put_field("OVAL", ivov.clone())?;
+        self.put_field("RVAL", rval)?;
+        self.put_field("VAL", ivov)
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // Step 1: DOL reading handled by framework (OMSL=ClosedLoop)
 

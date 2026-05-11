@@ -1,5 +1,6 @@
 //! CA server components — TCP handler, UDP search, beacon, monitor.
 
+pub mod access_token;
 pub mod addr_list;
 pub mod beacon;
 pub mod ca_server;

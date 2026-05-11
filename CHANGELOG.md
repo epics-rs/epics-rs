@@ -1,5 +1,295 @@
 # Changelog
 
+## v0.16.0 — 2026-05-11
+
+Access-security as a closed invariant: every wire op (CA + PVA) now
+flows through a type-state `AccessChecked` token minted by a
+per-source `AccessGate`. The unforgeable token replaces ad-hoc
+`name: &str + ctx` ACL plumbing and makes "missed an ACF site" a
+compile error rather than a runtime audit finding. The release also
+absorbs ~30 upstream epics-base / asyn / pva PR-equivalents queued
+during v0.13–v0.15 reviews (alias-aware DB lookup, alarm-message
+strings, JSON link options, hardware-link parser, asyn UInt64,
+asyn:READBACK, dbCreateRecord/dbDeleteRecord/dbglob/dbgrep, calc
+A–U inputs, dfanout IVOA, bi/mbbi AFTC, …) and the resulting
+50-plus self-review rounds (`upstream-tracking` doc captures
+provenance per item).
+
+### epics-base-rs
+
+- **feat**: `AccessChecked` + `AccessGate` type-state foundation.
+  `AccessChecked` cannot be constructed outside `AccessGate::check`,
+  so any code path that operates on a PV by name must thread it
+  through and inspect `allows_read()` / `allows_write()`. Closes
+  the "missed an ACF site" pattern that surfaced across review
+  rounds 32–39. `AccessLevel::ReadWrite` / `Read` / `NoAccess`
+  exposed on the token.
+- **feat**: ACF `METHOD` / `AUTHORITY` rule clauses (epics-base
+  PR #563 + #618 partial). Rules can now scope on the auth method
+  (`anonymous`, `ca`, `x509`, `cap-token`) and the cert authority
+  / issuer DN; `check_access_method` extends the legacy
+  `check_access_asl` without breaking the empty-`method`/`authority`
+  rules (legacy ACFs keep working). `check_access_asl` re-routed
+  through the method-aware path so both surfaces apply the same
+  semantics.
+- **feat**: alarm message `AMSG` / `NAMSG` strings on every record
+  (epics-base PR #568 + #566). `AMSG` populated on `UDF` /
+  `CALC` / device-support alarm paths; `NAMSG` carries the
+  not-acknowledged form so HMI displays can render an audit trail
+  per alarm.
+- **feat**: record alias parsing + alias-aware lookup (epics-base
+  PR #336). `PvDatabase::add_alias` validates names, refuses
+  collisions across simple-PV / record / alias namespaces, and
+  the `find_entry` / `get_record` / `has_name` family resolves
+  aliases transparently. `dbpr` / `dbsr` / `dbgrep` / `dbglob`
+  iterate aliases too. Field I/O (`get_pv` / `put_pv`),
+  link processing, CP-link registration, and PVA `channelList` /
+  qsrv all routed through the alias-aware path so an alias is a
+  drop-in replacement for the record name anywhere.
+- **feat**: JSON-style inline link options + hardware-link parser
+  (epics-base PR #86 + #213). Inputs / outputs accept
+  `{"const":42}` / `{"calc":"A*2","args":["@OTHER.VAL"]}`-style
+  inline link syntax; the hardware-link grammar carries
+  `card`/`signal`/`parm` for VME-style records.
+- **feat**: dfanout `IVOA` / `IVOV` invalid-output handling
+  (epics-base PR #688). On UDF/INVALID input the record routes
+  to "do nothing" / "set to IVOV" / "set to IVOV on every
+  out-link" per `IVOA` (0..2). Route 2 fans the IVOV value to
+  every per-record output.
+- **feat**: bi / mbbi `AFTC` alarm-filter time-constant (epics-base
+  PR #817). Suppresses alarm transitions shorter than `AFTC`
+  seconds so noisy contacts don't flap STATE / SEVR.
+- **feat**: bi / bo / mbbi accept enum-string on VAL writes
+  (epics-base PR #183). `caput bi:val "ON"` resolves through
+  ZNAM/ONAM (bi/bo) or `OneSTR..FfvlSTR` (mbbi) instead of
+  requiring the numeric index.
+- **feat**: calc engine inputs A–L extended to A–U (epics-base
+  PR #655). Existing CALC / CALCOUT / ACALCOUT / SCALCOUT record
+  types grew the new `INP[M..U]` fields and the lexer/parser
+  accept the extended identifier set.
+- **feat**: db-loader captures `info(tag, value)` directives on
+  records, exposes them through `RecordInstance::info_tag` and
+  the `dbpr` level-≥2 output. asyn-side consumers
+  (`info(asyn:READBACK, …)`) plug into the parameter-callback
+  registry through this.
+- **feat**: db-loader validates record / alias names per
+  epics-base PR #78 (`A-Z 0-9 _ - + : ; [ ] < >` allowed; first
+  char alpha-or-underscore; empty/too-long rejected).
+- **feat**: iocsh `afterIocRunning <command>` queue (epics-base
+  PR #558). Commands queued at parse time run after PINI
+  completes, through a fresh IocShell so user shell commands and
+  built-ins are both visible.
+- **feat**: iocsh `dbCreateRecord <type> <name>` + `dbDeleteRecord
+  <name>` (epics-base PR #812 + #505). Record deletion cleans
+  every back-reference (scan index, CP links, alias targets,
+  device support) under a single registration mutex so the DB
+  can shed records at runtime without leaving phantoms.
+- **feat**: iocsh `dbglob <pattern>` alias-aware + `dbgrep <pattern>
+  [<fields>...]` (epics-base PR #613 / #626). `dbglob` now
+  surfaces aliases alongside records; `dbgrep` accepts a
+  positional fields list so `dbgrep "*:TEMP" VAL EGU` prints
+  exactly the requested fields.
+- **feat**: iocsh bound history + `pushd` / `popd` / `dirs`
+  (epics-base PR #459 + #497). History capped at 1024 lines;
+  directory stack mirrors bash so multi-IOC `iocshLoad`-from-
+  subdir setups stay navigable.
+- **feat**: `iocsh dbpr` surfaces `info()` tags at level ≥2 and
+  record aliases alongside the canonical name. `dbpf` typos
+  suggest the nearest field name (Levenshtein within 2) instead
+  of just rejecting.
+- **feat**: `dbsr` / `dbgrep` / `dbglob` include simple PVs (not
+  just records) when iterating, so monitor / audit tooling sees
+  the full PV surface.
+- **fix**: route record `ASL` through ACF checks for every
+  record-aware path (CA + PVA + qsrv). Records previously had
+  `asl` parsed but unused by the runtime; the per-record gate
+  now disables rules below the record's ASL when checking access,
+  matching C-EPICS semantics. Accept `.db` String form (`"ASL0"`
+  / `"ASL1"`) as well as the integer in `dbd`-loaded records.
+- **fix**: serialize `update_scan_index` + un-block `records.read`
+  on PINI scan (review round 35). PINI scans previously held the
+  records read-lock across the entire periodic-task spawn,
+  blocking interactive `dbpr` / monitor traffic while a large DB
+  initialised; the spawn now happens after dropping the lock and
+  `update_scan_index` is gated by the registration mutex so
+  removals don't race in.
+- **fix**: scan + scan_event use a `JoinSet` per scan rate so
+  cancellation (DB drop / `dbDeleteRecord`) aborts every
+  periodic task instead of leaving orphans (round 45).
+- **fix**: reap dead subscriber `Sender`s before the per-PV /
+  per-field cap check (round 46). Without the reap, a client
+  that connected, subscribed N times, and disconnected would
+  burn the N slots until the next non-empty fanout, eventually
+  blocking new MONITORs with a stale-cap rejection.
+- **fix**: canonicalise `cp_links` registration (round 15) — the
+  hash key is now the canonical record name so an alias
+  registering as a CP source resolves to the same set the
+  canonical name would. Closes the alias-aware-lookup invariant
+  (round 12).
+
+### epics-ca-rs (client)
+
+- **feat**: `EPICS_CA_ADDR_LIST` DNS re-resolution wired into the
+  search engine (R50-G2). Hostname entries (`my-host` vs.
+  `1.2.3.4`) now re-resolve on every retransmit fanout, so an
+  IOC that moves IPs is rediscovered without a client restart.
+  `AddrEntry::new` preserves the original hostname so the
+  resolver loop knows whether to re-query DNS.
+- **feat**: hostname-preserving `AddrEntry` for DNS re-resolution
+  (Launchpad #488). Replaces the legacy `SocketAddr`-only entry
+  shape that lost the original hostname after the first
+  resolution.
+- **feat**: bound nameserver TCP send queue (Launchpad
+  #739789). A nameserver that hangs no longer grows the queue
+  unbounded; backpressure surfaces as a connect error after the
+  per-entry deadline.
+- **feat**: honour `EPICS_CA_AUTO_ADDR_LIST=NO` with empty
+  `EPICS_CA_ADDR_LIST` — previously the client fell back to the
+  broadcast list even when both flags asked it not to.
+- **fix**: per-server beacon EMA reset on TCP (re)connect — a
+  reconnect now starts fresh instead of inheriting the previous
+  session's beacon-drift estimate.
+- **fix**: `CaClient` and `ServerConnection` abort spawned tasks
+  on `Drop` so a dropped client doesn't leak the search /
+  beacon / read-loop tasks.
+
+### epics-ca-rs (server)
+
+- **feat**: CA type-state ACF gate (round 44). CA server enforces
+  the same `AccessGate` → `AccessChecked` flow as PVA, so the
+  PUT / READ / EVENT_ADD / PUT_ACKT / PUT_ACKS paths all consult
+  one source of truth.
+- **fix**: enforce `access_rights` on CA READ + EVENT_ADD
+  (round 38) — a peer flagged `NoAccess` on the ASG now gets
+  `ECA_NORDACCESS` on `caget` and an `EVENT_CANCEL` -shaped
+  teardown on `camonitor` instead of silently receiving values.
+  Default flipped to deny-first.
+- **fix**: gate `PUT_ACKT` / `PUT_ACKS` on access; tear
+  subscriptions on re-eval to `NoAccess` (round 39). An ACF
+  reload that demotes a peer mid-monitor closes the existing
+  subscription instead of leaving it streaming under the old
+  policy.
+
+### epics-pva-rs (server)
+
+- **feat**: `PvaServer::reload_acf_from(&Path)` + `AcfCell`
+  runtime swap (round 28). The ACF policy can be hot-swapped
+  without restarting the server; an `acl_version` counter bumps
+  on every swap so MONITOR loops detect the change and re-check
+  on the next event.
+- **feat**: per-PV ASG resolver (round 30D) — sources hand back a
+  `(ASG, ASL)` tuple per PV name so a single composite gateway
+  can serve PVs from multiple ASGs without splitting into
+  separate sources.
+- **feat**: `AccessChecked` type-state across every PVA op —
+  `get_value_checked` (round 41), `put_value_checked` /
+  `subscribe_checked` / `subscribe_raw_checked` / `rpc_checked`
+  (round 42). Legacy `*_ctx` paths removed (round 43): the
+  AccessGate is now the single allowable entry point.
+- **fix**: PVA PUT / GET / MONITOR / RPC enforce ACF (rounds 17,
+  18, 37). Pre-fix the wire layer pulled an `AccessControl`
+  per op but never consulted it; now every op flows through
+  `AccessGate::check` before reaching the source.
+- **fix**: gateway-side ACF enforcement (round 29). A gateway
+  in front of an unguarded IOC now applies its own ACF; the
+  downstream peer's credentials are forwarded to the upstream
+  client pool through `ChannelContext` (PG-G10).
+- **fix**: ctx-aware `get_value` for `PUT_GET` readback and raw
+  MONITOR initial snapshot (round 30A). The readback / initial
+  paths consulted the legacy ctx-less surface, so a deny-ACL
+  source still emitted the readback value; both now go through
+  `get_value_checked`.
+- **fix**: composite `access()` gate aggregates inner ACL
+  versions (R50-G1). The composite previously inherited the
+  default `Open` gate (version=0 forever), so the monitor
+  reload loop never noticed a child's `set_acf` bump. The
+  aggregator surfaces inner bumps via a `wrapping_sum` of every
+  inner gate's version — a `max(...)` shape produced false
+  negatives when a smaller inner bumped under the existing
+  peak (R50 follow-up).
+- **fix**: monitor reload re-check routed through
+  `ChannelSource::revalidate_read` (R50 audit-3). The composite
+  aggregate gate is a change-signal only; allow/deny revalidation
+  resolves the matched inner source by name and routes the
+  check through THAT inner gate (the same gate
+  `subscribe_checked` / `get_value_checked` consult). Pre-fix
+  the recv loop called `access_gate().check(...)` on the
+  composite — an `Open` gate — and kept forwarding events
+  after a child flipped to deny.
+- **fix**: include aliases in `channelList` output (round 14) —
+  PVA `info` channels now report the alias surface so external
+  discovery tooling sees the same PV inventory as `dbpr`.
+- **fix**: reject duplicate registrations + route IVOA=2 to per-
+  record output (round 30B+C), close ACF/registration invariant
+  gaps (round 32), and per-PV ASG resolver (round 30D) — the
+  "round 30" set tightened registration single-ownership so a
+  re-add of an existing PV is an error rather than a silent
+  shadow.
+- **fix**: `EPICS_PVAS_AUTO_BEACON_ADDR_LIST=NO` honours the
+  empty list — previously the server-side code fell back to the
+  broadcast list (parallel to the CA-side round-25 fix).
+
+### epics-bridge-rs (pva_gateway / qsrv / pvalink)
+
+- **fix**: `GatewayChannelSource::set_acf` is the single owner
+  of ACL-change visibility (round 49 follow-up). Every external
+  ACF swap now bumps `acl_version` through the same call so
+  downstream monitor loops can detect the change; no other path
+  can mutate ACL state without bumping the counter.
+- **fix**: pvalink dedup in-flight registry opens (round 36).
+  Concurrent first-callers no longer each spin up their own
+  `PvaLink` + monitor task; a `Notify` parks the loser on the
+  winner's open future. Eliminates 2× search / connect round-
+  trips per concurrent open under DCL.
+- **fix**: bridge `AccessControl` to epics-base ACF (round 19).
+  qsrv records now consult the same ACF that the native CA / PVA
+  servers do — a unified gate across the three surfaces.
+- **fix**: 4 external audit findings each in rounds 48, 49 —
+  raw-subscribe counter underflow, gateway acf_cell single
+  owner, pvalink Notify wake-loss, version capture order
+  before-mint, audit details in the round commits.
+
+### asyn-rs
+
+- **feat**: `AsynUInt64` / `AsynUInt64Array` interfaces, plus
+  `UInt64` `ParamValue` / `ParamType` plumbing (asyn PR #231).
+  Drivers can now register and post `u64`-typed parameters
+  end-to-end without truncating to `i32`.
+- **feat**: `AsynFloat64::get_limits` (asyn PR #218). Returns
+  `(low, high)` for the bound parameter so device-support
+  layers can enforce range without a per-driver hack.
+- **feat**: `asyn:READBACK` driver-callback path (asyn PR #60 /
+  #208). A db `info(asyn:READBACK, "PORT,addr,REASON")`
+  directive wires a `paramCallback`-driven readback into the
+  bound record without separate `ao` + `ai` plumbing.
+- **feat**: `IocBuilder::register_asyn_device_support` companion
+  helper so an asyn-backed IOC can register drivers + records in
+  one builder chain.
+- **fix**: reject duplicate port names instead of silent shadow
+  (asyn PR #34).
+- **fix**: forward `info()` tags from `wire_device_support` too
+  so asyn-side parameter-callback registration sees them.
+
+### Stability / tests
+
+- **test**: regression-guard 3 audit-rated upstream defects
+  (stability suite). Pins the wire-format expectation for the
+  symptoms that drove these review rounds so a future
+  regression fails the test instead of the production server.
+
+### Notes
+
+- `cargo clippy --workspace --all-targets -- -D warnings` clean
+  on the release commit. Workspace `nextest run` passes all
+  3206 tests.
+- `cargo workspaces` is the publish driver — crates are
+  published in dependency order. Example crates
+  (`examples/*`) and `*-fuzz` crates remain `publish = false`.
+- The `feat/upstream-pr-fixes` branch carries a parallel
+  `upstream-tracking` doc (`docs/upstream-tracking.md`) with
+  per-PR provenance for every feature in this release; consult
+  that file when wondering "which epics-base PR does X track?".
+
 ## v0.15.0 — 2026-05-07
 
 Five Layer-2 feature-map gaps closed with audit-driven follow-throughs.

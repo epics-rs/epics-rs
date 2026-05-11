@@ -49,13 +49,28 @@ impl Default for CompositeSource {
         let entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>> =
             Arc::new(parking_lot::RwLock::new(Vec::new()));
         let entries_for_version = entries.clone();
+        // Round 50 follow-up (audit): the composite's aggregate
+        // version is the `wrapping_sum` of every inner gate's
+        // `acl_version()`. The earlier `max(...)` shape produced
+        // false negatives — a monitor whose subscribe-time snapshot
+        // captured the existing max would miss a bump on a
+        // *different* inner whose pre-bump version was below the
+        // max (e.g. A=5, B=0 yields max=5; B's set_acf bumps B to
+        // 1 but max stays 5, so the monitor's `live == stored`
+        // compare on the next event never fires). Per-inner
+        // versions only ever monotonically `fetch_add`, so summing
+        // them gives strict change-detection: any inner bump shifts
+        // the sum; only "no inner moved" keeps it constant.
+        // `wrapping_add` covers the astronomical-overflow case
+        // (≥ 2^64 cumulative bumps) and the monitor uses
+        // `live != stored` rather than `>`, so a wrap-around still
+        // triggers a re-check on the next event.
         let access_gate = AccessGate::open_with_aggregator(Arc::new(move || {
-            entries_for_version
-                .read()
-                .iter()
-                .map(|e| e.source.access_gate().acl_version())
-                .max()
-                .unwrap_or(0)
+            let mut sum: u64 = 0;
+            for entry in entries_for_version.read().iter() {
+                sum = sum.wrapping_add(entry.source.access_gate().acl_version());
+            }
+            sum
         }));
         Self {
             entries,
@@ -535,6 +550,100 @@ mod tests {
         inner2.gate.bump_acl_version();
         let v2 = comp.access().acl_version();
         assert!(v2 > v1, "composite gate must track inner2 bumps too: {v1} -> {v2}");
+    }
+
+    /// Round 50 follow-up (audit): pre-fix the composite used
+    /// `max(inner.acl_version)` to aggregate. That's wrong — an
+    /// inner that bumps but stays below the existing max produces
+    /// the SAME aggregate, so the monitor's `live != stored`
+    /// compare never fires. This regression test sets up exactly
+    /// that pathological shape: inner A pre-bumped to a higher
+    /// version than inner B, then bumps B (which the old `max`
+    /// aggregator would miss) and asserts the composite version
+    /// changes.
+    #[tokio::test]
+    async fn aggregator_detects_inner_bump_below_max() {
+        use epics_base_rs::server::access_security::AccessGate;
+        struct VersionedSrc {
+            gate: AccessGate,
+        }
+        impl ChannelSource for VersionedSrc {
+            fn access(&self) -> &AccessGate {
+                &self.gate
+            }
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { Vec::new() }
+            }
+            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn get_introspection(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                _: PvField,
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                async { Err("n/a".into()) }
+            }
+            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let resolver: epics_base_rs::server::access_security::AsgAslResolver =
+            Arc::new(|_| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
+        let inner_a = Arc::new(VersionedSrc {
+            gate: AccessGate::required(acf.clone(), resolver.clone()),
+        });
+        let inner_b = Arc::new(VersionedSrc {
+            gate: AccessGate::required(acf, resolver),
+        });
+
+        // Pre-bump A several times so its version is well above B's
+        // initial 0. The "max" aggregator would lock the composite
+        // at A's version regardless of subsequent activity on B.
+        inner_a.gate.bump_acl_version();
+        inner_a.gate.bump_acl_version();
+        inner_a.gate.bump_acl_version();
+        inner_a.gate.bump_acl_version();
+        inner_a.gate.bump_acl_version();
+        assert_eq!(inner_a.gate.acl_version(), 5);
+        assert_eq!(inner_b.gate.acl_version(), 0);
+
+        let comp = CompositeSource::new();
+        comp.add_source("a", inner_a.clone() as DynSource, 0).unwrap();
+        comp.add_source("b", inner_b.clone() as DynSource, 1).unwrap();
+
+        let v0 = comp.access().acl_version();
+        // Bump only B by one — B(0)→B(1). With `max` aggregator
+        // composite stays at 5; with `wrapping_sum` it moves from
+        // 5 to 6, which is what the monitor needs to detect.
+        inner_b.gate.bump_acl_version();
+        let v1 = comp.access().acl_version();
+        assert_ne!(
+            v0, v1,
+            "composite gate must detect a sub-max inner bump: \
+             v0={v0} v1={v1} (max-style aggregation would have left it equal)"
+        );
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@ use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server::native_source::AcfCell;
-use epics_pva_rs::server_native::source::{ChannelContext, ChannelSource};
+use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource};
 
 use super::channel_cache::ChannelCache;
 
@@ -286,19 +286,6 @@ impl ChannelSource for GatewayChannelSource {
     /// upstream lookup, so a denied client never opens an upstream
     /// channel and never appears in upstream audit logs as the
     /// gateway.
-    async fn get_value_ctx(&self, name: &str, ctx: ChannelContext) -> Option<PvField> {
-        if self.acl_level(name, &ctx).await == AccessLevel::NoAccess {
-            tracing::debug!(
-                pv = %name,
-                account = %ctx.account,
-                method = %ctx.method,
-                "pva-gateway: GET denied by gateway ACF"
-            );
-            return None;
-        }
-        self.get_value(name).await
-    }
-
     async fn put_value(&self, name: &str, value: PvField) -> Result<(), String> {
         // Look up the entry to keep the upstream channel alive (and
         // confirm the PV exists) before issuing the PUT through the
@@ -318,37 +305,38 @@ impl ChannelSource for GatewayChannelSource {
             .map_err(|e| e.to_string())
     }
 
-    /// Credential-aware PUT (PG-G10). Routes the put through a
-    /// per-(account, method) upstream PvaClient so the upstream IOC's
-    /// ASG rules see the *real* downstream identity instead of the
-    /// gateway's. Anonymous / empty-account peers fall back to the
-    /// shared client.
-    async fn put_value_ctx(
+    /// Credential-aware PUT (PG-G10) — Round 43 migration to the
+    /// type-state API. Routes the put through a per-(account,
+    /// method) upstream PvaClient so the upstream IOC's ASG rules
+    /// see the real downstream identity instead of the gateway's.
+    /// Anonymous / empty-account peers fall back to the shared
+    /// client. The AccessChecked token gates entry — `NoAccess` or
+    /// `Read`-only peers receive the same gateway-identifying error
+    /// the default put_value_checked would produce.
+    async fn put_value_checked(
         &self,
-        name: &str,
+        checked: AccessChecked,
         value: PvField,
         ctx: ChannelContext,
     ) -> Result<(), String> {
-        // Round-29: gateway-side ACF gate for PUT. Deny BEFORE the
-        // upstream lookup so a forbidden write never reaches the
-        // upstream IOC. The downstream sees a denial message that
-        // names the gateway as the enforcement point.
-        if self.acl_level(name, &ctx).await != AccessLevel::ReadWrite {
+        if !checked.allows_write() {
             tracing::debug!(
-                pv = %name,
+                pv = %checked.pv_name(),
                 account = %ctx.account,
                 method = %ctx.method,
                 "pva-gateway: PUT denied by gateway ACF"
             );
             return Err(format!(
                 "PUT denied by gateway access security: \
-                 PV '{name}' from {host}/{account}/{method}",
+                 PV '{pv}' from {host}/{account}/{method}",
+                pv = checked.pv_name(),
                 host = ctx.host,
                 account = ctx.account,
                 method = ctx.method,
             ));
         }
 
+        let name = checked.pv_name();
         let _entry = self
             .cache
             .lookup(name, self.connect_timeout)
@@ -387,37 +375,6 @@ impl ChannelSource for GatewayChannelSource {
     /// parity gap (review §1). With this override, RPC requests pass
     /// through transparently — `pvrpc` reuses the cached channel
     /// connection-pool entry so we don't pay a fresh search per call.
-    /// R37-G1 / Round 37: ACF-aware RPC. Pre-fix the gateway
-    /// forwarded every RPC upstream without consulting the
-    /// gateway-side ACF — a `NoAccess` peer's RPC reached the
-    /// upstream IOC carrying the gateway's identity, completely
-    /// bypassing the gateway's policy. Now an `acl_level !=
-    /// NoAccess` is required before the upstream call.
-    async fn rpc_ctx(
-        &self,
-        name: &str,
-        request_desc: FieldDesc,
-        request_value: PvField,
-        ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), String> {
-        if self.acl_level(name, &ctx).await == AccessLevel::NoAccess {
-            tracing::debug!(
-                pv = %name,
-                account = %ctx.account,
-                method = %ctx.method,
-                "pva-gateway: RPC denied by gateway ACF"
-            );
-            return Err(format!(
-                "RPC denied by gateway access security: \
-                 PV '{name}' from {host}/{account}/{method}",
-                host = ctx.host,
-                account = ctx.account,
-                method = ctx.method,
-            ));
-        }
-        self.rpc(name, request_desc, request_value).await
-    }
-
     async fn rpc(
         &self,
         name: &str,
@@ -496,51 +453,6 @@ impl ChannelSource for GatewayChannelSource {
             }
         });
         Some(mpsc_rx)
-    }
-
-    /// Round-29: ACF-aware MONITOR. Denies BEFORE the subscriber
-    /// counter increments so a denied request doesn't consume one
-    /// of the gateway's `max_subscribers` slots.
-    async fn subscribe_ctx(
-        &self,
-        name: &str,
-        ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<PvField>> {
-        if self.acl_level(name, &ctx).await == AccessLevel::NoAccess {
-            tracing::debug!(
-                pv = %name,
-                account = %ctx.account,
-                method = %ctx.method,
-                "pva-gateway: MONITOR denied by gateway ACF"
-            );
-            return None;
-        }
-        self.subscribe(name).await
-    }
-
-    /// Round-32A (R31-G6): ACF-aware raw-frame MONITOR. The
-    /// round-29 ACL gate covered `subscribe_ctx` only; the F-G12
-    /// raw fast path went straight to `subscribe_raw`, letting a
-    /// `NoAccess` peer mount a wire-byte-forwarded subscription
-    /// that bypassed every downstream re-encode and every ACF
-    /// hook. Denying here causes the tcp.rs MONITOR handler to
-    /// fall through to `subscribe_ctx`, which also denies — so
-    /// no events leak to the peer.
-    async fn subscribe_raw_ctx(
-        &self,
-        name: &str,
-        ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
-        if self.acl_level(name, &ctx).await == AccessLevel::NoAccess {
-            tracing::debug!(
-                pv = %name,
-                account = %ctx.account,
-                method = %ctx.method,
-                "pva-gateway: raw MONITOR denied by gateway ACF"
-            );
-            return None;
-        }
-        self.subscribe_raw(name).await
     }
 
     async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {

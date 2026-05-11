@@ -56,6 +56,12 @@ impl<S: ChannelSource> Layer<S> for ReadOnlyLayer {
 }
 
 impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
+    // Round 43: forward the inner source's AccessGate so the wire
+    // layer's `gate.check` flows to the actual policy holder, not
+    // a permissive Open singleton.
+    fn access(&self) -> &epics_pva_rs::server_native::source::AccessGate {
+        self.inner.access()
+    }
     async fn list_pvs(&self) -> Vec<String> {
         self.inner.list_pvs().await
     }
@@ -71,9 +77,9 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
         Err("read-only mode: PUT rejected".into())
     }
-    async fn put_value_ctx(
+    async fn put_value_checked(
         &self,
-        _name: &str,
+        _checked: epics_pva_rs::server_native::source::AccessChecked,
         _value: PvField,
         _ctx: ChannelContext,
     ) -> Result<(), String> {
@@ -85,23 +91,34 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
         self.inner.subscribe(name).await
     }
-    // Forward read-only methods so wrapping a Layer doesn't silently
-    // turn off F-G12 raw-frame forwarding or RPC dispatch on the
-    // inner source.
+    // Forward type-state op variants to the inner. Without these,
+    // the trait defaults would route through this layer's ctx-less
+    // (`get_value`/`subscribe`/`subscribe_raw`/`rpc`) — silently
+    // skipping any ctx-aware behaviour the inner installs (gateway
+    // per-credential routing, audit ctx fields).
+    async fn get_value_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<PvField> {
+        self.inner.get_value_checked(checked, ctx).await
+    }
+    async fn subscribe_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        self.inner.subscribe_checked(checked, ctx).await
+    }
     async fn subscribe_raw(&self, name: &str) -> Option<mpsc::Receiver<RawMonitorEvent>> {
         self.inner.subscribe_raw(name).await
     }
-    // R31-G6 / Round-32A: forward ctx so the inner source's ACF
-    // gate runs on the raw fast path too. Without this override the
-    // trait default would drop ctx and call back into our
-    // `subscribe_raw(name)` — letting a `NoAccess` peer mount a
-    // raw subscription that completely bypasses the gateway ACL.
-    async fn subscribe_raw_ctx(
+    async fn subscribe_raw_checked(
         &self,
-        name: &str,
-        ctx: epics_pva_rs::server_native::source::ChannelContext,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
     ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
-        self.inner.subscribe_raw_ctx(name, ctx).await
+        self.inner.subscribe_raw_checked(checked, ctx).await
     }
     async fn rpc(
         &self,
@@ -111,16 +128,14 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Result<(FieldDesc, PvField), String> {
         self.inner.rpc(name, request_desc, request_value).await
     }
-    // R37-G1 / Round 37: forward ctx so the inner gateway's ACF
-    // check runs on RPC dispatch too.
-    async fn rpc_ctx(
+    async fn rpc_checked(
         &self,
-        name: &str,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
         request_desc: FieldDesc,
         request_value: PvField,
-        ctx: epics_pva_rs::server_native::source::ChannelContext,
+        ctx: ChannelContext,
     ) -> Result<(FieldDesc, PvField), String> {
-        self.inner.rpc_ctx(name, request_desc, request_value, ctx).await
+        self.inner.rpc_checked(checked, request_desc, request_value, ctx).await
     }
     fn notify_watermark_high(&self, name: &str) {
         self.inner.notify_watermark_high(name);
@@ -226,16 +241,33 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.put_value(name, value).await
     }
-    async fn put_value_ctx(
+    // Round 43: type-state op variants gate by the layer's static
+    // allowlist BEFORE delegating. The inner source still gets the
+    // full AccessChecked + ctx and may apply its own ACF / per-
+    // credential routing on top.
+    fn access(&self) -> &epics_pva_rs::server_native::source::AccessGate {
+        self.inner.access()
+    }
+    async fn get_value_checked(
         &self,
-        name: &str,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<PvField> {
+        if !self.config.allowed(checked.pv_name()) {
+            return None;
+        }
+        self.inner.get_value_checked(checked, ctx).await
+    }
+    async fn put_value_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
         value: PvField,
         ctx: ChannelContext,
     ) -> Result<(), String> {
-        if !self.config.allowed(name) {
-            return Err(format!("ACL: PV '{name}' denied"));
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
         }
-        self.inner.put_value_ctx(name, value, ctx).await
+        self.inner.put_value_checked(checked, value, ctx).await
     }
     async fn is_writable(&self, name: &str) -> bool {
         self.config.allowed(name) && self.inner.is_writable(name).await
@@ -246,25 +278,31 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.subscribe(name).await
     }
+    async fn subscribe_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        if !self.config.allowed(checked.pv_name()) {
+            return None;
+        }
+        self.inner.subscribe_checked(checked, ctx).await
+    }
     async fn subscribe_raw(&self, name: &str) -> Option<mpsc::Receiver<RawMonitorEvent>> {
         if !self.config.allowed(name) {
             return None;
         }
         self.inner.subscribe_raw(name).await
     }
-    // R31-G6 / Round-32A: mirror `subscribe_raw`'s allowlist
-    // restriction AND forward ctx so the inner source's ACF gate
-    // runs on the raw fast path. Acl's static allowlist and the
-    // gateway's per-PV ASG must both apply.
-    async fn subscribe_raw_ctx(
+    async fn subscribe_raw_checked(
         &self,
-        name: &str,
-        ctx: epics_pva_rs::server_native::source::ChannelContext,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
     ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
-        if !self.config.allowed(name) {
+        if !self.config.allowed(checked.pv_name()) {
             return None;
         }
-        self.inner.subscribe_raw_ctx(name, ctx).await
+        self.inner.subscribe_raw_checked(checked, ctx).await
     }
     async fn rpc(
         &self,
@@ -277,19 +315,19 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.rpc(name, request_desc, request_value).await
     }
-    // R37-G1 / Round 37: mirror the allowlist restriction AND
-    // forward ctx so the inner gateway's ACF check runs.
-    async fn rpc_ctx(
+    async fn rpc_checked(
         &self,
-        name: &str,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
         request_desc: FieldDesc,
         request_value: PvField,
-        ctx: epics_pva_rs::server_native::source::ChannelContext,
+        ctx: ChannelContext,
     ) -> Result<(FieldDesc, PvField), String> {
-        if !self.config.allowed(name) {
-            return Err(format!("ACL: PV '{name}' denied"));
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
         }
-        self.inner.rpc_ctx(name, request_desc, request_value, ctx).await
+        self.inner
+            .rpc_checked(checked, request_desc, request_value, ctx)
+            .await
     }
     fn notify_watermark_high(&self, name: &str) {
         self.inner.notify_watermark_high(name);
@@ -566,6 +604,9 @@ impl<S: ChannelSource, A: AuditSink> Layer<S> for AuditLayer<A> {
 }
 
 impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
+    fn access(&self) -> &epics_pva_rs::server_native::source::AccessGate {
+        self.inner.access()
+    }
     async fn list_pvs(&self) -> Vec<String> {
         self.inner.list_pvs().await
     }
@@ -596,17 +637,62 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         self.sink.record(make_audit_event(name, "", "", &result));
         result
     }
-    async fn put_value_ctx(
+    // Round 43: typed PUT — emits a credential-aware audit row and
+    // forwards through the inner's gate-enforced path.
+    async fn put_value_checked(
         &self,
-        name: &str,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
         value: PvField,
         ctx: ChannelContext,
     ) -> Result<(), String> {
+        let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
-        let result = self.inner.put_value_ctx(name, value, ctx).await;
+        let result = self.inner.put_value_checked(checked, value, ctx).await;
         self.sink
-            .record(make_audit_event(name, &user, &host, &result));
+            .record(make_audit_event(&pv, &user, &host, &result));
+        result
+    }
+    async fn get_value_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<PvField> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.get_value_checked(checked, ctx).await;
+        if self.audit_get {
+            let outcome: Result<(), String> = if result.is_some() {
+                Ok(())
+            } else {
+                Err(format!("PV '{pv}' not found / denied"))
+            };
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Get;
+            self.sink.record(ev);
+        }
+        result
+    }
+    async fn subscribe_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Option<mpsc::Receiver<PvField>> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.subscribe_checked(checked, ctx).await;
+        if self.audit_subscribe {
+            let outcome: Result<(), String> = if result.is_some() {
+                Ok(())
+            } else {
+                Err(format!("PV '{pv}' not subscribable"))
+            };
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Subscribe;
+            self.sink.record(ev);
+        }
         result
     }
     async fn is_writable(&self, name: &str) -> bool {
@@ -643,25 +729,25 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    // R31-G6 / Round-32A: ctx-aware audit + raw-frame subscribe.
-    // Same audit shape as `subscribe_raw` but populates the user /
-    // host columns from the downstream credentials, and forwards
-    // ctx so the inner gateway's ACF check runs.
-    async fn subscribe_raw_ctx(
+    // Round 43: typed raw MONITOR — populate audit row with peer
+    // credentials and forward through the inner's gate-enforced
+    // path.
+    async fn subscribe_raw_checked(
         &self,
-        name: &str,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
     ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+        let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
-        let result = self.inner.subscribe_raw_ctx(name, ctx).await;
+        let result = self.inner.subscribe_raw_checked(checked, ctx).await;
         if self.audit_subscribe {
             let outcome: Result<(), String> = if result.is_some() {
                 Ok(())
             } else {
-                Err(format!("PV '{name}' not subscribable (raw)"))
+                Err(format!("PV '{pv}' not subscribable (raw)"))
             };
-            let mut ev = make_audit_event(name, &user, &host, &outcome);
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
             ev.event = AuditEventKind::Subscribe;
             self.sink.record(ev);
         }
@@ -685,28 +771,29 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    // R37-G1 / Round 37: ctx-aware audit + RPC dispatch. Populates
-    // the audit row with the downstream peer's credentials and
-    // forwards ctx so the inner gateway's ACF check runs.
-    async fn rpc_ctx(
+    // Round 43: typed RPC — populate audit row with peer
+    // credentials and forward through the inner's gate-enforced
+    // path.
+    async fn rpc_checked(
         &self,
-        name: &str,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
     ) -> Result<(FieldDesc, PvField), String> {
+        let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
         let result = self
             .inner
-            .rpc_ctx(name, request_desc, request_value, ctx)
+            .rpc_checked(checked, request_desc, request_value, ctx)
             .await;
         if self.audit_rpc {
             let outcome: Result<(), String> = match &result {
                 Ok(_) => Ok(()),
                 Err(e) => Err(e.clone()),
             };
-            let mut ev = make_audit_event(name, &user, &host, &outcome);
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
             ev.event = AuditEventKind::Rpc;
             self.sink.record(ev);
         }

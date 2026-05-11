@@ -88,30 +88,9 @@ impl PvDatabaseSource {
         &self.db
     }
 
-    /// Resolve the ASG and ASL of the record backing `pv_name`
-    /// (the part before the optional `.FIELD` suffix). Returns
-    /// `("DEFAULT", 0)` for simple PVs (no record-level ASG/ASL)
-    /// or for unknown names; the ACF defaults its `DEFAULT` ASG
-    /// when no rule matches.
-    ///
-    /// Round-33A (R33-G4): previously this only returned the ASG
-    /// string and every ACF call site hard-coded `record_asl=0`,
-    /// silently disabling the `RULE(N, …)` ASL gate for every
-    /// record. Now the ASL is read from `common.asl` and threaded
-    /// through to `check_access_method`.
-    async fn resolve_asg(&self, pv_name: &str) -> (String, u8) {
-        let (base, _field) = parse_pv_name(pv_name);
-        if let Some(rec) = self.db.get_record(base).await {
-            let inst = rec.read().await;
-            let asg = if !inst.common.asg.is_empty() {
-                inst.common.asg.clone()
-            } else {
-                "DEFAULT".to_string()
-            };
-            return (asg, inst.common.asl);
-        }
-        ("DEFAULT".to_string(), 0)
-    }
+    // Round 43: the ASG/ASL resolution moved into the AccessGate
+    // builder (`Self::build_gate`). The duplicate `resolve_asg`
+    // method that the deleted `*_ctx` overrides used is now gone.
 }
 
 // ── EpicsValue → PvField (NTScalar / NTScalarArray) ─────────────────────
@@ -490,114 +469,13 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
-    fn get_value_ctx(
-        &self,
-        name: &str,
-        ctx: crate::server_native::ChannelContext,
-    ) -> impl std::future::Future<Output = Option<PvField>> + Send {
-        let acf = self.acf.clone();
-        let resolve_fut = self.resolve_asg(name);
-        let get_fut = self.get_value(name);
-        async move {
-            // ACF gate for READ. When ACF is attached, the peer must
-            // have at least Read access on the record's ASG; without
-            // it (or NoAccess) the GET returns None — same shape as
-            // an unknown PV, so the wire layer surfaces an
-            // ECA_NORDACCESS-equivalent.
-            let acf_guard = acf.read().await;
-            if let Some(ref cfg) = *acf_guard {
-                let (asg, asl) = resolve_fut.await;
-                let level =
-                    cfg.check_access_method(&asg, &ctx.host, &ctx.account, asl, &ctx.method, "");
-                if level == AccessLevel::NoAccess {
-                    return None;
-                }
-            }
-            drop(acf_guard);
-            get_fut.await
-        }
-    }
-
-    fn subscribe_ctx(
-        &self,
-        name: &str,
-        ctx: crate::server_native::ChannelContext,
-    ) -> impl std::future::Future<
-        Output = Option<tokio::sync::mpsc::Receiver<PvField>>,
-    > + Send {
-        let acf = self.acf.clone();
-        let resolve_fut = self.resolve_asg(name);
-        let sub_fut = self.subscribe(name);
-        async move {
-            // ACF gate for MONITOR — same Read requirement as
-            // get_value_ctx.
-            let acf_guard = acf.read().await;
-            if let Some(ref cfg) = *acf_guard {
-                let (asg, asl) = resolve_fut.await;
-                let level =
-                    cfg.check_access_method(&asg, &ctx.host, &ctx.account, asl, &ctx.method, "");
-                if level == AccessLevel::NoAccess {
-                    return None;
-                }
-            }
-            drop(acf_guard);
-            sub_fut.await
-        }
-    }
-
-    fn put_value_ctx(
-        &self,
-        name: &str,
-        value: PvField,
-        ctx: crate::server_native::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
-        let db = self.db.clone();
-        let acf = self.acf.clone();
-        let name_s = name.to_string();
-        // Look up the record's ASG eagerly so the async block below
-        // doesn't have to borrow `&self`.
-        let resolve_fut = self.resolve_asg(name);
-        async move {
-            // ACF gate. Skipped when no AccessSecurityConfig is
-            // attached (legacy / opt-in behaviour for tests + simple
-            // tools); otherwise the PUT is denied unless the peer's
-            // (host, account, method) yields ReadWrite for the
-            // record's ASG.
-            let acf_guard = acf.read().await;
-            if let Some(ref cfg) = *acf_guard {
-                let (asg, asl) = resolve_fut.await;
-                let level = cfg.check_access_method(
-                    &asg,
-                    &ctx.host,
-                    &ctx.account,
-                    asl,
-                    &ctx.method,
-                    "", // authority (cert issuer) not surfaced via PVA wire today
-                );
-                if level != AccessLevel::ReadWrite {
-                    return Err(format!(
-                        "PUT denied by access security: ASG '{asg}' from {host}/{account}/{method}",
-                        host = ctx.host,
-                        account = ctx.account,
-                        method = ctx.method,
-                    ));
-                }
-            }
-            drop(acf_guard);
-
-            // Reuse the standard PUT path for the actual write —
-            // identical to `put_value` so behaviour stays in sync
-            // when ACF is disabled.
-            let scalar = match &value {
-                PvField::Structure(s) => s.get_field("value").cloned(),
-                _ => Some(value),
-            };
-            let scalar = scalar.ok_or_else(|| "PUT missing 'value' field".to_string())?;
-            let epics = pv_field_to_epics(&scalar)
-                .ok_or_else(|| "PUT value not representable as EpicsValue".to_string())?;
-            db.put_pv(&name_s, epics).await.map_err(|e| e.to_string())
-        }
-    }
+    // Round 43: the legacy `get_value_ctx` / `subscribe_ctx` /
+    // `put_value_ctx` overrides were deleted. The trait's
+    // `*_checked` defaults already enforce the AccessChecked level
+    // before delegating to the ctx-less variants here, and the
+    // gate (built by `Self::build_gate`) reads the ASG/ASL from
+    // the record itself — so this source no longer carries any
+    // duplicate ACF logic.
 
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let db = self.db.clone();
@@ -728,6 +606,59 @@ mod tests {
             account: account.to_string(),
             method: method.to_string(),
             host: host.to_string(),
+        }
+    }
+
+    /// Round 43: test-only compat layer that reproduces the
+    /// pre-Round-43 `*_ctx` shape on top of the new gate +
+    /// `*_checked` typed API. Production callers in `tcp.rs` go
+    /// through the gate directly; only these regression tests
+    /// retain the legacy call shape for clarity.
+    trait PvaSourceTestExt {
+        async fn put_value_ctx(
+            &self,
+            pv: &str,
+            value: PvField,
+            ctx: ChannelContext,
+        ) -> Result<(), String>;
+        async fn get_value_ctx(&self, pv: &str, ctx: ChannelContext) -> Option<PvField>;
+        async fn subscribe_ctx(
+            &self,
+            pv: &str,
+            ctx: ChannelContext,
+        ) -> Option<tokio::sync::mpsc::Receiver<PvField>>;
+    }
+
+    impl PvaSourceTestExt for PvDatabaseSource {
+        async fn put_value_ctx(
+            &self,
+            pv: &str,
+            value: PvField,
+            ctx: ChannelContext,
+        ) -> Result<(), String> {
+            let checked = self
+                .access()
+                .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            self.put_value_checked(checked, value, ctx).await
+        }
+        async fn get_value_ctx(&self, pv: &str, ctx: ChannelContext) -> Option<PvField> {
+            let checked = self
+                .access()
+                .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            self.get_value_checked(checked, ctx).await
+        }
+        async fn subscribe_ctx(
+            &self,
+            pv: &str,
+            ctx: ChannelContext,
+        ) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+            let checked = self
+                .access()
+                .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+                .await;
+            self.subscribe_checked(checked, ctx).await
         }
     }
 

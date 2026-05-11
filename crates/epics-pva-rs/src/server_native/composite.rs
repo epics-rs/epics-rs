@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField};
 
-use super::source::{ChannelContext, ChannelSource, DynSource, RawMonitorEvent};
+use super::source::{AccessChecked, ChannelContext, ChannelSource, DynSource, RawMonitorEvent};
 
 /// One entry in the registry.
 #[derive(Clone)]
@@ -219,48 +219,119 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    // R37-G1 / Round 37: forward ctx through composite dispatch so
-    // the resolved source's ACF gate runs on RPC.
-    fn rpc_ctx(
+    // Round 43: composite has no single gate of its own — each
+    // inner source carries its own. The `*_checked` overrides
+    // resolve the matched source by name, then mint a fresh
+    // AccessChecked via THAT source's gate before invoking its
+    // typed op. The outer token passed into the composite is
+    // effectively a permissive seal from the composite's Open
+    // gate (which `access()` returns by default); only the inner
+    // re-check is load-bearing for ACF.
+
+    fn get_value_checked(
         &self,
-        name: &str,
-        request_desc: FieldDesc,
-        request_value: PvField,
+        checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
-        let name = name.to_string();
+    ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
             for src in this {
                 if src.has_pv(&name).await {
-                    return src
-                        .rpc_ctx(&name, request_desc, request_value, ctx)
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
                         .await;
+                    return src.get_value_checked(inner_checked, ctx).await;
+                }
+            }
+            None
+        }
+    }
+
+    fn put_value_checked(
+        &self,
+        checked: AccessChecked,
+        value: PvField,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .await;
+                    return src.put_value_checked(inner_checked, value, ctx).await;
                 }
             }
             Err(format!("no source serves '{name}'"))
         }
     }
 
-    // F-G6-1: explicitly forward the trait methods that have default
-    // impls so the composite doesn't shadow per-source overrides.
-    // Round-2 caught the same pattern in the middleware Layer wrappers
-    // (subscribe_raw / put_value_ctx / notify_watermark_*) — without
-    // these, F-G12 raw-frame forwarding and PG-G10 per-credential
-    // routing silently revert to the default no-op for any source
-    // routed through the composite.
-    fn put_value_ctx(
+    fn subscribe_checked(
         &self,
-        name: &str,
-        value: PvField,
-        ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
-        let name = name.to_string();
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
             for src in this {
                 if src.has_pv(&name).await {
-                    return src.put_value_ctx(&name, value, ctx).await;
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .await;
+                    return src.subscribe_checked(inner_checked, ctx).await;
+                }
+            }
+            None
+        }
+    }
+
+    fn subscribe_raw_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .await;
+                    return src.subscribe_raw_checked(inner_checked, ctx).await;
+                }
+            }
+            None
+        }
+    }
+
+    fn rpc_checked(
+        &self,
+        checked: AccessChecked,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .await;
+                    return src
+                        .rpc_checked(inner_checked, request_desc, request_value, ctx)
+                        .await;
                 }
             }
             Err(format!("no source serves '{name}'"))
@@ -277,26 +348,6 @@ impl ChannelSource for CompositeSource {
             for src in this {
                 if src.has_pv(&name).await {
                     return src.subscribe_raw(&name).await;
-                }
-            }
-            None
-        }
-    }
-
-    // R31-G6 / Round-32A: forward ctx through the composite dispatch
-    // so the resolved source sees the downstream credentials on the
-    // raw fast path too.
-    fn subscribe_raw_ctx(
-        &self,
-        name: &str,
-        ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
-        let name = name.to_string();
-        let this = self.snapshot();
-        async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    return src.subscribe_raw_ctx(&name, ctx).await;
                 }
             }
             None

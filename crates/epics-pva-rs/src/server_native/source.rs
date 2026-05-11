@@ -337,7 +337,7 @@ pub trait ChannelSourceObj: Send + Sync {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
     /// Round 41: per-source access gate. Dyn forwarder.
-    fn access_gate<'a>(&'a self) -> &'a AccessGate;
+    fn access_gate(&self) -> &AccessGate;
     /// Round 50 follow-up: monitor reload revalidation owner.
     fn revalidate_read<'a>(
         &'a self,
@@ -443,7 +443,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
             self, checked, ctx,
         ))
     }
-    fn access_gate<'a>(&'a self) -> &'a AccessGate {
+    fn access_gate(&self) -> &AccessGate {
         <Self as ChannelSource>::access(self)
     }
     fn revalidate_read<'a>(

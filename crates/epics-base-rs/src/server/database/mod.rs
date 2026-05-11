@@ -499,12 +499,11 @@ impl PvDatabase {
     /// gone).
     pub async fn remove_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
         let _gate = self.inner.registration_mutex.lock().await;
-        let removed = self.inner.simple_pvs.write().await.remove(name);
         // Simple PVs cannot be alias targets (aliases point at
         // records), but a stale alias whose name MATCHES this PV
         // would have been rejected at add_alias time. No alias
         // cleanup needed for simple-PV removal.
-        removed
+        self.inner.simple_pvs.write().await.remove(name)
     }
 
     /// Add a record (accepts a boxed Record to avoid double-boxing).

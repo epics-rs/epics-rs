@@ -312,6 +312,17 @@ impl ProcessVariable {
             coalesced: Arc::new(StdMutex::new(None)),
         };
         let mut subs = self.subscribers.lock().await;
+        // Round 46 (R46-G1): reap dead Senders BEFORE counting
+        // against the cap. `notify_subscribers` / `post_alarm`
+        // already retain-filter on every emission, but a PV with
+        // no value changes (e.g. a static catalog entry that
+        // dashboards latch onto and drop) never triggered the
+        // reaper — a long-lived subscribe / disconnect storm could
+        // pin the Vec at `cap` worth of closed `Sender`s and lock
+        // out genuine new subscribers with a false-positive cap-
+        // reached warning. Same defect class as the round-37
+        // NDPluginPva subscribe reaper (qsrv/pva_adapter.rs:247).
+        subs.retain(|s| !s.tx.is_closed());
         if subs.len() >= cap {
             tracing::warn!(
                 pv = %self.name,

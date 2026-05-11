@@ -1710,6 +1710,14 @@ impl RecordInstance {
         let cap = crate::server::pv::max_subscribers_per_pv();
         let field_str = field.to_string();
         let bucket = self.subscribers.entry(field_str.clone()).or_default();
+        // Round 46 (R46-G1, mirror): reap dead Senders before
+        // counting against the cap. A record field whose value
+        // never changes (e.g. a quasi-static catalog field) never
+        // triggers `notify_field_with_origin`'s retain-filter, so
+        // a long-lived subscribe-disconnect storm could pin the
+        // bucket at `cap` worth of closed Senders and lock out
+        // genuine new subscribers.
+        bucket.retain(|s| !s.tx.is_closed());
         if bucket.len() >= cap {
             tracing::warn!(
                 record = %self.name,

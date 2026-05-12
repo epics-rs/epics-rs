@@ -10,8 +10,24 @@ pub const PVA_SERVER_PORT: u16 = 5075;
 pub const PVA_BROADCAST_PORT: u16 = 5076;
 
 /// Returns the CA server port, allowing override via `EPICS_CA_SERVER_PORT`.
+///
+/// This is the *UDP discovery port* — clients send SEARCH packets here.
+/// On a multi-IOC host every IOC must agree on the same UDP port so that
+/// one search reaches them all; the TCP port can vary per IOC and is
+/// controlled by [`cas_server_port`].
 pub fn ca_server_port() -> u16 {
     env::get_u16("EPICS_CA_SERVER_PORT", CA_SERVER_PORT)
+}
+
+/// Returns the CA server *TCP* port, allowing override via
+/// `EPICS_CAS_SERVER_PORT`. Falls back to [`ca_server_port`] when unset.
+///
+/// Mirrors epics-base PR #69: lets multiple IOCs on one host bind unique
+/// TCP ports while all sharing the canonical UDP search port (5064).
+/// The UDP responder advertises this TCP port back in SEARCH_REPLY so
+/// clients connect to the right listener.
+pub fn cas_server_port() -> u16 {
+    env::get_u16("EPICS_CAS_SERVER_PORT", ca_server_port())
 }
 
 /// Returns the CA repeater port, allowing override via `EPICS_CA_REPEATER_PORT`.
@@ -74,6 +90,39 @@ mod tests {
         unsafe { std::env::set_var("EPICS_CA_SERVER_PORT", "9064") };
         assert_eq!(ca_server_port(), 9064);
         unsafe { std::env::remove_var("EPICS_CA_SERVER_PORT") };
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn test_cas_server_port_defaults_to_ca_server_port() {
+        unsafe {
+            std::env::remove_var("EPICS_CAS_SERVER_PORT");
+            std::env::remove_var("EPICS_CA_SERVER_PORT");
+        }
+        assert_eq!(cas_server_port(), CA_SERVER_PORT);
+
+        unsafe { std::env::set_var("EPICS_CA_SERVER_PORT", "9064") };
+        assert_eq!(
+            cas_server_port(),
+            9064,
+            "cas_server_port falls back to EPICS_CA_SERVER_PORT when CAS-specific unset"
+        );
+        unsafe { std::env::remove_var("EPICS_CA_SERVER_PORT") };
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn test_cas_server_port_overrides_ca_server_port() {
+        unsafe {
+            std::env::set_var("EPICS_CA_SERVER_PORT", "5064");
+            std::env::set_var("EPICS_CAS_SERVER_PORT", "9064");
+        }
+        assert_eq!(ca_server_port(), 5064, "UDP discovery port stays at 5064");
+        assert_eq!(cas_server_port(), 9064, "TCP port follows CAS-specific var");
+        unsafe {
+            std::env::remove_var("EPICS_CAS_SERVER_PORT");
+            std::env::remove_var("EPICS_CA_SERVER_PORT");
+        }
     }
 
     #[test]

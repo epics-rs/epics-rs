@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::runtime::net::CA_SERVER_PORT;
+use epics_base_rs::runtime::net::ca_server_port;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 
@@ -23,7 +23,14 @@ use epics_base_rs::server::{access_security, autosave, device_support, ioc_build
 /// `acf()`, and `acf_file()` are CA-specific.
 pub struct CaServerBuilder {
     ioc: ioc_builder::IocBuilder,
+    /// UDP discovery port — clients send SEARCH packets here. Defaults
+    /// to `EPICS_CA_SERVER_PORT` or 5064.
     port: u16,
+    /// Explicit TCP listen port override. When `None`, resolved at
+    /// `build()` time from `EPICS_CAS_SERVER_PORT`, falling back to
+    /// `port`. Lets the canonical UDP port stay at 5064 while each
+    /// IOC binds a unique TCP port (epics-base PR #69).
+    tcp_port: Option<u16>,
     acf: Option<access_security::AccessSecurityConfig>,
     /// Captured by `acf_file(path)` so the built server can later
     /// `reload_acf()` from the same source. None when the ACF was
@@ -64,7 +71,8 @@ impl CaServerBuilder {
     pub fn new() -> Self {
         Self {
             ioc: ioc_builder::IocBuilder::new(),
-            port: CA_SERVER_PORT,
+            port: ca_server_port(),
+            tcp_port: None,
             acf: None,
             acf_path: None,
             #[cfg(feature = "experimental-rust-tls")]
@@ -136,9 +144,30 @@ impl CaServerBuilder {
 
     // ── CA-specific methods ──────────────────────────────────────────
 
-    /// Set the port for both UDP and TCP (default: 5064).
+    /// Set the UDP discovery port (default: `EPICS_CA_SERVER_PORT` or 5064).
+    ///
+    /// When no [`Self::tcp_port`] override is provided, the TCP listener
+    /// inherits this port — preserving the historical
+    /// "one port for both" behaviour for callers that don't need a
+    /// split-port deployment.
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// Set the TCP listen port independently from the UDP search port.
+    ///
+    /// Mirrors epics-base PR #69 (`EPICS_CAS_SERVER_PORT`): multiple
+    /// IOCs on one host can each bind a unique TCP port while every
+    /// IOC keeps the canonical UDP search port (5064). The UDP search
+    /// responder advertises this TCP port back in SEARCH_REPLY so
+    /// clients connect to the correct listener.
+    ///
+    /// When unset, the TCP port is resolved at `build()` time from
+    /// `EPICS_CAS_SERVER_PORT`; if that env var is also unset, the TCP
+    /// port falls back to [`Self::port`].
+    pub fn tcp_port(mut self, port: u16) -> Self {
+        self.tcp_port = Some(port);
         self
     }
 
@@ -244,9 +273,21 @@ impl CaServerBuilder {
         });
         let (conn_tx, _) = tokio::sync::broadcast::channel(64);
         let (acf_reload_tx, _) = tokio::sync::broadcast::channel(16);
+        // Explicit `.tcp_port(...)` wins; otherwise honor
+        // EPICS_CAS_SERVER_PORT; otherwise fall back to the UDP port.
+        // Reading the env here (rather than at `new()`) means callers
+        // can `unsafe { set_var(...) }` after `CaServer::builder()` and
+        // still pick up the override.
+        let tcp_port = self.tcp_port.unwrap_or_else(|| {
+            std::env::var("EPICS_CAS_SERVER_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(self.port)
+        });
         Ok(CaServer {
             db,
             port: self.port,
+            tcp_port,
             stats: Arc::new(ServerStats::default()),
             acf,
             acf_source_path: std::sync::Mutex::new(self.acf_path),
@@ -320,7 +361,13 @@ impl ServerStats {
 
 pub struct CaServer {
     db: Arc<PvDatabase>,
+    /// UDP discovery port. Bound by the search responder.
     port: u16,
+    /// TCP listen port. Equal to `port` unless explicitly split via
+    /// [`CaServerBuilder::tcp_port`] or `EPICS_CAS_SERVER_PORT`
+    /// (epics-base PR #69). The UDP responder advertises this port in
+    /// SEARCH_REPLY frames so clients connect to the right listener.
+    tcp_port: u16,
     /// Shared stats counter — incremented by a task spawned in
     /// `start()` that subscribes to `conn_events`. Surfaced via
     /// [`Self::stats`] and the `casr` iocsh command.
@@ -422,10 +469,14 @@ impl CaServer {
     }
 
     /// Construct a CaServer from pre-populated parts.
-    /// Used by [`ioc_app::IocApplication`] after st.cmd execution and device support wiring.
+    /// Used by [`ioc_app::IocApplication`] after st.cmd execution and
+    /// device support wiring. `tcp_port` carries the optional split-port
+    /// TCP override (`EPICS_CAS_SERVER_PORT`); pass `None` to share the
+    /// UDP discovery port with the TCP listener.
     pub fn from_parts(
         db: Arc<PvDatabase>,
         port: u16,
+        tcp_port: Option<u16>,
         acf: Option<access_security::AccessSecurityConfig>,
         autosave_config: Option<autosave::SaveSetConfig>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
@@ -437,9 +488,11 @@ impl CaServer {
         // 64 matches the previous lazy default.
         let (conn_tx, _) = tokio::sync::broadcast::channel(64);
         let (acf_reload_tx, _) = tokio::sync::broadcast::channel(16);
+        let tcp_port = tcp_port.unwrap_or(port);
         Self {
             db,
             port,
+            tcp_port,
             stats,
             acf: Arc::new(tokio::sync::RwLock::new(acf)),
             acf_source_path: std::sync::Mutex::new(None),
@@ -741,6 +794,9 @@ impl CaServer {
         let db_scan = self.db.clone();
         let acf = self.acf.clone();
         let port = self.port;
+        // TCP listen port — equal to `port` unless split via
+        // EPICS_CAS_SERVER_PORT / `.tcp_port()` (epics-base PR #69).
+        let tcp_listen_port = self.tcp_port;
 
         let scanner = ScanScheduler::new(db_scan);
 
@@ -820,7 +876,7 @@ impl CaServer {
             {
                 tcp::run_tcp_listener(
                     db_tcp,
-                    port,
+                    tcp_listen_port,
                     acf,
                     acf_reload_tx,
                     tcp_tx,
@@ -838,7 +894,7 @@ impl CaServer {
             {
                 tcp::run_tcp_listener(
                     db_tcp,
-                    port,
+                    tcp_listen_port,
                     acf,
                     acf_reload_tx,
                     tcp_tx,

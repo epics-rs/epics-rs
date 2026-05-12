@@ -52,7 +52,14 @@ pub type DynamicDeviceSupportFactory =
 /// (e.g., CA or PVA) with an interactive shell.
 pub struct IocRunConfig {
     pub db: Arc<PvDatabase>,
+    /// UDP discovery port — clients SEARCH here. Defaults to
+    /// `EPICS_CA_SERVER_PORT` or 5064.
     pub port: u16,
+    /// Optional TCP-listen port override. `None` means "use `port`".
+    /// `Some(p)` lets multiple IOCs on one host bind unique TCP ports
+    /// (epics-base PR #69, `EPICS_CAS_SERVER_PORT`) while keeping the
+    /// canonical UDP discovery port.
+    pub tcp_port: Option<u16>,
     pub acf: Option<access_security::AccessSecurityConfig>,
     pub autosave_config: Option<autosave::SaveSetConfig>,
     pub autosave_manager: Option<Arc<autosave::AutosaveManager>>,
@@ -64,6 +71,10 @@ pub struct IocRunConfig {
 /// IOC Application with st.cmd-style startup support.
 pub struct IocApplication {
     port: u16,
+    /// Optional TCP listen port override. `None` means "share with UDP
+    /// discovery port". Set via [`Self::tcp_port`] or the
+    /// `EPICS_CAS_SERVER_PORT` env var (resolved at run time).
+    tcp_port: Option<u16>,
     device_factories: HashMap<String, DeviceSupportFactory>,
     dynamic_device_factory: Option<DynamicDeviceSupportFactory>,
     record_factories: HashMap<String, super::RecordFactory>,
@@ -84,6 +95,7 @@ impl IocApplication {
     pub fn new() -> Self {
         Self {
             port: CA_SERVER_PORT,
+            tcp_port: None,
             device_factories: HashMap::new(),
             dynamic_device_factory: None,
             record_factories: HashMap::new(),
@@ -99,9 +111,20 @@ impl IocApplication {
         }
     }
 
-    /// Set the server port (default: 5064).
+    /// Set the UDP discovery port (default: 5064).
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// Set the TCP listen port independently from the UDP discovery
+    /// port (epics-base PR #69, `EPICS_CAS_SERVER_PORT`). Multiple IOCs
+    /// on one host can each bind a unique TCP port while sharing the
+    /// canonical 5064 UDP search port. When unset, the IOC resolves it
+    /// at run time from `EPICS_CAS_SERVER_PORT`; if that's also unset,
+    /// the TCP listener inherits [`Self::port`].
+    pub fn tcp_port(mut self, port: u16) -> Self {
+        self.tcp_port = Some(port);
         self
     }
 
@@ -247,6 +270,7 @@ impl IocApplication {
 
         let Self {
             port,
+            tcp_port,
             device_factories,
             dynamic_device_factory,
             record_factories,
@@ -452,10 +476,21 @@ impl IocApplication {
             }
         }
 
-        // Phase 3: Hand off to protocol runner
+        // Phase 3: Hand off to protocol runner.
+        // Resolve TCP port: explicit `.tcp_port(...)` wins, then
+        // EPICS_CAS_SERVER_PORT, otherwise inherit the UDP discovery
+        // port (epics-base PR #69 semantics). Read the env here at run
+        // time so tests / wrappers that set the var after constructing
+        // the app still pick up the value.
+        let tcp_port = tcp_port.or_else(|| {
+            std::env::var("EPICS_CAS_SERVER_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+        });
         let config = IocRunConfig {
             db,
             port,
+            tcp_port,
             acf,
             autosave_config,
             autosave_manager,

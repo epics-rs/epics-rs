@@ -48,7 +48,7 @@ impl DownstreamServer {
     /// Create a new downstream server bound to `port`, serving from
     /// the given shadow database.
     pub fn new(shadow_db: Arc<PvDatabase>, port: u16) -> Self {
-        let server = CaServer::from_parts(shadow_db.clone(), port, None, None, None);
+        let server = CaServer::from_parts(shadow_db.clone(), port, None, None, None, None);
         Self {
             server: Mutex::new(Some(server)),
             shadow_db,
@@ -66,7 +66,7 @@ impl DownstreamServer {
         port: u16,
         tls: std::sync::Arc<epics_ca_rs::tls::ServerConfig>,
     ) -> Self {
-        let mut server = CaServer::from_parts(shadow_db.clone(), port, None, None, None);
+        let mut server = CaServer::from_parts(shadow_db.clone(), port, None, None, None, None);
         server.set_tls(tls);
         Self {
             server: Mutex::new(Some(server)),

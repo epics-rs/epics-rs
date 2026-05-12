@@ -50,7 +50,7 @@ async fn boot_softioc(n_pvs: usize, port: u16) -> tokio::task::JoinHandle<()> {
     // dynamic port and read it back; bench uses a fixed offset to
     // avoid collisions when run repeatedly.)
     // Override port to the fixed value before starting.
-    let server = CaServer::from_parts(server.database().clone(), port, None, None, None);
+    let server = CaServer::from_parts(server.database().clone(), port, None, None, None, None);
     let handle = tokio::spawn(async move {
         if let Err(e) = server.run().await {
             eprintln!("CA benchmark server exited: {e}");

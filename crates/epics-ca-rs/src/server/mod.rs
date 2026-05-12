@@ -38,6 +38,7 @@ pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
     let mut server = CaServer::from_parts(
         config.db,
         config.port,
+        config.tcp_port,
         config.acf,
         config.autosave_config,
         config.autosave_manager,

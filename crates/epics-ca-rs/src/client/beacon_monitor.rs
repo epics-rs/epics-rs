@@ -185,6 +185,11 @@ async fn run_beacon_monitor_inner(
         Some("NO" | "no" | "0" | "false" | "FALSE")
     );
     let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+    // EPICS_IOC_IGNORE_SERVERS snapshot (epics-base 6efe2924). Captured
+    // at task start so the beacon hot path stays env-read-free; admins
+    // restart the IOC to apply a new ignore list.
+    let ignored_servers: std::collections::HashSet<Ipv4Addr> =
+        super::epics_ioc_ignore_servers().into_iter().collect();
     // Beacons are 16 B but the repeater may concatenate VERSION + RSRV_IS_UP
     // and forward client-noop traffic. Use 4 KB so chained datagrams are
     // received intact.
@@ -342,7 +347,7 @@ async fn run_beacon_monitor_inner(
                 }
             }
 
-            handle_beacon(hdr, &mut servers, &coord_tx);
+            handle_beacon(hdr, &mut servers, &coord_tx, &ignored_servers);
         }
     }
 }
@@ -433,6 +438,7 @@ fn handle_beacon(
     hdr: CaHeader,
     servers: &mut HashMap<SocketAddr, BeaconState>,
     coord_tx: &mpsc::UnboundedSender<CoordRequest>,
+    ignored_servers: &std::collections::HashSet<Ipv4Addr>,
 ) {
     // count = server TCP port (CA v4.1+), data_type = protocol version.
     let server_port = if hdr.count != 0 {
@@ -446,6 +452,15 @@ fn handle_beacon(
     // as-is for beacon tracking — each IOC still has a unique port,
     // matching the approach used by the C CA client (libca).
     let server_ip = Ipv4Addr::from(hdr.available.to_be_bytes());
+    // EPICS_IOC_IGNORE_SERVERS (epics-base 6efe2924): silently drop
+    // beacons announcing a blacklisted server so the anomaly-poke
+    // path doesn't keep waking the search engine for a quarantined
+    // IOC. Filter applies only when the announced IP is concrete —
+    // INADDR_ANY (0) means "I'm an IOC announcing myself, use the
+    // UDP source," which the search engine resolves separately.
+    if !server_ip.is_unspecified() && ignored_servers.contains(&server_ip) {
+        return;
+    }
     let server_addr = SocketAddr::V4(SocketAddrV4::new(server_ip, server_port));
     let now = Instant::now();
 
@@ -747,7 +762,7 @@ mod tests {
         // First beacon — first sighting → anomaly fires with the
         // FirstSighting kind so the coordinator can wake searches
         // without probing operational TCP circuits.
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         assert!(matches!(
             rx.try_recv(),
             Ok(CoordRequest::ForceRescanServer {
@@ -760,7 +775,7 @@ mod tests {
 
         // Second beacon with the SAME cid (true duplicate from another
         // NIC / repeater coalesce) — must be silently dropped.
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         assert!(
             rx.try_recv().is_err(),
             "duplicate same-cid beacon must not fire ForceRescanServer"
@@ -782,7 +797,7 @@ mod tests {
         hdr.cid = 100;
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
         // First sighting — anomaly fires.
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         assert!(rx.try_recv().is_ok());
 
         // Sub-50ms later, IOC restarts: id resets to 1 (not the
@@ -790,7 +805,7 @@ mod tests {
         // though actual_interval < 50ms now, the id-mismatch branch
         // must catch the restart.
         hdr.cid = 1;
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         assert!(
             matches!(
                 rx.try_recv(),
@@ -843,7 +858,7 @@ mod tests {
         hdr.count = 5064;
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
         hdr.cid = 100; // monotonic — rules out IdMismatch
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         // No `ForceRescanServer` — the cascade is server-side reset,
         // not a restart. `BeaconArrival { anomaly: false }` IS emitted
         // (healthy-beacon refresh path) and that is fine.
@@ -916,7 +931,7 @@ mod tests {
         hdr.cid = 0;
 
         // Beacon #1 — first sighting.
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         // Drain the FirstSighting event.
         let mut first_sighting_seen = false;
         while let Ok(msg) = rx.try_recv() {
@@ -941,7 +956,7 @@ mod tests {
             let s = servers.get_mut(&server).expect("entry");
             s.last_seen = std::time::Instant::now() - Duration::from_millis(ms);
             hdr.cid = (i as u32) + 1;
-            handle_beacon(hdr, &mut servers, &tx);
+            handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
 
             // Inspect every emitted CoordRequest; PeriodCollapse
             // would surface as a `ForceRescanServer { kind:
@@ -978,7 +993,7 @@ mod tests {
         // healthy-beacon watchdog refresh and is correct here).
         for id in 100..105 {
             hdr.cid = id;
-            handle_beacon(hdr, &mut servers, &tx);
+            handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         }
         let mut search_wakes = 0;
         let mut healthy_arrivals = 0;
@@ -1021,13 +1036,13 @@ mod tests {
         hdr.cid = 100;
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
         // Establish the BHE so the second beacon isn't a first sighting.
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         // Drain first-sighting messages.
         while rx.try_recv().is_ok() {}
 
         // Restart: id resets to 1.
         hdr.cid = 1;
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         let mut saw_search_wake = false;
         let mut saw_anomaly_arrival = false;
         while let Ok(msg) = rx.try_recv() {
@@ -1061,7 +1076,7 @@ mod tests {
         hdr.count = 5064;
         hdr.cid = 100;
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
 
         let mut saw_first_sighting = false;
         let mut saw_arrival = false;
@@ -1101,13 +1116,13 @@ mod tests {
         // Establish steady-state beacons (ids 100..103).
         for id in 100..103 {
             hdr.cid = id;
-            handle_beacon(hdr, &mut servers, &tx);
+            handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         }
         while rx.try_recv().is_ok() {}
 
         // Advance of 2 (last_id = 102, next id = 104) — must drop.
         hdr.cid = 104;
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         assert!(
             rx.try_recv().is_err(),
             "advance=2 must be silently dropped, not classified as anomaly"
@@ -1115,13 +1130,13 @@ mod tests {
 
         // Advance of 3 from the just-updated 104 — also drop.
         hdr.cid = 107;
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         assert!(rx.try_recv().is_err(), "advance=3 must be silently dropped");
 
         // last_id should now be 107 (drop path still updates it).
         // The next monotonic beacon (108 = advance=1) is healthy.
         hdr.cid = 108;
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         let mut saw_arrival_healthy = false;
         let mut saw_anomaly = false;
         while let Ok(msg) = rx.try_recv() {
@@ -1155,14 +1170,14 @@ mod tests {
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
         for id in 100..103 {
             hdr.cid = id;
-            handle_beacon(hdr, &mut servers, &tx);
+            handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         }
         while rx.try_recv().is_ok() {}
 
         // last_id is 102. A late copy with id=101 — wrapping_sub
         // gives u32::MAX (advance treated as 0xFFFFFFFF, > MAX-256).
         hdr.cid = 101;
-        handle_beacon(hdr, &mut servers, &tx);
+        handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         assert!(
             rx.try_recv().is_err(),
             "backwards-by-1 (within 256) must drop"
@@ -1263,7 +1278,7 @@ mod tests {
             let s = servers.get_mut(&server).expect("entry");
             s.last_seen = Instant::now() - Duration::from_millis(ms);
             hdr.cid = 1000 + (i as u32);
-            handle_beacon(hdr, &mut servers, &tx);
+            handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
 
             while let Ok(msg) = rx.try_recv() {
                 if let CoordRequest::ForceRescanServer { kind, .. } = msg {
@@ -1330,7 +1345,7 @@ mod tests {
             let s = servers.get_mut(&server).expect("entry");
             s.last_seen = Instant::now() - Duration::from_millis(ms);
             hdr.cid = 1000 + (i as u32);
-            handle_beacon(hdr, &mut servers, &tx);
+            handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
 
             while let Ok(msg) = rx.try_recv() {
                 if let CoordRequest::ForceRescanServer { kind, .. } = msg {

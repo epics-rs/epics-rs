@@ -228,6 +228,16 @@ struct SearchEngineState {
     /// rate (~30 ms) and would otherwise spam logs. We log on first
     /// occurrence, on errno change, and on recovery; suppress repeats.
     send_errors: HashMap<SocketAddr, std::io::ErrorKind>,
+    /// `EPICS_IOC_IGNORE_SERVERS` filter snapshot taken at startup
+    /// (epics-base 6efe2924). Any SEARCH reply whose announced server
+    /// IP — or the datagram source IP — appears here is dropped before
+    /// the per-channel attempt counter is consulted. Mirrors the
+    /// server-side EPICS_CAS_IGNORE_ADDR_LIST: silently quarantine
+    /// known-bad upstream IOCs without removing them from a shared
+    /// EPICS_CA_ADDR_LIST. Held in `HashSet` for O(1) lookup; updated
+    /// only at engine start (env changes mid-run are not picked up to
+    /// keep the hot path lock-free).
+    ignored_servers: std::collections::HashSet<Ipv4Addr>,
 }
 
 impl SearchEngineState {
@@ -248,6 +258,7 @@ impl SearchEngineState {
             dgram_seq: 0,
             last_valid_seq: None,
             send_errors: HashMap::new(),
+            ignored_servers: super::epics_ioc_ignore_servers().into_iter().collect(),
         }
     }
 
@@ -825,6 +836,26 @@ fn handle_udp_response(
                 metrics::counter!("ca_client_search_responses_total").increment(1);
                 let server_addr = SocketAddr::new(server_ip, server_port as u16);
                 let cid = hdr.available;
+
+                // EPICS_IOC_IGNORE_SERVERS (epics-base 6efe2924): drop
+                // SEARCH replies announcing a blacklisted server so a
+                // beacon-discovered server can't sneak past the
+                // EPICS_CA_ADDR_LIST filter. Both the announced server
+                // IP and the source IP are checked — most upstream IOCs
+                // announce ~0 ("use UDP src"), but a misconfigured
+                // server announcing its own IP must also be filtered.
+                if let std::net::IpAddr::V4(v4) = server_ip {
+                    if state.ignored_servers.contains(&v4) {
+                        offset += CaHeader::SIZE + align8(hdr.postsize as usize);
+                        continue;
+                    }
+                }
+                if let std::net::IpAddr::V4(v4) = src.ip() {
+                    if state.ignored_servers.contains(&v4) {
+                        offset += CaHeader::SIZE + align8(hdr.postsize as usize);
+                        continue;
+                    }
+                }
 
                 // Check penalty box — skip penalized servers so the channel
                 // can potentially find a non-penalized one.

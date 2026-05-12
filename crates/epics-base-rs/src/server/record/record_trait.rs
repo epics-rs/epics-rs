@@ -252,10 +252,22 @@ pub trait Record: Send + Sync + 'static {
     }
 
     /// Whether this record type supports device write (output records only).
+    /// `aao` is included here even though it's served by the same
+    /// concrete struct as `waveform`/`aai`/`subArray` — the
+    /// WaveformRecord's `can_device_write` override picks the right
+    /// answer per [`ArrayKind`], but this default matters for code that
+    /// only has the record-type string.
     fn can_device_write(&self) -> bool {
         matches!(
             self.record_type(),
-            "ao" | "bo" | "longout" | "int64out" | "mbbo" | "mbboDirect" | "stringout" | "lso"
+            "ao" | "bo"
+                | "longout"
+                | "int64out"
+                | "mbbo"
+                | "mbboDirect"
+                | "stringout"
+                | "lso"
+                | "aao"
         )
     }
 

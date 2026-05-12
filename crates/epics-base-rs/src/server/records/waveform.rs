@@ -2,8 +2,43 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
-/// Waveform record — manual Record impl (no macro).
+/// Which EPICS record-type name an [`ArrayRecord`] reports. The four
+/// upstream array record types (`waveform`, `aai`, `aao`, `subArray`)
+/// share the same scalar fields and DBR encoding; differentiation is
+/// only at the record-type string and (for `aao`) the output-record
+/// flag. Keeping them as one storage type avoids 1500 LOC of
+/// duplication while preserving each type's identity to clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayKind {
+    Waveform,
+    Aai,
+    Aao,
+    SubArray,
+}
+
+impl ArrayKind {
+    pub fn as_record_type(self) -> &'static str {
+        match self {
+            Self::Waveform => "waveform",
+            Self::Aai => "aai",
+            Self::Aao => "aao",
+            Self::SubArray => "subArray",
+        }
+    }
+
+    /// `aao` is an output record (the framework calls `device.write`);
+    /// the rest are input. Drives [`Record::can_device_write`].
+    pub fn is_output(self) -> bool {
+        matches!(self, Self::Aao)
+    }
+}
+
+/// Waveform record — manual Record impl (no macro). Also serves as the
+/// storage for `aai`, `aao`, and `subArray` since the four share their
+/// scalar surface. The [`Self::kind`] field selects the reported
+/// `record_type()` and the output/input distinction.
 pub struct WaveformRecord {
+    pub kind: ArrayKind,
     pub val: EpicsValue,
     pub nelm: i32,
     pub nord: i32,
@@ -18,12 +53,20 @@ pub struct WaveformRecord {
     pub prec: i16,
 }
 
+/// Type aliases for documentation / pattern-match clarity. All point
+/// at [`WaveformRecord`] — runtime type discrimination is the
+/// [`ArrayKind`] field.
+pub type AaiRecord = WaveformRecord;
+pub type AaoRecord = WaveformRecord;
+pub type SubArrayRecord = WaveformRecord;
+
 /// menuFtype constants for FTVL field.
 const MENU_FTYPE_DOUBLE: i16 = 10;
 
 impl Default for WaveformRecord {
     fn default() -> Self {
         Self {
+            kind: ArrayKind::Waveform,
             val: EpicsValue::DoubleArray(Vec::new()),
             nelm: 1,
             nord: 0,
@@ -36,6 +79,18 @@ impl Default for WaveformRecord {
             hopr: 0.0,
             lopr: 0.0,
             prec: 0,
+        }
+    }
+}
+
+impl WaveformRecord {
+    /// Construct an array record with an explicit [`ArrayKind`].
+    /// Lets `db_loader::create_record` mint `aai`, `aao`, or `subArray`
+    /// without needing distinct types per record-type name.
+    pub fn with_kind(kind: ArrayKind) -> Self {
+        Self {
+            kind,
+            ..Default::default()
         }
     }
 }
@@ -195,7 +250,15 @@ static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = &[
 
 impl Record for WaveformRecord {
     fn record_type(&self) -> &'static str {
-        "waveform"
+        self.kind.as_record_type()
+    }
+
+    /// `aao` is an output record; the rest of the array family read
+    /// from INP. Output records take the device-write path in
+    /// processing.rs (or fall through to the soft-link write when the
+    /// DTYP is empty / "Soft Channel").
+    fn can_device_write(&self) -> bool {
+        self.kind.is_output()
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -299,5 +362,50 @@ impl Record for WaveformRecord {
             9 => WAVEFORM_FIELDS_FLOAT,
             _ => WAVEFORM_FIELDS_DOUBLE,
         }
+    }
+}
+
+#[cfg(test)]
+mod array_kind_tests {
+    use super::*;
+
+    #[test]
+    fn waveform_default_kind() {
+        let r = WaveformRecord::default();
+        assert_eq!(r.record_type(), "waveform");
+        assert!(!r.can_device_write(), "waveform is input-only");
+    }
+
+    #[test]
+    fn aai_record_type_and_input() {
+        let r = WaveformRecord::with_kind(ArrayKind::Aai);
+        assert_eq!(r.record_type(), "aai");
+        assert!(!r.can_device_write(), "aai is input");
+    }
+
+    #[test]
+    fn aao_is_output() {
+        let r = WaveformRecord::with_kind(ArrayKind::Aao);
+        assert_eq!(r.record_type(), "aao");
+        assert!(r.can_device_write(), "aao must take the device-write path");
+    }
+
+    #[test]
+    fn sub_array_record_type() {
+        let r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        assert_eq!(r.record_type(), "subArray");
+        assert!(!r.can_device_write(), "subArray is input");
+    }
+
+    #[test]
+    fn aliases_resolve_to_waveform_record() {
+        // The type aliases are documentation-only; constructing
+        // through them must yield the same concrete struct.
+        let a: AaiRecord = WaveformRecord::with_kind(ArrayKind::Aai);
+        let b: AaoRecord = WaveformRecord::with_kind(ArrayKind::Aao);
+        let c: SubArrayRecord = WaveformRecord::with_kind(ArrayKind::SubArray);
+        assert_eq!(a.record_type(), "aai");
+        assert_eq!(b.record_type(), "aao");
+        assert_eq!(c.record_type(), "subArray");
     }
 }

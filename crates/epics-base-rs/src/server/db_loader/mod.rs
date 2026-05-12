@@ -473,7 +473,18 @@ pub fn create_record(record_type: &str) -> CaResult<Box<dyn Record>> {
         "event" => Ok(Box::new(event::EventRecord::default())),
         "printf" => Ok(Box::new(printf::PrintfRecord::default())),
         "swait" => Ok(Box::new(swait::SwaitRecord::default())),
-        "waveform" | "subArray" => Ok(Box::new(waveform::WaveformRecord::default())),
+        "waveform" => Ok(Box::new(waveform::WaveformRecord::with_kind(
+            waveform::ArrayKind::Waveform,
+        ))),
+        "aai" => Ok(Box::new(waveform::WaveformRecord::with_kind(
+            waveform::ArrayKind::Aai,
+        ))),
+        "aao" => Ok(Box::new(waveform::WaveformRecord::with_kind(
+            waveform::ArrayKind::Aao,
+        ))),
+        "subArray" => Ok(Box::new(waveform::WaveformRecord::with_kind(
+            waveform::ArrayKind::SubArray,
+        ))),
         "calc" => Ok(Box::new(calc::CalcRecord::default())),
         "fanout" => Ok(Box::new(fanout::FanoutRecord::default())),
         "seq" => Ok(Box::new(seq::SeqRecord::default())),

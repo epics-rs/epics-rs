@@ -1,5 +1,6 @@
 pub mod access_security;
 pub mod autosave;
+pub mod builtin_devices;
 pub mod database;
 pub mod db_loader;
 pub mod device_support;

@@ -93,10 +93,20 @@ pub struct IocApplication {
 
 impl IocApplication {
     pub fn new() -> Self {
+        let mut device_factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
+        // epics-base 3.15.4: built-in `getenv` device support for
+        // stringin / lsi — pre-registered so .db files can use the
+        // canonical DTYP name with zero extra setup.
+        device_factories.insert(
+            "getenv".to_string(),
+            Box::new(|| -> Box<dyn DeviceSupport> {
+                Box::new(crate::server::builtin_devices::GetenvDeviceSupport::new())
+            }),
+        );
         Self {
             port: CA_SERVER_PORT,
             tcp_port: None,
-            device_factories: HashMap::new(),
+            device_factories,
             dynamic_device_factory: None,
             record_factories: HashMap::new(),
             subroutine_registry: HashMap::new(),

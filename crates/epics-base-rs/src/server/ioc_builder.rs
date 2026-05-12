@@ -38,13 +38,24 @@ pub struct IocBuilder {
 }
 
 impl IocBuilder {
-    /// Create an empty builder.
+    /// Create an empty builder. Built-in device support that historically
+    /// ships with epics-base (currently: `getenv` for stringin/lsi)
+    /// is pre-registered so `.db` files can use the canonical DTYP
+    /// names with zero extra setup.
     pub fn new() -> Self {
+        let mut device_factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
+        // epics-base 3.15.4: built-in `getenv` device support.
+        device_factories.insert(
+            "getenv".to_string(),
+            Box::new(|| -> Box<dyn device_support::DeviceSupport> {
+                Box::new(super::builtin_devices::GetenvDeviceSupport::new())
+            }),
+        );
         Self {
             pvs: Vec::new(),
             records: Vec::new(),
             db_defs: Vec::new(),
-            device_factories: HashMap::new(),
+            device_factories,
             dynamic_device_factory: None,
             record_factories: HashMap::new(),
             subroutine_registry: HashMap::new(),

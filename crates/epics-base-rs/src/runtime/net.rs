@@ -35,6 +35,32 @@ pub fn ca_repeater_port() -> u16 {
     env::get_u16("EPICS_CA_REPEATER_PORT", CA_REPEATER_PORT)
 }
 
+/// IP TTL applied to CA multicast traffic.
+///
+/// Reads `EPICS_CA_MCAST_TTL` (epics-base 3.16, commit f2a1834d) and
+/// returns the value clamped to `1..=255` — the protocol field is one
+/// byte and 0 would silently drop every packet at the source NIC.
+/// Default 1 matches both the upstream default and the link-local
+/// scope assumption EPICS clients rely on; raise it only when a
+/// site uses multicast for beacons/search across routed segments.
+///
+/// Applied on a UDP socket via `socket.set_multicast_ttl_v4(value)`.
+/// Has no effect on unicast or limited-broadcast destinations — the
+/// OS only consults this field when the destination is in the
+/// 224.0.0.0/4 range.
+pub fn ca_mcast_ttl() -> u32 {
+    const DEFAULT: u32 = 1;
+    match env::get("EPICS_CA_MCAST_TTL") {
+        Some(s) => s
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|v| *v >= 1 && *v <= 255)
+            .unwrap_or(DEFAULT),
+        None => DEFAULT,
+    }
+}
+
 /// Returns the PVA broadcast port, allowing override via `EPICS_PVA_BROADCAST_PORT`.
 pub fn pva_broadcast_port() -> u16 {
     env::get_u16("EPICS_PVA_BROADCAST_PORT", PVA_BROADCAST_PORT)
@@ -108,6 +134,35 @@ mod tests {
             "cas_server_port falls back to EPICS_CA_SERVER_PORT when CAS-specific unset"
         );
         unsafe { std::env::remove_var("EPICS_CA_SERVER_PORT") };
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn test_ca_mcast_ttl_default() {
+        unsafe { std::env::remove_var("EPICS_CA_MCAST_TTL") };
+        assert_eq!(ca_mcast_ttl(), 1);
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn test_ca_mcast_ttl_override() {
+        unsafe { std::env::set_var("EPICS_CA_MCAST_TTL", "32") };
+        assert_eq!(ca_mcast_ttl(), 32);
+        unsafe { std::env::remove_var("EPICS_CA_MCAST_TTL") };
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn test_ca_mcast_ttl_clamps_invalid_to_default() {
+        for bad in ["0", "256", "abc", ""] {
+            unsafe { std::env::set_var("EPICS_CA_MCAST_TTL", bad) };
+            assert_eq!(
+                ca_mcast_ttl(),
+                1,
+                "invalid EPICS_CA_MCAST_TTL={bad:?} must fall back to default 1"
+            );
+        }
+        unsafe { std::env::remove_var("EPICS_CA_MCAST_TTL") };
     }
 
     #[test]

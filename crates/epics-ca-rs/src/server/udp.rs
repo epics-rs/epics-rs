@@ -90,6 +90,9 @@ async fn run_single_responder(
     sock.bind(&std::net::SocketAddrV4::new(bind_ip, port).into())?;
     let socket = UdpSocket::from_std(sock.into())?;
     socket.set_broadcast(true)?;
+    // EPICS_CA_MCAST_TTL (epics-base 3.16, f2a1834d). Only consulted by
+    // the OS for multicast destinations; safe to apply unconditionally.
+    let _ = socket.set_multicast_ttl_v4(epics_base_rs::runtime::net::ca_mcast_ttl());
 
     // 64 KB receive buffer — IPv4 maximum datagram size. The previous
     // 4 KB cap silently truncated bursts of multi-PV searches in

@@ -302,6 +302,11 @@ pub(crate) async fn run_search_engine(
     };
     // Larger receive buffer absorbs multi-PV SEARCH response bursts.
     let _ = socket.set_recv_buffer_size(256 * 1024);
+    // Apply `EPICS_CA_MCAST_TTL` (epics-base 3.16, f2a1834d). Affects
+    // outgoing packets only when the destination falls in 224.0.0.0/4;
+    // setting it unconditionally is safe and lets sites that
+    // multicast SEARCH across routed segments raise the TTL via env.
+    let _ = socket.set_multicast_ttl_v4(epics_base_rs::runtime::net::ca_mcast_ttl());
 
     // Spawn a connection task per EPICS_CA_NAME_SERVERS entry.
     // Each task auto-reconnects with exponential backoff and forwards

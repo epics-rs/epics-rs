@@ -35,6 +35,11 @@ pub async fn run_beacon_emitter(
 ) -> CaResult<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.set_broadcast(true)?;
+    // Honor `EPICS_CA_MCAST_TTL` (epics-base 3.16, f2a1834d). Only
+    // affects multicast destinations; unicast and limited-broadcast
+    // are unaffected. Beacon_addrs frequently includes multicast
+    // groups when a site fans out beacons across routed segments.
+    let _ = socket.set_multicast_ttl_v4(epics_base_rs::runtime::net::ca_mcast_ttl());
 
     // Resolve the server's local IP via routing. Prefer the first beacon
     // destination as a probe so multi-NIC hosts pick the matching outgoing

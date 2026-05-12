@@ -541,6 +541,49 @@ impl AsyncUdpV4 {
         Ok(())
     }
 
+    /// Apply an `IP_MULTICAST_TTL` value to every underlying NIC socket.
+    ///
+    /// Mirrors epics-base 3.16 commit f2a1834d (`EPICS_CA_MCAST_TTL`):
+    /// when the destination of a UDP send is a multicast group the OS
+    /// uses this TTL for the outgoing packet. Has no effect on unicast
+    /// or limited-broadcast traffic, so it's safe to apply unconditionally
+    /// on every CA / PVA UDP socket — callers don't have to know whether
+    /// any particular send will hit a multicast destination.
+    ///
+    /// Errors on individual NICs are logged at `debug` and ignored; the
+    /// call returns `Err` only when every NIC fails (so the caller can
+    /// detect "TTL was applied nowhere"). `ttl` must already be in
+    /// `1..=255` — pass `runtime::net::ca_mcast_ttl()` to honor the
+    /// `EPICS_CA_MCAST_TTL` env var.
+    pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
+        let mut ok = 0usize;
+        let mut last_err: Option<io::Error> = None;
+        for nic in &self.sockets {
+            match nic.sock.set_multicast_ttl_v4(ttl) {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "epics_base_rs::net",
+                        iface_ip = %nic.iface_ip,
+                        ttl,
+                        error = %e,
+                        "set_multicast_ttl_v4 failed"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        if ok == 0 {
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "AsyncUdpV4: set_multicast_ttl_v4 had no NICs",
+                )
+            }));
+        }
+        Ok(())
+    }
+
     /// Join a multicast group on every up, non-loopback NIC. Errors
     /// per-NIC are logged at `debug` and not propagated unless every
     /// join fails.

@@ -200,6 +200,18 @@ struct ClientState {
     free_sids: Vec<u32>,
     hostname: String,
     username: String,
+    /// Authentication method for ACF `METHOD()` clause matching.
+    /// `"x509"` for mTLS-authenticated peers (epics-base PR #641);
+    /// `"ca"` (or empty for backwards compat) for plaintext peers.
+    /// ACF rules without a `METHOD()` clause ignore this field
+    /// — the legacy `check_access_asl()` codepath continues to work.
+    auth_method: String,
+    /// Authority for ACF `AUTHORITY()` clause matching. mTLS peers
+    /// carry their cert's *issuer* DN here so rules like
+    /// `RULE(1, WRITE) { METHOD("x509") AUTHORITY("CN=ops-ca, …") }`
+    /// can pin write access to certs minted by a specific CA.
+    /// Empty for plaintext peers.
+    auth_authority: String,
     acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
     tcp_port: u16,
     client_minor_version: u16,
@@ -242,6 +254,8 @@ impl ClientState {
             free_sids: Vec::new(),
             hostname: String::new(),
             username: String::new(),
+            auth_method: String::new(),
+            auth_authority: String::new(),
             acf,
             tcp_port,
             client_minor_version: 0,
@@ -315,7 +329,17 @@ impl ClientState {
                     // them as ASL=0 so the most-restrictive rule
                     // applies. Matches the C IOC's behaviour for
                     // names that never went through `dbAddMember`.
-                    match acf_cfg.check_access_asl("DEFAULT", &self.hostname, &self.username, 0) {
+                    // PR #641: pass auth method/authority so
+                    // METHOD("x509") / AUTHORITY(<issuer>) rules
+                    // can gate mTLS-authenticated peers.
+                    match acf_cfg.check_access_method(
+                        "DEFAULT",
+                        &self.hostname,
+                        &self.username,
+                        0,
+                        &self.auth_method,
+                        &self.auth_authority,
+                    ) {
                         AccessLevel::ReadWrite => 3,
                         AccessLevel::Read => 1,
                         AccessLevel::NoAccess => 0,
@@ -347,9 +371,19 @@ impl ClientState {
                     // ASL into the ACF check so `RULE(N, …)`
                     // gates correctly disable rules whose level
                     // is below the record's ASL.
+                    // PR #641: pass auth method/authority so
+                    // mTLS-only rules (METHOD("x509"), AUTHORITY(...))
+                    // can gate write access by issuer CA.
                     let asg = &instance.common.asg;
                     let asl = instance.common.asl;
-                    acf_cfg.check_access_asl(asg, &self.hostname, &self.username, asl)
+                    acf_cfg.check_access_method(
+                        asg,
+                        &self.hostname,
+                        &self.username,
+                        asl,
+                        &self.auth_method,
+                        &self.auth_authority,
+                    )
                 } else {
                     AccessLevel::ReadWrite
                 };
@@ -514,17 +548,28 @@ pub async fn run_tcp_listener(
                                 ))
                             }
                             Ok(Ok(tls_stream)) => {
-                                // Extract verified peer identity from the
-                                // client certificate, if presented.
-                                let identity = tls_stream
+                                // Extract verified peer identity + issuer
+                                // from the client certificate, if presented.
+                                let (identity, authority) = tls_stream
                                     .get_ref()
                                     .1
                                     .peer_certificates()
                                     .and_then(|chain| chain.first())
-                                    .map(crate::tls::identity_from_cert);
+                                    .map(|cert| {
+                                        (
+                                            crate::tls::identity_from_cert(cert),
+                                            crate::tls::issuer_from_cert(cert),
+                                        )
+                                    })
+                                    .map(|(id, auth)| (Some(id), auth))
+                                    .unwrap_or((None, None));
                                 if let Some(ref id) = identity {
-                                    tracing::info!(peer = %peer, identity = %id,
-                                        "mTLS identity verified");
+                                    tracing::info!(
+                                        peer = %peer,
+                                        identity = %id,
+                                        authority = authority.as_deref().unwrap_or("<none>"),
+                                        "mTLS identity verified"
+                                    );
                                 }
                                 handle_client(
                                     tls_stream,
@@ -534,6 +579,7 @@ pub async fn run_tcp_listener(
                                     acf_reload_rx,
                                     actual_port,
                                     identity,
+                                    authority,
                                     audit,
                                     conn_events.clone(),
                                     #[cfg(feature = "cap-tokens")]
@@ -556,6 +602,7 @@ pub async fn run_tcp_listener(
                             acf_reload_rx,
                             actual_port,
                             None,
+                            None,
                             audit,
                             conn_events.clone(),
                             #[cfg(feature = "cap-tokens")]
@@ -573,6 +620,7 @@ pub async fn run_tcp_listener(
                         acf,
                         acf_reload_rx,
                         actual_port,
+                        None,
                         None,
                         audit,
                         conn_events.clone(),
@@ -627,6 +675,11 @@ async fn handle_client<S>(
     mut acf_reload_rx: broadcast::Receiver<()>,
     tcp_port: u16,
     initial_hostname: Option<String>,
+    // PR #641 — mTLS issuer DN of the peer's cert. `Some(...)` only
+    // when the peer was authenticated via mTLS; gets paired with
+    // `auth_method = "x509"` on the ClientState so ACF
+    // METHOD()/AUTHORITY() rules can gate by issuer.
+    tls_authority: Option<String>,
     audit: Option<crate::audit::AuditLogger>,
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
@@ -652,6 +705,13 @@ where
     // peer IP. Matches C rsrv default with EPICS_CAS_USE_HOST_NAMES=NO,
     // upgraded transparently when mTLS is in effect.
     state.hostname = initial_hostname.unwrap_or_else(|| peer.ip().to_string());
+    // PR #641: surface the mTLS authentication context to the ACF
+    // check. Plaintext peers stay with empty fields — every legacy
+    // rule (no METHOD/AUTHORITY clause) ignores them.
+    if let Some(authority) = tls_authority {
+        state.auth_method = "x509".to_string();
+        state.auth_authority = authority;
+    }
     state.peer = peer.to_string();
     state.audit = audit;
     let rl_cfg = crate::server::rate_limit::RateLimitConfig::from_env();

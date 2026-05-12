@@ -1009,6 +1009,37 @@ ASG(SECURE) {
     }
 
     #[test]
+    fn tls_x509_acf_rule_grants_write_on_issuer_match() {
+        // PR #641 end-to-end: an ACF rule that requires both
+        // METHOD("x509") and AUTHORITY(<issuer>) must succeed only
+        // when an mTLS peer presents a cert signed by that issuer.
+        let cfg = parse_acf(
+            r#"
+ASG(TLS_ONLY) {
+    RULE(1, WRITE) { METHOD("x509") AUTHORITY("CN=ops-ca, O=Lab") }
+    RULE(1, READ)
+}
+"#,
+        )
+        .unwrap();
+        // Plaintext (no method) → READ only.
+        assert_eq!(
+            cfg.check_access_method("TLS_ONLY", "h", "u", 0, "", ""),
+            AccessLevel::Read
+        );
+        // mTLS, wrong issuer → READ only.
+        assert_eq!(
+            cfg.check_access_method("TLS_ONLY", "h", "u", 0, "x509", "CN=other-ca"),
+            AccessLevel::Read
+        );
+        // mTLS, matching issuer → WRITE granted.
+        assert_eq!(
+            cfg.check_access_method("TLS_ONLY", "h", "u", 0, "x509", "CN=ops-ca, O=Lab"),
+            AccessLevel::ReadWrite
+        );
+    }
+
+    #[test]
     fn check_access_method_gates_on_method() {
         let acf = r#"
 ASG(METHOD_GATED) {

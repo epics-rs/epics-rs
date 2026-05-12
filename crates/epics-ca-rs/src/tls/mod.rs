@@ -299,6 +299,22 @@ pub fn identity_from_cert(cert: &CertificateDer<'_>) -> String {
     s
 }
 
+/// Extract the certificate's issuer Distinguished Name (DN) in a
+/// stable RFC 4514-ish string form. Mirrors epics-base PR #641's
+/// "authority" concept — the cert was issued by *whom*, and that
+/// identity becomes the `AUTHORITY()` clause an ACF rule can match
+/// on. Returns `None` if the issuer field is malformed or missing
+/// (rare — every conformant X.509 cert has a non-empty issuer).
+///
+/// Example output (Subject DN of the issuer CA):
+/// `"CN=ops-ca, O=Lab, C=KR"`
+#[cfg(feature = "experimental-rust-tls")]
+pub fn issuer_from_cert(cert: &CertificateDer<'_>) -> Option<String> {
+    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).ok()?;
+    let dn = parsed.tbs_certificate.issuer.to_string();
+    if dn.is_empty() { None } else { Some(dn) }
+}
+
 /// Best-effort parse of an X.509 cert to extract a name field. Returns
 /// `None` when no usable name is present, leaving the caller to fall
 /// back to a fingerprint identity.

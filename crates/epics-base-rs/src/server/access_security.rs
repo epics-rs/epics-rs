@@ -488,7 +488,8 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
             "HAG" => {
                 let name = read_paren_name(&mut chars)?;
                 let members = read_brace_list(&mut chars)?;
-                config.hag.insert(name, members);
+                let expanded = expand_hag_members(&members);
+                config.hag.insert(name, expanded);
             }
             "ASG" => {
                 let name = read_paren_name(&mut chars)?;
@@ -505,6 +506,56 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
     }
 
     Ok(config)
+}
+
+/// Expand HAG members with their resolved IP addresses for soft
+/// hostname matching.
+///
+/// Mirrors epics-base libcom commit 932e9f3 ("asLib: soft fallback on
+/// DNS lookup failure"). Upstream resolves each hostname to its IP at
+/// parse time and matches the connecting client's IP against the
+/// resolved set; the fix made DNS failure a non-fatal warning instead
+/// of an `abort()`.
+///
+/// We keep the original behaviour of matching the literal HOST_NAME
+/// the client sent over CA (which is what the CA protocol gives us —
+/// `HOST_NAME` is the peer's self-reported hostname, not its IP) and
+/// additionally append every resolved IPv4/IPv6 literal so an
+/// IP-presenting client (gateway, NATed peer with no reverse DNS) still
+/// matches. DNS failures are dropped silently — the parser never
+/// aborts, so a single bad entry doesn't deny the entire IOC.
+fn expand_hag_members(members: &[String]) -> Vec<String> {
+    use std::net::ToSocketAddrs;
+    let mut out: Vec<String> = Vec::with_capacity(members.len());
+    for m in members {
+        out.push(m.clone());
+        // Bare IP literal: nothing more to add — `m` already covers
+        // the IP-match path. The to_socket_addrs() trick below would
+        // round-trip an IP to itself, but skipping the syscall keeps
+        // ACF reload latency proportional to actual hostnames.
+        if m.parse::<std::net::IpAddr>().is_ok() {
+            continue;
+        }
+        match format!("{m}:0").to_socket_addrs() {
+            Ok(iter) => {
+                for sa in iter {
+                    let ip = sa.ip().to_string();
+                    if !out.iter().any(|s| s == &ip) {
+                        out.push(ip);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "epics_base_rs::access_security",
+                    host = %m,
+                    error = %e,
+                    "ACF HAG: DNS lookup failed; keeping literal entry (libcom 932e9f3 soft fallback)"
+                );
+            }
+        }
+    }
+    out
 }
 
 fn skip_ws_comments(chars: &mut std::iter::Peekable<std::str::Chars>) {
@@ -792,9 +843,14 @@ ASG(DEFAULT) {
 
     #[test]
     fn test_parse_acf_hag_uag() {
+        // Use `.invalid` so DNS resolution is guaranteed to fail
+        // (RFC 6761 — every resolver returns NXDOMAIN). This isolates
+        // the test from `expand_hag_members`' soft-DNS path: the
+        // literal entry is preserved, and no resolved IPs are
+        // appended.
         let acf = r#"
 UAG(ops) { alice, bob }
-HAG(lab) { lab-pc1 }
+HAG(lab) { lab-pc1.invalid }
 ASG(SECURE) {
     RULE(1, WRITE) { UAG(ops) HAG(lab) }
     RULE(1, READ)
@@ -802,7 +858,56 @@ ASG(SECURE) {
 "#;
         let config = parse_acf(acf).unwrap();
         assert_eq!(config.uag["ops"], vec!["alice", "bob"]);
-        assert_eq!(config.hag["lab"], vec!["lab-pc1"]);
+        assert_eq!(config.hag["lab"], vec!["lab-pc1.invalid"]);
+    }
+
+    #[test]
+    fn hag_dns_resolution_appends_ip_for_match() {
+        // Loopback name `localhost` is universally resolvable on
+        // Linux/macOS/Windows. The expansion must add 127.0.0.1 (and
+        // optionally ::1) alongside the literal entry so a peer
+        // presenting `127.0.0.1` as its HOST_NAME still matches the
+        // HAG, mirroring upstream's IP-based comparison.
+        let acf = r#"
+HAG(local) { localhost }
+ASG(DEFAULT) {
+    RULE(1, WRITE) { HAG(local) }
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        let entries = &config.hag["local"];
+        assert!(
+            entries.contains(&"localhost".to_string()),
+            "literal hostname always preserved"
+        );
+        assert!(
+            entries.iter().any(|s| s == "127.0.0.1"),
+            "resolved IPv4 appended for IP-presenting peers"
+        );
+    }
+
+    #[test]
+    fn hag_unresolvable_name_does_not_abort_parser() {
+        // `.invalid` TLD guarantees NXDOMAIN (RFC 6761). Pre-fix
+        // upstream would `abort()` here; we keep the literal entries
+        // verbatim — no resolved IPs are appended and the parser
+        // returns Ok. Comma separator matches the brace-list parser's
+        // tokenization (whitespace alone is consumed silently).
+        let acf = r#"
+HAG(quarantine) { gone.invalid, alive.invalid }
+ASG(DEFAULT) {
+    RULE(1, WRITE) { HAG(quarantine) }
+}
+"#;
+        let config = parse_acf(acf).expect("parser must not abort on bad DNS");
+        let entries = &config.hag["quarantine"];
+        assert_eq!(
+            entries.len(),
+            2,
+            "literal entries preserved verbatim; no resolved IPs appended"
+        );
+        assert_eq!(entries[0], "gone.invalid");
+        assert_eq!(entries[1], "alive.invalid");
     }
 
     #[test]

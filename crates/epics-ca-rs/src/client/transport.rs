@@ -829,6 +829,23 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     let idle_timeout = Duration::from_secs(echo_idle_secs());
     let echo_timeout = Duration::from_secs(ECHO_TIMEOUT_SECS);
     let mut echo_pending = false;
+    // libca Issue #190 (laptop-suspend stall): the OS may pause the
+    // tokio reactor for many minutes during system suspend. On
+    // resume, `Instant::now()` jumps forward by ~the suspend
+    // duration. The Sleep fires immediately (deadline in the past)
+    // and sends an echo — but the TCP socket may be half-open and
+    // we'd otherwise wait the full 5 s echo timeout to find out.
+    // Track wall-clock between loop iterations; if it skips more than
+    // `SUSPEND_THRESHOLD` (3× idle_timeout — large enough to ignore
+    // ordinary scheduling jitter, small enough to fire on a real
+    // suspend of even a few minutes) we use the abbreviated echo
+    // timeout so recovery completes in seconds instead of tens.
+    const SUSPEND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+    let suspend_threshold = idle_timeout.saturating_mul(3).max(Duration::from_secs(60));
+    // Anchor for suspend detection — refreshed at the top of every
+    // loop iteration. Initialized at the loop entry; first iteration
+    // overwrites it before the wall-clock skip is consulted.
+    let mut last_loop_at;
     // libca `tcpRecvWatchdog::beaconAnomaly` flag. Set when the
     // beacon monitor classifies a beacon as a real restart signal
     // (`IdMismatch` / `PeriodCollapse`); suppresses subsequent
@@ -850,6 +867,13 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     tokio::pin!(sleep);
 
     loop {
+        // Refresh the suspend-detection anchor at the top of each
+        // loop iteration. When the sleep branch wakes, `wall_skip =
+        // SystemTime::now() - last_loop_at` reveals whether the host
+        // was suspended during the await — sleep duration on a live
+        // system stays bounded by `idle_timeout`/`echo_timeout`, so a
+        // skip far beyond that is a strong suspend signal.
+        last_loop_at = std::time::SystemTime::now();
         let n = tokio::select! {
             // No `biased;` — let tokio randomize. With three
             // branches (beacon arrival, sleep expiry, data read)
@@ -893,6 +917,16 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             }
             // Watchdog deadline expired.
             _ = &mut sleep => {
+                // libca Issue #190: detect suspend wake. If wall-clock
+                // skipped far more than expected for this sleep, the
+                // tokio reactor was paused (laptop suspend / VM stop).
+                // Shorten the echo probe so recovery is seconds, not
+                // tens of seconds.
+                let now_wall = std::time::SystemTime::now();
+                let wall_skip = now_wall
+                    .duration_since(last_loop_at)
+                    .unwrap_or(Duration::ZERO);
+                let suspend_wake = wall_skip >= suspend_threshold;
                 if echo_pending {
                     if !unresponsive_notified {
                         let _ = event_tx.send(TransportEvent::CircuitUnresponsive { server_addr });
@@ -901,7 +935,12 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                             let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
                             return;
                         }
-                        deadline = tokio::time::Instant::now() + echo_timeout;
+                        let probe = if suspend_wake {
+                            SUSPEND_PROBE_TIMEOUT
+                        } else {
+                            echo_timeout
+                        };
+                        deadline = tokio::time::Instant::now() + probe;
                         sleep.as_mut().reset(deadline);
                         continue;
                     }
@@ -923,7 +962,17 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     return;
                 }
                 echo_pending = true;
-                deadline = tokio::time::Instant::now() + echo_timeout;
+                let probe = if suspend_wake {
+                    tracing::info!(
+                        server = %server_addr,
+                        wall_skip_secs = wall_skip.as_secs(),
+                        "suspend wake detected; probing with shortened echo timeout"
+                    );
+                    SUSPEND_PROBE_TIMEOUT
+                } else {
+                    echo_timeout
+                };
+                deadline = tokio::time::Instant::now() + probe;
                 sleep.as_mut().reset(deadline);
                 continue;
             }

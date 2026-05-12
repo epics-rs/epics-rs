@@ -1,5 +1,64 @@
 # Changelog
 
+## v0.16.2 — 2026-05-12
+
+Wire-faithful introspection for native PVA PVs registered by IOC code
+(NDPluginPva, custom benchmark PVs). The qsrv adapter previously
+recovered each PV's `FieldDesc` from its current value at every
+introspection query — fine for structure-rooted normative types where
+every field is exercised, but **lossy** for types whose root variant
+cannot be reconstructed from the value alone:
+
+- top-level `UnionArray` → empty `variants` list (item `selector`
+  indices would misalign on best-effort recovery),
+- `Union` → only the currently-selected variant (sibling variants
+  in the original descriptor missing),
+- empty `ScalarArray` / `StructureArray` → fall back to `Double` /
+  empty struct.
+
+Top-level UnionArray PVs were thus not round-trippable; NTNDArray's
+`value` union advertised only the current frame's pixel type rather
+than all ten scalar-array variants.
+
+### epics-bridge-rs (qsrv adapter)
+
+- **feat**: `PvaPvHandle` gains an optional `descriptor: Option<FieldDesc>`
+  carrying the producer's canonical introspection. `QsrvPvStore::get_introspection`
+  prefers it over `PvField::descriptor` recovery; absent, falls back
+  to the prior value-derived path (preserving behavior for callers
+  that don't populate it).
+- **feat**: invariant gate `assert_handle_root_kind` enforced at both
+  registration paths (`register_pva_pv_global` for the producer-side
+  global registry, `QsrvPvStore::register_pva_pv` for the runner-side
+  wire-up). Mismatched root kind (e.g. `FieldDesc::UnionArray` with a
+  `PvField::Structure` value) panics at the producer call site rather
+  than surfacing as garbled wire frames on a downstream client.
+- **fix**: `register_pva_pv` doc — `get_snapshot` → `get_value`.
+- **test**: four tests — supplied-descriptor wins, documented lossy
+  fallback when `None`, panic on root mismatch at both gates, and
+  end-to-end wire round-trip via `PvaServer` + `PvaClient::pvinfo`.
+
+### ad-plugins-rs (NDPluginPva)
+
+- **feat**: `NDPvaConfigure` now passes `nt_nd_array_desc()` as the
+  canonical descriptor at registration. Clients introspecting an
+  NTNDArray PV see all ten variants of the `value` union instead of
+  whichever scalar-array variant the current frame happens to use.
+
+### epics-pva-rs (`PvField::descriptor`)
+
+- **docs**: enumerate the five lossy recovery paths (empty
+  `ScalarArray`, empty `StructureArray`, `Union` siblings,
+  `UnionArray` variants, `Variant`/`Null` degrade to bare `Variant`)
+  and point callers at the plumb-through API
+  (`PvaPvHandle::descriptor`) when they need wire-faithful
+  introspection.
+
+### examples/mini-beamline
+
+- **feat**: `register_pva_bundle` forwards the bundle's
+  type-stability-guard `expected_desc` through to `PvaPvHandle`.
+
 ## v0.16.1 — 2026-05-11
 
 Beacon-monitor false-positive fix on the CA client side. Long-lived

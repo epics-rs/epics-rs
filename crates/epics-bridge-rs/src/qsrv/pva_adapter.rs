@@ -11,20 +11,32 @@ use std::sync::Arc;
 
 use tokio::sync::{RwLock, mpsc};
 
-use epics_pva_rs::pvdata::{PvField, PvStructure};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
 
 use super::provider::{AnyChannel, BridgeProvider, Channel, ChannelProvider, PvaMonitor};
 
-/// Handle for a native PVA PV: latest snapshot + subscriber list.
+/// Handle for a native PVA PV: latest snapshot + subscriber list +
+/// (optional) canonical introspection descriptor.
 ///
 /// Registered via [`QsrvPvStore::register_pva_pv`] so the native PVA
 /// server can serve structure-shaped values produced directly by IOC code
 /// (for example NTNDArray or aggregate benchmark PVs). Snapshots and
 /// notifications use native [`PvField`] values; no spvirit dependency.
+///
+/// `descriptor` lets the producer pass the authoritative wire shape,
+/// bypassing the lossy [`PvField::descriptor`] recovery for types it
+/// cannot reconstruct from the value alone (top-level `UnionArray`,
+/// `Union` with sibling variants, empty `ScalarArray`/`StructureArray`).
+/// When `None`, `get_introspection` falls back to value-derived recovery
+/// — sufficient for structure-rooted normative types where every field
+/// is exercised in the value.
 #[derive(Clone)]
 pub struct PvaPvHandle {
     pub latest: Arc<parking_lot::Mutex<Option<PvField>>>,
     pub subscribers: Arc<parking_lot::Mutex<Vec<mpsc::Sender<PvField>>>>,
+    /// Canonical introspection descriptor supplied by the producer.
+    /// Preferred over value-derived recovery when present.
+    pub descriptor: Option<FieldDesc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -37,17 +49,96 @@ static PVA_PV_REGISTRY: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Register a native PVA PV before the CA+PVA runner starts.
+///
+/// Same root-kind invariant as [`QsrvPvStore::register_pva_pv`]: if the
+/// handle carries both a value and a descriptor, their root kinds must
+/// agree, otherwise this panics. Enforcing it here too (not just on the
+/// later runner-side `register_pva_pv` call) means the failure surfaces
+/// at the producer call site, where the wrong descriptor was assembled,
+/// rather than deep inside the CA+PVA runner.
 pub fn register_pva_pv_global(pv_name: &str, handle: PvaPvHandle) {
+    assert_handle_root_kind(pv_name, &handle);
     PVA_PV_REGISTRY
         .lock()
         .unwrap()
         .insert(pv_name.to_string(), handle);
 }
 
+/// Invariant gate shared by both registration paths
+/// (`register_pva_pv_global` and `QsrvPvStore::register_pva_pv`).
+fn assert_handle_root_kind(pv_name: &str, handle: &PvaPvHandle) {
+    if let Some(desc) = &handle.descriptor {
+        let guard = handle.latest.lock();
+        if let Some(value) = guard.as_ref() {
+            assert!(
+                root_kind_matches(value, desc),
+                "PvaPvHandle for {pv_name:?}: supplied descriptor root kind \
+                 does not match value root kind ({value_kind} vs {desc_kind}) — \
+                 introspection would disagree with served values",
+                value_kind = root_kind_name_value(value),
+                desc_kind = root_kind_name_desc(desc),
+            );
+        }
+    }
+}
+
 /// Take all registered native PVA PVs. Called by [`run_ca_pva_qsrv_ioc`]
 /// to wire them into `QsrvPvStore`.
 pub fn take_registered_pva_pvs() -> std::collections::HashMap<String, PvaPvHandle> {
     std::mem::take(&mut *PVA_PV_REGISTRY.lock().unwrap())
+}
+
+/// Root-level kind compatibility between a value and a descriptor.
+///
+/// This is the weakest invariant we can cheaply verify at registration
+/// time: deeper structural agreement (field names, scalar types,
+/// variants list) is the producer's responsibility. The root check
+/// catches the obvious misconfiguration — wiring a `Structure` value
+/// with a `UnionArray` descriptor — without forcing a full recursive
+/// walk on a potentially large `latest` snapshot under the mutex.
+fn root_kind_matches(value: &PvField, desc: &FieldDesc) -> bool {
+    matches!(
+        (value, desc),
+        (PvField::Scalar(_), FieldDesc::Scalar(_))
+            | (
+                PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_),
+                FieldDesc::ScalarArray(_)
+            )
+            | (PvField::Structure(_), FieldDesc::Structure { .. })
+            | (PvField::StructureArray(_), FieldDesc::StructureArray { .. })
+            | (PvField::Union { .. }, FieldDesc::Union { .. })
+            | (PvField::UnionArray(_), FieldDesc::UnionArray { .. })
+            | (PvField::Variant(_) | PvField::Null, FieldDesc::Variant)
+            | (PvField::VariantArray(_), FieldDesc::VariantArray)
+    )
+}
+
+fn root_kind_name_value(v: &PvField) -> &'static str {
+    match v {
+        PvField::Scalar(_) => "Scalar",
+        PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_) => "ScalarArray",
+        PvField::Structure(_) => "Structure",
+        PvField::StructureArray(_) => "StructureArray",
+        PvField::Union { .. } => "Union",
+        PvField::UnionArray(_) => "UnionArray",
+        PvField::Variant(_) => "Variant",
+        PvField::VariantArray(_) => "VariantArray",
+        PvField::Null => "Null",
+    }
+}
+
+fn root_kind_name_desc(d: &FieldDesc) -> &'static str {
+    match d {
+        FieldDesc::Scalar(_) => "Scalar",
+        FieldDesc::ScalarArray(_) => "ScalarArray",
+        FieldDesc::Structure { .. } => "Structure",
+        FieldDesc::StructureArray { .. } => "StructureArray",
+        FieldDesc::Union { .. } => "Union",
+        FieldDesc::UnionArray { .. } => "UnionArray",
+        FieldDesc::Variant => "Variant",
+        FieldDesc::VariantArray => "VariantArray",
+        FieldDesc::BoundedString(_) => "BoundedString",
+    }
 }
 
 /// PvStore implementation backed by a qsrv [`BridgeProvider`].
@@ -79,20 +170,39 @@ impl QsrvPvStore {
     /// Register a native PVA PV (e.g., NTNDArray from NDPluginPva).
     ///
     /// After registration, the PV is discoverable via `has_pv`, readable
-    /// via `get_snapshot`, and subscribable via `subscribe`.
+    /// via `get_value`, and subscribable via `subscribe`.
+    ///
+    /// Pass `descriptor = Some(...)` when the producer knows the
+    /// canonical wire shape (e.g. `nt_nd_array_desc()` for NTNDArray, or
+    /// a custom top-level `UnionArray`); pass `None` to use value-derived
+    /// recovery on each introspection query (lossy for some types — see
+    /// [`PvField::descriptor`]).
+    ///
+    /// **Panics** if `descriptor` is supplied and a value is already
+    /// present in `latest` whose root kind disagrees (e.g. supplying a
+    /// `FieldDesc::UnionArray` alongside a `PvField::Structure` value).
+    /// This catches misconfigured producers at startup rather than
+    /// shipping clients an introspection that disagrees with the values
+    /// they receive. Producers whose first value arrives after
+    /// registration (NDPluginPva: first NDArray hasn't been processed
+    /// yet) trivially pass this check.
     pub async fn register_pva_pv(
         &self,
         pv_name: &str,
         latest: Arc<parking_lot::Mutex<Option<PvField>>>,
         subscribers: Arc<parking_lot::Mutex<Vec<mpsc::Sender<PvField>>>>,
+        descriptor: Option<FieldDesc>,
     ) {
-        self.pva_pvs.write().await.insert(
-            pv_name.to_string(),
-            PvaPvHandle {
-                latest,
-                subscribers,
-            },
-        );
+        let handle = PvaPvHandle {
+            latest,
+            subscribers,
+            descriptor,
+        };
+        assert_handle_root_kind(pv_name, &handle);
+        self.pva_pvs
+            .write()
+            .await
+            .insert(pv_name.to_string(), handle);
     }
 
     async fn channel(&self, name: &str) -> Option<Arc<AnyChannel>> {
@@ -155,10 +265,16 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // pva_pvs — the BridgeProvider has no record for them, so
             // self.channel() would return None and the descriptor
             // would be lost. Probe the PVA registry first.
-            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned()
-                && let Some(value) = handle.latest.lock().clone()
-            {
-                return Some(value.descriptor());
+            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
+                // Prefer the canonical descriptor supplied at registration
+                // (wire-faithful for `UnionArray` and other types that
+                // `PvField::descriptor` cannot losslessly reconstruct).
+                if let Some(desc) = handle.descriptor.clone() {
+                    return Some(desc);
+                }
+                if let Some(value) = handle.latest.lock().clone() {
+                    return Some(value.descriptor());
+                }
             }
             let channel = self.channel(&name_owned).await?;
             channel.get_field().await.ok()
@@ -306,7 +422,12 @@ pub async fn run_ca_pva_qsrv_ioc(
     for (pv_name, handle) in pva_pvs {
         tracing::info!(pv = %pv_name, "registering native PVA PV");
         store
-            .register_pva_pv(&pv_name, handle.latest, handle.subscribers)
+            .register_pva_pv(
+                &pv_name,
+                handle.latest,
+                handle.subscribers,
+                handle.descriptor,
+            )
             .await;
     }
 
@@ -360,5 +481,189 @@ mod tests {
         let store = QsrvPvStore::new(provider);
         assert!(store.has_pv("TEST:X").await);
         assert!(!store.has_pv("NOT:THERE").await);
+    }
+
+    /// Top-level `UnionArray` PV: when the producer hands the canonical
+    /// descriptor through `register_pva_pv`, introspection returns the
+    /// full variants list — not the empty-variants degradation that
+    /// [`PvField::descriptor`] would produce on its own. Regression for
+    /// the lossy `UnionArray` recovery path documented on
+    /// `PvField::descriptor`.
+    #[tokio::test]
+    async fn get_introspection_uses_supplied_descriptor_for_union_array() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue, UnionItem};
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = QsrvPvStore::new(provider);
+
+        // Top-level UnionArray with two named variants. Only the first is
+        // exercised in the value below, so value-derived recovery would
+        // lose the `as_double` variant entirely.
+        let canonical = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![
+                ("as_int".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("as_double".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let value = PvField::UnionArray(vec![UnionItem {
+            selector: 0,
+            variant_name: "as_int".into(),
+            value: PvField::Scalar(ScalarValue::Int(7)),
+        }]);
+
+        let latest = Arc::new(parking_lot::Mutex::new(Some(value)));
+        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        store
+            .register_pva_pv("TEST:UARR", latest, subscribers, Some(canonical.clone()))
+            .await;
+
+        let got = store.get_introspection("TEST:UARR").await.unwrap();
+        assert_eq!(got, canonical, "supplied descriptor must round-trip");
+    }
+
+    /// When the producer omits the canonical descriptor, introspection
+    /// falls back to value-derived recovery — locking in the documented
+    /// lossy behavior so future refactors can't silently invert it.
+    #[tokio::test]
+    async fn get_introspection_falls_back_to_value_descriptor_when_unset() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, UnionItem};
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = QsrvPvStore::new(provider);
+
+        let value = PvField::UnionArray(vec![UnionItem {
+            selector: 0,
+            variant_name: "as_int".into(),
+            value: PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)),
+        }]);
+        let latest = Arc::new(parking_lot::Mutex::new(Some(value)));
+        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        store
+            .register_pva_pv("TEST:UARR_LOSSY", latest, subscribers, None)
+            .await;
+
+        let got = store.get_introspection("TEST:UARR_LOSSY").await.unwrap();
+        assert_eq!(
+            got,
+            FieldDesc::UnionArray {
+                struct_id: String::new(),
+                variants: Vec::new(),
+            },
+            "documented lossy recovery: variants list must be empty"
+        );
+    }
+
+    /// Symmetric invariant guard at the global-registry entry point.
+    /// `register_pva_pv_global` is the producer-side path (called from
+    /// IOC startup before the runner exists); it must enforce the same
+    /// root-kind invariant as the runner-side `register_pva_pv`,
+    /// otherwise misconfigured handles silently sit in the global map
+    /// and surface only when the runner drains it later.
+    #[test]
+    #[should_panic(expected = "root kind")]
+    fn register_pva_pv_global_panics_on_root_mismatch() {
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType};
+
+        let value = PvField::Structure(PvStructure::new("x"));
+        let bogus_desc = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![("as_int".into(), FieldDesc::Scalar(ScalarType::Int))],
+        };
+        register_pva_pv_global(
+            "TEST:BOGUS_GLOBAL",
+            PvaPvHandle {
+                latest: Arc::new(parking_lot::Mutex::new(Some(value))),
+                subscribers: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                descriptor: Some(bogus_desc),
+            },
+        );
+    }
+
+    /// Invariant guard: registering a descriptor whose root kind
+    /// disagrees with the current value panics. Mirrors the
+    /// `PvaPvHandle` contract — introspection must not diverge from
+    /// the values served.
+    #[tokio::test]
+    #[should_panic(expected = "root kind")]
+    async fn register_pva_pv_panics_on_descriptor_value_root_mismatch() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType};
+
+        let db = Arc::new(PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = QsrvPvStore::new(provider);
+
+        // Value is a Structure, descriptor is a UnionArray — root mismatch.
+        let value = PvField::Structure(PvStructure::new("x"));
+        let bogus_desc = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![("as_int".into(), FieldDesc::Scalar(ScalarType::Int))],
+        };
+        let latest = Arc::new(parking_lot::Mutex::new(Some(value)));
+        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        store
+            .register_pva_pv("TEST:BOGUS", latest, subscribers, Some(bogus_desc))
+            .await;
+    }
+
+    /// End-to-end wire test: a top-level `UnionArray` PV registered
+    /// with a canonical descriptor is served over real PVA, and the
+    /// client recovers the full variants list via `GET_FIELD`. Closes
+    /// the loop on the doc claim that wire-faithful round-tripping
+    /// now works — the previous unit tests only validated the
+    /// `ChannelSource` contract.
+    #[tokio::test]
+    async fn pva_server_serves_canonical_union_array_descriptor_over_wire() {
+        use std::time::Duration;
+
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue, UnionItem};
+        use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+
+        let db = Arc::new(PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = Arc::new(QsrvPvStore::new(provider));
+
+        let canonical = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![
+                ("as_int".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("as_double".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let value = PvField::UnionArray(vec![UnionItem {
+            selector: 0,
+            variant_name: "as_int".into(),
+            value: PvField::Scalar(ScalarValue::Int(7)),
+        }]);
+        store
+            .register_pva_pv(
+                "TEST:WIRE:UARR",
+                Arc::new(parking_lot::Mutex::new(Some(value))),
+                Arc::new(parking_lot::Mutex::new(Vec::new())),
+                Some(canonical.clone()),
+            )
+            .await;
+
+        let server = PvaServer::start(store, PvaServerConfig::isolated());
+        let client = server.client_config();
+
+        let got = tokio::time::timeout(Duration::from_secs(5), client.pvinfo("TEST:WIRE:UARR"))
+            .await
+            .expect("pvinfo timeout")
+            .expect("pvinfo failed");
+
+        assert_eq!(
+            got, canonical,
+            "client-side introspection must recover the producer's UnionArray variants over the wire"
+        );
     }
 }

@@ -586,11 +586,17 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     let proc = crate::pva::PvaProcessor::new(pva_pv_name.clone());
                     let latest = proc.latest_handle();
                     let subscribers = proc.subscribers_handle();
+                    // NTNDArray's `value` field is a `union` of ten scalar
+                    // array variants; only one is exercised per snapshot.
+                    // Hand the canonical descriptor through so introspection
+                    // advertises every variant rather than just the one the
+                    // current frame happens to use.
                     epics_bridge_rs::qsrv::register_pva_pv_global(
                         &pva_pv_name,
                         epics_bridge_rs::qsrv::PvaPvHandle {
                             latest,
                             subscribers,
+                            descriptor: Some(epics_pva_rs::nt::nd_array::nt_nd_array_desc()),
                         },
                     );
                     proc

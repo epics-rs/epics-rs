@@ -355,11 +355,15 @@ pub mod ioc_support {
         pub fn register_pva_bundle(&self, pv_name: &str, field_prefix: &str) {
             self.shared.set_field_prefix(field_prefix);
             self.shared.publish_bundle();
+            // publish_bundle stamped expected_desc on first call — pass it
+            // through so introspection serves the canonical wire shape
+            // rather than re-deriving from the value.
             epics_bridge_rs::qsrv::register_pva_pv_global(
                 pv_name,
                 epics_bridge_rs::qsrv::PvaPvHandle {
                     latest: self.shared.latest.clone(),
                     subscribers: self.shared.subscribers.clone(),
+                    descriptor: self.shared.expected_desc.get().cloned(),
                 },
             );
         }

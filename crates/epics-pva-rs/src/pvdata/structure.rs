@@ -151,6 +151,33 @@ impl PvField {
     /// Recover a [`FieldDesc`] from a concrete value. Used by paths
     /// that cache values without a separate descriptor (e.g. QSRV
     /// PVA-plugin PV registry, gateway snapshot replay).
+    ///
+    /// **Lossy paths.** Several variants cannot be fully reconstructed
+    /// from the value alone and produce a best-effort or degraded
+    /// descriptor. Callers that need wire-faithful introspection
+    /// (e.g. archiver-engine forwarding the original channel
+    /// descriptor through a gateway) must thread the original
+    /// [`FieldDesc`] alongside the value rather than rely on this
+    /// recovery:
+    ///
+    /// - `ScalarArray` with no elements falls back to `Double`.
+    /// - `StructureArray` with no elements yields `struct_id=""` and
+    ///   no fields.
+    /// - `Union` reports only the currently-selected variant — sibling
+    ///   variants in the original descriptor are not recoverable.
+    /// - `UnionArray` returns an **empty** variants list. The per-item
+    ///   `selector` is an index into the original variants vector, so
+    ///   a best-effort reconstruction from the items would either
+    ///   misalign indices (when not every slot is exercised) or omit
+    ///   types entirely; both are wrong on the wire. Top-level
+    ///   `UnionArray` PVs routed through this recovery are therefore
+    ///   not round-trippable here. Producers that need wire-faithful
+    ///   introspection should hand the canonical descriptor through
+    ///   their registration API (e.g.
+    ///   `epics_bridge_rs::qsrv::PvaPvHandle::descriptor`) so the
+    ///   server emits it directly instead of calling this recovery.
+    /// - `Variant` with no captured descriptor and bare `Null` both
+    ///   degrade to `FieldDesc::Variant`.
     pub fn descriptor(&self) -> FieldDesc {
         match self {
             Self::Scalar(v) => FieldDesc::Scalar(v.scalar_type()),
@@ -191,6 +218,8 @@ impl PvField {
                 struct_id: String::new(),
                 variants: vec![(variant_name.clone(), value.descriptor())],
             },
+            // Lossy: see `descriptor()` doc. Reconstructing variants
+            // from items would misalign per-item `selector` indices.
             Self::UnionArray(_) => FieldDesc::UnionArray {
                 struct_id: String::new(),
                 variants: Vec::new(),

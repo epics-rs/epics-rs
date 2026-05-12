@@ -700,10 +700,9 @@ impl EpicsValue {
                             CaError::InvalidValue(format!("invalid short or menu string: {s}"))
                         })
                 }),
-            DbFieldType::Float => s
-                .parse::<f32>()
-                .map(Self::Float)
-                .map_err(|e| CaError::InvalidValue(e.to_string())),
+            DbFieldType::Float => parse_string_to_f64(s)
+                .map(|v| Self::Float(v as f32))
+                .ok_or_else(|| CaError::InvalidValue(format!("invalid float literal: {s}"))),
             DbFieldType::Enum => Self::parse_int(s)
                 .map(|v| Self::Enum(v as u16))
                 .or_else(|_| {
@@ -722,10 +721,9 @@ impl EpicsValue {
             DbFieldType::Int64 => Self::parse_int(s)
                 .map(Self::Int64)
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
-            DbFieldType::Double => s
-                .parse::<f64>()
+            DbFieldType::Double => parse_string_to_f64(s)
                 .map(Self::Double)
-                .map_err(|e| CaError::InvalidValue(e.to_string())),
+                .ok_or_else(|| CaError::InvalidValue(format!("invalid double literal: {s}"))),
         }
     }
 
@@ -775,4 +773,83 @@ fn parse_string_to_f64(s: &str) -> Option<f64> {
         }
     }
     trimmed.parse::<f64>().ok()
+}
+
+#[cfg(test)]
+mod parse_radix_tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_to_long() {
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Long, "0xFF").unwrap(),
+            EpicsValue::Long(255)
+        );
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Long, "0X1A").unwrap(),
+            EpicsValue::Long(26)
+        );
+    }
+
+    #[test]
+    fn parse_octal_to_long() {
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Long, "0377").unwrap(),
+            EpicsValue::Long(255)
+        );
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Long, "010").unwrap(),
+            EpicsValue::Long(8)
+        );
+    }
+
+    #[test]
+    fn parse_hex_to_double() {
+        // PR #678: dbpf to a DOUBLE field with "0xFF" must accept.
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Double, "0xFF").unwrap(),
+            EpicsValue::Double(255.0)
+        );
+    }
+
+    #[test]
+    fn parse_octal_to_double() {
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Double, "0377").unwrap(),
+            EpicsValue::Double(255.0)
+        );
+    }
+
+    #[test]
+    fn parse_hex_to_float_with_sign() {
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Float, "-0x10").unwrap(),
+            EpicsValue::Float(-16.0)
+        );
+    }
+
+    #[test]
+    fn parse_double_keeps_decimal_format() {
+        // The hex/octal extension must not break plain decimals.
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Double, "1.5").unwrap(),
+            EpicsValue::Double(1.5)
+        );
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Double, "1e6").unwrap(),
+            EpicsValue::Double(1_000_000.0)
+        );
+    }
+
+    #[test]
+    fn parse_hex_to_short_and_char() {
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Short, "0x7F").unwrap(),
+            EpicsValue::Short(127)
+        );
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::Char, "0xFF").unwrap(),
+            EpicsValue::Char(255)
+        );
+    }
 }

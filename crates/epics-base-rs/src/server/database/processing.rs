@@ -624,7 +624,15 @@ impl PvDatabase {
                     None
                 }
             } else if is_soft_out {
-                if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out {
+                if !record_should_output {
+                    // epics-base 7.0.8 OOPT: gate the soft OUT-link
+                    // write on the record's `should_output()`. For
+                    // longout/calcout with OOPT != 0 this lets a
+                    // condition-not-met cycle silently skip the link
+                    // write without disturbing alarms / monitors.
+                    None
+                } else if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out
+                {
                     let out_val = instance
                         .record
                         .get_field("OVAL")
@@ -633,6 +641,13 @@ impl PvDatabase {
                 } else {
                     None
                 }
+            } else if !record_should_output {
+                // OOPT gating for hardware outputs (longout DTYP=...).
+                // Skip the device write when the OOPT predicate is
+                // not satisfied; the record's val/timestamp/snapshot
+                // path still runs so monitor consumers see the value
+                // change even on a non-output cycle.
+                None
             } else {
                 if let Some(mut dev) = instance.device.take() {
                     // Try async write_begin() first
@@ -664,6 +679,11 @@ impl PvDatabase {
                                     crate::server::recgbl::alarm_status::WRITE_ALARM;
                                 instance.common.sevr =
                                     crate::server::record::AlarmSeverity::Invalid;
+                            } else {
+                                // OOPT 7.0.8: notify the record so it can
+                                // latch transition state (e.g. longout.pval)
+                                // for the next cycle.
+                                instance.record.on_output_complete();
                             }
                         }
                         Err(e) => {
@@ -784,6 +804,12 @@ impl PvDatabase {
         if let Some((ref link, ref out_val)) = out_info {
             self.write_db_link_value(link, out_val.clone(), visited, depth)
                 .await;
+            // OOPT 7.0.8: latch the record's post-output state so the
+            // next cycle's `should_output` sees the right pval.
+            {
+                let mut instance = rec.write().await;
+                instance.record.on_output_complete();
+            }
         }
 
         // 4.5. Multi-output dispatch (fanout/dfanout/seq)

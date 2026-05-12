@@ -273,10 +273,18 @@ pub trait Record: Send + Sync + 'static {
     }
 
     /// Whether this record's OUT link should be written after processing.
-    /// Defaults to true. Override in calcout to implement OOPT conditional output.
+    /// Defaults to true. Override in calcout / longout to implement OOPT
+    /// conditional output (epics-base 7.0.8).
     fn should_output(&self) -> bool {
         true
     }
+
+    /// Notify the record that the OUT-link / device write completed
+    /// successfully on this cycle. The framework calls this right after
+    /// the actual write so transition-detection state (e.g.
+    /// `longout.pval`) can update for the next cycle's
+    /// [`Self::should_output`] check. Default: no-op.
+    fn on_output_complete(&mut self) {}
 
     /// Whether this record uses MDEL/ADEL deadband for monitor posting.
     /// Binary records (bi, bo, busy, mbbi, mbbo) return false because

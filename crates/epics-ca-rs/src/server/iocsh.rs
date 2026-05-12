@@ -45,12 +45,18 @@ pub fn casr_command(stats: Arc<ServerStats>) -> CommandDef {
             let connects = stats.connects_total.load(Relaxed);
             let disconnects = stats.disconnects_total.load(Relaxed);
             let active = stats.active_clients();
+            let active_chans = stats.active_channels();
+            let chans_opened = stats.channels_opened_total.load(Relaxed);
+            let chans_closed = stats.channels_closed_total.load(Relaxed);
             let up = stats.uptime();
             ctx.println(&format!(
                 "Channel Access Server: {active} active client(s), {connects} connect(s) total, {disconnects} disconnect(s) total"
             ));
             if level >= 1 {
                 ctx.println(&format!("    uptime: {:.1}s", up.as_secs_f64()));
+                ctx.println(&format!(
+                    "    channels: {active_chans} active ({chans_opened} opened / {chans_closed} closed total)"
+                ));
             }
             if level >= 2 {
                 let secs = up.as_secs();
@@ -58,6 +64,12 @@ pub fn casr_command(stats: Arc<ServerStats>) -> CommandDef {
                 let m = (secs % 3600) / 60;
                 let s = secs % 60;
                 ctx.println(&format!("    uptime breakdown: {h}h {m}m {s}s"));
+                let bytes_in = stats.bytes_in.load(Relaxed);
+                let bytes_out = stats.bytes_out.load(Relaxed);
+                let subs_active = stats.active_subscriptions();
+                ctx.println(&format!(
+                    "    subscriptions: {subs_active} active; bytes in={bytes_in}, out={bytes_out}"
+                ));
             }
             Ok(CommandOutcome::Continue)
         },

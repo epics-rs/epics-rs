@@ -1494,7 +1494,18 @@ impl PvDatabase {
             return None; // NO simulation, proceed normally
         }
 
-        // SIMM=YES(1): handle simulation
+        // epics-base 7.0.7 (SIMM menu):
+        //   1 = YES — read/write via SIOL using the cooked VAL
+        //   2 = RAW — read/write via SIOL using the raw RVAL when the
+        //             record carries one (ai/ao only); falls back to
+        //             VAL when no RVAL is present. Mirrors the C
+        //             implementation, which treats records lacking
+        //             a raw value as "YES" since there's nothing
+        //             else to copy.
+        let raw_mode = simm == 2;
+        let raw_field = if raw_mode { "RVAL" } else { "VAL" };
+
+        // SIMM=YES(1) / SIMM=RAW(2): handle simulation
         if let crate::server::record::ParsedLink::Db(ref link) = siol_link {
             let pv_name = if link.field == "VAL" {
                 link.record.clone()
@@ -1503,9 +1514,19 @@ impl PvDatabase {
             };
 
             if is_input {
-                // Input record: read from SIOL -> set VAL directly (skip conversion)
+                // Input record: read from SIOL -> set VAL/RVAL (skip conversion).
                 if let Ok(siol_val) = self.get_pv(&pv_name).await {
                     let mut instance = rec.write().await;
+                    let target_supports_raw =
+                        raw_mode && instance.record.get_field("RVAL").is_some();
+                    if target_supports_raw {
+                        // RAW path: drop the value into RVAL and let
+                        // the record's normal conversion chain
+                        // promote it to VAL on the next process —
+                        // matches C semantic where SIMM=RAW writes
+                        // raw counts.
+                        let _ = instance.record.put_field("RVAL", siol_val.clone());
+                    }
                     let _ = instance.record.set_val(siol_val);
                     apply_timestamp(&mut instance.common, true);
                     instance.common.udf = false;
@@ -1538,10 +1559,20 @@ impl PvDatabase {
                     instance.notify_from_snapshot(&snapshot);
                 }
             } else {
-                // Output record: write VAL to SIOL (skip device write)
+                // Output record: write VAL (or RVAL for SIMM=RAW) to
+                // SIOL (skip device write).
                 let out_val = {
                     let instance = rec.read().await;
-                    instance.record.val()
+                    if raw_mode {
+                        // RAW path: prefer RVAL when the record has
+                        // one. Otherwise fall through to VAL.
+                        instance
+                            .record
+                            .get_field(raw_field)
+                            .or_else(|| instance.record.val())
+                    } else {
+                        instance.record.val()
+                    }
                 };
                 if let Some(val) = out_val {
                     let _ = self.put_pv(&pv_name, val).await;

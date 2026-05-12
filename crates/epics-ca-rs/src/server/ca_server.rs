@@ -338,6 +338,29 @@ pub struct ServerStats {
     pub connects_total: std::sync::atomic::AtomicU64,
     pub disconnects_total: std::sync::atomic::AtomicU64,
     pub started_at: std::sync::OnceLock<std::time::Instant>,
+    /// Total bytes received from clients since startup. Incremented
+    /// by `handle_client` on every TCP read. Mirrors the
+    /// `caServerBytes_in` counter from PR #592's `dbServerStats`.
+    pub bytes_in: std::sync::atomic::AtomicU64,
+    /// Total bytes sent to clients since startup. Mirrors
+    /// `caServerBytes_out`. Updated when the per-client BufWriter
+    /// reports successful flushes; CA over TLS counts post-decrypt
+    /// plaintext (the rustls handshake bytes are not surfaced).
+    pub bytes_out: std::sync::atomic::AtomicU64,
+    /// Total CREATE_CHAN successes across the server lifetime.
+    /// PR #592's `caServerChannelCount` minus the closes (which we
+    /// track separately so the open-channel count is computable).
+    pub channels_opened_total: std::sync::atomic::AtomicU64,
+    /// Total CLEAR_CHANNEL successes. Subtract from
+    /// `channels_opened_total` for the live channel count.
+    pub channels_closed_total: std::sync::atomic::AtomicU64,
+    /// Total successful EVENT_ADD setups. Mirrors
+    /// `caServerSubscriptionCount`.
+    pub subscriptions_opened_total: std::sync::atomic::AtomicU64,
+    /// Total successful EVENT_CANCEL / channel-close subscription
+    /// teardowns. Subtract from opened for the live subscription
+    /// count.
+    pub subscriptions_closed_total: std::sync::atomic::AtomicU64,
 }
 
 impl ServerStats {
@@ -349,6 +372,30 @@ impl ServerStats {
             .disconnects_total
             .load(std::sync::atomic::Ordering::Relaxed);
         c.saturating_sub(d)
+    }
+
+    /// Number of channels currently open across all clients.
+    /// Mirrors PR #592's `caServerChannelCount`.
+    pub fn active_channels(&self) -> u64 {
+        let o = self
+            .channels_opened_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let c = self
+            .channels_closed_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        o.saturating_sub(c)
+    }
+
+    /// Number of subscriptions currently active across all clients.
+    /// Mirrors PR #592's `caServerSubscriptionCount`.
+    pub fn active_subscriptions(&self) -> u64 {
+        let o = self
+            .subscriptions_opened_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let c = self
+            .subscriptions_closed_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        o.saturating_sub(c)
     }
 
     pub fn uptime(&self) -> std::time::Duration {
@@ -772,6 +819,13 @@ impl CaServer {
             tokio::spawn(async move {
                 while let Ok(evt) = rx.recv().await {
                     use std::sync::atomic::Ordering::Relaxed;
+                    // ServerConnectionEvent is `#[non_exhaustive]`, so
+                    // the `_` arm guards against future variants — even
+                    // though every present variant is matched today,
+                    // we don't want a new event in some future minor
+                    // release to break this crate. Clippy sees today's
+                    // exhaustive cover and warns; allow it explicitly.
+                    #[allow(unreachable_patterns)]
                     match evt {
                         crate::server::tcp::ServerConnectionEvent::Connected(_) => {
                             stats_for_task.connects_total.fetch_add(1, Relaxed);
@@ -779,10 +833,12 @@ impl CaServer {
                         crate::server::tcp::ServerConnectionEvent::Disconnected(_) => {
                             stats_for_task.disconnects_total.fetch_add(1, Relaxed);
                         }
-                        // Per-channel events are observable by ca_gateway
-                        // and similar consumers; stats here only track
-                        // connection-level counters. Catch-all because
-                        // `ServerConnectionEvent` is `#[non_exhaustive]`.
+                        crate::server::tcp::ServerConnectionEvent::ChannelCreated { .. } => {
+                            stats_for_task.channels_opened_total.fetch_add(1, Relaxed);
+                        }
+                        crate::server::tcp::ServerConnectionEvent::ChannelCleared { .. } => {
+                            stats_for_task.channels_closed_total.fetch_add(1, Relaxed);
+                        }
                         _ => {}
                     }
                 }

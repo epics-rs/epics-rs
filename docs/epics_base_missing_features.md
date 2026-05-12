@@ -1,51 +1,82 @@
 # EPICS Base & Asyn 변경 사항 중 `epics-rs` 미반영 항목 총정리 (과거 내역 포함)
 
-`epics-rs` 프로젝트의 `docs/upstream-tracking.md` 및 `epics-base`, `asyn` (2015년~현재)의 PR, Issue, Commit 전체 내역을 심층 분석한 결과, 아직 러스트 환경(`epics-rs`)에 반영되지 않았거나 추적/개발 중인 미반영 항목들은 다음과 같습니다. 
+`epics-rs` 프로젝트의 `docs/upstream-tracking.md` 및 `epics-base`, `asyn` (2015년~현재)의 PR, Issue, Commit 전체 내역을 심층 분석한 결과, 아직 러스트 환경(`epics-rs`)에 반영되지 않았거나 추적/개발 중인 미반영 항목들은 다음과 같습니다.
+
+> **Status legend** (항목 머리에 부착되는 마커)
+> - ✅ **DONE** `<commit>` — 본 작업에서 새로 구현. 괄호의 commit hash는 `feat/upstream-features` 브랜치의 SHA.
+> - ⏭️ **ALREADY** — 기존 코드베이스에 이미 구현되어 있던 항목. 점검만 수행.
+> - 🔄 **PARTIAL** `<commit>` — 부분 구현. 한계는 본문에 명시.
+> - ⏸️ **DEFERRED** — 별도 PR 필요. scope/이유는 본문에 명시.
+> - ⚠️ **N/A** — 적용 불필요 (디자인 차이, wire-format 제약 등).
+
+## 진행 요약 (2026-05-13 세션)
+
+`feat/upstream-features` 브랜치에 11 commits, 3245 tests pass, fmt+clippy 클린.
+
+| Commit | 항목 |
+|---|---|
+| `9d8a34b` | TCP/UDP 서버 포트 분리 (`EPICS_CAS_SERVER_PORT`, PR #69) |
+| `ae277d1` | `EPICS_CA_MCAST_TTL` UDP 멀티캐스트 TTL (3.16 f2a1834d) |
+| `8615bb4` | `EPICS_IOC_IGNORE_SERVERS` 클라이언트 quarantine (6efe2924) |
+| `6862ef0` | ACF HAG DNS soft fallback (libcom 932e9f3) |
+| `17210b4` | dbPut/dbGet 16진수·8진수 (Double/Float, PR #678) |
+| `7ed3baf` | `getenv` 내장 디바이스 (3.15.4) |
+| `23360e6` | mTLS → ACF METHOD/AUTHORITY (PR #641) |
+| `a409311` | 절전 wake echo probe 단축 (Issue #190) |
+| `73b517c` | longout OOPT 조건부 출력 (7.0.8) |
+| `a02c310` | aai/aao/subArray 레코드 (PR #162/#742) |
+| `ac92e3e` | SIMM=RAW + dbServerStats 카운터 확장 |
+
+미해결 핵심 deferred 항목:
+- IPv6 완전 지원 (PR #205) — ~2000 LOC, 별도 multi-day PR
+- 서버 측 채널 필터 (3.15.7) — ~1000 LOC + 설계 리뷰
+- `aSub` constant INP / `bi`-`bo` mask 변환 / 다수의 9-A high-priority 라이프사이클 fix
 
 ---
 
 ## 1. 네트워킹 및 CA / PVA 프로토콜 (Networking)
-- **IPv6 지원 (PR #205)**: `epics-ca-rs`의 `ADDR_LIST` 및 `BEACON` 멀티캐스트 로직이 아직 IPv4 전용으로 구현되어 있습니다.
-- **DNS 변경 시 영구 연결 끊김 현상 (Issue #488)**: `CaClient`가 초기 시작 시 한 번만 DNS를 조회합니다. 네트워크 환경 변화로 타겟의 IP가 변경되면 재연결 시도 시 호스트명을 다시 확인하지 않아 영구적으로 연결이 끊기는 현상이 수정되지 않았습니다.
-- **TLS 기반 보안 pvAccess (PR #641)**: C++에서 제안된 TLS-cert 인증서 기반 접근 제어(ACF Gateway) 연동은 대기 상태입니다.
-- **CA 클라이언트의 서버 프로토콜 버전 결정 (PR #711)**: 서버와의 초기 핸드쉐이크에서 프로토콜 버전을 능동적으로 확인하고 분기하는 로직이 부족합니다.
-- **지정된 TCP 포트 + UDP 5064 분리 (PR #69)**: 서버 포트 환경 변수를 TCP와 UDP에 대해 각각 분리하여 설정하는 기능이 지원되지 않습니다.
-- **절전 모드(Suspend) 해제 후 CA 멈춤 현상 (Issue #190)**: 랩탑 등의 절전 모드 해제 시 기존 CA 소켓 연결이 끊어진 상태로 스톨(stall)되는 문제에 대한 복구 절차가 미비합니다.
-- **서버 측 채널 필터 (Server-side Filters, 3.15.7)**: 클라이언트가 구독 시 `{"dec":{"n":60}}` (Decimation), `{"arr":{"s":0}}` (Array) 등의 필터를 적용하여 서버 단에서 트래픽을 필터링하는 기능이 아직 없습니다.
+- **IPv6 지원 (PR #205)** — ⏸️ **DEFERRED**: `epics-ca-rs`의 `ADDR_LIST` 및 `BEACON` 멀티캐스트 로직이 아직 IPv4 전용. 62 Ipv4Addr sites/8 files, CA wire 4-byte IP 필드 구조 제약, dual-stack + IPv6 multicast semantics, AsyncUdpV4 generic화 필요 (~2000 LOC, multi-day PR).
+- **DNS 변경 시 영구 연결 끊김 현상 (Issue #488)** — ⏭️ **ALREADY**: round-50 작업으로 `EPICS_CA_DNS_REFRESH_SECS` + `AddrEntry::refresh_dns` 구현됨 (`crates/epics-ca-rs/src/client/search.rs:354`).
+- **TLS 기반 보안 pvAccess (PR #641)** — ✅ **DONE** `23360e6`: `tls::issuer_from_cert` 추가, `ClientState{auth_method, auth_authority}` 필드, `compute_access`를 `check_access_method`로 전환. mTLS peer cert의 issuer DN이 `AUTHORITY()` ACF 절과 매칭되며 method는 `"x509"` 고정.
+- **CA 클라이언트의 서버 프로토콜 버전 결정 (PR #711)** — ⏭️ **ALREADY**: `transport.rs`가 CA_PROTO_VERSION 수신 시 `server_minor_version`을 캡처하고 `send_echo`에서 v4.3+ ECHO vs 이전 READ_SYNC로 분기.
+- **지정된 TCP 포트 + UDP 5064 분리 (PR #69)** — ✅ **DONE** `9d8a34b`: `cas_server_port()`, `CaServerBuilder::tcp_port`, `IocApplication::tcp_port`. UDP 응답기가 실제 바인딩된 TCP 포트를 SEARCH_REPLY에 광고.
+- **절전 모드(Suspend) 해제 후 CA 멈춤 현상 (Issue #190)** — ✅ **DONE** `a409311`: wall-clock skip 기반 suspend wake 탐지, echo probe 5s→1s 단축, tracing::info 기록. 절전 후 복구 ~1s.
+- **서버 측 채널 필터 (Server-side Filters, 3.15.7)** — ⏸️ **DEFERRED**: PV-name JSON 파서 + SubscriptionFilter trait + 모든 monitor 발행 경로 통과 + 4개 필터 타입(decimation/arr/ts/sync) ~1000 LOC + 별도 design review 필요.
 
 ---
 
 ## 2. IOC, 레코드 및 데이터베이스 (Records & Database)
-- **`aai`, `aao`, `subArray` 등 배열 레코드 부재 (PR #162, #742)**: 현재 `waveform` 외의 다른 배열 레코드들이 구현되어 있지 않으며, 배열 요소 크기 변경에 따른 `NORD` 이벤트 발행 기능도 누락되었습니다.
-- **`dbServerStats()` API 구현 지연 (PR #592)**: 온전한 API 표면이 부족합니다.
-- **`dbLoadTemplate`의 `EPICS_DB_INCLUDE_PATH` 지원 (PR #636)**.
-- **잘못된 필드명에 대한 자동 제안 (PR #689)**: `dbAccess` 파싱 중 오타가 발생했을 때 필드명을 추측하여 보여주는 "Better guesses" 기능이 없습니다.
-- **`dbPut` / `dbGet`의 16진수 및 8진수 문자열 지원 (PR #678)**.
-- **`asTrap` 내 `dbChannel` 노출 (PR #501)**.
-- **레코드 삭제 기능 (PR #505)**: 데이터베이스 생성/로딩 단계에서 레코드를 삭제(`dbDeleteRecord`)하는 기능이 노출되어 있지 않습니다.
-- **`getenv` 디바이스 지원 (3.15.4)**: `stringin` 및 `lsi` 레코드에서 런타임에 서버의 환경 변수를 읽어올 수 있는 기능이 없습니다.
-- **출력 레코드의 `SIMM=RAW` 시뮬레이션 모드 (7.0.7)**.
-- **`longout` 레코드의 조건부 출력 `OOPT` 필드 (7.0.8)**.
+- **`aai`, `aao`, `subArray` 등 배열 레코드 부재 (PR #162, #742)** — ✅ **DONE** `a02c310`: `ArrayKind` 열거형으로 `WaveformRecord` 공유, `aao`만 `can_device_write=true`. NORD 이벤트는 기존 waveform 경로에서 처리. 단, `subArray`의 INDX/MALM 슬라이싱 시맨틱은 후속 작업.
+- **`dbServerStats()` API 구현 지연 (PR #592)** — 🔄 **PARTIAL** `ac92e3e`: `ServerStats`에 channels_opened/closed + subscriptions_opened/closed + bytes_in/out 카운터 추가. channel 카운터는 `ServerConnectionEvent`로 wired; subscription/bytes counter는 declared (transport-level wiring deferred).
+- **`dbLoadTemplate`의 `EPICS_DB_INCLUDE_PATH` 지원 (PR #636)** — ⏭️ **ALREADY**: `iocsh/commands.rs:876`이 env var를 읽어 include path 리스트 구성.
+- **잘못된 필드명에 대한 자동 제안 (PR #689)** — ⏭️ **ALREADY**: round 23 commit으로 `dbpf` typo suggestion 구현.
+- **`dbPut` / `dbGet`의 16진수 및 8진수 문자열 지원 (PR #678)** — ✅ **DONE** `17210b4`: 기존 `parse_int`가 정수 타입 prefix를 처리했고, 본 commit으로 Double/Float도 `parse_string_to_f64`로 통합 (sign + 0x hex + 0-leading octal + 일반 decimal/exponent).
+- **`asTrap` 내 `dbChannel` 노출 (PR #501)** — ⚠️ **N/A**: epics-rs는 generic asTrap 인터페이스 대신 `epics_ca_rs::audit::AuditLogger`를 사용하며, PV 이름·user·host·method·deny-reason 등 dbChannel-equivalent 컨텍스트를 이미 JSON으로 기록.
+- **레코드 삭제 기능 (PR #505)** — ⏭️ **ALREADY**: `iocsh/commands.rs:24`에 `cmd_db_delete_record` 등록되어 있음.
+- **`getenv` 디바이스 지원 (3.15.4)** — ✅ **DONE** `7ed3baf`: 신규 모듈 `server/builtin_devices/getenv.rs`. `IocBuilder::new()`/`IocApplication::new()`에서 `DTYP="getenv"`로 자동 등록. INP의 `@` prefix 처리.
+- **출력 레코드의 `SIMM=RAW` 시뮬레이션 모드 (7.0.7)** — 🔄 **PARTIAL** `ac92e3e`: SIMM=2 명시 인식, RVAL-있는 레코드(ai/ao)에서 raw value path. RVAL 없는 레코드는 SIMM=YES와 동일 fallback.
+- **`longout` 레코드의 조건부 출력 `OOPT` 필드 (7.0.8)** — ✅ **DONE** `73b517c`: EpicsRecord derive를 manual `impl Record`로 교체, `should_output` override + 신규 trait method `on_output_complete` 추가, processing.rs의 device-write/soft-link 양 경로에 OOPT gate.
 
 ---
 
 ## 3. Shell (iocsh) 및 런타임 환경 (Runtime/Environment)
-- **비대화형(non-interactive) `readline` 스킵 (PR #848)**: 백그라운드 환경에서도 쉘이 프롬프트 초기화를 강제합니다.
-- **`iocshLoad` 명령어 미지원 (Issue #847)**: 매크로(`MACRO=VAL`)를 포함하여 스크립트를 로드하는 런타임 쉘 명령어 구현이 아직 없습니다. (`<` 문법만 지원)
-- **가용 CPU 수치 과다 보고 방지 API (PR #788)**.
-- **`SIGTERM` / `SIGINT` 수신 시 `atExit` 정상 종료 절차 (PR #671)**: 시스템 종료 시그널 셧다운 훅 누락.
-- **`iocsh` 내 `Ctrl+C` 처리 시 `stdin` 닫기 (PR #673)**.
-- **`iocsh` 멀티라인 문자열 지원 (PR #603)**.
+- **비대화형(non-interactive) `readline` 스킵 (PR #848)** — ⏸️ **DEFERRED**: 미구현. 백그라운드 환경에서도 쉘이 프롬프트 초기화 강제.
+- **`iocshLoad` 명령어 미지원 (Issue #847)** — ⏸️ **DEFERRED**: 매크로 포함 스크립트 로드 명령 미구현 (`<` 문법만 존재).
+- **가용 CPU 수치 과다 보고 방지 API (PR #788)** — ⏸️ **DEFERRED**: `taskset` 등 어피니티 제한 환경에서 실제 가용 CPU 수 보고 미구현.
+- **`SIGTERM` / `SIGINT` 수신 시 `atExit` 정상 종료 절차 (PR #671)** — 🔄 **PARTIAL**: CA 서버(`ca_server.rs`)·PVA 서버 runtime·`epics-tools-rs::procserv`에는 SIGTERM 핸들러 존재. `epics-base-rs::server::ioc_app`에는 명시 핸들러 없음(드롭 시 자연 종료에 의존).
+- **`iocsh` 내 `Ctrl+C` 처리 시 `stdin` 닫기 (PR #673)** — ⏸️ **DEFERRED**: 미구현.
+- **`iocsh` 멀티라인 문자열 지원 (PR #603)** — ⏸️ **DEFERRED**: 미구현.
 
 ---
 
 ## 4. `asyn` 드라이버 관련 (asyn-rs)
-- **`asyn:READBACK` 연동 미완성 (PR #208, #60)**: `info` 태그 자동 캡처와 아웃풋 레코드 데드락 방지 구현이 대기 중입니다.
-- **`UInt64` 인터페이스 파이프라인 (Issue #231)**: 메시지 파이프라인(`ParamValue` / `RequestOp`) 배선 작업 누락.
-- **Serial Port 및 FTDI 드라이버 부재 (PR #180, #88)**.
-- **IP 서버 포트의 `Bind` 인터페이스 및 `SO_REUSEPORT` 지원 (PR #148, #109)**.
-- **`lsi`, `lso`, `printf` 레코드에 대한 `asyn` 매핑 (PR #104)**.
-- **단순 평균치 장치 지원 (Issue #30)**: `asynInt32Average` / `asynFloat64Average`.
+- **`asyn:READBACK` 연동 미완성 (PR #208, #60)** — ⏭️ **ALREADY**: round 6에서 `adapter.rs::asyn_readback` 플래그로 처리.
+- **`UInt64` 인터페이스 파이프라인 (Issue #231)** — ⏭️ **ALREADY**: `asyn-rs/param.rs`에 `UInt64`/`UInt64Array` 타입 정의 완료.
+- **Serial Port 드라이버 (PR #180)** — ⏭️ **ALREADY**: `asyn-rs/drivers/serial_port.rs::DrvAsynSerialPort` 구현.
+- **FTDI 드라이버 (PR #88)** — ⏸️ **DEFERRED**: 미구현.
+- **IP 서버 포트의 `Bind` 인터페이스 및 `SO_REUSEPORT` 지원 (PR #148, #109)** — ⏸️ **DEFERRED**: asyn IP 포트 드라이버의 특정 인터페이스 바인딩 옵션 미구현.
+- **`lsi`, `lso`, `printf` 레코드에 대한 `asyn` 매핑 (PR #104)** — ⏸️ **DEFERRED**: `asyn-rs` 어댑터에서 LongString 파라미터 → 레코드 매핑 없음.
+- **단순 평균치 장치 지원 (Issue #30)** — ⏸️ **DEFERRED**: `asynInt32Average`/`asynFloat64Average` 미구현.
 
 ---
 
@@ -53,42 +84,55 @@
 큰 골격 외에도, 과거 버그 픽스나 엣지 케이스 처리 중 아직 `epics-rs`에 완벽하게 반영되지 않았거나 교차 검증(Audit)이 필요한 자잘한 누락 사항들은 다음과 같습니다.
 
 ### 네트워킹 & 프로토콜 세부
-- **DNS TTL 주기적 갱신 부재 (PR #862)**: 게이트웨이 및 HAG 연결 시 캐싱된 DNS가 만료될 때 능동적으로 TTL을 갱신하는 타이머 로직이 없습니다.
-- **네임서버 CA 프로토콜 강제 지정 (PR #621)**: 네임서버와 핸드쉐이크 시 특정 CA 버전(`CA_V413` 등)을 강제하는 옵션 미구현.
-- **다량 채널 검색(Mass-channel) 성능 튜닝 (Issue #372)**: 로드가 심할 때의 AIMD 서치 예산(Search budget) 최적화.
-- **`caget` 반환 타입 단축 (PR #629)**: `DBR_INT`를 `SHORT`로 캐스팅할 때의 엣지 케이스 처리.
+- **DNS TTL 주기적 갱신 부재 (PR #862)** — ⏭️ **ALREADY**: `EPICS_CA_DNS_REFRESH_SECS` 타이머 + `AddrEntry::refresh_dns` 구현 (round 50).
+- **네임서버 CA 프로토콜 강제 지정 (PR #621)** — ⏸️ **DEFERRED**: `CA_V413` 강제 옵션 미구현.
+- **다량 채널 검색(Mass-channel) 성능 튜닝 (Issue #372)** — 🔄 **PARTIAL**: AIMD search budget + 30-bucket cooperative tick 기반 구현되어 있으나 mass scenario 별도 검증 필요.
+- **`caget` 반환 타입 단축 (PR #629)** — ⏸️ **DEFERRED**: DBR_INT→SHORT 캐스팅 엣지 케이스 미점검.
+- **CA UDP 전송 오류 rate-limit (cae597d, c23012d)** — ⏭️ **ALREADY**: `client/search.rs::send_with_fanout`, `server/beacon.rs::run_beacon_emitter`에 per-destination first/change/recovery만 로그하는 dedup.
+- **EPICS_CA_MCAST_TTL (3.16 f2a1834d)** — ✅ **DONE** `ae277d1`: `runtime::net::ca_mcast_ttl` + `AsyncUdpV4::set_multicast_ttl_v4` + CA 서버 beacon/UDP 응답기·클라이언트 search 소켓에 적용.
+- **EPICS_IOC_IGNORE_SERVERS (6efe2924)** — ✅ **DONE** `8615bb4`: ADDR_LIST 파싱·SEARCH 응답·beacon 수신 3개 경로에서 quarantine IP 필터.
+- **asLib DNS soft fallback (libcom 932e9f3)** — ✅ **DONE** `6862ef0`: ACF HAG 파싱 시 DNS 실패해도 abort 대신 literal 유지 + 가능한 IP 추가.
 
 ### 레코드 & 데이터베이스 세부
-- **범용 `TOUT` (Timeout) 레코드 필드 부재 (PR #803)**.
-- **Soft Time Part 디바이스 지원 (PR #776)**: 타임스탬프의 `dtyp` 분리 처리 로직 미구현.
-- **`bi` / `bo` 변환(Conversion) 로직 누락 (PR #775)**.
-- **상수 링크(Constant Link)의 오프셋 계산 버그 대조 (PR #467)**: 오프셋/길이 수학 계산 시 "Off-by-one" 에러 엣지 케이스 확인 필요.
-- **사용되지 않는 `INPx` 링크 파손 시 `calc` 레코드 중단 문제 (Issue #823)**.
-- **`mbboDirect`의 `B0..BF` 필드 ASL0 권한 조정 (PR #439)**.
-- **`dbLoadRecords` 매크로 기본값 의미론 불일치 (PR #463)**: 치환(substitution) 없이 매크로 기본값이 들어올 때의 파서 처리 엣지 케이스.
-- **DB 파서의 알 수 없는 필드명 힌트 제공 (PR #434)**.
-- **aSub 레코드의 상수 `INP*` 허용 여부 (Issue #284)**.
-- **긴 문자열 `CALC$` 지원 이슈 (Issue #194)**: `scalcout` 레코드에서 `$` 접미사 처리 로직 누락.
-- **`DBF_MENU` → `DBF_STRING` 변환 버그 픽스 대조 (Issue #183)**.
-- **`zero-length` (길이가 0인) 배열 지원 엣지 케이스 (7.0.5)**.
-- **`compress` 레코드 개선 (7.0.8)**.
+
+> 이 하위 섹션 항목 대부분은 점검·검증 작업이 본문 아래에서 별도로 다뤄집니다. 본 세션에서는 직접 다루지 않음 → **⏸️ DEFERRED**.
+
+- **범용 `TOUT` (Timeout) 레코드 필드 부재 (PR #803)** — ⏸️ DEFERRED.
+- **Soft Time Part 디바이스 지원 (PR #776)** — ⏸️ DEFERRED.
+- **`bi` / `bo` 변환(Conversion) 로직 누락 (PR #775)** — ⏸️ DEFERRED.
+- **상수 링크(Constant Link)의 오프셋 계산 버그 대조 (PR #467)** — ⏸️ DEFERRED.
+- **사용되지 않는 `INPx` 링크 파손 시 `calc` 레코드 중단 문제 (Issue #823)** — ⏸️ DEFERRED.
+- **`mbboDirect`의 `B0..BF` 필드 ASL0 권한 조정 (PR #439)** — ⏸️ DEFERRED.
+- **`dbLoadRecords` 매크로 기본값 의미론 불일치 (PR #463)** — ⏸️ DEFERRED.
+- **DB 파서의 알 수 없는 필드명 힌트 제공 (PR #434)** — ⏭️ ALREADY: round 23의 dbpf typo suggestion이 부분적으로 동일 기능 제공.
+- **aSub 레코드의 상수 `INP*` 허용 여부 (Issue #284)** — ⏸️ DEFERRED.
+- **긴 문자열 `CALC$` 지원 이슈 (Issue #194)** — ⏸️ DEFERRED.
+- **`DBF_MENU` → `DBF_STRING` 변환 버그 픽스 대조 (Issue #183)** — ⏸️ DEFERRED.
+- **`zero-length` (길이가 0인) 배열 지원 엣지 케이스 (7.0.5)** — ⏸️ DEFERRED.
+- **`compress` 레코드 개선 (7.0.8)** — ⏸️ DEFERRED.
 
 ### Shell & 시스템 코어 세부
-- **`iocsh` 다중 후행 줄바꿈(trailing newlines) 트리밍 (PR #371)**: 출력 포맷팅 처리.
-- **`initHookRegister` 멱등성 보장 로직 (PR #594)**: 동일한 훅이 여러 번 등록되지 않게 방어하는 로직 누락.
-- **새로운 문자열 유틸리티 부재 (7.0.5/7.0.6)**: `epicsStrSimilarity()`, `epicsStrnGlobMatch()`와 같은 C 베이스 유틸리티 함수의 러스트 매핑 부재.
-- **빈 인스턴스의 `dbLoadTemplate` vs `msi` 파서 불일치 (Issue #666)**.
-- **서버 필터 프레임워크 셧다운 안전성 (Issue #643)**: CA 서버 필터의 티어다운(Teardown) 메모리 누수 방어.
+
+> 본 세션에서 직접 다루지 않음 → **⏸️ DEFERRED**.
+
+- **`iocsh` 다중 후행 줄바꿈(trailing newlines) 트리밍 (PR #371)** — ⏸️ DEFERRED.
+- **`initHookRegister` 멱등성 보장 로직 (PR #594)** — ⏸️ DEFERRED.
+- **새로운 문자열 유틸리티 부재 (7.0.5/7.0.6)** — ⏸️ DEFERRED: `epicsStrSimilarity()`, `epicsStrnGlobMatch()` 러스트 매핑 없음.
+- **빈 인스턴스의 `dbLoadTemplate` vs `msi` 파서 불일치 (Issue #666)** — ⏸️ DEFERRED.
+- **서버 필터 프레임워크 셧다운 안전성 (Issue #643)** — ⚠️ N/A: 서버 측 필터 프레임워크가 미구현이므로 그 셧다운 안전성 이슈도 자동 무관.
 
 ### Asyn 모듈 세부
-- **직렬 포트 `Auto serial break` 기능 (PR #188)**: 쓰기(Write) 이후 자동으로 Serial Break 신호를 보내는 옵션 미지원.
-- **`ASYN_TRACE_STATE` 마스크 비트 (PR #67)**.
-- **`asynMask`의 시프트 파라미터 (Issue #166)**: 마스크 레이아웃 배치 엣지 케이스.
-- **`setStringParam` NULL 포인터 안전성 (Issue #146)**: 러스트 `Option<&str>`로 매핑 시 발생할 수 있는 엣지 케이스 로직 처리.
-- **EOS(End-of-String) 설정자 블록 문제 (Issue #103)**: 디바이스가 없을 때 IOC Init/Exit에서 블로킹되는 현상.
-- **장치 드라이버로의 파라미터 변경 알림(Notification) 방향성 버그 대조 (Issue #46)**.
-- **`drvAsynIPPort` 읽기 타임아웃 시 연결 종료 옵션 (PR #6)**.
-- **`asynSetTrace*Mask`의 문자열 옵션 파싱 (PR #76)**.
+
+> 본 세션에서 직접 다루지 않음 → **⏸️ DEFERRED**.
+
+- **직렬 포트 `Auto serial break` 기능 (PR #188)** — ⏸️ DEFERRED.
+- **`ASYN_TRACE_STATE` 마스크 비트 (PR #67)** — ⏸️ DEFERRED.
+- **`asynMask`의 시프트 파라미터 (Issue #166)** — ⏸️ DEFERRED.
+- **`setStringParam` NULL 포인터 안전성 (Issue #146)** — ⏭️ ALREADY: 러스트의 `Option<&str>` 모델 + 타입 시스템으로 구조적 방어. NULL deref 자체 발생 불가.
+- **EOS(End-of-String) 설정자 블록 문제 (Issue #103)** — ⏸️ DEFERRED.
+- **장치 드라이버로의 파라미터 변경 알림(Notification) 방향성 버그 대조 (Issue #46)** — ⏸️ DEFERRED.
+- **`drvAsynIPPort` 읽기 타임아웃 시 연결 종료 옵션 (PR #6)** — ⏸️ DEFERRED.
+- **`asynSetTrace*Mask`의 문자열 옵션 파싱 (PR #76)** — ⏸️ DEFERRED.
 
 ---
 
@@ -112,6 +156,8 @@ C++ `epics-base`에는 존재하지만 러스트 생태계의 특성상 **의도
 **범위**: `epics-base` 저장소의 3.15 이후 커밋 총 1,370개를 카테고리별로 전수조사.  
 KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해결된 것과 아직 직접 반영이 필요한 것을 분리합니다.
 
+> **본 세션 상태**: Section 7~10의 개별 항목은 별도 PR 단위로 분리되어 다뤄지므로, 본 세션에서는 일괄 **⏸️ DEFERRED** (이미 위 1~4 섹션에서 본 세션이 다룬 항목은 거기서 ✅/⏭️로 표시되어 있음). 아래에는 본 세션과 직접 관련된 항목만 status를 명시.
+
 ---
 
 ### 7-A. 와이어 프로토콜 / DBR 인코딩 (Wire-Protocol, 32건 → 점검 필요)
@@ -121,14 +167,14 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **빈 배열(length=0) `caput` 시 DBR 오프셋 오계산** (`8cc20393`, 2020): DBR 헤더에서 첫 번째 원소의 크기를 잘못 계산. `epics-rs`의 `dbr::encode_array` 엣지 케이스 확인.
 - **빈 배열 `caput` 시 스칼라에 `INVALID_ALARM` 설정** (`12cfd418`, 2020): 빈 배열을 스칼라 필드에 쓰면 알람 상태를 올바르게 설정해야 함.
 - **`dbGet`으로 빈 배열을 스칼라로 읽을 때 크래시** (`39c8d561`, 2020): 배열 원소가 0개일 때 스칼라 `dbGet` 경로가 크래시하는 버그.
-- **`UTAG` uint64 타입 필드 전파** (`b94afaa0`, 2020): `UTAG`가 64비트 정수형으로 변경되고, 링크 및 `db_field_log` 페이로드 내에서 전파. `epics-rs`의 `UTAG` 지원 여부 확인.
+- **`UTAG` uint64 타입 필드 전파** (`b94afaa0`, 2020) — ⚠️ **N/A** (의도적): `epics-rs`의 `snapshot.user_tag: i32`는 PVA Normative `time_t.userTag = int` 스펙과 일치하는 wire-correct 표현. upstream의 internal uint64는 CA-level UTAG 노출 + db_field_log 전파(둘 다 미구현)에 의미. CA-level UTAG가 필요해질 때 i64로 승격 + PVA encode에서 truncate-with-warning.
 - **`amsg`/`utag`의 `dbGet()` 옵션 통로 분리** (`bd3ecf1c`, 2021): 알람 메시지(`AMSG`) 및 `UTAG`를 `dbGet()` 옵션 경로로 별도 분리. 두 필드의 `epics-rs` 직렬화 경로 교차 검증 필요.
 - **`db_field_log::mask` 필드** (`235f8ed2`, 2020): 모니터 페이로드의 이벤트 마스크가 실제 발행 마스크로 덮어쓰기 되어야 함.
-- **CA 서버 프로토콜 버전 클라이언트 노출** (`d7635413`, 2025, PR #711): 클라이언트가 초기 핸드쉐이크에서 서버의 CA 프로토콜 버전을 읽어 분기 → 미구현(섹션 1 항목과 동일).
-- **`SOCK_CLOEXEC` 사용 + `accept4()`** (`cf3173b6`, 2021): 소켓 생성 시 `SOCK_CLOEXEC` 적용 및 `accept4()` 사용. `epics-rs`의 TCP 수용 경로(`TcpListener`) 확인(Tokio에서 이미 처리 가능성 높음).
-- **`IPPORT_USERRESERVED` 포트 상수 정의** (`cd0e6a4f`, 2021): 포트 바인딩 시 예약 포트 충돌 방지.
-- **`16진수/8진수 문자열 dbPut/dbGet 지원`** (`88bfd6f3`, 2025, PR #678): → 섹션 2의 기존 항목과 동일.
-- **`bi` 레코드 소프트 채널에서 `MASK` 비트 사용** (`f2fe9d12`, 2023): `bi` 레코드의 소프트 채널 디바이스 지원에서 `MASK` 필드를 사용하여 값을 추출해야 함.
+- **CA 서버 프로토콜 버전 클라이언트 노출** (`d7635413`, 2025, PR #711) — ⏭️ **ALREADY**: 섹션 1 참조 (transport.rs server_minor_version 분기).
+- **`SOCK_CLOEXEC` 사용 + `accept4()`** (`cf3173b6`, 2021) — ⏭️ **ALREADY**: Tokio가 내부에서 처리, `epics-rs` 직접 점검 불필요.
+- **`IPPORT_USERRESERVED` 포트 상수 정의** (`cd0e6a4f`, 2021) — ⏸️ DEFERRED.
+- **`16진수/8진수 문자열 dbPut/dbGet 지원`** (`88bfd6f3`, 2025, PR #678) — ✅ **DONE** `17210b4` (섹션 2 항목과 동일).
+- **`bi` 레코드 소프트 채널에서 `MASK` 비트 사용** (`f2fe9d12`, 2023) — ⏸️ DEFERRED.
 
 ---
 
@@ -271,6 +317,8 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 8-D. iocsh / 런타임 / 환경
 
+> 본 세션 일괄: **⏸️ DEFERRED** (단, `dbServerStats`는 🔄 PARTIAL `ac92e3e` — 섹션 2 참조).
+
 - **iocsh 스크립트 include 시 echo 비활성화 옵션** (`0fd07d16`, 2016): `< script.cmd` 등으로 스크립트를 실행할 때 각 명령줄의 에코를 끄는 옵션.
 - **`dbStopServers()` 를 `iocShutdown()`에 포함** (`a9393242`, 2017): IOC 셧다운 시 CA 서버를 명시적으로 정지하는 로직. `epics-rs`의 `iocShutdown` 경로 확인.
 - **`readline`을 `epicsExit()`에서 정리** (`444b89f5`, 2015): `epicsExit` 시 readline 라이브러리를 정상적으로 해제하는 훅.
@@ -287,6 +335,8 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 8-E. 스캔 / 이벤트 / 콜백
 
+> 본 세션 일괄: **⏸️ DEFERRED**.
+
 - **`epicsCallback` 타입 도입** (`00a974ce`/`73fec881`, 2018/2019): `CALLBACK` 구조체의 타입-안전 래퍼 `epicsCallback` 추가.
 - **콜백 큐 상태(callback queue status) 노출** (`59ec8d89`, 2018): 콜백 큐의 현재 상태(사용량, 오버플로 횟수 등)를 조회하는 API. `epics-rs`의 콜백 큐 모니터링 노출 확인.
 - **`EPICS_NO_CALLBACK` 옵션** (`75a1b823`, 2019): 콜백 처리 시스템 전체를 런타임에 비활성화. → 8-A와 동일.
@@ -297,6 +347,8 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 ---
 
 ### 8-F. 필터 시스템
+
+> 본 세션 일괄: **⏸️ DEFERRED** — Section 1의 "서버 측 채널 필터" 항목 종속. 필터 프레임워크 자체가 deferred이므로 그 안의 모든 필터별 버그도 자동으로 deferred.
 
 - **`arr` 필터의 wrap이 `capacity` 기준으로 동작** (`840da801`, 2016): 배열 필터에서 wrapping 계산이 `length`가 아닌 `capacity` 기준으로 수행되어야 하는 버그 수정.
 - **`sync` / `unless` 모드 필터의 메모리 누수** (`8ff6ce48`, 2019): sync 필터의 특정 모드에서 field-log가 누수되는 버그.
@@ -312,6 +364,8 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 ---
 
 ### 9-A. `base-rs` — 수명주기 & 초기화 (Lifecycle)
+
+> 본 세션 일괄: **⏸️ DEFERRED**. 9-A는 high-priority 라이프사이클 버그 다수 포함 — 별도 PR로 한 항목씩 정밀 작업 권장. `iocInit 로컬 CA 링크 대기`, `dbDbLink 자기-링크 RPRO 무한 루프`, `errlog 이중 버퍼링`, `PINI 힙 UAF` 등은 실용 영향 큰 우선 후보.
 
 - **`waveform` 레코드 `PACT=TRUE` 유실** (`16c3202`, high): 비동기 완료 시 `PACT` 플래그가 소실되어 이중 처리(double-processing)가 발생. → `waveform_record.rs`
 - **`errlog` 이중 버퍼링 재작성** (`29fa062`, high): 출력 중 락(Lock)을 보유하는 구조를 이중 버퍼링으로 교체. → `errlog.rs`
@@ -349,6 +403,8 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 9-B. `base-rs` — 경계 및 타입 (Bounds / Type-system)
 
+> 본 세션 일괄: **⏸️ DEFERRED**.
+
 - **`histogramRecord` wdog 콜백이 `VAL` 대신 `bptr`로 이벤트 발송** (`4a0f488`, medium): 히스토그램 레코드의 잘못된 포인터로 모니터 이벤트 발송.
 - **영(zero)원소 배열 읽기에 대한 고유 오류 코드** (`5d808b7`, medium): `S_db_emptyArray` 등 배열 길이 0 상황에 대한 전용 오류 코드 필요.
 - **`.DTYP` 없는 레코드 타입에서 `DTYP` 조회 시 크래시 대신 빈 문자열** (`6e7a715`, medium): 디바이스 지원이 없는 레코드에서 `.DTYP` 조회 시 안전하게 처리.
@@ -366,6 +422,8 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 9-C. `base-rs` — 흐름 제어 (Flow-Control)
 
+> 본 세션 일괄: **⏸️ DEFERRED**.
+
 - **`logClient`: 연결 끊김 시 미전송 버퍼 버리지 않기** (`0a3427c`, medium): → 섹션 7-C의 기존 항목 보강 (파일: `errlog.rs`).
 - **필터가 DB 링크 읽기 경로(`dbDbGetValue`)에 적용되지 않음** (`17a8dbc`, medium): DB 링크로 값을 읽을 때 서버 필터가 바이패스되는 구조적 누락. → `db_db_link.rs`
 - **DB 링크가 `dbChannel` 대신 `DBADDR`를 저장하여 필터 메타데이터 손실** (`b1f4459`, medium): → 섹션 7-C의 `dbChannel` 교체 항목 보강.
@@ -375,19 +433,21 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 9-D. `ca-rs` — 네트워크 라우팅 (Network-Routing)
 
-- **`rsrv`: 클라이언트 공급 호스트명 대신 검증된 IP 주소 사용** (`530eba1`, high): 클라이언트가 자신의 호스트명을 조작할 수 있는 보안 취약점. → `server/client.rs`
-- **`RSRV_SERVER_PORT` 9999 초과 포트 번호에서 잘림** (`772c10d`, high): 5자리 포트 번호가 4자리 버퍼에서 잘리는 버그. → `server/rsrv.rs`
-- **SO_REUSEPORT + SO_REUSEADDR 함께 설정 (Linux)** (`5064931`, medium): Linux에서 데이터그램 팬아웃 소켓은 두 옵션을 모두 설정해야 함. → `server/udp.rs`
-- **BSD에서 `SO_REUSEADDR`만으로는 부족 — `SO_REUSEPORT` 필요** (`65ef6e9`, medium): BSD/macOS에서 멀티캐스트 바인딩 시 `SO_REUSEPORT` 없으면 실패. → 검토 필요.
-- **RSRV 반복 비콘 UDP 전송 오류 메시지 억제** (`c23012d`, medium): 동일한 UDP 전송 오류가 반복적으로 로깅되는 것을 Rate-limiting.
-- **CA 클라이언트 UDP 전송 오류 억제(목적지별)** (`cae597d`, medium): 목적지별로 반복 오류 메시지를 억제하는 로직.
-- **asLib: DNS 조회 실패 시 소프트 폴백** (`932e9f3`, partial): DNS 조회 실패 시 abort 대신 `"unresolved:<host>"` 형태로 저장하고 계속 진행.
-- **네트워크 인터페이스 열거에서 `SIOCGIFCONF` → `getifaddrs` 교체** (`410921b`, partial): 더 안정적이고 이식 가능한 NIC 열거 방식으로 전환.
-- **`caRepeater` 부모 프로세스의 `stdin`/`stdout`/`stderr` 상속 문제** (`6dba2ec`, partial): `caget`이 Repeater를 스폰할 때 표준 스트림을 상속하여 문제가 되는 상황.
+- **`rsrv`: 클라이언트 공급 호스트명 대신 검증된 IP 주소 사용** (`530eba1`, high) — ⏭️ **ALREADY**: `EPICS_CAS_USE_HOST_NAMES=NO` 기본값으로 peer IP를 권위로 사용; `=YES`일 때 `host_resolves_to_peer`로 forward-DNS 검증.
+- **`RSRV_SERVER_PORT` 9999 초과 포트 번호에서 잘림** (`772c10d`, high) — ⚠️ **N/A**: Rust의 `u16` 사용으로 0..=65535 전 범위 안전.
+- **SO_REUSEPORT + SO_REUSEADDR 함께 설정 (Linux)** (`5064931`, medium) — ⏭️ **ALREADY**: `AsyncUdpV4::bind_one_at`이 양 옵션 설정 (`set_reuse_address` + `set_reuse_port`).
+- **BSD에서 `SO_REUSEADDR`만으로는 부족 — `SO_REUSEPORT` 필요** (`65ef6e9`, medium) — ⏭️ **ALREADY**: 위와 동일.
+- **RSRV 반복 비콘 UDP 전송 오류 메시지 억제** (`c23012d`, medium) — ⏭️ **ALREADY**: `server/beacon.rs::run_beacon_emitter`에 per-destination first/change/recovery dedup.
+- **CA 클라이언트 UDP 전송 오류 억제(목적지별)** (`cae597d`, medium) — ⏭️ **ALREADY**: `client/search.rs::send_with_fanout`에 동일 패턴.
+- **asLib: DNS 조회 실패 시 소프트 폴백** (`932e9f3`, partial) — ✅ **DONE** `6862ef0`.
+- **네트워크 인터페이스 열거에서 `SIOCGIFCONF` → `getifaddrs` 교체** (`410921b`, partial) — ⏭️ **ALREADY**: `get_if_addrs` crate 사용 (cross-platform).
+- **`caRepeater` 부모 프로세스의 `stdin`/`stdout`/`stderr` 상속 문제** (`6dba2ec`, partial) — ⏸️ DEFERRED.
 
 ---
 
 ### 9-E. `base-rs` — 와이어 프로토콜 (Wire-Protocol)
+
+> 본 세션 일괄: **⏸️ DEFERRED**.
 
 - **`dbPut` long-string(nRequest>1) 경로에서 `get_array_info` 스킵** (`82ec539`, medium): 긴 문자열 Put 시 배열 정보를 가져오지 않아 쓰기 경로가 손상. → `db_access.rs`
 - **`db_field_log` DBE 마스크 누락으로 필터가 `DBE_PROPERTY` 구분 불가** (`235f8ed`, medium): → 섹션 7-A의 기존 항목 보강.
@@ -397,6 +457,8 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 ---
 
 ### 9-F. `base-rs` / `ca-rs` — 기타 (Other)
+
+> 본 세션 일괄: **⏸️ DEFERRED**.
 
 - **`recGblRecordError`: 음수 상태 코드에 대한 오류 심볼 조회 건너뜀** (`4c20518`, medium): 음수 오류 코드를 받았을 때 심볼 이름 조회를 건너뛰어 오류 메시지가 불명확.
 - **`iocsh` 인자 분리기: EOF 센티널 (-1)이 유효 문자로 처리** (`3dbc9ea`, partial): `iocsh` 파서에서 -1이 EOF가 아닌 정수로 처리되는 버그. → `iocsh/mod.rs`
@@ -411,11 +473,11 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 `documentation/new-notes/`에서 발굴한 현재 개발 중이거나 병합 예정인 기능들:
 
-- **PR #359: `aai`/`aao`/`subArray`/`waveform`의 `NORD` 필드 타임스탬프 버그 수정**: non-VAL 필드(`NORD`)를 모니터링할 때 타임스탬프가 잘못 설정되는 버그. → `aai`, `aao`, `subArray`, `waveform` 레코드 구현 시 반드시 `AAI_POSTS_NORD` 등의 매크로 정의와 함께 반영 필요.
-- **PR #768: `iocInit`에서 로컬 CA 링크 연결 대기**: `iocInit()` 중 로컬 CA 링크가 완전히 연결될 때까지 대기하여, `initHookAfterIocRunning` 및 `PINI=RUNNING` 실행 전에 모든 CA 링크가 준비됨을 보장. (→ 9-A의 `717d69e` 항목과 연동)
-- **PR #788: `epicsThreadGetCPUs` 및 `callbackParallelThreads` CPU 어피니티 반영**: `taskset` 등으로 CPU 어피니티가 제한된 환경에서 과다 보고 방지. `callbackParallelThreads`에 백분율(%) 표기 지원. (→ 섹션 3/7-F 항목 보강)
-- **PR #812: `dbCreateRecord` iocsh 명령어**: iocsh에서 레코드를 직접 생성하는 명령어 추가. `iocInit` 이전에만 호출 가능. (→ 섹션 2 항목 보강)
-- **PR #817: `mbbi` 레코드의 `AFTC`/`LALM` 버그 수정**: `mbbi` 레코드에서 알람 필터 타임 상수(`AFTC`)와 마지막 알람 값(`LALM`)이 정상 동작하지 않는 버그.
+- **PR #359: `aai`/`aao`/`subArray`/`waveform`의 `NORD` 필드 타임스탬프 버그 수정** — 🔄 **PARTIAL** `a02c310`: `aai`/`aao`/`subArray` 레코드 타입 자체는 신규 구현. NORD 타임스탬프 갱신 순서 fix는 별도 작업.
+- **PR #768: `iocInit`에서 로컬 CA 링크 연결 대기** — ⏸️ DEFERRED: 9-A high-priority 항목 — 우선 후보.
+- **PR #788: `epicsThreadGetCPUs` 및 `callbackParallelThreads` CPU 어피니티 반영** — ⏸️ DEFERRED.
+- **PR #812: `dbCreateRecord` iocsh 명령어** — ⏸️ DEFERRED.
+- **PR #817: `mbbi` 레코드의 `AFTC`/`LALM` 버그 수정** — ⏸️ DEFERRED.
 
 ---
 
@@ -428,18 +490,20 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 10-A. `pva-rs` — 클라이언트 & 네트워크 연결 (Client & Connection)
 
-- **TCP Search 기능 추가** (`8363c7fe9a5f`, high): UDP 브로드캐스트 외에 TCP를 통한 Name Resolution(Search) 지원 필요.
-- **재연결 루프 지연(Slow down reconnect loop)** (`3b8540f52002`, high): 클라이언트가 동일 서버에 너무 빠르게 재연결 시도를 반복하지 않도록 Hold-off 타이머 추가 (`92f728f5c9c4` 와 연계).
-- **종료(Shutdown) 중 Name Server 재연결 금지** (`4d12da87205e`, high): Context 종료 절차 중 끊어진 서버를 다시 검색/연결하려는 시도 차단.
-- **`Channel` Search Bypass 최적화** (`5d3a21f03010`, high): 이미 알고 있는 주소가 있을 경우 불필요한 UDP 검색을 우회하고 직접 TCP 연결 시도.
-- **`Channel` 일관된 연결 해제(Disconnect) 처리** (`f7b3821e10b4`, high): 여러 경로의 연결 끊김 이벤트가 동일한 클린업 로직을 타도록 통일.
-- **`Context::close()` 명시적 지원** (`0de17036f4a6`, medium): Context 자원의 명시적 소멸 및 스레드 조인 지원.
-- **Search 패킷 단편화(Fragmentation) 방지** (`84ef355a4a1a`, medium): 대규모 검색 시 패킷이 MTU를 초과해 조각나지 않도록 분할 전송.
-- **환경 변수를 통한 설정 가능 타임아웃** (`da004bc54bb3`, medium): `$EPICS_PVA_CONN_TMO`를 통한 TCP 연결/응답 타임아웃 구성 (기본 TCP 타임아웃 40초 증가 `6861f03c6075` 연계).
-- **Search 응답 처리 한계 상향** (`b38b33db034e`, medium): 트래픽 폭주 시 응답을 누락하지 않도록 처리 큐/한계치 상승.
-- **Search 대상 목적지 없음 오류 로깅** (`8db40be29c81`, medium): 클라이언트가 쿼리할 Name Server/Broadcast 목적지가 없을 때 명시적 오류 발생.
+- **TCP Search 기능 추가** (`8363c7fe9a5f`, high) — ⏭️ **ALREADY**: `EPICS_PVA_NAME_SERVERS` 환경변수로 TCP name server 지원 (`client_native/channel.rs::new_with_name_servers`).
+- **재연결 루프 지연(Slow down reconnect loop)** (`3b8540f52002`, high) — ⏭️ **ALREADY**: `channel.rs::holdoff_until` 타이머로 connect-fail holdoff 구현.
+- **종료(Shutdown) 중 Name Server 재연결 금지** (`4d12da87205e`, high) — ⏸️ DEFERRED.
+- **`Channel` Search Bypass 최적화** (`5d3a21f03010`, high) — ⏸️ DEFERRED.
+- **`Channel` 일관된 연결 해제(Disconnect) 처리** (`f7b3821e10b4`, high) — ⏸️ DEFERRED.
+- **`Context::close()` 명시적 지원** (`0de17036f4a6`, medium) — ⏭️ **ALREADY**: `PvaClient::close()` (`context.rs:610`).
+- **Search 패킷 단편화(Fragmentation) 방지** (`84ef355a4a1a`, medium) — ⚠️ **N/A**: 현재 `build_search`가 count=1 단일 PV 패킷이라 MTU 미만 — batching 미구현이므로 fragmentation 발생 자체 불가.
+- **환경 변수를 통한 설정 가능 타임아웃** (`da004bc54bb3`, medium) — ⏸️ DEFERRED.
+- **Search 응답 처리 한계 상향** (`b38b33db034e`, medium) — ⏸️ DEFERRED.
+- **Search 대상 목적지 없음 오류 로깅** (`8db40be29c81`, medium) — ⏭️ **ALREADY**: `search_engine.rs:202`에서 ADDR_LIST 비어있고 AUTO_ADDR_LIST=NO일 때 명시적 warning.
 
 ### 10-B. `pva-rs` — 서버 동작 & 세션 제어 (Server & Session)
+
+> 본 세션 일괄: **⏸️ DEFERRED**.
 
 - **공유 PV(SharedPV) 에러 경로 데드락 방지** (`b17f8207676d`, high): 에러 발생 시 내부 락(Lock) 해제 순서가 꼬여 데드락이 발생하는 문제 해결.
 - **잘못된 SID(Session ID) 처리** (`280919b3ec08`, medium): 존재하지 않거나 종료된 채널 ID로 들어오는 요청을 무시/로깅.
@@ -451,7 +515,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 10-C. `pva-rs` — 와이어 프로토콜 & 디코딩 (Protocol & Decoding)
 
-- **`SetEndian` 제어 메시지 올바른 처리** (`cce797263d1d`, high): `pva_ctrl_msg::SetEndian`에 따라 후속 페이로드 디코딩 엔디언 동적 변경.
+- **`SetEndian` 제어 메시지 올바른 처리** (`cce797263d1d`, high) — ⏭️ **ALREADY**: `proto/command.rs::ControlCommand::SetByteOrder`가 정의되어 있고 `server_native/tcp.rs:574`에서 handshake에 emit + 클라이언트 측에서도 수신 처리.
 - **배열(Array) 디코드 버그 수정** (`cf91bc3033e2`, high): 특정 조건에서 가변 길이 배열 디코딩 크래시/잘림 해결.
 - **디코드 오류 시 원격 `file:line` 정보 추출** (`e9ce80880d92`, high): 오류 응답에 포함된 상대방 디버그 위치 파싱.
 - **`null` 문자열 디코딩** (`0356eee74037`, medium): 스칼라 문자열 타입에 `null`이 전달될 때의 기본값 처리.
@@ -460,11 +524,12 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 10-D. `pva-rs` — UDP / 비콘 (Beacon) & 기타
 
-- **UDP RX 버퍼 오버플로 감지** (`a064677e3625`, high): UDP 수신 버퍼 꽉 참을 감지하고 OS 수준의 Drop 통계를 로깅.
-- **클라이언트 비콘 수신 시작** (`acfba6469ed3`, high): 서버 모니터링을 위해 백그라운드에서 주기적 비콘(Beacon) 수신 및 서버 리스트 갱신.
-- **잘못된 스레드에서의 비콘 발송 경고** (`882a7720fb92`, medium) 및 **서버 비콘 TX 최적화** (`cc5071cd22c4`, medium).
-- **잘린 비콘(Truncated Beacon) 오류 무시** (`772cc5297cf8`, medium) 및 **반복적인 비콘 TX 오류 표시 제어** (`adcac746efff`, `91fed88cdd7f`).
-- **비콘 정리 타이머 단순화** (`b33ea5df3113`, medium): 유효하지 않은 서버 목록을 정리하는 타임아웃 최적화.
+- **UDP RX 버퍼 오버플로 감지** (`a064677e3625`, high) — ⏸️ DEFERRED.
+- **클라이언트 비콘 수신 시작** (`acfba6469ed3`, high) — ⏭️ **ALREADY**: `client_native/search_engine.rs:598` `beacon_recv` future로 백그라운드 수신.
+- **잘못된 스레드에서의 비콘 발송 경고** (`882a7720fb92`, medium) — ⚠️ **N/A**: Rust의 `Send`/`Sync` trait이 컴파일 시 보장.
+- **서버 비콘 TX 최적화** (`cc5071cd22c4`, medium) — ⏸️ DEFERRED.
+- **잘린 비콘(Truncated Beacon) 오류 무시** (`772cc5297cf8`, medium) / **반복적인 비콘 TX 오류 표시 제어** (`adcac746efff`, `91fed88cdd7f`) — ⏸️ DEFERRED.
+- **비콘 정리 타이머 단순화** (`b33ea5df3113`, medium) — ⏸️ DEFERRED.
 
 ---
 

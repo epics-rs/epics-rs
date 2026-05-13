@@ -3,10 +3,15 @@
 //! Usage:
 //!
 //! ```text
-//! pva-gateway-rs [--bind 0.0.0.0] [--tcp-port 5075] [--udp-port 5076]
+//! pva-gateway-rs [--bind 0.0.0.0|::|::1] [--tcp-port 5075] [--udp-port 5076]
 //!                [--connect-timeout-secs 5] [--cleanup-interval-secs 30]
 //!                [--prefetch PV1 PV2 ...]
 //! ```
+//!
+//! `--bind` accepts both IPv4 (`0.0.0.0`, `127.0.0.1`, ...) and IPv6
+//! (`::`, `::1`, ...) addresses (PR #205 IPv6 Stage 1). On Linux a
+//! `[::]` bind dual-stacks automatically; BSD/macOS need a parallel
+//! v4 instance for dual-stack.
 //!
 //! Mirrors `pva2pva/p2pApp/gwmain.cpp` at the runtime level: a single
 //! process that holds an upstream `PvaClient` and a downstream

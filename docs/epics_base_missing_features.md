@@ -208,7 +208,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`FIFO 스케줄링`을 환경 변수로 비활성화** (`862272d6`, 2025): `EPICS_NO_RT_SCHED` 같은 환경 변수로 RT 스케줄링을 비활성화하는 기능. `epics-rs`의 RT 스레드 옵트아웃 로직 확인.
 - **`memlock()` 옵트아웃** (`0916cf98`, 2025): FIFO 스케줄링이 비활성화된 경우 `mlockall()` 호출도 건너뜁니다.
 - **`aSub` 레코드의 상수 `INP*` 링크 지원** (`d47fa4ca`, 2022, Issue #284) — ⏭️ **ALREADY**: 섹션 5 보강 참조. 핵심: `read_link_with_alarm`의 `ParsedLink::Constant(_)` arm이 constant value를 직접 반환하므로 dbGetLink 등가 호출이 발생하지 않음.
-- **`dbLoadRecords()` 오류 메시지 중복 출력 방지** (`9af7fb3`, 2025): 로딩 실패 시 에러 메시지가 두 번 출력되는 버그.
+- **`dbLoadRecords()` 오류 메시지 중복 출력 방지** (`9af7fb3`, 2025) — ⏭️ **ALREADY**: 원버그는 C `softMain.cpp`가 `dbLoadRecords` 내부 에러 메시지 + 자체 wrapper 메시지를 둘 다 출력. Rust `cmd_db_load_records` (`iocsh/commands.rs`)는 단일 `ctx.println(&e)` 후 `Err(e)` 전파만 수행하며 `softioc-rs`도 자체 wrapper 메시지를 추가하지 않음. 중복 출력 경로 자체가 부재.
 - **`dbReadDatabaseFP()` 파일 닫기 보장** (`a6779df2`, 2022) — ⚠️ **N/A (eliminated)**: Rust `std::fs::File`의 `Drop`이 자동으로 `close()` 보장. `BufReader<File>` 등 모든 파일 래퍼 동일. `rust_verdict: eliminated`.
 - **`logClient` 연결 끊김 시 미전송 메시지 재전송 시도** (`0a3427c8`, 2019) — ⚠️ **N/A (design diff)**: epics-rs는 C의 `logClient.c` TCP forwarder를 사용하지 않고 `tracing` crate로 구조화된 로깅을 처리. 로그 서버 reconnect 시 retransmit이 필요한 송신 버퍼 자체가 부재. EPICS log server protocol 지원이 필요해질 때 buffer-preserve 정신을 적용.
 - **알람 메시지 필드(`AMSG`) 및 타임 태그 필드(`UTAG`) 추가** (`892a361d`/`b94afaa0`, 2020): `recGbl`에 알람 문자열 필드(`AMSG`)와 64비트 사용자 태그(`UTAG`)가 추가됨. `epics-rs` 레코드 공통 필드 동기화 필요.

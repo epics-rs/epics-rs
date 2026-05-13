@@ -5,6 +5,7 @@ use tokio::net::UdpSocket;
 
 use crate::protocol::*;
 use epics_base_rs::error::CaResult;
+use epics_base_rs::net::{enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket};
 use epics_base_rs::server::database::PvDatabase;
 
 /// Run UDP search responders bound to one or more local interfaces.
@@ -93,6 +94,19 @@ async fn run_single_responder(
     // EPICS_CA_MCAST_TTL (epics-base 3.16, f2a1834d). Only consulted by
     // the OS for multicast destinations; safe to apply unconditionally.
     let _ = socket.set_multicast_ttl_v4(epics_base_rs::runtime::net::ca_mcast_ttl());
+    // pvxs `udp_collector.cpp::UDPCollector::UDPCollector` parity
+    // (commit a064677e3625): opt the kernel into SO_RXQ_OVFL so each
+    // recvmsg surfaces the per-socket dropped-datagram counter as a
+    // cmsg. No-op on non-Linux. Diagnostic-only; failure to enable
+    // is logged at trace and the responder continues normally.
+    if let Err(e) = enable_so_rxq_ovfl_for_socket(&socket) {
+        tracing::trace!(
+            target: "epics_ca_rs::server::udp",
+            %bind_ip,
+            error = %e,
+            "SO_RXQ_OVFL enable failed (non-fatal)"
+        );
+    }
 
     // 64 KB receive buffer — IPv4 maximum datagram size. The previous
     // 4 KB cap silently truncated bursts of multi-PV searches in
@@ -110,8 +124,22 @@ async fn run_single_responder(
     // larger response.
     let udp_rl = UdpRateLimiter::from_env();
 
+    // Tracks the previously-observed SO_RXQ_OVFL counter for this
+    // socket. Logged on transitions only — pvxs `udp_collector.cpp:55-67`.
+    let mut prev_drops: u32 = 0;
+
     loop {
-        let (len, src) = socket.recv_from(&mut buf).await?;
+        let (len, src, drops) = recv_from_with_drop_count_socket(&socket, &mut buf).await?;
+        if drops != 0 && drops != prev_drops {
+            tracing::debug!(
+                target: "epics_ca_rs::server::udp",
+                %bind_ip,
+                prev = prev_drops,
+                drops,
+                "CA server UDP search responder buffer overflow"
+            );
+        }
+        prev_drops = drops;
         if len < CaHeader::SIZE {
             continue;
         }

@@ -318,6 +318,19 @@ pub(crate) async fn run_search_engine(
     // setting it unconditionally is safe and lets sites that
     // multicast SEARCH across routed segments raise the TTL via env.
     let _ = socket.set_multicast_ttl_v4(epics_base_rs::runtime::net::ca_mcast_ttl());
+    // pvxs `client.cpp` parity (commit a064677e3625): opt every per-NIC
+    // SEARCH socket into SO_RXQ_OVFL so a sustained reply backlog
+    // (slow main-loop, undersized SO_RCVBUF, mass-disconnect storm)
+    // surfaces as a debug log instead of silent reply loss. No-op on
+    // non-Linux. Failure is logged at trace and ignored — the
+    // counter is diagnostic-only.
+    if let Err(e) = socket.enable_so_rxq_ovfl() {
+        tracing::trace!(
+            target: "epics_ca_rs::client::search",
+            error = %e,
+            "SO_RXQ_OVFL enable on per-NIC SEARCH bundle failed (non-fatal)"
+        );
+    }
 
     // Spawn a connection task per EPICS_CA_NAME_SERVERS entry.
     // Each task auto-reconnects with exponential backoff and forwards
@@ -350,6 +363,10 @@ pub(crate) async fn run_search_engine(
 
     let mut state = SearchEngineState::with_attempts(attempts);
     let mut recv_buf = [0u8; 65536];
+    // pvxs parity: track per-NIC SO_RXQ_OVFL counters, log on
+    // transitions only. Key on the receiving NIC's iface_ip
+    // (already exposed on the AsyncUdpV4 RecvMeta we read each tick).
+    let mut prev_drops_per_iface: HashMap<Ipv4Addr, u32> = HashMap::new();
 
     // pvxs `client.cpp::tickSearch`: a single steady tick advances the
     // bucket cursor. fast_tick is engaged after a beacon poke for one
@@ -398,9 +415,22 @@ pub(crate) async fn run_search_engine(
                 }
             }
 
-            result = socket.recv_from(&mut recv_buf) => {
-                let Ok((len, src)) = result else { continue };
-                handle_udp_response(&mut state, &recv_buf[..len], src, &response_tx);
+            result = socket.recv_with_meta_with_drops(&mut recv_buf) => {
+                let Ok((meta, drops)) = result else { continue };
+                // Surface per-NIC kernel drop transitions — pvxs
+                // `udp_collector.cpp:55-67` logs at debug on
+                // `prev != current && current != 0`.
+                let prev = prev_drops_per_iface.insert(meta.iface_ip, drops).unwrap_or(0);
+                if drops != 0 && drops != prev {
+                    tracing::debug!(
+                        target: "epics_ca_rs::client::search",
+                        iface_ip = %meta.iface_ip,
+                        prev,
+                        drops,
+                        "CA client SEARCH per-NIC socket buffer overflow"
+                    );
+                }
+                handle_udp_response(&mut state, &recv_buf[..meta.n], meta.src, &response_tx);
             }
 
             tcp_dgram = tcp_response_rx.recv() => {

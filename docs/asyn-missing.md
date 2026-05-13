@@ -30,7 +30,7 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 | Prologix GPIB 드라이버 (full) | PR #129 | `drivers/prologix.rs` (this session — host:port + GPIB addr parser, embedded `DrvAsynIPPort`, `connect()`/`read_octet`/`write_octet` 위임, `++addr` 헤더 자동 inject + 변경시만 재전송, 2× loopback TCP 회귀 테스트) |
 | VXI-11 드라이버 스캐폴드 | 기존 | `drivers/vxi11.rs` (this session — host[:device_name] + lock/io timeout parser, `vxi11-hw` feature-gated, ONC RPC stack 미장착) |
 | HiSLIP 드라이버 스캐폴드 | Issue #130 | `drivers/hislip.rs` (this session — host[:port] + subaddress + maxMessageSize parser, `hislip-hw` feature-gated, IVI-6.1 frame parser 미장착) |
-| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | 기존 | `drivers/ip_server_port.rs::IpServerProtocol::Udp` (this session — parser + protocol enum; runtime listener returns "not yet wired" pending UDP-server adapter) |
+| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | 기존 | `drivers/ip_server_port.rs` full UDP runtime (this session — `bind_udp_with_options`, `udp_recv_loop` worker thread, peer→slot HashMap 매핑, per-slot `UdpInbox` (drop-newest + drops counter), slot-assignment Condvar 로 read-on-empty 대기, write 가 `send_to(peer)`, disconnect 가 worker join). 3× loopback 회귀 테스트 |
 | `asyn:FIFO` info-tag 링 버퍼 | 2015년경 | `asyn_record/fifo.rs` (this session — `RingBuffer<T>` drop-oldest + overrun counter + `parse_fifo_tag`) |
 | `getLimits` 인터페이스 | Issue #218 | `interfaces/limits.rs::AsynLimits` (this session — `IntLimits`/`FloatLimits` + read trait) |
 | 양방향 파라미터 notification | Issue #46 | `interrupt.rs::Interrupt` + `call_param_callbacks` (verified ALREADY) |
@@ -61,7 +61,6 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 |---|---|---|---|
 | **PVI** (PVInterface) tree-structured params | PR #117 | 🔄 PARTIAL | `param_tree.rs::ParamTree` (this session — 계층 경로 → flat-name 리졸버 + 결정적 leaf 순회). port driver / drvInfo 결정 경로와 wiring (각 port 가 `ParamTree` + `ParamList` 둘 다 보유, drvInfo 가 양쪽 동시 검색) 은 follow-up |
 | `asynParamSet` 그룹화 클래스 | PR #117 | 🔄 PARTIAL | `param_tree.rs::ParamGroupBuilder` (this session — prefix 기반 group builder). full programmatic param set lifecycle (add/remove/walk + interrupt fan-out per-group) 은 follow-up |
-| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | 기존 | 🔄 PARTIAL | `drivers/ip_server_port.rs` 가 `IpServerProtocol::Udp` 파싱/저장. 런타임 `open_listener` 는 명시적 "not yet wired" 반환 — UDP-server adapter (peer-per-datagram slot 매핑) 가 다음 단계 |
 
 ### 4. 외부-dep 필요 항목 묶음
 
@@ -76,8 +75,7 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 
 ## 다음 우선순위 (구현 가능 순)
 
-1. **UDP server 런타임 어댑터** (peer-per-datagram slot 매핑) — small/medium
-2. **getLimits ↔ record DRVH/DRVL 자동 동기화** (adapter wiring) — small
+1. **getLimits ↔ record DRVH/DRVL 자동 동기화** (adapter wiring) — small
 3. **asyn:FIFO record adapter wiring** (push/pop 호출 사이트) — medium
 4. **USBTMC `usbtmc-hw` rusb/nusb 바인딩** — medium
 6. **VXI-11 `vxi11-hw` ONC RPC 스택 wiring** — large

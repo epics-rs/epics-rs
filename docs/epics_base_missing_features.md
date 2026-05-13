@@ -106,7 +106,7 @@
 - **`dbLoadRecords` 매크로 기본값 의미론 불일치 (PR #463)** — ⏭️ **ALREADY**: `db_loader::substitute_macros` (`crates/epics-base-rs/src/server/db_loader/mod.rs:268-291`)가 `$(KEY=default)` 분해 로직을 macros HashMap 비어있을 때도 동일하게 적용하므로 `dbLoadRecords("file.db","")`와 `dbLoadRecords("file.db")` (macros 인자 생략) 양쪽 다 default가 expansion됨. recursive default expansion + 따옴표 stripping까지 포함.
 - **DB 파서의 알 수 없는 필드명 힌트 제공 (PR #434)** — ⏭️ ALREADY: round 23의 dbpf typo suggestion이 부분적으로 동일 기능 제공.
 - **aSub 레코드의 상수 `INP*` 허용 여부 (Issue #284 / d47fa4c)** — ⏭️ **ALREADY**: `processing.rs` multi-input fetch (`PvDatabase::read_link_with_alarm`)이 `ParsedLink::Constant`에 대해 `link.constant_value()`를 직접 반환 (`links.rs:91`), `_ => (None, None)`로 polymorphic하게 처리. C가 `dbGetLink` 단일 진입점에서 constant에 에러 반환하던 패턴이 enum 분기로 자연스럽게 해소 — aSub `INPA..INPL`이 constant일 때도 fetch_values 등가 단계가 에러 없이 진행.
-- **긴 문자열 `CALC$` 지원 이슈 (Issue #194)** — ⏸️ DEFERRED.
+- **긴 문자열 `CALC$` 지원 이슈 (Issue #194)** — ⚠️ **N/A (out of scope)**: 원이슈는 C `caput -S test_calc.CALC$`(field name + `$` long-string suffix)가 일부 바이트만 작성되는 truncation 버그. `parse_pv_name` (`crates/epics-base-rs/src/server/database/mod.rs:22`)이 `$` 접미사를 별도 처리하지 않으며 `FIELD$` long-string access 자체가 미구현. truncation할 access 경로가 부재 — long-string `$` 접근이 추가될 때 이 항목 재검토.
 - **`DBF_MENU` → `DBF_STRING` 변환 버그 픽스 대조 (Issue #183)** — ⏭️ **ALREADY**: `BiRecord::put_field("VAL", String)` / `MbbiRecord::put_field("VAL", String)` / `BoRecord::put_field("VAL", String)` 모두 ZNAM/ONAM/STATE_STR 문자열을 enum 인덱스로 매핑하는 분기 보유 (`crates/epics-base-rs/src/server/records/{bi,mbbi,bo}.rs`에 "epics-base PR/issue #183" 주석으로 명시).
 - **`zero-length` (길이가 0인) 배열 지원 엣지 케이스 (7.0.5)** — ⏸️ DEFERRED.
 - **`compress` 레코드 개선 (7.0.8)** — ⏸️ DEFERRED.

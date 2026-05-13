@@ -117,8 +117,8 @@ async fn test_soft_inp_read_failure_sets_link_alarm() {
 /// dropped them even though the link parser recorded the MS modifier.
 #[tokio::test]
 async fn test_single_inp_ms_class_propagates_source_alarm() {
-    use epics_base_rs::server::record::AlarmSeverity;
     use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
 
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(7.0)))

@@ -51,6 +51,16 @@ pub struct WaveformRecord {
     pub hopr: f64,
     pub lopr: f64,
     pub prec: i16,
+    /// subArray-only: starting offset into the source array. Out-of-
+    /// range values clamp to the source length; NORD=0 in that case.
+    /// Ignored when `kind != SubArray`.
+    pub indx: i32,
+    /// subArray-only: declared maximum length of the source array.
+    /// Used as an additional upper bound when computing the slice end:
+    /// `end = min(indx + nelm, min(source_len, malm))`. Defaults to 0
+    /// for non-subArray kinds — those records ignore the field
+    /// altogether.
+    pub malm: i32,
 }
 
 /// Type aliases for documentation / pattern-match clarity. All point
@@ -79,6 +89,8 @@ impl Default for WaveformRecord {
             hopr: 0.0,
             lopr: 0.0,
             prec: 0,
+            indx: 0,
+            malm: 0,
         }
     }
 }
@@ -274,6 +286,11 @@ impl Record for WaveformRecord {
             "NELM" => Some(EpicsValue::Long(self.nelm)),
             "NORD" => Some(EpicsValue::Long(self.nord)),
             "FTVL" => Some(EpicsValue::Short(self.ftvl)),
+            // subArray-specific INDX/MALM fields. Other array record
+            // kinds expose them as zero (matches C dbpr output for a
+            // record type that doesn't declare the field).
+            "INDX" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.indx)),
+            "MALM" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.malm)),
             _ => None,
         }
     }
@@ -350,6 +367,28 @@ impl Record for WaveformRecord {
                 }
             }
             "NORD" => Err(CaError::ReadOnlyField(name.to_string())),
+            "INDX" if matches!(self.kind, ArrayKind::SubArray) => match value {
+                EpicsValue::Long(v) => {
+                    self.indx = v.max(0);
+                    Ok(())
+                }
+                EpicsValue::Short(v) => {
+                    self.indx = (v as i32).max(0);
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("INDX".into())),
+            },
+            "MALM" if matches!(self.kind, ArrayKind::SubArray) => match value {
+                EpicsValue::Long(v) => {
+                    self.malm = v.max(0);
+                    Ok(())
+                }
+                EpicsValue::Short(v) => {
+                    self.malm = (v as i32).max(0);
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("MALM".into())),
+            },
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -362,6 +401,74 @@ impl Record for WaveformRecord {
             9 => WAVEFORM_FIELDS_FLOAT,
             _ => WAVEFORM_FIELDS_DOUBLE,
         }
+    }
+
+    /// epics-base PR #a02c310 follow-up: subArray slices its input
+    /// array on `set_val`. Effective slice = source[INDX .. INDX+NELM]
+    /// further capped by `min(source.len, MALM)` (MALM=0 → no extra
+    /// cap, matching C dbCommon defaults where the field is set by
+    /// the record initialiser). All other ArrayKind values delegate
+    /// to the trait's default `put_field("VAL", ...)` write.
+    fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        if !matches!(self.kind, ArrayKind::SubArray) {
+            return match self.put_field("VAL", value.clone()) {
+                Ok(()) => Ok(()),
+                Err(CaError::TypeMismatch(_)) => {
+                    let target = self
+                        .get_field("VAL")
+                        .map(|v| v.db_field_type())
+                        .unwrap_or(DbFieldType::Double);
+                    let coerced = value.convert_to(target);
+                    self.put_field("VAL", coerced)
+                }
+                Err(e) => Err(e),
+            };
+        }
+        let start = self.indx.max(0) as usize;
+        let take = self.nelm.max(0) as usize;
+        // MALM=0 keeps the legacy "no extra cap" behaviour. When set,
+        // it bounds how much of the source we're allowed to look at.
+        let malm_cap = if self.malm > 0 {
+            self.malm as usize
+        } else {
+            usize::MAX
+        };
+        let nelm_buf = take; // physical buffer is sized to NELM
+        macro_rules! slice {
+            ($v:ident, $arr:ident, $variant:ident, $zero:expr) => {{
+                let src_len = $arr.len().min(malm_cap);
+                let end = (start + take).min(src_len);
+                let valid = if start >= src_len { 0 } else { end - start };
+                let mut out: Vec<_> = if valid > 0 {
+                    $arr[start..end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                out.resize(nelm_buf, $zero);
+                self.nord = valid as i32;
+                self.val = EpicsValue::$variant(out);
+            }};
+        }
+        match value {
+            EpicsValue::CharArray(arr) => slice!(value, arr, CharArray, 0u8),
+            EpicsValue::ShortArray(arr) => slice!(value, arr, ShortArray, 0i16),
+            EpicsValue::LongArray(arr) => slice!(value, arr, LongArray, 0i32),
+            EpicsValue::FloatArray(arr) => slice!(value, arr, FloatArray, 0.0f32),
+            EpicsValue::DoubleArray(arr) => slice!(value, arr, DoubleArray, 0.0f64),
+            other => {
+                // Scalar fed into subArray (e.g. CA put of a single
+                // number): degrade to "NORD=1 at offset 0" semantics
+                // when INDX==0, else NORD=0. Matches what C does
+                // through dbScalarToArray.
+                if start == 0 {
+                    self.nord = 1;
+                    self.val = other;
+                } else {
+                    self.nord = 0;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -407,5 +514,90 @@ mod array_kind_tests {
         assert_eq!(a.record_type(), "aai");
         assert_eq!(b.record_type(), "aao");
         assert_eq!(c.record_type(), "subArray");
+    }
+
+    /// PR #a02c310 follow-up: subArray slices source[INDX..INDX+NELM]
+    /// into VAL with NORD set to the actual copied length. Source
+    /// shorter than INDX → NORD=0. INDX+NELM > source.len → only
+    /// available tail is copied, rest zero-padded to NELM.
+    #[test]
+    fn subarray_slices_input_at_indx_with_nelm_take() {
+        let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        // 4-element double buffer; consume up to 4 from offset 2.
+        r.put_field("NELM", EpicsValue::Long(4)).unwrap();
+        r.put_field("INDX", EpicsValue::Long(2)).unwrap();
+        let source = EpicsValue::DoubleArray(vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0]);
+        r.set_val(source).unwrap();
+        assert_eq!(r.nord, 4, "should copy 4 elements from offset 2");
+        let val = r.get_field("VAL").unwrap();
+        if let EpicsValue::DoubleArray(v) = val {
+            assert_eq!(v, vec![12.0, 13.0, 14.0, 15.0]);
+        } else {
+            panic!("VAL should be DoubleArray, got {val:?}");
+        }
+    }
+
+    #[test]
+    fn subarray_indx_out_of_range_yields_nord_zero() {
+        let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        r.put_field("NELM", EpicsValue::Long(3)).unwrap();
+        r.put_field("INDX", EpicsValue::Long(10)).unwrap();
+        let source = EpicsValue::LongArray(vec![1, 2, 3]);
+        r.put_field("FTVL", EpicsValue::Short(5)).unwrap(); // LONG
+        r.set_val(source).unwrap();
+        assert_eq!(r.nord, 0, "INDX past source.len must zero NORD");
+    }
+
+    #[test]
+    fn subarray_partial_tail_zero_pads_to_nelm() {
+        let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        r.put_field("NELM", EpicsValue::Long(5)).unwrap();
+        r.put_field("INDX", EpicsValue::Long(3)).unwrap();
+        let source = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        r.set_val(source).unwrap();
+        assert_eq!(r.nord, 2, "only 2 elements available from offset 3");
+        // get_field("VAL") truncates to NORD — caller-visible slice
+        // is only the 2 valid elements.
+        if let Some(EpicsValue::DoubleArray(v)) = r.get_field("VAL") {
+            assert_eq!(v, vec![4.0, 5.0]);
+        } else {
+            panic!("VAL must be DoubleArray of valid tail");
+        }
+    }
+
+    #[test]
+    fn subarray_malm_caps_visible_source_length() {
+        let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        r.put_field("NELM", EpicsValue::Long(4)).unwrap();
+        r.put_field("INDX", EpicsValue::Long(0)).unwrap();
+        // MALM caps how far into the source we look — even if the
+        // source has 8 elements, MALM=3 keeps us to indices [0..3).
+        r.put_field("MALM", EpicsValue::Long(3)).unwrap();
+        let source = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        r.set_val(source).unwrap();
+        assert_eq!(r.nord, 3, "MALM=3 limits visible source to 3 elements");
+        if let Some(EpicsValue::DoubleArray(v)) = r.get_field("VAL") {
+            assert_eq!(v, vec![1.0, 2.0, 3.0]);
+        } else {
+            panic!("VAL truncated to MALM-bound prefix");
+        }
+    }
+
+    #[test]
+    fn subarray_indx_malm_fields_round_trip() {
+        let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        r.put_field("INDX", EpicsValue::Long(5)).unwrap();
+        r.put_field("MALM", EpicsValue::Long(100)).unwrap();
+        assert_eq!(r.get_field("INDX"), Some(EpicsValue::Long(5)));
+        assert_eq!(r.get_field("MALM"), Some(EpicsValue::Long(100)));
+    }
+
+    #[test]
+    fn waveform_does_not_expose_indx_malm() {
+        // Non-subArray record kinds must NOT expose INDX/MALM via the
+        // field map — those fields are subArray-specific.
+        let r = WaveformRecord::with_kind(ArrayKind::Waveform);
+        assert!(r.get_field("INDX").is_none());
+        assert!(r.get_field("MALM").is_none());
     }
 }

@@ -46,7 +46,7 @@
 ---
 
 ## 2. IOC, 레코드 및 데이터베이스 (Records & Database)
-- **`aai`, `aao`, `subArray` 등 배열 레코드 부재 (PR #162, #742)** — ✅ **DONE** `a02c310`: `ArrayKind` 열거형으로 `WaveformRecord` 공유, `aao`만 `can_device_write=true`. NORD 이벤트는 기존 waveform 경로에서 처리. 단, `subArray`의 INDX/MALM 슬라이싱 시맨틱은 후속 작업.
+- **`aai`, `aao`, `subArray` 등 배열 레코드 부재 (PR #162, #742)** — ✅ **DONE** `a02c310` (+follow-up): `ArrayKind` 열거형으로 `WaveformRecord` 공유, `aao`만 `can_device_write=true`. NORD 이벤트는 기존 waveform 경로에서 처리. **subArray INDX/MALM 슬라이싱 완료**: `WaveformRecord`에 `indx: i32`, `malm: i32` 추가 + `kind == SubArray`일 때만 `get_field/put_field`에서 노출. `set_val` 오버라이드가 SubArray에 대해 `source[INDX..INDX+NELM]` 슬라이스 (MALM>0이면 `min(source.len, MALM)`으로 추가 캡), 부족분은 NELM 크기 버퍼에 0-pad, NORD는 실제 복사 개수. INDX가 source 길이 초과 시 NORD=0. 5 단위 테스트 (정상 슬라이스 / out-of-range / partial tail zero-pad / MALM 캡 / non-subArray INDX·MALM 숨김).
 - **`dbServerStats()` API 구현 지연 (PR #592)** — 🔄 **PARTIAL** `ac92e3e` (+follow-up): `ServerStats`에 channels_opened/closed + subscriptions_opened/closed + bytes_in/out 카운터 추가. channel 카운터는 `ServerConnectionEvent`로 wired. **bytes_in/out wired**: `run_tcp_listener`에 `stats: Option<Arc<ServerStats>>` 파라미터 추가 (CaServer::run에서 자동 전달), `handle_client`가 매 read마다 `bytes_in.fetch_add(n)`, 매 BufWriter flush 직전 `buffer().len()`을 캡처해 `bytes_out.fetch_add(...)`. 통합 테스트 `server_stats_bytes_in_out_track_real_traffic` — 실제 CaClient↔CaServer TCP 라운드트립 후 두 카운터 모두 > 0 확인. subscription 카운터는 별도 wiring 대기.
 - **`dbLoadTemplate`의 `EPICS_DB_INCLUDE_PATH` 지원 (PR #636)** — ⏭️ **ALREADY**: `iocsh/commands.rs:876`이 env var를 읽어 include path 리스트 구성.
 - **잘못된 필드명에 대한 자동 제안 (PR #689)** — ⏭️ **ALREADY**: round 23 commit으로 `dbpf` typo suggestion 구현.

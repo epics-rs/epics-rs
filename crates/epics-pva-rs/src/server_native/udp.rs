@@ -59,6 +59,50 @@ fn try_fill_secure(_buf: &mut [u8]) -> bool {
     false
 }
 
+/// PR #205 IPv6 Stage 5: bind a v6-only ephemeral UDP socket used to
+/// emit beacons to v6 multicast groups. Mirrors the client-side
+/// `bind_ephemeral_udp_v6`. Returns `None` when the host lacks v6 —
+/// the beacon emitter keeps running v4-only in that case.
+fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let sock = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("v6 beacon socket: socket() failed: {e}; v6 beacon disabled");
+            return None;
+        }
+    };
+    if let Err(e) = sock.set_only_v6(true) {
+        debug!("v6 beacon socket: set_only_v6 failed: {e}");
+    }
+    if let Err(e) = sock.set_nonblocking(true) {
+        debug!("v6 beacon socket: set_nonblocking failed: {e}");
+        return None;
+    }
+    if let Err(e) = sock.set_multicast_hops_v6(1) {
+        debug!("v6 beacon socket: set_multicast_hops_v6 failed: {e}");
+    }
+    let bind = SocketAddr::V6(std::net::SocketAddrV6::new(
+        std::net::Ipv6Addr::UNSPECIFIED,
+        0,
+        0,
+        0,
+    ));
+    if let Err(e) = sock.bind(&bind.into()) {
+        debug!("v6 beacon socket: bind {bind} failed: {e}; v6 beacon disabled");
+        return None;
+    }
+    let std_sock: std::net::UdpSocket = sock.into();
+    match tokio::net::UdpSocket::from_std(std_sock) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            debug!("v6 beacon socket: tokio adoption failed: {e}");
+            None
+        }
+    }
+}
+
 fn bind_udp(port: u16) -> PvaResult<AsyncUdpV4> {
     let sock = AsyncUdpV4::bind(port, true).map_err(PvaError::Io)?;
     // pvxs server.cpp joins multicast groups listed in
@@ -95,6 +139,7 @@ pub async fn run_udp_responder_proto(
         Vec::new(),
         true,
         Vec::new(),
+        false,
     )
     .await
 }
@@ -117,6 +162,12 @@ pub async fn run_udp_responder_with_config(
     destinations: Vec<SocketAddr>,
     auto_beacon: bool,
     ignore_addrs: Vec<(IpAddr, u16)>,
+    // PR #205 IPv6 Stage 5: when true, also emit beacons to the
+    // default v6 multicast group `[ff0e::400]:udp_port` via a
+    // dedicated v6 send socket. The v6 SEARCH responder is spawned
+    // separately (see [`run_udp_responder_v6`]); the v6 flag here only
+    // controls beacon emission to the v6 group.
+    enable_ipv6_udp: bool,
 ) -> PvaResult<()> {
     let socket = bind_udp(udp_port)?;
     let socket = Arc::new(socket);
@@ -131,20 +182,47 @@ pub async fn run_udp_responder_with_config(
     // (matching pvxs `EPICS_PVAS_AUTO_BEACON_ADDR_LIST=NO` semantics).
     // Pre-fix this branch fell through to limited broadcast, leaking
     // beacon frames against site policy. Mirror round-25 CA fix.
-    let beacon_destinations: Vec<SocketAddr> = if !destinations.is_empty() {
+    let mut beacon_destinations: Vec<SocketAddr> = if !destinations.is_empty() {
         destinations
     } else if auto_beacon {
         crate::config::env::list_broadcast_addresses(udp_port)
     } else {
         Vec::new()
     };
+    // PR #205 IPv6 Stage 5: when v6 UDP is enabled AND auto_beacon is
+    // on (i.e. the operator hasn't explicitly disabled beacon
+    // emission), add the default v6 multicast group as a beacon
+    // destination. Mirrors pvxs' v6 group `ff0e::400`.
+    if enable_ipv6_udp && auto_beacon {
+        let v6_mcast = SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x0400),
+            udp_port,
+            0,
+            0,
+        ));
+        if !beacon_destinations.contains(&v6_mcast) {
+            beacon_destinations.push(v6_mcast);
+        }
+    }
+    // Send-only v6 socket used for beacon emission to v6 destinations.
+    // The receive side (SEARCH on `[::]:udp_port`) is handled by the
+    // companion `run_udp_responder_v6` task — keeping the beacon TX
+    // socket separate avoids confusing the recv loop with our own
+    // outgoing beacons echoed by the multicast group.
+    let beacon_socket_v6: Option<Arc<tokio::net::UdpSocket>> = if enable_ipv6_udp {
+        bind_beacon_send_v6()
+    } else {
+        None
+    };
     debug!(
         ?beacon_destinations,
         ?beacon_period,
+        v6 = beacon_socket_v6.is_some(),
         "beacon emitter config"
     );
 
     let beacon_socket = socket.clone();
+    let beacon_socket_v6_for_task = beacon_socket_v6.clone();
     let beacon_guid = guid;
     let beacon_source = source.clone();
     // F2: bind the JoinHandle to an AbortOnDrop guard scoped to this
@@ -219,14 +297,26 @@ pub async fn run_udp_responder_with_config(
                 // Limited broadcast / multicast destinations need
                 // explicit per-NIC fanout. Per-subnet broadcast and
                 // unicast route via AsyncUdpV4::send_to's NIC pick.
-                let needs_fanout = match dest {
-                    SocketAddr::V4(v4) => v4.ip().is_broadcast() || v4.ip().is_multicast(),
-                    SocketAddr::V6(_) => false,
-                };
-                let result = if needs_fanout {
-                    beacon_socket.fanout_to(&beacon, *dest).await.map(|_| ())
-                } else {
-                    beacon_socket.send_to(&beacon, *dest).await.map(|_| ())
+                // PR #205 IPv6 Stage 5: v6 destinations route through
+                // the dedicated v6 send socket. The `enable_ipv6_udp`
+                // false path will never queue v6 destinations here, so
+                // the missing-v6-socket branch is defensive.
+                let result = match dest {
+                    SocketAddr::V4(v4) => {
+                        let needs_fanout = v4.ip().is_broadcast() || v4.ip().is_multicast();
+                        if needs_fanout {
+                            beacon_socket.fanout_to(&beacon, *dest).await.map(|_| ())
+                        } else {
+                            beacon_socket.send_to(&beacon, *dest).await.map(|_| ())
+                        }
+                    }
+                    SocketAddr::V6(_) => match &beacon_socket_v6_for_task {
+                        Some(s6) => s6.send_to(&beacon, *dest).await.map(|_| ()),
+                        None => Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrNotAvailable,
+                            "v6 beacon destination configured without a v6 send socket",
+                        )),
+                    },
                 };
                 match result {
                     Ok(()) => {
@@ -1283,5 +1373,78 @@ mod tests {
             0xBEEF,
             "change_count at offset 14"
         );
+    }
+
+    /// PR #205 IPv6 Stage 5: when `enable_ipv6_udp=true` and an
+    /// explicit v6 beacon destination is configured, the beacon
+    /// emitter routes it through a v6 send socket. Regression guard
+    /// against the v6 send path being dropped from the per-destination
+    /// dispatch in the beacon loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn beacon_emit_reaches_explicit_ipv6_destination() {
+        use crate::server_native::SharedSource;
+        use std::net::{Ipv6Addr, SocketAddrV6};
+
+        // Sniffer bound to `[::1]:0`. The server will send beacons
+        // unicast here.
+        let sniffer = tokio::net::UdpSocket::bind("[::1]:0")
+            .await
+            .expect("v6 sniffer bind");
+        let sniffer_port = sniffer.local_addr().unwrap().port();
+        let v6_dest = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, sniffer_port, 0, 0));
+
+        // Pick a free UDP port for the responder itself (not used by
+        // this test directly — we only care about beacon TX).
+        let pick_udp = || {
+            let l =
+                std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("probe bind");
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let udp_port = pick_udp();
+
+        // Short beacon period so the first burst fires quickly.
+        let task = tokio::spawn(run_udp_responder_with_config(
+            Arc::new(SharedSource::new()) as DynSource,
+            udp_port,
+            5075, // advertised TCP port (any non-zero value)
+            [0xAB; 12],
+            "tcp",
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(10),
+            3,
+            vec![v6_dest],
+            false, // auto_beacon=false: only the explicit v6 dest
+            Vec::new(),
+            true, // enable_ipv6_udp
+        ));
+
+        let mut buf = vec![0u8; 4096];
+        let recv = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sniffer.recv_from(&mut buf),
+        )
+        .await
+        .expect("beacon must arrive within 3s")
+        .expect("recv_from ok");
+        let n = recv.0;
+        // Verify it's actually a beacon (CMD_BEACON header).
+        assert!(n >= PvaHeader::SIZE, "beacon too short: {n}");
+        let hdr = PvaHeader::decode(&mut Cursor::new(&buf[..n])).expect("hdr decode");
+        assert_eq!(
+            hdr.command,
+            Command::Beacon.code(),
+            "expected CMD_BEACON on v6 unicast destination"
+        );
+        // Confirm GUID in payload matches what we passed in.
+        let payload = &buf[PvaHeader::SIZE..n];
+        assert_eq!(
+            &payload[0..12],
+            &[0xAB; 12],
+            "GUID in v6 beacon payload must match server's guid"
+        );
+
+        task.abort();
     }
 }

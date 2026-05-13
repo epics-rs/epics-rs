@@ -485,6 +485,7 @@ impl PvaServer {
             config.beacon_destinations.clone(),
             config.auto_beacon,
             config.ignore_addrs.clone(),
+            config.enable_ipv6_udp,
         ));
         // PR #205 IPv6 Stage 2: optional companion responder bound
         // to `[::]:udp_port` that answers v6 SEARCH packets. Shares

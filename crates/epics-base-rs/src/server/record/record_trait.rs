@@ -234,6 +234,32 @@ pub trait Record: Send + Sync + 'static {
         }
     }
 
+    /// Whether this record implements the `DTYP="Raw Soft Channel"`
+    /// read path via [`Record::apply_raw_input`]. Records that return
+    /// `true` opt into framework routing of the INP link value through
+    /// `apply_raw_input` (RVAL + MASK) instead of the default
+    /// soft-channel `VAL` direct write.
+    ///
+    /// Default `false` keeps any record that has not been wired for
+    /// raw soft channel on the legacy path (which sets VAL directly).
+    fn accepts_raw_soft_input(&self) -> bool {
+        false
+    }
+
+    /// Apply a value read from a `DTYP="Raw Soft Channel"` INP link.
+    ///
+    /// Mirrors the C `devXxxSoftRaw.c` `read_xxx()` convention: the
+    /// raw value goes to `RVAL` (so the record's `process()` then runs
+    /// the standard `RVAL → VAL` conversion). Records that expose a
+    /// `MASK` field must apply it here, matching epics-base
+    /// `f2fe9d12` (devBiSoftRaw: `prec->rval &= prec->mask`).
+    ///
+    /// Only invoked by the framework when
+    /// [`Record::accepts_raw_soft_input`] returns `true`.
+    fn apply_raw_input(&mut self, value: EpicsValue) -> CaResult<()> {
+        self.set_val(value)
+    }
+
     /// Apply IVOA=2 ("set outputs to IVOV") semantics: copy the
     /// IVOV value into whatever output staging field the OUT
     /// writeback consumes for this record type. Mirrors the

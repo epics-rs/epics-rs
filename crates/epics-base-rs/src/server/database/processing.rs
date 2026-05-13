@@ -332,10 +332,24 @@ impl PvDatabase {
                 }
             }
 
-            // Apply INP value. Soft channel: equivalent to C status=2.
-            let soft_inp_applied = inp_value.is_some();
+            // Apply INP value. "Soft Channel" sets VAL directly
+            // (C `read_xxx` return 2, skip RVAL→VAL conversion).
+            // "Raw Soft Channel" routes the value into RVAL and lets
+            // the record's RVAL→VAL convert run (epics-base
+            // f2fe9d12: devBiSoftRaw applies MASK after the read).
+            // Records opt into the raw path via
+            // `Record::accepts_raw_soft_input` so DTYPs on records
+            // that haven't wired raw soft channel stay on the legacy
+            // VAL-direct path.
+            let is_raw_soft = instance.common.dtyp == "Raw Soft Channel"
+                && instance.record.accepts_raw_soft_input();
+            let soft_inp_applied = inp_value.is_some() && !is_raw_soft;
             if let Some(inp_val) = inp_value {
-                let _ = instance.record.set_val(inp_val);
+                if is_raw_soft {
+                    let _ = instance.record.apply_raw_input(inp_val);
+                } else {
+                    let _ = instance.record.set_val(inp_val);
+                }
             }
 
             // Apply multi-input values (INPA..INPL -> A..L)

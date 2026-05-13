@@ -103,6 +103,47 @@ fn test_bi_record() {
     }
 }
 
+// epics-base f2fe9d12 (devBiSoftRaw): "Raw Soft Channel" INP reads
+// must apply MASK to RVAL before the RVAL→VAL conversion. Verifies the
+// `Record::apply_raw_input` override on BiRecord.
+#[test]
+fn test_bi_raw_soft_channel_applies_mask() {
+    let mut rec = BiRecord::new(0);
+    rec.mask = 0x0F;
+    rec.apply_raw_input(EpicsValue::Long(0xFF)).unwrap();
+    assert_eq!(rec.rval, 0x0F, "mask must clamp RVAL to low nibble");
+    let _ = rec.process().unwrap();
+    match rec.get_field("VAL") {
+        Some(EpicsValue::Enum(v)) => assert_eq!(v, 1, "masked-non-zero RVAL → VAL=1"),
+        other => panic!("expected Enum, got {:?}", other),
+    }
+}
+
+// MASK=0 must leave RVAL untouched (idempotent passthrough).
+#[test]
+fn test_bi_raw_soft_channel_mask_zero_passthrough() {
+    let mut rec = BiRecord::new(0);
+    rec.mask = 0;
+    rec.apply_raw_input(EpicsValue::Long(0xDEAD_BEEFu32 as i32))
+        .unwrap();
+    assert_eq!(rec.rval, 0xDEAD_BEEFu32 as i32);
+}
+
+// A masked-to-zero raw read must yield VAL=0 even when the source
+// had bits outside the mask set.
+#[test]
+fn test_bi_raw_soft_channel_mask_to_zero() {
+    let mut rec = BiRecord::new(1);
+    rec.mask = 0x01;
+    rec.apply_raw_input(EpicsValue::Long(0xFE)).unwrap();
+    assert_eq!(rec.rval, 0);
+    let _ = rec.process().unwrap();
+    match rec.get_field("VAL") {
+        Some(EpicsValue::Enum(v)) => assert_eq!(v, 0),
+        other => panic!("expected Enum, got {:?}", other),
+    }
+}
+
 #[test]
 fn test_stringin_record() {
     let rec = StringinRecord::new("hello");

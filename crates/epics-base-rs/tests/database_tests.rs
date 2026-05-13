@@ -8,6 +8,8 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::*;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
+use epics_base_rs::server::records::bi::BiRecord;
+use epics_base_rs::server::records::longin::LonginRecord;
 use epics_base_rs::types::EpicsValue;
 
 #[tokio::test]
@@ -779,6 +781,52 @@ async fn test_ca_put_no_double_device_write() {
         .await
         .unwrap();
     assert_eq!(write_count.load(Ordering::SeqCst), 1);
+}
+
+// epics-base f2fe9d12 (devBiSoftRaw): a `bi` record with
+// `DTYP="Raw Soft Channel"`, MASK set, and a soft INP link must mask
+// the link value into RVAL before the RVAL→VAL convert. The framework
+// must route the INP value to `apply_raw_input` (not `set_val`).
+#[tokio::test]
+async fn test_bi_raw_soft_channel_inp_applies_mask() {
+    let db = PvDatabase::new();
+    db.add_record("SRC_LI", Box::new(LonginRecord::new(0)))
+        .await
+        .unwrap();
+    db.add_record("BI_RAW", Box::new(BiRecord::new(0)))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("SRC_LI", "VAL", EpicsValue::Long(0xFF))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("BI_RAW").await {
+        let mut inst = rec.write().await;
+        inst.common.dtyp = "Raw Soft Channel".to_string();
+        inst.common.inp = "SRC_LI".to_string();
+        inst.parsed_inp = epics_base_rs::server::record::parse_link_v2(&inst.common.inp);
+        inst.record
+            .put_field("MASK", EpicsValue::Long(0x0F))
+            .unwrap();
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("BI_RAW", &mut visited, 0)
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("BI_RAW").await {
+        let inst = rec.read().await;
+        let rval = inst.record.get_field("RVAL");
+        assert_eq!(
+            rval,
+            Some(EpicsValue::Long(0x0F)),
+            "MASK must clamp RVAL to low nibble"
+        );
+        let val = inst.record.get_field("VAL");
+        assert_eq!(
+            val,
+            Some(EpicsValue::Enum(1)),
+            "masked-non-zero RVAL → VAL=1"
+        );
+    }
 }
 
 #[tokio::test]

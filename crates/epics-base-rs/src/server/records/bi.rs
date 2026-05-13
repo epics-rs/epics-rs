@@ -192,6 +192,25 @@ impl Record for BiRecord {
         self.skip_convert = did_compute;
     }
 
+    fn accepts_raw_soft_input(&self) -> bool {
+        true
+    }
+
+    /// `DTYP="Raw Soft Channel"` reads the link value into `RVAL` and
+    /// applies `MASK` (epics-base f2fe9d12, devBiSoftRaw): a non-zero
+    /// MASK gates which bits of the source contribute to the
+    /// subsequent RVAL→VAL conversion.
+    fn apply_raw_input(&mut self, value: EpicsValue) -> CaResult<()> {
+        let rval = value.to_f64().map(|f| f as i32).ok_or_else(|| {
+            CaError::TypeMismatch("bi Raw Soft Channel: INP value not numeric".into())
+        })?;
+        self.rval = rval;
+        if self.mask != 0 {
+            self.rval &= self.mask;
+        }
+        Ok(())
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),

@@ -839,6 +839,20 @@ impl CaServer {
                         crate::server::tcp::ServerConnectionEvent::ChannelCleared { .. } => {
                             stats_for_task.channels_closed_total.fetch_add(1, Relaxed);
                         }
+                        crate::server::tcp::ServerConnectionEvent::SubscriptionOpened {
+                            ..
+                        } => {
+                            stats_for_task
+                                .subscriptions_opened_total
+                                .fetch_add(1, Relaxed);
+                        }
+                        crate::server::tcp::ServerConnectionEvent::SubscriptionClosed {
+                            ..
+                        } => {
+                            stats_for_task
+                                .subscriptions_closed_total
+                                .fetch_add(1, Relaxed);
+                        }
                         _ => {}
                     }
                 }

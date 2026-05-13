@@ -406,6 +406,77 @@ async fn server_stats_bytes_in_out_track_real_traffic() {
     );
 }
 
+/// PR #592 follow-up: subscription counters track EVENT_ADD opens
+/// and EVENT_CANCEL/teardown closes. Pre-wiring the counters were
+/// declared and printed by `casr` but never incremented. Asserts
+/// that `subscriptions_opened_total` and `subscriptions_closed_total`
+/// both increment for a normal monitor lifecycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
+    use std::time::Duration;
+
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("STATS:SUB:PV", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let stats = server.stats();
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    unsafe {
+        std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+        std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
+    }
+
+    let client = epics_ca_rs::client::CaClient::new().await.expect("client");
+    let channel = client.create_channel("STATS:SUB:PV");
+    let mut monitor = channel.subscribe().await.expect("subscribe");
+    // Wait for the initial monitor frame so we know EVENT_ADD has
+    // been accepted server-side.
+    let _initial = tokio::time::timeout(Duration::from_secs(2), monitor.recv())
+        .await
+        .expect("initial monitor frame did not arrive")
+        .expect("monitor stream yielded no value");
+
+    use std::sync::atomic::Ordering::Relaxed;
+    let opened = stats.subscriptions_opened_total.load(Relaxed);
+    assert!(
+        opened >= 1,
+        "subscriptions_opened_total must increment after EVENT_ADD; got {opened}"
+    );
+
+    // Drop the monitor — server-side teardown path runs either via
+    // EVENT_CANCEL (if the client sends it) or via the
+    // ChannelCleared → subscription drain path. Both increment the
+    // closed counter.
+    drop(monitor);
+    drop(channel);
+    drop(client);
+
+    // Give the server a moment to process the disconnect / clear.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let closed = stats.subscriptions_closed_total.load(Relaxed);
+    assert!(
+        closed >= 1,
+        "subscriptions_closed_total must increment after teardown; got {closed}"
+    );
+    assert_eq!(
+        opened, closed,
+        "open and close counts must match for a clean lifecycle: {opened} vs {closed}"
+    );
+}
+
 #[tokio::test]
 async fn server_put_nonexistent_pv_returns_error() {
     let server = CaServer::builder()

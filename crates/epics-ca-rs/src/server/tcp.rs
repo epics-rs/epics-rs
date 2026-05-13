@@ -148,6 +148,23 @@ pub enum ServerConnectionEvent {
         pv_name: String,
         cid: u32,
     },
+    /// `CA_PROTO_EVENT_ADD` accepted; a new subscription is live.
+    /// Drives `ServerStats::subscriptions_opened_total` (PR #592's
+    /// `caServerSubscriptionCount`).
+    SubscriptionOpened {
+        peer: SocketAddr,
+        pv_name: String,
+        sub_id: u32,
+    },
+    /// `CA_PROTO_EVENT_CANCEL` or channel teardown closed a
+    /// subscription. Drives `ServerStats::subscriptions_closed_total`.
+    /// Subtract from the opened counter for the live subscription
+    /// count.
+    SubscriptionClosed {
+        peer: SocketAddr,
+        pv_name: String,
+        sub_id: u32,
+    },
 }
 
 use crate::protocol::*;
@@ -950,8 +967,15 @@ where
         }
     }
 
-    // Cleanup: cancel all subscriptions
-    for (_, sub) in state.subscriptions.drain() {
+    // Cleanup: cancel all subscriptions. PR #592 dbServerStats —
+    // emit `SubscriptionClosed` for each so the running close-count
+    // matches the open-count when a client disconnects without
+    // explicit EVENT_CANCEL (TCP RST, network drop, panic). Without
+    // this, `active_subscriptions` reports a permanent leak after
+    // every ungraceful disconnect.
+    let pending_subs: Vec<SubscriptionEntry> =
+        state.subscriptions.drain().map(|(_, sub)| sub).collect();
+    for sub in pending_subs {
         sub.task.abort();
         match &sub.target {
             ChannelTarget::SimplePv(pv) => {
@@ -960,6 +984,18 @@ where
             ChannelTarget::RecordField { record, .. } => {
                 record.write().await.remove_subscriber(sub.sub_id);
             }
+        }
+        if let Some(tx) = &conn_events {
+            let pv_name = state
+                .channels
+                .get(&sub.channel_sid)
+                .map(|e| e.pv_name.clone())
+                .unwrap_or_default();
+            let _ = tx.send(ServerConnectionEvent::SubscriptionClosed {
+                peer,
+                pv_name,
+                sub_id: sub.sub_id,
+            });
         }
     }
 
@@ -1753,6 +1789,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     return Ok(());
                 }
             };
+            // Captured up front so the SubscriptionOpened event we
+            // emit after a successful insert below doesn't have to
+            // re-borrow `state.channels` (the insert path mutates
+            // `state.subscriptions` so the entry borrow has to be
+            // released before then).
+            let sub_pv_name = entry.pv_name.clone();
 
             // R38-G3 / Round 38: EVENT_ADD must also consult the
             // channel's access_rights. A NoAccess peer mounting a
@@ -1854,6 +1896,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 task,
                             },
                         );
+                        if let Some(tx) = conn_events {
+                            let _ = tx.send(ServerConnectionEvent::SubscriptionOpened {
+                                peer,
+                                pv_name: sub_pv_name.clone(),
+                                sub_id,
+                            });
+                        }
                     }
                     ChannelTarget::RecordField { record, field } => {
                         let mut instance = record.write().await;
@@ -1999,6 +2048,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 task,
                             },
                         );
+                        if let Some(tx) = conn_events {
+                            let _ = tx.send(ServerConnectionEvent::SubscriptionOpened {
+                                peer,
+                                pv_name: sub_pv_name.clone(),
+                                sub_id,
+                            });
+                        }
                     }
                 }
             }
@@ -2008,6 +2064,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let sub_id = hdr.available;
             if let Some(sub) = state.subscriptions.remove(&sub_id) {
                 sub.task.abort();
+                // Resolve pv_name for the SubscriptionClosed event.
+                // Look up via the subscription's channel_sid; if the
+                // channel was already cleared, fall back to an empty
+                // string (the event still increments the counter).
+                let pv_name_for_event = state
+                    .channels
+                    .get(&sub.channel_sid)
+                    .map(|e| e.pv_name.clone())
+                    .unwrap_or_default();
                 match &sub.target {
                     ChannelTarget::SimplePv(pv) => {
                         pv.remove_subscriber(sub.sub_id).await;
@@ -2015,6 +2080,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     ChannelTarget::RecordField { record, .. } => {
                         record.write().await.remove_subscriber(sub.sub_id);
                     }
+                }
+                if let Some(tx) = conn_events {
+                    let _ = tx.send(ServerConnectionEvent::SubscriptionClosed {
+                        peer,
+                        pv_name: pv_name_for_event,
+                        sub_id,
+                    });
                 }
 
                 // Per spec: send final EVENT_ADD response with count=0
@@ -2126,6 +2198,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             ChannelTarget::RecordField { record, .. } => {
                                 record.write().await.remove_subscriber(sub.sub_id);
                             }
+                        }
+                        if let Some(tx) = &conn_events {
+                            let _ = tx.send(ServerConnectionEvent::SubscriptionClosed {
+                                peer,
+                                pv_name: entry.pv_name.clone(),
+                                sub_id,
+                            });
                         }
                     }
                 }

@@ -161,6 +161,19 @@ async fn run_beacon_monitor_inner(
         Ok(s) => s,
         Err(_) => return,
     };
+    // pvxs `udp_collector.cpp` parity (commit a064677e3625): opt
+    // the kernel into SO_RXQ_OVFL so a sustained beacon backlog
+    // (slow main loop, undersized SO_RCVBUF, mass-restart storm)
+    // surfaces as a debug log instead of silent loss. No-op on
+    // non-Linux. Diagnostic-only failure is logged at trace.
+    if let Err(e) = socket.enable_so_rxq_ovfl() {
+        tracing::trace!(
+            target: "epics_ca_rs::client::beacon_monitor",
+            error = %e,
+            "SO_RXQ_OVFL enable failed (non-fatal)"
+        );
+    }
+    let mut prev_drops_beacon: u32 = 0;
 
     // Initial registration with retry
     for attempt in 0..3u32 {
@@ -207,8 +220,11 @@ async fn run_beacon_monitor_inner(
         // archiver that reconnects to a server whose `online_notify`
         // ramp-up is in progress sees a PeriodCollapse cascade against
         // its stale steady-state estimate.
-        let recv_fut = tokio::time::timeout(REREGISTER_INTERVAL, socket.recv_from(&mut buf));
-        let (len, _src) = tokio::select! {
+        let recv_fut = tokio::time::timeout(
+            REREGISTER_INTERVAL,
+            socket.recv_with_meta_with_drops(&mut buf),
+        );
+        let (meta, drops) = tokio::select! {
             ctrl = control_rx.recv(), if control_rx_open => {
                 match ctrl {
                     Some(BeaconControl::ResetServer { server_addr }) => {
@@ -232,6 +248,16 @@ async fn run_beacon_monitor_inner(
                 }
             }
         };
+        if drops != 0 && drops != prev_drops_beacon {
+            tracing::debug!(
+                target: "epics_ca_rs::client::beacon_monitor",
+                prev = prev_drops_beacon,
+                drops,
+                "CA beacon RX socket buffer overflow"
+            );
+        }
+        prev_drops_beacon = drops;
+        let len = meta.n;
         if len < CaHeader::SIZE {
             continue;
         }
@@ -706,7 +732,16 @@ async fn register_with_repeater(socket: &AsyncUdpV4) -> Result<(), ()> {
     let mut buf = [0u8; 64];
     let result = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
-            let (len, _) = socket.recv_from(&mut buf).await.map_err(|_| ())?;
+            // Brief CONFIRM wait — drop counter is monitored by the
+            // long-running run_beacon_monitor_inner loop on the same
+            // socket. Here we reuse `recv_with_meta_with_drops` for
+            // pattern consistency but ignore drops (the long loop is
+            // already tracking).
+            let (meta, _drops) = socket
+                .recv_with_meta_with_drops(&mut buf)
+                .await
+                .map_err(|_| ())?;
+            let len = meta.n;
             if len >= CaHeader::SIZE {
                 if let Ok(resp) = CaHeader::from_bytes(&buf[..len]) {
                     if resp.cmmd == CA_PROTO_REPEATER_CONFIRM {

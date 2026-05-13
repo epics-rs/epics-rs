@@ -95,12 +95,33 @@ pub async fn run_repeater() -> io::Result<()> {
 
     let std_sock: StdUdpSocket = sock.into();
     let socket = UdpSocket::from_std(std_sock)?;
+    // pvxs `udp_collector.cpp` parity: opt the kernel into
+    // SO_RXQ_OVFL so a sustained beacon-fanout backlog surfaces as
+    // a debug log instead of silent loss. No-op on non-Linux.
+    if let Err(e) = epics_base_rs::net::enable_so_rxq_ovfl_for_socket(&socket) {
+        tracing::trace!(
+            target: "epics_ca_rs::repeater",
+            error = %e,
+            "SO_RXQ_OVFL enable failed (non-fatal)"
+        );
+    }
 
     let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
     let mut buf = [0u8; 4096];
+    let mut prev_drops: u32 = 0;
 
     loop {
-        let (len, src) = socket.recv_from(&mut buf).await?;
+        let (len, src, drops) =
+            epics_base_rs::net::recv_from_with_drop_count_socket(&socket, &mut buf).await?;
+        if drops != 0 && drops != prev_drops {
+            tracing::debug!(
+                target: "epics_ca_rs::repeater",
+                prev = prev_drops,
+                drops,
+                "CA repeater UDP socket buffer overflow"
+            );
+        }
+        prev_drops = drops;
 
         // C CA clients send a zero-length UDP packet for repeater
         // registration (backward compat with pre-3.12 repeaters).
@@ -278,6 +299,12 @@ pub async fn ensure_repeater() {
 /// Send a REPEATER_REGISTER to localhost:5065 and wait for CONFIRM.
 async fn try_register() -> Result<(), ()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|_| ())?;
+    // SO_RXQ_OVFL opt-in for diagnostic parity with the long-running
+    // repeater; the brief CONFIRM wait below ignores the counter
+    // (just one packet expected) but enables it so any future reuse
+    // of this socket inherits the same diagnostic surface. No-op
+    // on non-Linux.
+    let _ = epics_base_rs::net::enable_so_rxq_ovfl_for_socket(&socket);
 
     let local_ip = match socket.local_addr().ok() {
         Some(SocketAddr::V4(v4)) => *v4.ip(),
@@ -297,7 +324,10 @@ async fn try_register() -> Result<(), ()> {
     let mut buf = [0u8; 64];
     let result = tokio::time::timeout(std::time::Duration::from_millis(200), async {
         loop {
-            let (len, _) = socket.recv_from(&mut buf).await.map_err(|_| ())?;
+            let (len, _, _drops) =
+                epics_base_rs::net::recv_from_with_drop_count_socket(&socket, &mut buf)
+                    .await
+                    .map_err(|_| ())?;
             if len >= CaHeader::SIZE {
                 if let Ok(resp) = CaHeader::from_bytes(&buf[..len]) {
                     if resp.cmmd == CA_PROTO_REPEATER_CONFIRM {

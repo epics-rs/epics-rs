@@ -593,6 +593,115 @@ async fn process_search_datagram(
     }
 }
 
+/// IPv6 UDP responder. Binds `[::]:udp_port` (kernel default
+/// `IPV6_V6ONLY` controls whether IPv4-mapped traffic also lands
+/// here — Linux is dual-stack by default, BSD/macOS are v6-only)
+/// and answers `Search` queries against `source` with a
+/// `SearchResponse` containing this server's TCP port and GUID.
+///
+/// Companion to the existing IPv4 responder driven by
+/// [`run_udp_responder_with_config`]. Both can run in parallel
+/// (Stage 2 of the PR #205 IPv6 effort) and share a single GUID
+/// so a client that sees both flavours of SEARCH_RESPONSE
+/// resolves them to the same server identity.
+///
+/// Replies use the UDP source address as the destination,
+/// ignoring any `reply_addr` announced inside the SEARCH payload —
+/// today that field decodes IPv4-only via
+/// `parse_search_request` and surfaces as `None` for v6 traffic.
+/// Falling back to the source matches the pvxs
+/// `udp_collector.cpp:540-548` "isAny() ⇒ reply to sender" path.
+///
+/// Beacon emission stays on the IPv4 path for this stage; v6
+/// multicast beacons (FF0E::400) need per-NIC multicast scope
+/// management that arrives in a follow-up commit.
+pub async fn run_udp_responder_v6(
+    source: DynSource,
+    udp_port: u16,
+    tcp_port: u16,
+    guid: [u8; 12],
+    protocol: &'static str,
+    ignore_addrs: Vec<(IpAddr, u16)>,
+) -> PvaResult<()> {
+    let bind_addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), udp_port);
+    let socket = tokio::net::UdpSocket::bind(bind_addr)
+        .await
+        .map_err(crate::error::PvaError::Io)?;
+    let socket = Arc::new(socket);
+    debug!(?udp_port, "IPv6 UDP search responder started");
+
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let (n, peer) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("v6 udp recv error: {e}");
+                continue;
+            }
+        };
+        if !filter_inbound(peer, &ignore_addrs) {
+            continue;
+        }
+        process_v6_search_datagram(&source, &socket, &buf[..n], peer, tcp_port, guid, protocol)
+            .await;
+    }
+}
+
+/// Stripped-down `process_search_datagram` for the v6 responder.
+/// Skips the IPv4-only ORIGIN_TAG forwarding path entirely (v6 has
+/// its own group conventions that aren't wired yet) and always
+/// replies to the UDP source address rather than honouring the
+/// in-payload `reply_addr` field (which is IPv4-typed and stays
+/// `None` for v6 peers anyway).
+async fn process_v6_search_datagram(
+    source: &DynSource,
+    socket: &tokio::net::UdpSocket,
+    frame: &[u8],
+    udp_src: SocketAddr,
+    tcp_port: u16,
+    guid: [u8; 12],
+    protocol: &'static str,
+) {
+    let mut pos = 0usize;
+    while pos + PvaHeader::SIZE <= frame.len() {
+        let chunk = &frame[pos..];
+        let consumed = match parse_search_request(chunk) {
+            Some(req) => {
+                let consumed = req.consumed;
+                let reply_dest = SocketAddr::new(udp_src.ip(), req.reply_port);
+                let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
+                for (cid, name) in &req.queries {
+                    if source.has_pv(name).await {
+                        matched_cids.push(*cid);
+                    }
+                }
+                if !matched_cids.is_empty() {
+                    let resp = build_search_response_proto(
+                        guid,
+                        req.seq,
+                        tcp_port,
+                        &matched_cids,
+                        req.byte_order,
+                        protocol,
+                    );
+                    if let Err(e) = socket.send_to(&resp, reply_dest).await {
+                        debug!("v6 udp send to {reply_dest}: {e}");
+                    }
+                }
+                consumed
+            }
+            None => match PvaHeader::decode(&mut Cursor::new(chunk)) {
+                Ok(h) => PvaHeader::SIZE + h.payload_length as usize,
+                Err(_) => break,
+            },
+        };
+        if consumed == 0 {
+            break;
+        }
+        pos = pos.saturating_add(consumed);
+    }
+}
+
 /// Build a (one-PV) SEARCH_RESPONSE frame with explicit protocol name.
 fn build_search_response_proto(
     guid: [u8; 12],

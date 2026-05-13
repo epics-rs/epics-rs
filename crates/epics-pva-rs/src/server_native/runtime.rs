@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::error::PvaResult;
 
 use super::source::{ChannelSource, ChannelSourceObj, DynSource};
-use super::udp::{random_guid, run_udp_responder_with_config};
+use super::udp::{random_guid, run_udp_responder_v6, run_udp_responder_with_config};
 
 /// Runtime configuration for [`run_pva_server`].
 #[derive(Clone)]
@@ -143,6 +143,17 @@ pub struct PvaServerConfig {
     /// dropped. `port == 0` matches any port from that IP. Mirrors
     /// pvxs `Config::ignoreAddrs`. Empty = allow all (default).
     pub ignore_addrs: Vec<(std::net::IpAddr, u16)>,
+    /// Spawn a parallel IPv6 UDP listener bound to `[::]:udp_port`
+    /// alongside the existing IPv4 per-NIC responder. Required for
+    /// PVA clients that send SEARCH over IPv6 unicast / multicast.
+    /// Default `false` keeps every existing deployment exactly v4-only.
+    ///
+    /// Stage 2 of the PR #205 IPv6 effort. The v6 responder shares
+    /// the GUID / TCP-port / protocol of the v4 path so a single
+    /// client sees one consistent PVA server regardless of which
+    /// address family carried the SEARCH. Beacon emission stays on
+    /// the v4 path for now; v6 multicast beacons are deferred.
+    pub enable_ipv6_udp: bool,
     /// Per-monitor "high" watermark — emit a `tracing::warn!` when an
     /// outbound monitor queue grows past this many items. Default:
     /// `monitor_queue_depth * 3 / 4`. Mirrors pvxs
@@ -209,6 +220,7 @@ impl Default for PvaServerConfig {
             emit_type_cache: false,
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
+            enable_ipv6_udp: false,
             monitor_high_watermark: 48, // 64 * 3 / 4 default
             monitor_low_watermark: 0,
             auth_complete: None,
@@ -305,11 +317,16 @@ pub struct PvaServer {
     /// `.take()` the handles while leaving the struct intact for
     /// the Drop impl below.
     udp_handle: Option<tokio::task::JoinHandle<PvaResult<()>>>,
+    /// Optional companion IPv6 UDP responder (PR #205 IPv6 Stage 2).
+    /// Spawned only when `PvaServerConfig::enable_ipv6_udp = true`.
+    /// `None` matches every existing v4-only deployment.
+    udp_v6_handle: Option<tokio::task::JoinHandle<PvaResult<()>>>,
     tcp_handle: Option<tokio::task::JoinHandle<PvaResult<()>>>,
     /// Held only for the Drop impl. JoinHandle can't be cloned and
     /// `run`/`wait` may have already taken it, so Drop uses these
     /// AbortHandles to reach the live task either way.
     udp_abort: tokio::task::AbortHandle,
+    udp_v6_abort: Option<tokio::task::AbortHandle>,
     tcp_abort: tokio::task::AbortHandle,
     /// Effective config the server is running under. Captured at
     /// `start()` so [`Self::client_config`] can hand back a builder
@@ -349,6 +366,9 @@ impl Drop for PvaServer {
     fn drop(&mut self) {
         if self.udp_handle.is_some() || self.tcp_handle.is_some() {
             self.udp_abort.abort();
+            if let Some(ref abort) = self.udp_v6_abort {
+                abort.abort();
+            }
             self.tcp_abort.abort();
             self.interrupt.notify_waiters();
         }
@@ -466,6 +486,23 @@ impl PvaServer {
             config.auto_beacon,
             config.ignore_addrs.clone(),
         ));
+        // PR #205 IPv6 Stage 2: optional companion responder bound
+        // to `[::]:udp_port` that answers v6 SEARCH packets. Shares
+        // the GUID + TCP port + protocol of the v4 path so a peer
+        // sees one consistent PVA identity across both families.
+        // Default-off via `enable_ipv6_udp = false`.
+        let udp_v6_handle = if config.enable_ipv6_udp {
+            Some(tokio::spawn(run_udp_responder_v6(
+                dyn_source.clone(),
+                config.udp_port,
+                bound_tcp_port,
+                guid,
+                protocol,
+                config.ignore_addrs.clone(),
+            )))
+        } else {
+            None
+        };
         let peers = crate::server_native::peers::PeerRegistry::new();
         let tcp_handle = tokio::spawn(crate::server_native::tcp::run_tcp_server_on_listener(
             dyn_source,
@@ -475,11 +512,14 @@ impl PvaServer {
         ));
 
         let udp_abort = udp_handle.abort_handle();
+        let udp_v6_abort = udp_v6_handle.as_ref().map(|h| h.abort_handle());
         let tcp_abort = tcp_handle.abort_handle();
         Self {
             udp_handle: Some(udp_handle),
+            udp_v6_handle,
             tcp_handle: Some(tcp_handle),
             udp_abort,
+            udp_v6_abort,
             tcp_abort,
             effective_config: config,
             bound_tcp_port,
@@ -563,6 +603,11 @@ impl PvaServer {
                 .as_ref()
                 .map(|h| !h.is_finished())
                 .unwrap_or(false),
+            udp_v6_alive: self
+                .udp_v6_handle
+                .as_ref()
+                .map(|h| !h.is_finished())
+                .unwrap_or(false),
             tcp_alive: self
                 .tcp_handle
                 .as_ref()
@@ -581,6 +626,9 @@ impl PvaServer {
     pub fn stop(&self) {
         self.tcp_abort.abort();
         self.udp_abort.abort();
+        if let Some(ref abort) = self.udp_v6_abort {
+            abort.abort();
+        }
     }
 
     /// Block until either task returns. Either subsystem exiting is
@@ -633,6 +681,10 @@ pub struct ServerReport {
     pub ignore_addrs: usize,
     pub beacon_period_secs: u64,
     pub udp_alive: bool,
+    /// `true` iff the optional IPv6 UDP responder task is running.
+    /// `false` when `PvaServerConfig::enable_ipv6_udp = false`
+    /// (the default) — distinct from "task crashed".
+    pub udp_v6_alive: bool,
     pub tcp_alive: bool,
     /// Live per-connection counters captured under the registry's
     /// read lock (F-G7). pvxs `Server::report()` parity at the
@@ -723,6 +775,123 @@ mod tcp_fallback_tests {
                 .await
                 .expect("connect timed out");
         let _stream = connect.expect("IPv6 TCP connect must succeed");
+        drop(server);
+    }
+
+    /// PR #205 IPv6 Stage 2 — `enable_ipv6_udp = true` spawns a
+    /// companion `[::]:udp_port` SEARCH responder. We send a hand-
+    /// rolled SEARCH datagram from a v6 client socket against
+    /// `[::1]:udp_port` and verify the server's SEARCH_RESPONSE
+    /// arrives back with the right tcp_port + GUID-length payload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn udp_v6_responder_answers_v6_search() {
+        use crate::nt::typed::TypedNT;
+        use crate::proto::{ByteOrder, Command, PvaHeader, ReadExt, WriteExt};
+        use std::io::Cursor;
+        use std::net::Ipv6Addr;
+        use tokio::net::UdpSocket as TokioUdp;
+
+        // Pick a free v4 UDP port via `Ipv4Addr::LOCALHOST` so the
+        // server's pick is OS-coordinated; the v6 responder will
+        // bind `[::]:that_port` for its companion listener.
+        let pick_udp = || {
+            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("isolated udp port");
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+
+        let pv = crate::server_native::SharedPV::new();
+        pv.open(f64::descriptor(), f64::to_pv_field(&1.0));
+        let source = Arc::new(SharedSource::new());
+        source.add("V6:UDP:PV", pv);
+
+        let udp_port = pick_udp();
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            enable_ipv6_udp: true,
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config);
+        let server_tcp_port = server.report().tcp_port;
+        // Wait briefly for the v6 listener to bind.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let report = server.report();
+        assert!(
+            report.udp_v6_alive,
+            "udp_v6 responder must be alive when enable_ipv6_udp=true"
+        );
+
+        // Hand-roll a SEARCH frame asking for `V6:UDP:PV`. The
+        // server replies with a SEARCH_RESPONSE containing
+        // tcp_port + "tcp" protocol when the PV name matches.
+        let client = TokioUdp::bind("[::1]:0").await.expect("v6 client bind");
+        let mut payload = Vec::new();
+        payload.put_u32(0xABCD_0001, ByteOrder::Little); // seq
+        payload.put_u8(0); // flags
+        payload.extend_from_slice(&[0u8; 3]); // reserved
+        // 16-byte reply addr = ::1
+        payload.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        let reply_port = client.local_addr().unwrap().port();
+        payload.put_u16(reply_port, ByteOrder::Little);
+        // 1 protocol = "tcp"
+        payload.extend_from_slice(&crate::proto::encode_size(1, ByteOrder::Little));
+        crate::proto::encode_string_into("tcp", ByteOrder::Little, &mut payload);
+        // 1 query: cid=0x1234, name = V6:UDP:PV
+        payload.put_u16(1, ByteOrder::Little);
+        payload.put_u32(0x1234, ByteOrder::Little);
+        crate::proto::encode_string_into("V6:UDP:PV", ByteOrder::Little, &mut payload);
+        let header = PvaHeader::application(
+            true,
+            ByteOrder::Little,
+            Command::Search.code(),
+            payload.len() as u32,
+        );
+        let mut frame = Vec::new();
+        header.write_into(&mut frame);
+        frame.extend_from_slice(&payload);
+
+        let server_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), udp_port);
+        client
+            .send_to(&frame, server_v6)
+            .await
+            .expect("send v6 SEARCH");
+
+        // Receive SEARCH_RESPONSE.
+        let mut rx = vec![0u8; 64 * 1024];
+        let (n, peer) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut rx))
+            .await
+            .expect("v6 SEARCH_RESPONSE timed out")
+            .expect("recv_from ok");
+        assert!(n >= PvaHeader::SIZE, "response too short: {n}");
+        // Replies arrive on the v6 unicast loopback path, source
+        // address may be the link-local equivalent. Accept any v6.
+        assert!(matches!(peer.ip(), IpAddr::V6(_)));
+        let mut cur = Cursor::new(&rx[..n]);
+        let hdr = PvaHeader::decode(&mut cur).expect("hdr decode");
+        assert_eq!(
+            hdr.command,
+            Command::SearchResponse.code(),
+            "expected SEARCH_RESPONSE"
+        );
+        // Confirm the payload mentions our server's tcp_port (16-byte
+        // address + 2-byte port at offset 12+4+16 = 32, accounting
+        // for guid+seq+addr layout). Cheaper: decode after guid.
+        let mut p = Cursor::new(&rx[PvaHeader::SIZE..n]);
+        let _guid = p.get_bytes(12).expect("guid");
+        let _seq = p.get_u32(hdr.flags.byte_order()).expect("seq");
+        let _addr16 = p.get_bytes(16).expect("addr16");
+        let advertised_tcp = p.get_u16(hdr.flags.byte_order()).expect("tcp_port");
+        assert_eq!(
+            advertised_tcp, server_tcp_port,
+            "SEARCH_RESPONSE must advertise server's actual TCP port"
+        );
+
         drop(server);
     }
 

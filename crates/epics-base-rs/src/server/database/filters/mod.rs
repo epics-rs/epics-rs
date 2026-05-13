@@ -32,11 +32,13 @@ use crate::server::recgbl::EventMask;
 pub mod arr;
 pub mod dbnd;
 pub mod decimate;
+pub mod parser;
 pub mod ts;
 
 pub use arr::{ArrayFilter, ArrayFilterConfig};
 pub use dbnd::{DeadbandFilter, DeadbandMode};
 pub use decimate::DecimateFilter;
+pub use parser::{ParsedChannelName, parse_filter_chain, split_channel_name};
 pub use ts::TimestampFilter;
 
 /// One event passed through the filter chain. Wraps the standard

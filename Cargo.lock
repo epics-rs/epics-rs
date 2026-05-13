@@ -832,6 +832,7 @@ dependencies = [
  "if-addrs",
  "parking_lot",
  "rustyline",
+ "serde_json",
  "serial_test",
  "socket2 0.5.10",
  "tempfile",
@@ -880,6 +881,7 @@ dependencies = [
  "hickory-proto",
  "hickory-resolver",
  "if-addrs",
+ "libc",
  "mdns-sd",
  "metrics",
  "metrics-exporter-prometheus",
@@ -3214,6 +3216,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap 2.14.0",
  "itoa",
  "memchr",
  "serde",

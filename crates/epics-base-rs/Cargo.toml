@@ -22,6 +22,7 @@ rustyline = "14"
 # Cross-platform interface enumeration (Linux/macOS/Windows). Used by
 # `epics_base_rs::net::iface_map` to expose ifindex/IP/broadcast/mcast caps.
 if-addrs = "0.13"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # Dev-only — `path` (no `version`) so `cargo publish` strips this
 # from the uploaded manifest. Lets `epics-base-rs` publish first in

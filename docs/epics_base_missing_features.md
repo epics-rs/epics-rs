@@ -322,7 +322,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **iocsh 스크립트 include 시 echo 비활성화 옵션** (`0fd07d16`, 2016): `< script.cmd` 등으로 스크립트를 실행할 때 각 명령줄의 에코를 끄는 옵션.
 - **`dbStopServers()` 를 `iocShutdown()`에 포함** (`a9393242`, 2017): IOC 셧다운 시 CA 서버를 명시적으로 정지하는 로직. `epics-rs`의 `iocShutdown` 경로 확인.
 - **`readline`을 `epicsExit()`에서 정리** (`444b89f5`, 2015): `epicsExit` 시 readline 라이브러리를 정상적으로 해제하는 훅.
-- **`EPICS_TZ` 환경 변수로 표준화** (`b0db6568`, 2019): `EPICS_TIMEZONE`을 대체하는 POSIX 표준 `EPICS_TZ` 변수 지원.
+- **`EPICS_TZ` 환경 변수로 표준화** (`b0db6568`, 2019) — ⚠️ **N/A**: 원 commit은 RTEMS `rtems_init()`에서 `EPICS_TIMEZONE` 대신 `EPICS_TZ`를 읽도록 변경. Rust는 RTEMS 비대상 + `chrono::Local` 등이 OS POSIX `TZ` 환경변수를 자동 사용하므로 EPICS-namespaced timezone env var를 별도로 다룰 진입점이 없음.
 - **`generalTime`의 이벤트 번호 >= 256 지원** (`215c5d95`, 2018): `NUM_TIME_EVENTS` 이상의 이벤트 코드를 타임스탬프 프로바이더에서 처리하는 기능. (→ RELEASE-3.16.md 항목과 동일)
 - **`osiClockTime` 동기화 훅 지원** (`5cfff383`, 2019): 외부 시간 소스가 동기화될 때 알림을 받는 훅 인터페이스.
 - **`epicsTime` UTC `struct tm` 전체 변환** (`37024011`, 2016): 타임존 없이 UTC 기반으로 `struct tm`과 완전한 상호 변환을 지원하는 API.

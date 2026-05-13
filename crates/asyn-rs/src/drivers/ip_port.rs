@@ -17,27 +17,36 @@ use crate::{asyn_trace, asyn_trace_io};
 
 /// IP transport protocol.
 ///
-/// Matches C asyn's protocol suffix conventions:
-/// - `TCP` or no suffix → blocking TCP
-/// - `TCP&` → non-blocking TCP (connect + poll)
-/// - `UDP` → connected UDP
-/// - `UDP&` → UDP with SO_BROADCAST
-/// - `UDP*` → UDP multicast
+/// Mirrors C asyn `drvAsynIPPort.c::parseHostInfo` (lines 356-391)
+/// protocol suffix dispatch verbatim:
+///
+/// - `TCP` or no suffix → blocking TCP (SOCK_STREAM)
+/// - `TCP&` → TCP + `SO_REUSEPORT` (NOT non-blocking — see C
+///   line 360-363 setting `FLAG_SO_REUSEPORT`)
+/// - `UDP` → connected UDP (SOCK_DGRAM)
+/// - `UDP&` → UDP + `SO_REUSEPORT` (C line 375-378, NOT broadcast)
+/// - `UDP*` → UDP + `SO_BROADCAST` (C line 379-382, NOT multicast)
+/// - `UDP*&` → UDP + `SO_BROADCAST` + `SO_REUSEPORT` (C line 383-387)
 /// - `unix://path` → Unix domain socket (cfg(unix) only)
+/// - `HTTP` → TCP + `FLAG_CONNECT_PER_TRANSACTION` (C line 368-371)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IpProtocol {
     #[default]
     Tcp,
-    /// Non-blocking TCP (TCP&): uses O_NONBLOCK + poll for connect.
-    TcpNonBlocking,
+    /// TCP + `SO_REUSEPORT` (`tcp&` in C asyn). C parity:
+    /// `FLAG_SO_REUSEPORT` set, no other flags. NOT non-blocking.
+    TcpReusePort,
     Udp,
-    /// UDP with SO_BROADCAST enabled (UDP&).
+    /// UDP + `SO_REUSEPORT` (`udp&` in C asyn).
+    UdpReusePort,
+    /// UDP + `SO_BROADCAST` (`udp*` in C asyn).
     UdpBroadcast,
-    /// UDP multicast (UDP*).
-    UdpMulticast,
+    /// UDP + `SO_BROADCAST` + `SO_REUSEPORT` (`udp*&` in C asyn).
+    UdpBroadcastReusePort,
     /// Unix domain socket (unix://path).
     Unix,
-    /// HTTP: TCP with connect-per-transaction (C parity: FLAG_CONNECT_PER_TRANSACTION).
+    /// HTTP: TCP with connect-per-transaction (C parity:
+    /// `FLAG_CONNECT_PER_TRANSACTION` from line 368-371).
     Http,
 }
 
@@ -105,14 +114,18 @@ impl IpPortConfig {
 
 /// Parse the protocol suffix from the end of a spec string.
 /// Returns (remaining_addr_part, protocol).
+///
+/// Order matters: longest suffix first ("UDP*&" before "UDP*"
+/// before "UDP", and "TCP&" before "TCP") because we use
+/// `ends_with` and the first match wins.
 fn parse_protocol_suffix(spec: &str) -> (&str, IpProtocol) {
     let upper = spec.to_ascii_uppercase();
 
-    // Check multi-char suffixes first (order matters: "UDP&" before "UDP")
     for (suffix, proto) in [
-        (" TCP&", IpProtocol::TcpNonBlocking),
-        (" UDP&", IpProtocol::UdpBroadcast),
-        (" UDP*", IpProtocol::UdpMulticast),
+        (" UDP*&", IpProtocol::UdpBroadcastReusePort),
+        (" UDP&", IpProtocol::UdpReusePort),
+        (" UDP*", IpProtocol::UdpBroadcast),
+        (" TCP&", IpProtocol::TcpReusePort),
         (" HTTP", IpProtocol::Http),
         (" TCP", IpProtocol::Tcp),
         (" UDP", IpProtocol::Udp),
@@ -471,39 +484,31 @@ impl DrvAsynIPPort {
         Ok(socket)
     }
 
-    fn connect_udp_broadcast(&mut self) -> AsynResult<UdpSocket> {
+    /// UDP variant builder — applies any combination of `SO_BROADCAST`
+    /// and `SO_REUSEPORT` requested by the protocol suffix. Mirrors C
+    /// asyn `connectIt` UDP socket option flow (drvAsynIPPort.c
+    /// branches on `tty->flags & FLAG_BROADCAST` and `FLAG_SO_REUSEPORT`).
+    fn connect_udp_with_options(
+        &mut self,
+        broadcast: bool,
+        reuse_port: bool,
+    ) -> AsynResult<UdpSocket> {
         let socket = self.connect_udp()?;
-        socket.set_broadcast(true)?;
-        Ok(socket)
-    }
-
-    fn connect_udp_multicast(&mut self) -> AsynResult<UdpSocket> {
-        let bind_addr = if let Some(local_port) = self.config.local_port {
-            format!("0.0.0.0:{local_port}")
-        } else {
-            format!("0.0.0.0:{}", self.config.port)
-        };
-        let socket = UdpSocket::bind(&bind_addr)?;
-        // Try to parse as IPv4 multicast address
-        if let Ok(mcast_addr) = self.config.host.parse::<std::net::Ipv4Addr>() {
-            socket
-                .join_multicast_v4(&mcast_addr, &std::net::Ipv4Addr::UNSPECIFIED)
-                .map_err(|e| AsynError::Status {
+        if broadcast {
+            socket.set_broadcast(true)?;
+        }
+        if reuse_port {
+            #[cfg(unix)]
+            {
+                // SockRef borrows the std socket's fd without taking
+                // ownership — set_reuse_port goes through socket2's
+                // setsockopt(SO_REUSEPORT) wrapper.
+                let sref = socket2::SockRef::from(&socket);
+                sref.set_reuse_port(true).map_err(|e| AsynError::Status {
                     status: AsynStatus::Error,
-                    message: format!("join multicast {}: {e}", self.config.host),
+                    message: format!("UDP SO_REUSEPORT failed: {e}"),
                 })?;
-        } else if let Ok(mcast_addr) = self.config.host.parse::<std::net::Ipv6Addr>() {
-            socket
-                .join_multicast_v6(&mcast_addr, 0)
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("join multicast v6 {}: {e}", self.config.host),
-                })?;
-        } else {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("invalid multicast address: {}", self.config.host),
-            });
+            }
         }
         Ok(socket)
     }
@@ -531,26 +536,40 @@ impl PortDriver for DrvAsynIPPort {
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         match self.config.protocol {
-            IpProtocol::Tcp | IpProtocol::TcpNonBlocking => {
+            IpProtocol::Tcp | IpProtocol::TcpReusePort => {
                 let stream = self.connect_tcp()?;
                 if self.config.no_delay {
                     stream.set_nodelay(true)?;
                 }
-                if self.config.protocol == IpProtocol::TcpNonBlocking {
-                    stream.set_nonblocking(true)?;
+                if self.config.protocol == IpProtocol::TcpReusePort {
+                    // tcp& in C asyn = TCP + SO_REUSEPORT (NOT
+                    // non-blocking). Apply via SockRef on the std
+                    // TcpStream so we don't churn the socket type.
+                    #[cfg(unix)]
+                    {
+                        let sref = socket2::SockRef::from(&stream);
+                        sref.set_reuse_port(true).map_err(|e| AsynError::Status {
+                            status: AsynStatus::Error,
+                            message: format!("TCP SO_REUSEPORT failed: {e}"),
+                        })?;
+                    }
                 }
                 self.io.inner = Some(IpIoInner::Tcp(stream));
             }
             IpProtocol::Udp => {
-                let socket = self.connect_udp()?;
+                let socket = self.connect_udp_with_options(false, false)?;
+                self.io.inner = Some(IpIoInner::Udp(socket));
+            }
+            IpProtocol::UdpReusePort => {
+                let socket = self.connect_udp_with_options(false, true)?;
                 self.io.inner = Some(IpIoInner::Udp(socket));
             }
             IpProtocol::UdpBroadcast => {
-                let socket = self.connect_udp_broadcast()?;
+                let socket = self.connect_udp_with_options(true, false)?;
                 self.io.inner = Some(IpIoInner::Udp(socket));
             }
-            IpProtocol::UdpMulticast => {
-                let socket = self.connect_udp_multicast()?;
+            IpProtocol::UdpBroadcastReusePort => {
+                let socket = self.connect_udp_with_options(true, true)?;
                 self.io.inner = Some(IpIoInner::Udp(socket));
             }
             #[cfg(unix)]
@@ -1039,34 +1058,44 @@ mod tests {
         assert_eq!(drv.config.port, 9999);
     }
 
-    // --- Phase 3A: protocol suffix parsing ---
+    // --- Protocol suffix parsing — C parity (drvAsynIPPort.c:355-391) ---
 
     #[test]
-    fn test_parse_tcp_nonblocking() {
+    fn test_parse_tcp_reuse_port() {
+        // C asyn `tcp&` = TCP + SO_REUSEPORT (NOT non-blocking).
         let cfg = IpPortConfig::parse("host:5025 TCP&").unwrap();
-        assert_eq!(cfg.protocol, IpProtocol::TcpNonBlocking);
+        assert_eq!(cfg.protocol, IpProtocol::TcpReusePort);
         assert_eq!(cfg.host, "host");
         assert_eq!(cfg.port, 5025);
     }
 
     #[test]
-    fn test_parse_tcp_nonblocking_lowercase() {
+    fn test_parse_tcp_reuse_port_lowercase() {
         let cfg = IpPortConfig::parse("host:5025 tcp&").unwrap();
-        assert_eq!(cfg.protocol, IpProtocol::TcpNonBlocking);
+        assert_eq!(cfg.protocol, IpProtocol::TcpReusePort);
+    }
+
+    #[test]
+    fn test_parse_udp_reuse_port() {
+        // C asyn `udp&` = UDP + SO_REUSEPORT (NOT broadcast).
+        let cfg = IpPortConfig::parse("192.168.1.10:9000 UDP&").unwrap();
+        assert_eq!(cfg.protocol, IpProtocol::UdpReusePort);
+        assert_eq!(cfg.host, "192.168.1.10");
     }
 
     #[test]
     fn test_parse_udp_broadcast() {
-        let cfg = IpPortConfig::parse("192.168.1.255:9000 UDP&").unwrap();
+        // C asyn `udp*` = UDP + SO_BROADCAST (NOT multicast).
+        let cfg = IpPortConfig::parse("192.168.1.255:9000 UDP*").unwrap();
         assert_eq!(cfg.protocol, IpProtocol::UdpBroadcast);
         assert_eq!(cfg.host, "192.168.1.255");
     }
 
     #[test]
-    fn test_parse_udp_multicast() {
-        let cfg = IpPortConfig::parse("239.1.2.3:5000 UDP*").unwrap();
-        assert_eq!(cfg.protocol, IpProtocol::UdpMulticast);
-        assert_eq!(cfg.host, "239.1.2.3");
+    fn test_parse_udp_broadcast_reuse_port() {
+        // C asyn `udp*&` = UDP + SO_BROADCAST + SO_REUSEPORT.
+        let cfg = IpPortConfig::parse("192.168.1.255:9000 UDP*&").unwrap();
+        assert_eq!(cfg.protocol, IpProtocol::UdpBroadcastReusePort);
     }
 
     #[test]
@@ -1118,15 +1147,19 @@ mod tests {
         );
         assert_eq!(
             IpPortConfig::parse("h:1 Tcp&").unwrap().protocol,
-            IpProtocol::TcpNonBlocking
+            IpProtocol::TcpReusePort
         );
         assert_eq!(
             IpPortConfig::parse("h:1 Udp&").unwrap().protocol,
-            IpProtocol::UdpBroadcast
+            IpProtocol::UdpReusePort
         );
         assert_eq!(
             IpPortConfig::parse("h:1 Udp*").unwrap().protocol,
-            IpProtocol::UdpMulticast
+            IpProtocol::UdpBroadcast
+        );
+        assert_eq!(
+            IpPortConfig::parse("h:1 Udp*&").unwrap().protocol,
+            IpProtocol::UdpBroadcastReusePort
         );
     }
 
@@ -1168,10 +1201,14 @@ mod tests {
 
     // --- UDP broadcast flag test ---
 
+    /// `UDP*` (broadcast suffix per C asyn) parses correctly and a
+    /// driver can be constructed against a broadcast address.
+    /// Pre-fix this test asserted UdpBroadcast for `UDP&`, which was
+    /// the protocol-suffix swap bug.
     #[test]
     fn test_udp_broadcast_flag() {
-        let cfg = IpPortConfig::parse("255.255.255.255:9000 UDP&").unwrap();
-        let drv = DrvAsynIPPort::new("bcast_test", "255.255.255.255:9000 UDP&").unwrap();
+        let cfg = IpPortConfig::parse("255.255.255.255:9000 UDP*").unwrap();
+        let drv = DrvAsynIPPort::new("bcast_test", "255.255.255.255:9000 UDP*").unwrap();
         assert_eq!(cfg.protocol, IpProtocol::UdpBroadcast);
         assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcast);
     }

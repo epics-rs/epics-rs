@@ -2555,3 +2555,92 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
          DST.time should not advance from {dst_time_before_second:?} to {dst_time_after_second:?}"
     );
 }
+
+/// epics-base commit 62c11c2 (2019) regression: a record whose OUT
+/// link points at itself ("self link") must not trigger an infinite
+/// RPRO/PUTF reprocessing loop. The C bug computed
+/// `dstset = pdst.procThread==NULL` without checking psrc==pdst, so
+/// when the self-link write fired processTarget the dst-side state
+/// (= same record) was set up for RPRO and the record was scheduled
+/// to reprocess after the current pass completed — which would
+/// re-fire the self-link, ad infinitum.
+///
+/// In the Rust port the equivalent guard is the `visited: HashSet<String>`
+/// passed through every `process_record_with_links_inner` call:
+/// `visited.insert(name)` returns false for the second call on the
+/// same record, and the function returns Ok(()) immediately. The CP
+/// dispatch path (`dispatch_cp_targets`) and the RPRO recheck at L942
+/// likewise bail out on self-targets via the same guard.
+///
+/// This test pins the contract: a longout with OUT="<self>" must
+/// process exactly once per `process_record_with_links` call and the
+/// call must complete promptly (we use a 1s timeout to fail fast on
+/// infinite recursion regressions).
+#[tokio::test]
+async fn test_self_link_out_does_not_loop() {
+    use epics_base_rs::server::records::longout::LongoutRecord;
+    use std::time::Duration;
+
+    let db = PvDatabase::new();
+    db.add_record("SELF_LO", Box::new(LongoutRecord::new(0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("SELF_LO").await {
+        let mut inst = rec.write().await;
+        // OUT="SELF_LO" → defaults to .VAL with PP, writes back to
+        // self and would normally re-trigger processing.
+        inst.put_common_field("OUT", EpicsValue::String("SELF_LO".into()))
+            .unwrap();
+    }
+
+    // 1-second timeout: if the self-link guard regresses, the
+    // process call would never return (infinite recursion via
+    // write_db_link_value → process_record_with_links → ...).
+    let mut visited = HashSet::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        db.process_record_with_links("SELF_LO", &mut visited, 0),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "self-link processing must complete within 1s — \
+         hang implies the visited HashSet guard regressed"
+    );
+    result.unwrap().expect("process call must succeed");
+
+    // Confirm the visited set picked up SELF_LO exactly once.
+    assert!(visited.contains("SELF_LO"));
+
+    // A subsequent process call (fresh visited) must also complete
+    // promptly — the RPRO flag from the first call must not have
+    // been left set on the record, otherwise the record would
+    // reprocess in a loop after every external put.
+    let mut visited2 = HashSet::new();
+    let result2 = tokio::time::timeout(
+        Duration::from_secs(1),
+        db.process_record_with_links("SELF_LO", &mut visited2, 0),
+    )
+    .await;
+    assert!(
+        result2.is_ok(),
+        "subsequent self-link processing must also complete within 1s"
+    );
+    result2.unwrap().expect("second process call must succeed");
+
+    // RPRO flag must be cleared after each call, not stuck at true.
+    let rpro_after = db
+        .get_record("SELF_LO")
+        .await
+        .expect("SELF_LO exists")
+        .read()
+        .await
+        .common
+        .rpro;
+    assert!(
+        !rpro_after,
+        "RPRO must be cleared after self-link processing — \
+         stuck-true would queue an infinite reprocess loop"
+    );
+}

@@ -198,7 +198,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 ### 7-C. 런타임 수명주기 / 셧다운 (Lifecycle, 112건 → 핵심 점검 항목)
 - **`CA Repeater`를 프로세스 실행 실패 시 스레드로 폴백** (`08b741ed`, 2021): `caRepeater` 실행 파일을 실행할 수 없을 때 내부 스레드로 대체 실행하는 로직. `epics-ca-rs`의 Repeater 시작 전략 확인.
 - **`caRepeater`에 `-d` 디버그 옵션 추가** (`e2717521`, 2026): 커맨드라인 디버그 플래그 지원. → 섹션 1의 관련 항목(debug flag) 확인.
-- **`iocsh` 명령어에 `iocshSetError()` 전파** (`144f9756`, 2024): 명령어 실행 실패 시 오류 코드를 이후 로직에 전파하는 기능.
+- **`iocsh` 명령어에 `iocshSetError()` 전파** (`144f9756`, 2024) — ✅ **DONE**: `IocShell::execute_script` / `execute_script_with_macros`가 라인별 `Err`를 `last_err`로 캡처하여 스크립트 종료 시 종합 Err 반환 (=`iocshSetError` 의 비-제로 exit code 등가). 본 commit에서 `dbLoadRecords`가 add_record 거부 시 `Ok(Continue)`로 swallow하던 케이스(`commands.rs:1000-1002`)를 `Err(e)` 반환으로 수정 + duplicate name regression 테스트 추가.
 - **`iocsh` 인자 파싱 버그 수정** (`3dbc9ea2`, 2023): 인자 분리(splitting) 로직의 버그 수정 → `epics-rs` iocsh 파서 정합성 확인.
 - **`casStatsFetch()` RSRV 미초기화 시 안전성** (`7a6e11ca`, 2026): RSRV가 초기화되기 전에 CA 서버 통계를 조회하면 크래시하는 버그. `epics-rs`의 `dbServerStats()` 초기화 보호 확인.
 - **`dbGet`의 루프-안전 래퍼** (`dac620a7`, 2024): `dbGet()` 재귀 호출 시 데드락을 방지하는 루프-안전 래퍼 추가.

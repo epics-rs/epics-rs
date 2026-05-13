@@ -998,8 +998,14 @@ fn cmd_db_load_records() -> CommandDef {
                     Ok(())
                 });
                 if let Err(e) = added {
+                    // epics-base 144f975: propagate the failure to the
+                    // iocsh script chain (equivalent of `iocshSetError`)
+                    // so a startup script returns non-zero on a rejected
+                    // record load. The printed message stays for
+                    // operator-visible diagnostics; the `Err` return
+                    // lets `execute_script` mark its `last_err`.
                     ctx.println(&e);
-                    return Ok(CommandOutcome::Continue);
+                    return Err(e);
                 }
             }
 

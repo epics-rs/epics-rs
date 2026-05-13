@@ -695,6 +695,34 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// epics-base 144f975 — `dbLoadRecords` rejection (e.g., duplicate
+    /// name) must propagate an `Err` back to the iocsh script chain
+    /// (the Rust equivalent of `iocshSetError`). Pre-fix the command
+    /// printed the error and returned `Ok(Continue)`, so a startup
+    /// script silently succeeded. Verifies `execute_script` surfaces
+    /// the rejection as its overall result.
+    #[test]
+    fn test_db_load_records_duplicate_rejection_propagates() {
+        let shell = make_shell();
+        // make_shell already added TEST_REC. Loading a .db with the same
+        // name must hit `add_record` rejection and surface Err.
+        let db_path = std::env::temp_dir().join("iocsh_dup_load.db");
+        std::fs::write(&db_path, "record(ai, \"TEST_REC\") {}\n").unwrap();
+        let script_path = std::env::temp_dir().join("iocsh_dup_load.cmd");
+        std::fs::write(
+            &script_path,
+            format!("dbLoadRecords {}\n", db_path.display()),
+        )
+        .unwrap();
+        let result = shell.execute_script(script_path.to_str().unwrap());
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&script_path);
+        assert!(
+            result.is_err(),
+            "dbLoadRecords with duplicate record name must propagate Err"
+        );
+    }
+
     /// C++-style call `iocshLoad("path", "K=V,...")` must tokenize to
     /// the same args as the space form — quotes around the macro
     /// string protect the comma so it stays one token.

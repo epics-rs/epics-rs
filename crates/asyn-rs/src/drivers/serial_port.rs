@@ -442,6 +442,41 @@ impl DrvAsynSerialPort {
         self.base.push_octet_interpose(layer);
     }
 
+    /// Send a serial line BREAK condition (RS-232 BREAK), mirroring
+    /// asyn PR #188 ("auto serial break"). Duration is in tenths of
+    /// a second per POSIX `tcsendbreak(fd, duration)` (Linux honors
+    /// the value, BSD/macOS treats non-zero as ≥0.25s — match the
+    /// platform semantic). `duration = 0` requests the minimum
+    /// implementation-defined BREAK length (typically 250-500ms).
+    ///
+    /// Returns an error if the port is not currently connected.
+    /// Operators driving break-reset protocols (e.g. some Tektronix
+    /// scopes, certain Allen-Bradley PLCs) call this between
+    /// commands to force the device's serial state machine to its
+    /// initial state.
+    pub fn send_break(&self, duration_tenths: i32) -> AsynResult<()> {
+        let fd = self.io.fd_or_err()?;
+        let ret = unsafe { libc::tcsendbreak(fd, duration_tenths) };
+        if ret < 0 {
+            return Err(AsynError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Drain any output queued on the serial port, blocking until
+    /// every byte the kernel has accepted has actually been
+    /// transmitted (POSIX `tcdrain`). Useful immediately before
+    /// [`Self::send_break`] so the BREAK signal isn't preceded by
+    /// unflushed user data.
+    pub fn drain_output(&self) -> AsynResult<()> {
+        let fd = self.io.fd_or_err()?;
+        let ret = unsafe { libc::tcdrain(fd) };
+        if ret < 0 {
+            return Err(AsynError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     fn get_current_termios(&self) -> AsynResult<libc::termios> {
         let fd = self.io.fd_or_err()?;
         let mut t: libc::termios = unsafe { std::mem::zeroed() };

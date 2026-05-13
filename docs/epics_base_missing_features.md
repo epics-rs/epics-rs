@@ -73,10 +73,10 @@
 - **`asyn:READBACK` 연동 미완성 (PR #208, #60)** — ⏭️ **ALREADY**: round 6에서 `adapter.rs::asyn_readback` 플래그로 처리.
 - **`UInt64` 인터페이스 파이프라인 (Issue #231)** — ⏭️ **ALREADY**: `asyn-rs/param.rs`에 `UInt64`/`UInt64Array` 타입 정의 완료.
 - **Serial Port 드라이버 (PR #180)** — ⏭️ **ALREADY**: `asyn-rs/drivers/serial_port.rs::DrvAsynSerialPort` 구현.
-- **FTDI 드라이버 (PR #88)** — ⏸️ **DEFERRED (external dep)**: USB FTDI 디바이스 드라이버. `libftdi-rs` 또는 `ftdi-mpsse` crate 바인딩 필요. 사용 사례 등장 시 별도 PR.
+- **FTDI 드라이버 (PR #88)** — ⏸️ **DEFERRED (external dep + niche)**: USB FTDI MPSSE driver. `ftdi-mpsse` 또는 `libftd2xx` 외부 crate 바인딩 필요. asyn-rs 의 다른 drivers (ip_port, serial_port, ip_server_port) 와 동일한 PortDriver trait 구현 패턴이라 추후 추가는 간단 (~200 LOC + 외부 dep). 현재 epics-rs 사용 사이트가 FTDI를 요구하지 않아 일단 보류.
 - **IP 서버 포트의 `Bind` 인터페이스 및 `SO_REUSEPORT` 지원 (PR #148, #109)** — ✅ **DONE** (this session): 신규 모듈 `asyn-rs::drivers::ip_server_port::DrvAsynIPServerPort`. `IpServerConfig` 가 `host:port [TCP] [SO_REUSEPORT]` 파싱, IPv4/IPv6 bracket form 모두 지원. `accept_one()` 가 슬롯 테이블 (default 64 max_clients) 기반으로 incoming TCP 연결을 addr 슬롯에 할당. `read_octet`/`write_octet` 가 슬롯별 라우팅 + addr=-1 broadcast 지원. SO_REUSEPORT는 Linux/BSD `set_reuse_port(true)` 로 설정. 10 단위 테스트 (parser 5종 + e2e round-trip + slot cap + drop reuse + SO_REUSEPORT 두 번 bind).
 - **`lsi`, `lso`, `printf` 레코드에 대한 `asyn` 매핑 (PR #104)** — ⏭️ **ALREADY**: `asyn-rs/adapter.rs` 가 `asynOctet` 인터페이스 (read/write)를 통해 String / CharArray ↔ EpicsValue 변환 처리 (`adapter.rs:411,462,773`). lsi/lso/printf 모두 String VAL 필드를 가지므로 `asynOctet` DTYP로 자동 wire-through. printf는 record-side format expansion이 별도 단계라 record 자체에서 해결.
-- **단순 평균치 장치 지원 (Issue #30)** — ⏸️ **DEFERRED**: `asynInt32Average`/`asynFloat64Average` 인터페이스 미구현. 현재 averaging은 record-side (compress 레코드 ALG=Average) 로 처리. asyn-side averaging은 hardware-driven oversampling 시나리오 — 사용 사례 등장 시 별도 PR.
+- **단순 평균치 장치 지원 (Issue #30)** — ✅ **DONE** (this session): `interfaces::average` 모듈 신규 — `AsynInt32Average` / `AsynFloat64Average` 인터페이스 + `RingAverager<T>` 헬퍼 (capacity 기반 circular buffer, oldest 드롭, read-and-reset/peek/reset API). 5 단위 테스트.
 
 ---
 
@@ -125,12 +125,12 @@
 
 > 본 세션에서 직접 다루지 않음 → **⏸️ DEFERRED**.
 
-- **직렬 포트 `Auto serial break` 기능 (PR #188)** — ⏸️ **DEFERRED**: 시리얼 라인 break 자동 감지 (RS-232 BREAK condition). `serial_port.rs` 에 break 감지 미구현. 사용 사례 등장 시 추후.
+- **직렬 포트 `Auto serial break` 기능 (PR #188)** — ✅ **DONE** (this session): `DrvAsynSerialPort::send_break(duration_tenths)` 와 `drain_output()` 추가. POSIX `tcsendbreak` / `tcdrain` 호출. BREAK 길이는 0.1s 단위 (Linux 정확값, BSD/macOS는 ≥0.25s).
 - **`ASYN_TRACE_STATE` 마스크 비트 (PR #67)** — ✅ **DONE** (this session): `TraceMask::STATE = 0x0040` 추가. 회귀 테스트 `test_state_bit_value_and_disjoint`.
 - **`asynMask`의 시프트 파라미터 (Issue #166)** — ⏭️ **ALREADY**: SHFT는 record-layer 책임 — `mbbiDirect`/`mbboDirect` 가 `shft: u32` 필드 보유, asyn-side `mask` 가 단순 bit 선택만 담당.
 - **`setStringParam` NULL 포인터 안전성 (Issue #146)** — ⏭️ ALREADY: 러스트의 `Option<&str>` 모델 + 타입 시스템으로 구조적 방어. NULL deref 자체 발생 불가.
 - **EOS(End-of-String) 설정자 블록 문제 (Issue #103)** — ⏭️ **ALREADY**: `interpose/eos.rs` 의 `set_input_eos`/`set_output_eos` 가 atomic Mutex 안에서 update — C 의 thread blocking 패턴 부재.
-- **장치 드라이버로의 파라미터 변경 알림(Notification) 방향성 버그 대조 (Issue #46)** — ⏸️ **DEFERRED**: bidirectional parameter notification — 현재 `interrupt.rs::Interrupt` 가 driver → record 방향만 wire. record → driver 방향은 `RequestOp::*Write` op 자체로 표현 — 별도 notification API 필요성 검토.
+- **장치 드라이버로의 파라미터 변경 알림(Notification) 방향성 버그 대조 (Issue #46)** — ⏭️ **ALREADY** (verified): bidirectional notification은 이미 완비. driver→record는 `interrupt.rs::Interrupt` + `call_param_callbacks` 가 처리, record→driver는 trait method `write_int32`/`write_float64`/...의 default impl이 `set_*_param` + `call_param_callbacks` 호출로 callback 발화. driver internal poll task → records는 `set_int32_param` + `call_param_callbacks` 호출로 동등 처리. 양방향 알림 갭 부재.
 - **`drvAsynIPPort` 읽기 타임아웃 시 연결 종료 옵션 (PR #6)** — ⏭️ **ALREADY**: `IpPortConfig::disconnect_on_read_timeout: bool` (`drivers/ip_port.rs:364`), read 경로 L649 에서 timeout 시 자동 disconnect. 회귀 테스트 `test_disconnect_on_read_timeout`.
 - **`asynSetTrace*Mask`의 문자열 옵션 파싱 (PR #76)** — ✅ **DONE** (this session): `TraceMask::from_symbolic`, `TraceIoMask::from_symbolic`, `TraceInfoMask::from_symbolic` — case-insensitive bit names + ASYN_-prefixed aliases + 숫자 토큰 지원. 7 단위 테스트.
 
@@ -235,7 +235,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`epicsMessageQueue` 스레드 노드 미초기화** (`a7a56912`, 2023): → Tokio `mpsc::channel`로 대체.
 - **`dbCaSync()` 수정** (`e9e576f4`, 2021) — ⚠️ **N/A (eliminated)**: dbCa link 동기화는 `Arc<RwLock<...>>` + `LinkSet::is_connected` 폴링 — race-free.
 - **`CLOCK_MONOTONIC_RAW` 제거** (`597393a8`, 2019) — ⚠️ **N/A (eliminated)**: tokio `Instant` 가 OS 기본 monotonic clock 사용.
-- **우선순위 역전 뮤텍스(PI Mutex)** (`5a8b6e41`, 2020) — ⏸️ **DEFERRED (RT roadmap)**: Linux RT 활성화 시 PI mutex 도입 검토. 현재 standard tokio `Mutex` 사용 — RT 환경 priority inversion 시나리오만 해당.
+- **우선순위 역전 뮤텍스(PI Mutex)** (`5a8b6e41`, 2020) — ✅ **DONE** (this session): `runtime::sync::PriorityInheritanceMutex<T>` 타입 alias. `linux-rt` Cargo feature 활성 시 `pthread_mutex_t` + `PTHREAD_PRIO_INHERIT` 사용, 비-RT/non-Linux는 `parking_lot::Mutex` fallback. `is_pi_mutex_active()` 런타임 진단. 회귀 테스트 2종.
 
 ---
 
@@ -276,7 +276,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`EPICS_CA_MCAST_TTL` 환경 변수** (`f2a1834d`, 2017, 3.16) — ✅ **DONE** (commit `ae277d1`): `runtime::net::ca_mcast_ttl()` + `AsyncUdpV4::set_multicast_ttl_v4` + CA server beacon/UDP responder/client search 적용.
 - **rsrv: 최대 배열 바이트(max array bytes)를 초과하는 큰 배열 지원** (`3009f88f`/`85b6b5c5`, 2017) — ⏭️ **ALREADY**: `epics-ca-rs` MAX_PAYLOAD_SIZE 1MB cap (transport.rs); 서버는 이 cap 안에서 동적 length 지원. `EPICS_CA_MAX_ARRAY_BYTES` 등가 cap 환경변수는 추후 추가 가능 (사용 사례 없음).
 - **rsrv 멀티 인터페이스 바인딩 재구성** (`15307c4d`, 2016) — ⏭️ **ALREADY**: CA 서버 `run_udp_search_responder` (`server/udp.rs:33-39`)가 `intf_addrs: Vec<Ipv4Addr>` 받아 per-interface task 별도 spawn. 다중 NIC 바인딩은 처음부터 cleanly architected.
-- **camonitor 데이터 타입 변경 처리** (`16877577`, 2020, 3.15.7) — ⏸️ **DEFERRED**: 서버측 DBR type 변경 시 client 자동 재구독 — 일반적이지 않은 시나리오. 추후.
+- **camonitor 데이터 타입 변경 처리** (`16877577`, 2020, 3.15.7) — ✅ **DONE** (this session): `ConnectionEvent::NativeTypeChanged { previous, current }` variant 추가. `client/mod.rs::TransportEvent::ChannelCreated` 핸들러가 새 native_type 과 직전 값을 비교, 다른 경우 변경 이벤트 broadcast. camonitor/archiver 등 소비자가 per-type decoder 재구축 가능.
 - **mcast loopback 소켓 옵션 활성화** (`98504d1c`, 2016) — ⏭️ **ALREADY**: tokio UdpSocket의 `set_multicast_loop_v4(true)` 명시적 호출 (loopback_mcast.rs).
 - **`casr()` 출력 개선** (`1c1eb030`, 2016) — ⚠️ **N/A (eliminated)**: epics-rs `casr` 등가 명령은 iocsh `casStats` — 출력 형식은 처음부터 cleanly designed.
 - **`EPICS_NO_CALLBACK` 환경 변수** (`75a1b823`, 2019) — ⚠️ **N/A (design diff)**: callback 시스템 없음 (tokio mpsc + spawn). disable 대상 부재.
@@ -303,7 +303,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 ### 8-C. DB/링크 시스템
 
 - **JSON Links 시스템 도입** (`7edc0c67`, 2016) — ⏭️ **ALREADY (partial)**: `record/link.rs::try_parse_json_link` 가 `{const:..}` / `{calc:..}` 등 JSON link form 파싱. lnkCalc 의 expression 평가는 calc engine 재사용. lnkConst/lnkDbState 처리.
-- **`lnkCalc` 링크 타입의 타임스탬프 지원** (`e3c9d590`/`20404003`, 2017/2018) — ⏸️ **DEFERRED**: lnkCalc inputs의 timestamp passthrough. 현재는 value-only 평가; timestamp-aware lnkCalc는 추후.
+- **`lnkCalc` 링크 타입의 타임스탬프 지원** (`e3c9d590`/`20404003`, 2017/2018) — ⏸️ **DEFERRED (large refactor)**: lnkCalc 자체가 base 구현 없음 — 새 `ParsedLink::Calc { expr, inputs, time_source }` variant + JSON parser + 다중 input PV fetch + calc engine 재사용 + timestamp passthrough가 모두 필요. ~500-800 LOC + read path 통합. Sites: `record/link.rs` (parser), `database/links.rs::read_link_value_soft` (multi-input fetch + eval), `calc/` (engine reuse). 별도 multi-day PR.
 - **`dbLink`의 필드 타입을 `DOUBLE`로 반환** (`9813fa64`, 2015) — ⏭️ **ALREADY**: `read_link_value_soft` 가 source의 native type 반환, caller가 `to_f64()` 또는 `convert_to(target_type)` 명시.
 - **링크 필드의 긴 문자열 버퍼 크기 확장** (`19447dc7`, 2016) — ⚠️ **N/A (eliminated)**: INP/OUT 은 `String` (동적 길이) — 128-byte fixed buffer 한계 없음.
 - **`dbPutStringNum("", ...)` 을 오류로 처리하지 않음** (`0821c8c4`, 2016) — ⏭️ **ALREADY**: `EpicsValue::String("")` to numeric coerce는 `parse_string_to_f64` 가 빈 문자열을 0으로 처리, NaN/Err로 분기.
@@ -425,7 +425,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 > 본 세션 일괄: **⏸️ DEFERRED**.
 
 - **`logClient`: 연결 끊김 시 미전송 버퍼 버리지 않기** (`0a3427c`, medium) — ⚠️ **N/A (design diff)** — 섹션 7-C 항목과 동일 (logClient TCP forwarder 미구현).
-- **필터가 DB 링크 읽기 경로(`dbDbGetValue`)에 적용되지 않음** (`17a8dbc`, medium) — ⏸️ **DEFERRED**: epics-rs DB link read path (`processing.rs::read_link_value_soft`)는 필터 chain 적용 안 함. 현재 server-side filter framework는 CA/PVA 모니터 진입점에만 wire-through. DB link read path에 filter 적용은 별도 작업으로 추후.
+- **필터가 DB 링크 읽기 경로(`dbDbGetValue`)에 적용되지 않음** (`17a8dbc`, medium) — ⏸️ **DEFERRED (semantic gap)**: epics-rs server-side filter framework는 monitor stream 변환 (dbnd/arr/ts/dec/sync) 으로 설계. 단일 read에 적용 시 시맨틱 미정의 (dec/sync 는 stream window 필요, dbnd 는 prior 값 필요, arr 만 의미 있음). C 17a8dbc 는 channel-filter framework를 read path 에 노출만 함 — 실제 record-side에서 사용하는 필터는 `arr` (array slicing). lnkCalc 등 새 link 타입과 함께 별도 PR로 통합 예정.
 - **DB 링크가 `dbChannel` 대신 `DBADDR`를 저장하여 필터 메타데이터 손실** (`b1f4459`, medium) — ⚠️ **N/A (design diff)**: 섹션 7-C 동일 항목 참조 — `ParsedLink::Db(DbLink { record, field, policy, monitor_switch })` 가 DBADDR/dbChannel 분리 자체를 갖지 않음. 필터 chain이 추후 link 안에 들어오면 `DbLink` 에 Vec<FilterSpec> 필드 추가로 자연스럽게 확장.
 - **`logClient` 재연결 후 미전송 메시지 즉시 플러시되지 않음** (`9df98c1`, partial) — ⚠️ **N/A (eliminated)**: epics-rs는 `tracing` crate 사용. logClient TCP forwarder 자체가 부재.
 
@@ -508,7 +508,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **채널 누수(Channel leak) 차단** (`289f508af6fe`, medium) — ⏭️ **ALREADY**: tokio task가 drop되면 `Drop` impl로 모든 channel 상태 정리. 클라이언트 disconnect (TCP read=0 또는 IO error) 시 `handle_client` 가 task 종료, spawn된 모든 sub-task가 mpsc 닫힘으로 cascade 종료.
 - **초기 ACK 없는 Monitor 처리** (`2f4484889186`, medium) — ⏭️ **ALREADY**: epics-pva-rs monitor 는 `mpsc::channel(64)` + `coalesced: Mutex<Option>` 패턴 (`server_native/tcp.rs:587`). client ACK 등가는 mpsc capacity로, ACK 없으면 try_send fail → coalesced에 last-value 보관 — 누락 자체가 부재.
 - **GET_FIELD 마지막 연결 끊김 처리** (`5019744fa79c`, medium) — ⏭️ **ALREADY**: tokio future가 await에서 disconnect 감지, IO error 반환 → `handle_client` 가 정상 종료. C의 manual cleanup 등가 작업이 RAII로 자동.
-- **`autoExec=false` PUT 중 원격 오류 처리** (`70735383350b`, medium) — ⏸️ **DEFERRED**: epics-pva-rs는 PVA `init` 메시지의 `autoExec` 옵션 deferred-execution PUT 모드 미구현 (즉시 실행만 지원). autoExec=false 진입점 자체가 없으므로 그 안의 오류 콜백 분기도 부재. 추후 deferred PUT 구현 시 함께.
+- **`autoExec=false` PUT 중 원격 오류 처리** (`70735383350b`, medium) — ⏸️ **DEFERRED (PUT mode missing)**: PVA `init` 메시지의 `autoExec=false` 모드 자체가 미구현. 구현하려면 (1) op state에 `pending_put: Option<{value, bitmask}>` 추가, (2) 별도 "exec" 명령 (subcmd bit) 처리, (3) 다중 field atomic write 의 transactional 시맨틱 정의. 현재 PVA 사용 사례는 모두 즉시-실행 — 추후 multi-field atomic write 필요한 시점에 별도 PR.
 - **TX 버퍼 한계를 확인하여 스로틀링** (`8d58409481ef`, medium) — ⏭️ **ALREADY**: `tcp.rs:587-625`에 dedicated writer task + mpsc backpressure + per-monitor coalesced slot 구조. mpsc full 시 `try_send` 실패하면 `coalesced` 에 last-value 저장 — 메모리 무한 증가 차단.
 
 ### 10-C. `pva-rs` — 와이어 프로토콜 & 디코딩 (Protocol & Decoding)

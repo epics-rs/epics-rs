@@ -1,4 +1,5 @@
 pub mod arrays;
+pub mod average;
 pub mod common;
 pub mod enum_type;
 pub mod float64;

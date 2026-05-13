@@ -2381,6 +2381,17 @@ async fn run_coordinator(
                         if let Some(ch) = channels.get_mut(&cid) {
                             let was_disconnected = matches!(ch.state, ChannelState::Disconnected);
                             let dbr_type = DbFieldType::from_u16(data_type).ok();
+                            // epics-base `16877577` parity: detect native
+                            // DBR type change across reconnects so consumers
+                            // (camonitor, archiver) can rebuild their
+                            // per-type decoders / display metadata before
+                            // the next event flows.
+                            let previous_native = ch.native_type;
+                            let native_changed = match (previous_native, dbr_type) {
+                                (Some(p), Some(c)) => p != c,
+                                (Some(_), None) | (None, Some(_)) => true,
+                                (None, None) => false,
+                            };
                             ch.state = ChannelState::Connected;
                             ch.sid = sid;
                             ch.native_type = dbr_type;
@@ -2443,6 +2454,23 @@ async fn run_coordinator(
                                 read: access.read,
                                 write: access.write,
                             });
+                            // epics-base `16877577` parity: surface native
+                            // DBR type changes so consumers can react before
+                            // the next event flows.
+                            if native_changed {
+                                if let Some(cur) = dbr_type {
+                                    let _ = ch.conn_tx.send(ConnectionEvent::NativeTypeChanged {
+                                        previous: previous_native,
+                                        current: cur,
+                                    });
+                                    tracing::info!(
+                                        pv = %ch.pv_name,
+                                        previous = ?previous_native,
+                                        current = ?cur,
+                                        "channel native DBR type changed"
+                                    );
+                                }
+                            }
 
                             // Restore subscriptions
                             let (restored, stale) = subscriptions.restore_for_channel(

@@ -78,4 +78,17 @@ pub enum ConnectionEvent {
         read: bool,
         write: bool,
     },
+    /// epics-base `16877577` parity (PR #503-adjacent): the channel
+    /// just (re)connected with a native DBR type different from the
+    /// previously observed one. Records on the IOC side were
+    /// redefined (e.g. `mbbi` replaced with `ai`), or the channel
+    /// reconnected to a different IOC entirely. Consumers that cache
+    /// per-type decoders (camonitor, archiver, archiver-appliance)
+    /// should re-subscribe with the new type / re-build display
+    /// metadata. `previous` is `None` for a first-time connection
+    /// where the change check is vacuous.
+    NativeTypeChanged {
+        previous: Option<DbFieldType>,
+        current: DbFieldType,
+    },
 }

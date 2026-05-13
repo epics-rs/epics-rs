@@ -119,7 +119,7 @@ async fn main() {
     let (desc, value) = build_nturi(&args.pv_name, &parsed_args);
 
     let client = PvaClient::builder()
-        .timeout(std::time::Duration::from_secs_f64(args.timeout))
+        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
         .build();
 
     match client.pvrpc(&args.pv_name, &desc, &value).await {

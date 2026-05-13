@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
 use clap::Parser;
@@ -173,7 +173,7 @@ async fn main() {
     let timeout_secs = args
         .timeout
         .unwrap_or_else(epics_ca_rs::cli::env_default_timeout);
-    tokio::time::sleep(Duration::from_secs_f64(timeout_secs)).await;
+    tokio::time::sleep(epics_ca_rs::cli::timeout_duration(timeout_secs)).await;
 
     // Print "*** Not connected" for PVs that didn't connect within
     // the wait window. Mirrors `tool_lib.c::print_time_val_sts` line

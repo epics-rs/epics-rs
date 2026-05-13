@@ -3,15 +3,36 @@
 
 use epics_base_rs::types::EpicsValue;
 
-/// Read `EPICS_CLI_TIMEOUT` from the environment, falling back to 1.0 s
-/// when unset or unparsable. Mirrors C `tool_lib.c:use_ca_timeout_env`
+/// Default CA CLI timeout in seconds when neither `-w` nor a usable
+/// `EPICS_CLI_TIMEOUT` env var is set.
+pub const DEFAULT_CLI_TIMEOUT_SECS: f64 = 1.0;
+
+/// Read `EPICS_CLI_TIMEOUT` from the environment, falling back to
+/// [`DEFAULT_CLI_TIMEOUT_SECS`] when unset, unparsable, or
+/// non-finite/non-positive. Mirrors C `tool_lib.c:use_ca_timeout_env`
 /// (commit 1d056c6) — the env var is consulted only when the caller
 /// did not pass `-w`/`--wait` on the command line.
 pub fn env_default_timeout() -> f64 {
     std::env::var("EPICS_CLI_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(1.0)
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(DEFAULT_CLI_TIMEOUT_SECS)
+}
+
+/// Convert a user-supplied timeout (CLI `-w` or env var) into a
+/// `std::time::Duration`. `Duration::from_secs_f64` panics on NaN /
+/// infinity / negative values; clap accepts those literally so this
+/// guard clamps to [`DEFAULT_CLI_TIMEOUT_SECS`] on the bad inputs.
+/// Mirrors the spirit of epics-base 1655d68e (defensive against
+/// pathological floats in CA timeout computation).
+pub fn timeout_duration(secs: f64) -> std::time::Duration {
+    let s = if secs.is_finite() && secs > 0.0 {
+        secs
+    } else {
+        DEFAULT_CLI_TIMEOUT_SECS
+    };
+    std::time::Duration::from_secs_f64(s)
 }
 
 /// Field width the C tools (`caget` / `camonitor` / `caput -l`) use
@@ -393,6 +414,50 @@ mod tests {
     fn pv_name_width_constant_is_30() {
         // Lock the pad width so a future tweak gets caught.
         assert_eq!(PV_NAME_WIDTH, 30);
+    }
+
+    /// `Duration::from_secs_f64` panics on NaN / +Inf / negative.
+    /// `timeout_duration` must clamp those to the safe default rather
+    /// than panic — the user-supplied value reaches us via clap which
+    /// happily parses "NaN", "inf", "-1" as f64.
+    #[test]
+    fn timeout_duration_clamps_pathological_floats() {
+        let d = timeout_duration(f64::NAN);
+        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
+        let d = timeout_duration(f64::INFINITY);
+        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
+        let d = timeout_duration(f64::NEG_INFINITY);
+        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
+        let d = timeout_duration(-1.0);
+        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
+        let d = timeout_duration(0.0);
+        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
+    }
+
+    /// Sane positive values pass through unchanged.
+    #[test]
+    fn timeout_duration_preserves_positive_finite() {
+        let d = timeout_duration(2.5);
+        assert!((d.as_secs_f64() - 2.5).abs() < 1e-9);
+    }
+
+    /// Env-var path must reject the same pathological set so a
+    /// misconfigured `EPICS_CLI_TIMEOUT` doesn't propagate. Serialised
+    /// because env-var mutation races every other test that consults
+    /// `EPICS_CLI_TIMEOUT` (none today, but #[serial] is cheap insurance).
+    #[serial_test::serial]
+    #[test]
+    fn env_default_timeout_rejects_nan_inf() {
+        // SAFETY: serial_test::serial guarantees no concurrent env access.
+        unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "NaN") };
+        assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
+        unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "inf") };
+        assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
+        unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "-3") };
+        assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
+        unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "2.5") };
+        assert!((env_default_timeout() - 2.5).abs() < 1e-9);
+        unsafe { std::env::remove_var("EPICS_CLI_TIMEOUT") };
     }
 
     #[test]

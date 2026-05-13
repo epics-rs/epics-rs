@@ -14,6 +14,7 @@
 //! separated from the core IOC infrastructure in `epics-base-rs`.
 
 pub mod auth;
+pub mod cli;
 pub mod client;
 pub mod client_native;
 pub mod codec;

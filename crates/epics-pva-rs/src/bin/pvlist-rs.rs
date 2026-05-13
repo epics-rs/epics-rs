@@ -66,7 +66,11 @@ async fn main() {
 
     // De-dup by (server, guid) so a chatty IOC doesn't spam.
     let mut seen: HashMap<(std::net::SocketAddr, [u8; 12]), bool> = HashMap::new();
-    let deadline = if args.timeout > 0.0 {
+    // `args.timeout <= 0` means "wait forever" by design. Non-finite
+    // (NaN / ±Inf) also collapses to "no deadline" — closer to user
+    // intent than the 5 s default, and avoids the
+    // `Duration::from_secs_f64` panic on Inf.
+    let deadline = if args.timeout.is_finite() && args.timeout > 0.0 {
         Some(tokio::time::Instant::now() + Duration::from_secs_f64(args.timeout))
     } else {
         None

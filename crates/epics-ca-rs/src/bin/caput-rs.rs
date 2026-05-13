@@ -4,7 +4,7 @@ use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_ca_rs::CaError;
 use epics_ca_rs::cli::{PV_NAME_WIDTH, ValueFormat, format_value};
 use epics_ca_rs::client::CaClient;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 fn format_server_timestamp(ts: SystemTime) -> String {
     let dt: DateTime<Local> = ts.into();
@@ -180,7 +180,7 @@ async fn main() {
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    let timeout = Duration::from_secs_f64(
+    let timeout = epics_ca_rs::cli::timeout_duration(
         args.timeout
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );

@@ -218,7 +218,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 7-D. 타이밍 / 타임아웃 (Timeout, 15건 → 검토 필요)
 - **타이머 조기 만료(Early expiry) 버그** (`01360b2a`, 2022): 비 RTOS 환경에서 타이머가 예정보다 일찍 발화하는 버그. `tokio` 타이머가 대체하지만, CA 검색 타이머(`SearchTimer`) 로직 확인.
-- **NaN/Overflow 타임아웃 값 처리** (`1655d68e`, 2022): CA의 타임아웃 계산에서 NaN이나 무한대 값이 들어올 때의 안전한 처리.
+- **NaN/Overflow 타임아웃 값 처리** (`1655d68e`, 2022) — ✅ **DONE (analog)**: 원커밋은 RTEMS osdEvent 한정 (Rust 비대상)이지만 동일 정신: `epics_ca_rs::cli::timeout_duration` (`crates/epics-ca-rs/src/cli.rs`)이 NaN/±Inf/0/음수를 `DEFAULT_CLI_TIMEOUT_SECS=1.0`으로 클램프해 `Duration::from_secs_f64` panic을 차단. `env_default_timeout`도 같은 가드. 4개 CA CLI(caget/caput/cainfo/camonitor) 모두 `timeout_duration` 경유. PVA 측은 `epics_pva_rs::cli::timeout_duration` (default 5.0s) 추가, `pvcall-rs`에 적용. `pvlist-rs`는 `0`=wait-forever 의미를 보존하기 위해 `is_finite() && > 0.0` 가드만 적용 (Inf/NaN도 wait-forever). 테스트 5종.
 - **`EPICS_CLI_TIMEOUT` 환경 변수** (`1d056c6f`, 2022): `caget`/`caput`/`camonitor` 등의 CLI 도구의 기본 타임아웃을 환경 변수로 설정하는 기능. → 이미 `RELEASE-7.0.8.md` 항목에 포함됨.
 - **단조시간(Monotonic Clock) 기반 CA 타임아웃 통일** (`f1cbe93b`, 2020): CA 내부 타이머(`tcpiiu`, `searchTimer`)를 모두 단조 시계 기반으로 통일하는 작업. `tokio`의 `Instant` 사용으로 대체되나, 동일한 단조 보장 여부 확인.
 - **macOS 단조 시계 해상도 버그** (`3506d115`, 2020): 최신 macOS에서 `clock_gettime`의 오버헤드를 줄이기 위한 최적화(macOS Tier-2 개발 플랫폼이므로 확인 필요).

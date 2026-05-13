@@ -6,7 +6,7 @@ use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
 };
 use epics_ca_rs::client::CaClient;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 // C `caget -V` prints a blank line then
 //   "EPICS Version EPICS 7.0.10.1-DEV, CA Protocol version 4.13"
@@ -241,7 +241,7 @@ async fn main() {
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    let timeout = Duration::from_secs_f64(
+    let timeout = epics_ca_rs::cli::timeout_duration(
         args.timeout
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );

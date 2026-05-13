@@ -141,18 +141,41 @@ fn build_decimate(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>
     Some(Arc::new(DecimateFilter::new(n, offset)))
 }
 
-/// `{"sync":{"trigger":"PV_NAME"}}` — gate value events on a trigger
-/// PV's process notifications. epics-base 3.15.7 sync filter, "after"
-/// mode (the only mode upstream's syncfilter.cpp shipped initially).
-/// Missing/empty trigger → silently dropped (the chain just won't
-/// include a sync filter rather than rejecting the whole subscription).
+/// `sync` filter — six gating modes on a named [`super::DbState`].
+///
+/// Long form (matches upstream `chfPlugin` field tags):
+/// `{"sync":{"m":"after","s":"STATE_NAME"}}`
+///
+/// Mode-tagged shorthand (also upstream-supported):
+/// `{"sync":{"after":"STATE_NAME"}}` — the key acts as both the mode
+/// keyword and the value carries the state name.
+///
+/// Missing mode or state → entry is skipped with a warn rather than
+/// rejecting the whole chain.
 fn build_sync(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
-    let trigger = cfg
-        .as_object()
-        .and_then(|o| o.get("trigger"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?;
-    Some(Arc::new(super::SyncFilter::new(trigger)))
+    let obj = cfg.as_object()?;
+    // Long form: {"m": "after", "s": "STATE"}
+    if let (Some(m), Some(s)) = (
+        obj.get("m").and_then(|v| v.as_str()),
+        obj.get("s").and_then(|v| v.as_str()),
+    ) {
+        if let Some(mode) = super::SyncMode::from_keyword(m) {
+            if !s.is_empty() {
+                return Some(Arc::new(super::SyncFilter::new(mode, s)));
+            }
+        }
+    }
+    // Mode-tagged shorthand: {"after": "STATE"} / {"while": "STATE"} / ...
+    for (key, val) in obj {
+        if let Some(mode) = super::SyncMode::from_keyword(key) {
+            if let Some(state) = val.as_str() {
+                if !state.is_empty() {
+                    return Some(Arc::new(super::SyncFilter::new(mode, state)));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -238,26 +261,49 @@ mod tests {
     }
 
     #[test]
-    fn parse_unknown_filter_is_skipped() {
+    fn parse_sync_mode_without_state_is_skipped() {
+        // Long form requires both `m` and `s`; missing `s` skips.
         let chain = parse_filter_chain(r#"{"sync":{"m":"unless"},"dbnd":{"d":1.0}}"#);
         let names: Vec<&'static str> = chain.iter().map(|f| f.name()).collect();
-        // `sync` with only `m` (no `trigger`) is missing required
-        // config — silently skipped; `dbnd` survives. When the full
-        // sync filter learns the `m` mode keyword this case will
-        // start producing a sync entry too.
         assert_eq!(names, vec!["dbnd"]);
     }
 
     #[test]
-    fn parse_sync_with_trigger() {
-        let chain = parse_filter_chain(r#"{"sync":{"trigger":"SYS:TRIG"}}"#);
+    fn parse_sync_long_form_after_mode() {
+        let chain = parse_filter_chain(r#"{"sync":{"m":"after","s":"SYS:TRIG"}}"#);
         assert_eq!(chain.len(), 1);
         assert_eq!(chain.iter().next().unwrap().name(), "sync");
     }
 
     #[test]
-    fn parse_sync_without_trigger_is_skipped() {
+    fn parse_sync_tagged_shorthand_while_mode() {
+        // `{"while":"STATE"}` — upstream-supported shorthand where
+        // the mode keyword doubles as the JSON key and the value is
+        // the state name. epics-base sync.c uses `chfTagString` for
+        // exactly this case.
+        let chain = parse_filter_chain(r#"{"sync":{"while":"SYS:READY"}}"#);
+        assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn parse_sync_all_six_modes_via_shorthand() {
+        for mode in ["before", "first", "last", "after", "while", "unless"] {
+            let json = format!(r#"{{"sync":{{"{mode}":"STATE"}}}}"#);
+            let chain = parse_filter_chain(&json);
+            assert_eq!(chain.len(), 1, "mode {mode} must parse to one filter");
+            assert_eq!(chain.iter().next().unwrap().name(), "sync");
+        }
+    }
+
+    #[test]
+    fn parse_sync_empty_config_is_skipped() {
         let chain = parse_filter_chain(r#"{"sync":{}}"#);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn parse_sync_unknown_mode_is_skipped() {
+        let chain = parse_filter_chain(r#"{"sync":{"m":"nonsense","s":"STATE"}}"#);
         assert!(chain.is_empty());
     }
 

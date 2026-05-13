@@ -1,25 +1,32 @@
-//! `sync` — trigger-PV-gated event passthrough (epics-base 3.15.7 channel
+//! `sync` — dbState-gated event passthrough (epics-base 3.15.7 channel
 //! filters).
 //!
-//! pvxs JSON syntax: `PV.{"sync":{"m":"before"|"after"|"first"|"last"|"unless"|"while"}}`
-//! `trigger` is the PV name whose process events drive the gate.
+//! pvxs / dbCore JSON syntax:
 //!
-//! Semantics implemented here are the simplest "after" mode: arm the
-//! gate when the trigger PV processes; the very next value event from
-//! the subscriber consumes the arm and is forwarded, all other value
-//! events are dropped. Alarm and property events pass unchanged
-//! (446e0d4a rule) and do not consume the arm — those are out-of-band
-//! signals every filter must let through.
+//! ```text
+//! PV.{"sync":{"m":"before"|"first"|"last"|"after"|"while"|"unless","s":"STATE"}}
+//! ```
 //!
-//! Trigger wiring is via a process-wide [`SyncRegistry`]: filter
-//! construction registers an `Arc<AtomicBool>` keyed by trigger PV
-//! name, and the trigger PV's process path calls
-//! [`SyncRegistry::fire`] (typically from
-//! [`crate::server::pv::ProcessVariable::notify_subscribers`]) which
-//! arms every gate listening for that PV name. The full upstream
-//! syncfilter supports five additional modes (`before`, `first`,
-//! `last`, `unless`, `while`) — those land alongside as the trigger
-//! plumbing matures.
+//! `s` (or the mode-tagged shorthand `{"sync":{"after":"STATE"}}`) names
+//! a global [`DbState`] — a boolean held by the process-wide
+//! [`db_state_registry`] and toggled via [`DbState::set`]. Records
+//! that act as "triggers" call `set` from their process path; every
+//! filter listening on that state name sees the transition on its
+//! next `apply()`.
+//!
+//! Six modes, all per epics-base `db/std/filters/sync.c`:
+//!
+//! | mode     | semantics                                                 |
+//! |----------|------------------------------------------------------------|
+//! | `before` | cache every event; emit cached on state transition `0→1` |
+//! | `first`  | emit first event seen after state transition `0→1`; drop rest until state cycles |
+//! | `last`   | cache every event; emit cached on state transition `1→0` |
+//! | `after`  | emit first event seen after state transition `1→0`; drop rest until state cycles |
+//! | `while`  | pass events while state is `1`; drop while `0`            |
+//! | `unless` | pass events while state is `0`; drop while `1`            |
+//!
+//! Alarm and property events always pass unchanged (446e0d4a rule)
+//! and never affect cached state, regardless of mode.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,88 +37,135 @@ use parking_lot::Mutex;
 use super::{FilteredMonitorEvent, SubscriptionFilter};
 use crate::server::recgbl::EventMask;
 
-/// Process-wide map from trigger-PV name to the gates listening for it.
-/// Filters register on construction; the trigger PV's process path
-/// calls `fire(name)` to arm every gate currently subscribed.
-pub struct SyncRegistry {
-    gates: Mutex<HashMap<String, Vec<Arc<AtomicBool>>>>,
+/// Global named boolean state — the analogue of epics-base `dbState`.
+/// Cloning the `Arc` returned by [`db_state_registry::get_or_create`]
+/// is cheap; the underlying `AtomicBool` is shared across all
+/// subscribers and the trigger record's set/clear call sites.
+#[derive(Debug, Default)]
+pub struct DbState {
+    inner: AtomicBool,
 }
 
-impl Default for SyncRegistry {
+impl DbState {
+    pub fn set(&self, value: bool) {
+        self.inner.store(value, Ordering::Release);
+    }
+    pub fn get(&self) -> bool {
+        self.inner.load(Ordering::Acquire)
+    }
+}
+
+/// Process-wide named-state registry. Filters lazily acquire the
+/// `Arc<DbState>` for their configured state name; trigger paths use
+/// the same accessor to publish state changes.
+pub struct DbStateRegistry {
+    states: Mutex<HashMap<String, Arc<DbState>>>,
+}
+
+impl Default for DbStateRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SyncRegistry {
+impl DbStateRegistry {
     pub fn new() -> Self {
         Self {
-            gates: Mutex::new(HashMap::new()),
+            states: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Subscribe `gate` to fire when `trigger` PV processes.
-    pub fn subscribe(&self, trigger: &str, gate: Arc<AtomicBool>) {
-        self.gates
-            .lock()
-            .entry(trigger.to_string())
-            .or_default()
-            .push(gate);
+    /// Look up or create the named state. Existing entry's `Arc` is
+    /// returned unchanged — the underlying value is preserved.
+    pub fn get_or_create(&self, name: &str) -> Arc<DbState> {
+        let mut guard = self.states.lock();
+        if let Some(s) = guard.get(name) {
+            return s.clone();
+        }
+        let s = Arc::new(DbState::default());
+        guard.insert(name.to_string(), s.clone());
+        s
     }
 
-    /// Arm every gate listening for `trigger`. Stale gates whose
-    /// owning filter has been dropped (Arc strong count fell to 1 —
-    /// our own table entry is the only ref left) are reaped lazily.
-    pub fn fire(&self, trigger: &str) {
-        let mut guard = self.gates.lock();
-        let Some(list) = guard.get_mut(trigger) else {
-            return;
-        };
-        list.retain(|g| Arc::strong_count(g) > 1);
-        for g in list.iter() {
-            g.store(true, Ordering::Release);
-        }
+    /// Convenience: set a named state's value. Creates the state if
+    /// it didn't exist (with the requested value).
+    pub fn set(&self, name: &str, value: bool) {
+        self.get_or_create(name).set(value);
+    }
+
+    /// Convenience: read a named state's value. Returns `false` when
+    /// the state has never been touched (creates it implicitly).
+    pub fn get(&self, name: &str) -> bool {
+        self.get_or_create(name).get()
     }
 }
 
-/// The single process-wide [`SyncRegistry`] instance. Filters and
-/// record-processing paths share it via [`registry`].
-pub fn registry() -> &'static SyncRegistry {
+/// The single process-wide [`DbStateRegistry`] instance. Filters and
+/// trigger record-processing paths share it via [`db_state_registry`].
+pub fn db_state_registry() -> &'static DbStateRegistry {
     use std::sync::OnceLock;
-    static REGISTRY: OnceLock<SyncRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(SyncRegistry::new)
+    static REGISTRY: OnceLock<DbStateRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(DbStateRegistry::new)
 }
 
-/// `sync` filter, "after" mode. Constructed with the trigger PV name;
-/// auto-subscribes itself to the process-wide [`SyncRegistry`] so the
-/// trigger PV's `fire(name)` call arms this gate.
+/// Sync filter mode — six variants matching epics-base `sync.c`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    Before,
+    First,
+    Last,
+    After,
+    While,
+    Unless,
+}
+
+impl SyncMode {
+    /// Parse the JSON mode keyword. Returns `None` on unrecognised
+    /// strings so the chain parser can warn-and-skip.
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s {
+            "before" => Some(Self::Before),
+            "first" => Some(Self::First),
+            "last" => Some(Self::Last),
+            "after" => Some(Self::After),
+            "while" => Some(Self::While),
+            "unless" => Some(Self::Unless),
+            _ => None,
+        }
+    }
+}
+
+/// `sync` filter. Holds:
+///
+/// * `mode` — which of the six gating policies to apply.
+/// * `state` — the shared `Arc<DbState>` flipped by the trigger.
+/// * `last_state` — most recent state value the filter observed,
+///   used to detect transitions inside `apply`.
+/// * `cached_event` — for `before`/`last` modes that emit a delayed
+///   event on state transition. Replaced on every incoming value
+///   event so the most recent observation wins.
 pub struct SyncFilter {
-    /// Shared with [`SyncRegistry`] so the trigger's `fire(name)` call
-    /// can flip this from outside.
-    armed: Arc<AtomicBool>,
+    mode: SyncMode,
+    state: Arc<DbState>,
+    last_state: AtomicBool,
+    cached_event: Mutex<Option<FilteredMonitorEvent>>,
 }
 
 impl SyncFilter {
-    /// Construct a sync filter for the given trigger PV name. The
-    /// gate starts disarmed — events are dropped until the trigger
-    /// PV processes for the first time.
-    pub fn new(trigger: impl Into<String>) -> Self {
-        let armed = Arc::new(AtomicBool::new(false));
-        registry().subscribe(&trigger.into(), armed.clone());
-        Self { armed }
+    pub fn new(mode: SyncMode, state_name: impl Into<String>) -> Self {
+        let state = db_state_registry().get_or_create(&state_name.into());
+        Self {
+            mode,
+            last_state: AtomicBool::new(state.get()),
+            state,
+            cached_event: Mutex::new(None),
+        }
     }
 
-    /// Manually arm the gate. Useful for unit tests that don't want
-    /// to spin up a trigger PV; callers usually rely on the
-    /// auto-registration set up in [`Self::new`].
-    pub fn arm(&self) {
-        self.armed.store(true, Ordering::Release);
-    }
-
-    /// `true` iff the next value event will be consumed instead of
-    /// dropped. Exposed for tests; not part of the runtime path.
-    pub fn is_armed(&self) -> bool {
-        self.armed.load(Ordering::Acquire)
+    /// `true` when the underlying named state is currently set. Test
+    /// helper.
+    pub fn state_value(&self) -> bool {
+        self.state.get()
     }
 }
 
@@ -121,19 +175,68 @@ impl SubscriptionFilter for SyncFilter {
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        // 446e0d4a rule: alarm and property events pass without
-        // consuming the gate.
+        // 446e0d4a rule: alarm and property events always pass and
+        // never affect the cached state or transition tracker.
         if !event.mask.contains(EventMask::VALUE) {
             return Some(event);
         }
-        // Consume the arm if set; otherwise drop.
-        match self
-            .armed
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => Some(event),
-            Err(_) => None,
-        }
+        let actstate = self.state.get();
+        let laststate = self.last_state.load(Ordering::Acquire);
+        let transition_up = actstate && !laststate; // 0 → 1
+        let transition_down = !actstate && laststate; // 1 → 0
+
+        let pass = match self.mode {
+            SyncMode::Before => {
+                let mut cache = self.cached_event.lock();
+                let out = if transition_up { cache.take() } else { None };
+                // Always cache the incoming event for the *next*
+                // transition. Old cache contents (if no transition
+                // fired) are replaced by the new value.
+                *cache = Some(event.clone());
+                out
+            }
+            SyncMode::First => {
+                if transition_up {
+                    Some(event.clone())
+                } else {
+                    None
+                }
+            }
+            SyncMode::Last => {
+                let mut cache = self.cached_event.lock();
+                let out = if transition_down { cache.take() } else { None };
+                *cache = Some(event.clone());
+                out
+            }
+            SyncMode::After => {
+                if transition_down {
+                    Some(event.clone())
+                } else {
+                    None
+                }
+            }
+            SyncMode::While => {
+                if actstate {
+                    Some(event.clone())
+                } else {
+                    None
+                }
+            }
+            SyncMode::Unless => {
+                if !actstate {
+                    Some(event.clone())
+                } else {
+                    None
+                }
+            }
+        };
+        // Update transition tracker. `While`/`Unless` don't shift the
+        // tracker — the C source uses a `no_shift` label for those —
+        // but our `last_state` only matters to the four transition-
+        // sensitive modes, so storing for `While`/`Unless` is a
+        // harmless no-op.
+        self.last_state.store(actstate, Ordering::Release);
+        pass
     }
 }
 
@@ -155,74 +258,158 @@ mod tests {
         )
     }
 
-    #[test]
-    fn disarmed_drops_value_events() {
-        let f = SyncFilter::new("UNIT:TEST:TRIGGER:1");
-        assert!(!f.is_armed());
-        assert!(f.apply(ev(1.0, EventMask::VALUE)).is_none());
-        assert!(f.apply(ev(2.0, EventMask::VALUE)).is_none());
-    }
-
-    #[test]
-    fn arm_passes_next_value_and_disarms() {
-        let f = SyncFilter::new("UNIT:TEST:TRIGGER:2");
-        f.arm();
-        assert!(f.is_armed());
-        assert!(f.apply(ev(1.0, EventMask::VALUE)).is_some());
-        assert!(!f.is_armed(), "consumed the arm");
-        assert!(f.apply(ev(2.0, EventMask::VALUE)).is_none());
-    }
-
-    /// Alarm / property events MUST pass without consuming the arm
-    /// (446e0d4a rule). Otherwise an alarm-only emission would silence
-    /// the next value event the trigger meant to release.
-    #[test]
-    fn alarm_passes_without_consuming_arm() {
-        let f = SyncFilter::new("UNIT:TEST:TRIGGER:3");
-        f.arm();
-        assert!(f.apply(ev(0.0, EventMask::ALARM)).is_some());
-        assert!(f.is_armed(), "alarm did not consume the arm");
-        assert!(f.apply(ev(0.0, EventMask::PROPERTY)).is_some());
-        assert!(f.is_armed(), "property did not consume the arm");
-        // Now a value event consumes it.
-        assert!(f.apply(ev(1.0, EventMask::VALUE)).is_some());
-        assert!(!f.is_armed());
-    }
-
-    /// `SyncRegistry::fire(name)` arms every gate listening for that
-    /// PV name. Demonstrates the trigger plumbing end-to-end without
-    /// needing a real record-processing chain.
-    #[test]
-    fn registry_fire_arms_all_matching_gates() {
-        let a = SyncFilter::new("UNIT:TEST:TRIGGER:4");
-        let b = SyncFilter::new("UNIT:TEST:TRIGGER:4");
-        let other = SyncFilter::new("UNIT:TEST:TRIGGER:5");
-        assert!(!a.is_armed() && !b.is_armed() && !other.is_armed());
-
-        registry().fire("UNIT:TEST:TRIGGER:4");
-        assert!(a.is_armed(), "gate A subscribed to trigger:4 must arm");
-        assert!(b.is_armed(), "gate B subscribed to trigger:4 must arm");
-        assert!(
-            !other.is_armed(),
-            "gate listening for a different trigger must NOT arm"
-        );
-    }
-
-    /// Dropped filters get reaped from the registry on next fire —
-    /// no permanent leak in the gate list.
-    #[test]
-    fn registry_reaps_dropped_filters_on_fire() {
-        {
-            let _short_lived = SyncFilter::new("UNIT:TEST:TRIGGER:6");
-            // Goes out of scope here — strong count on its `armed`
-            // Arc falls to 1 (only the registry's clone remains).
+    fn val(e: &FilteredMonitorEvent) -> f64 {
+        match e.event.snapshot.value {
+            EpicsValue::Double(v) => v,
+            _ => panic!("test ev() always builds Double"),
         }
-        // Fire to trigger reap; subsequent registry state should not
-        // include the dropped filter.
-        registry().fire("UNIT:TEST:TRIGGER:6");
-        let guard = registry().gates.lock();
-        let entry = guard.get("UNIT:TEST:TRIGGER:6");
-        // After reap the list is empty (entry may still exist as Vec<>).
-        assert!(entry.map(|v| v.is_empty()).unwrap_or(true));
+    }
+
+    // ── While / Unless: stateful pass / drop ───────────────────────
+
+    #[test]
+    fn while_passes_when_state_set() {
+        let f = SyncFilter::new(SyncMode::While, "UNIT:T:WHILE:1");
+        // state starts false → drop
+        assert!(f.apply(ev(1.0, EventMask::VALUE)).is_none());
+        db_state_registry().set("UNIT:T:WHILE:1", true);
+        assert_eq!(val(&f.apply(ev(2.0, EventMask::VALUE)).unwrap()), 2.0);
+        assert_eq!(val(&f.apply(ev(3.0, EventMask::VALUE)).unwrap()), 3.0);
+        db_state_registry().set("UNIT:T:WHILE:1", false);
+        assert!(f.apply(ev(4.0, EventMask::VALUE)).is_none());
+    }
+
+    #[test]
+    fn unless_passes_when_state_clear() {
+        let f = SyncFilter::new(SyncMode::Unless, "UNIT:T:UNLESS:1");
+        // state starts false → pass
+        assert_eq!(val(&f.apply(ev(1.0, EventMask::VALUE)).unwrap()), 1.0);
+        db_state_registry().set("UNIT:T:UNLESS:1", true);
+        assert!(f.apply(ev(2.0, EventMask::VALUE)).is_none());
+        db_state_registry().set("UNIT:T:UNLESS:1", false);
+        assert_eq!(val(&f.apply(ev(3.0, EventMask::VALUE)).unwrap()), 3.0);
+    }
+
+    // ── First / After: pass-once-on-transition ─────────────────────
+
+    #[test]
+    fn first_passes_first_event_after_0_to_1_transition() {
+        let f = SyncFilter::new(SyncMode::First, "UNIT:T:FIRST:1");
+        // No transition yet → drop
+        assert!(f.apply(ev(0.0, EventMask::VALUE)).is_none());
+        // Flip state up. The NEXT apply observes the transition.
+        db_state_registry().set("UNIT:T:FIRST:1", true);
+        assert_eq!(val(&f.apply(ev(1.0, EventMask::VALUE)).unwrap()), 1.0);
+        // Subsequent events with state still 1 → drop (no transition).
+        assert!(f.apply(ev(2.0, EventMask::VALUE)).is_none());
+        // Bounce state to cycle the transition.
+        db_state_registry().set("UNIT:T:FIRST:1", false);
+        // The apply that observes 1→0 doesn't emit for `first`; it
+        // just updates last_state. But to make the test deterministic
+        // we feed an alarm event (no state shift since alarm bypasses
+        // the tracker per 446e0d4a — but actually NOT for `first`/
+        // `after`: those only fire on transitions of *value* events,
+        // and our impl updates last_state on every value event).
+        // Send a value event with state=false: drops + updates
+        // last_state to false.
+        assert!(f.apply(ev(3.0, EventMask::VALUE)).is_none());
+        // Now flip back up: next value passes again.
+        db_state_registry().set("UNIT:T:FIRST:1", true);
+        assert_eq!(val(&f.apply(ev(4.0, EventMask::VALUE)).unwrap()), 4.0);
+    }
+
+    #[test]
+    fn after_passes_first_event_after_1_to_0_transition() {
+        let f = SyncFilter::new(SyncMode::After, "UNIT:T:AFTER:1");
+        // Start with state=1 so the first downward transition is
+        // observable.
+        db_state_registry().set("UNIT:T:AFTER:1", true);
+        // Prime last_state by applying one value event.
+        assert!(f.apply(ev(0.0, EventMask::VALUE)).is_none());
+        // 1→0
+        db_state_registry().set("UNIT:T:AFTER:1", false);
+        assert_eq!(val(&f.apply(ev(1.0, EventMask::VALUE)).unwrap()), 1.0);
+        assert!(f.apply(ev(2.0, EventMask::VALUE)).is_none());
+    }
+
+    // ── Before / Last: cache-then-emit-on-transition ───────────────
+
+    #[test]
+    fn before_emits_cached_pre_transition_event() {
+        let f = SyncFilter::new(SyncMode::Before, "UNIT:T:BEFORE:1");
+        // Pre-transition events get cached, dropped from the stream.
+        assert!(f.apply(ev(10.0, EventMask::VALUE)).is_none());
+        assert!(f.apply(ev(20.0, EventMask::VALUE)).is_none());
+        // Flip 0→1 → the NEXT apply emits whatever was cached (the
+        // latest pre-transition value), then caches the incoming.
+        db_state_registry().set("UNIT:T:BEFORE:1", true);
+        let emitted = f.apply(ev(30.0, EventMask::VALUE)).unwrap();
+        assert_eq!(
+            val(&emitted),
+            20.0,
+            "emits the most recent cached pre-transition value"
+        );
+        // No further transitions → drops, but keeps caching.
+        assert!(f.apply(ev(40.0, EventMask::VALUE)).is_none());
+    }
+
+    #[test]
+    fn last_emits_cached_on_downward_transition() {
+        let f = SyncFilter::new(SyncMode::Last, "UNIT:T:LAST:1");
+        db_state_registry().set("UNIT:T:LAST:1", true);
+        // While state=1: events get cached, dropped.
+        assert!(f.apply(ev(10.0, EventMask::VALUE)).is_none());
+        assert!(f.apply(ev(20.0, EventMask::VALUE)).is_none());
+        // 1→0: emits the cached event (latest while active).
+        db_state_registry().set("UNIT:T:LAST:1", false);
+        let emitted = f.apply(ev(30.0, EventMask::VALUE)).unwrap();
+        assert_eq!(val(&emitted), 20.0);
+    }
+
+    // ── 446e0d4a rule: alarm / property events bypass all modes ────
+
+    #[test]
+    fn alarm_event_passes_unconditionally_for_every_mode() {
+        for mode in [
+            SyncMode::Before,
+            SyncMode::First,
+            SyncMode::Last,
+            SyncMode::After,
+            SyncMode::While,
+            SyncMode::Unless,
+        ] {
+            let f = SyncFilter::new(mode, "UNIT:T:ALARM");
+            // Even with state false (which would drop value events
+            // in modes like `while`/`first`), alarm passes.
+            assert!(
+                f.apply(ev(0.0, EventMask::ALARM)).is_some(),
+                "{mode:?} must pass alarm"
+            );
+            assert!(
+                f.apply(ev(0.0, EventMask::PROPERTY)).is_some(),
+                "{mode:?} must pass property"
+            );
+        }
+    }
+
+    // ── Registry semantics ─────────────────────────────────────────
+
+    #[test]
+    fn registry_get_or_create_returns_shared_state() {
+        let a = db_state_registry().get_or_create("UNIT:T:SHARED");
+        let b = db_state_registry().get_or_create("UNIT:T:SHARED");
+        a.set(true);
+        assert!(b.get(), "both Arcs view the same AtomicBool");
+    }
+
+    #[test]
+    fn mode_keyword_parsing() {
+        assert_eq!(SyncMode::from_keyword("before"), Some(SyncMode::Before));
+        assert_eq!(SyncMode::from_keyword("first"), Some(SyncMode::First));
+        assert_eq!(SyncMode::from_keyword("last"), Some(SyncMode::Last));
+        assert_eq!(SyncMode::from_keyword("after"), Some(SyncMode::After));
+        assert_eq!(SyncMode::from_keyword("while"), Some(SyncMode::While));
+        assert_eq!(SyncMode::from_keyword("unless"), Some(SyncMode::Unless));
+        assert_eq!(SyncMode::from_keyword("nonsense"), None);
     }
 }

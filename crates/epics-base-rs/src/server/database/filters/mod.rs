@@ -40,7 +40,7 @@ pub use arr::{ArrayFilter, ArrayFilterConfig};
 pub use dbnd::{DeadbandFilter, DeadbandMode};
 pub use decimate::DecimateFilter;
 pub use parser::{ParsedChannelName, parse_filter_chain, split_channel_name};
-pub use sync::{SyncFilter, SyncRegistry, registry as sync_registry};
+pub use sync::{DbState, DbStateRegistry, SyncFilter, SyncMode, db_state_registry};
 pub use ts::TimestampFilter;
 
 /// One event passed through the filter chain. Wraps the standard

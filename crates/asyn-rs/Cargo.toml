@@ -35,14 +35,6 @@ ftdi-mpsse = []
 # a clear "feature not enabled" error so callers fail fast. Add a
 # `rusb`/`nusb` dep when wiring the real device path.
 usbtmc-hw = []
-# Opt-in VXI-11 ONC RPC support. Scaffold compiles unconditionally;
-# `connect()` returns a clear "feature not enabled" error until an
-# `onc-rpc` (or custom XDR) dep is wired here.
-vxi11-hw = []
-# Opt-in HiSLIP protocol support. Scaffold compiles unconditionally;
-# `connect()` returns a clear "feature not enabled" error until the
-# IVI-6.1 frame parser / sync+async channel split lands.
-hislip-hw = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

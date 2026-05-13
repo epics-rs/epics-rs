@@ -109,7 +109,7 @@
 - **긴 문자열 `CALC$` 지원 이슈 (Issue #194)** — ⚠️ **N/A (out of scope)**: 원이슈는 C `caput -S test_calc.CALC$`(field name + `$` long-string suffix)가 일부 바이트만 작성되는 truncation 버그. `parse_pv_name` (`crates/epics-base-rs/src/server/database/mod.rs:22`)이 `$` 접미사를 별도 처리하지 않으며 `FIELD$` long-string access 자체가 미구현. truncation할 access 경로가 부재 — long-string `$` 접근이 추가될 때 이 항목 재검토.
 - **`DBF_MENU` → `DBF_STRING` 변환 버그 픽스 대조 (Issue #183)** — ⏭️ **ALREADY**: `BiRecord::put_field("VAL", String)` / `MbbiRecord::put_field("VAL", String)` / `BoRecord::put_field("VAL", String)` 모두 ZNAM/ONAM/STATE_STR 문자열을 enum 인덱스로 매핑하는 분기 보유 (`crates/epics-base-rs/src/server/records/{bi,mbbi,bo}.rs`에 "epics-base PR/issue #183" 주석으로 명시).
 - **`zero-length` (길이가 0인) 배열 지원 엣지 케이스 (7.0.5 / 5d808b7+3b3261c)** — ⏭️ **ALREADY**: upstream은 `S_db_emptyArray` 도입(5d808b7)했다가 호환성 문제로 revert(3b3261c) — 현재 C는 `S_db_badField`를 사용. Rust `CaError::InvalidValue`(`crates/epics-base-rs/src/error.rs:33` → ECA_BADTYPE 매핑)가 동일 의미로 일반화된 invalid-value 케이스를 처리하며, 빈 배열→스칼라 가드(12cfd41)가 이 경로에 적용됨. revert된 별도 `EmptyArray` variant는 의도적으로 추가하지 않음.
-- **`compress` 레코드 개선 (7.0.8)** — ⏸️ DEFERRED.
+- **`compress` 레코드 개선 (7.0.8)** — ⏸️ **DEFERRED**: 7.0.8에서 N-to-1 알고리즘이 부분 채워진 버퍼를 처리할 수 있도록 새 필드 `PBUF=YES` 도입. `crates/epics-base-rs/src/server/records/compress.rs`에 `PBUF` 필드 + N-to-1 algorithm-별 partial-buffer 처리 분기 + 테스트 추가 필요.
 
 ### Shell & 시스템 코어 세부
 

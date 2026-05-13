@@ -254,6 +254,15 @@ impl IocBuilder {
                 if let Err(e) = instance.record.init_record(1) {
                     eprintln!("init_record(1) failed for {}: {e}", def.name);
                 }
+                // epics-base PR dabcf89 (mbboDirect): after both init
+                // passes, give the record a chance to finalise UDF —
+                // e.g. fold initialised B0..B1F bits into VAL and
+                // clear UDF when no DOL/initial-VAL was provided.
+                let mut udf = instance.common.udf;
+                if let Err(e) = instance.record.post_init_finalize_undef(&mut udf) {
+                    eprintln!("post_init_finalize_undef failed for {}: {e}", def.name);
+                }
+                instance.common.udf = udf;
 
                 // Device support based on DTYP
                 let dtyp = instance.common.dtyp.clone();

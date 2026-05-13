@@ -258,8 +258,19 @@ impl Record for CompressRecord {
                 _ => Err(CaError::TypeMismatch("N".into())),
             },
             "RES" => match value {
-                EpicsValue::Short(v) => {
-                    self.res = v;
+                EpicsValue::Short(_) => {
+                    // epics-base 8ac2c87 (2025): writing any value to
+                    // RES triggers SPC_RESET — clear the circular
+                    // buffer and acknowledge by zeroing RES itself.
+                    // The framework should post a monitor event so
+                    // CA clients see the empty array immediately.
+                    self.nuse = 0;
+                    self.off = 0;
+                    self.res = 0;
+                    self.accum.clear();
+                    let nsam = self.nsam.max(0) as usize;
+                    self.val.clear();
+                    self.val.resize(nsam, 0.0);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("RES".into())),

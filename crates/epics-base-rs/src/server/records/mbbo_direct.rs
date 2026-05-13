@@ -268,7 +268,28 @@ impl Record for MbboDirectRecord {
             }
             self.mlst = self.val;
             self.oraw = self.rval;
+            // Don't derive bits from VAL yet — `post_init_finalize_undef`
+            // runs after both passes and chooses VAL→bits or bits→VAL
+            // based on the framework's UDF flag.
+        }
+        Ok(())
+    }
+
+    /// epics-base PR `dabcf89` (2021): when the record initialises
+    /// with no VAL set (UDF=true) but the operator populated B0..B1F
+    /// bits in the .db file, fold those bits into VAL and clear UDF.
+    /// Otherwise (VAL was set explicitly), derive bits from VAL.
+    /// The C code did this in init_record after `dset->init_record`.
+    /// In Rust the framework invokes us via the trait hook.
+    fn post_init_finalize_undef(&mut self, common_udf: &mut bool) -> CaResult<()> {
+        if !*common_udf {
             self.val_to_bits();
+        } else {
+            let any_bit_set = self.bits.iter().any(|&b| b != 0);
+            if any_bit_set {
+                self.bits_to_val();
+                *common_udf = false;
+            }
         }
         Ok(())
     }

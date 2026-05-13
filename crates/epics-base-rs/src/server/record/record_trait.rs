@@ -337,6 +337,20 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Post-init finalisation hook with mutable access to the
+    /// framework's UDF flag. Called once after both `init_record`
+    /// passes complete. Default implementation is a no-op.
+    ///
+    /// epics-base PR `dabcf89` (mbboDirect): when VAL is undefined
+    /// at init time but the user populated B0..B1F bits, the bits
+    /// should be folded into VAL and UDF cleared. The framework
+    /// owns `common.udf`, so the record cannot mutate it from
+    /// `init_record` alone — this hook is the controlled point of
+    /// access.
+    fn post_init_finalize_undef(&mut self, _udf: &mut bool) -> CaResult<()> {
+        Ok(())
+    }
+
     /// Called before/after a field put for side-effect processing.
     fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
         Ok(())

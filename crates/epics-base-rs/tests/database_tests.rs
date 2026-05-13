@@ -2025,3 +2025,104 @@ async fn test_new_common_fields_get_put() {
         assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::Char(1)));
     }
 }
+
+/// epics-base PR #359 (commits 5ba8080f6, aff74638b, 51c5b8f1e,
+/// fabc8d06a) regression: NORD monitor events from waveform / aai /
+/// aao / subArray must carry the post-process timestamp, not a stale
+/// (or zero) timestamp captured before `recGblGetTimeStamp`.
+///
+/// In the C source the bug was that `db_post_events(prec, &prec->nord, …)`
+/// was called inside `readValue()` *before* the record's timestamp was
+/// updated, so the very first NORD camonitor update arrived with an
+/// undefined timestamp. The upstream fix moved the NORD post into
+/// `process()` after `recGblGetTimeStampSimm`, applied across all four
+/// array record types.
+///
+/// In the Rust port the ordering is structural: every notify path
+/// (main, AsyncPendingNotify, complete_async_record) calls
+/// `apply_timestamp` *before* building the snapshot and invoking
+/// `notify_from_snapshot`. This test pins that contract for all four
+/// `ArrayKind` variants by subscribing to NORD, processing once, and
+/// verifying the delivered MonitorEvent timestamp is fresh.
+#[tokio::test]
+async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::waveform::{ArrayKind, WaveformRecord};
+    use epics_base_rs::types::DbFieldType;
+    use std::time::SystemTime;
+
+    for (kind, name) in [
+        (ArrayKind::Waveform, "WF_KIND"),
+        (ArrayKind::Aai, "AAI_KIND"),
+        (ArrayKind::Aao, "AAO_KIND"),
+        (ArrayKind::SubArray, "SUBA_KIND"),
+    ] {
+        let db = PvDatabase::new();
+        db.add_record(name, Box::new(WaveformRecord::with_kind(kind)))
+            .await
+            .unwrap();
+
+        // Configure DOUBLE buffer with NELM=10 — gives the put room
+        // to actually move NORD from 0 → N. For subArray, also set
+        // INDX=0 / MALM=10 so the slice is valid.
+        if let Some(rec) = db.get_record(name).await {
+            let mut inst = rec.write().await;
+            inst.record.put_field("NELM", EpicsValue::Long(10)).unwrap();
+            inst.record
+                .put_field("FTVL", EpicsValue::Short(10))
+                .unwrap();
+            if matches!(kind, ArrayKind::SubArray) {
+                inst.record.put_field("INDX", EpicsValue::Long(0)).unwrap();
+                inst.record.put_field("MALM", EpicsValue::Long(10)).unwrap();
+            }
+        }
+
+        // Wall-clock baseline AFTER record setup; the NORD event
+        // timestamp must be ≥ this value.
+        let start = SystemTime::now();
+
+        // Subscribe to NORD with VALUE mask. add_subscriber seeds
+        // last_posted with the current NORD (=0), so the next
+        // process cycle will treat the 0→N transition as a real
+        // change.
+        let mut nord_rx = if let Some(rec) = db.get_record(name).await {
+            let mut inst = rec.write().await;
+            inst.add_subscriber("NORD", 1, DbFieldType::Long, EventMask::VALUE.bits())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| panic!("NORD subscription must be accepted for {name}"));
+
+        // Stage the new array onto VAL. set_val updates VAL and
+        // implicitly NORD (now =3). Processing applies the
+        // timestamp and posts subscribed-field events.
+        if let Some(rec) = db.get_record(name).await {
+            let mut inst = rec.write().await;
+            inst.record
+                .set_val(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+                .unwrap();
+        }
+        let mut visited = HashSet::new();
+        db.process_record_with_links(name, &mut visited, 0)
+            .await
+            .unwrap();
+
+        let event = nord_rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("NORD monitor event must be delivered for {name}"));
+        assert!(
+            matches!(event.snapshot.value, EpicsValue::Long(3)),
+            "{name}: NORD payload should reflect post-set_val length (3), got {:?}",
+            event.snapshot.value
+        );
+        let ts = event.snapshot.timestamp;
+        assert!(
+            ts != SystemTime::UNIX_EPOCH,
+            "{name}: NORD event timestamp must not be the epoch sentinel"
+        );
+        assert!(
+            ts >= start,
+            "{name}: NORD event timestamp ({ts:?}) must be ≥ pre-process baseline ({start:?})"
+        );
+    }
+}

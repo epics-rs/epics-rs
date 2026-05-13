@@ -473,7 +473,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 `documentation/new-notes/`에서 발굴한 현재 개발 중이거나 병합 예정인 기능들:
 
-- **PR #359: `aai`/`aao`/`subArray`/`waveform`의 `NORD` 필드 타임스탬프 버그 수정** — 🔄 **PARTIAL** `a02c310`: `aai`/`aao`/`subArray` 레코드 타입 자체는 신규 구현. NORD 타임스탬프 갱신 순서 fix는 별도 작업.
+- **PR #359: `aai`/`aao`/`subArray`/`waveform`의 `NORD` 필드 타임스탬프 버그 수정** — ✅ **DONE**: 레코드 타입 `a02c310`로 구현 + NORD 타임스탬프 순서 수정은 구조적으로 enforced. Rust 측 모든 notify 경로(`process_record_with_links_inner`, `AsyncPendingNotify`, `complete_async_record_inner`)가 `apply_timestamp` → snapshot 빌드 → `notify_from_snapshot` 순서로 호출되므로 NORD 이벤트는 항상 post-process timestamp를 carries. 회귀 테스트 `test_array_records_nord_monitor_uses_post_process_timestamp` (`crates/epics-base-rs/tests/database_tests.rs`)이 4 종류(Waveform/Aai/Aao/SubArray) 모두 검증.
 - **PR #768: `iocInit`에서 로컬 CA 링크 연결 대기** — ✅ **DONE**: `IocApplication::run`이 `setup_cp_links` 직후 `PvDatabase::wait_for_external_links(timeout)`를 호출해 모든 등록된 LinkSet(dbCa/dbPv 양쪽)의 외부 링크가 connect될 때까지 대기. timeout은 `EPICS_RS_INIT_LINK_TIMEOUT` env (기본 10초, 0이면 wait skip). C의 `initOutstanding`/`DBCA_CALLBACK_INIT_WAIT` 카운터 + 별도 hook을 LinkSet trait의 `is_connected(name)` 폴링으로 단순화 — 결과 동등. `wait_for_external_links_*` 단위 테스트 3종(no lsets / quick-connect / partial-on-timeout).
 - **PR #788: `epicsThreadGetCPUs` 및 `callbackParallelThreads` CPU 어피니티 반영** — ⏭️ **ALREADY**: 섹션 3 보강 (Rust `std::thread::available_parallelism()`).
 - **PR #812: `dbCreateRecord` iocsh 명령어** — ⏭️ **ALREADY**: `cmd_db_create_record` (`crates/epics-base-rs/src/server/iocsh/commands.rs:680`)로 등록 + 5종 테스트(happy path + duplicate / bad name / unknown type / missing args).

@@ -528,7 +528,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **클라이언트 비콘 수신 시작** (`acfba6469ed3`, high) — ⏭️ **ALREADY**: `client_native/search_engine.rs:598` `beacon_recv` future로 백그라운드 수신.
 - **잘못된 스레드에서의 비콘 발송 경고** (`882a7720fb92`, medium) — ⚠️ **N/A**: Rust의 `Send`/`Sync` trait이 컴파일 시 보장.
 - **서버 비콘 TX 최적화** (`cc5071cd22c4`, medium) — ✅ **DONE** (partial): (1) `SO_BROADCAST`는 `AsyncUdpV4::bind(port, broadcast=true)` 경로(`epics-base-rs::net::async_udp_v4.rs:667`)로 이미 설정. (2) 본 commit에서 PVA 비콘 emitter 루프(`server_native/udp.rs:176-`)에 `first_beacon` flag 추가 — 서버 시작 후 첫 beacon이 `beacon_period`(default 15s) 대기 없이 즉시 emit (pvxs `immediate={0,0}` libevent 타이머와 동일 효과). (3) beacon_destinations port는 caller(server-side bind)에서 결정되며 `SocketAddr`로 이미 정확한 port 보유. (4) 별도 `searchReply` vs `beaconMsg` buffer 혼용 버그는 C 한정 (Rust는 `build_beacon`이 별도 Vec 반환).
-- **잘린 비콘(Truncated Beacon) 오류 무시** (`772cc5297cf8`, medium) / **반복적인 비콘 TX 오류 표시 제어** (`adcac746efff`, `91fed88cdd7f`) — ⏸️ DEFERRED.
+- **잘린 비콘(Truncated Beacon) 오류 무시** (`772cc5297cf8`, medium) / **반복적인 비콘 TX 오류 표시 제어** (`adcac746efff`, `91fed88cdd7f`) — ⏭️ **ALREADY**: 수신 측은 64KB UDP buffer 사용 (`crates/epics-pva-rs/src/client_native/search_engine.rs:593-594`)으로 truncation 자체가 발생하지 않음. 송신 측 TX 오류는 `beacon_send_errs: HashSet<SocketAddr>` per-destination dedup(`server_native/udp.rs:175,232-240`)로 first → warn, repeat → debug, recovery → remove 패턴 — pvxs의 first/change/recovery 의도와 동일.
 - **비콘 정리 타이머 단순화** (`b33ea5df3113`, medium) — ⏸️ DEFERRED.
 
 ---

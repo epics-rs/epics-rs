@@ -207,6 +207,71 @@ async fn test_putf_stays_off_for_cp_chained_targets() {
     );
 }
 
+/// epics-base 7.0.7 + PR #ac92e3e follow-up: SIMM=RAW input must
+/// route the SIOL value through RVAL and run the record's conversion
+/// chain (LINR/ESLO/EOFF), not overwrite VAL with the raw count.
+/// Pre-fix the simulation path called both put_field("RVAL", v) AND
+/// set_val(v), so VAL ended up holding raw counts and the operator's
+/// configured EGU conversion was silently bypassed.
+#[tokio::test]
+async fn test_simm_raw_input_runs_conversion_chain() {
+    let db = PvDatabase::new();
+    // Source PV that the ai's SIOL link reads from — provides the
+    // "raw count" for the simulation.
+    db.add_record("RAW:SRC", Box::new(AoRecord::new(5.0)))
+        .await
+        .unwrap();
+    // Target ai: configure LINR=SLOPE(1), ESLO=2.0, EOFF=10.0 so a
+    // raw value of 5 should convert to VAL = 5*2 + 10 = 20.
+    let mut ai = epics_base_rs::server::records::ai::AiRecord::new(0.0);
+    ai.linr = 1;
+    ai.eslo = 2.0;
+    ai.eoff = 10.0;
+    db.add_record("AI:SIMRAW", Box::new(ai)).await.unwrap();
+    if let Some(rec) = db.get_record("AI:SIMRAW").await {
+        let mut inst = rec.write().await;
+        // SIMM=2 (RAW) directly on the ai record's own SIMM field.
+        // Putting through put_field exercises the same code path
+        // operators hit via caput .SIMM 2.
+        inst.record.put_field("SIMM", EpicsValue::Short(2)).unwrap();
+        // SIOL lives on the ai record-specific struct (not common),
+        // so put through the record's own put_field — put_common_field
+        // would leave ai.siol empty and the simulation never enters.
+        inst.record
+            .put_field("SIOL", EpicsValue::String("RAW:SRC".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("AI:SIMRAW", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let ai_rec = db.get_record("AI:SIMRAW").await.expect("AI:SIMRAW exists");
+    let inst = ai_rec.read().await;
+    let val = inst
+        .record
+        .get_field("VAL")
+        .and_then(|v| v.to_f64())
+        .expect("VAL must be readable as f64");
+    assert!(
+        (val - 20.0).abs() < 1e-10,
+        "SIMM=RAW must run convert(): expected VAL=5*ESLO+EOFF=20.0, got {val}"
+    );
+    let rval = inst
+        .record
+        .get_field("RVAL")
+        .and_then(|v| match v {
+            EpicsValue::Long(n) => Some(n as f64),
+            other => other.to_f64(),
+        })
+        .expect("RVAL must be readable");
+    assert!(
+        (rval - 5.0).abs() < 1e-10,
+        "RVAL must hold the raw count from SIOL; got {rval}"
+    );
+}
+
 #[tokio::test]
 async fn test_cycle_detection() {
     let db = PvDatabase::new();

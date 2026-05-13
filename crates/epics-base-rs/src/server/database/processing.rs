@@ -1588,20 +1588,51 @@ impl PvDatabase {
             };
 
             if is_input {
-                // Input record: read from SIOL -> set VAL/RVAL (skip conversion).
+                // Input record: read from SIOL -> set VAL/RVAL.
                 if let Ok(siol_val) = self.get_pv(&pv_name).await {
                     let mut instance = rec.write().await;
                     let target_supports_raw =
                         raw_mode && instance.record.get_field("RVAL").is_some();
                     if target_supports_raw {
-                        // RAW path: drop the value into RVAL and let
-                        // the record's normal conversion chain
-                        // promote it to VAL on the next process —
-                        // matches C semantic where SIMM=RAW writes
-                        // raw counts.
-                        let _ = instance.record.put_field("RVAL", siol_val.clone());
+                        // PR #ac92e3e follow-up: SIMM=RAW on records
+                        // with RVAL (ai/ao/etc.) writes the raw value
+                        // into RVAL and runs the record's own
+                        // process() so the LINR / ESLO / EOFF / ASLO
+                        // / AOFF conversion chain computes VAL. The
+                        // pre-fix path additionally called set_val
+                        // here, which overwrote VAL with the raw
+                        // count and silently bypassed conversion —
+                        // the visible failure mode was "SIMM=RAW
+                        // simulation returns counts instead of EGU".
+                        //
+                        // Coerce to RVAL's native DBR type before
+                        // put_field — ai.RVAL is Long, but SIOL on a
+                        // soft channel typically yields Double. Without
+                        // the coerce step the put_field rejects with
+                        // TypeMismatch and leaves RVAL at 0, so
+                        // process() computes VAL = 0*ESLO + EOFF
+                        // (the offset only), not the intended
+                        // RAW*ESLO + EOFF.
+                        let rval_type = instance
+                            .record
+                            .field_list()
+                            .iter()
+                            .find(|f| f.name == "RVAL")
+                            .map(|f| f.dbf_type)
+                            .unwrap_or(crate::types::DbFieldType::Long);
+                        let coerced = if siol_val.db_field_type() != rval_type {
+                            siol_val.convert_to(rval_type)
+                        } else {
+                            siol_val
+                        };
+                        let _ = instance.record.put_field("RVAL", coerced);
+                        let _ = instance.record.process();
+                    } else {
+                        // Records without RVAL fall back to SIMM=YES
+                        // semantics: the SIOL value goes straight into
+                        // VAL; no conversion to run.
+                        let _ = instance.record.set_val(siol_val);
                     }
-                    let _ = instance.record.set_val(siol_val);
                     apply_timestamp(&mut instance.common, true);
                     instance.common.udf = false;
 

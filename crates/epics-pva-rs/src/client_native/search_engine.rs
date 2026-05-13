@@ -225,10 +225,30 @@ impl SearchEngine {
             })
             .await
             .unwrap_or_default();
+            // PR #205 IPv6 Stage 3 (client-side): the search UDP
+            // socket is still `AsyncUdpV4`, so IPv6 destinations
+            // would fail every send with InvalidInput and spam the
+            // per-destination retry log. Pre-filter explicit v6
+            // entries here with a single one-shot warning. When
+            // an IPv6 search socket is wired in a future stage,
+            // this filter can be dropped.
+            let mut dropped_v6: Vec<SocketAddr> = Vec::new();
             for sa in resolved {
+                if matches!(sa, SocketAddr::V6(_)) {
+                    dropped_v6.push(sa);
+                    continue;
+                }
                 if !extra_targets.contains(&sa) {
                     extra_targets.push(sa);
                 }
+            }
+            if !dropped_v6.is_empty() {
+                warn!(
+                    dropped = ?dropped_v6,
+                    "EPICS_PVA_ADDR_LIST contained IPv6 entries; client SEARCH \
+                     is still IPv4-only (PR #205 Stage 3 — pending). Use a v6 \
+                     name-server explicitly via PvaClient::builder().server_addr(..)"
+                );
             }
         }
 

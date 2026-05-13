@@ -1139,4 +1139,43 @@ mod tests {
         ads.read(&mut rec2).unwrap();
         assert_eq!(rec2.val(), Some(EpicsValue::Long(42)));
     }
+
+    /// PR #162: `aai` (array analog input) and `aao` (array analog output)
+    /// records use direction-specific DTYPs like `asynFloat64ArrayIn` and
+    /// `asynFloat64ArrayOut` that must collapse to the underlying interface
+    /// `asynFloat64Array` for the adapter dispatch. Without this the read_op
+    /// and write_op matchers (around L383/L417/L489) miss the DTYP and fail
+    /// to bind the record.
+    #[test]
+    fn dtyp_normalize_aai_aao_array_in_out() {
+        // Float64 — most common aai/aao pattern.
+        assert_eq!(normalize_asyn_dtyp("asynFloat64ArrayIn"), "asynFloat64Array");
+        assert_eq!(
+            normalize_asyn_dtyp("asynFloat64ArrayOut"),
+            "asynFloat64Array"
+        );
+        // Int32 family — covers waveform/aai/aao integer variants.
+        assert_eq!(normalize_asyn_dtyp("asynInt32ArrayIn"), "asynInt32Array");
+        assert_eq!(normalize_asyn_dtyp("asynInt32ArrayOut"), "asynInt32Array");
+        // Other widths sanity-check the suffix rule, not exhaustive of C asyn.
+        assert_eq!(normalize_asyn_dtyp("asynInt8ArrayIn"), "asynInt8Array");
+        assert_eq!(normalize_asyn_dtyp("asynInt16ArrayOut"), "asynInt16Array");
+        assert_eq!(normalize_asyn_dtyp("asynInt64ArrayIn"), "asynInt64Array");
+        assert_eq!(
+            normalize_asyn_dtyp("asynFloat32ArrayOut"),
+            "asynFloat32Array"
+        );
+    }
+
+    #[test]
+    fn dtyp_normalize_preserves_non_array_dtyps() {
+        // Scalar DTYPs must pass through unchanged — only Array/Octet
+        // direction suffixes are stripped.
+        assert_eq!(normalize_asyn_dtyp("asynInt32"), "asynInt32");
+        assert_eq!(normalize_asyn_dtyp("asynFloat64"), "asynFloat64");
+        // Octet read/write direction-specific DTYPs collapse to asynOctet
+        // (C EPICS lsi/lso/printf adapter convention).
+        assert_eq!(normalize_asyn_dtyp("asynOctetRead"), "asynOctet");
+        assert_eq!(normalize_asyn_dtyp("asynOctetWrite"), "asynOctet");
+    }
 }

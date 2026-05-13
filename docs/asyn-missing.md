@@ -34,6 +34,7 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 | 양방향 파라미터 notification | Issue #46 | `interrupt.rs::Interrupt` + `call_param_callbacks` (verified ALREADY) |
 | EOS 설정자 atomic update | Issue #103 | `interpose/eos.rs` Mutex-protected |
 | `asynMask` shift | Issue #166 | record-layer SHFT (mbbiDirect/mbboDirect) — asyn-side mask는 bit selection만 |
+| `aai`/`aao` 레코드 어댑터 매핑 | PR #162 | `epics-base-rs` `WaveformRecord::with_kind(Aai/Aao)` + `asyn-rs::adapter::normalize_asyn_dtyp` (asynFloat64ArrayIn/Out → asynFloat64Array). 이 세션에서 `dtyp_normalize_aai_aao_array_in_out` 회귀 테스트 추가 — universal_asyn_factory 가 aai/aao DTYP 정상 처리 |
 
 ## 진짜 미구현 (verified gaps)
 
@@ -50,7 +51,6 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 
 | 항목 | C asyn 출처 | 상태 | 비고 |
 |---|---|---|---|
-| `aai`/`aao` 레코드 어댑터 매핑 | PR #162 | 🔄 PARTIAL | record 자체는 구현 (`server/records/waveform.rs` SubArray/Aai/Aao kinds). asyn-rs adapter는 `asynInt32Array`/`asynFloat64Array` 인터페이스로 처리 — 별도 record-type 명시 매핑은 아직 |
 | `asyn:FIFO` info-tag 링 버퍼 | 2015년경 | 🔄 PARTIAL | `asyn_record/fifo.rs::RingBuffer<T>` (drop-oldest + overrun counter + tag parser) 완료. record adapter 측 push/pop 호출 사이트 wiring 은 follow-up |
 | `getLimits` 인터페이스 | Issue #218 | 🔄 PARTIAL | `interfaces/limits.rs::AsynLimits` trait + `IntLimits`/`FloatLimits` 완료. record-layer DRVH/DRVL ↔ limits read 자동 동기화는 follow-up |
 
@@ -80,9 +80,8 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 3. **asyn:FIFO record adapter wiring** (push/pop 호출 사이트) — medium
 4. **USBTMC `usbtmc-hw` rusb/nusb 바인딩** — medium
 5. **Prologix `connect()` ip_port 위임 wiring** — small
-6. **aai/aao record-type explicit mapping** (adapter type switch) — medium
-7. **PVI / asynParamSet** (architectural, multi-day) — large
-8. **VXI-11 / HiSLIP** (RPC / TCP protocols, multi-day each) — large
+6. **PVI / asynParamSet** (architectural, multi-day) — large
+7. **VXI-11 / HiSLIP** (RPC / TCP protocols, multi-day each) — large
 
 ---
 

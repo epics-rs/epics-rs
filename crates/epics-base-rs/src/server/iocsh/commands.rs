@@ -187,7 +187,19 @@ fn cmd_dbgf() -> CommandDef {
             match ctx.block_on(ctx.db().get_pv(name)) {
                 Ok(val) => {
                     let type_name = dbf_type_name(&val);
-                    ctx.println(&format!("{type_name}: {val}"));
+                    // epics-base dc70dfd6: dbgf must C-style-escape
+                    // non-printable bytes in CHAR-array output and
+                    // wrap in double-quotes so a CHAR array carrying
+                    // control bytes does not corrupt the operator's
+                    // terminal. Other types fall through to the
+                    // standard Display formatter.
+                    let formatted = match &val {
+                        EpicsValue::CharArray(arr) => {
+                            format!("\"{}\"", escape_char_array_for_dbgf(arr))
+                        }
+                        _ => format!("{val}"),
+                    };
+                    ctx.println(&format!("{type_name}: {formatted}"));
                     Ok(CommandOutcome::Continue)
                 }
                 Err(e) => Err(format!("{e}")),
@@ -1069,6 +1081,32 @@ fn cmd_exit() -> CommandDef {
     )
 }
 
+/// C-style escape a CHAR-array buffer for `dbgf` output (epics-base
+/// dc70dfd6). Printable ASCII passes through; well-known C escapes
+/// (`\n`, `\t`, `\r`, `\\`, `\"`, `\a`, `\b`, `\f`, `\v`) get their
+/// short form; everything else is rendered as `\xNN`. Mirrors
+/// `epicsStrnEscapedFromRaw` exactly enough for the dbgf use case —
+/// the surrounding quote pair is added by the caller.
+fn escape_char_array_for_dbgf(buf: &[u8]) -> String {
+    let mut out = String::with_capacity(buf.len());
+    for &b in buf {
+        match b {
+            b'\n' => out.push_str("\\n"),
+            b'\t' => out.push_str("\\t"),
+            b'\r' => out.push_str("\\r"),
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            0x0b => out.push_str("\\v"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out
+}
+
 /// Parse a macro string like "P=IOC:,R=TEMP" into a HashMap.
 /// Macro values may reference environment variables via `$(ENVVAR)`.
 pub(super) fn parse_macro_string(s: &str) -> HashMap<String, String> {
@@ -1107,6 +1145,42 @@ mod field_suggestion_tests {
         assert_eq!(edit_distance_short("", ""), 0);
         assert_eq!(edit_distance_short("ABC", ""), 3);
         assert_eq!(edit_distance_short("", "XYZ"), 3);
+    }
+}
+
+#[cfg(test)]
+mod dbgf_escape_tests {
+    use super::escape_char_array_for_dbgf;
+
+    /// epics-base dc70dfd6 — printable ASCII passes through unchanged.
+    #[test]
+    fn printable_ascii_passes_through() {
+        assert_eq!(escape_char_array_for_dbgf(b"hello"), "hello");
+        assert_eq!(escape_char_array_for_dbgf(b"a b c"), "a b c");
+    }
+
+    /// Common C escapes get their short form.
+    #[test]
+    fn common_c_escapes() {
+        assert_eq!(escape_char_array_for_dbgf(b"a\nb"), "a\\nb");
+        assert_eq!(escape_char_array_for_dbgf(b"a\tb"), "a\\tb");
+        assert_eq!(escape_char_array_for_dbgf(b"a\rb"), "a\\rb");
+        assert_eq!(escape_char_array_for_dbgf(b"a\\b"), "a\\\\b");
+        assert_eq!(escape_char_array_for_dbgf(b"a\"b"), "a\\\"b");
+        assert_eq!(escape_char_array_for_dbgf(b"a\x07b"), "a\\ab");
+        assert_eq!(escape_char_array_for_dbgf(b"a\x08b"), "a\\bb");
+        assert_eq!(escape_char_array_for_dbgf(b"a\x0cb"), "a\\fb");
+        assert_eq!(escape_char_array_for_dbgf(b"a\x0bb"), "a\\vb");
+    }
+
+    /// Other non-printable bytes (and any high-bit byte) become `\xNN`.
+    #[test]
+    fn other_bytes_use_hex_escape() {
+        assert_eq!(escape_char_array_for_dbgf(&[0x01, 0xff]), "\\x01\\xff");
+        // DEL (0x7f) is non-printable per the C convention.
+        assert_eq!(escape_char_array_for_dbgf(&[0x7f]), "\\x7f");
+        // Empty buffer stays empty.
+        assert_eq!(escape_char_array_for_dbgf(&[]), "");
     }
 }
 

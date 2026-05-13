@@ -191,7 +191,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`postfix()` 함수의 널 포인터 역참조** (`60fa2d31`, 2023): calc 엔진의 후위 변환기에서 잘못된 입력 시 크래시.
 - **`dbEvent` 잔여 이벤트 카운트(`eventsRemaining`) 오계산** (`e1c1bb8b`, 2023): 이벤트 큐에서 남은 이벤트 수 계산 오류로 조기 종료.
 - **`callbackSetQueueSize` 상한 검사** (`baa4cb54`, 2025) — ⚠️ **N/A (design diff)**: epics-rs는 C의 `callback.c` 큐 시스템을 사용하지 않고 tokio 런타임의 `mpsc::channel` / spawn 으로 콜백 워크를 처리. `callbackSetQueueSize` 등가 API 자체가 없음. 음수/0 큐 사이즈 입력 검증이 필요한 진입점이 부재.
-- **`CHAR` 배열 출력 시 비출력 문자 이스케이프** (`dc70dfd6`, 2022): `dbgf`에서 CHAR 배열을 텍스트로 출력할 때 제어 문자를 이스케이프.
+- **`CHAR` 배열 출력 시 비출력 문자 이스케이프** (`dc70dfd6`, 2022) — ✅ **DONE**: `cmd_dbgf`가 `EpicsValue::CharArray` 케이스에서 신규 `escape_char_array_for_dbgf` 헬퍼로 C 스타일 escape 후 큰따옴표 wrap (`"..."`). short form: `\n` `\t` `\r` `\\` `\"` `\a` `\b` `\f` `\v`, 그 외 non-printable 및 high-bit (0x7f..=0xff)는 `\xNN`. 다른 EpicsValue 타입은 기존 Display 그대로. Unit 테스트 3종.
 
 ---
 

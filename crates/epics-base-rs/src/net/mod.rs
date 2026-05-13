@@ -17,6 +17,8 @@ pub mod async_udp_v4;
 pub mod iface_map;
 pub mod loopback_mcast;
 
-pub use async_udp_v4::{AsyncUdpV4, RecvMeta};
+pub use async_udp_v4::{
+    AsyncUdpV4, RecvMeta, enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket,
+};
 pub use iface_map::{IfaceInfo, IfaceMap};
 pub use loopback_mcast::{ORIGIN_TAG_MCAST_GROUP, bind_loopback_mcast};

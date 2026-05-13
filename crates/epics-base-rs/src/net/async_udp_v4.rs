@@ -643,10 +643,8 @@ impl AsyncUdpV4 {
     /// to avoid spamming on every ordinary packet.
     ///
     /// This receives on the FIRST NIC's socket only — designed for
-    /// the single-binding cases (e.g. PVA UDP collector). The
-    /// multi-NIC `recv_with_meta` path uses `tokio::select!` across
-    /// every NIC and would need its own per-NIC drop tracking; that
-    /// integration is intentionally deferred.
+    /// the single-binding cases (e.g. PVA UDP collector). For the
+    /// multi-NIC fan-in case, see [`Self::recv_with_meta_with_drops`].
     pub async fn recv_from_with_drop_count(
         &self,
         buf: &mut [u8],
@@ -655,8 +653,99 @@ impl AsyncUdpV4 {
             .sockets
             .first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no NIC sockets"))?;
-        recv_from_with_drop_count_one(&nic.sock, buf).await
+        recv_from_with_drop_count_socket(&nic.sock, buf).await
     }
+
+    /// Multi-NIC `recv_with_meta` variant that also returns the
+    /// receiving NIC's `SO_RXQ_OVFL` drop counter at the moment this
+    /// packet arrived. Caller tracks deltas keyed by NIC `iface_ip`
+    /// (already exposed in [`RecvMeta::iface_ip`]) — a transition in
+    /// any NIC's counter signals that the kernel just dropped at
+    /// least one earlier datagram on that NIC because the per-socket
+    /// receive buffer was full.
+    ///
+    /// On non-Linux platforms `drop_count` is always 0.
+    pub async fn recv_with_meta_with_drops(&self, buf: &mut [u8]) -> io::Result<(RecvMeta, u32)> {
+        // Build one future per NIC socket, each calling the cmsg-aware
+        // single-socket recv. `select_all_owned` returns the first
+        // future to complete; the others are dropped (and their local
+        // buffers along with them) without leaking pending recvmsg
+        // calls — same lifetime contract as the plain recv_with_meta.
+        let mut futures = Vec::with_capacity(self.sockets.len());
+        for nic in &self.sockets {
+            let sock = nic.sock.clone();
+            let info = (nic.iface_ip, nic.ifindex);
+            futures.push(Box::pin(async move {
+                let mut local = vec![0u8; 65535];
+                let r = recv_from_with_drop_count_socket(&sock, &mut local).await;
+                (r, info, local)
+            }));
+        }
+        if futures.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "AsyncUdpV4: no NIC sockets",
+            ));
+        }
+        let ((res, info, local), _idx, _rest) = select_all_owned(futures).await;
+        let (n, src, drops) = res?;
+        let copy_len = n.min(buf.len());
+        buf[..copy_len].copy_from_slice(&local[..copy_len]);
+        let (iface_ip, ifindex) = info;
+        Ok((
+            RecvMeta {
+                n: copy_len,
+                src,
+                dst_ip: Some(iface_ip),
+                ifindex: if ifindex == 0 { None } else { Some(ifindex) },
+                iface_ip,
+            },
+            drops,
+        ))
+    }
+}
+
+/// Free-function recv that surfaces the `SO_RXQ_OVFL` cmsg value on
+/// Linux. Exposed so callers managing their own
+/// `tokio::net::UdpSocket` (e.g. the PVA loopback ORIGIN_TAG socket)
+/// can use the same overflow detection without going through
+/// `AsyncUdpV4`. On non-Linux platforms this is a thin wrapper over
+/// `tokio::net::UdpSocket::recv_from` returning `drop_count = 0`.
+pub async fn recv_from_with_drop_count_socket(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, u32)> {
+    recv_from_with_drop_count_one(sock, buf).await
+}
+
+/// Companion setter to [`recv_from_with_drop_count_socket`] for
+/// callers that bind their own `tokio::net::UdpSocket`. Linux:
+/// `setsockopt(SOL_SOCKET, SO_RXQ_OVFL, 1)`. Non-Linux: no-op
+/// success.
+pub fn enable_so_rxq_ovfl_for_socket(sock: &UdpSocket) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let val: libc::c_int = 1;
+        // SAFETY: fd is owned by the tokio UdpSocket borrowed for the
+        // duration of this call; setsockopt on a non-blocking UDP
+        // socket is sound.
+        let r = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RXQ_OVFL,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&val) as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let _ = sock;
+    Ok(())
 }
 
 /// Per-socket recv that surfaces the `SO_RXQ_OVFL` cmsg value on
@@ -1038,6 +1127,40 @@ mod tests {
         let sock = AsyncUdpV4::bind(0, false).expect("bind");
         sock.enable_so_rxq_ovfl()
             .expect("enable_so_rxq_ovfl must succeed on every platform");
+    }
+
+    /// Multi-NIC variant: `recv_with_meta_with_drops` must round-trip
+    /// `RecvMeta` (n / src / iface_ip) identically to the no-drops
+    /// `recv_with_meta` and report `drop_count = 0` under normal load.
+    #[tokio::test]
+    async fn recv_with_meta_with_drops_returns_zero_under_normal_load() {
+        let server = AsyncUdpV4::bind(0, false).expect("server bind");
+        server.enable_so_rxq_ovfl().expect("enable counter");
+        let server_port = server.sockets[0]
+            .sock
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port));
+
+        let client = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("client bind");
+        let payload = b"meta-with-drops-payload";
+        client.send_to(payload, dest).await.expect("send");
+
+        let mut buf = [0u8; 64];
+        let (meta, drops) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.recv_with_meta_with_drops(&mut buf),
+        )
+        .await
+        .expect("recv timeout")
+        .expect("recv ok");
+        assert_eq!(meta.n, payload.len(), "byte count must match");
+        assert_eq!(&buf[..meta.n], payload, "payload must round-trip");
+        assert!(meta.iface_ip.is_loopback(), "loopback recv path expected");
+        assert_eq!(drops, 0, "freshly-bound socket must report 0 drops");
     }
 
     /// `recv_from_with_drop_count` returns `drop_count = 0` on a

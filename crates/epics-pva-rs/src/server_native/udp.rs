@@ -10,7 +10,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::net::{AsyncUdpV4, ORIGIN_TAG_MCAST_GROUP, bind_loopback_mcast};
+use epics_base_rs::net::{
+    AsyncUdpV4, ORIGIN_TAG_MCAST_GROUP, bind_loopback_mcast, enable_so_rxq_ovfl_for_socket,
+    recv_from_with_drop_count_socket,
+};
 use std::net::SocketAddrV4;
 use tracing::{debug, warn};
 
@@ -347,12 +350,31 @@ pub async fn run_udp_responder_with_config(
     // requested group), we log at debug and run without ORIGIN_TAG
     // delivery rather than aborting startup.
     let lo_mcast = match bind_loopback_mcast(udp_port) {
-        Ok(s) => Some(Arc::new(s)),
+        Ok(s) => {
+            // pvxs `udp_collector.cpp::UDPCollector::UDPCollector`
+            // (commit a064677e3625) enables SO_RXQ_OVFL on the
+            // collector socket so the kernel's per-socket dropped-
+            // datagram counter is delivered as a cmsg on each
+            // recvmsg. No-op on non-Linux.
+            if let Err(e) = enable_so_rxq_ovfl_for_socket(&s) {
+                debug!("loopback SO_RXQ_OVFL enable failed (non-fatal): {e}");
+            }
+            Some(Arc::new(s))
+        }
         Err(e) => {
             debug!("loopback ORIGIN_TAG socket bind failed, running without: {e}");
             None
         }
     };
+    // pvxs parity for the per-NIC SEARCH responder bundle. Each NIC
+    // socket gets its own kernel counter; we track the previous
+    // observed value per iface IP and log only on transitions.
+    if let Err(e) = socket.enable_so_rxq_ovfl() {
+        debug!("per-NIC SO_RXQ_OVFL enable failed (non-fatal): {e}");
+    }
+    let mut prev_drops_per_iface: std::collections::HashMap<Ipv4Addr, u32> =
+        std::collections::HashMap::new();
+    let mut prev_drops_lo: u32 = 0;
 
     // 64 KB receive buffer — IPv4 maximum. The previous 1500-byte
     // (Ethernet MTU) cap silently truncated large multi-PV searches:
@@ -369,13 +391,16 @@ pub async fn run_udp_responder_with_config(
         // socket (if bound) catches CMD_ORIGIN_TAG forwards from local
         // PVA peers. Both paths feed `process_search_datagram` with a
         // tagged origin so anti-loop and reply-routing rules apply.
-        let recv_direct = socket.recv_with_meta(&mut buf);
+        let recv_direct = socket.recv_with_meta_with_drops(&mut buf);
         let recv_lo = async {
             match lo_mcast.as_ref() {
-                Some(s) => s.recv_from(&mut lo_buf).await.map(Some),
+                Some(s) => recv_from_with_drop_count_socket(s, &mut lo_buf)
+                    .await
+                    .map(Some),
                 // No loopback socket: never resolve.
                 None => {
-                    std::future::pending::<std::io::Result<Option<(usize, SocketAddr)>>>().await
+                    std::future::pending::<std::io::Result<Option<(usize, SocketAddr, u32)>>>()
+                        .await
                 }
             }
         };
@@ -385,10 +410,22 @@ pub async fn run_udp_responder_with_config(
         // PVA peer's ORIGIN_TAG forwards aren't starved of recv slots.
         tokio::select! {
             r = recv_direct => {
-                let meta = match r {
+                let (meta, drops) = match r {
                     Ok(m) => m,
                     Err(e) => { debug!("udp recv error: {e}"); continue; }
                 };
+                // Surface per-NIC kernel drop transitions exactly
+                // once per change — pvxs `udp_collector.cpp:55-67`
+                // logs at debug on `prev != current && current != 0`.
+                let prev = prev_drops_per_iface.insert(meta.iface_ip, drops).unwrap_or(0);
+                if drops != 0 && drops != prev {
+                    debug!(
+                        iface_ip = %meta.iface_ip,
+                        prev,
+                        drops,
+                        "PVA UDP collector socket buffer overflow on per-NIC socket"
+                    );
+                }
                 let frame_len = meta.n;
                 if !filter_inbound(meta.src, &ignore_addrs) {
                     continue;
@@ -414,7 +451,15 @@ pub async fn run_udp_responder_with_config(
                     Ok(None) => continue,
                     Err(e) => { debug!("loopback udp recv error: {e}"); continue; }
                 };
-                let (n, src) = r;
+                let (n, src, drops) = r;
+                if drops != 0 && drops != prev_drops_lo {
+                    debug!(
+                        prev = prev_drops_lo,
+                        drops,
+                        "PVA UDP collector socket buffer overflow on loopback ORIGIN_TAG socket"
+                    );
+                }
+                prev_drops_lo = drops;
                 if !filter_inbound(src, &ignore_addrs) {
                     continue;
                 }
@@ -717,18 +762,29 @@ pub async fn run_udp_responder_v6(
     let socket = tokio::net::UdpSocket::bind(bind_addr)
         .await
         .map_err(crate::error::PvaError::Io)?;
+    if let Err(e) = enable_so_rxq_ovfl_for_socket(&socket) {
+        debug!("v6 SO_RXQ_OVFL enable failed (non-fatal): {e}");
+    }
     let socket = Arc::new(socket);
     debug!(?udp_port, "IPv6 UDP search responder started");
 
     let mut buf = vec![0u8; 64 * 1024];
+    let mut prev_drops_v6: u32 = 0;
     loop {
-        let (n, peer) = match socket.recv_from(&mut buf).await {
+        let (n, peer, drops) = match recv_from_with_drop_count_socket(&socket, &mut buf).await {
             Ok(v) => v,
             Err(e) => {
                 debug!("v6 udp recv error: {e}");
                 continue;
             }
         };
+        if drops != 0 && drops != prev_drops_v6 {
+            debug!(
+                prev = prev_drops_v6,
+                drops, "PVA UDP collector socket buffer overflow on v6 socket"
+            );
+        }
+        prev_drops_v6 = drops;
         if !filter_inbound(peer, &ignore_addrs) {
             continue;
         }

@@ -204,7 +204,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`dbGet`의 루프-안전 래퍼** (`dac620a7`, 2024): `dbGet()` 재귀 호출 시 데드락을 방지하는 루프-안전 래퍼 추가.
 - **`NAMSG` 알람 문자열 필드를 `NSTAT`/`NSEV`와 함께 초기화** (`8483ff95`, 2024) — ⏭️ **ALREADY**: `rec_gbl_reset_alarms`(`crates/epics-base-rs/src/server/recgbl.rs:121`)가 `common.amsg = std::mem::take(&mut common.namsg)`로 promote 직후 namsg를 자동 클리어. `reset_alarms_transfers_amsg_and_clears_namsg` 테스트로 회귀 방어.
 - **`lset::getAlarmMsg()` API** (`5143c71a`, 2020): 링크 세트(link set)에서 알람 메시지를 직접 읽어오는 새 API.
-- **빈 문자열 링크를 `unset`과 동일하게 처리** (`3b484f58`, 2023): `INP`/`OUT` 링크가 빈 문자열 `""`일 때 링크를 해제(unset)된 것으로 처리해야 하는 시맨틱.
+- **빈 문자열 링크를 `unset`과 동일하게 처리** (`3b484f58`, 2023) — ⏭️ **ALREADY**: `parse_link_v2` (`crates/epics-base-rs/src/server/record/link.rs:233-235`)가 `s.is_empty()` 케이스를 `ParsedLink::None`으로 반환. JSON form `{const:""}`도 `try_parse_json_link:143-144`에서 동일하게 `None` 처리.
 - **`FIFO 스케줄링`을 환경 변수로 비활성화** (`862272d6`, 2025): `EPICS_NO_RT_SCHED` 같은 환경 변수로 RT 스케줄링을 비활성화하는 기능. `epics-rs`의 RT 스레드 옵트아웃 로직 확인.
 - **`memlock()` 옵트아웃** (`0916cf98`, 2025): FIFO 스케줄링이 비활성화된 경우 `mlockall()` 호출도 건너뜁니다.
 - **`aSub` 레코드의 상수 `INP*` 링크 지원** (`d47fa4ca`, 2022, Issue #284): → 섹션 5의 기존 항목과 동일.

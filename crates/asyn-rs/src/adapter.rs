@@ -190,6 +190,12 @@ pub struct AsynDeviceSupport {
     /// sending a blocking read to the port driver. This matches C EPICS behavior
     /// where the interrupt callback directly provides the value.
     interrupt_cache: Arc<std::sync::Mutex<Option<CachedInterrupt>>>,
+    /// Optional per-record FIFO ring buffer for `info(asyn:FIFO, "N")`
+    /// records. When `Some`, the I/O Intr forwarding task pushes to
+    /// the ring (drop-oldest on overflow) instead of overwriting
+    /// `interrupt_cache`, and `read()` pops one entry per process
+    /// cycle. None falls back to the historic single-cache behaviour.
+    interrupt_fifo: Option<Arc<crate::asyn_record::fifo::RingBuffer<CachedInterrupt>>>,
 }
 
 /// Cached interrupt value with metadata for alarm/timestamp propagation.
@@ -223,6 +229,7 @@ impl AsynDeviceSupport {
             write_only: false,
             interrupt_sub: None,
             interrupt_cache: Arc::new(std::sync::Mutex::new(None)),
+            interrupt_fifo: None,
         }
     }
 
@@ -575,7 +582,15 @@ impl DeviceSupport for AsynDeviceSupport {
         // sending a blocking read to the port. This matches C EPICS behavior
         // where the interrupt callback directly provides the new value.
         if self.scan == ScanType::IoIntr {
-            let cached = self.interrupt_cache.lock().unwrap().take();
+            let cached = if let Some(ref ring) = self.interrupt_fifo {
+                // FIFO mode: pop oldest queued entry. If more entries
+                // remain after this pop, the existing wake-ups still
+                // queued in the mpsc channel will trigger another
+                // process cycle naturally — no explicit re-arm needed.
+                ring.pop()
+            } else {
+                self.interrupt_cache.lock().unwrap().take()
+            };
             if let Some(ci) = cached {
                 if let Some(val) = param_value_to_epics_value(&ci.value) {
                     let _ = record.set_val(val);
@@ -663,6 +678,20 @@ impl DeviceSupport for AsynDeviceSupport {
                 && !v.eq_ignore_ascii_case("false");
             self.set_asyn_readback(on);
         }
+        // asyn 2015-era `info("asyn:FIFO", "N")` — replace the lossy
+        // single-slot interrupt cache with a depth-N ring buffer so
+        // bursts of interrupts that arrive faster than the record
+        // can `process()` are queued instead of overwritten. Drop-
+        // oldest on overflow (matches C asyn). `parse_fifo_tag`
+        // returns `None` for "0"/"false"/garbage — those leave the
+        // FIFO disabled and the historic behaviour intact.
+        if let Some(raw) = info.get("asyn:FIFO") {
+            if let Some(depth) = crate::asyn_record::fifo::parse_fifo_tag(raw) {
+                self.interrupt_fifo = Some(Arc::new(
+                    crate::asyn_record::fifo::RingBuffer::new(depth),
+                ));
+            }
+        }
     }
 
     fn write_begin(
@@ -726,14 +755,29 @@ impl DeviceSupport for AsynDeviceSupport {
         // updates, so no data is lost even if the record processes slowly.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let cache = self.interrupt_cache.clone();
+        let fifo = self.interrupt_fifo.clone();
         tokio::spawn(async move {
             while let Some(iv) = intr_rx.recv().await {
-                *cache.lock().unwrap() = Some(CachedInterrupt {
+                let entry = CachedInterrupt {
                     value: iv.value,
                     timestamp: iv.timestamp,
-                });
-                if tx.send(()).await.is_err() {
-                    break;
+                };
+                if let Some(ref ring) = fifo {
+                    // FIFO mode: push to ring (drop-oldest on full).
+                    // Wake non-blocking — if the wake channel is
+                    // saturated (16 pending), data still sits in the
+                    // ring and the next process cycle drains another
+                    // entry. Losing a wake-up event is recoverable;
+                    // losing a sample (the single-cache fallback's
+                    // failure mode) is what `asyn:FIFO` exists to
+                    // prevent.
+                    ring.push(entry);
+                    let _ = tx.try_send(());
+                } else {
+                    *cache.lock().unwrap() = Some(entry);
+                    if tx.send(()).await.is_err() {
+                        break;
+                    }
                 }
             }
         });
@@ -1102,6 +1146,111 @@ mod tests {
         assert!(
             ads.io_intr_receiver().is_some(),
             "asyn:READBACK=1 must enable readback path"
+        );
+    }
+
+    /// `info("asyn:FIFO", "N")` allocates a depth-N RingBuffer and
+    /// the adapter routes interrupts through it instead of the
+    /// single-slot cache. Default-truthy aliases (yes/true/on)
+    /// produce the DEFAULT_FIFO_DEPTH ring; "0"/false leave it off.
+    #[test]
+    fn apply_record_info_enables_fifo_for_depth_value() {
+        let mut ads = make_adapter(ScanType::IoIntr);
+        assert!(ads.interrupt_fifo.is_none());
+
+        let mut info = std::collections::HashMap::new();
+        info.insert("asyn:FIFO".to_string(), "10".to_string());
+        ads.apply_record_info(&info);
+        let ring = ads
+            .interrupt_fifo
+            .as_ref()
+            .expect("FIFO must be allocated");
+        assert_eq!(ring.capacity(), 10);
+
+        // "yes" alias produces DEFAULT_FIFO_DEPTH.
+        let mut ads2 = make_adapter(ScanType::IoIntr);
+        info.insert("asyn:FIFO".to_string(), "yes".to_string());
+        ads2.apply_record_info(&info);
+        assert_eq!(
+            ads2.interrupt_fifo.as_ref().unwrap().capacity(),
+            crate::asyn_record::fifo::DEFAULT_FIFO_DEPTH
+        );
+
+        // Falsy values keep FIFO disabled.
+        for off in ["0", "no", "false", "off"] {
+            let mut ads3 = make_adapter(ScanType::IoIntr);
+            info.insert("asyn:FIFO".to_string(), off.to_string());
+            ads3.apply_record_info(&info);
+            assert!(
+                ads3.interrupt_fifo.is_none(),
+                "value {off:?} must leave FIFO disabled"
+            );
+        }
+    }
+
+    /// End-to-end FIFO regression: enable `asyn:FIFO,5`, push 8
+    /// interrupts faster than the record can process, then drive 5
+    /// process cycles and confirm the ring delivered the 5 oldest
+    /// values that survived the drop-oldest policy (i.e. values 4..=8
+    /// of the 8 pushed). With the historic single-cache, 7 of the 8
+    /// would be lost — the test fences `asyn:FIFO`'s reason for
+    /// existing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fifo_preserves_burst_interrupts_no_loss_within_capacity() {
+        use crate::param::ParamValue;
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use std::time::SystemTime;
+
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+
+        let mut info = std::collections::HashMap::new();
+        info.insert("asyn:FIFO".to_string(), "5".to_string());
+        ads.apply_record_info(&info);
+        let ring = ads.interrupt_fifo.clone().expect("FIFO allocated");
+
+        // Bypass the live interrupt path — directly populate the ring
+        // the adapter holds. This isolates the read() drain logic
+        // from interrupt-task timing (covered separately by tests in
+        // asyn_record::fifo).
+        for v in 1..=8i32 {
+            ring.push(CachedInterrupt {
+                value: ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+            });
+        }
+        assert_eq!(ring.len(), 5, "ring saturated at depth 5");
+        assert_eq!(ring.overruns(), 3, "3 oldest dropped (1, 2, 3)");
+
+        // Drive 5 process cycles — each pops one entry, oldest first
+        // among the survivors (4, 5, 6, 7, 8).
+        let mut got = Vec::new();
+        for _ in 0..5 {
+            let mut r = LonginRecord::new(0);
+            ads.read(&mut r).unwrap();
+            got.push(r.val().unwrap());
+        }
+        assert_eq!(
+            got,
+            vec![
+                EpicsValue::Long(4),
+                EpicsValue::Long(5),
+                EpicsValue::Long(6),
+                EpicsValue::Long(7),
+                EpicsValue::Long(8),
+            ]
+        );
+        assert_eq!(ring.len(), 0, "drained");
+
+        // 6th process cycle with empty ring — read returns
+        // computed() with no value change; the record retains its
+        // last VAL (8). C asyn behaviour for "no new sample".
+        let mut r = LonginRecord::new(0);
+        ads.read(&mut r).unwrap();
+        assert!(
+            r.val().is_none() || r.val() == Some(EpicsValue::Long(0)),
+            "empty FIFO read must not pop a stale sample"
         );
     }
 

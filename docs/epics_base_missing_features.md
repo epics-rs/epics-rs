@@ -205,8 +205,8 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`NAMSG` 알람 문자열 필드를 `NSTAT`/`NSEV`와 함께 초기화** (`8483ff95`, 2024) — ⏭️ **ALREADY**: `rec_gbl_reset_alarms`(`crates/epics-base-rs/src/server/recgbl.rs:121`)가 `common.amsg = std::mem::take(&mut common.namsg)`로 promote 직후 namsg를 자동 클리어. `reset_alarms_transfers_amsg_and_clears_namsg` 테스트로 회귀 방어.
 - **`lset::getAlarmMsg()` API** (`5143c71a`, 2020): 링크 세트(link set)에서 알람 메시지를 직접 읽어오는 새 API.
 - **빈 문자열 링크를 `unset`과 동일하게 처리** (`3b484f58`, 2023) — ⏭️ **ALREADY**: `parse_link_v2` (`crates/epics-base-rs/src/server/record/link.rs:233-235`)가 `s.is_empty()` 케이스를 `ParsedLink::None`으로 반환. JSON form `{const:""}`도 `try_parse_json_link:143-144`에서 동일하게 `None` 처리.
-- **`FIFO 스케줄링`을 환경 변수로 비활성화** (`862272d6`, 2025): `EPICS_NO_RT_SCHED` 같은 환경 변수로 RT 스케줄링을 비활성화하는 기능. `epics-rs`의 RT 스레드 옵트아웃 로직 확인.
-- **`memlock()` 옵트아웃** (`0916cf98`, 2025): FIFO 스케줄링이 비활성화된 경우 `mlockall()` 호출도 건너뜁니다.
+- **`FIFO 스케줄링`을 환경 변수로 비활성화** (`862272d6`, 2025) — ⚠️ **N/A (design diff)**: 원 commit은 `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING=NO`로 C `epicsThread`의 `SCHED_FIFO` 활성화를 끄는 기능. Rust 측은 tokio runtime + std `thread::Builder` 사용으로 SCHED_FIFO/sched_setscheduler를 호출하지 않음 — RT 스케줄링 활성화 자체가 없어 비활성화할 대상도 없음. ROADMAP Phase 1의 RT 잠재 도입 시 동등 env var 추가.
+- **`memlock()` 옵트아웃** (`0916cf98`, 2025) — ⚠️ **N/A (design diff)**: FIFO 비활성화 시 `mlockall()`도 건너뛰는 C 코드. Rust는 `mlockall` 자체를 호출하지 않음 (RT 메모리 잠금 미사용) — 건너뛸 호출이 부재.
 - **`aSub` 레코드의 상수 `INP*` 링크 지원** (`d47fa4ca`, 2022, Issue #284) — ⏭️ **ALREADY**: 섹션 5 보강 참조. 핵심: `read_link_with_alarm`의 `ParsedLink::Constant(_)` arm이 constant value를 직접 반환하므로 dbGetLink 등가 호출이 발생하지 않음.
 - **`dbLoadRecords()` 오류 메시지 중복 출력 방지** (`9af7fb3`, 2025) — ⏭️ **ALREADY**: 원버그는 C `softMain.cpp`가 `dbLoadRecords` 내부 에러 메시지 + 자체 wrapper 메시지를 둘 다 출력. Rust `cmd_db_load_records` (`iocsh/commands.rs`)는 단일 `ctx.println(&e)` 후 `Err(e)` 전파만 수행하며 `softioc-rs`도 자체 wrapper 메시지를 추가하지 않음. 중복 출력 경로 자체가 부재.
 - **`dbReadDatabaseFP()` 파일 닫기 보장** (`a6779df2`, 2022) — ⚠️ **N/A (eliminated)**: Rust `std::fs::File`의 `Drop`이 자동으로 `close()` 보장. `BufReader<File>` 등 모든 파일 래퍼 동일. `rust_verdict: eliminated`.

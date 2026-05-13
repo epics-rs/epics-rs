@@ -477,7 +477,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **PR #768: `iocInit`에서 로컬 CA 링크 연결 대기** — ⏸️ **DEFERRED**: 9-A high-priority 항목 — 우선 후보. C 구현은 `initOutstanding` 카운터 + `DBCA_CALLBACK_INIT_WAIT` flag + `CA_INIT_READY` action 3단계 동기화로 `initHookAfterIocRunning` 발화 전에 모든 로컬 CA `CP` 링크가 connect되도록 함. Rust 측은 dbCa 등가물(`parsed_inp = ParsedLink::Ca(...)`)을 추적할 별도 lifecycle counter + tokio Notify 페어 + post-iocInit drain 단계가 필요 (archaeology 항목: `717d69e` / `a46bd5a-dbca-iocInit-wait-local-links-connect.md`).
 - **PR #788: `epicsThreadGetCPUs` 및 `callbackParallelThreads` CPU 어피니티 반영** — ⏭️ **ALREADY**: 섹션 3 보강 (Rust `std::thread::available_parallelism()`).
 - **PR #812: `dbCreateRecord` iocsh 명령어** — ⏭️ **ALREADY**: `cmd_db_create_record` (`crates/epics-base-rs/src/server/iocsh/commands.rs:680`)로 등록 + 5종 테스트(happy path + duplicate / bad name / unknown type / missing args).
-- **PR #817: `mbbi` 레코드의 `AFTC`/`LALM` 버그 수정** — ⏸️ DEFERRED.
+- **PR #817: `mbbi` 레코드의 `AFTC`/`LALM` 버그 수정** — ⏸️ **DEFERRED (scope)**: bi/mbbi 모두 `aftc`/`afvl` 필드는 선언되어 있으나(`crates/epics-base-rs/src/server/records/{bi,mbbi}.rs`) `process()`에서 알람 severity의 low-pass filter 로직이 미구현. PR #817은 (1) bi에 AFTC 동작 추가, (2) mbbi AFTC enable 버그 수정, (3) mbbi COSV 활성 시 LALM 갱신 버그 수정 — 3건 모두 process cycle 내 delta-t 기반 filter 구현이 선행되어야 함. 본 항목은 filter 로직 통합 작업으로 별도 PR.
 
 ---
 

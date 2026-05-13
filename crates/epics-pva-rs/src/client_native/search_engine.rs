@@ -18,12 +18,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::net::AsyncUdpV4;
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::interval;
 use tracing::{debug, warn};
@@ -40,6 +41,12 @@ pub const BACKOFF_SECS: &[u64] = &[1, 1, 2, 5, 10, 15, 30, 60, 120, 210];
 
 /// Default UDP broadcast port for SEARCH/BEACON messages (5076).
 pub const DEFAULT_BROADCAST_PORT: u16 = 5076;
+
+/// PR #205 IPv6 Stage 4: default v6 multicast group for PVA SEARCH.
+/// pvxs `udp_collector.cpp` uses `ff0e::400` (organization-local,
+/// dynamic) for the IPv6 equivalent of the v4 `224.0.2.3` group.
+/// Joined/sent only when an IPv6 send socket is available.
+pub const DEFAULT_V6_MULTICAST_GROUP: Ipv6Addr = Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x0400);
 
 /// Command sent into the engine.
 /// Why a search is being initiated — controls bucket placement and
@@ -177,6 +184,10 @@ impl SearchEngine {
         let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>(256);
 
         let search_socket = bind_ephemeral_udp()?;
+        // PR #205 IPv6 Stage 4: optional v6 send/recv socket. Used
+        // alongside the v4 socket — graceful degradation when the
+        // host has no usable IPv6 stack.
+        let search_socket_v6 = bind_ephemeral_udp_v6();
         let beacon_socket = bind_beacon_udp(); // Optional — may be None.
 
         // pvxs 8db40be (2025-10): warn loudly when a Context is built
@@ -225,16 +236,16 @@ impl SearchEngine {
             })
             .await
             .unwrap_or_default();
-            // PR #205 IPv6 Stage 3 (client-side): the search UDP
-            // socket is still `AsyncUdpV4`, so IPv6 destinations
-            // would fail every send with InvalidInput and spam the
-            // per-destination retry log. Pre-filter explicit v6
-            // entries here with a single one-shot warning. When
-            // an IPv6 search socket is wired in a future stage,
-            // this filter can be dropped.
+            // PR #205 IPv6 Stage 4: v6 entries are now routable
+            // when `search_socket_v6` was bound successfully. If the
+            // host has no v6 stack (v6 bind failed) we still need to
+            // drop v6 entries to avoid the InvalidInput retry storm
+            // on the v4 socket, but emit a one-shot warning rather
+            // than silently skipping.
+            let v6_available = search_socket_v6.is_some();
             let mut dropped_v6: Vec<SocketAddr> = Vec::new();
             for sa in resolved {
-                if matches!(sa, SocketAddr::V6(_)) {
+                if matches!(sa, SocketAddr::V6(_)) && !v6_available {
                     dropped_v6.push(sa);
                     continue;
                 }
@@ -245,10 +256,28 @@ impl SearchEngine {
             if !dropped_v6.is_empty() {
                 warn!(
                     dropped = ?dropped_v6,
-                    "EPICS_PVA_ADDR_LIST contained IPv6 entries; client SEARCH \
-                     is still IPv4-only (PR #205 Stage 3 — pending). Use a v6 \
-                     name-server explicitly via PvaClient::builder().server_addr(..)"
+                    "EPICS_PVA_ADDR_LIST contained IPv6 entries but no usable v6 \
+                     socket could be bound on this host. Dropping these entries; \
+                     the rest of the search remains IPv4-only."
                 );
+            }
+            // When v6 is available and AUTO_ADDR_LIST is YES, add
+            // the default v6 multicast group (ff0e::400:5076). Mirrors
+            // the v4 path that adds `224.0.2.3` only on explicit
+            // opt-in via ADDR_LIST — but for v6 we have no equivalent
+            // limited broadcast, so the multicast group is the only
+            // way to reach v6-only servers without enumerating each.
+            if v6_available && auto_on {
+                let bport = crate::config::env::broadcast_port();
+                let mcast = SocketAddr::V6(std::net::SocketAddrV6::new(
+                    DEFAULT_V6_MULTICAST_GROUP,
+                    bport,
+                    0,
+                    0,
+                ));
+                if !extra_targets.contains(&mcast) {
+                    extra_targets.push(mcast);
+                }
             }
         }
 
@@ -256,6 +285,7 @@ impl SearchEngine {
         tokio::spawn(run_engine(
             cmd_rx,
             search_socket,
+            search_socket_v6,
             beacon_socket,
             extra_targets,
             beacons_clone,
@@ -394,6 +424,66 @@ fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
     // identical so the IOC's response lands on the right
     // logical socket regardless of which NIC delivered it back.
     AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
+}
+
+/// PR #205 IPv6 Stage 4: bind a v6-only ephemeral UDP socket used to
+/// send SEARCH to IPv6 destinations (unicast servers from
+/// `EPICS_PVA_ADDR_LIST` and the v6 multicast group). Returns `None`
+/// when the host lacks IPv6 (bind fails) — the engine keeps running
+/// IPv4-only in that case.
+///
+/// Sets `IPV6_V6ONLY=true` explicitly so the v6 socket cannot accept
+/// v4-mapped traffic that would otherwise duplicate what the
+/// `AsyncUdpV4` search socket already handles.
+fn bind_ephemeral_udp_v6() -> Option<Arc<UdpSocket>> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let sock = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("IPv6 SEARCH socket: socket() failed: {e}; v6 disabled");
+            return None;
+        }
+    };
+    if let Err(e) = sock.set_only_v6(true) {
+        debug!("IPv6 SEARCH socket: set_only_v6 failed: {e}");
+    }
+    if let Err(e) = sock.set_nonblocking(true) {
+        debug!("IPv6 SEARCH socket: set_nonblocking failed: {e}");
+        return None;
+    }
+    // Multicast TTL=1 (link-local only) is the safe default — matches
+    // pvxs `udp_collector.cpp` v6 send path.
+    if let Err(e) = sock.set_multicast_hops_v6(1) {
+        debug!("IPv6 SEARCH socket: set_multicast_hops_v6 failed: {e}");
+    }
+    let bind =
+        std::net::SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+    if let Err(e) = sock.bind(&bind.into()) {
+        debug!("IPv6 SEARCH socket: bind {bind} failed: {e}; v6 disabled");
+        return None;
+    }
+    let std_sock: std::net::UdpSocket = sock.into();
+    match UdpSocket::from_std(std_sock) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            debug!("IPv6 SEARCH socket: tokio adoption failed: {e}");
+            None
+        }
+    }
+}
+
+/// `select!`-friendly recv helper: yields the next datagram from the
+/// optional v6 socket, or `None` (forever-pending) when v6 is disabled.
+/// Matches the pattern used for the optional beacon socket.
+async fn recv_from_v6_opt(
+    sock: Option<&Arc<UdpSocket>>,
+    buf: &mut [u8],
+) -> Option<std::io::Result<(usize, SocketAddr)>> {
+    match sock {
+        Some(s) => Some(s.recv_from(buf).await),
+        None => std::future::pending().await,
+    }
 }
 
 fn bind_beacon_udp() -> Option<AsyncUdpV4> {
@@ -558,6 +648,7 @@ fn cascade_smoothed_next(
 async fn run_engine(
     mut cmd_rx: mpsc::Receiver<SearchCommand>,
     search_socket: AsyncUdpV4,
+    search_socket_v6: Option<Arc<UdpSocket>>,
     beacon_socket: Option<AsyncUdpV4>,
     extra_targets: Vec<SocketAddr>,
     beacons: Arc<BeaconTracker>,
@@ -611,6 +702,7 @@ async fn run_engine(
     // servers; the previous 4 KB cap silently truncated either case.
     // Matches the new server-side recv buffer (server_native/udp.rs).
     let mut search_buf = vec![0u8; 64 * 1024];
+    let mut search_buf_v6 = vec![0u8; 64 * 1024];
     let mut beacon_buf = vec![0u8; 64 * 1024];
     let mut search_send_errs: HashSet<SocketAddr> = HashSet::new();
 
@@ -682,7 +774,7 @@ async fn run_engine(
                             p.attempt = 1;
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
-                            broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs).await;
+                            broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
                         }
                     }
                 }
@@ -715,7 +807,7 @@ async fn run_engine(
                             p.attempt = 1;
                             p.last_attempt = Instant::now();
                             let pkt = codec.build_search(0, sid, &p.pv_name, [0,0,0,0], response_port, false);
-                            broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs).await;
+                            broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
                         }
                     }
                 }
@@ -844,7 +936,7 @@ async fn run_engine(
                     // `ping_all()` was effectively a silent op.
                     let probe_id = NEXT_SEARCH_ID.fetch_add(1, Ordering::Relaxed);
                     let pkt = codec.build_discover_search(probe_id, response_port);
-                    broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs).await;
+                    broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs).await;
                 }
                 None => break,
             },
@@ -859,6 +951,25 @@ async fn run_engine(
                     while pos < n {
                         let consumed = handle_search_response(
                             &search_buf[pos..n],
+                            &mut pending, &mut by_name, &beacons, &ignore_guids, peer,
+                        );
+                        if consumed == 0 {
+                            break;
+                        }
+                        pos = pos.saturating_add(consumed);
+                    }
+                }
+            }
+
+            res = recv_from_v6_opt(search_socket_v6.as_ref(), &mut search_buf_v6) => {
+                // PR #205 IPv6 Stage 4: v6 SEARCH_RESPONSE arrives
+                // unicast back to this v6 socket. Decode reuses the
+                // same family-agnostic handler.
+                if let Some(Ok((n, peer))) = res {
+                    let mut pos = 0usize;
+                    while pos < n {
+                        let consumed = handle_search_response(
+                            &search_buf_v6[pos..n],
                             &mut pending, &mut by_name, &beacons, &ignore_guids, peer,
                         );
                         if consumed == 0 {
@@ -1013,7 +1124,7 @@ async fn run_engine(
                         )
                     });
                     if let Some(pkt) = pkt_opt {
-                        broadcast(&search_socket, &pkt, &extra_targets, &mut search_send_errs)
+                        broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &mut search_send_errs)
                             .await;
                         // Re-arm into the escalation bucket. Read
                         // attempt under a fresh borrow so the closure
@@ -1057,6 +1168,7 @@ async fn run_engine(
 
 async fn broadcast(
     socket: &AsyncUdpV4,
+    socket_v6: Option<&Arc<UdpSocket>>,
     packet: &[u8],
     extra_targets: &[SocketAddr],
     send_errs: &mut HashSet<SocketAddr>,
@@ -1117,14 +1229,28 @@ async fn broadcast(
         // need explicit per-NIC fanout — OS routing alone would only
         // pick the default-route NIC. Per-subnet broadcast and
         // unicast destinations route via the NIC chosen by AsyncUdpV4.
-        let needs_fanout = match t {
-            SocketAddr::V4(v4) => v4.ip().is_broadcast() || v4.ip().is_multicast(),
-            SocketAddr::V6(_) => false,
-        };
-        let result = if needs_fanout {
-            socket.fanout_to(packet, t).await.map(|_| ())
-        } else {
-            socket.send_to(packet, t).await.map(|_| ())
+        // PR #205 IPv6 Stage 4: SocketAddr::V6 destinations are sent
+        // via the optional v6 socket. If the engine has no v6 socket
+        // the entry was already filtered at spawn time, so reaching
+        // this branch here means a programmatic addr_list passed v6
+        // through despite the missing socket — fall through to the
+        // error path for visibility.
+        let result = match t {
+            SocketAddr::V4(v4) => {
+                let needs_fanout = v4.ip().is_broadcast() || v4.ip().is_multicast();
+                if needs_fanout {
+                    socket.fanout_to(packet, t).await.map(|_| ())
+                } else {
+                    socket.send_to(packet, t).await.map(|_| ())
+                }
+            }
+            SocketAddr::V6(_) => match socket_v6 {
+                Some(s6) => s6.send_to(packet, t).await.map(|_| ()),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "no IPv6 search socket; v6 entry routed despite v6 disabled",
+                )),
+            },
         };
         match result {
             Ok(()) => {
@@ -1354,7 +1480,16 @@ fn rewrite_loopback(addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
         if !peer.ip().is_loopback() {
             SocketAddr::new(peer.ip(), addr.port())
         } else {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+            // PR #205 IPv6 Stage 4: when both ends are loopback, mirror
+            // the peer's family rather than hard-coding `127.0.0.1`.
+            // For a v6 SEARCH that arrived from `[::1]` the resolved
+            // address must stay on `[::1]` so the subsequent TCP
+            // connect targets the v6 listener.
+            let lo = match peer.ip() {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            };
+            SocketAddr::new(lo, addr.port())
         }
     } else {
         addr
@@ -1921,5 +2056,87 @@ mod tests {
             "gap #2→#3 should be ~2 s (nSearch=2); got {gap_23:?}. \
              Production retry escalation may have regressed."
         );
+    }
+
+    /// PR #205 IPv6 Stage 4: client SEARCH must reach a v6 server.
+    /// Sets up a v6-bound PVA server (TCP via Stage 1, UDP via Stage
+    /// 2), spawns a SearchEngine with the server's v6 UDP address in
+    /// `extra_targets`, and verifies `find()` resolves to the server's
+    /// TCP endpoint. Regression guard against the v6 send path being
+    /// dropped or the v6 recv arm losing the SEARCH_RESPONSE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_search_resolves_over_ipv6() {
+        use crate::nt::typed::TypedNT;
+        use crate::server_native::{PvaServer, PvaServerConfig, SharedPV, SharedSource};
+        use std::net::Ipv6Addr;
+
+        // Suppress NIC broadcast so accidental v4 traffic to a sibling
+        // pva-rs server on this host can't resolve the PV name.
+        unsafe {
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+
+        let pv = SharedPV::new();
+        pv.open(f64::descriptor(), f64::to_pv_field(&2.5));
+        let source = Arc::new(SharedSource::new());
+        source.add("V6:SEARCH:PV", pv);
+
+        // Bind UDP on an OS-picked port so the v6 responder can claim
+        // the same port via its `[::]:udp_port` listener.
+        let pick_udp = || {
+            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("udp probe bind");
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let udp_port = pick_udp();
+
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port,
+            bind_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            enable_ipv6_udp: true,
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config);
+        let server_tcp_port = server.report().tcp_port;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            server.report().udp_v6_alive,
+            "udp_v6 responder must be alive"
+        );
+
+        let v6_target = SocketAddr::V6(std::net::SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            udp_port,
+            0,
+            0,
+        ));
+        let engine = SearchEngine::spawn(vec![v6_target])
+            .await
+            .expect("spawn engine");
+
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.find("V6:SEARCH:PV", SearchReason::Initial),
+        )
+        .await
+        .expect("SEARCH over IPv6 timed out")
+        .expect("SEARCH must resolve over IPv6");
+
+        assert_eq!(
+            resolved.port(),
+            server_tcp_port,
+            "resolved TCP port must match v6 server's listener"
+        );
+        assert!(
+            matches!(resolved.ip(), IpAddr::V6(_)),
+            "resolved server address must be IPv6; got {resolved:?}"
+        );
+        drop(server);
     }
 }

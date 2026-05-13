@@ -668,7 +668,15 @@ async fn process_v6_search_datagram(
         let consumed = match parse_search_request(chunk) {
             Some(req) => {
                 let consumed = req.consumed;
-                let reply_dest = SocketAddr::new(udp_src.ip(), req.reply_port);
+                // For IPv6 SEARCH we reply directly to the UDP source
+                // (ip + port). The wire `reply_port` field is parsed
+                // from an IPv4-typed payload and may not match what
+                // the v6 client actually listens on (a v6 client
+                // builds its packet via the same codec that encodes
+                // the v4 socket's port). Using `udp_src.port()` keeps
+                // the response on the same socket pair the SEARCH
+                // arrived on — natural for v6 unicast.
+                let reply_dest = udp_src;
                 let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
                 for (cid, name) in &req.queries {
                     if source.has_pv(name).await {

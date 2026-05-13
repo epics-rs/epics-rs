@@ -26,6 +26,7 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 | `lsi`/`lso`/`printf` 어댑터 매핑 | PR #104 | `adapter.rs::asynOctet` 경로가 String/CharArray ↔ EpicsValue 변환 처리 |
 | `ASYN_DESTRUCTIBLE` / shutdown | PR #171 | `port.rs::PortFlags::destructible` + `PortDriver::shutdown` |
 | FTDI 드라이버 스캐폴드 | PR #88 | `drivers/ftdi.rs` (config parser + scaffold, hardware path feature-gated) |
+| Prologix GPIB 드라이버 | `drvPrologixGPIB.c` | `drivers/prologix.rs` — embedded `DrvAsynIPPort` (`<port>_TCP`), per-write `setAddress(user.addr)` (addr/100 primary + addr%100+96 secondary), on-connect 8-line init burst (`++savecfg`/`++mode`/`++ifc`/`++eos`/`++eoi`/`++eot_char`/`++eot_enable`/`++ver`) + version-string capture, char escaping (`\r`/`\n`/`\033`/`+` → `\033`-prefix), EOS append + `\n` terminator, `++read eoi`/`++read <eos>` flow with EOT-marker strip + binary-mode disambiguation. 5× loopback 회귀 테스트. |
 | 양방향 파라미터 notification | Issue #46 | `interrupt.rs::Interrupt` + `call_param_callbacks` |
 | EOS 설정자 atomic update | Issue #103 | `interpose/eos.rs` Mutex-protected |
 | `asynMask` shift | Issue #166 | record-layer SHFT (mbbiDirect/mbboDirect) — asyn-side mask는 bit selection만 |
@@ -38,7 +39,6 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 | 항목 | C asyn 출처 | 비고 |
 |---|---|---|
 | **USBTMC** (`drvAsynUSBTMC`) | `drvAsynUSBTMC.c` | iocshArg: `(portName, vendorId int, productId int, serialNumber*, priority int, flags int)`. libusb 기반 (`libusb_init`/`libusb_open_device_with_vid_pid`). bulk OUT/IN BTAG/EOM 프레이밍. |
-| **Prologix GPIB** | `drvPrologixGPIB.c` | TCP bridge. per-write `setAddress(pasynUser->addr)` (addr/100 primary + addr%100+96 secondary). on-connect 8-line init (`++savecfg`/`++mode`/`++ifc`/`++eos`/`++eoi`/`++eot_char`/`++eot_enable`/`++ver`). char escaping (`+`/`\r`/`\n`/`\033` → `\033`-prefix). EOS char + `\n` terminator append. |
 | **VXI-11** (`drvVxi11`) | `vxi11/drvVxi11.c` | iocshArg: `(dn, hostName, flags, vxiName, ...)`. ONC RPC (Sun RPC `clnt_create`). create_link / device_write / device_read / device_clear / destroy_link / abort 채널. |
 | **HiSLIP** | Issue #130 (미머지) | C asyn 에 코드 자체 없음 — 공식 driver 가 아직 추가되지 않은 상태. 추가하려면 IVI-6.1 spec 기반 신규 구현 필요. |
 
@@ -65,7 +65,6 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 1. **`asyn:FIFO` adapter wiring** — `devAsynInt32::createRingBuffer` 패턴 (default 10, atoi only, overflow 시 scanIoRequest 안 함) — medium
 2. **`getBounds_int32/int64` ↔ LINEAR ESLO/EOFF** — `devAsynInt32::initAi`/`convertAi` 와 동일한 init→deviceLow/High→convert 흐름 — medium
 3. **UDP 서버 모드** — broadcast 모델 (per-peer 슬롯 없음, source addr 무시, write-back 없음) — small/medium
-4. **Prologix GPIB driver** — per-write setAddress + init 시퀀스 + char escaping + EOS append — medium
 5. **USBTMC driver** — libusb-rs (rusb/nusb) + iocshArg-style config (vid, pid, serial, priority, flags) + BTAG/EOM 프레이밍 — large
 6. **VXI-11 driver** — ONC RPC (`onc-rpc` crate 후보) + iocshArg-style config (dn, hostName, flags, vxiName) — large
 7. **HiSLIP driver** — C asyn 에 없음, IVI-6.1 spec 기반 신규 — large

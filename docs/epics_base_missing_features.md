@@ -441,7 +441,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **CA 클라이언트 UDP 전송 오류 억제(목적지별)** (`cae597d`, medium) — ⏭️ **ALREADY**: `client/search.rs::send_with_fanout`에 동일 패턴.
 - **asLib: DNS 조회 실패 시 소프트 폴백** (`932e9f3`, partial) — ✅ **DONE** `6862ef0`.
 - **네트워크 인터페이스 열거에서 `SIOCGIFCONF` → `getifaddrs` 교체** (`410921b`, partial) — ⏭️ **ALREADY**: `get_if_addrs` crate 사용 (cross-platform).
-- **`caRepeater` 부모 프로세스의 `stdin`/`stdout`/`stderr` 상속 문제** (`6dba2ec`, partial) — ⏸️ DEFERRED.
+- **`caRepeater` 부모 프로세스의 `stdin`/`stdout`/`stderr` 상속 문제** (`6dba2ec`, partial) — ✅ **DONE**: `ca-repeater-rs`가 Unix에서 기본적으로 `/dev/null`로 `dup2` (`crates/epics-ca-rs/src/bin/ca-repeater-rs.rs`). C `caRepeater.cpp`의 `CAN_DETACH_STDINOUT` 가드와 동일하게 Linux/macOS에서만 detach, Windows/RTEMS/VxWorks 패스. `-v/--verbose` flag로 기존 stdio 유지 (디버깅용). clap 기반 arg parsing.
 
 ---
 

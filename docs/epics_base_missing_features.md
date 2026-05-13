@@ -73,10 +73,10 @@
 - **`asyn:READBACK` 연동 미완성 (PR #208, #60)** — ⏭️ **ALREADY**: round 6에서 `adapter.rs::asyn_readback` 플래그로 처리.
 - **`UInt64` 인터페이스 파이프라인 (Issue #231)** — ⏭️ **ALREADY**: `asyn-rs/param.rs`에 `UInt64`/`UInt64Array` 타입 정의 완료.
 - **Serial Port 드라이버 (PR #180)** — ⏭️ **ALREADY**: `asyn-rs/drivers/serial_port.rs::DrvAsynSerialPort` 구현.
-- **FTDI 드라이버 (PR #88)** — ⏸️ **DEFERRED**: 미구현.
-- **IP 서버 포트의 `Bind` 인터페이스 및 `SO_REUSEPORT` 지원 (PR #148, #109)** — ⏸️ **DEFERRED**: asyn IP 포트 드라이버의 특정 인터페이스 바인딩 옵션 미구현.
-- **`lsi`, `lso`, `printf` 레코드에 대한 `asyn` 매핑 (PR #104)** — ⏸️ **DEFERRED**: `asyn-rs` 어댑터에서 LongString 파라미터 → 레코드 매핑 없음.
-- **단순 평균치 장치 지원 (Issue #30)** — ⏸️ **DEFERRED**: `asynInt32Average`/`asynFloat64Average` 미구현.
+- **FTDI 드라이버 (PR #88)** — ⏸️ **DEFERRED (external dep)**: USB FTDI 디바이스 드라이버. `libftdi-rs` 또는 `ftdi-mpsse` crate 바인딩 필요. 사용 사례 등장 시 별도 PR.
+- **IP 서버 포트의 `Bind` 인터페이스 및 `SO_REUSEPORT` 지원 (PR #148, #109)** — ✅ **DONE** (this session): 신규 모듈 `asyn-rs::drivers::ip_server_port::DrvAsynIPServerPort`. `IpServerConfig` 가 `host:port [TCP] [SO_REUSEPORT]` 파싱, IPv4/IPv6 bracket form 모두 지원. `accept_one()` 가 슬롯 테이블 (default 64 max_clients) 기반으로 incoming TCP 연결을 addr 슬롯에 할당. `read_octet`/`write_octet` 가 슬롯별 라우팅 + addr=-1 broadcast 지원. SO_REUSEPORT는 Linux/BSD `set_reuse_port(true)` 로 설정. 10 단위 테스트 (parser 5종 + e2e round-trip + slot cap + drop reuse + SO_REUSEPORT 두 번 bind).
+- **`lsi`, `lso`, `printf` 레코드에 대한 `asyn` 매핑 (PR #104)** — ⏭️ **ALREADY**: `asyn-rs/adapter.rs` 가 `asynOctet` 인터페이스 (read/write)를 통해 String / CharArray ↔ EpicsValue 변환 처리 (`adapter.rs:411,462,773`). lsi/lso/printf 모두 String VAL 필드를 가지므로 `asynOctet` DTYP로 자동 wire-through. printf는 record-side format expansion이 별도 단계라 record 자체에서 해결.
+- **단순 평균치 장치 지원 (Issue #30)** — ⏸️ **DEFERRED**: `asynInt32Average`/`asynFloat64Average` 인터페이스 미구현. 현재 averaging은 record-side (compress 레코드 ALG=Average) 로 처리. asyn-side averaging은 hardware-driven oversampling 시나리오 — 사용 사례 등장 시 별도 PR.
 
 ---
 
@@ -125,14 +125,14 @@
 
 > 본 세션에서 직접 다루지 않음 → **⏸️ DEFERRED**.
 
-- **직렬 포트 `Auto serial break` 기능 (PR #188)** — ⏸️ DEFERRED.
-- **`ASYN_TRACE_STATE` 마스크 비트 (PR #67)** — ⏸️ DEFERRED.
-- **`asynMask`의 시프트 파라미터 (Issue #166)** — ⏸️ DEFERRED.
+- **직렬 포트 `Auto serial break` 기능 (PR #188)** — ⏸️ **DEFERRED**: 시리얼 라인 break 자동 감지 (RS-232 BREAK condition). `serial_port.rs` 에 break 감지 미구현. 사용 사례 등장 시 추후.
+- **`ASYN_TRACE_STATE` 마스크 비트 (PR #67)** — ✅ **DONE** (this session): `TraceMask::STATE = 0x0040` 추가. 회귀 테스트 `test_state_bit_value_and_disjoint`.
+- **`asynMask`의 시프트 파라미터 (Issue #166)** — ⏭️ **ALREADY**: SHFT는 record-layer 책임 — `mbbiDirect`/`mbboDirect` 가 `shft: u32` 필드 보유, asyn-side `mask` 가 단순 bit 선택만 담당.
 - **`setStringParam` NULL 포인터 안전성 (Issue #146)** — ⏭️ ALREADY: 러스트의 `Option<&str>` 모델 + 타입 시스템으로 구조적 방어. NULL deref 자체 발생 불가.
-- **EOS(End-of-String) 설정자 블록 문제 (Issue #103)** — ⏸️ DEFERRED.
-- **장치 드라이버로의 파라미터 변경 알림(Notification) 방향성 버그 대조 (Issue #46)** — ⏸️ DEFERRED.
-- **`drvAsynIPPort` 읽기 타임아웃 시 연결 종료 옵션 (PR #6)** — ⏸️ DEFERRED.
-- **`asynSetTrace*Mask`의 문자열 옵션 파싱 (PR #76)** — ⏸️ DEFERRED.
+- **EOS(End-of-String) 설정자 블록 문제 (Issue #103)** — ⏭️ **ALREADY**: `interpose/eos.rs` 의 `set_input_eos`/`set_output_eos` 가 atomic Mutex 안에서 update — C 의 thread blocking 패턴 부재.
+- **장치 드라이버로의 파라미터 변경 알림(Notification) 방향성 버그 대조 (Issue #46)** — ⏸️ **DEFERRED**: bidirectional parameter notification — 현재 `interrupt.rs::Interrupt` 가 driver → record 방향만 wire. record → driver 방향은 `RequestOp::*Write` op 자체로 표현 — 별도 notification API 필요성 검토.
+- **`drvAsynIPPort` 읽기 타임아웃 시 연결 종료 옵션 (PR #6)** — ⏭️ **ALREADY**: `IpPortConfig::disconnect_on_read_timeout: bool` (`drivers/ip_port.rs:364`), read 경로 L649 에서 timeout 시 자동 disconnect. 회귀 테스트 `test_disconnect_on_read_timeout`.
+- **`asynSetTrace*Mask`의 문자열 옵션 파싱 (PR #76)** — ✅ **DONE** (this session): `TraceMask::from_symbolic`, `TraceIoMask::from_symbolic`, `TraceInfoMask::from_symbolic` — case-insensitive bit names + ASYN_-prefixed aliases + 숫자 토큰 지원. 7 단위 테스트.
 
 ---
 

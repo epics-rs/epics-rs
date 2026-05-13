@@ -212,7 +212,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`dbReadDatabaseFP()` 파일 닫기 보장** (`a6779df2`, 2022) — ⚠️ **N/A (eliminated)**: Rust `std::fs::File`의 `Drop`이 자동으로 `close()` 보장. `BufReader<File>` 등 모든 파일 래퍼 동일. `rust_verdict: eliminated`.
 - **`logClient` 연결 끊김 시 미전송 메시지 재전송 시도** (`0a3427c8`, 2019) — ⚠️ **N/A (design diff)**: epics-rs는 C의 `logClient.c` TCP forwarder를 사용하지 않고 `tracing` crate로 구조화된 로깅을 처리. 로그 서버 reconnect 시 retransmit이 필요한 송신 버퍼 자체가 부재. EPICS log server protocol 지원이 필요해질 때 buffer-preserve 정신을 적용.
 - **알람 메시지 필드(`AMSG`) 및 타임 태그 필드(`UTAG`) 추가** (`892a361d`/`b94afaa0`, 2020): `recGbl`에 알람 문자열 필드(`AMSG`)와 64비트 사용자 태그(`UTAG`)가 추가됨. `epics-rs` 레코드 공통 필드 동기화 필요.
-- **`dbChannel` 기반 링크 (DBADDR → dbChannel 교체)** (`b1f44592`, 2020): 내부 링크의 주소 타입이 `DBADDR`에서 `dbChannel`로 교체되는 대규모 리팩토링. `epics-rs`의 링크 어드레싱 모델 확인.
+- **`dbChannel` 기반 링크 (DBADDR → dbChannel 교체)** (`b1f44592`, 2020) — ⚠️ **N/A (design diff)**: C는 link 내부 주소를 `DBADDR`에서 `dbChannel`로 교체하여 필터 메타데이터를 동반시킴. epics-rs는 `ParsedLink::Db(DbLink { record, field, policy, monitor_switch })` 구조로 시작부터 record-name + field-name + 필터 메타데이터를 단일 enum variant에 담음 — DBADDR vs dbChannel 분리 자체가 부재. 서버 필터 프레임워크가 추후 도입되면 `DbLink`에 필터 chain 필드 추가로 자연스럽게 확장.
 
 ---
 

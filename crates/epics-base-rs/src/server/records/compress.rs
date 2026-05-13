@@ -72,22 +72,68 @@ impl CompressRecord {
                 // N-to-1 algorithms
                 self.accum.push(input);
                 if self.accum.len() >= self.n as usize {
-                    let compressed = match self.alg {
-                        0 => self.accum.iter().cloned().fold(f64::INFINITY, f64::min), // Low
-                        1 => self.accum.iter().cloned().fold(f64::NEG_INFINITY, f64::max), // High
-                        2 => self.accum.iter().sum::<f64>() / self.accum.len() as f64, // Mean
-                        _ => 0.0,
-                    };
-                    let idx = self.off as usize % self.nsam as usize;
-                    self.val[idx] = compressed;
-                    self.off += 1;
-                    if (self.nuse as usize) < self.nsam as usize {
-                        self.nuse += 1;
-                    }
-                    self.accum.clear();
+                    self.flush_accum();
                 }
             }
         }
+    }
+
+    /// epics-base PR #84f4771: array-input form of `push_value`.
+    /// Feeds each element of `input` through the configured
+    /// algorithm. For N-to-1 algorithms, this is the only path that
+    /// can observe the "partial buffer at end of input" case —
+    /// `push_value` always returns after a single element, so it
+    /// can't tell whether more samples are coming.
+    ///
+    /// When `PBUF=YES` and the array ends mid-chunk (i.e. the
+    /// accumulator has 0<k<N samples after consumption), emit the
+    /// compressed value of those k samples immediately instead of
+    /// dropping them. PBUF=NO retains the legacy "wait until N
+    /// samples available" behaviour — partial accumulation persists
+    /// for the next array.
+    pub fn push_array(&mut self, input: &[f64]) {
+        // Circular Buffer (alg=3) treats every sample independently;
+        // the partial-buffer question doesn't apply.
+        if self.alg == 3 {
+            for &v in input {
+                self.push_value(v);
+            }
+            return;
+        }
+        for &v in input {
+            self.accum.push(v);
+            if self.accum.len() >= self.n as usize {
+                self.flush_accum();
+            }
+        }
+        // Tail handling: anything still in the accumulator is a
+        // partial chunk. PBUF=YES emits it now (PR #84f4771).
+        if self.pbuf != 0 && !self.accum.is_empty() {
+            self.flush_accum();
+        }
+    }
+
+    /// Compress `self.accum` via the configured algorithm and push
+    /// the result into the circular VAL buffer. Clears `accum`
+    /// regardless of partial vs full — callers decide *whether* to
+    /// flush; this just executes it.
+    fn flush_accum(&mut self) {
+        if self.accum.is_empty() {
+            return;
+        }
+        let compressed = match self.alg {
+            0 => self.accum.iter().cloned().fold(f64::INFINITY, f64::min), // Low
+            1 => self.accum.iter().cloned().fold(f64::NEG_INFINITY, f64::max), // High
+            2 => self.accum.iter().sum::<f64>() / self.accum.len() as f64, // Mean
+            _ => 0.0,
+        };
+        let idx = self.off as usize % self.nsam as usize;
+        self.val[idx] = compressed;
+        self.off += 1;
+        if (self.nuse as usize) < self.nsam as usize {
+            self.nuse += 1;
+        }
+        self.accum.clear();
     }
 }
 
@@ -328,6 +374,72 @@ mod pbuf_tests {
         match rec.get_field("VAL").unwrap() {
             EpicsValue::DoubleArray(v) => assert!(v.is_empty()),
             other => panic!("expected empty DoubleArray, got {other:?}"),
+        }
+    }
+
+    /// epics-base PR #84f4771: N-to-1 push_array must emit a partial
+    /// chunk when PBUF=YES and the input ends mid-chunk. Pre-fix the
+    /// partial accumulator was silently dropped, so the operator
+    /// configured a 5-sample average over a 12-element waveform with
+    /// N=5 and saw only 2 averages (10 of 12 samples), losing the
+    /// tail-of-input data.
+    #[test]
+    fn pbuf_yes_n_to_1_partial_tail_emits_one_more_compressed_value() {
+        // alg=2 (Mean), N=5: 12-element input yields 2 full chunks
+        // + 2 leftover samples. With PBUF=YES the leftover is
+        // averaged and pushed as a third compressed value.
+        let mut rec = CompressRecord::new(8, 2);
+        rec.n = 5;
+        rec.pbuf = 1;
+        let input: Vec<f64> = (1..=12).map(|i| i as f64).collect();
+        rec.push_array(&input);
+        // Chunks: [1..5] mean=3, [6..10] mean=8, [11,12] mean=11.5
+        assert_eq!(rec.nuse, 3, "PBUF=YES must emit tail chunk");
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert_eq!(v[0], 3.0);
+            assert_eq!(v[1], 8.0);
+            assert!((v[2] - 11.5).abs() < 1e-10);
+        } else {
+            panic!("expected DoubleArray with the 3 compressed values");
+        }
+    }
+
+    #[test]
+    fn pbuf_no_n_to_1_partial_tail_held_for_next_array() {
+        // Same input, PBUF=NO (default): tail [11,12] stays in accum
+        // for the next push_array call. nuse=2 (only full chunks).
+        let mut rec = CompressRecord::new(8, 2);
+        rec.n = 5;
+        rec.pbuf = 0;
+        let first: Vec<f64> = (1..=12).map(|i| i as f64).collect();
+        rec.push_array(&first);
+        assert_eq!(rec.nuse, 2, "PBUF=NO must defer partial chunk");
+        // Next array of 3 more samples fills the chunk (2+3=5), so
+        // a third compressed value emits — [11,12,13,14,15] mean=13.
+        let second: Vec<f64> = vec![13.0, 14.0, 15.0];
+        rec.push_array(&second);
+        assert_eq!(rec.nuse, 3, "completed chunk emits on next array");
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert_eq!(v[0], 3.0);
+            assert_eq!(v[1], 8.0);
+            assert_eq!(v[2], 13.0);
+        } else {
+            panic!("expected DoubleArray");
+        }
+    }
+
+    #[test]
+    fn push_array_circular_buffer_passes_through_unchanged() {
+        // alg=3 doesn't compress; every element lands in the circular
+        // buffer directly. PBUF flag is irrelevant for this path.
+        let mut rec = CompressRecord::new(4, 3);
+        rec.push_array(&[1.0, 2.0, 3.0]);
+        assert_eq!(rec.nuse, 3);
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert_eq!(v.len(), 4);
+            assert_eq!(&v[..3], &[1.0, 2.0, 3.0]);
+        } else {
+            panic!("expected DoubleArray");
         }
     }
 }

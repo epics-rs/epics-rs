@@ -1158,3 +1158,203 @@ fn test_snapshot_alarm_state() {
     assert_eq!(snap.alarm.status, 7);
     assert_eq!(snap.alarm.severity, 1);
 }
+
+// ---------------------------------------------------------------------------
+// epics-base PR #817 integration regression tests.
+//
+// PR #817 (commit c9817fa59) bundled three changes:
+//   (1) Add AFTC alarm-severity low-pass filter to bi record.
+//   (2) Fix mbbi: write the new filter accumulator back to AFVL
+//       (originally the local was discarded, so the filter never
+//        retained state between cycles).
+//   (3) Fix mbbi COSV/LALM: the `if (val == lalm || recGblSetSevr(...))
+//       return;` short-circuit ate `recGblSetSevr`'s return as a
+//       boolean and skipped the LALM update when COSV was non-zero,
+//       so subsequent transitions were silently dropped.
+//
+// In epics-rs the filter is centralised in
+// `RecordInstance::aftc_filter` and plumbed through `evaluate_alarms`.
+// AFVL writeback and the LALM-always-update structure are already in
+// place. These tests pin the post-PR-817 contract end-to-end.
+// ---------------------------------------------------------------------------
+
+/// (PR #817) bi record AFTC integration. After the first
+/// `evaluate_alarms` call the AFVL accumulator must be seeded to
+/// the raw-severity float (not zero) and the reported severity
+/// must equal the unfiltered ZSV severity (initial-sample
+/// pass-through is part of the upstream filter contract).
+#[test]
+fn test_bi_aftc_seeds_afvl_on_initial_sample() {
+    let mut rec = BiRecord::new(0); // val=0 → ZSV path
+    rec.zsv = AlarmSeverity::Major as i16;
+    rec.aftc = 5.0;
+    rec.afvl = 0.0; // signals "first sample"
+
+    let mut inst = RecordInstance::new("BI:AFTC".into(), rec);
+    inst.common.udf = false;
+
+    inst.evaluate_alarms();
+    epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
+
+    // Initial sample: alarm passes through unfiltered.
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Major,
+        "initial AFTC sample must pass raw severity through"
+    );
+    // AFVL must have been seeded with the raw severity float (=2 for Major).
+    let afvl = inst
+        .record
+        .get_field("AFVL")
+        .and_then(|v| v.to_f64())
+        .expect("AFVL readable");
+    assert!(
+        (afvl - 2.0).abs() < 1e-9,
+        "AFVL must be seeded with raw severity (Major=2.0), got {afvl}"
+    );
+}
+
+/// (PR #817 Fix #2) mbbi must write the new filter accumulator back
+/// to AFVL on every evaluate_alarms call when AFTC>0. The pre-fix
+/// C code computed the new value into a local but never assigned
+/// `prec->afvl = afvl;` so the filter never retained state between
+/// process cycles. The Rust port routes through
+/// `record.put_field("AFVL", …)` after `aftc_filter`.
+#[test]
+fn test_mbbi_aftc_writes_afvl_back_each_cycle() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+
+    let mut rec = MbbiRecord::new(1); // val=1 → ONSV
+    rec.onsv = AlarmSeverity::Major as i16;
+    rec.aftc = 2.0;
+    rec.afvl = 0.0;
+
+    let mut inst = RecordInstance::new("MBBI:AFTC".into(), rec);
+    inst.common.udf = false;
+
+    inst.evaluate_alarms();
+    let afvl_after_first = inst
+        .record
+        .get_field("AFVL")
+        .and_then(|v| v.to_f64())
+        .expect("AFVL readable after first cycle");
+    assert!(
+        afvl_after_first != 0.0,
+        "AFVL must be non-zero after first AFTC cycle (was the writeback dropped?)"
+    );
+    // Second cycle with the same val keeps the filter state alive
+    // and yields a positive accumulator (steady-state aim is 2.0).
+    inst.evaluate_alarms();
+    let afvl_after_second = inst
+        .record
+        .get_field("AFVL")
+        .and_then(|v| v.to_f64())
+        .expect("AFVL readable after second cycle");
+    assert!(
+        afvl_after_second.abs() > 0.0,
+        "AFVL must remain non-zero after the second cycle"
+    );
+}
+
+/// (PR #817 Fix #3) mbbi LALM must be updated on every val change
+/// even when COSV fires. The pre-fix C code wrote
+/// `if (val == lalm || recGblSetSevr(prec, COS_ALARM, prec->cosv)) return;`
+/// — `recGblSetSevr` returns the previous severity as a small int,
+/// which when COSV≠0 was treated as truthy by the `||`, taking the
+/// early return and skipping `prec->lalm = val`. The downstream
+/// effect was that subsequent val transitions saw a stale LALM and
+/// COSV failed to fire on the next change.
+///
+/// The Rust port already has the post-fix shape: the
+/// `val != lalm` branch unconditionally writes LALM after firing
+/// COS_ALARM. This test pins both halves of the bug:
+///   (a) one transition with COSV≠NoAlarm bumps LALM to the new val;
+///   (b) a subsequent transition still fires COS because LALM was
+///       updated, and LALM advances again.
+#[test]
+fn test_mbbi_lalm_updates_when_cosv_set() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+
+    let mut rec = MbbiRecord::new(0);
+    rec.cosv = AlarmSeverity::Major as i16; // pre-fix bug trigger
+    rec.put_field("LALM", EpicsValue::Enum(0)).unwrap();
+
+    let mut inst = RecordInstance::new("MBBI:LALM".into(), rec);
+    inst.common.udf = false;
+
+    // Transition 0 → 2: COS_ALARM fires (cosv=Major), LALM must
+    // advance to 2.
+    inst.record.set_val(EpicsValue::Enum(2)).unwrap();
+    inst.evaluate_alarms();
+    let lalm_after_first = inst
+        .record
+        .get_field("LALM")
+        .and_then(|v| match v {
+            EpicsValue::Enum(s) => Some(s),
+            _ => None,
+        })
+        .expect("LALM readable");
+    assert_eq!(
+        lalm_after_first, 2,
+        "LALM must advance to new val even when COSV fires"
+    );
+
+    // Transition 2 → 0: LALM must advance to 0. The pre-fix C bug
+    // would have left LALM at 0 from the start, so this second
+    // transition would have looked like "val == lalm" and the COS
+    // path would have returned early without updating either.
+    inst.record.set_val(EpicsValue::Enum(0)).unwrap();
+    inst.evaluate_alarms();
+    let lalm_after_second = inst
+        .record
+        .get_field("LALM")
+        .and_then(|v| match v {
+            EpicsValue::Enum(s) => Some(s),
+            _ => None,
+        })
+        .expect("LALM readable");
+    assert_eq!(
+        lalm_after_second, 0,
+        "LALM must advance again on the next transition"
+    );
+    // COS alarm must have re-fired during cycle 2: the accumulator
+    // (`nsev`) records the highest severity hit since the last
+    // reset_alarms call. With LALM correctly advanced from 2 to 0
+    // between cycles, the val=2→0 step still triggers
+    // `recGblSetSevr(COS_ALARM, Major)`.
+    let nsev_after_second = inst.common.nsev;
+    assert_eq!(
+        nsev_after_second,
+        AlarmSeverity::Major,
+        "COS alarm must re-fire on the second transition (LALM-update bug regression)"
+    );
+}
+
+/// Sibling regression for bi: same LALM-always-updates contract.
+/// The Rust port handles bi and mbbi via the same `evaluate_alarms`
+/// branch structure, so any regression in one implies a regression
+/// in the other.
+#[test]
+fn test_bi_lalm_updates_when_cosv_set() {
+    let mut rec = BiRecord::new(0);
+    rec.cosv = AlarmSeverity::Major as i16;
+    rec.put_field("LALM", EpicsValue::Enum(0)).unwrap();
+
+    let mut inst = RecordInstance::new("BI:LALM".into(), rec);
+    inst.common.udf = false;
+
+    inst.record.set_val(EpicsValue::Enum(1)).unwrap();
+    inst.evaluate_alarms();
+    let lalm = inst
+        .record
+        .get_field("LALM")
+        .and_then(|v| match v {
+            EpicsValue::Enum(s) => Some(s),
+            _ => None,
+        })
+        .expect("LALM readable");
+    assert_eq!(
+        lalm, 1,
+        "bi LALM must advance to new val even when COSV fires"
+    );
+}

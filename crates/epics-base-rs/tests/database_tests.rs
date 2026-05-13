@@ -2299,3 +2299,163 @@ async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
         "NORD unchanged → no duplicate NORD event"
     );
 }
+
+/// epics-base commit f1e83b2 (2017) regression: output records must
+/// update their TIME stamp BEFORE writing to OUT-link targets so that
+/// downstream records (or anyone reading the source's TIME via TSEL)
+/// see the post-process value, not the previous cycle's stale one.
+///
+/// In the C source the bug pattern was `recGblGetTimeStamp()` placed
+/// AFTER `writeValue()` (the OUT-link write), so a downstream record
+/// triggered by the OUT cascade would read the stale TIME until the
+/// next process cycle.
+///
+/// In the Rust port the order is structural in
+/// `process_record_with_links_inner`:
+/// 1. `apply_timestamp` at L623 — TIME = now
+/// 2. OUT stage at L668-764 — captures `out_info` (link, value)
+/// 3. snapshot built / `notify_from_snapshot` at L866
+/// 4. `write_db_link_value` at L870 — actual OUT-link write that
+///    cascades downstream processing
+///
+/// This test pins the contract: when an SRC ao record with an OUT
+/// link to a Passive DST processes, BOTH records' `common.time`
+/// values must be ≥ the wall-clock baseline captured before
+/// processing began. The test deliberately does not exercise the
+/// downstream subscriber path (DST is an ai whose process()
+/// recomputes VAL from RVAL, washing out the put_pv side-effect)
+/// — the timestamp invariant is the load-bearing assertion here.
+#[tokio::test]
+async fn test_output_link_cascade_uses_post_process_source_timestamp() {
+    use std::time::SystemTime;
+
+    let db = PvDatabase::new();
+    db.add_record("TS_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("TS_DST", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("TS_SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("TS_DST".into()))
+            .unwrap();
+    }
+
+    let baseline = SystemTime::now();
+
+    // Drive the source. SRC processes → apply_timestamp → OUT stage
+    // captures (TS_DST, val) → snapshot/notify → write_db_link_value
+    // cascades into TS_DST processing (which itself runs
+    // apply_timestamp).
+    if let Some(rec) = db.get_record("TS_SRC").await {
+        let mut inst = rec.write().await;
+        inst.record.set_val(EpicsValue::Double(7.5)).unwrap();
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("TS_SRC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // SRC's `common.time` must be ≥ baseline — it was updated by
+    // apply_timestamp before write_db_link_value ran.
+    let src_time = db
+        .get_record("TS_SRC")
+        .await
+        .expect("TS_SRC exists")
+        .read()
+        .await
+        .common
+        .time;
+    assert!(
+        src_time >= baseline,
+        "SRC.common.time ({src_time:?}) must be post-baseline ({baseline:?}) — \
+         apply_timestamp must run before OUT write"
+    );
+
+    // DST's `common.time` must also be ≥ baseline — its own
+    // apply_timestamp ran on the cascaded process call. (If the
+    // cascade were broken or skipped, DST.common.time would be
+    // UNIX_EPOCH from its uninitialised default.)
+    let dst_time = db
+        .get_record("TS_DST")
+        .await
+        .expect("TS_DST exists")
+        .read()
+        .await
+        .common
+        .time;
+    assert!(
+        dst_time >= baseline,
+        "DST.common.time ({dst_time:?}) must be post-baseline ({baseline:?}) — \
+         OUT cascade must drive Passive DST through process_record_with_links"
+    );
+}
+
+/// f1e83b2 (second half) regression: for asynchronous output records
+/// the timestamp must be updated AGAIN at completion, so the monitor
+/// event reflects when the device write actually finished — not when
+/// the process cycle started.
+///
+/// In the C source `recGblGetTimeStampSimm` is called inside the
+/// `if (pact)` branch of process(), which fires at the async
+/// completion callback.
+///
+/// In the Rust port `complete_async_record_inner` calls
+/// `apply_timestamp` at L1192 before building the snapshot at
+/// L1259-1262 and invoking `notify_from_snapshot` at L1351.
+///
+/// This test pins that contract by sleeping a small but measurable
+/// interval between the synchronous `process_record_with_links`
+/// (which puts the AsyncRecord into AsyncPending and returns) and
+/// the `complete_async_record` call. The delivered VAL event must
+/// carry a timestamp ≥ the post-sleep wall-clock instant — proving
+/// the snapshot was timestamped at completion, not at process
+/// start.
+#[tokio::test]
+async fn test_complete_async_record_updates_timestamp_at_completion() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+    use std::time::{Duration, SystemTime};
+
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_TS", Box::new(AsyncRecord { val: 1.0 }))
+        .await
+        .unwrap();
+
+    let mut val_rx = if let Some(rec) = db.get_record("ASYNC_TS").await {
+        let mut inst = rec.write().await;
+        inst.add_subscriber("VAL", 9, DbFieldType::Double, EventMask::VALUE.bits())
+    } else {
+        None
+    }
+    .expect("VAL subscription accepted");
+
+    // First half: process → AsyncPending early return; no notify yet.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_TS", &mut visited, 0)
+        .await
+        .unwrap();
+    assert!(
+        val_rx.try_recv().is_err(),
+        "AsyncPending early-return must not deliver VAL event yet"
+    );
+
+    // Sleep a measurable interval so the completion timestamp is
+    // distinguishable from the process-start timestamp.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let post_sleep = SystemTime::now();
+
+    // Second half: completion fires snapshot/notify with a fresh
+    // apply_timestamp.
+    db.complete_async_record("ASYNC_TS").await.unwrap();
+    let event = val_rx
+        .try_recv()
+        .expect("VAL event must be delivered at async completion");
+    assert!(
+        event.snapshot.timestamp >= post_sleep,
+        "completion event timestamp ({:?}) must be ≥ post-sleep ({post_sleep:?}) — \
+         apply_timestamp must run at async completion, not at process start",
+        event.snapshot.timestamp
+    );
+}

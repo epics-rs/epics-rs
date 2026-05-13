@@ -1063,6 +1063,131 @@ async fn test_complete_async_record() {
 
 // --- Monitor Mask tests ---
 
+/// epics-base 3.15.7 — a server-side `dbnd` (deadband) filter
+/// attached to a subscriber must drop sub-threshold value changes
+/// while letting through deltas that cross the threshold. Mirrors
+/// the per-subscription filter chain semantics that the JSON-name
+/// parser (future commit) will wire in for real CA channels.
+#[tokio::test]
+async fn test_dbnd_filter_drops_subthreshold_changes() {
+    use epics_base_rs::server::database::filters::DeadbandFilter;
+    use epics_base_rs::server::recgbl::EventMask;
+    use std::sync::Arc;
+
+    let db = PvDatabase::new();
+    db.add_record("DBND:REC", Box::new(AoRecord::new(10.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("DBND:REC").await.unwrap();
+    let mut rx = {
+        let mut inst = rec.write().await;
+        let rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                epics_base_rs::types::DbFieldType::Double,
+                EventMask::VALUE.bits(),
+            )
+            .expect("subscribe");
+        let attached =
+            inst.attach_filter_to_last_subscriber("VAL", Arc::new(DeadbandFilter::absolute(1.0)));
+        assert!(attached, "filter must attach to the just-added subscriber");
+        rx
+    };
+
+    // 11.0: first event always passes (no `last_sent` baseline yet).
+    {
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(11.0))
+            .unwrap();
+        inst.notify_field("VAL", EventMask::VALUE);
+    }
+    rx.try_recv()
+        .expect("first value passes the deadband filter");
+
+    // 11.4: |delta|=0.4 < 1.0 → silenced.
+    {
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(11.4))
+            .unwrap();
+        inst.notify_field("VAL", EventMask::VALUE);
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "sub-threshold change must be filtered out"
+    );
+
+    // 12.5: |delta|=1.1 >= 1.0 → passes.
+    {
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(12.5))
+            .unwrap();
+        inst.notify_field("VAL", EventMask::VALUE);
+    }
+    rx.try_recv().expect("above-threshold change passes");
+}
+
+/// epics-base 446e0d4a — value filters MUST pass alarm-only events
+/// through regardless of the deadband state. Otherwise an alarm
+/// triggered mid-deadband-window would be silenced and clients
+/// would miss the state change.
+#[tokio::test]
+async fn test_dbnd_filter_passes_alarm_events() {
+    use epics_base_rs::server::database::filters::DeadbandFilter;
+    use epics_base_rs::server::recgbl::EventMask;
+    use std::sync::Arc;
+
+    let db = PvDatabase::new();
+    db.add_record("DBND:ALR", Box::new(AoRecord::new(50.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("DBND:ALR").await.unwrap();
+    let mut rx = {
+        let mut inst = rec.write().await;
+        let rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                epics_base_rs::types::DbFieldType::Double,
+                (EventMask::VALUE | EventMask::ALARM).bits(),
+            )
+            .expect("subscribe");
+        inst.attach_filter_to_last_subscriber("VAL", Arc::new(DeadbandFilter::absolute(10.0)));
+        rx
+    };
+
+    // Seed the filter state with one value event.
+    {
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(50.0))
+            .unwrap();
+        inst.notify_field("VAL", EventMask::VALUE);
+    }
+    rx.try_recv().expect("seed value");
+
+    // A 50.5 value-only update is silenced by the deadband (delta 0.5 < 10).
+    {
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(50.5))
+            .unwrap();
+        inst.notify_field("VAL", EventMask::VALUE);
+    }
+    assert!(rx.try_recv().is_err(), "sub-threshold value silenced");
+
+    // But an ALARM-tagged emission with the SAME value MUST pass —
+    // the filter's "always-pass alarm" rule.
+    {
+        let inst = rec.read().await;
+        inst.notify_field("VAL", EventMask::ALARM);
+    }
+    rx.try_recv().expect("alarm event passes the filter");
+}
+
 #[tokio::test]
 async fn test_notify_field_respects_mask() {
     let db = PvDatabase::new();

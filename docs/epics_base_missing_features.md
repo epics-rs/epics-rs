@@ -41,7 +41,7 @@
 - **CA 클라이언트의 서버 프로토콜 버전 결정 (PR #711)** — ⏭️ **ALREADY**: `transport.rs`가 CA_PROTO_VERSION 수신 시 `server_minor_version`을 캡처하고 `send_echo`에서 v4.3+ ECHO vs 이전 READ_SYNC로 분기.
 - **지정된 TCP 포트 + UDP 5064 분리 (PR #69)** — ✅ **DONE** `9d8a34b`: `cas_server_port()`, `CaServerBuilder::tcp_port`, `IocApplication::tcp_port`. UDP 응답기가 실제 바인딩된 TCP 포트를 SEARCH_REPLY에 광고.
 - **절전 모드(Suspend) 해제 후 CA 멈춤 현상 (Issue #190)** — ✅ **DONE** `a409311`: wall-clock skip 기반 suspend wake 탐지, echo probe 5s→1s 단축, tracing::info 기록. 절전 후 복구 ~1s.
-- **서버 측 채널 필터 (Server-side Filters, 3.15.7)** — ⏸️ **DEFERRED**: PV-name JSON 파서 + SubscriptionFilter trait + 모든 monitor 발행 경로 통과 + 4개 필터 타입(decimation/arr/ts/sync) ~1000 LOC + 별도 design review 필요.
+- **서버 측 채널 필터 (Server-side Filters, 3.15.7)** — 🔄 **PARTIAL**: Stage 1 완료 — `SubscriptionFilter` trait + `FilterChain` + `dbnd` (deadband) 필터 + `FilteredMonitorEvent`(EventMask 동반) framework 도입(`crates/epics-base-rs/src/server/database/filters/`). 3개 subscriber notify 경로(`notify_field_with_origin`, `notify_from_snapshot`, `ProcessVariable::{notify_subscribers, post_alarm}`)가 filter chain을 호출. `RecordInstance::attach_filter_to_last_subscriber` API로 테스트에서 chain 구성 가능. 446e0d4a의 "alarm/property는 항상 통과" 시맨틱 dbnd에 적용. 15 tests(unit 13 + integration 2). 남은 작업: PV-name JSON 파서 (`PV.{"dbnd":{"d":0.5}}`) + `ts`/`arr`/`decimate`/`sync` 필터 + CA/PVA 채널 생성 경로 wire-through.
 
 ---
 

@@ -1,5 +1,6 @@
 pub mod db_access;
 mod field_io;
+pub mod filters;
 mod link_set;
 mod links;
 mod processing;

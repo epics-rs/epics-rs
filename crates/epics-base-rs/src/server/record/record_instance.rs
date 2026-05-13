@@ -1641,6 +1641,7 @@ impl RecordInstance {
     /// Notify subscribers from a snapshot (call outside lock).
     /// Uses event_mask to filter: only notify subscribers whose mask intersects.
     pub fn notify_from_snapshot(&self, snapshot: &ProcessSnapshot) {
+        use crate::server::database::filters::FilteredMonitorEvent;
         use crate::server::recgbl::EventMask;
         let posting_mask = snapshot.event_mask;
 
@@ -1656,6 +1657,19 @@ impl RecordInstance {
                         let event = MonitorEvent {
                             snapshot: mon_snap.clone(),
                             origin: 0,
+                        };
+                        // Server-side filter chain (3.15.7). Empty chain
+                        // is identity, so no behaviour change for the
+                        // common no-filter case.
+                        let filtered = if sub.filters.is_empty() {
+                            Some(event)
+                        } else {
+                            sub.filters
+                                .apply(FilteredMonitorEvent::new(event, posting_mask))
+                                .map(|fe| fe.event)
+                        };
+                        let Some(event) = filtered else {
+                            continue;
                         };
                         if sub.tx.try_send(event.clone()).is_err() {
                             if let Ok(mut slot) = sub.coalesced.lock() {
@@ -1680,6 +1694,7 @@ impl RecordInstance {
         mask: crate::server::recgbl::EventMask,
         origin: u64,
     ) {
+        use crate::server::database::filters::FilteredMonitorEvent;
         if let Some(subs) = self.subscribers.get(field) {
             if let Some(value) = self.resolve_field(field) {
                 let mon_snap = self.make_monitor_snapshot(value);
@@ -1689,6 +1704,23 @@ impl RecordInstance {
                         let event = MonitorEvent {
                             snapshot: mon_snap.clone(),
                             origin,
+                        };
+                        // Server-side filter chain (3.15.7). Empty
+                        // chain (the default for every subscriber
+                        // until a `.{filter:opts}` PV-name suffix
+                        // parser wires one in) is the identity, so
+                        // existing subscribers see no behaviour
+                        // change. A filter returning `None` silences
+                        // this event for this subscriber only.
+                        let filtered = if sub.filters.is_empty() {
+                            Some(event)
+                        } else {
+                            sub.filters
+                                .apply(FilteredMonitorEvent::new(event, mask))
+                                .map(|fe| fe.event)
+                        };
+                        let Some(event) = filtered else {
+                            continue;
                         };
                         if sub.tx.try_send(event.clone()).is_err() {
                             if let Ok(mut slot) = sub.coalesced.lock() {
@@ -1743,6 +1775,7 @@ impl RecordInstance {
             mask,
             tx,
             coalesced: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            filters: crate::server::database::filters::FilterChain::new(),
         });
         // Initialize last_posted with current value so the first process cycle
         // doesn't treat it as "changed" (the initial value is already sent
@@ -1753,6 +1786,25 @@ impl RecordInstance {
             }
         }
         Some(rx)
+    }
+
+    /// Attach a filter to the most recently added subscriber for
+    /// `field`. Returns `false` when no subscriber exists yet on that
+    /// field (call `add_subscriber` first). The CA / PVA channel-name
+    /// parsers will use this once `.{filter:opts}` syntax is wired.
+    /// Tests can also use it directly to compose filter chains.
+    pub fn attach_filter_to_last_subscriber(
+        &mut self,
+        field: &str,
+        filter: std::sync::Arc<dyn crate::server::database::filters::SubscriptionFilter>,
+    ) -> bool {
+        if let Some(bucket) = self.subscribers.get_mut(field) {
+            if let Some(sub) = bucket.last_mut() {
+                sub.filters.push(filter);
+                return true;
+            }
+        }
+        false
     }
 
     /// Remove a subscriber by subscription ID from all fields.

@@ -154,6 +154,11 @@ pub struct Subscriber {
     /// recv() to deliver the most recent state — matching libca rsrv
     /// "drop oldest, keep newest" semantics.
     pub coalesced: Arc<StdMutex<Option<MonitorEvent>>>,
+    /// Server-side channel filter chain (epics-base 3.15.7).
+    /// Defaults to empty — every event passes unchanged. Populated
+    /// by the subscription path when the channel name carries a
+    /// `.{filter:opts}` JSON suffix (`dbnd`, `arr`, `ts`, ...).
+    pub filters: crate::server::database::filters::FilterChain,
 }
 
 /// A process variable hosted by the server.
@@ -231,6 +236,8 @@ impl ProcessVariable {
     /// unreachable). Mirrors gatePvData::death's "alarm-post"
     /// alternative discussed in the C++ ca-gateway audit.
     pub async fn post_alarm(&self, severity: u16, status: u16) {
+        use crate::server::database::filters::FilteredMonitorEvent;
+        use crate::server::recgbl::EventMask;
         let value = self.value.read().await.clone();
         let mut subs = self.subscribers.lock().await;
         subs.retain(|sub| !sub.tx.is_closed());
@@ -245,6 +252,19 @@ impl ProcessVariable {
                 snapshot,
                 origin: 0,
             };
+            // Alarm-only emission — never gate alarm events.
+            // `FilteredMonitorEvent` with `mask = ALARM` tells
+            // value filters (e.g. `dbnd`) to pass through (446e0d4a).
+            let filtered = if sub.filters.is_empty() {
+                Some(event)
+            } else {
+                sub.filters
+                    .apply(FilteredMonitorEvent::new(event, EventMask::ALARM))
+                    .map(|fe| fe.event)
+            };
+            let Some(event) = filtered else {
+                continue;
+            };
             if sub.tx.try_send(event.clone()).is_err() {
                 if let Ok(mut slot) = sub.coalesced.lock() {
                     *slot = Some(event);
@@ -255,6 +275,8 @@ impl ProcessVariable {
 
     /// Notify all subscribers of a new value.
     async fn notify_subscribers(&self, value: EpicsValue) {
+        use crate::server::database::filters::FilteredMonitorEvent;
+        use crate::server::recgbl::EventMask;
         let mut subs = self.subscribers.lock().await;
         // Remove subscribers whose channel has been dropped
         subs.retain(|sub| !sub.tx.is_closed());
@@ -263,6 +285,18 @@ impl ProcessVariable {
             let event = MonitorEvent {
                 snapshot,
                 origin: 0,
+            };
+            // Value-changed emission — channel filters may suppress
+            // this event when (e.g.) the deadband isn't crossed.
+            let filtered = if sub.filters.is_empty() {
+                Some(event)
+            } else {
+                sub.filters
+                    .apply(FilteredMonitorEvent::new(event, EventMask::VALUE))
+                    .map(|fe| fe.event)
+            };
+            let Some(event) = filtered else {
+                continue;
             };
             if sub.tx.try_send(event.clone()).is_err() {
                 // Queue full — overwrite any prior pending overflow with
@@ -310,6 +344,7 @@ impl ProcessVariable {
             mask,
             tx,
             coalesced: Arc::new(StdMutex::new(None)),
+            filters: crate::server::database::filters::FilterChain::new(),
         };
         let mut subs = self.subscribers.lock().await;
         // Round 46 (R46-G1): reap dead Senders BEFORE counting

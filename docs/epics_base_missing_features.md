@@ -87,7 +87,7 @@
 - **DNS TTL 주기적 갱신 부재 (PR #862)** — ⏭️ **ALREADY**: `EPICS_CA_DNS_REFRESH_SECS` 타이머 + `AddrEntry::refresh_dns` 구현 (round 50).
 - **네임서버 CA 프로토콜 강제 지정 (PR #621)** — ⏸️ **DEFERRED**: `CA_V413` 강제 옵션 미구현.
 - **다량 채널 검색(Mass-channel) 성능 튜닝 (Issue #372)** — 🔄 **PARTIAL**: AIMD search budget + 30-bucket cooperative tick 기반 구현되어 있으나 mass scenario 별도 검증 필요.
-- **`caget` 반환 타입 단축 (PR #629)** — ⏸️ **DEFERRED**: DBR_INT→SHORT 캐스팅 엣지 케이스 미점검.
+- **`caget` 반환 타입 단축 (PR #629)** — ⚠️ **N/A**: 원PR은 C `caget`의 `-d` argument parser에서 `DBR_INT` 문자열을 `DBR_SHORT`로 치환하는 패치(`dbr_text_to_type`이 `INT` suffix를 파싱하지 못하므로). `caget-rs`의 `-d/--dbr-type` 옵션은 현재 parity-only로 받기만 하고 채널 요청에 반영되지 않으므로(`bin/caget-rs.rs:233-235`) 변환 자체가 적용될 진입점 없음. `-d`를 실제로 wire-through할 때 같이 처리.
 - **CA UDP 전송 오류 rate-limit (cae597d, c23012d)** — ⏭️ **ALREADY**: `client/search.rs::send_with_fanout`, `server/beacon.rs::run_beacon_emitter`에 per-destination first/change/recovery만 로그하는 dedup.
 - **EPICS_CA_MCAST_TTL (3.16 f2a1834d)** — ✅ **DONE** `ae277d1`: `runtime::net::ca_mcast_ttl` + `AsyncUdpV4::set_multicast_ttl_v4` + CA 서버 beacon/UDP 응답기·클라이언트 search 소켓에 적용.
 - **EPICS_IOC_IGNORE_SERVERS (6efe2924)** — ✅ **DONE** `8615bb4`: ADDR_LIST 파싱·SEARCH 응답·beacon 수신 3개 경로에서 quarantine IP 필터.

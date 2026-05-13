@@ -108,7 +108,7 @@ Shape: PR# / merged date / what changed / epics-rs location to inspect / status 
 | [#497](https://github.com/epics-base/epics-base/pull/497) | iocsh `pushd`/`popd`/`dirs` | `iocsh/commands.rs::{cmd_pushd, cmd_popd, cmd_dirs}` with process-global `dir_stack` (OnceLock<Mutex<Vec<PathBuf>>>); failed `cd` restores popped entry | done |
 | [#475](https://github.com/epics-base/epics-base/pull/475) | asLib type-safety incompat | ACF library | not started |
 | [#459](https://github.com/epics-base/epics-base/pull/459) | iocsh history/file size limit | `iocsh/mod.rs::run_repl` builds `rustyline::Config` with `max_history_size` from `EPICS_RS_IOCSH_HISTORY_SIZE` (default 500, floor 16) | done |
-| [#205](https://github.com/epics-base/epics-base/pull/205) | IPv6 part 1 | epics-ca-rs ADDR_LIST/BEACON multi-NIC is IPv4-only | not started |
+| [#205](https://github.com/epics-base/epics-base/pull/205) | IPv6 part 1 | PVA Stages 1-6 done (server bind, UDP responder, search recv, beacon emit/recv); CA IPv4-only by wire-protocol lock | done (PVA), N/A (CA) — 잔여 `Ipv4Addr` 식별자 ~100건은 IPv4-only API surface (NIC enumeration, multicast, broadcast routing, CA wire) — load-bearing IPv4 시맨틱이라 churn 가치 없음, 의도적 보류 |
 | [#154](https://github.com/epics-base/epics-base/pull/154) | DBR_VFIELD virtual field | CA DBR types | not started |
 | [#149](https://github.com/epics-base/epics-base/pull/149) | Address modifiers | dblink modifiers | not started |
 | [#69](https://github.com/epics-base/epics-base/pull/69) | Specified TCP port + UDP 5064 fixed | server port env vars (decouple TCP/UDP) | not started |

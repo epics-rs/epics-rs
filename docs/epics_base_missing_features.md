@@ -100,7 +100,7 @@
 - **범용 `TOUT` (Timeout) 레코드 필드 부재 (PR #803)** — ⏸️ DEFERRED.
 - **Soft Time Part 디바이스 지원 (PR #776)** — ⏸️ DEFERRED.
 - **`bi` / `bo` 변환(Conversion) 로직 누락 (PR #775)** — ⏸️ DEFERRED.
-- **상수 링크(Constant Link)의 오프셋 계산 버그 대조 (PR #467)** — ⏸️ DEFERRED.
+- **상수 링크(Constant Link)의 오프셋 계산 버그 대조 (PR #467 / 1b46077)** — ⚠️ **N/A (eliminated)**: 원버그는 `lnkConst.c`의 `((char*)pbuffer)[*pnReq] = 0` one-past-end null terminator write로 `aai CHAR NELM=1` 1-byte heap overflow. Rust constant-link 데이터 복사는 `&str` / `Vec<u8>` slice의 checked indexing을 사용하므로 동일 패턴 자체가 컴파일러/런타임 차원에서 차단. `rust_verdict: eliminated`.
 - **사용되지 않는 `INPx` 링크 파손 시 `calc` 레코드 중단 문제 (Issue #823)** — ⏸️ DEFERRED.
 - **`mbboDirect`의 `B0..BF` 필드 ASL0 권한 조정 (PR #439)** — ⚠️ **N/A (design diff)**: 원PR은 `.dbd`의 `prompt(...)` ASL1 marker를 ASL0으로 바꿔 ACF 권한 게이트를 완화. epics-rs `FieldDesc`는 per-field ASL을 surface하지 않으며(필드 단위 ACF gating 미구현), 접근 제어는 `compute_access`/`AuditLogger` 경유 record-level + auth_method/authority 기반. 동등한 변경 지점이 없음.
 - **`dbLoadRecords` 매크로 기본값 의미론 불일치 (PR #463)** — ⏸️ DEFERRED.
@@ -179,7 +179,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 ---
 
 ### 7-B. 레코드/DB 경계값 및 배열 (Bounds, 56건 → 핵심 점검 항목)
-- **`constant link` 오프셋 오프바이원(off-by-one) 버그** (`1b460770`, 2024): → 섹션 5의 기존 항목과 동일.
+- **`constant link` 오프셋 오프바이원(off-by-one) 버그** (`1b460770`, 2024) — ⚠️ **N/A (eliminated)**: 섹션 5 보강 참조 (Rust slice indexing이 one-past-end write를 차단).
 - **`aai` 레코드의 pass-1 디바이스 초기화 지원** (`1c566e21`/`6754404d`, 2021): `aai`가 pass-1에서 디바이스를 초기화해야 하는 순서 의무. → 섹션 2의 `aai` 구현 항목에 포함.
 - **배열 레코드의 `BPTR` 필드 런타임 변경 지원** (`2340c6e6`, 2021): 배열 버퍼 포인터를 런타임에 변경하는 기능.
 - **`compress` 레코드 평균(average) 알고리즘 버그 수정** (`11a4bed9`, 2022): 단일 입력 데이터 경로 및 스칼라 평균 처리 버그. → 섹션 5의 기존 항목에 포함.

@@ -17,7 +17,6 @@ pub(crate) mod interpose;
 pub mod interrupt;
 pub mod manager;
 pub mod param;
-pub mod param_tree;
 pub mod port;
 pub(crate) mod port_actor;
 pub mod port_handle;

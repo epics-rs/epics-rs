@@ -115,8 +115,8 @@
 
 > 본 세션에서 직접 다루지 않음 → **⏸️ DEFERRED**.
 
-- **`iocsh` 다중 후행 줄바꿈(trailing newlines) 트리밍 (PR #371)** — ⏸️ DEFERRED.
-- **`initHookRegister` 멱등성 보장 로직 (PR #594)** — ⏸️ DEFERRED.
+- **`iocsh` 다중 후행 줄바꿈(trailing newlines) 트리밍 (PR #371)** — ⏭️ **ALREADY**: Rust `String::trim()`이 연속 줄바꿈 포함 모든 leading/trailing whitespace를 제거. `iocsh/mod.rs:38/159/229/231` 모두 명령 라인을 `trim()` 후 처리.
+- **`initHookRegister` 멱등성 보장 로직 (PR #594 / 13d6ca5)** — ⚠️ **N/A (design diff)**: Rust 측은 builder pattern으로 per-`IocApplication`의 `after_init_hooks: Vec<Box<dyn FnOnce>>` (`crates/epics-base-rs/src/server/ioc_app.rs:68`)만 존재. C의 전역 `functionList` linked list와 달리 module-static-init/iocsh 양쪽에서 동일 fn pointer가 누적되는 시나리오가 구조적으로 발생하지 않음. 보너스: closure는 비교 불가능하므로 dedup도 의미 없음 (사용자가 의도적으로 두 번 등록한 경우 그대로 두 번 실행).
 - **새로운 문자열 유틸리티 부재 (7.0.5/7.0.6)** — ⏸️ DEFERRED: `epicsStrSimilarity()`, `epicsStrnGlobMatch()` 러스트 매핑 없음.
 - **빈 인스턴스의 `dbLoadTemplate` vs `msi` 파서 불일치 (Issue #666)** — ⏸️ DEFERRED.
 - **서버 필터 프레임워크 셧다운 안전성 (Issue #643)** — ⚠️ N/A: 서버 측 필터 프레임워크가 미구현이므로 그 셧다운 안전성 이슈도 자동 무관.
@@ -165,14 +165,14 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`DBE_PROPERTY` → `DBE_VALUE` 순서 보장**: `DBE_PROPERTY`를 반드시 `DBE_VALUE`보다 먼저 전송해야 하는 순서 의무 (`b7cc33c3`, 2024). `epics-rs` 구독 이벤트 전송 순서 확인 필요.
 - **`mbbi`/`mbbo`의 `DBE_PROPERTY` 누락 버그**: 해당 레코드에서 `DBE_PROPERTY`가 아예 발생하지 않는 C++ 버그. `epics-rs` 구현에서 동일한 패턴 여부 점검.
 - **빈 배열(length=0) `caput` 시 DBR 오프셋 오계산** (`8cc20393`, 2020): DBR 헤더에서 첫 번째 원소의 크기를 잘못 계산. `epics-rs`의 `dbr::encode_array` 엣지 케이스 확인.
-- **빈 배열 `caput` 시 스칼라에 `INVALID_ALARM` 설정** (`12cfd418`, 2020): 빈 배열을 스칼라 필드에 쓰면 알람 상태를 올바르게 설정해야 함.
+- **빈 배열 `caput` 시 스칼라에 `INVALID_ALARM` 설정** (`12cfd418`, 2020) — ⏭️ **ALREADY** (semantic diff): `put_pv` (`crates/epics-base-rs/src/server/database/field_io.rs:83-92`)가 commit 12cfd41 hash까지 명시한 가드로 `value.is_empty_array() && target_is_scalar` 케이스를 `CaError::InvalidValue` 반환으로 reject. C의 LINK_ALARM/INVALID_ALARM 세트 대신 Err 전파로 fail-fast — converter는 호출되지 않으며 garbage value 작성도 차단됨. 알람 필드 변경은 발생하지 않으므로 stat/sevr monitor 채널은 영향 없음 (C와 미세 차이).
 - **`dbGet`으로 빈 배열을 스칼라로 읽을 때 크래시** (`39c8d561`, 2020): 배열 원소가 0개일 때 스칼라 `dbGet` 경로가 크래시하는 버그.
 - **`UTAG` uint64 타입 필드 전파** (`b94afaa0`, 2020) — ⚠️ **N/A** (의도적): `epics-rs`의 `snapshot.user_tag: i32`는 PVA Normative `time_t.userTag = int` 스펙과 일치하는 wire-correct 표현. upstream의 internal uint64는 CA-level UTAG 노출 + db_field_log 전파(둘 다 미구현)에 의미. CA-level UTAG가 필요해질 때 i64로 승격 + PVA encode에서 truncate-with-warning.
 - **`amsg`/`utag`의 `dbGet()` 옵션 통로 분리** (`bd3ecf1c`, 2021): 알람 메시지(`AMSG`) 및 `UTAG`를 `dbGet()` 옵션 경로로 별도 분리. 두 필드의 `epics-rs` 직렬화 경로 교차 검증 필요.
 - **`db_field_log::mask` 필드** (`235f8ed2`, 2020): 모니터 페이로드의 이벤트 마스크가 실제 발행 마스크로 덮어쓰기 되어야 함.
 - **CA 서버 프로토콜 버전 클라이언트 노출** (`d7635413`, 2025, PR #711) — ⏭️ **ALREADY**: 섹션 1 참조 (transport.rs server_minor_version 분기).
 - **`SOCK_CLOEXEC` 사용 + `accept4()`** (`cf3173b6`, 2021) — ⏭️ **ALREADY**: Tokio가 내부에서 처리, `epics-rs` 직접 점검 불필요.
-- **`IPPORT_USERRESERVED` 포트 상수 정의** (`cd0e6a4f`, 2021) — ⏸️ DEFERRED.
+- **`IPPORT_USERRESERVED` 포트 상수 정의** (`cd0e6a4f`/`0cae0db`, 2020-2021) — ⚠️ **N/A (eliminated)**: musl libc 헤더 호환 shim. Rust `std::net`/tokio는 `IPPORT_USERRESERVED`를 사용하지 않으며 epics-ca-rs는 하드코딩 상수/환경변수로 포트 선택. `rust_verdict: eliminated`.
 - **`16진수/8진수 문자열 dbPut/dbGet 지원`** (`88bfd6f3`, 2025, PR #678) — ✅ **DONE** `17210b4` (섹션 2 항목과 동일).
 - **`bi` 레코드 소프트 채널에서 `MASK` 비트 사용** (`f2fe9d12`, 2023) — ⏸️ DEFERRED.
 
@@ -202,14 +202,14 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`iocsh` 인자 파싱 버그 수정** (`3dbc9ea2`, 2023): 인자 분리(splitting) 로직의 버그 수정 → `epics-rs` iocsh 파서 정합성 확인.
 - **`casStatsFetch()` RSRV 미초기화 시 안전성** (`7a6e11ca`, 2026): RSRV가 초기화되기 전에 CA 서버 통계를 조회하면 크래시하는 버그. `epics-rs`의 `dbServerStats()` 초기화 보호 확인.
 - **`dbGet`의 루프-안전 래퍼** (`dac620a7`, 2024): `dbGet()` 재귀 호출 시 데드락을 방지하는 루프-안전 래퍼 추가.
-- **`NAMSG` 알람 문자열 필드를 `NSTAT`/`NSEV`와 함께 초기화** (`8483ff95`, 2024): 알람 상태가 클리어될 때 `NAMSG` 문자열도 함께 초기화되어야 함.
+- **`NAMSG` 알람 문자열 필드를 `NSTAT`/`NSEV`와 함께 초기화** (`8483ff95`, 2024) — ⏭️ **ALREADY**: `rec_gbl_reset_alarms`(`crates/epics-base-rs/src/server/recgbl.rs:121`)가 `common.amsg = std::mem::take(&mut common.namsg)`로 promote 직후 namsg를 자동 클리어. `reset_alarms_transfers_amsg_and_clears_namsg` 테스트로 회귀 방어.
 - **`lset::getAlarmMsg()` API** (`5143c71a`, 2020): 링크 세트(link set)에서 알람 메시지를 직접 읽어오는 새 API.
 - **빈 문자열 링크를 `unset`과 동일하게 처리** (`3b484f58`, 2023): `INP`/`OUT` 링크가 빈 문자열 `""`일 때 링크를 해제(unset)된 것으로 처리해야 하는 시맨틱.
 - **`FIFO 스케줄링`을 환경 변수로 비활성화** (`862272d6`, 2025): `EPICS_NO_RT_SCHED` 같은 환경 변수로 RT 스케줄링을 비활성화하는 기능. `epics-rs`의 RT 스레드 옵트아웃 로직 확인.
 - **`memlock()` 옵트아웃** (`0916cf98`, 2025): FIFO 스케줄링이 비활성화된 경우 `mlockall()` 호출도 건너뜁니다.
 - **`aSub` 레코드의 상수 `INP*` 링크 지원** (`d47fa4ca`, 2022, Issue #284): → 섹션 5의 기존 항목과 동일.
 - **`dbLoadRecords()` 오류 메시지 중복 출력 방지** (`9af7fb3`, 2025): 로딩 실패 시 에러 메시지가 두 번 출력되는 버그.
-- **`dbReadDatabaseFP()` 파일 닫기 보장** (`a6779df2`, 2022): 오류 경로에서 `fclose()` 미호출로 인한 파일 디스크립터 누수.
+- **`dbReadDatabaseFP()` 파일 닫기 보장** (`a6779df2`, 2022) — ⚠️ **N/A (eliminated)**: Rust `std::fs::File`의 `Drop`이 자동으로 `close()` 보장. `BufReader<File>` 등 모든 파일 래퍼 동일. `rust_verdict: eliminated`.
 - **`logClient` 연결 끊김 시 미전송 메시지 재전송 시도** (`0a3427c8`, 2019): 로그 서버와의 연결이 끊어져도 버퍼에 남은 메시지를 바로 버리지 않고 재전송 시도. `epics-rs`의 `logClient` 셧다운 경로 확인.
 - **알람 메시지 필드(`AMSG`) 및 타임 태그 필드(`UTAG`) 추가** (`892a361d`/`b94afaa0`, 2020): `recGbl`에 알람 문자열 필드(`AMSG`)와 64비트 사용자 태그(`UTAG`)가 추가됨. `epics-rs` 레코드 공통 필드 동기화 필요.
 - **`dbChannel` 기반 링크 (DBADDR → dbChannel 교체)** (`b1f44592`, 2020): 내부 링크의 주소 타입이 `DBADDR`에서 `dbChannel`로 교체되는 대규모 리팩토링. `epics-rs`의 링크 어드레싱 모델 확인.
@@ -219,7 +219,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 ### 7-D. 타이밍 / 타임아웃 (Timeout, 15건 → 검토 필요)
 - **타이머 조기 만료(Early expiry) 버그** (`01360b2a`, 2022): 비 RTOS 환경에서 타이머가 예정보다 일찍 발화하는 버그. `tokio` 타이머가 대체하지만, CA 검색 타이머(`SearchTimer`) 로직 확인.
 - **NaN/Overflow 타임아웃 값 처리** (`1655d68e`, 2022) — ✅ **DONE (analog)**: 원커밋은 RTEMS osdEvent 한정 (Rust 비대상)이지만 동일 정신: `epics_ca_rs::cli::timeout_duration` (`crates/epics-ca-rs/src/cli.rs`)이 NaN/±Inf/0/음수를 `DEFAULT_CLI_TIMEOUT_SECS=1.0`으로 클램프해 `Duration::from_secs_f64` panic을 차단. `env_default_timeout`도 같은 가드. 4개 CA CLI(caget/caput/cainfo/camonitor) 모두 `timeout_duration` 경유. PVA 측은 `epics_pva_rs::cli::timeout_duration` (default 5.0s) 추가, `pvcall-rs`에 적용. `pvlist-rs`는 `0`=wait-forever 의미를 보존하기 위해 `is_finite() && > 0.0` 가드만 적용 (Inf/NaN도 wait-forever). 테스트 5종.
-- **`EPICS_CLI_TIMEOUT` 환경 변수** (`1d056c6f`, 2022): `caget`/`caput`/`camonitor` 등의 CLI 도구의 기본 타임아웃을 환경 변수로 설정하는 기능. → 이미 `RELEASE-7.0.8.md` 항목에 포함됨.
+- **`EPICS_CLI_TIMEOUT` 환경 변수** (`1d056c6f`, 2022) — ⏭️ **ALREADY**: `epics_ca_rs::cli::env_default_timeout` (`crates/epics-ca-rs/src/cli.rs:10`)이 EPICS_CLI_TIMEOUT 환경변수를 읽어 unset/unparseable 시 1.0s fallback. `caget`/`caput`/`camonitor`/`cainfo` 4개 binary 모두 `.unwrap_or_else(env_default_timeout)` 패턴으로 적용. clap의 `-w` parse 실패 시 즉시 종료(C의 silent-revert와 달리 안전).
 - **단조시간(Monotonic Clock) 기반 CA 타임아웃 통일** (`f1cbe93b`, 2020): CA 내부 타이머(`tcpiiu`, `searchTimer`)를 모두 단조 시계 기반으로 통일하는 작업. `tokio`의 `Instant` 사용으로 대체되나, 동일한 단조 보장 여부 확인.
 - **macOS 단조 시계 해상도 버그** (`3506d115`, 2020): 최신 macOS에서 `clock_gettime`의 오버헤드를 줄이기 위한 최적화(macOS Tier-2 개발 플랫폼이므로 확인 필요).
 

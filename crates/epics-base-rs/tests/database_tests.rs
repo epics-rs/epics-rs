@@ -2459,3 +2459,99 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
         event.snapshot.timestamp
     );
 }
+
+/// epics-base PR #6c573b4 integration regression: a longout record
+/// with `OOPT=On_Change` (1) must still emit its initial OUT-link
+/// write on the very first process cycle even though val == pval ==
+/// 0 satisfies the "no change" comparison. The C bug skipped that
+/// initial write because outpvt was initialised to OUT_LINK_UNCHANGED;
+/// the fix flipped the initial outpvt to EXEC_OUTPUT.
+///
+/// In the Rust port the equivalent flag is `LongoutRecord::first_output_done`
+/// (`crates/epics-base-rs/src/server/records/longout.rs:69`):
+/// `compute_should_output` short-circuits to `true` while it is
+/// false, then the framework's `on_output_complete` flips it to
+/// `true` after the OUT link / device write succeeds.
+///
+/// This test pins the integration: a first process cycle with
+/// OOPT=1 must drive write_db_link_value (observed via the target
+/// record's `common.time` advancing past baseline), and a second
+/// no-op process cycle must not.
+#[tokio::test]
+async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
+    use epics_base_rs::server::records::longout::LongoutRecord;
+    use std::time::SystemTime;
+
+    let db = PvDatabase::new();
+    db.add_record("LO_SRC", Box::new(LongoutRecord::new(0)))
+        .await
+        .unwrap();
+    db.add_record("LO_DST", Box::new(LongoutRecord::new(0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("LO_SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("LO_DST".into()))
+            .unwrap();
+        inst.record.put_field("OOPT", EpicsValue::Short(1)).unwrap();
+    }
+
+    let baseline = SystemTime::now();
+
+    // First cycle: val == pval == 0 satisfies "no change", but the
+    // first-output-done guard forces the OUT cascade to fire.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("LO_SRC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let dst_time_after_first = db
+        .get_record("LO_DST")
+        .await
+        .expect("LO_DST exists")
+        .read()
+        .await
+        .common
+        .time;
+    assert!(
+        dst_time_after_first >= baseline,
+        "first-cycle OOPT=On_Change must drive OUT cascade (DST.time {dst_time_after_first:?} \
+         must be ≥ baseline {baseline:?}); pre-fix the cascade was suppressed"
+    );
+
+    // Confirm the framework latched first_output_done=true.
+    let src_first_done = db
+        .get_record("LO_SRC")
+        .await
+        .expect("LO_SRC exists")
+        .read()
+        .await
+        .record
+        .get_field("VAL")
+        .is_some();
+    assert!(src_first_done, "SRC must have processed at least once");
+
+    // Second cycle with VAL still 0: OOPT=1 should now suppress
+    // the cascade because val == pval and the first-cycle guard is
+    // off. Capture DST's time before to detect any unwanted
+    // re-process.
+    let dst_time_before_second = dst_time_after_first;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let mut visited = HashSet::new();
+    db.process_record_with_links("LO_SRC", &mut visited, 0)
+        .await
+        .unwrap();
+    let dst_time_after_second = db
+        .get_record("LO_DST")
+        .await
+        .expect("LO_DST exists")
+        .read()
+        .await
+        .common
+        .time;
+    assert_eq!(
+        dst_time_after_second, dst_time_before_second,
+        "second-cycle OOPT=On_Change with val==pval must NOT re-trigger OUT cascade — \
+         DST.time should not advance from {dst_time_before_second:?} to {dst_time_after_second:?}"
+    );
+}

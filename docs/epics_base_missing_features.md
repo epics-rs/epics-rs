@@ -99,7 +99,7 @@
 
 - **범용 `TOUT` (Timeout) 레코드 필드 부재 (PR #803)** — ⏸️ DEFERRED.
 - **Soft Time Part 디바이스 지원 (PR #776)** — ⏸️ DEFERRED.
-- **`bi` / `bo` 변환(Conversion) 로직 누락 (PR #775)** — ⏸️ DEFERRED.
+- **`bi` / `bo` 변환(Conversion) 로직 누락 (Issue #775)** — ⏸️ **DEFERRED (upstream design pending)**: enhancement 제안 — bi/bo에 `ZRVL`/`ONVL` 필드 추가로 mbbi/mbbo 스타일 임의 raw value 매핑 + MASK 의미 재정의. upstream Issue가 OPEN(question label) 상태이고 합의된 wire/field layout 없음. epics-rs 구현은 upstream이 새 필드 + MASK 시맨틱을 확정한 뒤 동기화.
 - **상수 링크(Constant Link)의 오프셋 계산 버그 대조 (PR #467 / 1b46077)** — ⚠️ **N/A (eliminated)**: 원버그는 `lnkConst.c`의 `((char*)pbuffer)[*pnReq] = 0` one-past-end null terminator write로 `aai CHAR NELM=1` 1-byte heap overflow. Rust constant-link 데이터 복사는 `&str` / `Vec<u8>` slice의 checked indexing을 사용하므로 동일 패턴 자체가 컴파일러/런타임 차원에서 차단. `rust_verdict: eliminated`.
 - **사용되지 않는 `INPx` 링크 파손 시 `calc` 레코드 중단 문제 (Issue #823)** — ⏭️ **ALREADY** (graceful by design): Rust multi-input fetch (`processing.rs` line ~270)는 `read_link_with_alarm`이 broken DB link에서 `get_pv` → `Err(ChannelNotFound)` → `.ok()` → `value=None`을 반환. `if let Some(value)` 분기를 통과하지 못해 해당 입력 슬롯은 default 그대로 유지되며, 알람 capture 분기는 ParsedLink::Db + Some(alarm) 모두 필요하므로 broken link에서는 alarm propagation도 일어나지 않음. CALC 식이 해당 입력을 참조하지 않으면 결과는 정상 계산 — Issue #823이 요청하는 동작을 자동 달성. (upstream issue OPEN이지만 Rust 구현은 이미 의도 부합.)
 - **`mbboDirect`의 `B0..BF` 필드 ASL0 권한 조정 (PR #439)** — ⚠️ **N/A (design diff)**: 원PR은 `.dbd`의 `prompt(...)` ASL1 marker를 ASL0으로 바꿔 ACF 권한 게이트를 완화. epics-rs `FieldDesc`는 per-field ASL을 surface하지 않으며(필드 단위 ACF gating 미구현), 접근 제어는 `compute_access`/`AuditLogger` 경유 record-level + auth_method/authority 기반. 동등한 변경 지점이 없음.

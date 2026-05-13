@@ -497,7 +497,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`Channel` 일관된 연결 해제(Disconnect) 처리** (`f7b3821e10b4`, high) — ⏭️ **ALREADY**: epics-pva-rs는 `Channel::set_state` (`channel.rs:678`)를 single entry point로 두고, 상태 전이 시 SID-close hook 등록/해제 + `server_destroyed` flag 처리를 한 곳에서 일관 처리. `close()`는 `set_state(Closed)`로 라우팅, 서버측 `CMD_DESTROY_CHANNEL` 수신 시에도 동일 경로(pvxs e668038 참조 코멘트). Rust Drop chain이 connector / op 정리를 보강.
 - **`Context::close()` 명시적 지원** (`0de17036f4a6`, medium) — ⏭️ **ALREADY**: `PvaClient::close()` (`context.rs:610`).
 - **Search 패킷 단편화(Fragmentation) 방지** (`84ef355a4a1a`, medium) — ⚠️ **N/A**: 현재 `build_search`가 count=1 단일 PV 패킷이라 MTU 미만 — batching 미구현이므로 fragmentation 발생 자체 불가.
-- **환경 변수를 통한 설정 가능 타임아웃** (`da004bc54bb3`, medium) — ⏸️ DEFERRED.
+- **환경 변수를 통한 설정 가능 타임아웃** (`da004bc54bb3`, medium) — ⏭️ **ALREADY**: `EPICS_PVA_CONN_TMO` 처리 `crates/epics-pva-rs/src/config/env.rs:243-248` + `Config`의 `tcp_timeout: Duration` 필드 (`client_native/context.rs:59-95`). pvxs convention의 4/3 scaling은 향후 적용 시점 검토.
 - **Search 응답 처리 한계 상향** (`b38b33db034e`, medium) — ⏸️ DEFERRED.
 - **Search 대상 목적지 없음 오류 로깅** (`8db40be29c81`, medium) — ⏭️ **ALREADY**: `search_engine.rs:202`에서 ADDR_LIST 비어있고 AUTO_ADDR_LIST=NO일 때 명시적 warning.
 

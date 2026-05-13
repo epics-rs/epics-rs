@@ -173,6 +173,40 @@ async fn test_single_inp_ms_class_propagates_source_alarm() {
     );
 }
 
+/// epics-base PR #3fb10b6 regression: only the record directly
+/// receiving a dbPut should carry PUTF=1 during chain processing.
+/// Pre-fix the CP-target dispatch set PUTF=true on every chained
+/// record, smearing put attribution across the entire chain.
+#[tokio::test]
+async fn test_putf_stays_off_for_cp_chained_targets() {
+    let db = PvDatabase::new();
+    db.add_record("SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("TGT", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("TGT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("SRC CP".into()))
+            .unwrap();
+    }
+
+    // Drive SRC's process directly. The CP dispatch enumerates TGT
+    // and would (pre-fix) set TGT.common.putf=true before processing.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let tgt = db.get_record("TGT").await.expect("TGT exists");
+    let inst = tgt.read().await;
+    assert!(
+        !inst.common.putf,
+        "CP-driven TGT must not carry PUTF=1 — that bit belongs only to the directly-put record"
+    );
+}
+
 #[tokio::test]
 async fn test_cycle_detection() {
     let db = PvDatabase::new();

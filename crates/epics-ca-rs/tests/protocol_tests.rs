@@ -416,8 +416,8 @@ async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
     use std::time::Duration;
 
     let port = {
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .expect("reserve free CA server port");
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
         let p = probe.local_addr().unwrap().port();
         drop(probe);
         p

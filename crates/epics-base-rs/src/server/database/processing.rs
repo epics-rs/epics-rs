@@ -1450,7 +1450,15 @@ impl PvDatabase {
                     tg.common.rpro = true;
                     true
                 } else {
-                    tg.common.putf = true;
+                    // epics-base PR #3fb10b6: PUTF must remain
+                    // false on CP-driven targets — only the record
+                    // directly receiving the dbPut should report
+                    // PUTF=1 to dbNotify/onChange observers. The
+                    // pre-fix C path (and this Rust port until now)
+                    // wrongly propagated PUTF=true onto every CP
+                    // target, so a downstream OPI reading PUTF on
+                    // chained records saw the put attribution
+                    // smeared across the entire chain.
                     false
                 }
             } else {

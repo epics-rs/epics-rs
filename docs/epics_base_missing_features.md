@@ -474,7 +474,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 `documentation/new-notes/`에서 발굴한 현재 개발 중이거나 병합 예정인 기능들:
 
 - **PR #359: `aai`/`aao`/`subArray`/`waveform`의 `NORD` 필드 타임스탬프 버그 수정** — 🔄 **PARTIAL** `a02c310`: `aai`/`aao`/`subArray` 레코드 타입 자체는 신규 구현. NORD 타임스탬프 갱신 순서 fix는 별도 작업.
-- **PR #768: `iocInit`에서 로컬 CA 링크 연결 대기** — ⏸️ DEFERRED: 9-A high-priority 항목 — 우선 후보.
+- **PR #768: `iocInit`에서 로컬 CA 링크 연결 대기** — ⏸️ **DEFERRED**: 9-A high-priority 항목 — 우선 후보. C 구현은 `initOutstanding` 카운터 + `DBCA_CALLBACK_INIT_WAIT` flag + `CA_INIT_READY` action 3단계 동기화로 `initHookAfterIocRunning` 발화 전에 모든 로컬 CA `CP` 링크가 connect되도록 함. Rust 측은 dbCa 등가물(`parsed_inp = ParsedLink::Ca(...)`)을 추적할 별도 lifecycle counter + tokio Notify 페어 + post-iocInit drain 단계가 필요 (archaeology 항목: `717d69e` / `a46bd5a-dbca-iocInit-wait-local-links-connect.md`).
 - **PR #788: `epicsThreadGetCPUs` 및 `callbackParallelThreads` CPU 어피니티 반영** — ⏭️ **ALREADY**: 섹션 3 보강 (Rust `std::thread::available_parallelism()`).
 - **PR #812: `dbCreateRecord` iocsh 명령어** — ⏭️ **ALREADY**: `cmd_db_create_record` (`crates/epics-base-rs/src/server/iocsh/commands.rs:680`)로 등록 + 5종 테스트(happy path + duplicate / bad name / unknown type / missing args).
 - **PR #817: `mbbi` 레코드의 `AFTC`/`LALM` 버그 수정** — ⏸️ DEFERRED.

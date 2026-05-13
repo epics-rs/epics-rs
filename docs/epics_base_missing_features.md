@@ -118,7 +118,7 @@
 - **`iocsh` 다중 후행 줄바꿈(trailing newlines) 트리밍 (PR #371)** — ⏭️ **ALREADY**: Rust `String::trim()`이 연속 줄바꿈 포함 모든 leading/trailing whitespace를 제거. `iocsh/mod.rs:38/159/229/231` 모두 명령 라인을 `trim()` 후 처리.
 - **`initHookRegister` 멱등성 보장 로직 (PR #594 / 13d6ca5)** — ⚠️ **N/A (design diff)**: Rust 측은 builder pattern으로 per-`IocApplication`의 `after_init_hooks: Vec<Box<dyn FnOnce>>` (`crates/epics-base-rs/src/server/ioc_app.rs:68`)만 존재. C의 전역 `functionList` linked list와 달리 module-static-init/iocsh 양쪽에서 동일 fn pointer가 누적되는 시나리오가 구조적으로 발생하지 않음. 보너스: closure는 비교 불가능하므로 dedup도 의미 없음 (사용자가 의도적으로 두 번 등록한 경우 그대로 두 번 실행).
 - **새로운 문자열 유틸리티 부재 (7.0.5/7.0.6)** — ⏸️ DEFERRED: `epicsStrSimilarity()`, `epicsStrnGlobMatch()` 러스트 매핑 없음.
-- **빈 인스턴스의 `dbLoadTemplate` vs `msi` 파서 불일치 (Issue #666)** — ⏸️ DEFERRED.
+- **빈 인스턴스의 `dbLoadTemplate` vs `msi` 파서 불일치 (Issue #666)** — ⚠️ **N/A (out of scope)**: `dbLoadTemplate` 다중 인스턴스 로더 + `msi` 도구 자체가 epics-rs 미구현 (현재 `dbLoadRecords` per-call macros만 존재). 두 도구의 파서 불일치도 자동 부재. 추후 substitution file 로더가 추가될 때 이 항목 재검토.
 - **서버 필터 프레임워크 셧다운 안전성 (Issue #643)** — ⚠️ N/A: 서버 측 필터 프레임워크가 미구현이므로 그 셧다운 안전성 이슈도 자동 무관.
 
 ### Asyn 모듈 세부

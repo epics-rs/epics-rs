@@ -584,6 +584,204 @@ impl AsyncUdpV4 {
         Ok(())
     }
 
+    /// Opt every underlying NIC socket into the Linux `SO_RXQ_OVFL`
+    /// receive-queue overflow counter (commit pvxs `a064677e3625`).
+    /// When enabled the kernel attaches a `SOL_SOCKET / SO_RXQ_OVFL`
+    /// `cmsg` to every received packet carrying a 32-bit running
+    /// counter of how many datagrams were dropped because the
+    /// per-socket receive buffer was full.
+    ///
+    /// On non-Linux platforms this is a no-op success — the kernel
+    /// has no equivalent counter, so callers don't need to gate on
+    /// `cfg(target_os = "linux")` themselves.
+    ///
+    /// Pair with [`AsyncUdpV4::recv_from_with_drop_count`] to surface
+    /// the counter value.
+    pub fn enable_so_rxq_ovfl(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            for nic in &self.sockets {
+                let fd = nic.sock.as_raw_fd();
+                let val: libc::c_int = 1;
+                // SAFETY: fd is owned by the tokio UdpSocket for the
+                // lifetime of `nic`; setsockopt on a non-blocking UDP
+                // socket is sound.
+                let r = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RXQ_OVFL,
+                        &val as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&val) as libc::socklen_t,
+                    )
+                };
+                if r != 0 {
+                    let err = io::Error::last_os_error();
+                    tracing::debug!(
+                        target: "epics_base_rs::net",
+                        iface_ip = %nic.iface_ip,
+                        error = %err,
+                        "enable_so_rxq_ovfl failed"
+                    );
+                }
+            }
+        }
+        let _ = self;
+        Ok(())
+    }
+
+    /// Receive one datagram and return the kernel's current
+    /// `SO_RXQ_OVFL` drop counter alongside the usual `(size, src)`
+    /// tuple. Caller is responsible for tracking deltas — the counter
+    /// is a monotonically-increasing running total since the socket
+    /// was opened (or since the option was enabled).
+    ///
+    /// On non-Linux platforms or when [`Self::enable_so_rxq_ovfl`]
+    /// was never called, returns `drop_count = 0`. Callers should
+    /// log only on transitions (`prev != current && current != 0`)
+    /// to avoid spamming on every ordinary packet.
+    ///
+    /// This receives on the FIRST NIC's socket only — designed for
+    /// the single-binding cases (e.g. PVA UDP collector). The
+    /// multi-NIC `recv_with_meta` path uses `tokio::select!` across
+    /// every NIC and would need its own per-NIC drop tracking; that
+    /// integration is intentionally deferred.
+    pub async fn recv_from_with_drop_count(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, u32)> {
+        let nic = self
+            .sockets
+            .first()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no NIC sockets"))?;
+        recv_from_with_drop_count_one(&nic.sock, buf).await
+    }
+}
+
+/// Per-socket recv that surfaces the `SO_RXQ_OVFL` cmsg value on
+/// Linux. On other platforms this is a thin wrapper over
+/// `tokio::net::UdpSocket::recv_from` returning `drop_count = 0`.
+#[cfg(target_os = "linux")]
+async fn recv_from_with_drop_count_one(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, u32)> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        sock.readable().await?;
+        let raw_fd = sock.as_raw_fd();
+
+        // try_io: drives one non-blocking recvmsg and yields the
+        // result. `Err(WouldBlock)` from the closure tells tokio to
+        // re-register and resume waiting on the next readable.
+        let res = sock.try_io(tokio::io::Interest::READABLE, || {
+            // SAFETY: the iovec / msghdr / cmsghdr scaffolding is
+            // local to this closure and does not outlive recvmsg.
+            // The destination buffers are borrowed for the duration
+            // of the call.
+            unsafe {
+                let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+                let mut iov = libc::iovec {
+                    iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: buf.len(),
+                };
+                // CMSG_SPACE(4) padded for alignment — one 32-bit
+                // SO_RXQ_OVFL value is the only ancillary we ask for.
+                let mut cbuf = [0u8; 64];
+                let mut msg: libc::msghdr = std::mem::zeroed();
+                msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
+                msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+                msg.msg_controllen = cbuf.len() as _;
+
+                let n = libc::recvmsg(raw_fd, &mut msg, 0);
+                if n < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // Decode the source address.
+                let src = sockaddr_storage_to_socketaddr(&storage, msg.msg_namelen)?;
+
+                // Walk the cmsg list for SOL_SOCKET / SO_RXQ_OVFL.
+                let mut drops: u32 = 0;
+                let mut cmsg_ptr = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg_ptr.is_null() {
+                    let cmsg = &*cmsg_ptr;
+                    if cmsg.cmsg_level == libc::SOL_SOCKET
+                        && cmsg.cmsg_type == libc::SO_RXQ_OVFL
+                        && cmsg.cmsg_len as usize
+                            >= libc::CMSG_LEN(std::mem::size_of::<u32>() as u32) as usize
+                    {
+                        let data_ptr = libc::CMSG_DATA(cmsg_ptr) as *const u32;
+                        drops = std::ptr::read_unaligned(data_ptr);
+                    }
+                    cmsg_ptr = libc::CMSG_NXTHDR(&msg, cmsg_ptr);
+                }
+
+                Ok((n as usize, src, drops))
+            }
+        });
+
+        match res {
+            Ok(out) => return out,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn recv_from_with_drop_count_one(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, u32)> {
+    let (n, src) = sock.recv_from(buf).await?;
+    Ok((n, src, 0))
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn sockaddr_storage_to_socketaddr(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> io::Result<SocketAddr> {
+    use std::net::Ipv6Addr;
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            if (len as usize) < std::mem::size_of::<libc::sockaddr_in>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "AF_INET sockaddr too short",
+                ));
+            }
+            let sa = &*(storage as *const _ as *const libc::sockaddr_in);
+            let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+            let port = u16::from_be(sa.sin_port);
+            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        }
+        libc::AF_INET6 => {
+            if (len as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "AF_INET6 sockaddr too short",
+                ));
+            }
+            let sa = &*(storage as *const _ as *const libc::sockaddr_in6);
+            let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
+            let port = u16::from_be(sa.sin6_port);
+            Ok(SocketAddr::new(ip.into(), port))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported sockaddr family",
+        )),
+    }
+}
+
+impl AsyncUdpV4 {
     /// Join a multicast group on every up, non-loopback NIC. Errors
     /// per-NIC are logged at `debug` and not propagated unless every
     /// join fails.
@@ -829,5 +1027,57 @@ mod tests {
             Ipv4Addr::UNSPECIFIED,
             Ipv4Addr::new(8, 8, 8, 8)
         ));
+    }
+
+    /// pvxs `a064677e3625` parity: `enable_so_rxq_ovfl` must be a
+    /// no-op success on every platform — Linux opts the kernel into
+    /// the SO_RXQ_OVFL counter, non-Linux returns Ok with no
+    /// behaviour change.
+    #[tokio::test]
+    async fn enable_so_rxq_ovfl_is_no_op_success_off_linux() {
+        let sock = AsyncUdpV4::bind(0, false).expect("bind");
+        sock.enable_so_rxq_ovfl()
+            .expect("enable_so_rxq_ovfl must succeed on every platform");
+    }
+
+    /// `recv_from_with_drop_count` returns `drop_count = 0` on a
+    /// freshly-bound socket whose receive buffer never overflowed.
+    /// The src/n payload must round-trip through the recvmsg path
+    /// identically to `recv_from`.
+    #[tokio::test]
+    async fn recv_from_with_drop_count_returns_zero_under_normal_load() {
+        let server = AsyncUdpV4::bind(0, false).expect("server bind");
+        server.enable_so_rxq_ovfl().expect("enable counter");
+        let server_port = server.sockets[0]
+            .sock
+            .local_addr()
+            .expect("local_addr")
+            .port();
+
+        let client = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("client bind");
+        let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port));
+        let payload = b"hello-rxq-ovfl";
+        client.send_to(payload, dest).await.expect("send");
+
+        let mut buf = [0u8; 64];
+        let (n, src, drops) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.recv_from_with_drop_count(&mut buf),
+        )
+        .await
+        .expect("recv timeout")
+        .expect("recv ok");
+        assert_eq!(n, payload.len(), "byte count must match");
+        assert_eq!(&buf[..n], payload, "payload must round-trip");
+        assert!(
+            src.port() != 0,
+            "src port must be the client's ephemeral port, got {src:?}"
+        );
+        assert_eq!(
+            drops, 0,
+            "freshly-bound socket must report 0 drops; got {drops}"
+        );
     }
 }

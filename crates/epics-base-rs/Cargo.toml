@@ -24,6 +24,13 @@ rustyline = "14"
 if-addrs = "0.13"
 serde_json = { version = "1", features = ["preserve_order"] }
 
+# Linux-only: `SO_RXQ_OVFL` setsockopt + `recvmsg`/cmsg parsing for
+# UDP RX overflow detection (`net::async_udp_v4::recv_from_with_drop_count`).
+# Cargo `target.'cfg(target_os = "linux")'` only links libc on Linux —
+# macOS / Windows builds skip it entirely.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # Dev-only — `path` (no `version`) so `cargo publish` strips this
 # from the uploaded manifest. Lets `epics-base-rs` publish first in
 # the dependency chain without `epics-ca-rs` already being on crates.io.

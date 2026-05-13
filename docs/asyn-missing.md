@@ -43,9 +43,21 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 ## 4. 기타 아키텍처 및 유틸리티
 
 *   **PVI (PVInterface) 지원**: 트리 구조의 파라미터 토폴로지 지원. (PR #117)
-*   **`asynParamSet`**: 대규모 파라미터를 다룰 때 파라미터 집합을 논리적으로 관리하고 검색하기 위한 클래스. (PR #117)
+*   **`asynParamSet`**: 대규모 파라미터를 다룰 때 파라미터를 논리적으로 그룹화하여 관리하고 검색하기 위한 클래스. (PR #117)
 *   **`getLimits` 인터페이스**: 파라미터의 타입뿐만 아니라 설정 가능한 최소/최대 한계값을 드라이버에 질의하는 기능. (Issue #218)
 
+## 5. 2019년 이전 레거시 주요 기능 중 누락 사항
+
+2019년 이전에 추가된 `asyn`의 핵심 기능 중 현재 `epics-rs` 코드 주석이나 구현체에서 명시적으로 "미구현(not yet wired)" 상태로 확인되거나 누락된 항목들입니다.
+
+*   **UDP 서버 소켓 (`drvAsynIPServerPort` UDP 모드)**: 
+    *   TCP 서버는 구현되어 있으나, `ip_server_port.rs` 소스 코드 주석에 `UDP server mode is not yet wired`라고 명시되어 있어 현재 UDP 서버 소켓 기능이 누락된 상태입니다.
+*   **콜백 데이터 유실 방지를 위한 `asyn:FIFO` Info Tag (Ring Buffer)**:
+    *   2015년경 추가된 기능으로, 인터럽트 발생 속도가 EPICS 레코드 처리 속도보다 빠를 때 발생하는 데이터(특히 String 및 Waveform/Array 배열) 유실을 막기 위해 레코드 단에 Ring Buffer 큐를 생성하는 기능입니다. 현재 `epics-rs`의 `asyn_record.rs` 어댑터 계층에 해당 Info Tag 파싱 및 버퍼링 로직이 누락되어 있습니다.
+
 ---
-### 요약
-`epics-rs/crates/asyn-rs`는 단순한 포팅을 넘어 C++ 버전의 고질적 버그와 최신 요구사항(TCP 비동기, RS485 등)을 이미 매우 높은 수준으로 선제 반영하고 있습니다. 앞으로 구현해야 할 주요 마일스톤은 **계측기 전용 프로토콜(USBTMC, VXI-11)의 추가**와 **최신 레코드 타입(aai/aao/lsi) 및 Readback 동기화 로직의 어댑터 계층 구현**입니다.
+### 종합 요약
+`epics-rs/crates/asyn-rs`는 단순한 포팅을 넘어 C++ 버전의 고질적 버그와 최신 요구사항(TCP 비동기 커넥션, RS485 지원, SO_REUSEPORT 등)을 이미 매우 높은 수준으로 선제 반영하고 있습니다. 앞으로 구현해야 할 주요 마일스톤은 다음과 같습니다.
+1. **계측기 전용 프로토콜(USBTMC, VXI-11, HiSLIP) 추가**
+2. **최신 레코드 타입(aai/aao/lsi) 및 Readback/초기값 동기화 로직의 어댑터 계층 구현**
+3. **UDP 서버 소켓 및 `asyn:FIFO` 링 버퍼 등 남은 미구현 레거시 보완**

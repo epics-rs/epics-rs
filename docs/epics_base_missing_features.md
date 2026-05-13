@@ -288,12 +288,12 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 - **`subArray` 레코드 개선 및 소프트 디바이스 지원** (`d1af6637`, 2017) — ⏭️ **ALREADY** (commit `a02c310` + cycle 1): `WaveformRecord` 가 SubArray kind 지원, INDX/MALM 슬라이싱 + 빈 source / partial tail / MALM cap 모두 처리.
 - **`int64in`/`int64out` 레코드의 모니터 델타 버그 수정** (`3091f7c5`, 2021) — ⏭️ **ALREADY**: int64in/out도 deadband 검사가 `check_deadband_ext` 공통 코드 — i64 → f64 변환 후 분기. 64bit/32bit 분기 자체가 부재.
-- **`PUTF`를 통해 `DB_LINK` 및 `RPRO` 비동기 전파** (`a4fcd229`, 2018) — ⏭️ **ALREADY**: `processing.rs::dispatch_cp_targets` 가 PUTF + RPRO를 target에 전파, async-pending 시 RPRO 셋팅 + complete_async에서 reprocess. PR #3fb10b6 follow-up도 적용.
-- **`dbCa` CP 링크 업데이트 시 `PUTF`/`RPRO` 설정** (`a4bc0db6`, 2024) — ⏭️ **ALREADY**: 위 항목과 동일 — `dispatch_cp_targets` 가 dbCa-driven 경로 등가 처리.
+- **`PUTF`를 통해 `DB_LINK` 및 `RPRO` 비동기 전파** (`a4fcd229`, 2018) — 🔄 **PARTIAL (verified)**: `processing.rs::dispatch_cp_targets` 가 RPRO만 전파 (`tg.common.rpro = true` L1472). PUTF는 PR #3fb10b6 fix로 의도적으로 CP target에 전파 안 함 (CP-driven targets must keep PUTF=false). DB_LINK OUT-driven 경로 (write_db_link_value)에서의 PUTF forward는 미구현. 현재 사용 사례에서는 RPRO 전파만으로 충분하나, OUT-link PUTF 전파가 필요한 사용 사례 등장 시 별도 PR.
+- **`dbCa` CP 링크 업데이트 시 `PUTF`/`RPRO` 설정** (`a4bc0db6`, 2024) — 🔄 **PARTIAL (verified)**: 위 항목과 동일 — RPRO만 전파, PUTF는 의도적 보류.
 - **`scanOnceCallback()` 완료 콜백 지원** (`2ba2b90b`/`bbbf0541`, 2015) — ⏭️ **ALREADY**: tokio `JoinHandle::await` 또는 `oneshot::channel` 패턴으로 등가. `process_record_with_links` 자체가 await 가능.
-- **`dbScan`: I/O Intr 목록 직접 스캔 지원** (`7d50f62a`, 2015) — ⏭️ **ALREADY**: `scan_index.rs::IoIntrIndex` 가 set/list 양쪽 view 노출.
+- **`dbScan`: I/O Intr 목록 직접 스캔 지원** (`7d50f62a`, 2015) — ⏭️ **ALREADY (different mechanism)**: 별도 `IoIntrIndex` 자료구조 없음. `ioc_app.rs::setup_io_intr` (L629)가 모든 record를 walk하면서 `ScanType::IoIntr` 인 것만 picked, 각 record의 `io_intr_receiver()`로부터 device-driven push event를 받아 process_record 호출. C 의 직접 list iter 등가는 record map walk + scan filter로 달성.
 - **`dbCa`: 가변 길이 배열 구독** (`b2716f0a`, 2015) — ⏭️ **ALREADY**: CA 링크 monitor가 NORD 변화 시 `count` 자동 조정. count=0 semantic도 처리.
-- **`aSub` 레코드 INAM 변경 시 출력 처리** (`2af98c33`, 2017) — ⏭️ **ALREADY**: `asub_record.rs::put_field("INAM")` 가 subroutine registry 재조회 + 다음 process cycle에 새 INAM 사용.
+- **`aSub` 레코드 INAM 변경 시 출력 처리** (`2af98c33`, 2017) — ⏸️ **DEFERRED (verified gap)**: `asub_record.rs::put_field("INAM")` (L681) 가 단순히 `self.inam = s` 만 수행, subroutine registry 재조회 + init function 재호출은 미구현. 현재 사용 사례에서 runtime INAM 변경이 드물어 미구현 — 필요 시 별도 PR.
 - **`aSub` 레코드의 올바른 데이터 복사량** (`52787995`, 2017) — ⚠️ **N/A (eliminated)**: aSub 데이터 복사는 `Vec::clone()` — 길이 자동 매치, off-by-one 불가.
 - **`asTrapWrite`에 Put 데이터 제공** (`c5ded306`, 2015) — ⏭️ **ALREADY (different mechanism)**: `epics_ca_rs::audit::AuditLogger` 가 PV name + user + host + method + value를 JSON 기록 — asTrapWrite 등가 확장 정보 모두 포함.
 - **`xRecord` 디바이스 지원** (`b9cbf7a3`, 2015): 모든 타입의 디바이스를 연결할 수 있는 범용 `xRecord`.
@@ -306,7 +306,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`lnkCalc` 링크 타입의 타임스탬프 지원** (`e3c9d590`/`20404003`, 2017/2018) — ✅ **DONE** (this session): 신규 `ParsedLink::Calc(CalcLink { expr, args, time_source })` variant + serde_json 기반 파서 (`{calc:{expr:"...",args:[...],time:"A"}}`). `read_link_value_soft` + `read_link_value` 양쪽 경로에 calc 평가 분기 추가. `evaluate_calc_link` 가 다중 input PV fetch → calc engine A..L 바인딩 → eval. `evaluate_calc_link_with_time` 가 `time_source` letter ('A'..='L') 가 가리키는 input record의 `common.time` 반환. 회귀 테스트 `test_lnk_calc_parses_evaluates_and_passes_timestamp` (parse + 12-input cap + read-path eval + timestamp passthrough).
 - **`dbLink`의 필드 타입을 `DOUBLE`로 반환** (`9813fa64`, 2015) — ⏭️ **ALREADY**: `read_link_value_soft` 가 source의 native type 반환, caller가 `to_f64()` 또는 `convert_to(target_type)` 명시.
 - **링크 필드의 긴 문자열 버퍼 크기 확장** (`19447dc7`, 2016) — ⚠️ **N/A (eliminated)**: INP/OUT 은 `String` (동적 길이) — 128-byte fixed buffer 한계 없음.
-- **`dbPutStringNum("", ...)` 을 오류로 처리하지 않음** (`0821c8c4`, 2016) — ⏭️ **ALREADY**: `EpicsValue::String("")` to numeric coerce는 `parse_string_to_f64` 가 빈 문자열을 0으로 처리, NaN/Err로 분기.
+- **`dbPutStringNum("", ...)` 을 오류로 처리하지 않음** (`0821c8c4`, 2016) — ⚠️ **N/A (semantic diff)**: `parse_string_to_f64` (`types/value.rs:754`) 가 빈 문자열을 `None` 으로 반환 → caller (put_field) 가 `Err` 반환. 12cfd41 "empty array → Err" 와 동일한 fail-fast 정책. C 0821c8c4 는 "silently accept and use default" — 우리는 의도적으로 stricter (silent garbage 대신 명시적 거절).
 - **`dbLinkDoLocked()` 지원** (`d2db634e`, 2017) — ⏭️ **ALREADY**: 모든 link 작업이 record write lock 안에서 수행. `dbLinkDoLocked` 등가는 자동.
 - **`iocshFindCommand()` API** (`9d7c4434`, 2017) — ⏭️ **ALREADY**: `iocsh/registry.rs::CommandRegistry` 가 `HashMap<String, Box<dyn CommandFn>>` — `commands.get(name)` 으로 조회.
 - **`dbRecordsAbcSorted`: 알파벳 순 레코드 목록** (`a32faa57`, 2016) — ⏭️ **ALREADY**: iocsh `dbl` 가 records를 sort 해서 출력 (`commands.rs::cmd_dbl`).
@@ -319,13 +319,13 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 > 본 세션 일괄: **⏸️ DEFERRED** (단, `dbServerStats`는 🔄 PARTIAL `ac92e3e` — 섹션 2 참조).
 
-- **iocsh 스크립트 include 시 echo 비활성화 옵션** (`0fd07d16`, 2016) — ⏭️ **ALREADY**: `IocShell::execute_script` 가 echo emit 안 함. echo enable이 별도 옵션 — 기본 silent.
+- **iocsh 스크립트 include 시 echo 비활성화 옵션** (`0fd07d16`, 2016) — 🔄 **PARTIAL (verified)**: `IocShell::execute_script` (L177) 가 매 라인마다 `println!("{line}")` 로 echo (C 기본 동작과 동일). C 0fd07d16 이 추가한 "no-echo" 옵트아웃은 미구현 — 환경변수 또는 `IocShell` 옵션으로 추가 가능.
 - **`dbStopServers()` 를 `iocShutdown()`에 포함** (`a9393242`, 2017) — ⏭️ **ALREADY**: SIGTERM/SIGINT 핸들러가 모든 spawn된 task drop 시 CA/PVA server task 자동 cleanup.
 - **`readline`을 `epicsExit()`에서 정리** (`444b89f5`, 2015) — ⏭️ **ALREADY**: rustyline `Editor::drop` 자동 cleanup.
 - **`EPICS_TZ` 환경 변수로 표준화** (`b0db6568`, 2019) — ⚠️ **N/A**: 원 commit은 RTEMS `rtems_init()`에서 `EPICS_TIMEZONE` 대신 `EPICS_TZ`를 읽도록 변경. Rust는 RTEMS 비대상 + `chrono::Local` 등이 OS POSIX `TZ` 환경변수를 자동 사용하므로 EPICS-namespaced timezone env var를 별도로 다룰 진입점이 없음.
 - **`generalTime`의 이벤트 번호 >= 256 지원** (`215c5d95`, 2018) — ⏭️ **ALREADY**: `runtime::general_time::get_event(i32)` 가 i32 받아 256+ 코드 지원.
 - **`osiClockTime` 동기화 훅 지원** (`5cfff383`, 2019) — ✅ **DONE** (this session): `runtime::general_time::register_clock_sync_hook(F)` + `notify_clock_sync(t)` API 추가. 시간 소스 (PTP/NTP/GPS PPS) 가 fresh sync 받았을 때 등록된 콜백을 registration order 로 발화. ratchet semantic은 영향 없음 — pure notification channel. 회귀 테스트 `sync_hooks_fire_in_registration_order`.
-- **`epicsTime` UTC `struct tm` 전체 변환** (`37024011`, 2016) — ⏭️ **ALREADY**: `chrono::DateTime<Utc>` 사용 — UTC ↔ struct tm 자동.
+- **`epicsTime` UTC `struct tm` 전체 변환** (`37024011`, 2016) — ⚠️ **N/A (eliminated)**: epics-rs는 C `struct tm` API를 노출하지 않음. 시간 표현은 `std::time::SystemTime` (epoch ns 정밀도) — call site 가 필요 시 `chrono` crate (Cargo.toml에 dep으로 등록)을 사용해 `DateTime<Utc>` 변환. C 의 timezone-aware struct tm 변환 버그가 발생할 수 있는 surface 자체가 부재.
 - **`envGetBoolConfigParam` 함수** (`f837add8`, 2016) — ⏭️ **ALREADY**: `runtime::env::get_bool` 구현.
 - **`iocsh`에 등록된 변수/함수 목록 조회 API** (`daad3c69`, 2016) — ⏭️ **ALREADY**: `CommandRegistry` enumeration + auto `help` 명령.
 - **`dbServerStats()` API** (`bcc6cb96`/`350570134`, 2025, PR #592) — ✅ **DONE**: 섹션 2 동일 (commit `ac92e3e`).

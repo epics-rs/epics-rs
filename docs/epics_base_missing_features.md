@@ -102,7 +102,7 @@
 - **`bi` / `bo` 변환(Conversion) 로직 누락 (PR #775)** — ⏸️ DEFERRED.
 - **상수 링크(Constant Link)의 오프셋 계산 버그 대조 (PR #467)** — ⏸️ DEFERRED.
 - **사용되지 않는 `INPx` 링크 파손 시 `calc` 레코드 중단 문제 (Issue #823)** — ⏸️ DEFERRED.
-- **`mbboDirect`의 `B0..BF` 필드 ASL0 권한 조정 (PR #439)** — ⏸️ DEFERRED.
+- **`mbboDirect`의 `B0..BF` 필드 ASL0 권한 조정 (PR #439)** — ⚠️ **N/A (design diff)**: 원PR은 `.dbd`의 `prompt(...)` ASL1 marker를 ASL0으로 바꿔 ACF 권한 게이트를 완화. epics-rs `FieldDesc`는 per-field ASL을 surface하지 않으며(필드 단위 ACF gating 미구현), 접근 제어는 `compute_access`/`AuditLogger` 경유 record-level + auth_method/authority 기반. 동등한 변경 지점이 없음.
 - **`dbLoadRecords` 매크로 기본값 의미론 불일치 (PR #463)** — ⏸️ DEFERRED.
 - **DB 파서의 알 수 없는 필드명 힌트 제공 (PR #434)** — ⏭️ ALREADY: round 23의 dbpf typo suggestion이 부분적으로 동일 기능 제공.
 - **aSub 레코드의 상수 `INP*` 허용 여부 (Issue #284)** — ⏸️ DEFERRED.

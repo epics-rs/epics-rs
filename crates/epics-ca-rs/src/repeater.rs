@@ -61,9 +61,30 @@ impl RepeaterClient {
     }
 }
 
-/// Run the CA repeater daemon.
-/// Binds to UDP 5065, accepts client registrations, and fans out beacons.
+/// Run the CA repeater daemon. Equivalent to
+/// `run_repeater_with_debug(0)`.
 pub async fn run_repeater() -> io::Result<()> {
+    run_repeater_with_debug(0).await
+}
+
+/// Run the CA repeater daemon with an explicit debug level.
+///
+/// Mirrors epics-base PR #831 (commit `e2717521` "Added -d option
+/// to caRepeater, sets debug level"):
+/// - level 0: silent (default)
+/// - level 1: print "New client", "Verified N active clients",
+///   "Client refused message", "Deleted client" — high-level
+///   client lifecycle.
+/// - level 2: also print per-beacon "Sent to port N" and per-client
+///   "Client on port N is alive" verification.
+///
+/// Output goes to stderr to match the C repeater's `fprintf(stderr, …)`.
+/// `ca-repeater-rs -v` keeps stderr connected so the messages reach
+/// the operator; without `-v` stderr is `dup2`'d to `/dev/null` and
+/// the messages are discarded (also matches C behaviour).
+///
+/// Binds to UDP 5065, accepts client registrations, and fans out beacons.
+pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     // libcom commits 19146a5 + 5064931 + 65ef6e9: SO_REUSEADDR is POSIX-only
@@ -106,6 +127,10 @@ pub async fn run_repeater() -> io::Result<()> {
         );
     }
 
+    if debug > 0 {
+        eprintln!("CA Repeater: Attached and initialized");
+    }
+
     let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
     let mut buf = [0u8; 4096];
     let mut prev_drops: u32 = 0;
@@ -126,7 +151,7 @@ pub async fn run_repeater() -> io::Result<()> {
         // C CA clients send a zero-length UDP packet for repeater
         // registration (backward compat with pre-3.12 repeaters).
         if len == 0 {
-            register_client(&mut clients, src);
+            register_client_debug(&mut clients, src, debug);
             continue;
         }
 
@@ -140,7 +165,7 @@ pub async fn run_repeater() -> io::Result<()> {
 
         match hdr.cmmd {
             CA_PROTO_REPEATER_REGISTER => {
-                register_client(&mut clients, src);
+                register_client_debug(&mut clients, src, debug);
             }
             _ => {
                 // Beacon or other message from server — fan out to all
@@ -170,13 +195,26 @@ pub async fn run_repeater() -> io::Result<()> {
                         continue;
                     }
                     if !client.send_message(&data) {
+                        if debug >= 1 {
+                            eprintln!("Client on port {port} refused message");
+                        }
                         if !client.verify() {
                             dead.push(*port);
+                        } else if debug >= 2 {
+                            eprintln!("Client on port {port} is alive");
                         }
+                    } else if debug >= 2 {
+                        eprintln!("Sent to port {port}");
                     }
                 }
                 for p in dead {
+                    if debug >= 1 {
+                        eprintln!("Deleted client on port {p}");
+                    }
                     clients.remove(&p);
+                }
+                if debug >= 1 {
+                    eprintln!("Verified {} active clients", clients.len());
                 }
             }
         }
@@ -217,6 +255,16 @@ fn join_beacon_multicast_groups(sock: &socket2::Socket) {
 /// handful of caget/caput) but small enough to bound memory if
 /// abused. C `caRepeater.c` has no cap; we choose to be stricter.
 const MAX_REPEATER_CLIENTS: usize = 1024;
+
+fn register_client_debug(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, debug: u8) {
+    let port = src.port();
+    let was_registered = clients.contains_key(&port);
+    register_client(clients, src);
+    if !was_registered && debug >= 1 && clients.contains_key(&port) {
+        eprintln!("New client on port {port}");
+        eprintln!("Verified {} active clients", clients.len());
+    }
+}
 
 fn register_client(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr) {
     let port = src.port();

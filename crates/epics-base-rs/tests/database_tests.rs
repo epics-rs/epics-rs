@@ -2211,3 +2211,91 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
         "DESC stable after the change → no further events"
     );
 }
+
+/// Regression: `put_pv_and_post_with_origin` (and the no-origin
+/// alias used by the CA gateway monitor forwarder) writes only the
+/// explicitly-named field to subscribers. For array-family records
+/// (waveform/aai/aao/subArray) a put to VAL implicitly updates NORD
+/// via the record's `put_field("VAL", …)` side-effect, but the
+/// pre-fix code never told NORD subscribers about the new length.
+/// Result: a CA gateway forwarding upstream waveform monitors
+/// updated VAL on the shadow PV but left downstream NORD subscribers
+/// stuck at their last seen length — frozen-element-count bug
+/// observable in PyDM image views computing height from element
+/// count.
+///
+/// The fix snapshots NORD before and after the put and, when changed,
+/// posts a NORD event with the same fresh timestamp as the VAL event.
+/// This test pins the behaviour for waveform; the same code path
+/// applies to aai/aao/subArray since they share the WaveformRecord
+/// implementation.
+#[tokio::test]
+async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::waveform::{ArrayKind, WaveformRecord};
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record(
+        "WF_GW",
+        Box::new(WaveformRecord::with_kind(ArrayKind::Waveform)),
+    )
+    .await
+    .unwrap();
+    if let Some(rec) = db.get_record("WF_GW").await {
+        let mut inst = rec.write().await;
+        inst.record.put_field("NELM", EpicsValue::Long(10)).unwrap();
+        inst.record
+            .put_field("FTVL", EpicsValue::Short(10))
+            .unwrap();
+    }
+
+    // Subscribe to NORD and VAL separately. add_subscriber seeds
+    // last_posted with current values (NORD=0, VAL=empty array) so
+    // the next change is treated as new.
+    let (mut nord_rx, mut val_rx) = if let Some(rec) = db.get_record("WF_GW").await {
+        let mut inst = rec.write().await;
+        let n = inst.add_subscriber("NORD", 1, DbFieldType::Long, EventMask::VALUE.bits());
+        let v = inst.add_subscriber("VAL", 2, DbFieldType::Double, EventMask::VALUE.bits());
+        (n, v)
+    } else {
+        (None, None)
+    };
+    let nord_rx = nord_rx.as_mut().expect("NORD subscription accepted");
+    let val_rx = val_rx.as_mut().expect("VAL subscription accepted");
+
+    // Drive the gateway-style put: VAL update via put_pv_and_post,
+    // no record processing. NORD must be reported alongside.
+    db.put_pv_and_post("WF_GW", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
+        .await
+        .unwrap();
+
+    let val_event = val_rx
+        .try_recv()
+        .expect("VAL event must be delivered after put_pv_and_post");
+    let nord_event = nord_rx
+        .try_recv()
+        .expect("NORD event must be delivered after put_pv_and_post (side-effect of VAL)");
+    assert!(
+        matches!(nord_event.snapshot.value, EpicsValue::Long(4)),
+        "NORD event should reflect post-put length (4), got {:?}",
+        nord_event.snapshot.value
+    );
+    // VAL and NORD events must carry the SAME timestamp — both
+    // observed the put within one critical section so they reflect
+    // the same wall-clock snapshot.
+    assert_eq!(
+        val_event.snapshot.timestamp, nord_event.snapshot.timestamp,
+        "VAL and NORD side-effect events must share the put's timestamp"
+    );
+
+    // No-op re-put with the same array: NORD didn't change, so no
+    // duplicate NORD event.
+    db.put_pv_and_post("WF_GW", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0]))
+        .await
+        .unwrap();
+    assert!(
+        nord_rx.try_recv().is_err(),
+        "NORD unchanged → no duplicate NORD event"
+    );
+}

@@ -237,6 +237,16 @@ impl PvDatabase {
             let old_value = instance.record.get_field(&field);
             let old_stat = instance.common.stat;
             let old_sevr = instance.common.sevr;
+            // Snapshot side-effect-prone fields BEFORE the put. The
+            // array-family records (waveform/aai/aao/subArray) update
+            // NORD as a side-effect of put_field("VAL"); other record
+            // types return None for "NORD" and the comparison reduces
+            // to None==None → unchanged.
+            let old_nord = if field == "VAL" {
+                instance.record.get_field("NORD")
+            } else {
+                None
+            };
 
             // Write value + special/on_put
             match instance.record.put_field(&field, value.clone()) {
@@ -268,17 +278,41 @@ impl PvDatabase {
             let value_changed = old_value != new_value;
             let alarm_changed =
                 old_stat != instance.common.stat || old_sevr != instance.common.sevr;
-            if value_changed || alarm_changed {
+            let new_nord = if field == "VAL" {
+                instance.record.get_field("NORD")
+            } else {
+                None
+            };
+            let nord_changed = field == "VAL" && old_nord != new_nord && new_nord.is_some();
+            if value_changed || alarm_changed || nord_changed {
                 // Update timestamp so the snapshot carries current time
                 instance.common.time = crate::runtime::general_time::get_current();
                 instance.cleanup_subscribers();
-                instance.notify_field_with_origin(
-                    &field,
-                    crate::server::recgbl::EventMask::VALUE
-                        | crate::server::recgbl::EventMask::LOG
-                        | crate::server::recgbl::EventMask::ALARM,
-                    origin,
-                );
+                if value_changed || alarm_changed {
+                    instance.notify_field_with_origin(
+                        &field,
+                        crate::server::recgbl::EventMask::VALUE
+                            | crate::server::recgbl::EventMask::LOG
+                            | crate::server::recgbl::EventMask::ALARM,
+                        origin,
+                    );
+                }
+                // Surface the implicit NORD update to NORD subscribers
+                // for waveform/aai/aao/subArray. Without this, a CA
+                // gateway forwarding upstream waveform monitors via
+                // put_pv_and_post would update VAL on the shadow PV
+                // but leave downstream NORD subscribers stuck at their
+                // last seen length — a frozen-element-count bug that
+                // surfaces in PyDM image views and similar consumers
+                // that compute height = element_count / width.
+                if nord_changed {
+                    instance.notify_field_with_origin(
+                        "NORD",
+                        crate::server::recgbl::EventMask::VALUE
+                            | crate::server::recgbl::EventMask::LOG,
+                        origin,
+                    );
+                }
             }
 
             return Ok(());

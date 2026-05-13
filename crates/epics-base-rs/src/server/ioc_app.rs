@@ -507,7 +507,47 @@ impl IocApplication {
             shell_commands,
             after_init_hooks,
         };
-        protocol_runner(config).await
+
+        // epics-base PR #671 parity: race the protocol runner against
+        // SIGTERM/SIGINT so a `kill` (or Ctrl+C on the controlling
+        // terminal) cleanly returns Ok(()) instead of leaving the
+        // future suspended forever. The CA/PVA runners already wire
+        // their own signal handlers when used standalone; this one
+        // covers the `IocApplication::run` entry point where the
+        // runner closure may not (e.g., a custom user runner that
+        // only sleeps on `pending()`).
+        let runner_fut = protocol_runner(config);
+        tokio::pin!(runner_fut);
+        let ctrl_c = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        #[cfg(unix)]
+        let sigterm = async {
+            if let Ok(mut sig) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                let _ = sig.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        #[cfg(not(unix))]
+        let sigterm = std::future::pending::<()>();
+
+        tokio::select! {
+            biased;
+            // Runner takes priority: if it completes naturally
+            // before any signal arrives, propagate its result.
+            res = &mut runner_fut => res,
+            _ = ctrl_c => {
+                tracing::info!(target: "epics_base_rs::ioc_app", "SIGINT received, shutting down IOC");
+                Ok(())
+            }
+            _ = sigterm => {
+                tracing::info!(target: "epics_base_rs::ioc_app", "SIGTERM received, shutting down IOC");
+                Ok(())
+            }
+        }
     }
 }
 

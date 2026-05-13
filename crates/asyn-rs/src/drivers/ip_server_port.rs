@@ -25,9 +25,25 @@
 //! connection closes, the slot is freed and reusable. Reads/writes
 //! address a slot via [`crate::user::AsynUser::addr`]. The `addr=-1`
 //! sentinel (broadcast) writes to every connected client.
+//!
+//! # UDP server mode (C-asyn `drvAsynSerial/drvAsynIPServerPort.c`)
+//!
+//! With protocol `Udp`, the server binds a UDP socket and a worker
+//! thread loops `recv` (the source address is intentionally
+//! discarded — C asyn calls `recvfrom(fd, buf, size, 0, NULL, NULL)`
+//! at line 311) into a single shared buffer. `read_octet` drains the
+//! buffer non-blocking — when the buffer is empty it returns `0`
+//! bytes immediately rather than blocking, mirroring the C "if
+//! `(UDPbufferPos == 0) && (UDPbufferSize == 0)` then sleep 1ms,
+//! return 0" pattern (line 190). `write_octet` always errors —
+//! `writeIt` in C is a one-line `return asynError;` (line 251).
+//! There is no per-peer slot table; UDP server is a port-wide
+//! "what arrived last on the socket" cache.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,22 +59,45 @@ use crate::user::AsynUser;
 /// modern IOC hosts. Tunable per-port via [`IpServerConfig::max_clients`].
 pub const DEFAULT_MAX_CLIENTS: usize = 64;
 
+/// IPv4 datagram payload cap from C asyn `THEORETICAL_UDP_MAX_SIZE`
+/// (line 83 of drvAsynIPServerPort.c). 65507 = 65535 minus IPv4
+/// header (20) and UDP header (8). Matches the largest datagram the
+/// kernel will hand us in one `recvfrom`.
+pub const UDP_MAX_DATAGRAM: usize = 65507;
+
+/// Server-mode transport protocol — TCP (multi-client slot table)
+/// or UDP (single shared cache, no per-peer state). Matches the
+/// `socketType` field branch in C asyn drvAsynIPServerPort.c
+/// (`SOCK_STREAM` vs `SOCK_DGRAM`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpServerProtocol {
+    #[default]
+    Tcp,
+    /// UDP receiver. C asyn calls `recvfrom(fd, buf, size, 0, NULL,
+    /// NULL)` — **source address discarded** — into a single shared
+    /// buffer. `read_octet` drains; `write_octet` is a no-op error.
+    Udp,
+}
+
 /// Configuration parsed from a `drvAsynIPServerPortConfigure`-style spec.
 #[derive(Debug, Clone)]
 pub struct IpServerConfig {
     /// Bind address (`0.0.0.0` to accept on every interface, or a
     /// specific NIC IP / `127.0.0.1` for loopback-only).
     pub bind_host: String,
-    /// Bind TCP port. `0` requests an OS-assigned ephemeral port —
+    /// Bind TCP/UDP port. `0` requests an OS-assigned ephemeral port —
     /// useful for tests; the actual port can be queried via
     /// [`DrvAsynIPServerPort::local_port`] post-bind.
     pub bind_port: u16,
+    /// Transport protocol — TCP listener or UDP receiver.
+    pub protocol: IpServerProtocol,
     /// Enable `SO_REUSEPORT` (asyn PR #109). On Linux/macOS this
     /// allows multiple processes / threads to bind the same port for
     /// kernel-level load balancing across listening sockets. No-op
     /// on platforms without the option.
     pub reuse_port: bool,
-    /// Slot table cap — see [`DEFAULT_MAX_CLIENTS`].
+    /// Slot table cap — see [`DEFAULT_MAX_CLIENTS`]. Ignored in UDP
+    /// mode (no per-peer slots).
     pub max_clients: usize,
     /// Per-accepted-connection read timeout. Affects the worker
     /// task's `set_read_timeout`; defaults to no timeout (block until
@@ -84,11 +123,17 @@ impl IpServerConfig {
         }
 
         let mut reuse_port = false;
+        let mut protocol = IpServerProtocol::Tcp;
         // Strip option tokens from the tail.
         while tokens.len() > 1 {
             let last = tokens.last().unwrap().to_ascii_uppercase();
             match last.as_str() {
                 "TCP" => {
+                    protocol = IpServerProtocol::Tcp;
+                    tokens.pop();
+                }
+                "UDP" => {
+                    protocol = IpServerProtocol::Udp;
                     tokens.pop();
                 }
                 "SO_REUSEPORT" | "REUSEPORT" => {
@@ -143,6 +188,7 @@ impl IpServerConfig {
         Ok(Self {
             bind_host: host,
             bind_port: port,
+            protocol,
             reuse_port,
             max_clients: DEFAULT_MAX_CLIENTS,
             read_timeout: None,
@@ -173,7 +219,54 @@ pub struct DrvAsynIPServerPort {
     /// Fixed-size client slot table. `slots[addr]` is `None` until a
     /// connection is assigned to that addr. Slot reuse on disconnect
     /// keeps `addr` stable for the lifetime of the connection.
+    /// Unused in UDP mode.
     slots: Vec<Mutex<Option<Arc<ClientSlot>>>>,
+
+    // ----- UDP mode only -----
+    /// Bound UDP socket. `Some` between `connect` and `disconnect` in
+    /// UDP mode. The recv worker holds a clone so it can `recv` even
+    /// while `disconnect` is replacing the field.
+    udp_socket: Mutex<Option<Arc<UdpSocket>>>,
+    /// Single shared cache of the most-recently-received datagram.
+    /// Mirrors C asyn `tty->UDPbuffer`/`UDPbufferSize`/`UDPbufferPos`
+    /// (lines 78-80 of drvAsynIPServerPort.c). The recv worker only
+    /// re-fills when the cache is empty (matches line 190's
+    /// "if Pos==0 && Size==0 then recvfrom").
+    udp_cache: Arc<Mutex<UdpCache>>,
+    /// Set to true on disconnect to stop the recv worker. The
+    /// worker observes this between `recv` calls (woken by socket
+    /// `set_read_timeout(200ms)`).
+    udp_shutdown: Arc<AtomicBool>,
+    /// Recv worker thread join handle. Joined on disconnect.
+    udp_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// UDP cache state. `pos < len` means data is available to read;
+/// `len == 0` means the recv worker can fetch a fresh datagram.
+struct UdpCache {
+    /// Bytes from the most-recent datagram (capped at
+    /// [`UDP_MAX_DATAGRAM`]).
+    data: Vec<u8>,
+    /// Read position within `data`. Drained by `read_octet`.
+    pos: usize,
+}
+
+impl UdpCache {
+    fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pos >= self.data.len()
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.pos = 0;
+    }
 }
 
 impl DrvAsynIPServerPort {
@@ -209,11 +302,18 @@ impl DrvAsynIPServerPort {
             config,
             listener: Mutex::new(None),
             slots,
+            udp_socket: Mutex::new(None),
+            udp_cache: Arc::new(Mutex::new(UdpCache::new())),
+            udp_shutdown: Arc::new(AtomicBool::new(false)),
+            udp_thread: Mutex::new(None),
         })
     }
 
     /// Bind the listener socket and mark the port connected.
     fn open_listener(&mut self) -> AsynResult<()> {
+        if self.config.protocol == IpServerProtocol::Udp {
+            return self.open_udp_listener();
+        }
         let bind_str = if self.config.bind_host.contains(':') {
             // IPv6
             format!("[{}]:{}", self.config.bind_host, self.config.bind_port)
@@ -231,6 +331,80 @@ impl DrvAsynIPServerPort {
                 message: format!("set_nonblocking failed: {e}"),
             })?;
         *self.listener.lock().unwrap() = Some(listener);
+        self.base.connected = true;
+        self.base.announce_exception(AsynException::Connect, -1);
+        Ok(())
+    }
+
+    /// UDP-mode bind: open the datagram socket, spawn the recv
+    /// worker. Mirrors C asyn's `connectIt` SOCK_DGRAM branch
+    /// (drvAsynIPServerPort.c lines ~440-470).
+    fn open_udp_listener(&mut self) -> AsynResult<()> {
+        let bind_str = if self.config.bind_host.contains(':') {
+            format!("[{}]:{}", self.config.bind_host, self.config.bind_port)
+        } else {
+            format!("{}:{}", self.config.bind_host, self.config.bind_port)
+        };
+        let addr: SocketAddr =
+            bind_str
+                .parse()
+                .map_err(|e: std::net::AddrParseError| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("invalid UDP bind address '{bind_str}': {e}"),
+                })?;
+        let domain = if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let sock =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+                .map_err(|e| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("UDP socket() failed: {e}"),
+                })?;
+        sock.set_reuse_address(true)
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP SO_REUSEADDR failed: {e}"),
+            })?;
+        if self.config.reuse_port {
+            #[cfg(unix)]
+            sock.set_reuse_port(true).map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP SO_REUSEPORT failed: {e}"),
+            })?;
+        }
+        sock.bind(&addr.into()).map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("UDP bind '{bind_str}' failed: {e}"),
+        })?;
+        let socket = UdpSocket::from(sock);
+        // Read timeout caps shutdown latency — recv wakes every
+        // 200ms so the worker can observe `udp_shutdown` flag.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP set_read_timeout failed: {e}"),
+            })?;
+        let socket = Arc::new(socket);
+
+        self.udp_shutdown.store(false, Ordering::SeqCst);
+        let socket_t = Arc::clone(&socket);
+        let cache_t = Arc::clone(&self.udp_cache);
+        let shutdown_t = Arc::clone(&self.udp_shutdown);
+        let port_name = self.base.port_name.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("udp-server-{port_name}"))
+            .spawn(move || udp_recv_loop(socket_t, cache_t, shutdown_t, port_name))
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP recv thread spawn failed: {e}"),
+            })?;
+
+        *self.udp_socket.lock().unwrap() = Some(socket);
+        *self.udp_thread.lock().unwrap() = Some(handle);
         self.base.connected = true;
         self.base.announce_exception(AsynException::Connect, -1);
         Ok(())
@@ -397,7 +571,10 @@ impl PortDriver for DrvAsynIPServerPort {
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        if self.base.connected && self.listener.lock().unwrap().is_some() {
+        let already_up = self.base.connected
+            && (self.listener.lock().unwrap().is_some()
+                || self.udp_socket.lock().unwrap().is_some());
+        if already_up {
             return Ok(());
         }
         self.open_listener()
@@ -413,6 +590,16 @@ impl PortDriver for DrvAsynIPServerPort {
                     .announce_exception(AsynException::Connect, i as i32);
             }
         }
+        // UDP path: stop the recv worker before dropping the socket
+        // so the worker's `recv` doesn't race against socket close.
+        // Worker observes the shutdown flag at most 200ms after we
+        // set it (the socket's read timeout).
+        self.udp_shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.udp_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        *self.udp_socket.lock().unwrap() = None;
+        self.udp_cache.lock().unwrap().clear();
         *self.listener.lock().unwrap() = None;
         self.base.connected = false;
         self.base.announce_exception(AsynException::Connect, -1);
@@ -420,11 +607,23 @@ impl PortDriver for DrvAsynIPServerPort {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        if self.config.protocol == IpServerProtocol::Udp {
+            return Ok(self.udp_drain_into(buf));
+        }
         let res = self.base_read_octet(user, buf)?;
         Ok(res.nbytes_transferred)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+        if self.config.protocol == IpServerProtocol::Udp {
+            // C asyn `writeIt` for UDP server is a one-line
+            // `return asynError;` — the server is read-only.
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "UDP server-mode port is read-only (C asyn writeIt returns asynError)"
+                    .into(),
+            });
+        }
         if user.addr < 0 {
             // Broadcast: send to every connected slot. Errors per
             // slot are logged but never abort the broadcast — a dead
@@ -533,6 +732,87 @@ impl DrvAsynIPServerPort {
         })?;
         Ok(())
     }
+
+    /// UDP-mode read: copy at most `buf.len()` bytes from the cache,
+    /// advance pos. When the cache fully drains, clear it so the
+    /// recv worker can fetch the next datagram. Returns 0 (NOT an
+    /// error) when the cache is empty — caller polls. Mirrors C
+    /// asyn `readIt` (drvAsynIPServerPort.c lines 167-238) in
+    /// behaviour, simplified to drop the off-by-one C bug
+    /// (`maxchars - 1` copy with `+= maxchars` advance).
+    fn udp_drain_into(&self, buf: &mut [u8]) -> usize {
+        let mut cache = self.udp_cache.lock().unwrap();
+        if cache.is_empty() {
+            return 0;
+        }
+        let avail = cache.data.len() - cache.pos;
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&cache.data[cache.pos..cache.pos + n]);
+        cache.pos += n;
+        if cache.is_empty() {
+            cache.clear();
+        }
+        n
+    }
+
+    /// Total bytes currently in the UDP cache (for tests/diagnostics).
+    pub fn udp_cache_pending(&self) -> usize {
+        let c = self.udp_cache.lock().unwrap();
+        c.data.len().saturating_sub(c.pos)
+    }
+}
+
+/// UDP recv worker thread. Loops `socket.recv` (source address
+/// discarded — C parity, line 311 `recvfrom(fd, buf, size, 0,
+/// NULL, NULL)`). Only fetches a fresh datagram when the cache is
+/// empty (C parity, line 190 `if Pos==0 && Size==0 then recvfrom
+/// else sleep`). Exits when `shutdown` flips to true; the socket's
+/// 200ms read timeout caps shutdown latency.
+fn udp_recv_loop(
+    socket: Arc<UdpSocket>,
+    cache: Arc<Mutex<UdpCache>>,
+    shutdown: Arc<AtomicBool>,
+    port_name: String,
+) {
+    let mut buf = vec![0u8; UDP_MAX_DATAGRAM];
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        // Only `recv` if the cache is fully drained — match C asyn's
+        // single-buffer protocol where new data is only fetched once
+        // the consumer (read_octet) has finished with the previous
+        // datagram.
+        let cache_empty = cache.lock().unwrap().is_empty();
+        if !cache_empty {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        match socket.recv(&mut buf) {
+            Ok(n) => {
+                let mut c = cache.lock().unwrap();
+                c.data.clear();
+                c.data.extend_from_slice(&buf[..n]);
+                c.pos = 0;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // 200ms read-timeout wake — loop and re-check shutdown.
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "asyn_rs::ip_server_port",
+                    port = %port_name,
+                    error = %e,
+                    "UDP recv error — exiting recv loop"
+                );
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +849,111 @@ mod tests {
         let cfg = IpServerConfig::parse("[::1]:7000").unwrap();
         assert_eq!(cfg.bind_host, "::1");
         assert_eq!(cfg.bind_port, 7000);
+    }
+
+    #[test]
+    fn parse_udp_protocol_token() {
+        let cfg = IpServerConfig::parse("0.0.0.0:7000 UDP").unwrap();
+        assert_eq!(cfg.protocol, IpServerProtocol::Udp);
+        let cfg2 = IpServerConfig::parse("0.0.0.0:7000").unwrap();
+        assert_eq!(cfg2.protocol, IpServerProtocol::Tcp, "default is TCP");
+        let cfg3 = IpServerConfig::parse("127.0.0.1:5000 UDP SO_REUSEPORT").unwrap();
+        assert_eq!(cfg3.protocol, IpServerProtocol::Udp);
+        assert!(cfg3.reuse_port);
+    }
+
+    /// UDP-mode end-to-end: bind ephemeral, two clients each fire one
+    /// datagram, server polls `read_octet` until both arrive (in any
+    /// order — kernel scheduling is non-deterministic but C asyn's
+    /// single-buffer cache means each `read_octet` returns one
+    /// complete datagram).
+    #[test]
+    fn udp_server_receives_datagrams_from_any_peer() {
+        use std::net::UdpSocket as ClientSock;
+        let mut srv = DrvAsynIPServerPort::new("udp_srv", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let server_addr = srv
+            .udp_socket
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let c1 = ClientSock::bind("127.0.0.1:0").unwrap();
+        let c2 = ClientSock::bind("127.0.0.1:0").unwrap();
+        c1.send_to(b"alpha", server_addr).unwrap();
+        c2.send_to(b"bravo", server_addr).unwrap();
+
+        // Drain two datagrams via polling — read_octet returns 0
+        // when cache empty, so loop with a brief sleep until we
+        // collect both.
+        let user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(Duration::from_secs(2));
+        let mut got: Vec<String> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut buf = [0u8; 64];
+        while got.len() < 2 && std::time::Instant::now() < deadline {
+            let n = srv.read_octet(&user, &mut buf).unwrap();
+            if n == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            got.push(String::from_utf8_lossy(&buf[..n]).to_string());
+        }
+        got.sort();
+        assert_eq!(got, vec!["alpha".to_string(), "bravo".to_string()]);
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// UDP write must error — C asyn `writeIt` is `return asynError;`.
+    #[test]
+    fn udp_server_write_octet_errors() {
+        let mut srv = DrvAsynIPServerPort::new("udp_srv2", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let mut user = AsynUser::default().with_addr(0);
+        let err = srv.write_octet(&mut user, b"x").unwrap_err();
+        match err {
+            AsynError::Status { message, .. } => {
+                assert!(
+                    message.contains("read-only"),
+                    "expected read-only error, got: {message}"
+                );
+            }
+            _ => panic!("wrong error variant"),
+        }
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// `read_octet` on empty UDP cache returns 0 (NOT an error) — the
+    /// C asyn semantics is "poll", not "block". Caller is expected to
+    /// retry or use the I/O Intr path.
+    #[test]
+    fn udp_server_read_returns_zero_when_empty() {
+        let mut srv = DrvAsynIPServerPort::new("udp_srv3", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(Duration::from_millis(50));
+        let mut buf = [0u8; 64];
+        let n = srv.read_octet(&user, &mut buf).unwrap();
+        assert_eq!(n, 0, "empty UDP cache must return 0 bytes, not error");
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// disconnect must stop the worker cleanly so a subsequent
+    /// connect/disconnect cycle works (the previous worker thread
+    /// must have released its socket Arc).
+    #[test]
+    fn udp_server_disconnect_stops_worker_cleanly() {
+        let mut srv = DrvAsynIPServerPort::new("udp_srv4", "127.0.0.1:0 UDP").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        srv.disconnect(&AsynUser::default()).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        srv.disconnect(&AsynUser::default()).unwrap();
     }
 
     #[test]
@@ -626,6 +1011,7 @@ mod tests {
         let cfg = IpServerConfig {
             bind_host: "127.0.0.1".into(),
             bind_port: 0,
+            protocol: IpServerProtocol::Tcp,
             reuse_port: false,
             max_clients: 2,
             read_timeout: None,
@@ -667,6 +1053,7 @@ mod tests {
         let cfg = IpServerConfig {
             bind_host: "127.0.0.1".into(),
             bind_port: 0,
+            protocol: IpServerProtocol::Tcp,
             reuse_port: false,
             max_clients: 1,
             read_timeout: None,
@@ -697,6 +1084,7 @@ mod tests {
         let cfg1 = IpServerConfig {
             bind_host: "127.0.0.1".into(),
             bind_port: 0,
+            protocol: IpServerProtocol::Tcp,
             reuse_port: true,
             max_clients: 1,
             read_timeout: None,
@@ -708,6 +1096,7 @@ mod tests {
         let cfg2 = IpServerConfig {
             bind_host: "127.0.0.1".into(),
             bind_port: port,
+            protocol: IpServerProtocol::Tcp,
             reuse_port: true,
             max_clients: 1,
             read_timeout: None,

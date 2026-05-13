@@ -18,6 +18,7 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 | 런타임 `hostInfo` (`set_option("hostInfo")`) | Issue #12 | `drivers/ip_port.rs` (set_option) |
 | Interpose 필터 (`asynInterposeDelay`/`Echo`/`Eos`/`Flush`) | PR #79 | `interpose/{delay,echo,eos,flush}.rs` |
 | TCP 서버 모드 (`drvAsynIPServerPort`) | PR #148/#109 | `drivers/ip_server_port.rs` |
+| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | `drvAsynIPServerPort.c` SOCK_DGRAM | `drivers/ip_server_port.rs::IpServerProtocol::Udp` — single shared `UdpCache` (C parity, source addr 무시), recv 워커 스레드 (cache empty 일 때만 recv), `read_octet` 가 cache drain 후 0 반환 (non-blocking, C parity), `write_octet` 가 read-only 에러. UDP_MAX_DATAGRAM=65507. 4× 회귀 테스트. |
 | `ASYN_TRACE_STATE` 마스크 비트 | PR #67 | `trace.rs::TraceMask::STATE` |
 | `asynSetTrace*Mask` 문자열 파싱 | PR #76 | `trace.rs::*::from_symbolic` |
 | `asynInt32Average`/`asynFloat64Average` + `RingAverager` | Issue #30 | `interfaces/average.rs` |
@@ -56,7 +57,6 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 |---|---|---|
 | `asynParamSet` 파라미터 그룹 | `asynPortDriver/asynParamSet.h` | C++ 클래스: `std::vector<asynParam{name, type, int*}>` + `add()` + `getParamDefinitions()`. asynPortDriver 생성자가 받아서 createParam 일괄 호출. **평탄 리스트 (트리 아님).** |
 | **PVI** (PVInterface) | (없음) | C asyn 에 PVI / 트리 구조 파라미터 토폴로지는 존재하지 않음. PR 후보 단계도 확인 안 됨. |
-| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | `drvAsynSerial/drvAsynIPServerPort.c::SOCK_DGRAM` 분기 | 단일 `THEORETICAL_UDP_MAX_SIZE = 65507` 버퍼, `recvfrom(fd, buf, size, 0, NULL, NULL)` — **source addr 무시**, 매 datagram 을 모든 interrupt subscriber 에게 broadcast (`pasynManager->interruptStart` → callback iteration, `ASYN_EOM_END`). write-back 없음. asyn-rs `ip_server_port.rs` 는 TCP 만 지원. |
 
 ---
 
@@ -64,7 +64,6 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 
 1. **`asyn:FIFO` adapter wiring** — `devAsynInt32::createRingBuffer` 패턴 (default 10, atoi only, overflow 시 scanIoRequest 안 함) — medium
 2. **`getBounds_int32/int64` ↔ LINEAR ESLO/EOFF** — `devAsynInt32::initAi`/`convertAi` 와 동일한 init→deviceLow/High→convert 흐름 — medium
-3. **UDP 서버 모드** — broadcast 모델 (per-peer 슬롯 없음, source addr 무시, write-back 없음) — small/medium
 5. **USBTMC driver** — libusb-rs (rusb/nusb) + iocshArg-style config (vid, pid, serial, priority, flags) + BTAG/EOM 프레이밍 — large
 6. **VXI-11 driver** — ONC RPC (`onc-rpc` crate 후보) + iocshArg-style config (dn, hostName, flags, vxiName) — large
 7. **HiSLIP driver** — C asyn 에 없음, IVI-6.1 spec 기반 신규 — large

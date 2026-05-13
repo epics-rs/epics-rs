@@ -1,6 +1,6 @@
 //! Top-level [`PvaServer`] runtime: spawns UDP responder + TCP listener.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +19,20 @@ pub struct PvaServerConfig {
     /// any single read.
     pub op_timeout: Duration,
     /// Bind address for the TCP listener (default `0.0.0.0`).
-    pub bind_ip: Ipv4Addr,
+    ///
+    /// Accepts both IPv4 and IPv6 (epics-base PR #205 IPv6 Stage 1).
+    /// For pure-IPv6 listening pass `IpAddr::V6(Ipv6Addr::UNSPECIFIED)`
+    /// (`[::]`) or `IpAddr::V6(Ipv6Addr::LOCALHOST)` (`[::1]`). On
+    /// Linux the kernel default is `IPV6_V6ONLY=0` so a `[::]` socket
+    /// also accepts IPv4-mapped connections, giving dual-stack
+    /// behaviour automatically. On BSD / macOS the default is
+    /// `IPV6_V6ONLY=1`; users who need dual-stack on those platforms
+    /// must run a second PVA server instance bound to IPv4.
+    ///
+    /// CA wire format restricts CA channels to IPv4 (4-byte address
+    /// field in SEARCH_REPLY); this knob only affects the PVA TCP
+    /// listener.
+    pub bind_ip: IpAddr,
     /// Maximum number of concurrent client connections. Excess incoming
     /// connections are accepted then immediately closed.
     pub max_connections: usize,
@@ -179,7 +192,7 @@ impl Default for PvaServerConfig {
             tcp_port: 5075,
             udp_port: 5076,
             op_timeout: Duration::from_secs(64_000),
-            bind_ip: Ipv4Addr::UNSPECIFIED,
+            bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             max_connections: 1024,
             max_channels_per_connection: 1024,
             max_ops_per_channel: 64,
@@ -216,7 +229,7 @@ impl PvaServerConfig {
         Self {
             tcp_port: 0,
             udp_port: 0,
-            bind_ip: Ipv4Addr::LOCALHOST,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auto_beacon: false,
             beacon_destinations: Vec::new(),
             ..Default::default()
@@ -387,7 +400,7 @@ impl PvaServer {
     {
         let dyn_source: DynSource = source as Arc<dyn ChannelSourceObj>;
         let guid = random_guid();
-        let bind_addr = SocketAddr::new(std::net::IpAddr::V4(config.bind_ip), config.tcp_port);
+        let bind_addr = SocketAddr::new(config.bind_ip, config.tcp_port);
 
         // Robustness: bind the TCP listener synchronously here so the
         // actually-bound port is observable to client_config() before
@@ -416,7 +429,7 @@ impl PvaServer {
                     && (e.kind() == std::io::ErrorKind::AddrInUse
                         || e.kind() == std::io::ErrorKind::PermissionDenied) =>
             {
-                let fallback_addr = SocketAddr::new(std::net::IpAddr::V4(config.bind_ip), 0);
+                let fallback_addr = SocketAddr::new(config.bind_ip, 0);
                 let listener = std::net::TcpListener::bind(fallback_addr)
                     .expect("PvaServer::start: bind TCP listener (ephemeral fallback)");
                 tracing::warn!(
@@ -648,7 +661,7 @@ mod tcp_fallback_tests {
         let config = PvaServerConfig {
             tcp_port: blocked_port,
             udp_port: 0,
-            bind_ip: Ipv4Addr::LOCALHOST,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auto_beacon: false,
             beacon_destinations: Vec::new(),
             ..Default::default()
@@ -675,6 +688,37 @@ mod tcp_fallback_tests {
         drop(blocker);
     }
 
+    /// epics-base PR #205 IPv6 Stage 1 — `PvaServerConfig::bind_ip`
+    /// accepts `IpAddr::V6` and the TCP listener binds successfully.
+    /// Verifies the change is genuinely IPv6-capable rather than just
+    /// type-compatible.
+    #[tokio::test]
+    async fn binds_ipv6_loopback_listener() {
+        use std::net::Ipv6Addr;
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config);
+        let report = server.report();
+        assert!(report.tcp_port != 0, "v6 listener must bind a port");
+
+        // Confirm we can dial the IPv6 listener — the bind type is
+        // really v6, not silently downgraded to v4.
+        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), report.tcp_port);
+        let connect =
+            tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr))
+                .await
+                .expect("connect timed out");
+        let _stream = connect.expect("IPv6 TCP connect must succeed");
+        drop(server);
+    }
+
     /// Sanity: when the requested port IS available, no fallback is
     /// triggered and the server gets exactly what it asked for.
     #[tokio::test]
@@ -695,7 +739,7 @@ mod tcp_fallback_tests {
         let config = PvaServerConfig {
             tcp_port: target,
             udp_port: 0,
-            bind_ip: Ipv4Addr::LOCALHOST,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auto_beacon: false,
             beacon_destinations: Vec::new(),
             ..Default::default()

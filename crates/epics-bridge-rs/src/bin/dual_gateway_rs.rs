@@ -272,13 +272,11 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
 }
 
 async fn run_pva_gateway(args: &Args) -> Result<(), String> {
+    // PR #205 IPv6 Stage 1: PvaServerConfig::bind_ip is `IpAddr`.
     let server_config = PvaServerConfig {
         tcp_port: args.pva_tcp_port,
         udp_port: args.pva_udp_port,
-        bind_ip: match args.pva_bind {
-            IpAddr::V4(v4) => v4,
-            IpAddr::V6(_) => return Err("PVA IPv6 bind not supported".into()),
-        },
+        bind_ip: args.pva_bind,
         ..PvaServerConfig::default()
     };
     let control_prefix = if args.pva_control_prefix.trim().is_empty() {

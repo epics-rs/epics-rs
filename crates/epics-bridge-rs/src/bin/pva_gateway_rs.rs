@@ -80,16 +80,12 @@ async fn main() -> ExitCode {
     let args = Args::parse();
     init_tracing(args.verbose);
 
+    // epics-base PR #205 IPv6 Stage 1: `PvaServerConfig::bind_ip` is
+    // `IpAddr` so v4 and v6 bind addresses pass through unchanged.
     let server_config = PvaServerConfig {
         tcp_port: args.tcp_port,
         udp_port: args.udp_port,
-        bind_ip: match args.bind {
-            IpAddr::V4(v4) => v4,
-            IpAddr::V6(_) => {
-                eprintln!("pva-gateway-rs: IPv6 bind not supported yet");
-                return ExitCode::FAILURE;
-            }
-        },
+        bind_ip: args.bind,
         ..PvaServerConfig::default()
     };
 

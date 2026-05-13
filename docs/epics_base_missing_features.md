@@ -174,7 +174,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`SOCK_CLOEXEC` 사용 + `accept4()`** (`cf3173b6`, 2021) — ⏭️ **ALREADY**: Tokio가 내부에서 처리, `epics-rs` 직접 점검 불필요.
 - **`IPPORT_USERRESERVED` 포트 상수 정의** (`cd0e6a4f`/`0cae0db`, 2020-2021) — ⚠️ **N/A (eliminated)**: musl libc 헤더 호환 shim. Rust `std::net`/tokio는 `IPPORT_USERRESERVED`를 사용하지 않으며 epics-ca-rs는 하드코딩 상수/환경변수로 포트 선택. `rust_verdict: eliminated`.
 - **`16진수/8진수 문자열 dbPut/dbGet 지원`** (`88bfd6f3`, 2025, PR #678) — ✅ **DONE** `17210b4` (섹션 2 항목과 동일).
-- **`bi` 레코드 소프트 채널에서 `MASK` 비트 사용** (`f2fe9d12`, 2023) — ⏸️ DEFERRED.
+- **`bi` 레코드 소프트 채널에서 `MASK` 비트 사용** (`f2fe9d12`, 2023) — ✅ **DONE** `97300ce`: 섹션 1/2 보강. `Record::accepts_raw_soft_input()` + `apply_raw_input` opt-in trait + BiRecord override (RVAL routing + MASK AND) + processing.rs Raw Soft Channel 분기. 테스트 4종 (unit 3 + integration 1).
 
 ---
 

@@ -524,7 +524,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 10-D. `pva-rs` — UDP / 비콘 (Beacon) & 기타
 
-- **UDP RX 버퍼 오버플로 감지** (`a064677e3625`, high) — ⏸️ DEFERRED.
+- **UDP RX 버퍼 오버플로 감지** (`a064677e3625`, high) — ⏸️ **DEFERRED (Linux-only + low-level)**: pvxs는 `SO_RXQ_OVFL` 소켓 옵션 + `recvmsg` cmsg에서 커널 드롭 카운터를 추출해 backlog 발생 시 디버그 로그 출력. Rust 측에 적용하려면 tokio `UdpSocket`이 노출하지 않는 `recvmsg+ancillary` 경로가 필요 — socket2/`nix` 직접 호출 + 자체 wake loop 구현, Linux 전용 분기. 추후 별도 PR.
 - **클라이언트 비콘 수신 시작** (`acfba6469ed3`, high) — ⏭️ **ALREADY**: `client_native/search_engine.rs:598` `beacon_recv` future로 백그라운드 수신.
 - **잘못된 스레드에서의 비콘 발송 경고** (`882a7720fb92`, medium) — ⚠️ **N/A**: Rust의 `Send`/`Sync` trait이 컴파일 시 보장.
 - **서버 비콘 TX 최적화** (`cc5071cd22c4`, medium) — ⏸️ DEFERRED.

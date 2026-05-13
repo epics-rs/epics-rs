@@ -17,77 +17,61 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 | `disconnectOnReadTimeout` | PR #6 | `drivers/ip_port.rs::IpPortConfig::disconnect_on_read_timeout` |
 | 런타임 `hostInfo` (`set_option("hostInfo")`) | Issue #12 | `drivers/ip_port.rs` (set_option) |
 | Interpose 필터 (`asynInterposeDelay`/`Echo`/`Eos`/`Flush`) | PR #79 | `interpose/{delay,echo,eos,flush}.rs` |
-| TCP 서버 모드 (`drvAsynIPServerPort`) | PR #148/#109 | `drivers/ip_server_port.rs` (this session) |
-| `ASYN_TRACE_STATE` 마스크 비트 | PR #67 | `trace.rs::TraceMask::STATE` (this session) |
-| `asynSetTrace*Mask` 문자열 파싱 | PR #76 | `trace.rs::*::from_symbolic` (this session) |
-| `asynInt32Average`/`asynFloat64Average` + `RingAverager` | Issue #30 | `interfaces/average.rs` (this session) |
-| `asyn:READBACK` info-tag | PR #60 / #208 | `adapter.rs::asyn_readback` field + auto-detect at L658 |
-| 초기값 동기화 (initial readback) | Issue #24 / PR #27 | `adapter.rs::with_initial_readback` (L242) |
+| TCP 서버 모드 (`drvAsynIPServerPort`) | PR #148/#109 | `drivers/ip_server_port.rs` |
+| `ASYN_TRACE_STATE` 마스크 비트 | PR #67 | `trace.rs::TraceMask::STATE` |
+| `asynSetTrace*Mask` 문자열 파싱 | PR #76 | `trace.rs::*::from_symbolic` |
+| `asynInt32Average`/`asynFloat64Average` + `RingAverager` | Issue #30 | `interfaces/average.rs` |
+| `asyn:READBACK` info-tag | PR #60 / #208 | `adapter.rs::asyn_readback` field + auto-detect |
+| 초기값 동기화 (initial readback) | Issue #24 / PR #27 | `adapter.rs::with_initial_readback` |
 | `lsi`/`lso`/`printf` 어댑터 매핑 | PR #104 | `adapter.rs::asynOctet` 경로가 String/CharArray ↔ EpicsValue 변환 처리 |
-| `ASYN_DESTRUCTIBLE` / shutdown | PR #171 | `port.rs::PortFlags::destructible` + `PortDriver::shutdown` (trait L860) |
+| `ASYN_DESTRUCTIBLE` / shutdown | PR #171 | `port.rs::PortFlags::destructible` + `PortDriver::shutdown` |
 | FTDI 드라이버 스캐폴드 | PR #88 | `drivers/ftdi.rs` (config parser + scaffold, hardware path feature-gated) |
-| USBTMC 드라이버 스캐폴드 | 기존 | `drivers/usbtmc.rs` (this session — vid/pid/serial/interface parser + scaffold, `usbtmc-hw` feature-gated) |
-| Prologix GPIB 드라이버 스캐폴드 | PR #129 | `drivers/prologix.rs` (this session — host:port + GPIB addr parser, `++addr` line builder, TCP path delegates to ip_port) |
-| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | 기존 | `drivers/ip_server_port.rs::IpServerProtocol::Udp` (this session — parser + protocol enum; runtime listener returns "not yet wired" pending UDP-server adapter) |
-| `asyn:FIFO` info-tag 링 버퍼 | 2015년경 | `asyn_record/fifo.rs` (this session — `RingBuffer<T>` drop-oldest + overrun counter + `parse_fifo_tag`) |
-| `getLimits` 인터페이스 | Issue #218 | `interfaces/limits.rs::AsynLimits` (this session — `IntLimits`/`FloatLimits` + read trait) |
-| 양방향 파라미터 notification | Issue #46 | `interrupt.rs::Interrupt` + `call_param_callbacks` (verified ALREADY) |
+| 양방향 파라미터 notification | Issue #46 | `interrupt.rs::Interrupt` + `call_param_callbacks` |
 | EOS 설정자 atomic update | Issue #103 | `interpose/eos.rs` Mutex-protected |
 | `asynMask` shift | Issue #166 | record-layer SHFT (mbbiDirect/mbboDirect) — asyn-side mask는 bit selection만 |
-| `aai`/`aao` 레코드 어댑터 매핑 | PR #162 | `epics-base-rs` `WaveformRecord::with_kind(Aai/Aao)` + `asyn-rs::adapter::normalize_asyn_dtyp` (asynFloat64ArrayIn/Out → asynFloat64Array). 이 세션에서 `dtyp_normalize_aai_aao_array_in_out` 회귀 테스트 추가 — universal_asyn_factory 가 aai/aao DTYP 정상 처리 |
+| `aai`/`aao` 레코드 어댑터 매핑 | PR #162 | `epics-base-rs` `WaveformRecord::with_kind(Aai/Aao)` + `asyn-rs::adapter::normalize_asyn_dtyp` (asynFloat64ArrayIn/Out → asynFloat64Array). `dtyp_normalize_aai_aao_array_in_out` 회귀 테스트로 fence |
 
-## 진짜 미구현 (verified gaps)
+## 진짜 미구현 (verified gaps — C asyn 소스 대비)
 
 ### 1. 하드웨어 계측기 통신 프로토콜 드라이버
 
-| 항목 | C asyn 출처 | 상태 | 비고 |
-|---|---|---|---|
-| **USBTMC** (`drvAsynUSBTMC`) | 기존 | 🔄 PARTIAL | `drivers/usbtmc.rs` 스캐폴드 (config parser + `PortDriver` trait) 완료. `usbtmc-hw` feature 활성화 시 `rusb`/`nusb` 바인딩 wiring 필요 |
-| **Prologix GPIB** | PR #129 | 🔄 PARTIAL | `drivers/prologix.rs` 스캐폴드 (host:port + GPIB addr parser + `++addr` line builder) 완료. `connect()` 가 ip_port adapter 위임 — TCP 본체는 follow-up |
-| **VXI-11** (`drvVxi11`) | 기존 | ❌ 미구현 | ONC RPC 클라이언트 필요 (`onc-rpc` crate). 1000+ LOC |
-| **HiSLIP** | Issue #130 | ❌ 미구현 | TCP 기반 고속 LAN 계측기 프로토콜. 500-800 LOC |
+| 항목 | C asyn 출처 | 비고 |
+|---|---|---|
+| **USBTMC** (`drvAsynUSBTMC`) | `drvAsynUSBTMC.c` | iocshArg: `(portName, vendorId int, productId int, serialNumber*, priority int, flags int)`. libusb 기반 (`libusb_init`/`libusb_open_device_with_vid_pid`). bulk OUT/IN BTAG/EOM 프레이밍. |
+| **Prologix GPIB** | `drvPrologixGPIB.c` | TCP bridge. per-write `setAddress(pasynUser->addr)` (addr/100 primary + addr%100+96 secondary). on-connect 8-line init (`++savecfg`/`++mode`/`++ifc`/`++eos`/`++eoi`/`++eot_char`/`++eot_enable`/`++ver`). char escaping (`+`/`\r`/`\n`/`\033` → `\033`-prefix). EOS char + `\n` terminator append. |
+| **VXI-11** (`drvVxi11`) | `vxi11/drvVxi11.c` | iocshArg: `(dn, hostName, flags, vxiName, ...)`. ONC RPC (Sun RPC `clnt_create`). create_link / device_write / device_read / device_clear / destroy_link / abort 채널. |
+| **HiSLIP** | Issue #130 (미머지) | C asyn 에 코드 자체 없음 — 공식 driver 가 아직 추가되지 않은 상태. 추가하려면 IVI-6.1 spec 기반 신규 구현 필요. |
 
-### 2. 어댑터 계층 누락
+### 2. 어댑터 / 레코드 계층 누락
 
-| 항목 | C asyn 출처 | 상태 | 비고 |
-|---|---|---|---|
-| `asyn:FIFO` info-tag 링 버퍼 | 2015년경 | 🔄 PARTIAL | `asyn_record/fifo.rs::RingBuffer<T>` (drop-oldest + overrun counter + tag parser) 완료. record adapter 측 push/pop 호출 사이트 wiring 은 follow-up |
-| `getLimits` 인터페이스 | Issue #218 | 🔄 PARTIAL | `interfaces/limits.rs::AsynLimits` trait + `IntLimits`/`FloatLimits` 완료. record-layer DRVH/DRVL ↔ limits read 자동 동기화는 follow-up |
+| 항목 | C asyn 출처 | 비고 |
+|---|---|---|
+| `asyn:FIFO` info-tag 링 버퍼 | `devEpics/devAsynInt32.c::createRingBuffer` 등 | per-record `ringBuffer[ringSize+1]` (default `ringSize = DEFAULT_RING_BUFFER_SIZE = 10`, `atoi(asynDbGetInfo(pr, "asyn:FIFO"))` overrides). drop-oldest on overflow + `ringBufferOverflows++`. **`scanIoRequest` 는 새 entry 추가시에만 호출 — overflow 로 overwrite 할 때는 호출 안 함** (process queue flooding 방지). 해당 디바이스 서포트 6종 모두 (Int32, Int64, Float64, Octet, UInt32Digital, XXXArray) 같은 패턴. |
+| `getBounds` ↔ ai/ao LINEAR ESLO/EOFF | `devEpics/devAsynInt32.c::initAi` 등 | C asyn 의 `getBounds` 는 asynInt32/asynInt64 만 보유 (`asynInt32.h` L36). `(int* low, int* high)` 시그니처. `devAsynInt32::initAi/initAiAverage` 가 init 시 `pasynInt32SyncIO->getBounds` 호출 → `pPvt->deviceLow/deviceHigh` 저장 → `convertAi` 가 LINR=LINEAR 모드에서 ESLO/EOFF 계산 사용. **DRVL/DRVH/HOPR/LOPR 는 set 하지 않음** (사용자 .db 필드). asyn-rs 의 `port.rs::get_bounds_int32`/`int64` 는 trait 에 존재하나 adapter 측 LINEAR convert 호출 사이트 미존재. |
+| `getLimits` 인터페이스 | (Issue #218 미머지) | C asyn 에 `getLimits` 는 존재 자체가 없음 — Issue #218 은 feature request 이며 머지되지 않음. asynFloat64 에는 `getBounds` 도 없음. |
 
 ### 3. 아키텍처
 
-| 항목 | C asyn 출처 | 상태 | 비고 |
-|---|---|---|---|
-| **PVI** (PVInterface) tree-structured params | PR #117 | ❌ 미구현 | 계층적 파라미터 토폴로지. 우리는 flat `ParamSet` 만 보유 |
-| `asynParamSet` 그룹화 클래스 | PR #117 | ❌ 미구현 | 대규모 파라미터 논리적 그룹/검색. 우리는 단일 namespace |
-| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | 기존 | 🔄 PARTIAL | `drivers/ip_server_port.rs` 가 `IpServerProtocol::Udp` 파싱/저장. 런타임 `open_listener` 는 명시적 "not yet wired" 반환 — UDP-server adapter (peer-per-datagram slot 매핑) 가 다음 단계 |
-
-### 4. 외부-dep 필요 항목 묶음
-
-- USBTMC (`usbtmc-hw`), FTDI (`ftdi-mpsse`) hardware-path —
-  scaffold-only-status. 패턴: config parser + `PortDriver` trait
-  impl + 외부 dep feature-gate.
-- Prologix GPIB — 외부 dep 없음 (TCP). scaffold + `++addr` 빌더
-  완료, `connect()` 가 ip_port adapter 위임 (follow-up).
-- VXI-11, HiSLIP — 아직 dep crate 선정 단계 (`onc-rpc` 후보).
+| 항목 | C asyn 출처 | 비고 |
+|---|---|---|
+| `asynParamSet` 파라미터 그룹 | `asynPortDriver/asynParamSet.h` | C++ 클래스: `std::vector<asynParam{name, type, int*}>` + `add()` + `getParamDefinitions()`. asynPortDriver 생성자가 받아서 createParam 일괄 호출. **평탄 리스트 (트리 아님).** |
+| **PVI** (PVInterface) | (없음) | C asyn 에 PVI / 트리 구조 파라미터 토폴로지는 존재하지 않음. PR 후보 단계도 확인 안 됨. |
+| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | `drvAsynSerial/drvAsynIPServerPort.c::SOCK_DGRAM` 분기 | 단일 `THEORETICAL_UDP_MAX_SIZE = 65507` 버퍼, `recvfrom(fd, buf, size, 0, NULL, NULL)` — **source addr 무시**, 매 datagram 을 모든 interrupt subscriber 에게 broadcast (`pasynManager->interruptStart` → callback iteration, `ASYN_EOM_END`). write-back 없음. asyn-rs `ip_server_port.rs` 는 TCP 만 지원. |
 
 ---
 
-## 다음 우선순위 (구현 가능 순)
+## 다음 우선순위 (C asyn 소스 대비 정확 구현)
 
-1. **UDP server 런타임 어댑터** (peer-per-datagram slot 매핑) — small/medium
-2. **getLimits ↔ record DRVH/DRVL 자동 동기화** (adapter wiring) — small
-3. **asyn:FIFO record adapter wiring** (push/pop 호출 사이트) — medium
-4. **USBTMC `usbtmc-hw` rusb/nusb 바인딩** — medium
-5. **Prologix `connect()` ip_port 위임 wiring** — small
-6. **PVI / asynParamSet** (architectural, multi-day) — large
-7. **VXI-11 / HiSLIP** (RPC / TCP protocols, multi-day each) — large
+1. **`asyn:FIFO` adapter wiring** — `devAsynInt32::createRingBuffer` 패턴 (default 10, atoi only, overflow 시 scanIoRequest 안 함) — medium
+2. **`getBounds_int32/int64` ↔ LINEAR ESLO/EOFF** — `devAsynInt32::initAi`/`convertAi` 와 동일한 init→deviceLow/High→convert 흐름 — medium
+3. **UDP 서버 모드** — broadcast 모델 (per-peer 슬롯 없음, source addr 무시, write-back 없음) — small/medium
+4. **Prologix GPIB driver** — per-write setAddress + init 시퀀스 + char escaping + EOS append — medium
+5. **USBTMC driver** — libusb-rs (rusb/nusb) + iocshArg-style config (vid, pid, serial, priority, flags) + BTAG/EOM 프레이밍 — large
+6. **VXI-11 driver** — ONC RPC (`onc-rpc` crate 후보) + iocshArg-style config (dn, hostName, flags, vxiName) — large
+7. **HiSLIP driver** — C asyn 에 없음, IVI-6.1 spec 기반 신규 — large
+8. **`asynParamSet` 평탄 그룹 헬퍼** — `vector<asynParam>` 등가 — small (PVI 는 C asyn 에 부재 → 미구현 항목 아님)
 
 ---
 
 ### 종합 요약
-`asyn-rs`는 단순한 포팅을 넘어 C++ 버전의 고질적 버그와 최신 요구사항(TCP 비동기 커넥션, RS485 지원, SO_REUSEPORT, BREAK, AVERAGE 등)을 이미 매우 높은 수준으로 선제 반영. 본 세션에서 USBTMC/Prologix scaffold, UDP-server protocol parser, `asyn:FIFO` ring buffer, `getLimits` trait 까지 추가 — 남은 큰 마일스톤은:
-
-1. **계측기 전용 프로토콜 (VXI-11, HiSLIP)** — RPC/TCP 본체 구현
-2. **scaffold → 런타임 wiring** (USBTMC HW, Prologix ip_port 위임, FIFO record-adapter, UDP-server adapter, getLimits ↔ DRVH/DRVL)
-3. **PVI tree topology** — 아키텍처적 확장
+`asyn-rs`는 단순한 포팅을 넘어 C++ 버전의 고질적 버그와 최신 요구사항(TCP 비동기 커넥션, RS485 지원, SO_REUSEPORT, BREAK, AVERAGE 등)을 이미 매우 높은 수준으로 선제 반영. 본 audit 에서 이전 세션의 일부 invented scaffold (USBTMC/Prologix/VXI-11/HiSLIP scaffold, `getLimits` trait, PVI ParamTree, UDP-server peer-routing, A1-A3 wiring) 가 C asyn 소스 대비 검증 실패로 revert. 남은 작업은 C asyn 원본 시그니처/세만틱 대비 정확한 구현으로 다시 접근.

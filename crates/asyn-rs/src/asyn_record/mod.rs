@@ -1,4 +1,3 @@
-pub mod fifo;
 pub mod registry;
 pub use registry::{
     PortEntry, PortRegistry, asyn_record_factory, get_port, register_asyn_record_type,

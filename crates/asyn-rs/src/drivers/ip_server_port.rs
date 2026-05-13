@@ -43,31 +43,16 @@ use crate::user::AsynUser;
 /// modern IOC hosts. Tunable per-port via [`IpServerConfig::max_clients`].
 pub const DEFAULT_MAX_CLIENTS: usize = 64;
 
-/// Server-mode transport protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum IpServerProtocol {
-    /// TCP listener — accepts connections, each becomes a slot.
-    #[default]
-    Tcp,
-    /// UDP server — receives datagrams from any peer; each unique
-    /// source address auto-occupies a slot. Writes back to a slot
-    /// send to that peer's address. No connection lifecycle —
-    /// idle peers are evicted on slot pressure.
-    Udp,
-}
-
 /// Configuration parsed from a `drvAsynIPServerPortConfigure`-style spec.
 #[derive(Debug, Clone)]
 pub struct IpServerConfig {
     /// Bind address (`0.0.0.0` to accept on every interface, or a
     /// specific NIC IP / `127.0.0.1` for loopback-only).
     pub bind_host: String,
-    /// Bind TCP / UDP port. `0` requests an OS-assigned ephemeral
-    /// port — useful for tests; the actual port can be queried via
+    /// Bind TCP port. `0` requests an OS-assigned ephemeral port —
+    /// useful for tests; the actual port can be queried via
     /// [`DrvAsynIPServerPort::local_port`] post-bind.
     pub bind_port: u16,
-    /// Transport protocol — TCP listener or UDP receiver.
-    pub protocol: IpServerProtocol,
     /// Enable `SO_REUSEPORT` (asyn PR #109). On Linux/macOS this
     /// allows multiple processes / threads to bind the same port for
     /// kernel-level load balancing across listening sockets. No-op
@@ -99,17 +84,11 @@ impl IpServerConfig {
         }
 
         let mut reuse_port = false;
-        let mut protocol = IpServerProtocol::Tcp;
         // Strip option tokens from the tail.
         while tokens.len() > 1 {
             let last = tokens.last().unwrap().to_ascii_uppercase();
             match last.as_str() {
                 "TCP" => {
-                    protocol = IpServerProtocol::Tcp;
-                    tokens.pop();
-                }
-                "UDP" => {
-                    protocol = IpServerProtocol::Udp;
                     tokens.pop();
                 }
                 "SO_REUSEPORT" | "REUSEPORT" => {
@@ -164,7 +143,6 @@ impl IpServerConfig {
         Ok(Self {
             bind_host: host,
             bind_port: port,
-            protocol,
             reuse_port,
             max_clients: DEFAULT_MAX_CLIENTS,
             read_timeout: None,
@@ -236,24 +214,6 @@ impl DrvAsynIPServerPort {
 
     /// Bind the listener socket and mark the port connected.
     fn open_listener(&mut self) -> AsynResult<()> {
-        if self.config.protocol == IpServerProtocol::Udp {
-            // UDP server mode parses fully via `IpServerConfig` but
-            // the runtime accept-loop / per-peer slot routing is a
-            // separate code path from the TCP listener (UDP has no
-            // connection lifecycle — every datagram carries its
-            // source address). The parser landed first so callers
-            // can configure the spec; runtime wiring is a follow-up
-            // when a use case lands.
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "UDP server-mode runtime not yet wired (config parsed: \
-                     bind={}:{} reuse_port={}); pending follow-up that adds \
-                     the per-datagram peer-slot routing",
-                    self.config.bind_host, self.config.bind_port, self.config.reuse_port,
-                ),
-            });
-        }
         let bind_str = if self.config.bind_host.contains(':') {
             // IPv6
             format!("[{}]:{}", self.config.bind_host, self.config.bind_port)
@@ -605,37 +565,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_udp_protocol() {
-        let cfg = IpServerConfig::parse("0.0.0.0:7000 UDP").unwrap();
-        assert_eq!(cfg.protocol, IpServerProtocol::Udp);
-        assert_eq!(cfg.bind_port, 7000);
-
-        let cfg2 = IpServerConfig::parse("127.0.0.1:5000 UDP SO_REUSEPORT").unwrap();
-        assert_eq!(cfg2.protocol, IpServerProtocol::Udp);
-        assert!(cfg2.reuse_port);
-
-        // Default protocol is TCP when no token supplied.
-        let cfg3 = IpServerConfig::parse("0.0.0.0:1234").unwrap();
-        assert_eq!(cfg3.protocol, IpServerProtocol::Tcp);
-    }
-
-    #[test]
-    fn udp_server_runtime_returns_not_yet_wired() {
-        let mut srv = DrvAsynIPServerPort::new("udp_srv", "127.0.0.1:0 UDP").unwrap();
-        let user = AsynUser::default();
-        let err = srv.connect(&user).unwrap_err();
-        match err {
-            AsynError::Status { message, .. } => {
-                assert!(
-                    message.contains("UDP server-mode runtime not yet wired"),
-                    "expected UDP-not-wired error, got: {message}"
-                );
-            }
-            _ => panic!("wrong error variant"),
-        }
-    }
-
-    #[test]
     fn parse_ipv6_bracket_form() {
         let cfg = IpServerConfig::parse("[::1]:7000").unwrap();
         assert_eq!(cfg.bind_host, "::1");
@@ -698,7 +627,6 @@ mod tests {
             bind_host: "127.0.0.1".into(),
             bind_port: 0,
             reuse_port: false,
-            protocol: IpServerProtocol::Tcp,
             max_clients: 2,
             read_timeout: None,
         };
@@ -740,7 +668,6 @@ mod tests {
             bind_host: "127.0.0.1".into(),
             bind_port: 0,
             reuse_port: false,
-            protocol: IpServerProtocol::Tcp,
             max_clients: 1,
             read_timeout: None,
         };
@@ -771,7 +698,6 @@ mod tests {
             bind_host: "127.0.0.1".into(),
             bind_port: 0,
             reuse_port: true,
-            protocol: IpServerProtocol::Tcp,
             max_clients: 1,
             read_timeout: None,
         };
@@ -783,7 +709,6 @@ mod tests {
             bind_host: "127.0.0.1".into(),
             bind_port: port,
             reuse_port: true,
-            protocol: IpServerProtocol::Tcp,
             max_clients: 1,
             read_timeout: None,
         };

@@ -30,11 +30,6 @@ epics = ["dep:epics-base-rs"]
 # `ftdi-mpsse = "..."` dep below this section gated to
 # `target.'cfg(unix)'`.
 ftdi-mpsse = []
-# Opt-in USBTMC hardware support. Same scaffold pattern as
-# `ftdi-mpsse`: parser compiles unconditionally; `connect()` returns
-# a clear "feature not enabled" error so callers fail fast. Add a
-# `rusb`/`nusb` dep when wiring the real device path.
-usbtmc-hw = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

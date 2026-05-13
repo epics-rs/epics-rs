@@ -164,7 +164,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`DBE_PROPERTY` 이벤트 중복 발송 방지**: 필드 값이 실제로 바뀐 경우에만 `DBE_PROPERTY` 이벤트를 발송하도록 수정 (`faac1df1`, 2024). `epics-rs`의 DBE 이벤트 마스크 로직 교차 검증 필요.
 - **`DBE_PROPERTY` → `DBE_VALUE` 순서 보장**: `DBE_PROPERTY`를 반드시 `DBE_VALUE`보다 먼저 전송해야 하는 순서 의무 (`b7cc33c3`, 2024). `epics-rs` 구독 이벤트 전송 순서 확인 필요.
 - **`mbbi`/`mbbo`의 `DBE_PROPERTY` 누락 버그**: 해당 레코드에서 `DBE_PROPERTY`가 아예 발생하지 않는 C++ 버그. `epics-rs` 구현에서 동일한 패턴 여부 점검.
-- **빈 배열(length=0) `caput` 시 DBR 오프셋 오계산** (`8cc20393`, 2020): DBR 헤더에서 첫 번째 원소의 크기를 잘못 계산. `epics-rs`의 `dbr::encode_array` 엣지 케이스 확인.
+- **빈 배열(length=0) `caput` 시 DBR 오프셋 오계산** (`8cc20393`, 2020) — ⏭️ **ALREADY**: C 매크로 `dbr_size_n`의 `(COUNT)-1` 언더플로 버그(unsigned)는 Rust `DbFieldType::buffer_size(count) = element_size() * count` 직접 곱셈으로 발생 불가. `count=0` → `value_size=0` (`crates/epics-base-rs/src/types/dbr.rs:147,167`). `dbr_buffer_size`도 동일.
 - **빈 배열 `caput` 시 스칼라에 `INVALID_ALARM` 설정** (`12cfd418`, 2020) — ⏭️ **ALREADY** (semantic diff): `put_pv` (`crates/epics-base-rs/src/server/database/field_io.rs:83-92`)가 commit 12cfd41 hash까지 명시한 가드로 `value.is_empty_array() && target_is_scalar` 케이스를 `CaError::InvalidValue` 반환으로 reject. C의 LINK_ALARM/INVALID_ALARM 세트 대신 Err 전파로 fail-fast — converter는 호출되지 않으며 garbage value 작성도 차단됨. 알람 필드 변경은 발생하지 않으므로 stat/sevr monitor 채널은 영향 없음 (C와 미세 차이).
 - **`dbGet`으로 빈 배열을 스칼라로 읽을 때 크래시** (`39c8d561`, 2020): 배열 원소가 0개일 때 스칼라 `dbGet` 경로가 크래시하는 버그.
 - **`UTAG` uint64 타입 필드 전파** (`b94afaa0`, 2020) — ⚠️ **N/A** (의도적): `epics-rs`의 `snapshot.user_tag: i32`는 PVA Normative `time_t.userTag = int` 스펙과 일치하는 wire-correct 표현. upstream의 internal uint64는 CA-level UTAG 노출 + db_field_log 전파(둘 다 미구현)에 의미. CA-level UTAG가 필요해질 때 i64로 승격 + PVA encode에서 truncate-with-warning.

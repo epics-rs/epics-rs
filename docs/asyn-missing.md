@@ -28,6 +28,8 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 | FTDI 드라이버 스캐폴드 | PR #88 | `drivers/ftdi.rs` (config parser + scaffold, hardware path feature-gated) |
 | USBTMC 드라이버 스캐폴드 | 기존 | `drivers/usbtmc.rs` (this session — vid/pid/serial/interface parser + scaffold, `usbtmc-hw` feature-gated) |
 | Prologix GPIB 드라이버 스캐폴드 | PR #129 | `drivers/prologix.rs` (this session — host:port + GPIB addr parser, `++addr` line builder, TCP path delegates to ip_port) |
+| VXI-11 드라이버 스캐폴드 | 기존 | `drivers/vxi11.rs` (this session — host[:device_name] + lock/io timeout parser, `vxi11-hw` feature-gated, ONC RPC stack 미장착) |
+| HiSLIP 드라이버 스캐폴드 | Issue #130 | `drivers/hislip.rs` (this session — host[:port] + subaddress + maxMessageSize parser, `hislip-hw` feature-gated, IVI-6.1 frame parser 미장착) |
 | UDP 서버 모드 (`drvAsynIPServerPort UDP`) | 기존 | `drivers/ip_server_port.rs::IpServerProtocol::Udp` (this session — parser + protocol enum; runtime listener returns "not yet wired" pending UDP-server adapter) |
 | `asyn:FIFO` info-tag 링 버퍼 | 2015년경 | `asyn_record/fifo.rs` (this session — `RingBuffer<T>` drop-oldest + overrun counter + `parse_fifo_tag`) |
 | `getLimits` 인터페이스 | Issue #218 | `interfaces/limits.rs::AsynLimits` (this session — `IntLimits`/`FloatLimits` + read trait) |
@@ -44,8 +46,8 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 |---|---|---|---|
 | **USBTMC** (`drvAsynUSBTMC`) | 기존 | 🔄 PARTIAL | `drivers/usbtmc.rs` 스캐폴드 (config parser + `PortDriver` trait) 완료. `usbtmc-hw` feature 활성화 시 `rusb`/`nusb` 바인딩 wiring 필요 |
 | **Prologix GPIB** | PR #129 | 🔄 PARTIAL | `drivers/prologix.rs` 스캐폴드 (host:port + GPIB addr parser + `++addr` line builder) 완료. `connect()` 가 ip_port adapter 위임 — TCP 본체는 follow-up |
-| **VXI-11** (`drvVxi11`) | 기존 | ❌ 미구현 | ONC RPC 클라이언트 필요 (`onc-rpc` crate). 1000+ LOC |
-| **HiSLIP** | Issue #130 | ❌ 미구현 | TCP 기반 고속 LAN 계측기 프로토콜. 500-800 LOC |
+| **VXI-11** (`drvVxi11`) | 기존 | 🔄 PARTIAL | `drivers/vxi11.rs` 스캐폴드 (host[:device_name] + 타임아웃 parser + `PortDriver` trait) 완료. `vxi11-hw` feature 활성화 시 ONC RPC 스택 (`onc-rpc` crate 또는 커스텀 XDR — `create_link`, `device_write`, `device_read`, `device_clear`, `destroy_link`, abort 채널) wiring 필요 |
+| **HiSLIP** | Issue #130 | 🔄 PARTIAL | `drivers/hislip.rs` 스캐폴드 (host[:port] + subaddress + maxMessageSize parser + `PortDriver` trait) 완료. `hislip-hw` feature 활성화 시 IVI-6.1 프레임 파서 + sync/async 채널 분리 wiring 필요 |
 
 ### 2. 어댑터 계층 누락
 
@@ -64,12 +66,12 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 
 ### 4. 외부-dep 필요 항목 묶음
 
-- USBTMC (`usbtmc-hw`), FTDI (`ftdi-mpsse`) hardware-path —
-  scaffold-only-status. 패턴: config parser + `PortDriver` trait
-  impl + 외부 dep feature-gate.
+- USBTMC (`usbtmc-hw`), FTDI (`ftdi-mpsse`), VXI-11 (`vxi11-hw`),
+  HiSLIP (`hislip-hw`) — 모두 scaffold-only. 패턴: config parser +
+  `PortDriver` trait impl + 외부 dep feature-gate. `connect()` 가
+  feature 미활성화 시 명확한 에러 반환.
 - Prologix GPIB — 외부 dep 없음 (TCP). scaffold + `++addr` 빌더
   완료, `connect()` 가 ip_port adapter 위임 (follow-up).
-- VXI-11, HiSLIP — 아직 dep crate 선정 단계 (`onc-rpc` 후보).
 
 ---
 
@@ -80,14 +82,14 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 3. **asyn:FIFO record adapter wiring** (push/pop 호출 사이트) — medium
 4. **USBTMC `usbtmc-hw` rusb/nusb 바인딩** — medium
 5. **Prologix `connect()` ip_port 위임 wiring** — small
-6. **PVI / asynParamSet** (architectural, multi-day) — large
-7. **VXI-11 / HiSLIP** (RPC / TCP protocols, multi-day each) — large
+6. **VXI-11 `vxi11-hw` ONC RPC 스택 wiring** — large
+7. **HiSLIP `hislip-hw` IVI-6.1 frame parser wiring** — large
+8. **PVI / asynParamSet** (architectural, multi-day) — large
 
 ---
 
 ### 종합 요약
-`asyn-rs`는 단순한 포팅을 넘어 C++ 버전의 고질적 버그와 최신 요구사항(TCP 비동기 커넥션, RS485 지원, SO_REUSEPORT, BREAK, AVERAGE 등)을 이미 매우 높은 수준으로 선제 반영. 본 세션에서 USBTMC/Prologix scaffold, UDP-server protocol parser, `asyn:FIFO` ring buffer, `getLimits` trait 까지 추가 — 남은 큰 마일스톤은:
+`asyn-rs`는 단순한 포팅을 넘어 C++ 버전의 고질적 버그와 최신 요구사항(TCP 비동기 커넥션, RS485 지원, SO_REUSEPORT, BREAK, AVERAGE 등)을 이미 매우 높은 수준으로 선제 반영. 본 세션에서 USBTMC/Prologix/VXI-11/HiSLIP scaffold, UDP-server protocol parser, `asyn:FIFO` ring buffer, `getLimits` trait, aai/aao DTYP 회귀 테스트까지 추가 — 남은 큰 마일스톤은:
 
-1. **계측기 전용 프로토콜 (VXI-11, HiSLIP)** — RPC/TCP 본체 구현
-2. **scaffold → 런타임 wiring** (USBTMC HW, Prologix ip_port 위임, FIFO record-adapter, UDP-server adapter, getLimits ↔ DRVH/DRVL)
-3. **PVI tree topology** — 아키텍처적 확장
+1. **scaffold → 런타임 wiring** (USBTMC HW, VXI-11 ONC RPC, HiSLIP IVI-6.1 frames, Prologix ip_port 위임, FIFO record-adapter, UDP-server adapter, getLimits ↔ DRVH/DRVL)
+2. **PVI tree topology** — 아키텍처적 확장

@@ -99,6 +99,12 @@ impl PvDatabase {
                 }
             };
 
+            // Capture the pre-put value so the metadata-cache
+            // invalidation (and the downstream `DBE_PROPERTY`
+            // emission) can be skipped when the put is a no-op —
+            // epics-base faac1df1.
+            let prev_value = instance.record.get_field(&field);
+
             // put_pv is C EPICS dbPut: write value + special/on_put.
             // Does NOT post monitor events (use put_pv_and_post for that).
             // Does NOT clear UDF or trigger processing.
@@ -113,9 +119,9 @@ impl PvDatabase {
                 Err(e) => return Err(e),
             };
 
-            // Invalidate metadata cache if this field was a metadata-class field
-            // (EGU/PREC/HOPR/LOPR/alarm-limits/DRVH/DRVL/state-strings).
-            instance.notify_field_written(&field);
+            // Invalidate metadata cache only if the metadata-class
+            // field's value actually changed (faac1df1).
+            instance.notify_field_written_if_changed(&field, prev_value.as_ref());
 
             // Update scan index if SCAN or PHAS changed
             match common_result {
@@ -252,8 +258,10 @@ impl PvDatabase {
                 Err(e) => return Err(e),
             }
 
-            // Invalidate metadata cache if a metadata-class field changed.
-            instance.notify_field_written(&field);
+            // Invalidate metadata cache only if a metadata-class
+            // field actually changed value (faac1df1 — DBE_PROPERTY
+            // fires on real changes, not no-op writes).
+            instance.notify_field_written_if_changed(&field, old_value.as_ref());
 
             // Post monitor events if value or alarm changed
             let new_value = instance.record.get_field(&field);
@@ -428,6 +436,9 @@ impl PvDatabase {
                 return Err(e);
             }
 
+            // Capture pre-put value for faac1df1 idempotent-write suppression.
+            let prev_value = instance.record.get_field(&field);
+
             // Try record-specific field first; fall back to common on FieldNotFound.
             // For record-owned fields, call on_put() and special() after successful put,
             // matching what put_common_field() does for common fields.
@@ -445,8 +456,9 @@ impl PvDatabase {
                 }
             };
 
-            // Invalidate metadata cache if a metadata-class field changed.
-            instance.notify_field_written(&field);
+            // Invalidate metadata cache only if the metadata-class
+            // field's value actually changed (faac1df1).
+            instance.notify_field_written_if_changed(&field, prev_value.as_ref());
 
             instance.common.putf = false;
 
@@ -555,6 +567,7 @@ impl PvDatabase {
         // Records — alias-aware (epics-base PR #336).
         if let Some(rec) = self.get_record(base).await {
             let mut instance = rec.write().await;
+            let prev_value = instance.record.get_field(&field);
             match instance.record.put_field(&field, value.clone()) {
                 Ok(()) => {}
                 Err(CaError::FieldNotFound(_)) => {
@@ -562,8 +575,9 @@ impl PvDatabase {
                 }
                 Err(e) => return Err(e),
             }
-            // Invalidate metadata cache if a metadata-class field changed.
-            instance.notify_field_written(&field);
+            // Invalidate metadata cache only if the metadata-class
+            // field actually changed (faac1df1).
+            instance.notify_field_written_if_changed(&field, prev_value.as_ref());
             return Ok(());
         }
 

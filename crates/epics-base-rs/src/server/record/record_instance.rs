@@ -229,6 +229,28 @@ impl RecordInstance {
         }
     }
 
+    /// Like [`notify_field_written`] but skips the invalidation when
+    /// the put did not actually change the field's value. Mirrors
+    /// epics-base `faac1df1` — `DBE_PROPERTY` events fire only on
+    /// real changes, not on idempotent writes (the C path compares
+    /// `paddr->pfield` against the converted payload before setting
+    /// the `propertyUpdate` flag).
+    ///
+    /// `prev` is the value captured BEFORE the put. Callers that
+    /// don't need the change-detection (e.g. internal writers that
+    /// know the field is non-metadata) can keep using
+    /// [`notify_field_written`].
+    pub fn notify_field_written_if_changed(&self, field: &str, prev: Option<&EpicsValue>) {
+        let upper = field.to_ascii_uppercase();
+        if !is_metadata_field(&upper) {
+            return;
+        }
+        let now = self.record.get_field(&upper);
+        if prev != now.as_ref() {
+            self.invalidate_metadata_cache();
+        }
+    }
+
     /// Returns the cached MetadataSnapshot, building and storing it on
     /// the first call (or after invalidation). Used by both
     /// `snapshot_for_field` and `make_monitor_snapshot` so the populate
@@ -1885,6 +1907,59 @@ mod metadata_cache_tests {
         // Lowercase metadata field name should still trigger invalidation
         inst.notify_field_written("egu");
         assert!(inst.metadata_cache.lock().unwrap().is_none());
+    }
+
+    /// epics-base faac1df1 — `notify_field_written_if_changed` must
+    /// SKIP the cache invalidation when the metadata field's value
+    /// didn't actually change. Otherwise a stream of idempotent puts
+    /// from a CSS panel binds DBE_PROPERTY subscribers to bogus
+    /// "property changed" events on every cycle.
+    #[test]
+    fn notify_field_written_if_changed_skips_when_unchanged() {
+        let mut inst = ai_instance();
+        let _ = inst.snapshot_for_field("VAL");
+        assert!(inst.metadata_cache.lock().unwrap().is_some());
+
+        // Capture prev, do a no-op put, then notify — cache must remain.
+        let prev = inst.record.get_field("EGU");
+        let _ = inst.record.put_field("EGU", prev.clone().unwrap());
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
+        assert!(
+            inst.metadata_cache.lock().unwrap().is_some(),
+            "no-op put must not invalidate the metadata cache"
+        );
+    }
+
+    /// And when the value DID change, the cache must invalidate.
+    #[test]
+    fn notify_field_written_if_changed_invalidates_on_real_change() {
+        let mut inst = ai_instance();
+        let _ = inst.snapshot_for_field("VAL");
+        assert!(inst.metadata_cache.lock().unwrap().is_some());
+
+        let prev = inst.record.get_field("EGU");
+        let _ = inst
+            .record
+            .put_field("EGU", EpicsValue::String("kPa".into()));
+        inst.notify_field_written_if_changed("EGU", prev.as_ref());
+        assert!(
+            inst.metadata_cache.lock().unwrap().is_none(),
+            "real metadata change must invalidate cache"
+        );
+    }
+
+    /// Non-metadata fields don't carry property semantics — the
+    /// `if_changed` variant must never invalidate for them, matching
+    /// the existing `notify_field_written` short-circuit.
+    #[test]
+    fn notify_field_written_if_changed_skips_non_metadata_field() {
+        let inst = ai_instance();
+        let _ = inst.snapshot_for_field("VAL");
+        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        // VAL is not in is_metadata_field set — must be skipped even
+        // with a changed value.
+        inst.notify_field_written_if_changed("VAL", None);
+        assert!(inst.metadata_cache.lock().unwrap().is_some());
     }
 
     #[test]

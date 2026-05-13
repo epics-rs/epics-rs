@@ -494,7 +494,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **재연결 루프 지연(Slow down reconnect loop)** (`3b8540f52002`, high) — ⏭️ **ALREADY**: `channel.rs::holdoff_until` 타이머로 connect-fail holdoff 구현.
 - **종료(Shutdown) 중 Name Server 재연결 금지** (`4d12da87205e`, high) — ✅ **DONE**: `ConnectionPool`에 `shutdown: AtomicBool` 추가, `clear()`(PvaClient::close 경로)가 release-store로 set. `Channel::ensure_active`의 name-server fallback이 `pool.is_shutdown()`을 체크해 true일 때 후보 목록에 추가하지 않음 — 이 경로가 pvxs 4d12da87이 `context->state==Running` 분기로 막던 것과 동일 효과. 테스트 2종(clear→true 전이, fresh→false 유지).
 - **`Channel` Search Bypass 최적화** (`5d3a21f03010`, high) — ⏭️ **ALREADY**: `Channel::new_direct` (`crates/epics-pva-rs/src/client_native/channel.rs:315`)와 `PvaClient::channel`의 `forced.or(server_addr)` 분기 (`context.rs:298-311`)가 UDP search를 건너뛰고 지정된 server addr로 직접 TCP 연결. 코멘트에 "pvxs ConnectBuilder::server"로 출처 명시.
-- **`Channel` 일관된 연결 해제(Disconnect) 처리** (`f7b3821e10b4`, high) — ⏸️ DEFERRED.
+- **`Channel` 일관된 연결 해제(Disconnect) 처리** (`f7b3821e10b4`, high) — ⏭️ **ALREADY**: epics-pva-rs는 `Channel::set_state` (`channel.rs:678`)를 single entry point로 두고, 상태 전이 시 SID-close hook 등록/해제 + `server_destroyed` flag 처리를 한 곳에서 일관 처리. `close()`는 `set_state(Closed)`로 라우팅, 서버측 `CMD_DESTROY_CHANNEL` 수신 시에도 동일 경로(pvxs e668038 참조 코멘트). Rust Drop chain이 connector / op 정리를 보강.
 - **`Context::close()` 명시적 지원** (`0de17036f4a6`, medium) — ⏭️ **ALREADY**: `PvaClient::close()` (`context.rs:610`).
 - **Search 패킷 단편화(Fragmentation) 방지** (`84ef355a4a1a`, medium) — ⚠️ **N/A**: 현재 `build_search`가 count=1 단일 PV 패킷이라 MTU 미만 — batching 미구현이므로 fragmentation 발생 자체 불가.
 - **환경 변수를 통한 설정 가능 타임아웃** (`da004bc54bb3`, medium) — ⏸️ DEFERRED.

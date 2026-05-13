@@ -52,7 +52,7 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 
 | 항목 | C asyn 출처 | 상태 | 비고 |
 |---|---|---|---|
-| `asyn:FIFO` info-tag 링 버퍼 (full wiring) | 2015년경 | `asyn_record/fifo.rs::RingBuffer<T>` + `adapter.rs` 통합 (this session — `info(asyn:FIFO, "N")` 파싱, 인터럽트 task 가 ring 에 push (drop-oldest), `read()` 가 ring 에서 pop. 8개 burst → 5-deep ring 회귀 테스트로 drop-oldest 정책 fence) |
+| `asyn:FIFO` info-tag 링 버퍼 | 2015년경 | 🔄 PARTIAL | `asyn_record/fifo.rs::RingBuffer<T>` (drop-oldest + overrun counter + tag parser) 완료. record adapter 측 push/pop 호출 사이트 wiring 은 follow-up |
 | `getLimits` 인터페이스 | Issue #218 | 🔄 PARTIAL | `interfaces/limits.rs::AsynLimits` trait + `IntLimits`/`FloatLimits` 완료. record-layer DRVH/DRVL ↔ limits read 자동 동기화는 follow-up |
 
 ### 3. 아키텍처
@@ -76,6 +76,7 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 ## 다음 우선순위 (구현 가능 순)
 
 1. **getLimits ↔ record DRVH/DRVL 자동 동기화** (adapter wiring) — small
+3. **asyn:FIFO record adapter wiring** (push/pop 호출 사이트) — medium
 4. **USBTMC `usbtmc-hw` rusb/nusb 바인딩** — medium
 6. **VXI-11 `vxi11-hw` ONC RPC 스택 wiring** — large
 7. **HiSLIP `hislip-hw` IVI-6.1 frame parser wiring** — large

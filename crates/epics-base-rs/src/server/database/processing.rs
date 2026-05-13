@@ -350,6 +350,29 @@ impl PvDatabase {
                 } else {
                     let _ = instance.record.set_val(inp_val);
                 }
+            } else if is_soft
+                && matches!(
+                    inp_parsed,
+                    crate::server::record::ParsedLink::Db(_)
+                        | crate::server::record::ParsedLink::Ca(_)
+                        | crate::server::record::ParsedLink::Pva(_)
+                )
+            {
+                // epics-base PR #4737901: soft-channel `read_xxx` must
+                // surface link-read failures via the alarm tree, not
+                // silently succeed. When the INP link is a real
+                // Db/Ca/Pva link (i.e. operator expected a value) and
+                // the read returned None, attach LINK_ALARM/INVALID
+                // so downstream consumers can react. ParsedLink::None
+                // and Constant don't fall into this branch — the
+                // former is "no link configured", the latter has its
+                // own None-as-no-value semantics.
+                use crate::server::recgbl::{alarm_status, rec_gbl_set_sevr};
+                rec_gbl_set_sevr(
+                    &mut instance.common,
+                    alarm_status::LINK_ALARM,
+                    crate::server::record::AlarmSeverity::Invalid,
+                );
             }
 
             // Apply multi-input values (INPA..INPL -> A..L)

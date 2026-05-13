@@ -389,7 +389,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`AMSG` 알람 메시지가 MSS 링크를 통해 전파되지 않음** (`d0cf47c`, medium): 알람 메시지 문자열이 링크를 타고 다운스트림 레코드로 전파되지 않는 버그.
 - **타임스탬프가 출력 링크 처리 후 갱신되어 `TSEL` 스탤 타임스탬프 발생** (`f1e83b2`, medium): 출력 링크가 처리된 후에 타임스탬프가 갱신되어 다운스트림 `TSEL`이 오래된 값을 읽는 버그.
 - **`dbNotify`: 첫 번째 레코드 호출에서만 `PUTF` 설정** (`3fb10b6`, medium): `dbNotify` 경로에서 `PUTF` 플래그가 중간 레코드에도 잘못 설정되는 버그.
-- **`devAiSoft read_ai`: 디바이스 읽기 실패 시 오류 반환** (`4737901`, medium): 소프트 채널이 오류를 무시하고 성공을 반환하는 버그.
+- **`devAiSoft read_ai`: 디바이스 읽기 실패 시 오류 반환** (`4737901`, medium) — ✅ **DONE**: `processing.rs::process_record_with_links_inner`에서 soft-channel DTYP의 INP read 가 `None`을 반환하고 (`read_link_value_soft → get_pv → Err`) 그 INP가 실제 Db/Ca/Pva 링크였을 때 `rec_gbl_set_sevr(LINK_ALARM, INVALID)`로 알람 전파. 기존엔 silently `None` → 정상 처리 종료로 broken link 가 invisible. 회귀 테스트: `test_soft_inp_read_failure_sets_link_alarm` (database_tests.rs).
 - **`initHookRegister` 멱등성 보장** (`13d6ca5`, medium): 동일한 훅 함수를 여러 번 등록해도 한 번만 실행되도록 보장. → 섹션 5 항목 보강.
 - **`iocShutdown`에서 de-init hook 알림 추가** (`5d5e552`, partial): 셧다운 시퀀스에 `initHookAfterShutdown` 등 훅 발화 추가.
 - **`errlog` 워커가 셧다운 전 버퍼를 비우지 않고 루프 종료** (`7448a8b`, partial): 종료 시 로그 버퍼가 드레인되지 않는 버그.

@@ -64,6 +64,52 @@ async fn test_inp_link_processing() {
     }
 }
 
+/// epics-base PR #4737901 regression: a soft-channel ai record with
+/// an INP link to a non-existent PV must surface LINK_ALARM/INVALID
+/// rather than silently returning the cached VAL with NO_ALARM. The
+/// pre-fix path called `read_link_value_soft → get_pv → Err` then
+/// folded the error to `None` and let process() succeed — leaving
+/// downstream alarm consumers blind to the broken link.
+#[tokio::test]
+async fn test_soft_inp_read_failure_sets_link_alarm() {
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::server::recgbl::alarm_status;
+
+    let db = PvDatabase::new();
+    db.add_record("BROKEN", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Point INP at a record that doesn't exist. Soft Channel is the
+    // default DTYP, so the read path runs through
+    // `read_link_value_soft → get_pv("NO_SUCH_PV")` which returns Err.
+    if let Some(rec) = db.get_record("BROKEN").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("NO_SUCH_PV".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("BROKEN", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("BROKEN").await.expect("record exists");
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Invalid,
+        "broken soft-channel INP must drive SEVR=INVALID, got {:?}",
+        inst.common.sevr
+    );
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::LINK_ALARM,
+        "broken soft-channel INP must drive STAT=LINK, got {}",
+        inst.common.stat
+    );
+}
+
 #[tokio::test]
 async fn test_cycle_detection() {
     let db = PvDatabase::new();

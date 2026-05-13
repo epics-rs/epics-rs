@@ -591,6 +591,21 @@ impl CaServer {
     /// Re-read ACF from an arbitrary path. Use this when the source has
     /// moved or when the server was originally configured in-memory.
     pub async fn reload_acf_from(&self, path: &str) -> CaResult<()> {
+        Self::reload_acf_inner(path, &self.acf, &self.acf_reload_tx).await?;
+        if let Ok(mut p) = self.acf_source_path.lock() {
+            *p = Some(path.to_string());
+        }
+        Ok(())
+    }
+
+    /// Shared implementation of `reload_acf_from` factored so the
+    /// HAG-DNS-refresh task in `run()` can reload via cloned handles
+    /// without holding the full `&self` borrow.
+    pub(crate) async fn reload_acf_inner(
+        path: &str,
+        acf: &Arc<tokio::sync::RwLock<Option<access_security::AccessSecurityConfig>>>,
+        reload_tx: &tokio::sync::broadcast::Sender<()>,
+    ) -> CaResult<()> {
         // F9: std::fs::read_to_string blocks the worker thread on slow
         // NFS / FUSE / network FS. Run it on the blocking pool so
         // concurrent CA TCP traffic on the same worker doesn't stall
@@ -602,16 +617,13 @@ impl CaServer {
             .map_err(CaError::Io)?;
         let parsed = access_security::parse_acf(&content)?;
         {
-            let mut guard = self.acf.write().await;
+            let mut guard = acf.write().await;
             *guard = Some(parsed);
-        }
-        if let Ok(mut p) = self.acf_source_path.lock() {
-            *p = Some(path.to_string());
         }
         // Notify every active TCP client to recompute and push fresh
         // CA_PROTO_ACCESS_RIGHTS for its open channels. Send-error
         // (no live subscribers) is a normal transient state.
-        let notified = self.acf_reload_tx.send(()).unwrap_or(0);
+        let notified = reload_tx.send(()).unwrap_or(0);
         tracing::info!(
             path = %path,
             clients = notified,
@@ -981,6 +993,53 @@ impl CaServer {
                 .await
             }
         });
+
+        // epics-base PR #862/#863 (DNS TTL refresh of HAG): when the
+        // operator sets `EPICS_RS_HAG_DNS_REFRESH_SECS=N`, periodically
+        // re-read the registered ACF source path and re-resolve every
+        // HAG hostname → IP set. This catches cases where a hostname's
+        // DNS A record changed (cluster failover, DHCP host renewal)
+        // without an operator-driven `/reload-acf`. N=0 (default) keeps
+        // the historic on-demand-only behaviour. The task is silently
+        // skipped when no ACF source path is registered (in-memory
+        // config has no file to re-read).
+        //
+        // We clone the small set of fields the task needs (acf,
+        // acf_reload_tx, path string) instead of cloning the whole
+        // `&self` borrow — `run` takes `&self` so no Arc<Self> is
+        // available, but the inner Arc-shared state already implements
+        // the necessary handle semantics.
+        let _hag_refresh_handle = {
+            let secs = epics_base_rs::runtime::env::get("EPICS_RS_HAG_DNS_REFRESH_SECS")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let path = self.acf_source_path();
+            if secs > 0 && path.is_some() {
+                let path = path.unwrap();
+                let acf = self.acf.clone();
+                let reload_tx = self.acf_reload_tx.clone();
+                Some(epics_base_rs::runtime::task::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+                    tick.tick().await; // skip immediate fire
+                    loop {
+                        tick.tick().await;
+                        match Self::reload_acf_inner(&path, &acf, &reload_tx).await {
+                            Ok(()) => tracing::trace!(
+                                target: "epics_ca_rs::server",
+                                "HAG DNS refresh tick: ACF re-read + re-resolved"
+                            ),
+                            Err(e) => tracing::debug!(
+                                target: "epics_ca_rs::server",
+                                error = %e,
+                                "HAG DNS refresh: ACF reload failed (non-fatal)"
+                            ),
+                        }
+                    }
+                }))
+            } else {
+                None
+            }
+        };
 
         // Signal-driven drain: SIGTERM (and SIGINT on unix) flips the
         // drain flag. The accept loop will exit; existing connections

@@ -329,7 +329,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`envGetBoolConfigParam` 함수** (`f837add8`, 2016) — ⏭️ **ALREADY**: `runtime::env::get_bool` 구현.
 - **`iocsh`에 등록된 변수/함수 목록 조회 API** (`daad3c69`, 2016) — ⏭️ **ALREADY**: `CommandRegistry` enumeration + auto `help` 명령.
 - **`dbServerStats()` API** (`bcc6cb96`/`350570134`, 2025, PR #592) — ✅ **DONE**: 섹션 2 동일 (commit `ac92e3e`).
-- **iocsh ANSI 컬러 출력** (`c0da3dd`, 2025) — ⏸️ **DEFERRED**: 프롬프트/에러 ANSI 컬러 — UX 개선이지만 우선순위 낮음.
+- **iocsh ANSI 컬러 출력** (`c0da3dd`, 2025) — ✅ **DONE** (this session): `IocShell::run_repl_interactive` 가 cyan 프롬프트 (`\x1b[36m...epics> \x1b[0m`), 에러는 bold-red `\x1b[1;31mError:\x1b[0m ...`. rustyline `\x01...\x02` 브래킷으로 prompt-width tracking 보존. `NO_COLOR=1` (https://no-color.org) 및 `EPICS_RS_IOCSH_NO_COLOR=1` opt-out 지원. 회귀 테스트 2종 (format_error / use_ansi_color env vars).
 
 ---
 

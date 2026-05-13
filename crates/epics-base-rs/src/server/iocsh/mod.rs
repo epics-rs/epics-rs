@@ -230,8 +230,25 @@ impl IocShell {
         let mut rl = rustyline::DefaultEditor::with_config(config)
             .map_err(|e| format!("failed to initialize readline: {e}"))?;
 
+        // epics-base 8-D `c0da3dd` ANSI color: tint the prompt cyan
+        // and route errors through bold red so an operator can scan a
+        // long terminal scrollback for command outcomes. Honour the
+        // `NO_COLOR=1` env var convention (https://no-color.org) and
+        // also fall through to plain output when stdout is not a TTY
+        // (already TTY-gated by `run_repl` dispatch but defensive).
+        let want_color = use_ansi_color();
+        let prompt = if want_color {
+            // \x1b[36m = cyan; \x1b[0m = reset.
+            // Bracket as `\x01...\x02` so rustyline excludes the
+            // sequence from prompt-width / cursor-position tracking
+            // (otherwise the cursor lands several chars off).
+            "\x01\x1b[36m\x02epics> \x01\x1b[0m\x02"
+        } else {
+            "epics> "
+        };
+
         loop {
-            match rl.readline("epics> ") {
+            match rl.readline(prompt) {
                 Ok(line) => {
                     let line = line.trim().to_string();
                     if line.is_empty() {
@@ -242,13 +259,16 @@ impl IocShell {
                     match self.execute_line(&line) {
                         Ok(CommandOutcome::Continue) => {}
                         Ok(CommandOutcome::Exit) => break,
-                        Err(e) => eprintln!("Error: {e}"),
+                        Err(e) => eprintln!("{}", format_error(&e, want_color)),
                     }
                 }
                 Err(rustyline::error::ReadlineError::Eof) => break,
                 Err(rustyline::error::ReadlineError::Interrupted) => continue,
                 Err(e) => {
-                    eprintln!("readline error: {e}");
+                    eprintln!(
+                        "{}",
+                        format_error(&format!("readline error: {e}"), want_color)
+                    );
                     break;
                 }
             }
@@ -310,6 +330,33 @@ impl IocShell {
 /// leading whitespace) follow immediately. `\` followed by any other
 /// character — including a space before the newline — keeps the
 /// backslash literal and terminates the logical line normally.
+/// epics-base 8-D `c0da3dd` ANSI color: returns `true` if the iocsh
+/// REPL should emit ANSI color sequences. Honours `NO_COLOR` env var
+/// (https://no-color.org) and `EPICS_RS_IOCSH_NO_COLOR=1` opt-out;
+/// otherwise on by default in the interactive (TTY) path.
+fn use_ansi_color() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if let Ok(v) = std::env::var("EPICS_RS_IOCSH_NO_COLOR") {
+        let t = v.trim().to_ascii_uppercase();
+        if matches!(t.as_str(), "1" | "YES" | "TRUE" | "ON") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Format an error string with optional ANSI bold-red prefix.
+/// Plain `Error: <msg>` when color is off — preserves grep-ability.
+fn format_error(msg: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[1;31mError:\x1b[0m {msg}")
+    } else {
+        format!("Error: {msg}")
+    }
+}
+
 ///
 /// Returns `(physical_line_number, logical_line)` pairs. The line
 /// number is the 1-based index of the *first* physical line in the
@@ -805,5 +852,52 @@ mod tests {
         // Both args are required — missing recordName must Err.
         let r = shell.execute_line("dbCreateRecord ai");
         assert!(r.is_err());
+    }
+
+    /// epics-base 8-D `c0da3dd`: `format_error` emits a bold-red
+    /// `Error:` prefix when color is on, plain `Error:` otherwise.
+    #[test]
+    fn test_format_error_with_and_without_color() {
+        let plain = format_error("oops", false);
+        assert_eq!(plain, "Error: oops");
+        let colored = format_error("oops", true);
+        assert!(colored.starts_with("\x1b[1;31mError:\x1b[0m "));
+        assert!(colored.contains("oops"));
+    }
+
+    /// `NO_COLOR` and `EPICS_RS_IOCSH_NO_COLOR` env vars opt out of
+    /// the ANSI prompt. Defensive — uses `serial_test` group key so
+    /// concurrent env-mutating tests don't race.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn test_use_ansi_color_respects_no_color() {
+        // Snapshot + restore so the test doesn't leak state to siblings.
+        let no_color = std::env::var_os("NO_COLOR");
+        let epics_no = std::env::var_os("EPICS_RS_IOCSH_NO_COLOR");
+        // Clear both so the default path returns true.
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+            std::env::remove_var("EPICS_RS_IOCSH_NO_COLOR");
+        }
+        assert!(use_ansi_color());
+
+        unsafe { std::env::set_var("NO_COLOR", "1") };
+        assert!(!use_ansi_color(), "NO_COLOR=1 must disable color");
+        unsafe { std::env::remove_var("NO_COLOR") };
+
+        unsafe { std::env::set_var("EPICS_RS_IOCSH_NO_COLOR", "yes") };
+        assert!(
+            !use_ansi_color(),
+            "EPICS_RS_IOCSH_NO_COLOR=yes must disable color"
+        );
+        unsafe { std::env::remove_var("EPICS_RS_IOCSH_NO_COLOR") };
+
+        // Restore.
+        if let Some(v) = no_color {
+            unsafe { std::env::set_var("NO_COLOR", v) };
+        }
+        if let Some(v) = epics_no {
+            unsafe { std::env::set_var("EPICS_RS_IOCSH_NO_COLOR", v) };
+        }
     }
 }

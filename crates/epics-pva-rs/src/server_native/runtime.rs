@@ -492,11 +492,18 @@ impl PvaServer {
     /// this server on loopback. Mirrors pvxs `Server::clientConfig` —
     /// useful for self-contained tests where you want a client that
     /// talks to the in-process server without UDP discovery.
+    ///
+    /// Loopback family matches the server's `bind_ip` family (PR #205
+    /// IPv6 Stage 1): a v6-bound server hands out a `[::1]:port`
+    /// client target, a v4-bound server hands out `127.0.0.1:port`.
+    /// Otherwise a v6 listener on `[::1]` would be unreachable from
+    /// the test client.
     pub fn client_config(&self) -> crate::client_native::context::PvaClient {
-        let addr = SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            self.bound_tcp_port,
-        );
+        let loopback = match self.effective_config.bind_ip {
+            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        };
+        let addr = SocketAddr::new(loopback, self.bound_tcp_port);
         crate::client_native::context::PvaClient::builder()
             .server_addr(addr)
             .build()
@@ -716,6 +723,42 @@ mod tcp_fallback_tests {
                 .await
                 .expect("connect timed out");
         let _stream = connect.expect("IPv6 TCP connect must succeed");
+        drop(server);
+    }
+
+    /// End-to-end IPv6 PVA round-trip — start a server on `[::1]`,
+    /// add a PV, build a client via `client_config()` (which now
+    /// hands out a v6 loopback target to match the server family),
+    /// and pvget the value. Proves the full PVA stack — TCP listener,
+    /// handshake, channel creation, GET — works over IPv6.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pvget_round_trip_over_ipv6_loopback() {
+        use crate::nt::typed::TypedNT;
+        use std::net::Ipv6Addr;
+        // Plain NTScalar<double> source, matching the typed_nt
+        // `pvget_typed_primitive_f64` shape.
+        let pv = crate::server_native::SharedPV::new();
+        let value: f64 = 42.5;
+        pv.open(f64::descriptor(), f64::to_pv_field(&value));
+        let source = Arc::new(SharedSource::new());
+        source.add("V6:LOOP", pv);
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config);
+        let client = server.client_config();
+
+        let got: f64 =
+            tokio::time::timeout(Duration::from_secs(5), client.pvget_typed::<f64>("V6:LOOP"))
+                .await
+                .expect("pvget timed out over IPv6")
+                .expect("pvget must succeed over IPv6");
+        assert_eq!(got, value, "round-trip value must match over IPv6");
         drop(server);
     }
 

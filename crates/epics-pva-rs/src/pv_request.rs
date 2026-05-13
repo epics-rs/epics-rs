@@ -16,8 +16,8 @@
 //! caller need not append anything after the body.
 
 use crate::proto::ByteOrder;
-use crate::pvdata::{FieldDesc, PvField};
 use crate::pvdata::encode::encode_type_desc;
+use crate::pvdata::{FieldDesc, PvField};
 
 /// Build a pvRequest selecting `fields` at the top level of "field(...)".
 fn build(fields: &[&str], order: ByteOrder) -> Vec<u8> {

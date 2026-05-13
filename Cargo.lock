@@ -830,6 +830,7 @@ dependencies = [
  "epics-macros-rs",
  "hostname",
  "if-addrs",
+ "libc",
  "parking_lot",
  "rustyline",
  "serde_json",

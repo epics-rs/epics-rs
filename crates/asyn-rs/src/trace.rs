@@ -11,12 +11,18 @@ use bitflags::bitflags;
 
 bitflags! {
     /// What to trace — control message categories.
-    /// Values MUST match C asyn's asynDriver.h definitions:
-    ///   ASYN_TRACE_ERROR=0x0001, ASYN_TRACEIO_DEVICE=0x0002,
-    ///   ASYN_TRACEIO_FILTER=0x0004, ASYN_TRACEIO_DRIVER=0x0008,
-    ///   ASYN_TRACE_FLOW=0x0010, ASYN_TRACE_WARNING=0x0020,
-    ///   ASYN_TRACE_STATE=0x0040 (asyn PR #67 — driver state-machine
-    ///   transition events)
+    ///
+    /// Values match C asyn `asynDriver.h:211-216` exactly:
+    /// ```text
+    ///   ASYN_TRACE_ERROR     0x0001
+    ///   ASYN_TRACEIO_DEVICE  0x0002
+    ///   ASYN_TRACEIO_FILTER  0x0004
+    ///   ASYN_TRACEIO_DRIVER  0x0008
+    ///   ASYN_TRACE_FLOW      0x0010
+    ///   ASYN_TRACE_WARNING   0x0020
+    /// ```
+    /// C asyn defines exactly these 6 bits — no `ASYN_TRACE_STATE`
+    /// or any other bit is referenced anywhere in the C source.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct TraceMask: u32 {
         const ERROR      = 0x0001;
@@ -25,38 +31,47 @@ bitflags! {
         const IO_DRIVER  = 0x0008;
         const FLOW       = 0x0010;
         const WARNING    = 0x0020;
-        const STATE      = 0x0040;
     }
 }
 
 impl TraceMask {
-    /// Parse a `|`-separated symbolic mask string (asyn PR #76):
-    /// `"ERROR|IO_DEVICE|FLOW"`. Case-insensitive on bit names.
-    /// Numeric tokens accepted (`"0x40"`, `"64"`) and OR-folded with
-    /// the symbolic ones. Empty input returns empty mask. Unknown
-    /// tokens are reported as Err naming the offending token —
-    /// callers (iocsh `asynSetTraceMask`) can `unwrap_or` to silent
-    /// no-op or surface to operator.
+    /// Parse a symbolic mask string the way C asyn does
+    /// (asynShellCommands.c:670-699 `asynTraceMaskStringToInt`):
+    ///
+    /// - **Tokens**: short names `ERROR`, `DEVICE`, `FILTER`,
+    ///   `DRIVER`, `FLOW`, `WARNING`. C accepts these directly OR
+    ///   with `ASYN_` and `TRACE_` / `TRACEIO_` prefixes stripped
+    ///   (`ASYN_TRACEIO_DEVICE` → `DEVICE`).
+    /// - **Separators**: `|` OR `+` (C: `*maskStr == '|' || == '+'`).
+    /// - **Numeric**: decimal / `0x` hex / leading-`0` octal via
+    ///   `strtol(.., 0)`.
+    /// - **Case-insensitive** (C uses `epicsStrnCaseCmp`).
+    /// - **Whitespace** between tokens / separators tolerated.
+    ///
+    /// Empty input returns the empty mask. Unknown tokens are
+    /// reported as `Err` naming the offending text — callers
+    /// (iocsh `asynSetTraceMask`) can choose to fail or silently
+    /// drop. C just `printf`s an error and returns whatever it
+    /// accumulated so far; we surface explicitly.
     pub fn from_symbolic(s: &str) -> Result<TraceMask, String> {
         let mut mask = TraceMask::empty();
-        for raw in s.split('|') {
+        for raw in split_mask_tokens(s) {
             let tok = raw.trim();
             if tok.is_empty() {
                 continue;
             }
-            // Try numeric first (decimal, 0x hex, 0o octal).
             if let Some(n) = parse_numeric(tok) {
                 mask |= TraceMask::from_bits_truncate(n);
                 continue;
             }
-            let bit = match tok.to_ascii_uppercase().as_str() {
-                "ERROR" | "ASYN_TRACE_ERROR" => TraceMask::ERROR,
-                "IO_DEVICE" | "ASYN_TRACEIO_DEVICE" => TraceMask::IO_DEVICE,
-                "IO_FILTER" | "ASYN_TRACEIO_FILTER" => TraceMask::IO_FILTER,
-                "IO_DRIVER" | "ASYN_TRACEIO_DRIVER" => TraceMask::IO_DRIVER,
-                "FLOW" | "ASYN_TRACE_FLOW" => TraceMask::FLOW,
-                "WARNING" | "ASYN_TRACE_WARNING" => TraceMask::WARNING,
-                "STATE" | "ASYN_TRACE_STATE" => TraceMask::STATE,
+            let normalized = strip_c_prefixes(tok, &["TRACE_", "TRACEIO_"]);
+            let bit = match normalized.as_str() {
+                "ERROR" => TraceMask::ERROR,
+                "DEVICE" => TraceMask::IO_DEVICE,
+                "FILTER" => TraceMask::IO_FILTER,
+                "DRIVER" => TraceMask::IO_DRIVER,
+                "FLOW" => TraceMask::FLOW,
+                "WARNING" => TraceMask::WARNING,
                 _ => {
                     return Err(format!("unknown trace mask token: '{tok}'"));
                 }
@@ -68,10 +83,15 @@ impl TraceMask {
 }
 
 impl TraceIoMask {
-    /// Parse a `|`-separated symbolic mask: `"ASCII|ESCAPE|HEX"`.
+    /// Parse a symbolic IO-mask string the way C asyn does
+    /// (asynShellCommands.c:756-783 `asynTraceIOMaskStringToInt`):
+    ///
+    /// Tokens: `NODATA` (= 0x0, suppress payload), `ASCII`,
+    /// `ESCAPE`, `HEX`. Accepts `ASYN_` / `TRACEIO_` prefixes.
+    /// Separators `|` or `+`. Numeric strtol-style.
     pub fn from_symbolic(s: &str) -> Result<TraceIoMask, String> {
         let mut mask = TraceIoMask::empty();
-        for raw in s.split('|') {
+        for raw in split_mask_tokens(s) {
             let tok = raw.trim();
             if tok.is_empty() {
                 continue;
@@ -80,10 +100,16 @@ impl TraceIoMask {
                 mask |= TraceIoMask::from_bits_truncate(n);
                 continue;
             }
-            let bit = match tok.to_ascii_uppercase().as_str() {
-                "ASCII" | "ASYN_TRACEIO_ASCII" => TraceIoMask::ASCII,
-                "ESCAPE" | "ASYN_TRACEIO_ESCAPE" => TraceIoMask::ESCAPE,
-                "HEX" | "ASYN_TRACEIO_HEX" => TraceIoMask::HEX,
+            let normalized = strip_c_prefixes(tok, &["TRACEIO_"]);
+            let bit = match normalized.as_str() {
+                // C asyn `ASYN_TRACEIO_NODATA = 0x0000` — accepted
+                // as a token name but contributes no bits. Caller
+                // setting only NODATA effectively clears the mask,
+                // which matches the C semantic of "show no payload".
+                "NODATA" => TraceIoMask::empty(),
+                "ASCII" => TraceIoMask::ASCII,
+                "ESCAPE" => TraceIoMask::ESCAPE,
+                "HEX" => TraceIoMask::HEX,
                 _ => return Err(format!("unknown trace I/O mask token: '{tok}'")),
             };
             mask |= bit;
@@ -93,10 +119,14 @@ impl TraceIoMask {
 }
 
 impl TraceInfoMask {
-    /// Parse a `|`-separated symbolic mask: `"TIME|PORT|SOURCE|THREAD"`.
+    /// Parse a symbolic info-mask string the way C asyn does
+    /// (asynShellCommands.c:822-849 `asynTraceInfoMaskStringToInt`):
+    ///
+    /// Tokens: `TIME`, `PORT`, `SOURCE`, `THREAD`. Accepts
+    /// `ASYN_` / `TRACEINFO_` prefixes. Separators `|` or `+`.
     pub fn from_symbolic(s: &str) -> Result<TraceInfoMask, String> {
         let mut mask = TraceInfoMask::empty();
-        for raw in s.split('|') {
+        for raw in split_mask_tokens(s) {
             let tok = raw.trim();
             if tok.is_empty() {
                 continue;
@@ -105,11 +135,12 @@ impl TraceInfoMask {
                 mask |= TraceInfoMask::from_bits_truncate(n);
                 continue;
             }
-            let bit = match tok.to_ascii_uppercase().as_str() {
-                "TIME" | "ASYN_TRACEINFO_TIME" => TraceInfoMask::TIME,
-                "PORT" | "ASYN_TRACEINFO_PORT" => TraceInfoMask::PORT,
-                "SOURCE" | "ASYN_TRACEINFO_SOURCE" => TraceInfoMask::SOURCE,
-                "THREAD" | "ASYN_TRACEINFO_THREAD" => TraceInfoMask::THREAD,
+            let normalized = strip_c_prefixes(tok, &["TRACEINFO_"]);
+            let bit = match normalized.as_str() {
+                "TIME" => TraceInfoMask::TIME,
+                "PORT" => TraceInfoMask::PORT,
+                "SOURCE" => TraceInfoMask::SOURCE,
+                "THREAD" => TraceInfoMask::THREAD,
                 _ => return Err(format!("unknown trace info mask token: '{tok}'")),
             };
             mask |= bit;
@@ -118,11 +149,40 @@ impl TraceInfoMask {
     }
 }
 
+/// Split a mask string on `|` or `+` (C asyn: see the do/while
+/// `*maskStr == '|' || == '+'` at asynShellCommands.c:693).
+fn split_mask_tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c| c == '|' || c == '+')
+}
+
+/// Strip the `ASYN_` prefix (always tried) plus any of the
+/// `category_prefixes` (e.g. `TRACE_`, `TRACEIO_`, `TRACEINFO_`),
+/// uppercase the result. Mirrors the `STARTSWITH(maskStr, ASYN_)`
+/// + `STARTSWITH(maskStr, TRACE_) || STARTSWITH(maskStr, TRACEIO_)`
+/// pattern that asynShellCommands.c uses to fold long forms
+/// (`ASYN_TRACEIO_DEVICE`) into short ones (`DEVICE`).
+fn strip_c_prefixes(tok: &str, category_prefixes: &[&str]) -> String {
+    let upper = tok.to_ascii_uppercase();
+    let stripped = upper.strip_prefix("ASYN_").unwrap_or(&upper);
+    for p in category_prefixes {
+        if let Some(rest) = stripped.strip_prefix(p) {
+            return rest.to_string();
+        }
+    }
+    stripped.to_string()
+}
+
 fn parse_numeric(tok: &str) -> Option<u32> {
     if let Some(rest) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
         u32::from_str_radix(rest, 16).ok()
     } else if let Some(rest) = tok.strip_prefix("0o").or_else(|| tok.strip_prefix("0O")) {
         u32::from_str_radix(rest, 8).ok()
+    } else if let Some(rest) = tok.strip_prefix('0').filter(|s| !s.is_empty()) {
+        // C `strtol(., ., 0)` treats `"0..."` as octal. Match that
+        // for parity with C asyn's symbolic-or-numeric token
+        // handling. Plain "0" (no following digits) parses as 0
+        // via the strip-fail branch below.
+        u32::from_str_radix(rest, 8).ok().or_else(|| tok.parse::<u32>().ok())
     } else {
         tok.parse::<u32>().ok()
     }
@@ -612,36 +672,45 @@ mod tests {
         assert!(!mgr.is_enabled("port1", TraceMask::IO_DRIVER));
     }
 
-    /// asyn PR #67: ASYN_TRACE_STATE bit (0x40) must be a usable
-    /// flag, distinct from the other 6 categories.
+    /// C asyn defines 6 trace bits in `asynDriver.h:211-216`. This
+    /// test fences that we don't accidentally re-introduce extra
+    /// bits — `grep -rn "ASYN_TRACE_STATE" ~/codes/epics-modules/asyn`
+    /// returns 0 hits, so any additional bit would be invented.
     #[test]
-    fn test_state_bit_value_and_disjoint() {
-        assert_eq!(TraceMask::STATE.bits(), 0x0040);
-        // Disjoint from every other category bit.
-        for other in [
-            TraceMask::ERROR,
-            TraceMask::IO_DEVICE,
-            TraceMask::IO_FILTER,
-            TraceMask::IO_DRIVER,
-            TraceMask::FLOW,
-            TraceMask::WARNING,
-        ] {
-            assert!(
-                !TraceMask::STATE.intersects(other),
-                "STATE must not overlap {other:?}"
-            );
-        }
+    fn test_six_bits_match_c_asyn_header() {
+        assert_eq!(TraceMask::ERROR.bits(), 0x0001);
+        assert_eq!(TraceMask::IO_DEVICE.bits(), 0x0002);
+        assert_eq!(TraceMask::IO_FILTER.bits(), 0x0004);
+        assert_eq!(TraceMask::IO_DRIVER.bits(), 0x0008);
+        assert_eq!(TraceMask::FLOW.bits(), 0x0010);
+        assert_eq!(TraceMask::WARNING.bits(), 0x0020);
+        // Union of all 6 = 0x3F.
+        let all = TraceMask::ERROR
+            | TraceMask::IO_DEVICE
+            | TraceMask::IO_FILTER
+            | TraceMask::IO_DRIVER
+            | TraceMask::FLOW
+            | TraceMask::WARNING;
+        assert_eq!(all.bits(), 0x003F);
     }
 
-    /// asyn PR #76: symbolic mask string parsing for
-    /// `asynSetTraceMask <port> "ERROR|FLOW|STATE"` — accepts
-    /// case-insensitive bit names, ASYN_-prefixed aliases, and
-    /// numeric tokens (decimal / 0x hex / 0o octal). Unknown
-    /// tokens return Err naming the offending token.
+    /// C asyn `asynShellCommands.c:670-699`: short token names
+    /// `ERROR/DEVICE/FILTER/DRIVER/FLOW/WARNING` (no `IO_` prefix).
+    /// C accepts the long forms via `STARTSWITH(maskStr, ASYN_)` +
+    /// `STARTSWITH(maskStr, TRACE_)/(TRACEIO_)` prefix stripping.
     #[test]
     fn test_trace_mask_from_symbolic_basic() {
-        let m = TraceMask::from_symbolic("ERROR|FLOW|STATE").unwrap();
-        assert_eq!(m, TraceMask::ERROR | TraceMask::FLOW | TraceMask::STATE);
+        let m = TraceMask::from_symbolic("ERROR|FLOW|DEVICE").unwrap();
+        assert_eq!(m, TraceMask::ERROR | TraceMask::FLOW | TraceMask::IO_DEVICE);
+    }
+
+    /// C parity: long tokens `ASYN_TRACEIO_DRIVER`, `ASYN_TRACE_FLOW`
+    /// fold to short names via prefix-strip; `+` separator works as
+    /// well as `|` (asynShellCommands.c:693).
+    #[test]
+    fn test_trace_mask_from_symbolic_long_form_and_plus_separator() {
+        let m = TraceMask::from_symbolic("ASYN_TRACEIO_DRIVER+ASYN_TRACE_FLOW").unwrap();
+        assert_eq!(m, TraceMask::IO_DRIVER | TraceMask::FLOW);
     }
 
     #[test]
@@ -655,8 +724,9 @@ mod tests {
 
     #[test]
     fn test_trace_mask_from_symbolic_numeric_mix() {
-        let m = TraceMask::from_symbolic("ERROR|0x40|0o20").unwrap();
-        assert_eq!(m, TraceMask::ERROR | TraceMask::STATE | TraceMask::FLOW);
+        // 0x10 = FLOW (C asyn `ASYN_TRACE_FLOW`).
+        let m = TraceMask::from_symbolic("ERROR|0x10|0o20").unwrap();
+        assert_eq!(m, TraceMask::ERROR | TraceMask::FLOW);
     }
 
     #[test]
@@ -677,10 +747,30 @@ mod tests {
 
     #[test]
     fn test_trace_io_mask_and_info_mask_symbolic() {
-        let io = TraceIoMask::from_symbolic("ASCII|HEX").unwrap();
-        assert_eq!(io, TraceIoMask::ASCII | TraceIoMask::HEX);
+        // `+` separator + ASYN_-prefixed long form, per C asyn usage
+        // strings (asynShellCommands.c:723 example).
+        let io = TraceIoMask::from_symbolic("ESCAPE+HEX").unwrap();
+        assert_eq!(io, TraceIoMask::ESCAPE | TraceIoMask::HEX);
+        let io2 = TraceIoMask::from_symbolic("ASYN_TRACEIO_ASCII").unwrap();
+        assert_eq!(io2, TraceIoMask::ASCII);
         let info = TraceInfoMask::from_symbolic("TIME|THREAD").unwrap();
         assert_eq!(info, TraceInfoMask::TIME | TraceInfoMask::THREAD);
+    }
+
+    /// C asyn `ASYN_TRACEIO_NODATA = 0x0000` (asynDriver.h:219) is
+    /// a valid token that means "no payload". Setting only NODATA
+    /// gives an empty mask (asynShellCommands.c:770).
+    #[test]
+    fn test_trace_io_nodata_token() {
+        assert_eq!(
+            TraceIoMask::from_symbolic("NODATA").unwrap(),
+            TraceIoMask::empty()
+        );
+        // NODATA OR'd with other bits is a no-op.
+        assert_eq!(
+            TraceIoMask::from_symbolic("NODATA+HEX").unwrap(),
+            TraceIoMask::HEX
+        );
     }
 
     #[test]

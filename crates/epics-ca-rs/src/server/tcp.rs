@@ -175,6 +175,14 @@ struct ChannelEntry {
     /// `.FIELD` suffix). Retained so the `ChannelCleared` lifecycle
     /// event can emit the same name as `ChannelCreated`.
     pv_name: String,
+    /// Raw channel-filter JSON suffix the client appended after the
+    /// record (epics-base 3.15.7). `None` for ordinary channels;
+    /// `Some` when the client requested `REC.{"dbnd":{"d":0.5}}`
+    /// etc. Parsed via
+    /// `server::database::filters::parse_filter_chain` on
+    /// `CA_PROTO_EVENT_ADD` so the filter chain attaches to the
+    /// fresh subscriber.
+    filter_suffix: Option<String>,
 }
 
 struct SubscriptionEntry {
@@ -1099,10 +1107,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .unwrap_or(payload.len());
             let pv_name = String::from_utf8_lossy(&payload[..end]).to_string();
             let client_cid = hdr.cid;
-            let (_base, field_raw) = parse_pv_name(&pv_name);
+            // epics-base 3.15.7 channel-filter suffix
+            // (`REC.{"dbnd":{"d":0.5}}`). Split the JSON suffix off
+            // for the record lookup, but keep `pv_name` verbatim so
+            // the audit log and `ChannelCreated`/`ChannelCleared`
+            // events still surface the literal string the client
+            // used. `filter_suffix` is stashed on the channel so
+            // EVENT_ADD can build a `FilterChain` from it later.
+            let parsed_channel =
+                epics_base_rs::server::database::filters::split_channel_name(&pv_name);
+            let record_path = parsed_channel.record_path;
+            let filter_suffix = parsed_channel.json_suffix;
+            let (_base, field_raw) = parse_pv_name(&record_path);
             let field = field_raw.to_ascii_uppercase();
 
-            if let Some(entry) = db.find_entry(&pv_name).await {
+            if let Some(entry) = db.find_entry(&record_path).await {
                 let sid = state.alloc_sid();
 
                 let (dbr_type, element_count, target) = match entry {
@@ -1172,6 +1191,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         target,
                         cid: client_cid,
                         pv_name: pv_name.clone(),
+                        filter_suffix: filter_suffix.clone(),
                     },
                 );
                 state.channel_access.insert(sid, access_level);
@@ -1825,6 +1845,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             .await?;
                             return Ok(());
                         };
+
+                        // epics-base 3.15.7 channel filter — if the
+                        // channel was created with a `.{...}` JSON
+                        // suffix, build the FilterChain now and attach
+                        // it to the just-registered subscriber. The
+                        // parser is permissive: malformed JSON or
+                        // unknown filters degrade gracefully to an
+                        // empty chain with a tracing::warn!.
+                        if let Some(json) = entry.filter_suffix.as_deref() {
+                            let chain =
+                                epics_base_rs::server::database::filters::parse_filter_chain(json);
+                            for filt in chain.iter() {
+                                instance.attach_filter_to_last_subscriber(field, filt.clone());
+                            }
+                        }
 
                         // Send initial value with full metadata
                         if let Some(mut snap) = instance.snapshot_for_field(field) {

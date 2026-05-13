@@ -41,7 +41,7 @@
 - **CA 클라이언트의 서버 프로토콜 버전 결정 (PR #711)** — ⏭️ **ALREADY**: `transport.rs`가 CA_PROTO_VERSION 수신 시 `server_minor_version`을 캡처하고 `send_echo`에서 v4.3+ ECHO vs 이전 READ_SYNC로 분기.
 - **지정된 TCP 포트 + UDP 5064 분리 (PR #69)** — ✅ **DONE** `9d8a34b`: `cas_server_port()`, `CaServerBuilder::tcp_port`, `IocApplication::tcp_port`. UDP 응답기가 실제 바인딩된 TCP 포트를 SEARCH_REPLY에 광고.
 - **절전 모드(Suspend) 해제 후 CA 멈춤 현상 (Issue #190)** — ✅ **DONE** `a409311`: wall-clock skip 기반 suspend wake 탐지, echo probe 5s→1s 단축, tracing::info 기록. 절전 후 복구 ~1s.
-- **서버 측 채널 필터 (Server-side Filters, 3.15.7)** — 🔄 **PARTIAL**: Stages 1-3 완료 — Framework + 4개 필터 (`dbnd`, `arr`, `ts`, `dec`) + **PV-name JSON 파서**. `parser.rs`의 `split_channel_name`/`parse_filter_chain`이 `PV.{"dbnd":{"d":0.5}}`/`PV.VAL.{"arr":{"s":0,"i":2,"e":-1}}` 형태를 `(record_path, FilterChain)`으로 분해. `serde_json` `preserve_order` feature로 입력 순서 보존 (`dec→dbnd→ts` 체인이 `dbnd→dec→ts`로 reorder되지 않음). 알려지지 않은 필터는 `tracing::warn!` 후 skip — forward-compat. 47 tests (filter logic 33 + parser 14). 남은 작업: `sync` 필터 (외부 trigger PV 종속) + CA/PVA 채널 생성 경로에서 `split_channel_name` → `attach_filter_to_last_subscriber` wire-through.
+- **서버 측 채널 필터 (Server-side Filters, 3.15.7)** — 🔄 **PARTIAL**: Stages 1-4 완료 — Framework + 4개 필터 (`dbnd`, `arr`, `ts`, `dec`) + JSON 파서 + **CA 서버 wire-through**. `CA_PROTO_CREATE_CHAN`에서 `split_channel_name`으로 record path/JSON suffix 분리, `ChannelEntry.filter_suffix`에 stash. `CA_PROTO_EVENT_ADD`(record-field 분기)가 `parse_filter_chain`으로 chain 구성 → 갓 등록된 subscriber에 `attach_filter_to_last_subscriber`로 attach. `pv_name` audit 필드는 client가 보낸 원본 그대로 유지(JSON suffix 포함)하여 추적성 보존. 남은 작업: PVA 서버 wire-through (pvRequest 구문 다름) + `sync` 필터 (외부 trigger PV 종속).
 
 ---
 

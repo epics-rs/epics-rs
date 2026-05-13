@@ -242,7 +242,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 ### 7-F. 흐름 제어 / 큐 (Flow-Control, 7건)
 - **`dbnd` 필터의 알람/프로퍼티 이벤트 통과** (`446e0d4a`, 2021): 데드밴드(deadband) 필터가 `DBE_ALARM` 및 `DBE_PROPERTY` 이벤트는 항상 통과시켜야 함. `epics-rs` 서버 필터 구현 시 반드시 반영 필요.
 - **`dbEvent` 큐 사이즈 조정** (`c8e5deca`, 2019): 이벤트 큐 크기 기본값 변경. `epics-rs`의 이벤트 큐 버퍼 정책 검토.
-- **`callbackParallelThreads` 비율(%) 지정 지원** (`fe39a007`, 2026): 콜백 스레드 수를 CPU 코어 수의 백분율로 지정하는 기능. `epics-rs`의 Tokio 런타임 워커 설정에 준하는 노출 방식 검토.
+- **`callbackParallelThreads` 비율(%) 지정 지원** (`fe39a007`, 2026) — ⚠️ **N/A (design diff)**: epics-rs는 C의 `callback.c` 큐 시스템과 그 `callbackParallelThreads` iocsh 명령을 갖지 않음 (tokio 런타임이 callback work를 처리). 백분율 인자 파싱이 적용될 진입점 자체가 부재. tokio worker thread 수는 별도 `tokio::runtime::Builder::worker_threads` 설정으로 제어, 백분율 입력이 필요해질 때 iocsh 명령 신설 시 동등하게 처리.
 - **CPU 과다 보고 방지** (`556de06f`, 2026): → 섹션 3의 기존 항목과 동일 (PR #788).
 - **필터 내 `dbGet` 통과 경로** (`17a8dbc2`, 2020): `dbDbGetValue()` 내에서 채널 필터를 거치는 흐름 경로. `epics-rs`의 서버 필터 컨텍스트 처리 확인.
 

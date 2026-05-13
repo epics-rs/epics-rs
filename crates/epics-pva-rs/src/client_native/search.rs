@@ -177,11 +177,11 @@ pub async fn search(pv_name: &str, total_timeout: Duration) -> PvaResult<SocketA
 
         let mut buf = vec![0u8; 1500];
         match timeout(wait, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, _from))) => {
+            Ok(Ok((n, peer))) => {
                 if let Ok(Some((frame, _))) = try_parse_frame(&buf[..n]) {
                     if let Ok(resp) = decode_search_response(&frame) {
                         if resp.found && resp.cids.contains(&search_id) {
-                            return Ok(rewrite_loopback_target(&resp));
+                            return Ok(rewrite_loopback_target(&resp, peer));
                         }
                     }
                 }
@@ -199,10 +199,20 @@ pub async fn search(pv_name: &str, total_timeout: Duration) -> PvaResult<SocketA
 }
 
 /// Some servers report 0.0.0.0 as their TCP address (meaning "use the source
-/// address of this UDP packet"); rewrite that to a useful loopback addr.
-fn rewrite_loopback_target(resp: &SearchResponse) -> SocketAddr {
+/// address of this UDP packet"); rewrite that to the actual UDP peer so we
+/// connect to a routable address. Falls back to a loopback whose family
+/// matches the peer when the peer itself is loopback (PR #205 IPv6 Stage 4).
+fn rewrite_loopback_target(resp: &SearchResponse, peer: SocketAddr) -> SocketAddr {
     if resp.server_addr.ip().is_unspecified() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), resp.server_addr.port())
+        let target_ip = if peer.ip().is_loopback() {
+            match peer.ip() {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            }
+        } else {
+            peer.ip()
+        };
+        SocketAddr::new(target_ip, resp.server_addr.port())
     } else {
         resp.server_addr
     }

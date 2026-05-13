@@ -108,7 +108,7 @@
 - **aSub 레코드의 상수 `INP*` 허용 여부 (Issue #284 / d47fa4c)** — ⏭️ **ALREADY**: `processing.rs` multi-input fetch (`PvDatabase::read_link_with_alarm`)이 `ParsedLink::Constant`에 대해 `link.constant_value()`를 직접 반환 (`links.rs:91`), `_ => (None, None)`로 polymorphic하게 처리. C가 `dbGetLink` 단일 진입점에서 constant에 에러 반환하던 패턴이 enum 분기로 자연스럽게 해소 — aSub `INPA..INPL`이 constant일 때도 fetch_values 등가 단계가 에러 없이 진행.
 - **긴 문자열 `CALC$` 지원 이슈 (Issue #194)** — ⚠️ **N/A (out of scope)**: 원이슈는 C `caput -S test_calc.CALC$`(field name + `$` long-string suffix)가 일부 바이트만 작성되는 truncation 버그. `parse_pv_name` (`crates/epics-base-rs/src/server/database/mod.rs:22`)이 `$` 접미사를 별도 처리하지 않으며 `FIELD$` long-string access 자체가 미구현. truncation할 access 경로가 부재 — long-string `$` 접근이 추가될 때 이 항목 재검토.
 - **`DBF_MENU` → `DBF_STRING` 변환 버그 픽스 대조 (Issue #183)** — ⏭️ **ALREADY**: `BiRecord::put_field("VAL", String)` / `MbbiRecord::put_field("VAL", String)` / `BoRecord::put_field("VAL", String)` 모두 ZNAM/ONAM/STATE_STR 문자열을 enum 인덱스로 매핑하는 분기 보유 (`crates/epics-base-rs/src/server/records/{bi,mbbi,bo}.rs`에 "epics-base PR/issue #183" 주석으로 명시).
-- **`zero-length` (길이가 0인) 배열 지원 엣지 케이스 (7.0.5)** — ⏸️ DEFERRED.
+- **`zero-length` (길이가 0인) 배열 지원 엣지 케이스 (7.0.5 / 5d808b7+3b3261c)** — ⏭️ **ALREADY**: upstream은 `S_db_emptyArray` 도입(5d808b7)했다가 호환성 문제로 revert(3b3261c) — 현재 C는 `S_db_badField`를 사용. Rust `CaError::InvalidValue`(`crates/epics-base-rs/src/error.rs:33` → ECA_BADTYPE 매핑)가 동일 의미로 일반화된 invalid-value 케이스를 처리하며, 빈 배열→스칼라 가드(12cfd41)가 이 경로에 적용됨. revert된 별도 `EmptyArray` variant는 의도적으로 추가하지 않음.
 - **`compress` 레코드 개선 (7.0.8)** — ⏸️ DEFERRED.
 
 ### Shell & 시스템 코어 세부
@@ -406,7 +406,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 > 본 세션 일괄: **⏸️ DEFERRED**.
 
 - **`histogramRecord` wdog 콜백이 `VAL` 대신 `bptr`로 이벤트 발송** (`4a0f488`, medium): 히스토그램 레코드의 잘못된 포인터로 모니터 이벤트 발송.
-- **영(zero)원소 배열 읽기에 대한 고유 오류 코드** (`5d808b7`, medium): `S_db_emptyArray` 등 배열 길이 0 상황에 대한 전용 오류 코드 필요.
+- **영(zero)원소 배열 읽기에 대한 고유 오류 코드** (`5d808b7`+`3b3261c`, medium) — ⏭️ **ALREADY (post-revert)**: 섹션 5 보강 참조. upstream이 `S_db_emptyArray`를 revert하여 다시 `S_db_badField` 사용, Rust `CaError::InvalidValue`가 동일 의미.
 - **`.DTYP` 없는 레코드 타입에서 `DTYP` 조회 시 크래시 대신 빈 문자열** (`6e7a715`, medium): 디바이스 지원이 없는 레코드에서 `.DTYP` 조회 시 안전하게 처리.
 - **`get_enum_strs` 포인터 산술이 `_FORTIFY_SOURCE=3`에서 경고** (`979dde8`, medium): 열거형 문자열 배열 접근 방식이 강화된 컴파일러 보안 검사에서 걸리는 패턴.
 - **`lsi`/`lso` `SIZV` 필드가 32767에서 오버플로** (`e5b4829`, medium → 7-B 항목 보강): `dbAddr::field_size`가 부호 있는 정수여서 32768 이상에서 오버플로.

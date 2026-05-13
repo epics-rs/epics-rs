@@ -1244,6 +1244,15 @@ impl PvDatabase {
                     EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
                 ));
             }
+            // Add subscribed non-{VAL,SEVR,STAT,UDF} fields that
+            // actually changed since last notification — mirrors the
+            // main-path snapshot gate (process_record_with_links_inner
+            // L794-820). Without this, every async-completion cycle
+            // re-sends every subscribed auxiliary field even when its
+            // value is unchanged, multiplying the monitor traffic for
+            // any record that pairs an async write with a sticky
+            // metadata field.
+            let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
                     && field != "VAL"
@@ -1252,9 +1261,22 @@ impl PvDatabase {
                     && field != "UDF"
                 {
                     if let Some(val) = instance.resolve_field(field) {
-                        changed_fields.push((field.clone(), val));
+                        let changed = match instance.last_posted.get(field) {
+                            Some(prev) => prev != &val,
+                            None => true,
+                        };
+                        if changed {
+                            sub_updates.push((field.clone(), val));
+                        }
                     }
                 }
+            }
+            if !sub_updates.is_empty() {
+                for (field, val) in &sub_updates {
+                    instance.last_posted.insert(field.clone(), val.clone());
+                }
+                changed_fields.extend(sub_updates);
+                event_mask |= crate::server::recgbl::EventMask::VALUE;
             }
             let snapshot = crate::server::record::ProcessSnapshot {
                 changed_fields,

@@ -2126,3 +2126,88 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
         );
     }
 }
+
+/// Regression: `complete_async_record_inner`'s subscriber-snapshot loop
+/// previously appended every subscribed non-{VAL,SEVR,STAT,UDF} field
+/// unconditionally — no `last_posted` change check, no `last_posted`
+/// update — while the main path (`process_record_with_links_inner`
+/// L794-820) gates on actual change. The asymmetry meant every
+/// async-completion cycle re-sent every subscribed auxiliary field even
+/// when its value was unchanged, multiplying monitor traffic for
+/// records that pair an async write with a sticky metadata field
+/// subscription.
+///
+/// This test pins the post-fix behaviour for both halves of the gate:
+/// (a) unchanged → no event; (b) changed → event flows through.
+#[tokio::test]
+async fn test_complete_async_record_gates_subscribed_field_on_change() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_GATE", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Seed DESC to a known value so add_subscriber's last_posted
+    // initialiser captures it.
+    if let Some(rec) = db.get_record("ASYNC_GATE").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("DESC", EpicsValue::String("alpha".into()))
+            .unwrap();
+    }
+
+    let mut desc_rx = if let Some(rec) = db.get_record("ASYNC_GATE").await {
+        let mut inst = rec.write().await;
+        inst.add_subscriber("DESC", 7, DbFieldType::String, EventMask::VALUE.bits())
+    } else {
+        None
+    }
+    .expect("DESC subscription must be accepted");
+
+    // Drive process → AsyncPending early-return, then async completion.
+    // DESC value unchanged since subscription, so the gate must
+    // suppress the event.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_GATE", &mut visited, 0)
+        .await
+        .unwrap();
+    db.complete_async_record("ASYNC_GATE").await.unwrap();
+
+    assert!(
+        desc_rx.try_recv().is_err(),
+        "DESC unchanged across async-completion → must NOT post a duplicate event"
+    );
+
+    // Change DESC, re-run process+complete. The new value must flow.
+    if let Some(rec) = db.get_record("ASYNC_GATE").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("DESC", EpicsValue::String("beta".into()))
+            .unwrap();
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_GATE", &mut visited, 0)
+        .await
+        .unwrap();
+    db.complete_async_record("ASYNC_GATE").await.unwrap();
+
+    let event = desc_rx
+        .try_recv()
+        .expect("DESC change must produce a post-completion event");
+    assert!(
+        matches!(event.snapshot.value, EpicsValue::String(ref s) if s == "beta"),
+        "DESC event payload should reflect post-change value, got {:?}",
+        event.snapshot.value
+    );
+
+    // And another no-op cycle after the change must again be silent.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_GATE", &mut visited, 0)
+        .await
+        .unwrap();
+    db.complete_async_record("ASYNC_GATE").await.unwrap();
+    assert!(
+        desc_rx.try_recv().is_err(),
+        "DESC stable after the change → no further events"
+    );
+}

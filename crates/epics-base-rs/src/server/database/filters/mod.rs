@@ -29,9 +29,15 @@ use std::sync::Arc;
 use crate::server::pv::MonitorEvent;
 use crate::server::recgbl::EventMask;
 
+pub mod arr;
 pub mod dbnd;
+pub mod decimate;
+pub mod ts;
 
-pub use dbnd::DeadbandFilter;
+pub use arr::{ArrayFilter, ArrayFilterConfig};
+pub use dbnd::{DeadbandFilter, DeadbandMode};
+pub use decimate::DecimateFilter;
+pub use ts::TimestampFilter;
 
 /// One event passed through the filter chain. Wraps the standard
 /// [`MonitorEvent`] with the originating [`EventMask`] so filters

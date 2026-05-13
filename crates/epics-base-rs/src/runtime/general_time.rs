@@ -33,6 +33,12 @@ struct GeneralTimeInner {
     last_current_name: Option<String>,
     /// Name of the provider that last supplied event time.
     last_event_name: Option<String>,
+    /// epics-base 8-D `5cfff383` `osiClockTime` sync hooks: callbacks
+    /// notified when an external time source (PTP, NTP, beacon-driven
+    /// PPS) reports a clock-step or fresh sync. Registered via
+    /// [`register_clock_sync_hook`]; fired by [`notify_clock_sync`]
+    /// when the time-source provider has new sync information.
+    sync_hooks: Vec<Box<dyn Fn(SystemTime) + Send + Sync>>,
 }
 
 impl GeneralTimeInner {
@@ -45,6 +51,7 @@ impl GeneralTimeInner {
             last_best_time: SystemTime::UNIX_EPOCH,
             last_current_name: None,
             last_event_name: None,
+            sync_hooks: Vec::new(),
         };
         // Register the OS clock as the last-resort current time provider.
         inner.current_providers.push(CurrentTimeProvider {
@@ -99,6 +106,41 @@ pub fn register_event_provider(
         .position(|p| p.priority > priority)
         .unwrap_or(inner.event_providers.len());
     inner.event_providers.insert(pos, provider);
+}
+
+/// Register a callback fired whenever a time provider reports a fresh
+/// external sync (PTP master step, NTP sync window, GPS PPS). Mirrors
+/// epics-base 8-D `5cfff383` `osiClockTime` sync-hook interface.
+///
+/// Hooks are invoked from [`notify_clock_sync`] in registration order
+/// with the new (post-sync) time. They MUST be cheap — they execute
+/// inside the general-time mutex; long work should defer to a spawn.
+/// There is no de-registration API: hooks live for the process
+/// lifetime, mirroring the upstream's atomic-add semantics.
+pub fn register_clock_sync_hook<F>(hook: F)
+where
+    F: Fn(SystemTime) + Send + Sync + 'static,
+{
+    let mut inner = GENERAL_TIME.lock().unwrap();
+    inner.sync_hooks.push(Box::new(hook));
+}
+
+/// Time-source providers (PTP/NTP integrations, hardware-clock
+/// drivers) call this when they receive a fresh sync from their
+/// upstream master. Every registered [`register_clock_sync_hook`]
+/// callback fires with `t_synced` — the time the source reports as
+/// authoritative right now.
+///
+/// `notify_clock_sync` does NOT itself update any internal cache —
+/// `get_current` and `get_event` keep their existing ratchet semantics
+/// (a backward step is rejected). The hook is purely a notification
+/// channel for downstream consumers (records that want to log a
+/// step, archivers that want to insert a discontinuity marker).
+pub fn notify_clock_sync(t_synced: SystemTime) {
+    let inner = GENERAL_TIME.lock().unwrap();
+    for hook in &inner.sync_hooks {
+        hook(t_synced);
+    }
 }
 
 /// Get the current time from the highest-priority provider that succeeds.
@@ -423,5 +465,51 @@ mod tests {
 
         reset_error_counts();
         assert_eq!(error_counts(), 0);
+    }
+
+    /// epics-base 8-D `5cfff383` regression: a registered sync hook
+    /// fires when `notify_clock_sync` is invoked. Multiple hooks
+    /// fire in registration order. Hooks live for process lifetime
+    /// — the test asserts via Arc<Mutex<Vec<...>>> capture rather
+    /// than de-registering.
+    #[test]
+    fn sync_hooks_fire_in_registration_order() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<(usize, SystemTime)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let cap1 = captured.clone();
+        register_clock_sync_hook(move |t| {
+            cap1.lock().unwrap().push((1, t));
+        });
+        let cap2 = captured.clone();
+        register_clock_sync_hook(move |t| {
+            cap2.lock().unwrap().push((2, t));
+        });
+
+        let synced = SystemTime::UNIX_EPOCH + Duration::from_secs(5_000_000_000);
+        notify_clock_sync(synced);
+
+        let log = captured.lock().unwrap();
+        // Other tests may have registered hooks too — filter to ours.
+        let ours: Vec<_> = log.iter().filter(|(id, _)| *id == 1 || *id == 2).collect();
+        assert!(
+            ours.len() >= 2,
+            "both hooks must have fired at least once: {ours:?}"
+        );
+        // Find the most recent pair-firing — registration order
+        // means the (1, _) entry must precede the (2, _) entry that
+        // share our exact `synced` value.
+        let last1_idx = ours
+            .iter()
+            .rposition(|(id, t)| *id == 1 && *t == synced)
+            .expect("hook 1 fired with our synced timestamp");
+        let last2_idx = ours
+            .iter()
+            .rposition(|(id, t)| *id == 2 && *t == synced)
+            .expect("hook 2 fired with our synced timestamp");
+        assert!(
+            last1_idx < last2_idx,
+            "hook 1 must fire before hook 2 (registration order)"
+        );
     }
 }

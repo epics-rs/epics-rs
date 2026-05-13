@@ -324,7 +324,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`readline`을 `epicsExit()`에서 정리** (`444b89f5`, 2015) — ⏭️ **ALREADY**: rustyline `Editor::drop` 자동 cleanup.
 - **`EPICS_TZ` 환경 변수로 표준화** (`b0db6568`, 2019) — ⚠️ **N/A**: 원 commit은 RTEMS `rtems_init()`에서 `EPICS_TIMEZONE` 대신 `EPICS_TZ`를 읽도록 변경. Rust는 RTEMS 비대상 + `chrono::Local` 등이 OS POSIX `TZ` 환경변수를 자동 사용하므로 EPICS-namespaced timezone env var를 별도로 다룰 진입점이 없음.
 - **`generalTime`의 이벤트 번호 >= 256 지원** (`215c5d95`, 2018) — ⏭️ **ALREADY**: `runtime::general_time::get_event(i32)` 가 i32 받아 256+ 코드 지원.
-- **`osiClockTime` 동기화 훅 지원** (`5cfff383`, 2019) — ⏸️ **DEFERRED**: 외부 시간 소스 sync notify hook — 사용 사례 없음.
+- **`osiClockTime` 동기화 훅 지원** (`5cfff383`, 2019) — ✅ **DONE** (this session): `runtime::general_time::register_clock_sync_hook(F)` + `notify_clock_sync(t)` API 추가. 시간 소스 (PTP/NTP/GPS PPS) 가 fresh sync 받았을 때 등록된 콜백을 registration order 로 발화. ratchet semantic은 영향 없음 — pure notification channel. 회귀 테스트 `sync_hooks_fire_in_registration_order`.
 - **`epicsTime` UTC `struct tm` 전체 변환** (`37024011`, 2016) — ⏭️ **ALREADY**: `chrono::DateTime<Utc>` 사용 — UTC ↔ struct tm 자동.
 - **`envGetBoolConfigParam` 함수** (`f837add8`, 2016) — ⏭️ **ALREADY**: `runtime::env::get_bool` 구현.
 - **`iocsh`에 등록된 변수/함수 목록 조회 API** (`daad3c69`, 2016) — ⏭️ **ALREADY**: `CommandRegistry` enumeration + auto `help` 명령.
@@ -515,7 +515,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 - **`SetEndian` 제어 메시지 올바른 처리** (`cce797263d1d`, high) — ⏭️ **ALREADY**: `proto/command.rs::ControlCommand::SetByteOrder`가 정의되어 있고 `server_native/tcp.rs:574`에서 handshake에 emit + 클라이언트 측에서도 수신 처리.
 - **배열(Array) 디코드 버그 수정** (`cf91bc3033e2`, high) — ⏭️ **ALREADY**: epics-pva-rs `pvdata::decode` 가 size prefix를 `decode_size`로 명시적 파싱 후 `Vec::with_capacity(n)` + element-by-element decode. C의 `vector.resize()` + raw memcpy 크래시 패턴이 부재 — Rust slice/Vec API가 모든 boundary check를 강제.
-- **디코드 오류 시 원격 `file:line` 정보 추출** (`e9ce80880d92`, high) — ⏸️ **DEFERRED (low value)**: pvxs는 자체 `decodeError(file, line, msg)` 매크로의 file:line을 STATUS 메시지에 포함시켜 양 끝단 디버깅 도움. epics-pva-rs는 `PvaError` enum으로 enum-variant 자체가 위치 정보 — 추가 file:line 직렬화는 wire 호환성 영향 적은 편이라 별도 PR.
+- **디코드 오류 시 원격 `file:line` 정보 추출** (`e9ce80880d92`, high) — ✅ **DONE** (this session): `Status::error_with_location(file, line, msg)` 가 stack-trace 필드에 `<file>:<line>` 포맷으로 인코딩, `Status::source_location()` 가 round-trip 파싱. 회귀 테스트 4종 (round-trip / OK 시 None / Windows 경로 (콜론 포함) / malformed stack rejection).
 - **`null` 문자열 디코딩** (`0356eee74037`, medium) — ⏭️ **ALREADY**: epics-pva-rs `pvdata::decode::decode_string` 이 length=0 또는 length=-1 (varint sentinel) 모두 빈 String으로 normalise. `Option<String>` 변환은 위 레이어 (PvField → 사용자 type)에서 처리.
 - **`CMD_MESSAGE` 처리 수정** (`0eea8fd1c7e0`, medium) — ⏭️ **ALREADY**: `proto/command.rs::Command::Message` 가 디코드 + display + handler 모두 정의 (`server_native/tcp.rs::handle_message_command`).
 - **자격 증명(Credentials) 디코드** (`7de1f7d32f63`, medium) — ⏭️ **ALREADY**: PVA Connection Request 의 `auth` 필드 디코드는 `proto/auth.rs::ConnectionAuth` (`anonymous`/`ca`/`x509` 3가지 method). x509 mTLS 경우 peer cert에서 issuer DN 추출 (`tls::issuer_from_cert`).

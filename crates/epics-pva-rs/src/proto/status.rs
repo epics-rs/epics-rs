@@ -84,6 +84,39 @@ impl Status {
         }
     }
 
+    /// Build an Error status with a `file:line` source location encoded
+    /// into the stack-trace field. Mirrors pvxs commit `e9ce80880d92`
+    /// ("decode error response carries remote file:line for the
+    /// originator's diagnostic").
+    ///
+    /// The stack-trace field is the wire's canonical place for free-form
+    /// diagnostic context — our helper formats it as
+    /// `"<file>:<line>"` (single line) so the receiver's
+    /// [`Self::source_location`] parser can round-trip the pair without
+    /// guessing at the format.
+    pub fn error_with_location<F: AsRef<str>, M: Into<String>>(file: F, line: u32, msg: M) -> Self {
+        Status::Detailed {
+            kind: StatusKind::Error,
+            message: msg.into(),
+            stack: format!("{}:{}", file.as_ref(), line),
+        }
+    }
+
+    /// Extract the `(file, line)` source location embedded in
+    /// [`Self::error_with_location`]'s stack field. Returns `None` when
+    /// the status carries no stack, or when the stack does not match
+    /// the `<file>:<line>` shape (e.g. a multi-frame stack from a peer
+    /// that didn't follow the convention).
+    pub fn source_location(&self) -> Option<(&str, u32)> {
+        let stack = match self {
+            Status::Detailed { stack, .. } if !stack.is_empty() => stack.as_str(),
+            _ => return None,
+        };
+        let (file, line) = stack.rsplit_once(':')?;
+        let line: u32 = line.parse().ok()?;
+        Some((file, line))
+    }
+
     pub fn is_success(&self) -> bool {
         match self {
             Status::OkNoMsg => true,
@@ -162,6 +195,56 @@ mod tests {
         assert_eq!(buf[1] as usize, "bad request".len());
         let mut cur = Cursor::new(buf.as_slice());
         assert_eq!(Status::decode(&mut cur, ByteOrder::Little).unwrap(), s);
+    }
+
+    /// pvxs `e9ce80880d92`: error_with_location embeds `<file>:<line>`
+    /// in the stack field; source_location parses it back. Round-trips
+    /// through encode/decode unchanged.
+    #[test]
+    fn error_with_location_round_trip() {
+        let s = Status::error_with_location("src/server.rs", 1234, "decode failed");
+        let buf = s.encode(ByteOrder::Little);
+        let mut cur = Cursor::new(buf.as_slice());
+        let decoded = Status::decode(&mut cur, ByteOrder::Little).unwrap();
+        assert_eq!(decoded, s);
+        let (file, line) = decoded.source_location().expect("location parses");
+        assert_eq!(file, "src/server.rs");
+        assert_eq!(line, 1234);
+    }
+
+    /// `source_location` returns None for plain errors and OK statuses.
+    #[test]
+    fn source_location_returns_none_when_no_stack() {
+        assert!(Status::ok().source_location().is_none());
+        assert!(Status::error("plain error").source_location().is_none());
+    }
+
+    /// File path with a colon (e.g. C:\path\file.rs on Windows) — the
+    /// rsplit_once on the LAST colon keeps the filename intact and
+    /// yields the line number from the trailing component.
+    #[test]
+    fn source_location_handles_paths_with_colon() {
+        let s = Status::error_with_location(r"C:\src\foo.rs", 42, "boom");
+        let (file, line) = s.source_location().unwrap();
+        assert_eq!(file, r"C:\src\foo.rs");
+        assert_eq!(line, 42);
+    }
+
+    /// Malformed stack (no colon, or non-numeric trailing component)
+    /// is not a panic — source_location returns None.
+    #[test]
+    fn source_location_rejects_malformed_stack() {
+        let mut s = Status::error("oops");
+        if let Status::Detailed { stack, .. } = &mut s {
+            *stack = "no colon here".into();
+        }
+        assert!(s.source_location().is_none());
+
+        let mut s2 = Status::error("oops");
+        if let Status::Detailed { stack, .. } = &mut s2 {
+            *stack = "file.rs:not_a_number".into();
+        }
+        assert!(s2.source_location().is_none());
     }
 
     #[test]

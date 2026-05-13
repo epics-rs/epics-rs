@@ -189,6 +189,11 @@ impl SearchEngine {
         // host has no usable IPv6 stack.
         let search_socket_v6 = bind_ephemeral_udp_v6();
         let beacon_socket = bind_beacon_udp(); // Optional — may be None.
+        // PR #205 IPv6 Stage 6: optional v6 beacon listener bound to
+        // `[::]:5076` joined to `ff0e::400`. Receives v6 multicast
+        // beacons emitted by the server's Stage 5 path. None when the
+        // host has no v6.
+        let beacon_socket_v6 = bind_beacon_udp_v6();
 
         // pvxs 8db40be (2025-10): warn loudly when a Context is built
         // with no search destinations and AUTO_ADDR_LIST disabled.
@@ -287,6 +292,7 @@ impl SearchEngine {
             search_socket,
             search_socket_v6,
             beacon_socket,
+            beacon_socket_v6,
             extra_targets,
             beacons_clone,
         ));
@@ -516,6 +522,78 @@ fn bind_beacon_udp() -> Option<AsyncUdpV4> {
     Some(sock)
 }
 
+/// PR #205 IPv6 Stage 6: bind a v6 beacon listener on `[::]:port` with
+/// `SO_REUSEADDR`/`SO_REUSEPORT` + `IPV6_V6ONLY=1`, then join the
+/// default v6 PVA multicast group `ff0e::400`. Returns `None` when the
+/// host lacks v6 or the bind fails — fast-reconnect via v6 beacons is
+/// best-effort, the v4 beacon socket keeps doing its job.
+fn bind_beacon_udp_v6() -> Option<Arc<UdpSocket>> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let port = std::env::var("EPICS_PVA_BROADCAST_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_BROADCAST_PORT);
+
+    let sock = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("v6 beacon socket: socket() failed: {e}; v6 beacon recv disabled");
+            return None;
+        }
+    };
+    if let Err(e) = sock.set_only_v6(true) {
+        debug!("v6 beacon socket: set_only_v6 failed: {e}");
+    }
+    // Mirror the v4 beacon socket setup: SO_REUSEADDR + SO_REUSEPORT so
+    // a server v6 SEARCH listener on `[::]:port` and a client v6 beacon
+    // listener can coexist. The server emits beacons FROM a separate
+    // ephemeral socket, so this REUSEPORT-shared listener only receives.
+    #[cfg(not(windows))]
+    if let Err(e) = sock.set_reuse_address(true) {
+        debug!("v6 beacon socket: set_reuse_address failed: {e}");
+    }
+    #[cfg(unix)]
+    if let Err(e) = sock.set_reuse_port(true) {
+        debug!("v6 beacon socket: set_reuse_port failed: {e}");
+    }
+    if let Err(e) = sock.set_nonblocking(true) {
+        debug!("v6 beacon socket: set_nonblocking failed: {e}");
+        return None;
+    }
+
+    let bind = SocketAddr::V6(std::net::SocketAddrV6::new(
+        Ipv6Addr::UNSPECIFIED,
+        port,
+        0,
+        0,
+    ));
+    if let Err(e) = sock.bind(&bind.into()) {
+        debug!("v6 beacon socket: bind {bind} failed: {e}; v6 beacon recv disabled");
+        return None;
+    }
+
+    let std_sock: std::net::UdpSocket = sock.into();
+    let tokio_sock = match UdpSocket::from_std(std_sock) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            debug!("v6 beacon socket: tokio adoption failed: {e}");
+            return None;
+        }
+    };
+
+    // Join the default PVA v6 multicast group on the unspecified
+    // interface (let the OS pick). Additional groups from
+    // EPICS_PVA_ADDR_LIST are joined separately.
+    if let Err(e) = tokio_sock.join_multicast_v6(&DEFAULT_V6_MULTICAST_GROUP, 0) {
+        debug!(
+            "v6 beacon socket: join_multicast_v6 ff0e::400 failed: {e}; \
+             v6 multicast beacons will not be received"
+        );
+    }
+    Some(tokio_sock)
+}
+
 /// Walk `EPICS_PVA_ADDR_LIST` and join every IPv4 multicast group on
 /// every up, non-loopback NIC of `sock`. Errors are logged but not
 /// propagated — a single failed join shouldn't disable the rest of
@@ -650,6 +728,7 @@ async fn run_engine(
     search_socket: AsyncUdpV4,
     search_socket_v6: Option<Arc<UdpSocket>>,
     beacon_socket: Option<AsyncUdpV4>,
+    beacon_socket_v6: Option<Arc<UdpSocket>>,
     extra_targets: Vec<SocketAddr>,
     beacons: Arc<BeaconTracker>,
 ) {
@@ -704,6 +783,7 @@ async fn run_engine(
     let mut search_buf = vec![0u8; 64 * 1024];
     let mut search_buf_v6 = vec![0u8; 64 * 1024];
     let mut beacon_buf = vec![0u8; 64 * 1024];
+    let mut beacon_buf_v6 = vec![0u8; 64 * 1024];
     let mut search_send_errs: HashSet<SocketAddr> = HashSet::new();
 
     loop {
@@ -1003,6 +1083,35 @@ async fn run_engine(
                         fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
                     } else if poke {
                         // Already in fast mode: extend the revolution.
+                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+                    }
+                }
+            }
+
+            res = recv_from_v6_opt(beacon_socket_v6.as_ref(), &mut beacon_buf_v6) => {
+                // PR #205 IPv6 Stage 6: v6 multicast beacon recv arm.
+                // Same decode path as the v4 beacon socket — beacon
+                // payloads are family-agnostic (server GUID + TCP port
+                // + 16-byte IPv4-mapped server address).
+                if let Some(Ok((n, from))) = res {
+                    let mut poke = false;
+                    let mut pos = 0usize;
+                    while pos < n {
+                        let consumed = handle_beacon(
+                            &beacon_buf_v6[pos..n], &beacons, &mut pending,
+                            &mut subscribers, &mut announced, &mut poke,
+                            &ignore_guids, from,
+                        );
+                        if consumed == 0 {
+                            break;
+                        }
+                        pos = pos.saturating_add(consumed);
+                    }
+                    if poke && fast_ticks_remaining == 0 {
+                        tick = interval(Duration::from_millis(200));
+                        tick.tick().await;
+                        fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
+                    } else if poke {
                         fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
                     }
                 }
@@ -2138,5 +2247,151 @@ mod tests {
             "resolved server address must be IPv6; got {resolved:?}"
         );
         drop(server);
+    }
+
+    /// PR #205 IPv6 Stage 6: `bind_beacon_udp_v6` returns a usable
+    /// socket bound to `[::]:5076` (or `EPICS_PVA_BROADCAST_PORT`)
+    /// with the default v6 multicast group joined. Confirms the
+    /// plumbing — without it the recv arm in `run_engine` never
+    /// fires for v6 beacons.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v6_beacon_socket_binds_and_joins_default_group() {
+        // Use a unique broadcast port for this test so we don't fight
+        // a parallel test or a local pva-rs IOC for the well-known
+        // 5076 socket. Picks via OS-coordinated probe, drops, then
+        // env-sets so `bind_beacon_udp_v6` reads the same port.
+        let pick_port = || {
+            let s = std::net::UdpSocket::bind("[::1]:0").expect("v6 probe bind");
+            let p = s.local_addr().unwrap().port();
+            drop(s);
+            p
+        };
+        let port = pick_port();
+        // SAFETY: test process-wide env mutation. Tests reading the
+        // same var serialise on this section via tokio's runtime
+        // ordering — set + bind are sequential.
+        unsafe {
+            std::env::set_var("EPICS_PVA_BROADCAST_PORT", port.to_string());
+        }
+
+        let sock =
+            bind_beacon_udp_v6().expect("v6 beacon socket must bind on a host with IPv6 enabled");
+        let local = sock.local_addr().expect("local_addr");
+        assert!(
+            matches!(local.ip(), IpAddr::V6(_)),
+            "beacon socket must be IPv6; got {local}"
+        );
+        assert_eq!(
+            local.port(),
+            port,
+            "beacon socket must bind the EPICS_PVA_BROADCAST_PORT we set"
+        );
+
+        // Best-effort cleanup so a re-run on the same port doesn't
+        // inherit a stale value.
+        unsafe {
+            std::env::remove_var("EPICS_PVA_BROADCAST_PORT");
+        }
+        drop(sock);
+    }
+
+    /// PR #205 IPv6 Stage 6 end-to-end: spawn a SearchEngine and emit
+    /// a synthetic v6 beacon to its v6 beacon socket. The engine's
+    /// recv arm decodes the beacon, the BeaconTracker observes the
+    /// (server_addr, guid) pair, and `beacon_guid_for(addr)` returns
+    /// the GUID we sent. Guards the full recv-decode-track chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v6_beacon_arriving_at_engine_is_observed_by_tracker() {
+        use crate::proto::{ByteOrder, Command, PvaHeader, WriteExt};
+
+        // Pick a free v6 UDP port. The engine's v6 beacon socket and
+        // our sender both target this port.
+        let pick_port = || {
+            let s = std::net::UdpSocket::bind("[::1]:0").expect("probe");
+            let p = s.local_addr().unwrap().port();
+            drop(s);
+            p
+        };
+        let port = pick_port();
+        // SAFETY: process-wide env mutation. Suppress v4 search
+        // destinations so the engine's broadcast loop has nothing
+        // useful to fire.
+        unsafe {
+            std::env::set_var("EPICS_PVA_BROADCAST_PORT", port.to_string());
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        }
+
+        let engine = SearchEngine::spawn(Vec::new()).await.expect("spawn engine");
+        // Give the engine a moment to bind sockets and enter its
+        // select loop.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Hand-roll a beacon frame: PVA header + 12B GUID + flags +
+        // seq + change_count + 16B server addr (IPv4-mapped ::FFFF:0)
+        // + tcp_port + protocol("tcp") + 0xFF status marker.
+        let guid: [u8; 12] = [0x42; 12];
+        let tcp_port: u16 = 5099;
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&guid);
+        payload.put_u8(0); // flags
+        payload.put_u8(7); // seq
+        payload.put_u16(0, order); // change_count
+        // 16-byte server addr = ::FFFF:0.0.0.0 (unspecified)
+        payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0]);
+        payload.put_u16(tcp_port, order);
+        // protocol string "tcp" (size-prefixed)
+        crate::proto::encode_string_into("tcp", order, &mut payload);
+        payload.put_u8(0xFF); // null serverStatus marker
+        let header =
+            PvaHeader::application(true, order, Command::Beacon.code(), payload.len() as u32);
+        let mut frame = Vec::new();
+        header.write_into(&mut frame);
+        frame.extend_from_slice(&payload);
+
+        // Send the beacon from an ephemeral v6 socket to the
+        // engine's listener on `[::1]:port`.
+        let tx = tokio::net::UdpSocket::bind("[::1]:0")
+            .await
+            .expect("tx bind");
+        let dest = SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
+        tx.send_to(&frame, dest).await.expect("send beacon");
+
+        // Poll the tracker for up to ~2s — the engine processes the
+        // beacon asynchronously. The tracker keys on the resolved
+        // server addr (peer IP + advertised tcp_port). For an
+        // unspecified wire address with a loopback peer, rewriter
+        // logic resolves to `[::1]:tcp_port`.
+        let resolved_server = SocketAddr::V6(std::net::SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            tcp_port,
+            0,
+            0,
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let found_guid = loop {
+            if let Some(g) = engine.beacon_guid_for(resolved_server) {
+                break Some(g);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        // Cleanup env before assertion so a failure doesn't leave it
+        // set for sibling tests.
+        unsafe {
+            std::env::remove_var("EPICS_PVA_BROADCAST_PORT");
+            std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST");
+            std::env::remove_var("EPICS_PVA_ADDR_LIST");
+        }
+
+        let observed = found_guid.expect(
+            "BeaconTracker must observe a beacon arriving on the v6 beacon socket; \
+             v6 recv arm in run_engine may be broken",
+        );
+        assert_eq!(observed, guid, "tracker must record the exact GUID");
     }
 }

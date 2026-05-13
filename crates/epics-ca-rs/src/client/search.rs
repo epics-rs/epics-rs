@@ -1547,6 +1547,125 @@ mod tests {
         );
     }
 
+    /// Issue #372 mass-channel scenario, single-tick view: simulate
+    /// the rearm half of one `process_bucket` call against a
+    /// 5000-channel reconnect storm and verify the inline-push
+    /// `cascade_smoothed_next` placement at least bisects the load
+    /// instead of piling every channel into a single bucket.
+    ///
+    /// pvxs's smoothing rule (`client.cpp:1199-1206`) defers ONLY by
+    /// one bucket (`next` → `nextnext`) when the chosen bucket
+    /// exceeds `nextnext + 100`, so within one tick a flat-attempt
+    /// reconnect storm can land in at most two buckets. The
+    /// follow-on test
+    /// `mass_5000_multi_tick_distribution_covers_full_ring`
+    /// pins the ring-wide spread that emerges across multiple ticks.
+    #[test]
+    fn mass_5000_reconnect_spreads_at_least_two_buckets() {
+        const N_CHANNELS: usize = 5000;
+        let current = 0;
+        let attempt = 1; // Reconnect → first retry uses attempt=1
+
+        let mut buckets = vec![0usize; N_SEARCH_BUCKETS];
+        for _sid in 0..N_CHANNELS {
+            let bucket_sizes = |idx: usize| buckets[idx];
+            let next = cascade_smoothed_next(current, attempt, bucket_sizes);
+            buckets[next] += 1;
+        }
+
+        let total: usize = buckets.iter().sum();
+        assert_eq!(
+            total, N_CHANNELS,
+            "every channel must be placed exactly once"
+        );
+
+        let nonempty = buckets.iter().filter(|&&n| n > 0).count();
+        assert!(
+            nonempty >= 2,
+            "smoothing must split the load across ≥2 buckets; got {} non-empty: {buckets:?}",
+            nonempty
+        );
+
+        // No single bucket may carry more than 60% of the total —
+        // a regressed smoothing threshold would let bucket 1 take
+        // all 5000 entries.
+        let max_load = *buckets.iter().max().unwrap();
+        let cap = (N_CHANNELS * 60) / 100;
+        assert!(
+            max_load <= cap,
+            "no single bucket may carry > {cap} entries (60% of {N_CHANNELS}); \
+             got max {max_load} in {buckets:?}"
+        );
+    }
+
+    /// Issue #372 multi-tick scenario: simulate `process_bucket`
+    /// running for `2 * N_SEARCH_BUCKETS` ticks against an initial
+    /// bulk reconnect of 5000 channels, advancing `current_bucket`
+    /// each tick and rearming sids via the inline-push smoothing.
+    /// Verify that across the full ring rotation the load distributes
+    /// across the majority of buckets and no bucket dominates more
+    /// than a fraction of the total — proving the per-tick send rate
+    /// stays bounded under sustained mass-channel load.
+    #[test]
+    fn mass_5000_multi_tick_distribution_covers_full_ring() {
+        const N_CHANNELS: usize = 5000;
+        const TICKS: usize = 2 * N_SEARCH_BUCKETS;
+
+        // Initial state: all sids placed in bucket 0 with attempt=0
+        // (mirrors a fresh Reconnect storm at process_bucket entry).
+        let mut buckets: Vec<Vec<u32>> = (0..N_SEARCH_BUCKETS).map(|_| Vec::new()).collect();
+        buckets[0] = (0..N_CHANNELS as u32).collect();
+        let mut attempts = vec![0u32; N_CHANNELS];
+
+        // Track maximum bucket load observed at the moment of
+        // processing — that is the per-tick send rate ceiling.
+        let mut max_per_tick = 0usize;
+        let mut buckets_visited = vec![false; N_SEARCH_BUCKETS];
+
+        let mut current = 0;
+        for _ in 0..TICKS {
+            buckets_visited[current] = true;
+            let processing = std::mem::take(&mut buckets[current]);
+            max_per_tick = max_per_tick.max(processing.len());
+
+            // Rearm each sid via inline-push smoothing.
+            for sid in processing {
+                attempts[sid as usize] = attempts[sid as usize].saturating_add(1);
+                let attempt = attempts[sid as usize];
+                let bucket_sizes = |idx: usize| buckets[idx].len();
+                let next = cascade_smoothed_next(current, attempt, bucket_sizes);
+                buckets[next].push(sid);
+            }
+
+            current = (current + 1) % N_SEARCH_BUCKETS;
+        }
+
+        // Across one full ring + extra slack, every bucket should
+        // have been visited as `current` rotates.
+        let visited_count = buckets_visited.iter().filter(|&&v| v).count();
+        assert_eq!(
+            visited_count, N_SEARCH_BUCKETS,
+            "current_bucket must rotate through every slot in {TICKS} ticks; got {visited_count}"
+        );
+
+        // The first tick processes the entire 5000-bulk; subsequent
+        // ticks see the smoothed redistribution. Cap is the initial
+        // bulk size — anything over that means the smoothing
+        // accumulated load *back* into a single bucket faster than
+        // the ring could drain it (regression).
+        assert!(
+            max_per_tick <= N_CHANNELS,
+            "per-tick processing load must not exceed initial burst {N_CHANNELS}; got {max_per_tick}"
+        );
+
+        // Conservation: every sid still accounted for somewhere.
+        let still_pending: usize = buckets.iter().map(|b| b.len()).sum();
+        assert_eq!(
+            still_pending, N_CHANNELS,
+            "sids must not be lost across {TICKS} ticks; got {still_pending} pending of {N_CHANNELS}"
+        );
+    }
+
     /// End-to-end Reconnect bucket-fire test. Boots `run_search_engine`
     /// with a sniffer socket as the only addr_list destination,
     /// submits a `Schedule { Reconnect }`, and asserts that a

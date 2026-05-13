@@ -927,6 +927,7 @@ impl CaServer {
         let drain_for_tcp = drain.clone();
         #[cfg(feature = "cap-tokens")]
         let cap_token_verifier_for_tcp = self.cap_token_verifier.clone();
+        let stats_for_tcp = Some(self.stats.clone());
         let tcp_handle = epics_base_rs::runtime::task::spawn(async move {
             #[cfg(feature = "experimental-rust-tls")]
             {
@@ -940,6 +941,7 @@ impl CaServer {
                     conn_events,
                     audit_for_tcp,
                     drain_for_tcp,
+                    stats_for_tcp,
                     tls,
                     #[cfg(feature = "cap-tokens")]
                     cap_token_verifier_for_tcp,
@@ -958,6 +960,7 @@ impl CaServer {
                     conn_events,
                     audit_for_tcp,
                     drain_for_tcp,
+                    stats_for_tcp,
                     #[cfg(feature = "cap-tokens")]
                     cap_token_verifier_for_tcp,
                 )

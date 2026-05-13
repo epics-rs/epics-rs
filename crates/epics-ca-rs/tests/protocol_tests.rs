@@ -329,6 +329,83 @@ async fn server_get_nonexistent_pv_returns_error() {
     assert!(result.is_err());
 }
 
+// ---------------------------------------------------------------------------
+// PR #592 dbServerStats — bytes_in / bytes_out counters
+// ---------------------------------------------------------------------------
+
+/// A real TCP round-trip (CaClient ↔ CaServer) must increment both
+/// `bytes_in` and `bytes_out` on the server's `ServerStats`. Pre-fix
+/// these counters were declared and exposed via `casr` but never
+/// updated by the read/flush hot path — operators saw `bytes in=0,
+/// out=0` no matter how much traffic flowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_stats_bytes_in_out_track_real_traffic() {
+    use std::time::Duration;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("STATS:BYTES", EpicsValue::Double(7.5))
+        .build()
+        .await
+        .expect("build CA server");
+    let stats = server.stats();
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+
+    // Let the listener bind + accept loop spin up.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Drive a real CA caget through the local TCP listener. Tell the
+    // client exactly where to find this server so it skips UDP search.
+    // SAFETY: tokio test runtime is multi-threaded; we're mutating env
+    // before the client constructs its name-resolver state.
+    unsafe {
+        std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+        std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
+    }
+
+    let client = epics_ca_rs::client::CaClient::new().await.expect("client");
+    let (_ty, val) = tokio::time::timeout(Duration::from_secs(5), client.caget("STATS:BYTES"))
+        .await
+        .expect("caget did not complete within 5s")
+        .expect("caget should succeed against local server");
+    match val {
+        EpicsValue::Double(d) => assert!((d - 7.5).abs() < 1e-10, "round-trip value {d}"),
+        other => panic!("expected Double(7.5), got {other:?}"),
+    }
+
+    use std::sync::atomic::Ordering::Relaxed;
+    let bin = stats.bytes_in.load(Relaxed);
+    let bout = stats.bytes_out.load(Relaxed);
+    assert!(
+        bin > 0,
+        "bytes_in must increment for a real CA round-trip; got 0"
+    );
+    assert!(
+        bout > 0,
+        "bytes_out must increment for a real CA round-trip; got 0"
+    );
+    // Sanity: the response is normally larger than the request once
+    // CTRL/STS metadata is included. We don't pin an exact ratio
+    // (depends on DBR type encoding), just that both are nontrivial.
+    assert!(
+        bin >= 16,
+        "bytes_in {bin} too small — should at least cover CA header(s)"
+    );
+    assert!(
+        bout >= 16,
+        "bytes_out {bout} too small — should at least cover CA header(s)"
+    );
+}
+
 #[tokio::test]
 async fn server_put_nonexistent_pv_returns_error() {
     let server = CaServer::builder()

@@ -49,6 +49,7 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
             None, // conn_events: not subscribed in this test
             None, // audit
             drain,
+            None, // stats: not asserted in this test
             #[cfg(feature = "ca-experimental-rust-tls")]
             None, // tls
             #[cfg(feature = "ca-cap-tokens")]

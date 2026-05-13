@@ -72,8 +72,8 @@ async fn test_inp_link_processing() {
 /// downstream alarm consumers blind to the broken link.
 #[tokio::test]
 async fn test_soft_inp_read_failure_sets_link_alarm() {
-    use epics_base_rs::server::record::AlarmSeverity;
     use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
 
     let db = PvDatabase::new();
     db.add_record("BROKEN", Box::new(AiRecord::new(0.0)))

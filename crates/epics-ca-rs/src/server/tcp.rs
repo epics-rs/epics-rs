@@ -423,6 +423,10 @@ pub async fn run_tcp_listener(
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
     audit: Option<crate::audit::AuditLogger>,
     drain: Arc<std::sync::atomic::AtomicBool>,
+    // PR #592 dbServerStats: per-connection byte counters feed the
+    // `casr` iocsh command's `bytes in=… out=…` line. Optional so unit
+    // tests of the TCP path don't need a full ServerStats wired up.
+    stats: Option<Arc<super::ca_server::ServerStats>>,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<
         Arc<std::sync::RwLock<Arc<tokio_rustls::rustls::ServerConfig>>>,
     >,
@@ -496,6 +500,7 @@ pub async fn run_tcp_listener(
         let conn_events = conn_events.clone();
         let acf_reload_rx = acf_reload_tx.subscribe();
         let audit = audit.clone();
+        let stats_for_client = stats.clone();
         // Read the latest server config under the RwLock so a
         // concurrent reload_tls() takes effect for the *next* accept
         // without restarting the listener. Cheap read lock — only
@@ -590,6 +595,7 @@ pub async fn run_tcp_listener(
                                     authority,
                                     audit,
                                     conn_events.clone(),
+                                    stats_for_client.clone(),
                                     #[cfg(feature = "cap-tokens")]
                                     cap_token_verifier_for_client.clone(),
                                 )
@@ -613,6 +619,7 @@ pub async fn run_tcp_listener(
                             None,
                             audit,
                             conn_events.clone(),
+                            stats_for_client.clone(),
                             #[cfg(feature = "cap-tokens")]
                             cap_token_verifier_for_client.clone(),
                         )
@@ -632,6 +639,7 @@ pub async fn run_tcp_listener(
                         None,
                         audit,
                         conn_events.clone(),
+                        stats_for_client.clone(),
                         #[cfg(feature = "cap-tokens")]
                         cap_token_verifier_for_client.clone(),
                     )
@@ -690,6 +698,12 @@ async fn handle_client<S>(
     tls_authority: Option<String>,
     audit: Option<crate::audit::AuditLogger>,
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
+    // PR #592 dbServerStats: bytes_in/bytes_out counters. Incremented
+    // post-read (per accepted UDP/TCP buffer) and at each BufWriter
+    // flush (by inspecting `BufWriter::buffer().len()` before flush).
+    // `None` skips all counter bookkeeping — used by the unit-test
+    // dispatch fixtures that don't spin up a full CaServer.
+    stats: Option<Arc<super::ca_server::ServerStats>>,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
 ) -> CaResult<()>
 where
@@ -775,6 +789,15 @@ where
         };
         if n == 0 {
             break;
+        }
+
+        // PR #592 dbServerStats: bytes_in mirrors RSRV's
+        // `caServerBytes_in`. Counted on every successful read of `n`
+        // wire bytes, regardless of whether the inner dispatch
+        // accepts or rejects the message.
+        if let Some(ref s) = stats {
+            s.bytes_in
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Chaos: optional stall + simulated read drop. Compiles to a
@@ -908,8 +931,20 @@ where
             // Errors here mean the TCP write stalled / peer closed —
             // surface as the read loop's normal disconnect path.
             let mut w = writer.lock().await;
+            // PR #592 dbServerStats: bytes_out mirrors RSRV's
+            // `caServerBytes_out`. Capture the buffered size *before*
+            // flush so we know exactly how many wire bytes leave on
+            // this syscall. CA-over-TLS counts post-decrypt plaintext
+            // since the rustls layer wraps the BufWriter externally —
+            // matches what the comment on ServerStats::bytes_out
+            // already documents.
+            let pending_out = w.buffer().len() as u64;
             if let Err(e) = w.flush().await {
                 return Err(e.into());
+            }
+            if let Some(ref s) = stats {
+                s.bytes_out
+                    .fetch_add(pending_out, std::sync::atomic::Ordering::Relaxed);
             }
             drop(w);
         }

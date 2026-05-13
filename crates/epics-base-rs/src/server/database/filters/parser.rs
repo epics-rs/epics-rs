@@ -106,6 +106,7 @@ fn build_filter(name: &str, cfg: &serde_json::Value) -> Option<Arc<dyn Subscript
         "arr" => build_arr(cfg),
         "ts" => Some(Arc::new(TimestampFilter::new())),
         "dec" => build_decimate(cfg),
+        "sync" => build_sync(cfg),
         _ => None,
     }
 }
@@ -138,6 +139,20 @@ fn build_decimate(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>
     let n = obj.get("n").and_then(|v| v.as_u64())?;
     let offset = obj.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
     Some(Arc::new(DecimateFilter::new(n, offset)))
+}
+
+/// `{"sync":{"trigger":"PV_NAME"}}` — gate value events on a trigger
+/// PV's process notifications. epics-base 3.15.7 sync filter, "after"
+/// mode (the only mode upstream's syncfilter.cpp shipped initially).
+/// Missing/empty trigger → silently dropped (the chain just won't
+/// include a sync filter rather than rejecting the whole subscription).
+fn build_sync(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
+    let trigger = cfg
+        .as_object()
+        .and_then(|o| o.get("trigger"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some(Arc::new(super::SyncFilter::new(trigger)))
 }
 
 #[cfg(test)]
@@ -226,8 +241,24 @@ mod tests {
     fn parse_unknown_filter_is_skipped() {
         let chain = parse_filter_chain(r#"{"sync":{"m":"unless"},"dbnd":{"d":1.0}}"#);
         let names: Vec<&'static str> = chain.iter().map(|f| f.name()).collect();
-        // `sync` not yet implemented → skipped; `dbnd` survives.
+        // `sync` with only `m` (no `trigger`) is missing required
+        // config — silently skipped; `dbnd` survives. When the full
+        // sync filter learns the `m` mode keyword this case will
+        // start producing a sync entry too.
         assert_eq!(names, vec!["dbnd"]);
+    }
+
+    #[test]
+    fn parse_sync_with_trigger() {
+        let chain = parse_filter_chain(r#"{"sync":{"trigger":"SYS:TRIG"}}"#);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.iter().next().unwrap().name(), "sync");
+    }
+
+    #[test]
+    fn parse_sync_without_trigger_is_skipped() {
+        let chain = parse_filter_chain(r#"{"sync":{}}"#);
+        assert!(chain.is_empty());
     }
 
     #[test]

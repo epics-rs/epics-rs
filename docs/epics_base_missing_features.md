@@ -105,7 +105,7 @@
 - **`mbboDirect`의 `B0..BF` 필드 ASL0 권한 조정 (PR #439)** — ⚠️ **N/A (design diff)**: 원PR은 `.dbd`의 `prompt(...)` ASL1 marker를 ASL0으로 바꿔 ACF 권한 게이트를 완화. epics-rs `FieldDesc`는 per-field ASL을 surface하지 않으며(필드 단위 ACF gating 미구현), 접근 제어는 `compute_access`/`AuditLogger` 경유 record-level + auth_method/authority 기반. 동등한 변경 지점이 없음.
 - **`dbLoadRecords` 매크로 기본값 의미론 불일치 (PR #463)** — ⏸️ DEFERRED.
 - **DB 파서의 알 수 없는 필드명 힌트 제공 (PR #434)** — ⏭️ ALREADY: round 23의 dbpf typo suggestion이 부분적으로 동일 기능 제공.
-- **aSub 레코드의 상수 `INP*` 허용 여부 (Issue #284)** — ⏸️ DEFERRED.
+- **aSub 레코드의 상수 `INP*` 허용 여부 (Issue #284 / d47fa4c)** — ⏭️ **ALREADY**: `processing.rs` multi-input fetch (`PvDatabase::read_link_with_alarm`)이 `ParsedLink::Constant`에 대해 `link.constant_value()`를 직접 반환 (`links.rs:91`), `_ => (None, None)`로 polymorphic하게 처리. C가 `dbGetLink` 단일 진입점에서 constant에 에러 반환하던 패턴이 enum 분기로 자연스럽게 해소 — aSub `INPA..INPL`이 constant일 때도 fetch_values 등가 단계가 에러 없이 진행.
 - **긴 문자열 `CALC$` 지원 이슈 (Issue #194)** — ⏸️ DEFERRED.
 - **`DBF_MENU` → `DBF_STRING` 변환 버그 픽스 대조 (Issue #183)** — ⏸️ DEFERRED.
 - **`zero-length` (길이가 0인) 배열 지원 엣지 케이스 (7.0.5)** — ⏸️ DEFERRED.
@@ -207,7 +207,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **빈 문자열 링크를 `unset`과 동일하게 처리** (`3b484f58`, 2023) — ⏭️ **ALREADY**: `parse_link_v2` (`crates/epics-base-rs/src/server/record/link.rs:233-235`)가 `s.is_empty()` 케이스를 `ParsedLink::None`으로 반환. JSON form `{const:""}`도 `try_parse_json_link:143-144`에서 동일하게 `None` 처리.
 - **`FIFO 스케줄링`을 환경 변수로 비활성화** (`862272d6`, 2025): `EPICS_NO_RT_SCHED` 같은 환경 변수로 RT 스케줄링을 비활성화하는 기능. `epics-rs`의 RT 스레드 옵트아웃 로직 확인.
 - **`memlock()` 옵트아웃** (`0916cf98`, 2025): FIFO 스케줄링이 비활성화된 경우 `mlockall()` 호출도 건너뜁니다.
-- **`aSub` 레코드의 상수 `INP*` 링크 지원** (`d47fa4ca`, 2022, Issue #284): → 섹션 5의 기존 항목과 동일.
+- **`aSub` 레코드의 상수 `INP*` 링크 지원** (`d47fa4ca`, 2022, Issue #284) — ⏭️ **ALREADY**: 섹션 5 보강 참조. 핵심: `read_link_with_alarm`의 `ParsedLink::Constant(_)` arm이 constant value를 직접 반환하므로 dbGetLink 등가 호출이 발생하지 않음.
 - **`dbLoadRecords()` 오류 메시지 중복 출력 방지** (`9af7fb3`, 2025): 로딩 실패 시 에러 메시지가 두 번 출력되는 버그.
 - **`dbReadDatabaseFP()` 파일 닫기 보장** (`a6779df2`, 2022) — ⚠️ **N/A (eliminated)**: Rust `std::fs::File`의 `Drop`이 자동으로 `close()` 보장. `BufReader<File>` 등 모든 파일 래퍼 동일. `rust_verdict: eliminated`.
 - **`logClient` 연결 끊김 시 미전송 메시지 재전송 시도** (`0a3427c8`, 2019) — ⚠️ **N/A (design diff)**: epics-rs는 C의 `logClient.c` TCP forwarder를 사용하지 않고 `tracing` crate로 구조화된 로깅을 처리. 로그 서버 reconnect 시 retransmit이 필요한 송신 버퍼 자체가 부재. EPICS log server protocol 지원이 필요해질 때 buffer-preserve 정신을 적용.
@@ -462,7 +462,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 - **`recGblRecordError`: 음수 상태 코드에 대한 오류 심볼 조회 건너뜀** (`4c20518`, medium): 음수 오류 코드를 받았을 때 심볼 이름 조회를 건너뛰어 오류 메시지가 불명확.
 - **`iocsh` 인자 분리기: EOF 센티널 (-1)이 유효 문자로 처리** (`3dbc9ea`, partial): `iocsh` 파서에서 -1이 EOF가 아닌 정수로 처리되는 버그. → `iocsh/mod.rs`
-- **`aSub` 레코드: 상수 입력 링크에 `dbGetLink` 호출 오류** (`d47fa4c`, partial): 상수 링크에 `dbGetLink`를 호출하면 오류 반환. → `aSub` 레코드 구현 시 주의.
+- **`aSub` 레코드: 상수 입력 링크에 `dbGetLink` 호출 오류** (`d47fa4c`, partial) — ⏭️ **ALREADY**: 섹션 5/7-C 보강 참조 (multi-input fetch가 `ParsedLink::Constant`를 별도 분기로 처리).
 - **`subRecord`: 잘못된 `INP` 링크 오류를 조용히 성공으로 처리** (`832abbd`, partial): 불량 입력 링크의 오류를 무시하는 버그.
 - **`iocsh`에 `iocshSetError`로 오류 코드 전파** (`144f975`, partial): → 섹션 7-C 기존 항목 보강.
 - **`waveform` `NORD`가 타임스탬프 갱신 전에 발송 → 첫 CA 모니터에 미정의 타임스탬프** (`5ba8080`, medium): `NORD` 이벤트와 타임스탬프 갱신 순서 문제. → `waveform` 레코드

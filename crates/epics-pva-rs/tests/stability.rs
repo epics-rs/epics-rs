@@ -469,3 +469,75 @@ async fn p8_channel_coalesces_concurrent_pvget() {
 
     h.abort();
 }
+
+/// PR #205 server-side filter PVA wire-through: a client that sets
+/// `record._options._filter` in its pvRequest must see the chain
+/// applied on the server side. Decimate by 3 — only every third
+/// pushed value passes through to the callback. Without the wire-
+/// through every push arrived; with it, ~1 in 3 do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_side_filter_pva_dec_wire_through() {
+    use epics_pva_rs::pv_request::PvRequestBuilder;
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:FILT:DEC", 0.0).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::<f64>::new()));
+    let seen_cb = seen.clone();
+
+    let req = PvRequestBuilder::new()
+        .record("_filter", r#"{"dec":{"n":3}}"#)
+        .build();
+
+    let monitor_handle = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let _ = client
+                .pvmonitor_with_request("STAB:FILT:DEC", &req, move |value| {
+                    if let PvField::Structure(s) = value
+                        && let Some(ScalarValue::Double(v)) = s.get_value()
+                    {
+                        seen_cb.lock().push(*v);
+                    }
+                })
+                .await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Push 9 values. With dec n=3, the filter passes the 1st, 4th,
+    // 7th of each window after the initial snapshot.
+    const N: i32 = 9;
+    for i in 1..=N {
+        source.push("STAB:FILT:DEC", i as f64).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let observed = seen.lock().clone();
+    // Initial snapshot + decimated pushes. The initial snapshot has
+    // value 0 from add_pv; the post-init pushes get filtered. We
+    // don't pin an exact count (the filter counter includes the
+    // initial frame), just that the wire-through actively dropped
+    // events — without it we'd see all 10 (initial + 9 pushes).
+    assert!(
+        observed.len() < (N as usize) + 1,
+        "filter wire-through did not drop any events; observed all {} of {} \
+         pushes plus the initial snapshot",
+        observed.len(),
+        N + 1
+    );
+    // And at least one event made it through (proving the filter
+    // isn't dropping everything).
+    assert!(
+        !observed.is_empty(),
+        "filter dropped every event — chain misconfigured"
+    );
+
+    monitor_handle.abort();
+    h.abort();
+}

@@ -47,6 +47,117 @@ struct PipelineOptions {
     queue_size: u32,
 }
 
+/// Wrap a PVA monitor event's `PvField` in the CA-side
+/// [`FilteredMonitorEvent`] shape so it can flow through the shared
+/// channel filter framework. The CA filters operate on a Snapshot
+/// (value + STAT/SEVR + time); the PVA monitor stream carries a
+/// PvField tree that contains those same fields under nested
+/// `value`/`alarm`/`timeStamp` members (NTScalar / NTNDArray shape).
+///
+/// Currently extracts:
+/// * Scalar value (DBND filter needs an f64 comparable). Falls back
+///   to `Double(0.0)` for non-scalar values — DBND on arrays /
+///   structures is meaningless and ARR (which would slice the
+///   array) is the wire-through gap documented separately.
+/// * The mask is always set to `EventMask::VALUE` because PVA's
+///   monitor stream does not carry the CA-style ALARM/PROPERTY
+///   discriminator at this layer — the field bitset already encodes
+///   which subfields changed.
+///
+/// Filters that work today through this adapter: DEC, TS, SYNC,
+/// DBND (scalar VAL only). ARR is the explicit remaining gap.
+fn pv_field_to_filter_event(
+    value: &PvField,
+) -> epics_base_rs::server::database::filters::FilteredMonitorEvent {
+    use crate::pvdata::ScalarValue;
+    use epics_base_rs::server::database::filters::FilteredMonitorEvent;
+    use epics_base_rs::server::pv::MonitorEvent;
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::snapshot::Snapshot;
+    use epics_base_rs::types::EpicsValue;
+    use std::time::SystemTime;
+
+    fn extract_scalar(f: &PvField) -> EpicsValue {
+        match f {
+            PvField::Scalar(ScalarValue::Double(d)) => EpicsValue::Double(*d),
+            PvField::Scalar(ScalarValue::Float(f32v)) => EpicsValue::Float(*f32v),
+            PvField::Scalar(ScalarValue::Int(i)) => EpicsValue::Long(*i),
+            PvField::Scalar(ScalarValue::Long(l)) => EpicsValue::Long(*l as i32),
+            PvField::Scalar(ScalarValue::Short(s)) => EpicsValue::Short(*s),
+            PvField::Scalar(ScalarValue::String(s)) => EpicsValue::String(s.clone()),
+            PvField::Structure(s) => {
+                // NT-style structure: look for a "value" subfield.
+                for (k, v) in &s.fields {
+                    if k == "value" {
+                        return extract_scalar(v);
+                    }
+                }
+                EpicsValue::Double(0.0)
+            }
+            _ => EpicsValue::Double(0.0),
+        }
+    }
+    let val = extract_scalar(value);
+    FilteredMonitorEvent::new(
+        MonitorEvent {
+            snapshot: Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH),
+            origin: 0,
+        },
+        EventMask::VALUE,
+    )
+}
+
+/// Read `record._options._filter` from a decoded pvRequest. The value
+/// must be a string carrying the same channel-filter JSON syntax used
+/// on the CA side (e.g.
+/// `{"dbnd":{"d":0.5},"dec":{"n":3}}`). Returns `None` when the
+/// option is absent, the empty string, or not a structure — the
+/// monitor subscriber then runs with no filter chain.
+///
+/// This is the PVA wire-through for epics-base 3.15.7 server-side
+/// channel filters. Upstream pvxs encodes filters per-field via
+/// `field(value).{filter}` syntax; that requires schema-aware
+/// parsing of the pvRequest's `field` subtree (the filter applies to
+/// a specific named field). The `record._options._filter` carrier
+/// here is the simpler universal form — one chain per subscription,
+/// applied at the monitor emit boundary regardless of which field
+/// the client is subscribed to. The two forms cover overlapping use
+/// cases; a future revision can layer the field-scoped form on top.
+fn monitor_filter_chain_json(req: &PvField) -> Option<String> {
+    use crate::pvdata::ScalarValue;
+    let root = match req {
+        PvField::Structure(s) => s,
+        _ => return None,
+    };
+    let record = root
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "record").then_some(v))?;
+    let record_s = match record {
+        PvField::Structure(s) => s,
+        _ => return None,
+    };
+    let options = record_s
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "_options").then_some(v))?;
+    let opt_s = match options {
+        PvField::Structure(s) => s,
+        _ => return None,
+    };
+    let json = opt_s.fields.iter().find_map(|(k, v)| {
+        (k == "_filter").then_some(v).and_then(|v| match v {
+            PvField::Scalar(ScalarValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+    })?;
+    if json.trim().is_empty() {
+        None
+    } else {
+        Some(json)
+    }
+}
+
 /// Inspect a decoded pvRequest for `record._options.pipeline` and
 /// `record._options.queueSize`. pvxs `Subscription` defaults to
 /// `queueSize = 4` when pipeline is enabled; we follow.
@@ -154,6 +265,14 @@ struct OpState {
     /// Pulsed via the same notify as the credit window so the loop
     /// wakes on resume.
     monitor_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Server-side filter chain decoded from
+    /// `record._options._filter` (a JSON string carrying the same
+    /// channel-filter syntax CA uses: `{"dbnd":{"d":0.5},...}`). The
+    /// monitor subscriber task wraps each emitted event through
+    /// `apply()` before building the wire payload — filters that drop
+    /// the event cause the iteration to continue without sending.
+    /// Empty chain (the default) is a no-op.
+    monitor_filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1281,6 +1400,22 @@ async fn handle_op(
             (None, None)
         };
 
+        // Server-side channel filters (PR #205 follow-up): if the
+        // pvRequest carries `record._options._filter` as a JSON
+        // chain spec, parse it via the shared filter framework.
+        // MONITOR only — GET/PUT/RPC don't have a stream to filter.
+        let monitor_filters = if kind == OpKind::Monitor {
+            let chain_json = req_value.as_ref().and_then(monitor_filter_chain_json);
+            match chain_json {
+                Some(j) => {
+                    Arc::new(epics_base_rs::server::database::filters::parse_filter_chain(&j))
+                }
+                None => Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
+            }
+        } else {
+            Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
+        };
+
         ch.ops.insert(
             ioid,
             OpState {
@@ -1292,6 +1427,7 @@ async fn handle_op(
                 monitor_window,
                 monitor_window_notify,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                monitor_filters,
             },
         );
 
@@ -1579,7 +1715,7 @@ async fn handle_op(
                     .await;
                 // Snapshot the window + notify so the spawned task can
                 // share state with this dispatch path's ACK handler.
-                let (window, window_notify, paused_flag) = ch
+                let (window, window_notify, paused_flag, filters) = ch
                     .ops
                     .get(&ioid)
                     .map(|s| {
@@ -1587,6 +1723,7 @@ async fn handle_op(
                             s.monitor_window.clone(),
                             s.monitor_window_notify.clone(),
                             s.monitor_paused.clone(),
+                            s.monitor_filters.clone(),
                         )
                     })
                     .unwrap_or_else(|| {
@@ -1594,18 +1731,23 @@ async fn handle_op(
                             None,
                             None,
                             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
                         )
                     });
                 let total_bits = intro_clone.total_bits();
                 // Raw fast path is correct only when the downstream's
                 // pvRequest matches the upstream's bytes 1:1 — i.e. no
-                // per-field projection, and no negotiated pipeline
-                // credit window (the raw branch has no per-event
-                // window-decrement / wait-for-ACK gating). Fall back to
-                // the decoded subscribe path otherwise.
+                // per-field projection, no negotiated pipeline credit
+                // window (the raw branch has no per-event
+                // window-decrement / wait-for-ACK gating), AND no
+                // server-side filter chain (the raw branch forwards
+                // pre-encoded wire bytes; the filter chain operates
+                // on the decoded PvField). Fall back to the decoded
+                // subscribe path in any of those cases.
                 let raw_path_eligible = mask_clone.count() == total_bits
                     && mask_clone.size() >= total_bits
-                    && window.is_none();
+                    && window.is_none()
+                    && filters.is_empty();
                 let join = tokio::spawn(async move {
                     // F-G12: raw-frame fast path. When the source can
                     // hand us pre-encoded MONITOR DATA bytes (e.g.
@@ -1921,6 +2063,15 @@ async fn handle_op(
                         if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
                             continue;
                         }
+                        // Server-side channel filters: skip when the
+                        // chain drops this event. Empty chain (the
+                        // default) is a no-op pass-through.
+                        if !filters.is_empty() {
+                            let fev = pv_field_to_filter_event(&value);
+                            if filters.apply(fev).is_none() {
+                                continue;
+                            }
+                        }
                         let payload =
                             build_monitor_payload(ioid, &intro_clone, &value, &mask_clone, order);
                         if tx_clone.send(payload).await.is_err() {
@@ -2224,6 +2375,9 @@ mod tests {
                 monitor_window: None,
                 monitor_window_notify: None,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                monitor_filters: Arc::new(
+                    epics_base_rs::server::database::filters::FilterChain::new(),
+                ),
             },
         );
         channels.insert(

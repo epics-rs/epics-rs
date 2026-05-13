@@ -16,7 +16,7 @@
 //! caller need not append anything after the body.
 
 use crate::proto::ByteOrder;
-use crate::pvdata::FieldDesc;
+use crate::pvdata::{FieldDesc, PvField};
 use crate::pvdata::encode::encode_type_desc;
 
 /// Build a pvRequest selecting `fields` at the top level of "field(...)".
@@ -349,7 +349,17 @@ impl PvRequestExpr {
         }
     }
 
-    /// Encode this expression as a wire-format pvRequest (0x80 + body).
+    /// Encode this expression as a wire-format pvRequest body: the
+    /// type descriptor followed by the full value. pvxs
+    /// `clientget.cpp::to_wire_full(R, request)` semantics — the
+    /// server decodes both halves so it can read `record._options`
+    /// string values like `pipeline=true` or `_filter={...}`.
+    ///
+    /// Before this carried the value half, record-level options were
+    /// silently dropped on the wire — the server saw the type
+    /// descriptor (which said "there's a string here named pipeline")
+    /// but no value, so `record._options.pipeline` ended up empty and
+    /// every option-driven feature degraded to "off" / default.
     pub fn encode(&self, big_endian: bool) -> Vec<u8> {
         let order = if big_endian {
             ByteOrder::Big
@@ -357,9 +367,65 @@ impl PvRequestExpr {
             ByteOrder::Little
         };
         let desc = self.to_field_desc();
+        let value = self.to_pv_field();
         let mut out = Vec::new();
         encode_type_desc(&desc, order, &mut out);
+        crate::pvdata::encode::encode_pv_field(&value, &desc, order, &mut out);
         out
+    }
+
+    /// Build a [`PvField`] tree matching [`Self::to_field_desc`],
+    /// populated with the actual record-option string values. The
+    /// `field` subtree carries no values (empty Structure) since
+    /// pvRequest field selection is purely structural — only
+    /// record-level options have data payload.
+    pub fn to_pv_field(&self) -> PvField {
+        use crate::pvdata::{PvField, PvStructure, ScalarValue};
+        fn empty_nested(desc: &FieldDesc) -> PvField {
+            match desc {
+                FieldDesc::Structure { struct_id, fields } => {
+                    let mut s = PvStructure::new(struct_id);
+                    for (name, sub) in fields {
+                        s.fields.push((name.clone(), empty_nested(sub)));
+                    }
+                    PvField::Structure(s)
+                }
+                _ => PvField::Scalar(ScalarValue::String(String::new())),
+            }
+        }
+        let desc = self.to_field_desc();
+        let FieldDesc::Structure {
+            struct_id,
+            fields: top_fields,
+        } = desc
+        else {
+            // to_field_desc always returns a Structure; fall back to
+            // an empty structure for safety.
+            return PvField::Structure(PvStructure::new(""));
+        };
+        let mut top = PvStructure::new(&struct_id);
+        for (name, sub_desc) in &top_fields {
+            let sub_val = match name.as_str() {
+                "field" => empty_nested(sub_desc),
+                "record" => {
+                    // record._options.{...} carries our string values.
+                    let mut record_s = PvStructure::new("");
+                    let mut options_s = PvStructure::new("");
+                    for (k, v) in &self.record_options {
+                        options_s
+                            .fields
+                            .push((k.clone(), PvField::Scalar(ScalarValue::String(v.clone()))));
+                    }
+                    record_s
+                        .fields
+                        .push(("_options".to_string(), PvField::Structure(options_s)));
+                    PvField::Structure(record_s)
+                }
+                _ => empty_nested(sub_desc),
+            };
+            top.fields.push((name.clone(), sub_val));
+        }
+        PvField::Structure(top)
     }
 }
 

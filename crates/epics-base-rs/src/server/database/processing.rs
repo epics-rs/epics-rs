@@ -229,6 +229,28 @@ impl PvDatabase {
         // Read INP value
         let inp_value = self.read_link_value_soft(&inp_parsed, is_soft).await;
 
+        // epics-base PR #d0cf47c: single-INP MS-class link must also
+        // propagate the source record's STAT/SEVR/AMSG just like the
+        // multi-input fetch loop below does. Previously the INPA..L
+        // path (calc/sub/aSub/sel) propagated alarms but plain single
+        // INP (ai/bi/longin/mbbi/stringin) silently dropped them —
+        // downstream MSS readers saw NoAlarm even when the source was
+        // INVALID. Only fires for soft-channel records: hardware-driver
+        // alarms travel through device-support's own last_alarm path.
+        let inp_link_alarm: Option<(
+            crate::server::record::MonitorSwitch,
+            super::links::LinkAlarm,
+        )> = if is_soft {
+            if let crate::server::record::ParsedLink::Db(ref db) = inp_parsed {
+                let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
+                alarm.map(|a| (db.monitor_switch, a))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Read DOL value
         let dol_value = if let Some((ref dol_parsed, _oif)) = dol_info {
             self.read_link_value(dol_parsed).await
@@ -282,6 +304,13 @@ impl PvDatabase {
                 }
             }
             multi_input_values = results;
+        }
+        // PR #d0cf47c continued: feed the INP alarm (if any) into the
+        // same `link_alarms` list the lock-section iterates over. Order
+        // doesn't matter — `rec_gbl_set_sevr_msg` takes the maximum
+        // severity across all sources.
+        if let Some(pair) = inp_link_alarm {
+            link_alarms.push(pair);
         }
 
         // 1.6. Sel NVL link: resolve NVL -> SELN

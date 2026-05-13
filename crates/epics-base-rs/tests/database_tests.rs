@@ -110,6 +110,69 @@ async fn test_soft_inp_read_failure_sets_link_alarm() {
     );
 }
 
+/// epics-base PR #d0cf47c regression: single-INP MS-class link must
+/// propagate STAT/SEVR/AMSG from the source record. Previously only
+/// the multi-input link path (INPA..INPL, calc/sub/aSub/sel) carried
+/// MS-class alarms; ai/longin/bi/mbbi/stringin INP=`SRC MSS` silently
+/// dropped them even though the link parser recorded the MS modifier.
+#[tokio::test]
+async fn test_single_inp_ms_class_propagates_source_alarm() {
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::server::recgbl::alarm_status;
+
+    let db = PvDatabase::new();
+    db.add_record("SRC", Box::new(AoRecord::new(7.0)))
+        .await
+        .unwrap();
+    db.add_record("DST", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Force the source into MAJOR severity with a specific STAT and
+    // alarm message so we can verify both numeric fields and the
+    // amsg string propagate through the MS modifier.
+    if let Some(rec) = db.get_record("SRC").await {
+        let mut inst = rec.write().await;
+        inst.common.stat = alarm_status::HIHI_ALARM;
+        inst.common.sevr = AlarmSeverity::Major;
+        inst.common.amsg = "src-major".to_string();
+    }
+
+    // INP="SRC NPP MS" — NPP prevents PP=ProcessPassive from
+    // re-processing SRC and clearing the alarm state the test just
+    // installed; MS (Maximize) makes the link propagate STAT/SEVR/AMSG.
+    // Also clear DST's default UDF so its own UDF_ALARM/Invalid
+    // doesn't mask the lower-severity Major from SRC under maximize.
+    if let Some(rec) = db.get_record("DST").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("SRC NPP MS".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let dst = db.get_record("DST").await.expect("DST exists");
+    let inst = dst.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Major,
+        "MS link must lift DST severity to source's Major"
+    );
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::HIHI_ALARM,
+        "MS link must carry source's STAT"
+    );
+    assert_eq!(
+        inst.common.amsg, "src-major",
+        "MS link must carry source's AMSG"
+    );
+}
+
 #[tokio::test]
 async fn test_cycle_detection() {
     let db = PvDatabase::new();

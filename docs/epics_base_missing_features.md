@@ -85,7 +85,7 @@
 
 ### 네트워킹 & 프로토콜 세부
 - **DNS TTL 주기적 갱신 부재 (PR #862)** — ⏭️ **ALREADY**: `EPICS_CA_DNS_REFRESH_SECS` 타이머 + `AddrEntry::refresh_dns` 구현 (round 50).
-- **네임서버 CA 프로토콜 강제 지정 (PR #621)** — ⏸️ **DEFERRED**: `CA_V413` 강제 옵션 미구현.
+- **네임서버 CA 프로토콜 강제 지정 (PR #621)** — ⏸️ **DEFERRED (upstream-DRAFT)**: name server를 거쳐 CA search 응답을 받을 때 UDP 버전이 name server의 것이므로 실제 server 버전 mismatch가 발생. PR은 compile-time `CA_V413` 강제값을 사용 — upstream PR이 DRAFT(검토 코멘트 다수). 머지 후 `epics-ca-rs` transport.rs의 version negotiation에 동등 옵션(아마도 env var) 추가.
 - **다량 채널 검색(Mass-channel) 성능 튜닝 (Issue #372)** — 🔄 **PARTIAL**: AIMD search budget + 30-bucket cooperative tick 기반 구현되어 있으나 mass scenario 별도 검증 필요.
 - **`caget` 반환 타입 단축 (PR #629)** — ⚠️ **N/A**: 원PR은 C `caget`의 `-d` argument parser에서 `DBR_INT` 문자열을 `DBR_SHORT`로 치환하는 패치(`dbr_text_to_type`이 `INT` suffix를 파싱하지 못하므로). `caget-rs`의 `-d/--dbr-type` 옵션은 현재 parity-only로 받기만 하고 채널 요청에 반영되지 않으므로(`bin/caget-rs.rs:233-235`) 변환 자체가 적용될 진입점 없음. `-d`를 실제로 wire-through할 때 같이 처리.
 - **CA UDP 전송 오류 rate-limit (cae597d, c23012d)** — ⏭️ **ALREADY**: `client/search.rs::send_with_fanout`, `server/beacon.rs::run_beacon_emitter`에 per-destination first/change/recovery만 로그하는 dedup.

@@ -492,7 +492,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 - **TCP Search 기능 추가** (`8363c7fe9a5f`, high) — ⏭️ **ALREADY**: `EPICS_PVA_NAME_SERVERS` 환경변수로 TCP name server 지원 (`client_native/channel.rs::new_with_name_servers`).
 - **재연결 루프 지연(Slow down reconnect loop)** (`3b8540f52002`, high) — ⏭️ **ALREADY**: `channel.rs::holdoff_until` 타이머로 connect-fail holdoff 구현.
-- **종료(Shutdown) 중 Name Server 재연결 금지** (`4d12da87205e`, high) — ⏸️ DEFERRED.
+- **종료(Shutdown) 중 Name Server 재연결 금지** (`4d12da87205e`, high) — ✅ **DONE**: `ConnectionPool`에 `shutdown: AtomicBool` 추가, `clear()`(PvaClient::close 경로)가 release-store로 set. `Channel::ensure_active`의 name-server fallback이 `pool.is_shutdown()`을 체크해 true일 때 후보 목록에 추가하지 않음 — 이 경로가 pvxs 4d12da87이 `context->state==Running` 분기로 막던 것과 동일 효과. 테스트 2종(clear→true 전이, fresh→false 유지).
 - **`Channel` Search Bypass 최적화** (`5d3a21f03010`, high) — ⏸️ DEFERRED.
 - **`Channel` 일관된 연결 해제(Disconnect) 처리** (`f7b3821e10b4`, high) — ⏸️ DEFERRED.
 - **`Context::close()` 명시적 지원** (`0de17036f4a6`, medium) — ⏭️ **ALREADY**: `PvaClient::close()` (`context.rs:610`).

@@ -167,6 +167,13 @@ impl Resolver {
 pub struct ConnectionPool {
     inner: parking_lot::Mutex<std::collections::HashMap<std::net::SocketAddr, Arc<ServerConn>>>,
     tls: parking_lot::Mutex<Option<Arc<crate::auth::TlsClientConfig>>>,
+    /// Set by `PvaClient::close` (pvxs `Context::close`). Once true,
+    /// reconnect attempts (especially the name-server fallback in
+    /// `Channel::connect`) MUST refuse to dial — pvxs commit
+    /// 4d12da87205e adds the same gate on the C++ side. Without it,
+    /// an in-flight operation tearing down can spawn fresh
+    /// connections during shutdown and leak the search-engine task.
+    shutdown: std::sync::atomic::AtomicBool,
 }
 
 impl ConnectionPool {
@@ -240,9 +247,21 @@ impl ConnectionPool {
     /// Drop every cached connection. The underlying `ServerConn`s live
     /// only as long as some `Arc` to them is held, so callers should
     /// already have dropped any operation handles that hold a clone.
-    /// Used by `PvaClient::close` for explicit shutdown.
+    /// Used by `PvaClient::close` for explicit shutdown. Also flips
+    /// the shutdown flag so any subsequent `get_or_connect` /
+    /// name-server reconnect path returns an error instead of dialing
+    /// out (pvxs 4d12da87205e).
     pub fn clear(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         self.inner.lock().clear();
+    }
+
+    /// `true` after `clear()` (i.e. after `PvaClient::close`) has run.
+    /// Channel reconnect paths consult this to skip name-server
+    /// fallback during shutdown.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -581,7 +600,13 @@ impl Channel {
         // self-serve case (gateway answers for any PV it proxies)
         // direct-connect to the name server's TCP port works
         // identically. Redirect-style chains aren't supported.
-        if !self.name_servers.is_empty() {
+        //
+        // pvxs 4d12da87205e: skip the name-server fallback entirely
+        // once the parent `PvaClient::close` (i.e. ConnectionPool
+        // shutdown flag) has been called. Otherwise an operation
+        // tearing down can still spawn fresh TCP dials to the
+        // name servers, leaking work past shutdown.
+        if !self.name_servers.is_empty() && !self.pool.is_shutdown() {
             for ns in &self.name_servers {
                 if !candidates.contains(ns) {
                     candidates.push(*ns);
@@ -786,6 +811,26 @@ mod tests {
             res,
             Err(PvaError::Protocol(ref m)) if m.contains("closed")
         ));
+    }
+
+    /// pvxs 4d12da87205e — `ConnectionPool::clear` (called by
+    /// `PvaClient::close`) must flip the shutdown flag so subsequent
+    /// reconnect paths reject. Otherwise tearing down an in-flight
+    /// operation can re-spawn fresh TCP dials to name-servers.
+    #[test]
+    fn connection_pool_clear_marks_shutdown() {
+        let pool = ConnectionPool::new();
+        assert!(!pool.is_shutdown());
+        pool.clear();
+        assert!(pool.is_shutdown());
+    }
+
+    /// `is_shutdown` is sticky — a fresh pool that has never been
+    /// cleared returns false.
+    #[test]
+    fn connection_pool_fresh_is_not_shutdown() {
+        let pool = ConnectionPool::new();
+        assert!(!pool.is_shutdown());
     }
 
     /// `is_active()` must return `false` whenever `server_destroyed`

@@ -1,6 +1,7 @@
 mod commands;
 pub mod registry;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::{Arc, RwLock};
 
@@ -40,12 +41,37 @@ impl IocShell {
             return Ok(CommandOutcome::Continue);
         }
 
-        // Handle `< filename` include syntax
+        // Handle `< filename` include syntax (no macro substitution).
         if let Some(rest) = line.strip_prefix('<') {
             let filename = registry::substitute_env_vars(rest.trim());
             return self
                 .execute_script(&filename)
                 .map(|_| CommandOutcome::Continue);
+        }
+
+        // Handle `iocshLoad <path> [macros]` (Issue #847): include with
+        // macro substitution applied to each line of the script. `<`
+        // lacks macro support so a separate dispatch is required;
+        // intercepting before registry lookup lets the loaded
+        // script's own lines re-enter `execute_line` (supporting
+        // `<` / `iocshLoad` / redirects / registered commands
+        // recursively). `tokenize` already runs `substitute_env_vars`
+        // on each token so we use the substituted path and macros
+        // string directly.
+        {
+            let toks = tokenize(line);
+            if toks.first().map(|s| s.as_str()) == Some("iocshLoad") {
+                if toks.len() < 2 {
+                    return Err("iocshLoad <path> [macros]".into());
+                }
+                let macros = toks
+                    .get(2)
+                    .map(|s| commands::parse_macro_string(s))
+                    .unwrap_or_default();
+                return self
+                    .execute_script_with_macros(&toks[1], &macros)
+                    .map(|_| CommandOutcome::Continue);
+            }
         }
 
         // Handle `> filename` / `>> filename` output redirection
@@ -108,6 +134,40 @@ impl IocShell {
         def.handler.call(&args, &self.ctx)
     }
 
+    /// Execute a script with per-line macro substitution applied,
+    /// mirroring C `iocshLoad("path", "K=V,...")` (Issue #847).
+    /// Macros use `$(KEY)` / `${KEY}` syntax via `db_loader::substitute_macros`.
+    /// Per-line errors are reported (matching `execute_script`) but
+    /// the script continues to the next line.
+    pub fn execute_script_with_macros(
+        &self,
+        path: &str,
+        macros: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+        let mut last_err: Option<String> = None;
+        for (line_num, line) in join_backslash_continuations(&content) {
+            let expanded = if macros.is_empty() {
+                line
+            } else {
+                crate::server::db_loader::substitute_macros(&line, macros)
+            };
+            println!("{expanded}");
+            match self.execute_line(&expanded) {
+                Ok(CommandOutcome::Continue) => {}
+                Ok(CommandOutcome::Exit) => {
+                    return last_err.map(Err).unwrap_or(Ok(()));
+                }
+                Err(e) => {
+                    eprintln!("{path}:{line_num}: Error: {e}");
+                    last_err = Some(format!("{path}:{line_num}: {e}"));
+                }
+            }
+        }
+        last_err.map(Err).unwrap_or(Ok(()))
+    }
+
     /// Execute a script file line by line, echoing each line like C++ iocsh.
     ///
     /// C parity (144f975): errors from individual commands are reported but
@@ -119,17 +179,18 @@ impl IocShell {
             std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
 
         let mut last_err: Option<String> = None;
-        for (line_num, line) in content.lines().enumerate() {
-            // Echo each line (C++ iocsh behavior)
+        for (line_num, line) in join_backslash_continuations(&content) {
+            // Echo each logical line (C++ iocsh behavior — continuations
+            // are already collapsed so the echo shows the joined line).
             println!("{line}");
-            match self.execute_line(line) {
+            match self.execute_line(&line) {
                 Ok(CommandOutcome::Continue) => {}
                 Ok(CommandOutcome::Exit) => {
                     return last_err.map(Err).unwrap_or(Ok(()));
                 }
                 Err(e) => {
-                    eprintln!("{}:{}: Error: {}", path, line_num + 1, e);
-                    last_err = Some(format!("{}:{}: {}", path, line_num + 1, e));
+                    eprintln!("{path}:{line_num}: Error: {e}");
+                    last_err = Some(format!("{path}:{line_num}: {e}"));
                 }
             }
         }
@@ -195,6 +256,42 @@ impl IocShell {
         }
         Ok(CommandOutcome::Continue)
     }
+}
+
+/// Collapse C iocsh backslash-newline line continuations into logical
+/// lines (epics-base PR #603). A physical line ending in `\` joins to
+/// the next line: the trailing backslash is stripped, the newline is
+/// dropped, and the next physical line's contents (including any
+/// leading whitespace) follow immediately. `\` followed by any other
+/// character — including a space before the newline — keeps the
+/// backslash literal and terminates the logical line normally.
+///
+/// Returns `(physical_line_number, logical_line)` pairs. The line
+/// number is the 1-based index of the *first* physical line in the
+/// group, matching where a user would look for an error.
+pub(crate) fn join_backslash_continuations(input: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut start_line: Option<usize> = None;
+    for (idx, line) in input.lines().enumerate() {
+        let physical_no = idx + 1;
+        if start_line.is_none() {
+            start_line = Some(physical_no);
+        }
+        if let Some(stripped) = line.strip_suffix('\\') {
+            current.push_str(stripped);
+        } else {
+            current.push_str(line);
+            out.push((
+                start_line.take().unwrap_or(physical_no),
+                std::mem::take(&mut current),
+            ));
+        }
+    }
+    if !current.is_empty() {
+        out.push((start_line.unwrap_or(1), current));
+    }
+    out
 }
 
 struct Redirect {
@@ -461,6 +558,172 @@ mod tests {
         let shell = make_shell();
         let r = shell.execute_line("dbCreateRecord nonexistent NEW_REC");
         assert!(matches!(r, Ok(CommandOutcome::Continue)));
+    }
+
+    /// PR #603 — line ending in `\` joins to the next physical line.
+    /// Mirrors the 8 scenarios in epics-base
+    /// `modules/libcom/test/multiline-input.txt`. Uses `concat!` (no
+    /// Rust source-line continuation) so trailing whitespace before
+    /// `\\\n` and leading whitespace on continuation chunks is
+    /// preserved verbatim — `String::lines()` then sees the exact
+    /// physical line layout from the upstream test file.
+    #[test]
+    fn test_backslash_continuation_scenarios() {
+        let input = concat!(
+            "1 not a multiline string\n",
+            "2 first multiline \\\n",
+            "string\n",
+            "3 second multiline \\\n",
+            "string \\\n",
+            "with more lines\n",
+            "4 several lines .. \\\n",
+            "next line is empty: \\\n",
+            "\\\n",
+            "next has only a space:\\\n",
+            " \\\n",
+            "next line has 3 spaces:\\\n",
+            "   \\\n",
+            "END\n",
+            "5 it is fine to sp\\\n",
+            "it words, or really \\\n",
+            "c\\\n",
+            "h\\\n",
+            "o\\\n",
+            "p\\\n",
+            " them up!\n",
+            "\\\n",
+            "6 start with backslash , fine with me but why?\n",
+            "7 have a trailing space after backslash \\ \n",
+            "8 not part of the string no. 7\n",
+        );
+        let lines: Vec<String> = join_backslash_continuations(input)
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(lines[0], "1 not a multiline string");
+        assert_eq!(lines[1], "2 first multiline string");
+        assert_eq!(lines[2], "3 second multiline string with more lines");
+        assert_eq!(
+            lines[3],
+            "4 several lines .. next line is empty: next has only a space: next line has 3 spaces:   END"
+        );
+        assert_eq!(
+            lines[4],
+            "5 it is fine to spit words, or really chop them up!"
+        );
+        assert_eq!(lines[5], "6 start with backslash , fine with me but why?");
+        assert_eq!(lines[6], "7 have a trailing space after backslash \\ ");
+        assert_eq!(lines[7], "8 not part of the string no. 7");
+        assert_eq!(lines.len(), 8);
+    }
+
+    /// Logical line numbers reported by `join_backslash_continuations`
+    /// point at the *first* physical line of the joined group — this
+    /// is what the user reads in the script when debugging.
+    #[test]
+    fn test_backslash_continuation_line_numbers() {
+        let input = "a\nb \\\nc\nd\n";
+        let out = join_backslash_continuations(input);
+        assert_eq!(
+            out,
+            vec![(1, "a".into()), (2, "b c".into()), (4, "d".into())]
+        );
+    }
+
+    /// EOF without trailing newline: emit the partial as a final line
+    /// (matches `String::lines()` semantics).
+    #[test]
+    fn test_backslash_continuation_no_trailing_newline() {
+        let out = join_backslash_continuations("partial");
+        assert_eq!(out, vec![(1, "partial".into())]);
+    }
+
+    /// CRLF input must yield the same logical lines as LF (Rust's
+    /// `str::lines()` strips the CR for us).
+    #[test]
+    fn test_backslash_continuation_crlf() {
+        let out = join_backslash_continuations("a \\\r\nb\r\n");
+        assert_eq!(out, vec![(1, "a b".into())]);
+    }
+
+    /// End-to-end: a backslash-continued script line tokenizes and
+    /// runs as one logical command.
+    #[test]
+    fn test_iocsh_script_backslash_continuation_end_to_end() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_multiline.cmd");
+        // dbgf TEST_REC.VAL — but split across two physical lines.
+        std::fs::write(&tmp, "dbgf \\\nTEST_REC.VAL\n").unwrap();
+        let result = shell.execute_script(tmp.to_str().unwrap());
+        std::fs::remove_file(&tmp).ok();
+        assert!(result.is_ok(), "joined `dbgf TEST_REC.VAL` must succeed");
+    }
+
+    /// Issue #847 — `iocshLoad <path> [macros]` reads a script and
+    /// substitutes `$(KEY)` / `${KEY}` per-call macros before
+    /// dispatching each line through the standard `execute_line`
+    /// pipeline. Verifies the happy path: a macro-parameterised
+    /// command is recognised after substitution.
+    #[test]
+    fn test_iocsh_load_macro_substitutes_command_name() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_load_macro_cmd.cmd");
+        std::fs::write(&tmp, "$(CMD)\n").unwrap();
+        let line = format!("iocshLoad {} CMD=dbl", tmp.display());
+        let result = shell.execute_line(&line);
+        std::fs::remove_file(&tmp).ok();
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+    }
+
+    /// Without macros, `iocshLoad` behaves like `<` (no substitution).
+    #[test]
+    fn test_iocsh_load_no_macros() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_load_no_macros.cmd");
+        std::fs::write(&tmp, "dbl\n").unwrap();
+        let line = format!("iocshLoad {}", tmp.display());
+        let result = shell.execute_line(&line);
+        std::fs::remove_file(&tmp).ok();
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+    }
+
+    /// Missing required `<path>` arg surfaces an error to the caller.
+    #[test]
+    fn test_iocsh_load_missing_path_errors() {
+        let shell = make_shell();
+        let result = shell.execute_line("iocshLoad");
+        assert!(result.is_err());
+    }
+
+    /// C++-style call `iocshLoad("path", "K=V,...")` must tokenize to
+    /// the same args as the space form — quotes around the macro
+    /// string protect the comma so it stays one token.
+    #[test]
+    fn test_iocsh_load_cpp_paren_syntax() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_load_paren.cmd");
+        std::fs::write(&tmp, "$(CMD)\n").unwrap();
+        let line = format!("iocshLoad(\"{}\", \"CMD=dbl\")", tmp.display());
+        let result = shell.execute_line(&line);
+        std::fs::remove_file(&tmp).ok();
+        assert!(matches!(result, Ok(CommandOutcome::Continue)));
+    }
+
+    /// Per-line errors during an iocshLoad must not abort the rest of
+    /// the script (matches the `execute_script` semantics) but the
+    /// final result is `Err` so callers detect a non-zero exit.
+    #[test]
+    fn test_iocsh_load_per_line_errors_continue_and_propagate() {
+        let shell = make_shell();
+        let tmp = std::env::temp_dir().join("iocsh_load_err.cmd");
+        std::fs::write(&tmp, "nonexistent_cmd\ndbl\n").unwrap();
+        let line = format!("iocshLoad {}", tmp.display());
+        let result = shell.execute_line(&line);
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            result.is_err(),
+            "iocshLoad with bad command must surface Err"
+        );
     }
 
     #[test]

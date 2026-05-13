@@ -1065,7 +1065,7 @@ fn cmd_exit() -> CommandDef {
 
 /// Parse a macro string like "P=IOC:,R=TEMP" into a HashMap.
 /// Macro values may reference environment variables via `$(ENVVAR)`.
-fn parse_macro_string(s: &str) -> HashMap<String, String> {
+pub(super) fn parse_macro_string(s: &str) -> HashMap<String, String> {
     let mut macros = HashMap::new();
     if s.is_empty() {
         return macros;

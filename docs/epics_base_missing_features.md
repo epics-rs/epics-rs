@@ -190,7 +190,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`iocinf.cpp` 호스트명 버퍼 오버플로** (`a8e8d22c`, 2022): 32바이트를 초과하는 호스트명이 CA 클라이언트에서 잘리는 버그.
 - **`postfix()` 함수의 널 포인터 역참조** (`60fa2d31`, 2023): calc 엔진의 후위 변환기에서 잘못된 입력 시 크래시.
 - **`dbEvent` 잔여 이벤트 카운트(`eventsRemaining`) 오계산** (`e1c1bb8b`, 2023): 이벤트 큐에서 남은 이벤트 수 계산 오류로 조기 종료.
-- **`callbackSetQueueSize` 상한 검사** (`baa4cb54`, 2025): 콜백 큐 사이즈 설정 시 정상 범위를 확인하는 산티티 체크 추가.
+- **`callbackSetQueueSize` 상한 검사** (`baa4cb54`, 2025) — ⚠️ **N/A (design diff)**: epics-rs는 C의 `callback.c` 큐 시스템을 사용하지 않고 tokio 런타임의 `mpsc::channel` / spawn 으로 콜백 워크를 처리. `callbackSetQueueSize` 등가 API 자체가 없음. 음수/0 큐 사이즈 입력 검증이 필요한 진입점이 부재.
 - **`CHAR` 배열 출력 시 비출력 문자 이스케이프** (`dc70dfd6`, 2022): `dbgf`에서 CHAR 배열을 텍스트로 출력할 때 제어 문자를 이스케이프.
 
 ---

@@ -1,6 +1,7 @@
 pub mod arrays;
 pub mod average;
 pub mod common;
+pub mod limits;
 pub mod enum_type;
 pub mod float64;
 pub mod generic_pointer;

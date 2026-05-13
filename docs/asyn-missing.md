@@ -60,8 +60,8 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 
 | 항목 | C asyn 출처 | 상태 | 비고 |
 |---|---|---|---|
-| **PVI** (PVInterface) tree-structured params | PR #117 | ❌ 미구현 | 계층적 파라미터 토폴로지. 우리는 flat `ParamSet` 만 보유 |
-| `asynParamSet` 그룹화 클래스 | PR #117 | ❌ 미구현 | 대규모 파라미터 논리적 그룹/검색. 우리는 단일 namespace |
+| **PVI** (PVInterface) tree-structured params | PR #117 | 🔄 PARTIAL | `param_tree.rs::ParamTree` (this session — 계층 경로 → flat-name 리졸버 + 결정적 leaf 순회). port driver / drvInfo 결정 경로와 wiring (각 port 가 `ParamTree` + `ParamList` 둘 다 보유, drvInfo 가 양쪽 동시 검색) 은 follow-up |
+| `asynParamSet` 그룹화 클래스 | PR #117 | 🔄 PARTIAL | `param_tree.rs::ParamGroupBuilder` (this session — prefix 기반 group builder). full programmatic param set lifecycle (add/remove/walk + interrupt fan-out per-group) 은 follow-up |
 | UDP 서버 모드 (`drvAsynIPServerPort UDP`) | 기존 | 🔄 PARTIAL | `drivers/ip_server_port.rs` 가 `IpServerProtocol::Udp` 파싱/저장. 런타임 `open_listener` 는 명시적 "not yet wired" 반환 — UDP-server adapter (peer-per-datagram slot 매핑) 가 다음 단계 |
 
 ### 4. 외부-dep 필요 항목 묶음
@@ -84,12 +84,12 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 5. **Prologix `connect()` ip_port 위임 wiring** — small
 6. **VXI-11 `vxi11-hw` ONC RPC 스택 wiring** — large
 7. **HiSLIP `hislip-hw` IVI-6.1 frame parser wiring** — large
-8. **PVI / asynParamSet** (architectural, multi-day) — large
+8. **PVI/asynParamSet ↔ port-driver drvInfo wiring** (ParamTree + ParamList 통합) — medium/large
 
 ---
 
 ### 종합 요약
-`asyn-rs`는 단순한 포팅을 넘어 C++ 버전의 고질적 버그와 최신 요구사항(TCP 비동기 커넥션, RS485 지원, SO_REUSEPORT, BREAK, AVERAGE 등)을 이미 매우 높은 수준으로 선제 반영. 본 세션에서 USBTMC/Prologix/VXI-11/HiSLIP scaffold, UDP-server protocol parser, `asyn:FIFO` ring buffer, `getLimits` trait, aai/aao DTYP 회귀 테스트까지 추가 — 남은 큰 마일스톤은:
+`asyn-rs`는 단순한 포팅을 넘어 C++ 버전의 고질적 버그와 최신 요구사항(TCP 비동기 커넥션, RS485 지원, SO_REUSEPORT, BREAK, AVERAGE 등)을 이미 매우 높은 수준으로 선제 반영. 본 세션에서 USBTMC/Prologix/VXI-11/HiSLIP scaffold, UDP-server protocol parser, `asyn:FIFO` ring buffer, `getLimits` trait, aai/aao DTYP 회귀 테스트, PVI/asynParamSet `ParamTree` 리졸버까지 추가 — `asyn-missing.md` 의 ❌ 항목은 모두 해소되어 🔄 PARTIAL (scaffold + follow-up wiring 단계) 만 남음. 남은 큰 마일스톤은:
 
-1. **scaffold → 런타임 wiring** (USBTMC HW, VXI-11 ONC RPC, HiSLIP IVI-6.1 frames, Prologix ip_port 위임, FIFO record-adapter, UDP-server adapter, getLimits ↔ DRVH/DRVL)
-2. **PVI tree topology** — 아키텍처적 확장
+1. **scaffold → 런타임 wiring** — USBTMC HW, VXI-11 ONC RPC, HiSLIP IVI-6.1 frames, Prologix ip_port 위임, FIFO record-adapter, UDP-server adapter, getLimits ↔ DRVH/DRVL, ParamTree ↔ drvInfo
+2. **외부 dep 선정** — `onc-rpc` (VXI-11), `rusb`/`nusb` (USBTMC), HiSLIP frame crate 후보 검토

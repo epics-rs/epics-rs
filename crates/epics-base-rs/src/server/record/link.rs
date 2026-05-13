@@ -58,6 +58,31 @@ pub enum ParsedLink {
     Pva(String),
     /// `@dev arg1 …` or `#Cn Sn` hardware link (epics-base PR #213).
     Hw(HwLink),
+    /// epics-base PR `e3c9d590` / `20404003`: a `lnkCalc` JSON link
+    /// computes a result from one or more input PV values + a calc
+    /// expression, optionally pulling its timestamp from one of the
+    /// inputs. JSON form:
+    /// `{calc:{expr:"A+B*2", args:["pv1","pv2.VAL"], time:"A"}}`
+    /// — `time` is the input letter (A-L) whose timestamp the result
+    /// should carry. `time` may be omitted (no timestamp passthrough).
+    Calc(CalcLink),
+}
+
+/// Configuration for a `lnkCalc` link.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalcLink {
+    /// Calc expression in epics-base postfix syntax — e.g. `"A+B*2"`,
+    /// `"MAX(A,B,C)"`. Variables A..L bind to `args[0..12]`.
+    pub expr: String,
+    /// Input PV names. Each `args[i]` is fetched at link-read time and
+    /// bound to the calc engine's variable slot at index `i` (0→A,
+    /// 1→B, …). PV names may include a field suffix (`.VAL`, `.NORD`).
+    /// Up to 12 inputs (calc engine A-L slots).
+    pub args: Vec<String>,
+    /// Input letter ('A'..='L') whose timestamp should be used for
+    /// the result. `None` skips timestamp passthrough — the consumer
+    /// uses its own `apply_timestamp` time.
+    pub time_source: Option<char>,
 }
 
 /// Monitor propagation policy for links.
@@ -157,6 +182,50 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             } else {
                 Some(ParsedLink::Pva(pv))
             }
+        }
+        "calc" => {
+            // Form: { calc: { expr: "...", args: ["pv1","pv2"], time: "A" } }
+            //   - expr (required, string)
+            //   - args (optional, JSON string array)
+            //   - time (optional, single uppercase letter A..L)
+            // We use serde_json for proper parsing — the previous
+            // permissive substring approach can't handle nested
+            // arrays / quoted commas reliably.
+            let body = rest.trim();
+            // Trim trailing brace-of-outer-object swallowed during the
+            // initial split. The body always starts with `{` and the
+            // outer brace was already stripped above.
+            let body_obj = if body.ends_with('}') {
+                body
+            } else {
+                return None;
+            };
+            let val: serde_json::Value = serde_json::from_str(body_obj).ok()?;
+            let obj = val.as_object()?;
+            let expr = obj.get("expr").and_then(|v| v.as_str())?.to_string();
+            let args: Vec<String> = obj
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // 12 input cap — calc engine A..L map.
+            if args.len() > 12 {
+                return None;
+            }
+            let time_source = obj
+                .get("time")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.chars().next())
+                .filter(|c| ('A'..='L').contains(c));
+            Some(ParsedLink::Calc(CalcLink {
+                expr,
+                args,
+                time_source,
+            }))
         }
         _ => None,
     }

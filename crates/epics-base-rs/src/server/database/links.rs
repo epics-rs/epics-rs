@@ -57,7 +57,57 @@ impl PvDatabase {
             // read; return None so the framework treats the link as
             // unresolvable for value-read purposes.
             crate::server::record::ParsedLink::Hw(_) => None,
+            // lnkCalc: fetch each input PV, evaluate the expr,
+            // return the result. Timestamp passthrough is handled by
+            // `read_calc_link_with_time` for callers that need it.
+            crate::server::record::ParsedLink::Calc(calc) => self.evaluate_calc_link(calc).await,
         }
+    }
+
+    /// lnkCalc evaluation: fetch each input PV, bind to calc engine
+    /// vars A..L, run `expr`, return the result as `EpicsValue::Double`.
+    /// Returns `None` if any input fetch fails, expr compile fails, or
+    /// eval fails — the caller treats the link as unresolvable.
+    pub async fn evaluate_calc_link(
+        &self,
+        calc: &crate::server::record::CalcLink,
+    ) -> Option<EpicsValue> {
+        use crate::calc::engine::{CALC_NARGS, NumericInputs};
+        let mut vars = [0.0f64; CALC_NARGS];
+        for (i, arg) in calc.args.iter().enumerate().take(12) {
+            let v = self.get_pv(arg).await.ok()?;
+            vars[i] = v.to_f64()?;
+        }
+        let compiled = crate::calc::compile(&calc.expr).ok()?;
+        let mut inputs = NumericInputs::with_vars(vars);
+        let result = crate::calc::eval(&compiled, &mut inputs).ok()?;
+        Some(EpicsValue::Double(result))
+    }
+
+    /// lnkCalc evaluation that also returns the timestamp pulled from
+    /// the input named by `time_source` (e.g. `'A'` → first input).
+    /// Returns `(value, Some(time))` when `time_source` is set and
+    /// the referenced input record has a timestamp, `(value, None)`
+    /// otherwise. The caller (link read path) uses `None` to mean
+    /// "consumer keeps its own apply_timestamp time".
+    pub async fn evaluate_calc_link_with_time(
+        &self,
+        calc: &crate::server::record::CalcLink,
+    ) -> Option<(EpicsValue, Option<std::time::SystemTime>)> {
+        let value = self.evaluate_calc_link(calc).await?;
+        let time = match calc.time_source {
+            Some(letter) => {
+                let idx = (letter as u8).saturating_sub(b'A') as usize;
+                let src = calc.args.get(idx)?;
+                // Strip `.FIELD` suffix to land on the record name.
+                let record_name = src.rsplit_once('.').map(|(r, _)| r).unwrap_or(src);
+                let rec = self.get_record(record_name).await?;
+                let inst = rec.read().await;
+                Some(inst.common.time)
+            }
+            None => None,
+        };
+        Some((value, time))
     }
 
     /// Read value + alarm from a DB link. Returns (value, alarm) for MS/NMS propagation.
@@ -94,7 +144,7 @@ impl PvDatabase {
     }
 
     /// Read a value from a parsed link for INP (only reads DB links when soft channel).
-    pub(crate) async fn read_link_value_soft(
+    pub async fn read_link_value_soft(
         &self,
         link: &crate::server::record::ParsedLink,
         is_soft: bool,
@@ -128,6 +178,11 @@ impl PvDatabase {
             {
                 self.resolve_external_pv(name).await
             }
+            // lnkCalc evaluates regardless of `is_soft` — the input
+            // PVs may themselves be local DB targets (which need the
+            // soft path) or remote CA/PVA, but the calc evaluation
+            // is uniform either way.
+            crate::server::record::ParsedLink::Calc(calc) => self.evaluate_calc_link(calc).await,
             _ => None,
         }
     }

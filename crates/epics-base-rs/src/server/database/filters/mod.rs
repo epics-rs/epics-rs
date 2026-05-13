@@ -123,6 +123,40 @@ impl FilterChain {
     pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn SubscriptionFilter>> {
         self.filters.iter()
     }
+
+    /// epics-base PR `17a8dbc` parity: apply the filter chain to a
+    /// single one-shot read (DB link `dbDbGetValue` path). Wraps the
+    /// value in a synthetic [`FilteredMonitorEvent`] with `EventMask::VALUE`,
+    /// runs the chain, and returns the (possibly transformed) value.
+    /// `None` is returned when any filter drops the synthetic event.
+    ///
+    /// Stream-only filters (`dbnd`, `dec`, `sync`) do NOT make sense
+    /// in a single-read context — `dbnd` would always pass on the
+    /// first call (no prior value), `dec` would emit every Nth call
+    /// from a continuous counter, and `sync` would be governed by a
+    /// state never observed in single-read flow. Only `arr` (array
+    /// slicing) and `ts` (timestamp tagging) have meaningful single-
+    /// read semantics. Operators are responsible for using filters
+    /// that match their intent — the framework executes whatever
+    /// chain is configured.
+    pub fn apply_to_read_value(
+        &self,
+        value: crate::types::EpicsValue,
+    ) -> Option<crate::types::EpicsValue> {
+        if self.filters.is_empty() {
+            return Some(value);
+        }
+        use crate::server::pv::MonitorEvent;
+        use crate::server::recgbl::EventMask;
+        use crate::server::snapshot::Snapshot;
+        let snap = Snapshot::new(value, 0, 0, std::time::SystemTime::now());
+        let event = MonitorEvent {
+            snapshot: snap,
+            origin: 0,
+        };
+        let filtered = self.apply(FilteredMonitorEvent::new(event, EventMask::VALUE))?;
+        Some(filtered.event.snapshot.value)
+    }
 }
 
 impl std::fmt::Debug for FilterChain {

@@ -158,6 +158,46 @@ fn monitor_filter_chain_json(req: &PvField) -> Option<String> {
     }
 }
 
+/// epics-base PR `70735383350b` parity: extract
+/// `record._options.autoExec` from a decoded pvRequest. Returns
+/// `Some(false)` only when the field is explicitly set to "false"
+/// (case-insensitive); `Some(true)` for "true"; `None` when the
+/// option is absent (caller defaults to true / immediate execute).
+fn put_autoexec_from_request(req: Option<&PvField>) -> Option<bool> {
+    use crate::pvdata::ScalarValue;
+    let root = match req? {
+        PvField::Structure(s) => s,
+        _ => return None,
+    };
+    let record = root
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "record").then_some(v))?;
+    let record_s = match record {
+        PvField::Structure(s) => s,
+        _ => return None,
+    };
+    let options = record_s
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "_options").then_some(v))?;
+    let opt_s = match options {
+        PvField::Structure(s) => s,
+        _ => return None,
+    };
+    let raw = opt_s.fields.iter().find_map(|(k, v)| {
+        (k == "autoExec").then_some(v).and_then(|v| match v {
+            PvField::Scalar(ScalarValue::String(s)) => Some(s.trim().to_ascii_lowercase()),
+            _ => None,
+        })
+    })?;
+    match raw.as_str() {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 /// Inspect a decoded pvRequest for `record._options.pipeline` and
 /// `record._options.queueSize`. pvxs `Subscription` defaults to
 /// `queueSize = 4` when pipeline is enabled; we follow.
@@ -273,6 +313,19 @@ struct OpState {
     /// the event cause the iteration to continue without sending.
     /// Empty chain (the default) is a no-op.
     monitor_filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
+    /// epics-base PR `70735383350b` (autoExec=false PUT support):
+    /// when a PUT op's INIT pvRequest carries
+    /// `record._options.autoExec=false`, the regular PUT subcmd
+    /// queues the value instead of writing it immediately. A
+    /// subsequent regular PUT subcmd commits the queued write.
+    /// `true` (default) preserves the historic immediate-execute
+    /// behaviour.
+    put_auto_exec: bool,
+    /// Queued PUT payload while `put_auto_exec == false`. Cleared
+    /// on commit (or when the op is destroyed). `None` means "no
+    /// pending value yet — the client hasn't sent the data
+    /// payload".
+    put_pending: Option<crate::pvdata::PvField>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1416,6 +1469,17 @@ async fn handle_op(
             Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
         };
 
+        // epics-base PR `70735383350b` parity: parse autoExec from
+        // pvRequest's `record._options.autoExec` field. Default true
+        // preserves immediate-execute semantics; "false" defers the
+        // PUT until a second regular PUT subcmd commits the queued
+        // value (used by clients doing atomic multi-step writes).
+        let put_auto_exec = if kind == OpKind::Put {
+            put_autoexec_from_request(req_value.as_ref()).unwrap_or(true)
+        } else {
+            true
+        };
+
         ch.ops.insert(
             ioid,
             OpState {
@@ -1428,6 +1492,8 @@ async fn handle_op(
                 monitor_window_notify,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 monitor_filters,
+                put_auto_exec,
+                put_pending: None,
             },
         );
 
@@ -1523,8 +1589,13 @@ async fn handle_op(
             // Read bitset (which fields client is putting) + value.
             let _changed =
                 BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-            let value = decode_pv_field(&intro, &mut cur, order)
-                .map_err(|e| PvaError::Decode(e.to_string()))?;
+            // For autoExec=false PUT, the client may send the value
+            // payload as either (a) the full descriptor + body for
+            // the queued write, or (b) an empty/no-op body to commit
+            // the previously queued value. We tentatively decode and
+            // fall back to the queued path on decode-error if a
+            // pending value exists.
+            let decoded = decode_pv_field(&intro, &mut cur, order).ok();
             let pv_name = ch.name.clone();
             // Round 42: type-state PUT gate. The token's
             // `allows_write()` is checked by `put_value_checked`;
@@ -1537,11 +1608,51 @@ async fn handle_op(
                 method: cred.method.clone(),
                 host: cred.host.clone(),
             };
-            let checked = source
-                .access_gate()
-                .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
-                .await;
-            let result = source.put_value_checked(checked, value, ctx.clone()).await;
+            // epics-base PR `70735383350b` autoExec=false handling.
+            // - autoExec=true (default): execute immediately, ack OK.
+            // - autoExec=false, no pending value, fresh value arrived:
+            //     queue, ack OK without writing.
+            // - autoExec=false, pending value exists: commit the queued
+            //     value (any incoming body is ignored — pvxs sends an
+            //     empty payload for the EXEC frame).
+            let (value_to_write, was_queue_ack) =
+                if !ch.ops.get(&ioid).map(|s| s.put_auto_exec).unwrap_or(true) {
+                    // autoExec=false branch.
+                    let pending = ch.ops.get_mut(&ioid).and_then(|s| s.put_pending.take());
+                    match (pending, decoded) {
+                        (Some(pending_v), _) => (Some(pending_v), false), // commit
+                        (None, Some(new_v)) => {
+                            // Queue the value, send OK without writing.
+                            if let Some(s) = ch.ops.get_mut(&ioid) {
+                                s.put_pending = Some(new_v);
+                            }
+                            (None, true)
+                        }
+                        (None, None) => {
+                            // No pending value AND no decoded body — nothing
+                            // to do. Treat as a no-op queue ack.
+                            (None, true)
+                        }
+                    }
+                } else {
+                    // autoExec=true (default): the decoded value MUST be
+                    // present; surface the decode error if not.
+                    let value = decoded
+                        .ok_or_else(|| PvaError::Decode("PUT requires a value payload".into()))?;
+                    (Some(value), false)
+                };
+
+            let result = if let Some(value) = value_to_write {
+                let checked = source
+                    .access_gate()
+                    .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+                    .await;
+                source.put_value_checked(checked, value, ctx.clone()).await
+            } else {
+                // Queued — no execute this round, just ack.
+                let _ = was_queue_ack; // silence dead_assign if optimised away
+                Ok(())
+            };
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
@@ -2378,6 +2489,8 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
+                put_auto_exec: true,
+                put_pending: None,
             },
         );
         channels.insert(
@@ -2454,5 +2567,89 @@ mod tests {
             }
             other => panic!("expected monitor data, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod autoexec_tests {
+    //! epics-base PR `70735383350b` regression: the
+    //! `record._options.autoExec` pvRequest option must parse
+    //! correctly into the per-op `put_auto_exec` flag.
+
+    use super::*;
+    use crate::pvdata::{PvField, PvStructure, ScalarValue};
+
+    fn build_request(autoexec: Option<&str>) -> PvField {
+        let mut options = PvStructure::new("");
+        if let Some(s) = autoexec {
+            options.fields.push((
+                "autoExec".into(),
+                PvField::Scalar(ScalarValue::String(s.into())),
+            ));
+        }
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut root = PvStructure::new("");
+        root.fields
+            .push(("record".into(), PvField::Structure(record)));
+        PvField::Structure(root)
+    }
+
+    #[test]
+    fn parses_explicit_false() {
+        let req = build_request(Some("false"));
+        assert_eq!(put_autoexec_from_request(Some(&req)), Some(false));
+    }
+
+    #[test]
+    fn parses_explicit_true() {
+        let req = build_request(Some("true"));
+        assert_eq!(put_autoexec_from_request(Some(&req)), Some(true));
+    }
+
+    #[test]
+    fn parses_alternate_truthy_strings() {
+        for v in ["yes", "1", "TRUE"] {
+            let req = build_request(Some(v));
+            assert_eq!(
+                put_autoexec_from_request(Some(&req)),
+                Some(true),
+                "{v} must parse as true"
+            );
+        }
+        for v in ["no", "0", "FALSE"] {
+            let req = build_request(Some(v));
+            assert_eq!(
+                put_autoexec_from_request(Some(&req)),
+                Some(false),
+                "{v} must parse as false"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_field_returns_none() {
+        let req = build_request(None);
+        assert_eq!(put_autoexec_from_request(Some(&req)), None);
+    }
+
+    #[test]
+    fn no_request_returns_none() {
+        assert_eq!(put_autoexec_from_request(None), None);
+    }
+
+    #[test]
+    fn malformed_request_returns_none() {
+        // Plain scalar — not a Structure. Must not panic.
+        let req = PvField::Scalar(ScalarValue::Double(42.0));
+        assert_eq!(put_autoexec_from_request(Some(&req)), None);
+    }
+
+    #[test]
+    fn unknown_string_returns_none() {
+        let req = build_request(Some("maybe"));
+        assert_eq!(put_autoexec_from_request(Some(&req)), None);
     }
 }

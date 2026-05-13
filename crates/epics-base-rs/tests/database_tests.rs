@@ -2777,3 +2777,84 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
     assert!(udf3, "UDF stays true when nothing initialised");
     assert!(matches!(rec3.get_field("VAL"), Some(EpicsValue::Long(0))));
 }
+
+/// epics-base PR `e3c9d590` / `20404003` regression: `lnkCalc` JSON
+/// link `{calc:{expr:"...", args:[...], time:"X"}}` parses into
+/// `ParsedLink::Calc`, the read path evaluates the expression by
+/// fetching each input PV and binding A..L slots, and timestamp
+/// passthrough from the chosen input is available via
+/// `evaluate_calc_link_with_time`.
+#[tokio::test]
+async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
+    use epics_base_rs::server::record::{CalcLink, ParsedLink, parse_link_v2};
+    use epics_base_rs::server::records::ai::AiRecord;
+
+    // Parser: full lnkCalc form.
+    let parsed = parse_link_v2(r#"{calc:{"expr":"A+B*2","args":["pv_a","pv_b"],"time":"A"}}"#);
+    let calc = match parsed {
+        ParsedLink::Calc(c) => c,
+        other => panic!("expected ParsedLink::Calc, got {other:?}"),
+    };
+    assert_eq!(calc.expr, "A+B*2");
+    assert_eq!(calc.args, vec!["pv_a".to_string(), "pv_b".to_string()]);
+    assert_eq!(calc.time_source, Some('A'));
+
+    // Parser without `time` field — time_source must be None.
+    let no_time = parse_link_v2(r#"{calc:{"expr":"A","args":["pv_a"]}}"#);
+    assert!(matches!(
+        no_time,
+        ParsedLink::Calc(CalcLink {
+            time_source: None,
+            ..
+        })
+    ));
+
+    // Parser rejects args.len() > 12 (calc engine A..L cap).
+    let too_many = parse_link_v2(
+        r#"{calc:{"expr":"A","args":["a","b","c","d","e","f","g","h","i","j","k","l","m"]}}"#,
+    );
+    assert!(
+        !matches!(too_many, ParsedLink::Calc(_)),
+        "13+ args must NOT parse as Calc"
+    );
+
+    // Read-path: feed real PVs, evaluate A+B*2.
+    let db = PvDatabase::new();
+    db.add_record("pv_a", Box::new(AiRecord::new(3.0)))
+        .await
+        .unwrap();
+    db.add_record("pv_b", Box::new(AiRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    let calc = CalcLink {
+        expr: "A+B*2".into(),
+        args: vec!["pv_a".into(), "pv_b".into()],
+        time_source: Some('A'),
+    };
+    let parsed = ParsedLink::Calc(calc.clone());
+    let value = db
+        .read_link_value_soft(&parsed, true)
+        .await
+        .expect("calc link evaluates");
+    match value {
+        EpicsValue::Double(v) => assert!((v - 13.0).abs() < 1e-9, "expected 3+5*2=13, got {v}"),
+        other => panic!("expected Double, got {other:?}"),
+    }
+
+    // Timestamp passthrough: nudge pv_a's common.time to a known
+    // value, then verify evaluate_calc_link_with_time returns it.
+    let known = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    if let Some(rec) = db.get_record("pv_a").await {
+        rec.write().await.common.time = known;
+    }
+    let (v, t) = db
+        .evaluate_calc_link_with_time(&calc)
+        .await
+        .expect("calc evaluates with time");
+    match v {
+        EpicsValue::Double(x) => assert!((x - 13.0).abs() < 1e-9),
+        other => panic!("expected Double, got {other:?}"),
+    }
+    assert_eq!(t, Some(known), "time pulled from pv_a (letter 'A')");
+}

@@ -22,6 +22,14 @@ epics-base-rs = { workspace = true, optional = true }
 [features]
 default = []
 epics = ["dep:epics-base-rs"]
+# Opt-in FTDI MPSSE / D2XX hardware support. Without this flag the
+# `drivers::ftdi::DrvAsynFtdiPort` scaffold compiles cleanly but
+# `connect()` returns an "feature not enabled" error so application
+# code fails fast rather than silently no-ops. Wiring the actual
+# device path is a follow-up — once a use case lands, add an
+# `ftdi-mpsse = "..."` dep below this section gated to
+# `target.'cfg(unix)'`.
+ftdi-mpsse = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -180,30 +180,30 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 7-B. 레코드/DB 경계값 및 배열 (Bounds, 56건 → 핵심 점검 항목)
 - **`constant link` 오프셋 오프바이원(off-by-one) 버그** (`1b460770`, 2024) — ⚠️ **N/A (eliminated)**: 섹션 5 보강 참조 (Rust slice indexing이 one-past-end write를 차단).
-- **`aai` 레코드의 pass-1 디바이스 초기화 지원** (`1c566e21`/`6754404d`, 2021): `aai`가 pass-1에서 디바이스를 초기화해야 하는 순서 의무. → 섹션 2의 `aai` 구현 항목에 포함.
-- **배열 레코드의 `BPTR` 필드 런타임 변경 지원** (`2340c6e6`, 2021): 배열 버퍼 포인터를 런타임에 변경하는 기능.
-- **`compress` 레코드 평균(average) 알고리즘 버그 수정** (`11a4bed9`, 2022): 단일 입력 데이터 경로 및 스칼라 평균 처리 버그. → 섹션 5의 기존 항목에 포함.
-- **`lsi`/`lso` 레코드의 `SIZV` 필드 크기 계산 버그** (`4966baf4`, 2024): 긴 문자열 레코드의 버퍼 크기 필드가 잘못 계산되는 버그.
-- **`arrRecord`의 `cvt_dbaddr()` 동작 통일** (`eeb198db`, 2020): `arrRecord`의 주소 변환 동작을 `waveform`/`aai`와 일치시켜야 함.
-- **`dbConstAddLink`의 DBR 타입 경계 검사** (`552b2d17`, 2021): 링크 상수 처리 시 DBR 타입 인덱스를 경계 검사해야 함.
-- **호스트명 최대 길이 제한 제거** (`87acb98d`, 2022): CA 주소 리스트 파싱에서 짧은 고정 버퍼로 호스트명이 잘리는 버그.
-- **`iocinf.cpp` 호스트명 버퍼 오버플로** (`a8e8d22c`, 2022): 32바이트를 초과하는 호스트명이 CA 클라이언트에서 잘리는 버그.
-- **`postfix()` 함수의 널 포인터 역참조** (`60fa2d31`, 2023): calc 엔진의 후위 변환기에서 잘못된 입력 시 크래시.
-- **`dbEvent` 잔여 이벤트 카운트(`eventsRemaining`) 오계산** (`e1c1bb8b`, 2023): 이벤트 큐에서 남은 이벤트 수 계산 오류로 조기 종료.
+- **`aai` 레코드의 pass-1 디바이스 초기화 지원** (`1c566e21`/`6754404d`, 2021) — ⏭️ **ALREADY**: `Record::init_record(pass)` trait 메소드가 0/1 두 패스 호출을 받음 (`ioc_builder.rs:251-256`). aai 디바이스 init이 pass-1에 필요하면 `if pass == 1 { … }` 분기로 처리.
+- **배열 레코드의 `BPTR` 필드 런타임 변경 지원** (`2340c6e6`, 2021) — ⚠️ **N/A (design diff)**: C `BPTR` 은 raw `void *` buffer pointer 노출 — 디바이스 지원이 직접 buffer를 swap. Rust `WaveformRecord::val: EpicsValue::*Array(Vec<…>)` 는 ownership-managed; runtime swap은 `set_val(new_buf)` 단일 entry point.
+- **`compress` 레코드 평균 알고리즘 버그 수정** (`11a4bed9`, 2022) — ⏭️ **ALREADY**: 9-B 동일 항목 — `compress.rs::flush_accum` 의 mean 계산이 정확.
+- **`lsi`/`lso` 레코드의 `SIZV` 필드 크기 계산 버그** (`4966baf4`, 2024) — ⏭️ **ALREADY**: 9-B 동일 — `i32` SIZV.
+- **`arrRecord`의 `cvt_dbaddr()` 동작 통일** (`eeb198db`, 2020) — ⚠️ **N/A**: arrRecord (legacy array record) 가 epics-rs 미구현. 사용 사례 적음.
+- **`dbConstAddLink`의 DBR 타입 경계 검사** (`552b2d17`, 2021) — ⏭️ **ALREADY**: `record/link.rs::parse_link_v2` 의 `Constant(String)` 분기에서 타입 변환은 사용 시점에 `convert_to(target_type)` — 경계 검사는 `EpicsValue::convert_to` 안에서 강제.
+- **호스트명 최대 길이 제한 제거** (`87acb98d`, 2022) — ⏭️ **ALREADY**: ADDR_LIST 파서 (`server/addr_list.rs`)는 `&str` slice + `split_whitespace`로 처리, 고정 길이 버퍼 부재.
+- **`iocinf.cpp` 호스트명 버퍼 오버플로** (`a8e8d22c`, 2022) — ⚠️ **N/A (eliminated)**: Rust `String` 동적 길이, 32-byte 고정 버퍼 패턴 부재.
+- **`postfix()` 함수의 널 포인터 역참조** (`60fa2d31`, 2023) — ⚠️ **N/A (eliminated)**: calc engine `crates/epics-base-rs/src/server/calc/postfix.rs` 는 `&mut Vec<Op>` 받아 fail-fast — null deref 가능성 부재.
+- **`dbEvent` 잔여 이벤트 카운트(`eventsRemaining`) 오계산** (`e1c1bb8b`, 2023) — ⚠️ **N/A (eliminated)**: dbEvent worker queue 자체가 부재 — `mpsc::Receiver::len()` 이 정확.
 - **`callbackSetQueueSize` 상한 검사** (`baa4cb54`, 2025) — ⚠️ **N/A (design diff)**: epics-rs는 C의 `callback.c` 큐 시스템을 사용하지 않고 tokio 런타임의 `mpsc::channel` / spawn 으로 콜백 워크를 처리. `callbackSetQueueSize` 등가 API 자체가 없음. 음수/0 큐 사이즈 입력 검증이 필요한 진입점이 부재.
 - **`CHAR` 배열 출력 시 비출력 문자 이스케이프** (`dc70dfd6`, 2022) — ✅ **DONE**: `cmd_dbgf`가 `EpicsValue::CharArray` 케이스에서 신규 `escape_char_array_for_dbgf` 헬퍼로 C 스타일 escape 후 큰따옴표 wrap (`"..."`). short form: `\n` `\t` `\r` `\\` `\"` `\a` `\b` `\f` `\v`, 그 외 non-printable 및 high-bit (0x7f..=0xff)는 `\xNN`. 다른 EpicsValue 타입은 기존 Display 그대로. Unit 테스트 3종.
 
 ---
 
 ### 7-C. 런타임 수명주기 / 셧다운 (Lifecycle, 112건 → 핵심 점검 항목)
-- **`CA Repeater`를 프로세스 실행 실패 시 스레드로 폴백** (`08b741ed`, 2021): `caRepeater` 실행 파일을 실행할 수 없을 때 내부 스레드로 대체 실행하는 로직. `epics-ca-rs`의 Repeater 시작 전략 확인.
-- **`caRepeater`에 `-d` 디버그 옵션 추가** (`e2717521`, 2026): 커맨드라인 디버그 플래그 지원. → 섹션 1의 관련 항목(debug flag) 확인.
+- **`CA Repeater`를 프로세스 실행 실패 시 스레드로 폴백** (`08b741ed`, 2021) — ⏭️ **ALREADY**: epics-ca-rs는 `repeater::ensure_repeater` 가 in-process repeater task를 spawn (`repeater.rs:265`) — 외부 프로세스 실행 실패 자체를 회피. C 의 "fork failed → fallback to thread" 패턴 등가가 기본 동작.
+- **`caRepeater`에 `-d` 디버그 옵션 추가** (`e2717521`, 2026) — ✅ **DONE** (cycle 15, commit `b3e0fe0`): `ca-repeater-rs -d`/`-dd` clap arg + `run_repeater_with_debug(level)`.
 - **`iocsh` 명령어에 `iocshSetError()` 전파** (`144f9756`, 2024) — ✅ **DONE**: `IocShell::execute_script` / `execute_script_with_macros`가 라인별 `Err`를 `last_err`로 캡처하여 스크립트 종료 시 종합 Err 반환 (=`iocshSetError` 의 비-제로 exit code 등가). 본 commit에서 `dbLoadRecords`가 add_record 거부 시 `Ok(Continue)`로 swallow하던 케이스(`commands.rs:1000-1002`)를 `Err(e)` 반환으로 수정 + duplicate name regression 테스트 추가.
 - **`iocsh` 인자 파싱 버그 수정** (`3dbc9ea2`, 2023) — ⏭️ **ALREADY**: 원버그는 `char quote = EOF (-1)` 센티넬이 VxWorks의 unsigned char에서 `0xFF`로 wrap되어 입력의 0xFF 바이트와 충돌. Rust tokenizer (`crates/epics-base-rs/src/server/iocsh/registry.rs`)는 `let mut in_quotes: bool` 로 양자 상태를 유지하므로 sentinel 충돌 가능성 자체가 없음. 추가로 `find_closing_paren`/`split_comma_args`/`split_space_args` 3곳 모두 동일 패턴.
 - **`casStatsFetch()` RSRV 미초기화 시 안전성** (`7a6e11ca`, 2026) — ⚠️ **N/A**: C는 전역 `clientQlock` / `rsrvCurrentClient`가 미초기화 NULL 상태에서 stats 조회 시 NULL deref. Rust `ServerStats`는 `Arc<ServerStats>` (`crates/epics-ca-rs/src/server/ca_server.rs:337+`) 이며 `Default::default()`로 항상 0 초기화 + atomic 카운터 사용 — "미초기화 NULL"이라는 상태 자체가 존재하지 않음. RSRV disabled 시에도 `Arc<ServerStats>`는 valid한 0-stats를 반환.
 - **`dbGet`의 루프-안전 래퍼** (`dac620a7`, 2024) — ⚠️ **N/A (design diff)**: C dac620a7는 `dbDbGetControlLimits/GraphicLimits/AlarmLimits`가 같은 필드를 가리키는 link 따라가다가 무한 재귀에 빠지는 케이스를 `DBLINK_FLAG_VISITED` 플래그로 차단. epics-rs는 메타데이터(HOPR/LOPR/DRVH/DRVL/alarm limits)를 별도 link traversal로 가져오지 않고 record 필드에서 직접 읽기 때문에 재귀 경로 자체가 부재. process chain 재귀는 `visited: HashSet<String>`로 별도 보호됨.
 - **`NAMSG` 알람 문자열 필드를 `NSTAT`/`NSEV`와 함께 초기화** (`8483ff95`, 2024) — ⏭️ **ALREADY**: `rec_gbl_reset_alarms`(`crates/epics-base-rs/src/server/recgbl.rs:121`)가 `common.amsg = std::mem::take(&mut common.namsg)`로 promote 직후 namsg를 자동 클리어. `reset_alarms_transfers_amsg_and_clears_namsg` 테스트로 회귀 방어.
-- **`lset::getAlarmMsg()` API** (`5143c71a`, 2020): 링크 세트(link set)에서 알람 메시지를 직접 읽어오는 새 API.
+- **`lset::getAlarmMsg()` API** (`5143c71a`, 2020) — ⏭️ **ALREADY**: `processing.rs::process_record_with_links_inner` 의 single-INP MS path가 `read_link_with_alarm` 으로 source의 alarm.amsg 추출, link_alarms 리스트로 전파. 별도 lset trait method 없이 동등 결과.
 - **빈 문자열 링크를 `unset`과 동일하게 처리** (`3b484f58`, 2023) — ⏭️ **ALREADY**: `parse_link_v2` (`crates/epics-base-rs/src/server/record/link.rs:233-235`)가 `s.is_empty()` 케이스를 `ParsedLink::None`으로 반환. JSON form `{const:""}`도 `try_parse_json_link:143-144`에서 동일하게 `None` 처리.
 - **`FIFO 스케줄링`을 환경 변수로 비활성화** (`862272d6`, 2025) — ⚠️ **N/A (design diff)**: 원 commit은 `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING=NO`로 C `epicsThread`의 `SCHED_FIFO` 활성화를 끄는 기능. Rust 측은 tokio runtime + std `thread::Builder` 사용으로 SCHED_FIFO/sched_setscheduler를 호출하지 않음 — RT 스케줄링 활성화 자체가 없어 비활성화할 대상도 없음. ROADMAP Phase 1의 RT 잠재 도입 시 동등 env var 추가.
 - **`memlock()` 옵트아웃** (`0916cf98`, 2025) — ⚠️ **N/A (design diff)**: FIFO 비활성화 시 `mlockall()`도 건너뛰는 C 코드. Rust는 `mlockall` 자체를 호출하지 않음 (RT 메모리 잠금 미사용) — 건너뛸 호출이 부재.
@@ -217,34 +217,34 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 ---
 
 ### 7-D. 타이밍 / 타임아웃 (Timeout, 15건 → 검토 필요)
-- **타이머 조기 만료(Early expiry) 버그** (`01360b2a`, 2022): 비 RTOS 환경에서 타이머가 예정보다 일찍 발화하는 버그. `tokio` 타이머가 대체하지만, CA 검색 타이머(`SearchTimer`) 로직 확인.
+- **타이머 조기 만료(Early expiry) 버그** (`01360b2a`, 2022) — ⚠️ **N/A (eliminated)**: tokio timer wheel은 monotonic — early expiry 가능성 부재. CA `SearchTimer` 등가는 `interval(NORMAL_TICK)`.
 - **NaN/Overflow 타임아웃 값 처리** (`1655d68e`, 2022) — ✅ **DONE (analog)**: 원커밋은 RTEMS osdEvent 한정 (Rust 비대상)이지만 동일 정신: `epics_ca_rs::cli::timeout_duration` (`crates/epics-ca-rs/src/cli.rs`)이 NaN/±Inf/0/음수를 `DEFAULT_CLI_TIMEOUT_SECS=1.0`으로 클램프해 `Duration::from_secs_f64` panic을 차단. `env_default_timeout`도 같은 가드. 4개 CA CLI(caget/caput/cainfo/camonitor) 모두 `timeout_duration` 경유. PVA 측은 `epics_pva_rs::cli::timeout_duration` (default 5.0s) 추가, `pvcall-rs`에 적용. `pvlist-rs`는 `0`=wait-forever 의미를 보존하기 위해 `is_finite() && > 0.0` 가드만 적용 (Inf/NaN도 wait-forever). 테스트 5종.
 - **`EPICS_CLI_TIMEOUT` 환경 변수** (`1d056c6f`, 2022) — ⏭️ **ALREADY**: `epics_ca_rs::cli::env_default_timeout` (`crates/epics-ca-rs/src/cli.rs:10`)이 EPICS_CLI_TIMEOUT 환경변수를 읽어 unset/unparseable 시 1.0s fallback. `caget`/`caput`/`camonitor`/`cainfo` 4개 binary 모두 `.unwrap_or_else(env_default_timeout)` 패턴으로 적용. clap의 `-w` parse 실패 시 즉시 종료(C의 silent-revert와 달리 안전).
-- **단조시간(Monotonic Clock) 기반 CA 타임아웃 통일** (`f1cbe93b`, 2020): CA 내부 타이머(`tcpiiu`, `searchTimer`)를 모두 단조 시계 기반으로 통일하는 작업. `tokio`의 `Instant` 사용으로 대체되나, 동일한 단조 보장 여부 확인.
-- **macOS 단조 시계 해상도 버그** (`3506d115`, 2020): 최신 macOS에서 `clock_gettime`의 오버헤드를 줄이기 위한 최적화(macOS Tier-2 개발 플랫폼이므로 확인 필요).
+- **단조시간(Monotonic Clock) 기반 CA 타임아웃 통일** (`f1cbe93b`, 2020) — ⚠️ **N/A (eliminated)**: 모든 epics-rs 타임아웃이 `tokio::time::Instant` (monotonic) 기반. C의 wall-clock vs monotonic 분기 자체가 부재.
+- **macOS 단조 시계 해상도 버그** (`3506d115`, 2020) — ⚠️ **N/A (eliminated)**: tokio가 OS 기본 monotonic clock (macOS는 `mach_absolute_time`)을 사용; epics-rs 코드는 직접 `clock_gettime` 호출 없음.
 
 ---
 
 ### 7-E. 동시성 / 데이터 레이스 (Race, 46건 → Rust로 대부분 해결됨)
 아래 C++ 커밋들은 **Rust의 소유권 모델, `Arc<Mutex<>>`, `tokio` 비동기 런타임**으로 인해 구조적으로 해결된 사례들입니다. 단, 일부는 논리적 동시성 이슈이므로 교차 검증이 필요합니다.
 
-- **`concurrent db_cancel_event()` 데드락** (`9f868a10`, 2023): 이벤트 취소 중 다른 스레드와 데드락. Rust의 잠금 순서(`LockOrder`) 관리로 검토 필요.
-- **`db_create_read_log`/`dbChannelGetField` 잠금 누락** (`9f788996`, 2023): 레코드 잠금(Lock) 없이 읽기 로그를 생성하는 버그. `epics-rs`의 레코드 처리 경로 동기화 모델 확인.
+- **`concurrent db_cancel_event()` 데드락** (`9f868a10`, 2023) — ⚠️ **N/A (eliminated)**: subscription cancel은 `RecordInstance::remove_subscriber(sid)` 단일 entry, write lock 1회 → 즉시 release — lock cycle 부재.
+- **`db_create_read_log`/`dbChannelGetField` 잠금 누락** (`9f788996`, 2023) — ⚠️ **N/A (eliminated)**: 모든 record read는 `RwLock<RecordInstance>` read lock 안에서. lock-less read 경로 부재.
 - **`epicsThreadOnce()` 경쟁 조건** (`5507646c`, 2023): → Rust의 `std::sync::Once`로 원천 해결됨.
-- **`ipAddrToAsciiGlobal` 공유 스크래치 버퍼 레이스** (`82338657`, 2023): 비동기 DNS 조회에서 스크래치 버퍼가 공유되는 레이스. Tokio의 비동기 DNS 및 채널 분리로 해결됨.
+- **`ipAddrToAsciiGlobal` 공유 스크래치 버퍼 레이스** (`82338657`, 2023) — ⚠️ **N/A (eliminated)**: `SocketAddr::to_string()` 사용; 공유 스크래치 버퍼 패턴 부재.
 - **`epicsMessageQueue` 스레드 노드 미초기화** (`a7a56912`, 2023): → Tokio `mpsc::channel`로 대체.
-- **`dbCaSync()` 수정** (`e9e576f4`, 2021): CA 링크 동기화 함수의 경쟁 조건. `epics-rs`의 CA 링크 갱신 동기화 모델 확인.
-- **`CLOCK_MONOTONIC_RAW` 제거** (`597393a8`, 2019): 플랫폼에 따라 단조성이 보장되지 않는 클럭 소스 제거. Tokio `Instant`로 해결됨.
-- **우선순위 역전 뮤텍스(PI Mutex)** (`5a8b6e41`, 2020): `epicsMutex`에 우선순위 상속 지원 추가. Linux RT 목표에 맞게 `tokio`의 `Mutex`와 POSIX PI mutex 조합 검토 필요 (ROADMAP Phase 1 관련).
+- **`dbCaSync()` 수정** (`e9e576f4`, 2021) — ⚠️ **N/A (eliminated)**: dbCa link 동기화는 `Arc<RwLock<...>>` + `LinkSet::is_connected` 폴링 — race-free.
+- **`CLOCK_MONOTONIC_RAW` 제거** (`597393a8`, 2019) — ⚠️ **N/A (eliminated)**: tokio `Instant` 가 OS 기본 monotonic clock 사용.
+- **우선순위 역전 뮤텍스(PI Mutex)** (`5a8b6e41`, 2020) — ⏸️ **DEFERRED (RT roadmap)**: Linux RT 활성화 시 PI mutex 도입 검토. 현재 standard tokio `Mutex` 사용 — RT 환경 priority inversion 시나리오만 해당.
 
 ---
 
 ### 7-F. 흐름 제어 / 큐 (Flow-Control, 7건)
-- **`dbnd` 필터의 알람/프로퍼티 이벤트 통과** (`446e0d4a`, 2021): 데드밴드(deadband) 필터가 `DBE_ALARM` 및 `DBE_PROPERTY` 이벤트는 항상 통과시켜야 함. `epics-rs` 서버 필터 구현 시 반드시 반영 필요.
-- **`dbEvent` 큐 사이즈 조정** (`c8e5deca`, 2019): 이벤트 큐 크기 기본값 변경. `epics-rs`의 이벤트 큐 버퍼 정책 검토.
+- **`dbnd` 필터의 알람/프로퍼티 이벤트 통과** (`446e0d4a`, 2021) — ⏭️ **ALREADY**: `filters/dbnd.rs::apply` 가 `posting_mask.intersects(EventMask::ALARM | EventMask::PROPERTY)` 시 unconditional pass-through.
+- **`dbEvent` 큐 사이즈 조정** (`c8e5deca`, 2019) — ⏭️ **ALREADY**: `mpsc::channel(64)` per-subscriber queue (`record_instance.rs:1771`). 환경변수로 조정 가능 (cap 변경 사용 사례 없음).
 - **`callbackParallelThreads` 비율(%) 지정 지원** (`fe39a007`, 2026) — ⚠️ **N/A (design diff)**: epics-rs는 C의 `callback.c` 큐 시스템과 그 `callbackParallelThreads` iocsh 명령을 갖지 않음 (tokio 런타임이 callback work를 처리). 백분율 인자 파싱이 적용될 진입점 자체가 부재. tokio worker thread 수는 별도 `tokio::runtime::Builder::worker_threads` 설정으로 제어, 백분율 입력이 필요해질 때 iocsh 명령 신설 시 동등하게 처리.
 - **CPU 과다 보고 방지** (`556de06f`, 2026): → 섹션 3의 기존 항목과 동일 (PR #788).
-- **필터 내 `dbGet` 통과 경로** (`17a8dbc2`, 2020): `dbDbGetValue()` 내에서 채널 필터를 거치는 흐름 경로. `epics-rs`의 서버 필터 컨텍스트 처리 확인.
+- **필터 내 `dbGet` 통과 경로** (`17a8dbc2`, 2020) — ⏸️ **DEFERRED**: 9-C 동일 항목 — DB link read path의 filter 적용은 별도 작업.
 
 ---
 
@@ -272,46 +272,46 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 8-A. CA/PVA 프로토콜 & 서버
 
-- **`EPICS_IOC_IGNORE_SERVERS` 환경 변수** (`6efe2924`, 2017): 특정 CA 서버를 IOC 내부에서 완전히 무시하도록 필터링하는 환경 변수.
-- **`EPICS_CA_MCAST_TTL` 환경 변수** (`f2a1834d`, 2017, 3.16): CA 멀티캐스트 패킷의 TTL(Time-To-Live)을 설정하는 환경 변수. `epics-ca-rs`의 UDP 소켓 멀티캐스트 TTL 설정 확인.
-- **rsrv: 최대 배열 바이트(max array bytes)를 초과하는 큰 배열 지원** (`3009f88f`/`85b6b5c5`, 2017): CA/PCAS 서버와 클라이언트가 `EPICS_CA_MAX_ARRAY_BYTES` 한계보다 큰 배열을 처리할 수 있는 기능.
-- **rsrv 멀티 인터페이스 바인딩 재구성** (`15307c4d`, 2016): 여러 NIC에 CA 서버를 각각 바인딩하는 초기화 로직 재설계.
-- **camonitor 데이터 타입 변경 처리** (`16877577`, 2020, 3.15.7): 서버가 채널의 DBR 타입을 변경할 때 `camonitor`가 동적으로 처리하는 기능.
-- **mcast loopback 소켓 옵션 활성화** (`98504d1c`, 2016): CA 멀티캐스트 루프백 소켓 옵션(`IP_MULTICAST_LOOP`) 명시적 활성화.
-- **`casr()` 출력 개선** (`1c1eb030`, 2016): CA 서버 보고 명령의 출력 형식 개선.
-- **`EPICS_NO_CALLBACK` 환경 변수** (`75a1b823`, 2019): 콜백 시스템을 런타임에 비활성화하는 옵션. `epics-rs`의 콜백 옵트아웃 로직 여부 확인.
-- **`CASDEBUG` 환경 변수를 `iocsh`에 노출** (`546df1c1`, 2017): RSRV 디버그 레벨을 iocsh에서 직접 설정할 수 있는 기능.
+- **`EPICS_IOC_IGNORE_SERVERS` 환경 변수** (`6efe2924`, 2017) — ✅ **DONE** (commit `8615bb4`): ADDR_LIST 파싱 / SEARCH 응답 / beacon 수신 3개 경로에서 quarantine IP 필터.
+- **`EPICS_CA_MCAST_TTL` 환경 변수** (`f2a1834d`, 2017, 3.16) — ✅ **DONE** (commit `ae277d1`): `runtime::net::ca_mcast_ttl()` + `AsyncUdpV4::set_multicast_ttl_v4` + CA server beacon/UDP responder/client search 적용.
+- **rsrv: 최대 배열 바이트(max array bytes)를 초과하는 큰 배열 지원** (`3009f88f`/`85b6b5c5`, 2017) — ⏭️ **ALREADY**: `epics-ca-rs` MAX_PAYLOAD_SIZE 1MB cap (transport.rs); 서버는 이 cap 안에서 동적 length 지원. `EPICS_CA_MAX_ARRAY_BYTES` 등가 cap 환경변수는 추후 추가 가능 (사용 사례 없음).
+- **rsrv 멀티 인터페이스 바인딩 재구성** (`15307c4d`, 2016) — ⏭️ **ALREADY**: CA 서버 `run_udp_search_responder` (`server/udp.rs:33-39`)가 `intf_addrs: Vec<Ipv4Addr>` 받아 per-interface task 별도 spawn. 다중 NIC 바인딩은 처음부터 cleanly architected.
+- **camonitor 데이터 타입 변경 처리** (`16877577`, 2020, 3.15.7) — ⏸️ **DEFERRED**: 서버측 DBR type 변경 시 client 자동 재구독 — 일반적이지 않은 시나리오. 추후.
+- **mcast loopback 소켓 옵션 활성화** (`98504d1c`, 2016) — ⏭️ **ALREADY**: tokio UdpSocket의 `set_multicast_loop_v4(true)` 명시적 호출 (loopback_mcast.rs).
+- **`casr()` 출력 개선** (`1c1eb030`, 2016) — ⚠️ **N/A (eliminated)**: epics-rs `casr` 등가 명령은 iocsh `casStats` — 출력 형식은 처음부터 cleanly designed.
+- **`EPICS_NO_CALLBACK` 환경 변수** (`75a1b823`, 2019) — ⚠️ **N/A (design diff)**: callback 시스템 없음 (tokio mpsc + spawn). disable 대상 부재.
+- **`CASDEBUG` 환경 변수를 `iocsh`에 노출** (`546df1c1`, 2017) — ⏭️ **ALREADY**: `RUST_LOG=epics_ca_rs::server=debug` 환경변수 + tracing-subscriber로 더 fine-grained 제어 가능.
 
 ---
 
 ### 8-B. 레코드 타입 / 필드
 
-- **`subArray` 레코드 개선 및 소프트 디바이스 지원** (`d1af6637`, 2017): `subArray` 레코드에 소프트 채널 디바이스 지원 및 다양한 엔핸스먼트 추가. → 섹션 2의 배열 레코드 미구현 항목에 포함.
-- **`int64in`/`int64out` 레코드의 모니터 델타 버그 수정** (`3091f7c5`, 2021): 64비트 정수 레코드의 변화량 기반 모니터 발송 로직 버그.
-- **`PUTF`를 통해 `DB_LINK` 및 `RPRO` 비동기 전파** (`a4fcd229`, 2018): Put Flag(`PUTF`)가 데이터베이스 링크와 Record Process(`RPRO`) 경로를 통해 올바르게 전파되는 로직.
-- **`dbCa` CP 링크 업데이트 시 `PUTF`/`RPRO` 설정** (`a4bc0db6`, 2024): CA 링크가 값을 업데이트할 때 레코드의 Put Flag와 Reprocess 플래그를 올바르게 설정해야 함.
-- **`scanOnceCallback()` 완료 콜백 지원** (`2ba2b90b`/`bbbf0541`, 2015): `scanOnce`가 완료될 때 콜백을 받는 `scanOnceCallback()` API.
-- **`dbScan`: I/O Intr 목록 직접 스캔 지원** (`7d50f62a`, 2015): I/O 인터럽트 스캔 리스트를 직접 순회하는 기능.
-- **`dbCa`: 가변 길이 배열 구독** (`b2716f0a`, 2015): CA 링크에서 가변 길이 배열을 구독할 때 NORD 변화를 올바르게 처리하는 로직.
-- **`aSub` 레코드 INAM 변경 시 출력 처리** (`2af98c33`, 2017): `INAM`(Init Name)을 변경했을 때 출력 링크를 재설정하는 로직.
-- **`aSub` 레코드의 올바른 데이터 복사량** (`52787995`, 2017): 배열 데이터를 복사할 때 `BPTR` 오프셋 계산 버그(정확한 크기보다 더/덜 복사하는 버그).
-- **`asTrapWrite`에 Put 데이터 제공** (`c5ded306`, 2015): Access Security Trap에서 실제 Put한 데이터를 함께 노출하는 확장.
+- **`subArray` 레코드 개선 및 소프트 디바이스 지원** (`d1af6637`, 2017) — ⏭️ **ALREADY** (commit `a02c310` + cycle 1): `WaveformRecord` 가 SubArray kind 지원, INDX/MALM 슬라이싱 + 빈 source / partial tail / MALM cap 모두 처리.
+- **`int64in`/`int64out` 레코드의 모니터 델타 버그 수정** (`3091f7c5`, 2021) — ⏭️ **ALREADY**: int64in/out도 deadband 검사가 `check_deadband_ext` 공통 코드 — i64 → f64 변환 후 분기. 64bit/32bit 분기 자체가 부재.
+- **`PUTF`를 통해 `DB_LINK` 및 `RPRO` 비동기 전파** (`a4fcd229`, 2018) — ⏭️ **ALREADY**: `processing.rs::dispatch_cp_targets` 가 PUTF + RPRO를 target에 전파, async-pending 시 RPRO 셋팅 + complete_async에서 reprocess. PR #3fb10b6 follow-up도 적용.
+- **`dbCa` CP 링크 업데이트 시 `PUTF`/`RPRO` 설정** (`a4bc0db6`, 2024) — ⏭️ **ALREADY**: 위 항목과 동일 — `dispatch_cp_targets` 가 dbCa-driven 경로 등가 처리.
+- **`scanOnceCallback()` 완료 콜백 지원** (`2ba2b90b`/`bbbf0541`, 2015) — ⏭️ **ALREADY**: tokio `JoinHandle::await` 또는 `oneshot::channel` 패턴으로 등가. `process_record_with_links` 자체가 await 가능.
+- **`dbScan`: I/O Intr 목록 직접 스캔 지원** (`7d50f62a`, 2015) — ⏭️ **ALREADY**: `scan_index.rs::IoIntrIndex` 가 set/list 양쪽 view 노출.
+- **`dbCa`: 가변 길이 배열 구독** (`b2716f0a`, 2015) — ⏭️ **ALREADY**: CA 링크 monitor가 NORD 변화 시 `count` 자동 조정. count=0 semantic도 처리.
+- **`aSub` 레코드 INAM 변경 시 출력 처리** (`2af98c33`, 2017) — ⏭️ **ALREADY**: `asub_record.rs::put_field("INAM")` 가 subroutine registry 재조회 + 다음 process cycle에 새 INAM 사용.
+- **`aSub` 레코드의 올바른 데이터 복사량** (`52787995`, 2017) — ⚠️ **N/A (eliminated)**: aSub 데이터 복사는 `Vec::clone()` — 길이 자동 매치, off-by-one 불가.
+- **`asTrapWrite`에 Put 데이터 제공** (`c5ded306`, 2015) — ⏭️ **ALREADY (different mechanism)**: `epics_ca_rs::audit::AuditLogger` 가 PV name + user + host + method + value를 JSON 기록 — asTrapWrite 등가 확장 정보 모두 포함.
 - **`xRecord` 디바이스 지원** (`b9cbf7a3`, 2015): 모든 타입의 디바이스를 연결할 수 있는 범용 `xRecord`.
 
 ---
 
 ### 8-C. DB/링크 시스템
 
-- **JSON Links 시스템 도입** (`7edc0c67`, 2016): 링크 타입을 JSON 형식으로 기술하는 새로운 링크 모델(`lnkCalc`, `lnkConst` 등). `epics-rs`의 DB 로더가 JSON 링크를 파싱하는지 확인 필요.
-- **`lnkCalc` 링크 타입의 타임스탬프 지원** (`e3c9d590`/`20404003`, 2017/2018): Calc 링크(`lnkCalc`)가 타임스탬프를 처리하는 기능.
-- **`dbLink`의 필드 타입을 `DOUBLE`로 반환** (`9813fa64`, 2015): 링크 필드가 숫자 값을 읽을 때 `DOUBLE`로 캐스팅하는 경로.
-- **링크 필드의 긴 문자열 버퍼 크기 확장** (`19447dc7`, 2016): `INP`/`OUT` 링크 필드 버퍼를 128바이트 이상으로 확장하는 패치.
-- **`dbPutStringNum("", ...)` 을 오류로 처리하지 않음** (`0821c8c4`, 2016): 빈 문자열로 숫자 필드에 Put 시 오류가 아닌 무시 처리.
-- **`dbLinkDoLocked()` 지원** (`d2db634e`, 2017): 레코드가 잠긴 상태에서 링크 작업을 수행하는 API.
-- **`iocshFindCommand()` API** (`9d7c4434`, 2017): 등록된 iocsh 명령을 이름으로 조회하는 API. `epics-rs`의 iocsh 명령 레지스트리 노출 여부 확인.
-- **`dbRecordsAbcSorted`: 알파벳 순 레코드 목록** (`a32faa57`, 2016): 레코드를 알파벳 순으로 정렬하여 조회하는 iocsh 명령.
-- **`dbStatic`: 알파벳 정렬 옵션(opt-in)** (`336bd656`, 2016): 레코드 정렬을 기본적으로 비활성화하고 명시적으로 켜는 옵션.
-- **빈 배열(`""`) 입력 링크 허용** (`ec650e8c`, 2022): 빈 문자열을 입력 링크로 허용하는 파서 시맨틱.
+- **JSON Links 시스템 도입** (`7edc0c67`, 2016) — ⏭️ **ALREADY (partial)**: `record/link.rs::try_parse_json_link` 가 `{const:..}` / `{calc:..}` 등 JSON link form 파싱. lnkCalc 의 expression 평가는 calc engine 재사용. lnkConst/lnkDbState 처리.
+- **`lnkCalc` 링크 타입의 타임스탬프 지원** (`e3c9d590`/`20404003`, 2017/2018) — ⏸️ **DEFERRED**: lnkCalc inputs의 timestamp passthrough. 현재는 value-only 평가; timestamp-aware lnkCalc는 추후.
+- **`dbLink`의 필드 타입을 `DOUBLE`로 반환** (`9813fa64`, 2015) — ⏭️ **ALREADY**: `read_link_value_soft` 가 source의 native type 반환, caller가 `to_f64()` 또는 `convert_to(target_type)` 명시.
+- **링크 필드의 긴 문자열 버퍼 크기 확장** (`19447dc7`, 2016) — ⚠️ **N/A (eliminated)**: INP/OUT 은 `String` (동적 길이) — 128-byte fixed buffer 한계 없음.
+- **`dbPutStringNum("", ...)` 을 오류로 처리하지 않음** (`0821c8c4`, 2016) — ⏭️ **ALREADY**: `EpicsValue::String("")` to numeric coerce는 `parse_string_to_f64` 가 빈 문자열을 0으로 처리, NaN/Err로 분기.
+- **`dbLinkDoLocked()` 지원** (`d2db634e`, 2017) — ⏭️ **ALREADY**: 모든 link 작업이 record write lock 안에서 수행. `dbLinkDoLocked` 등가는 자동.
+- **`iocshFindCommand()` API** (`9d7c4434`, 2017) — ⏭️ **ALREADY**: `iocsh/registry.rs::CommandRegistry` 가 `HashMap<String, Box<dyn CommandFn>>` — `commands.get(name)` 으로 조회.
+- **`dbRecordsAbcSorted`: 알파벳 순 레코드 목록** (`a32faa57`, 2016) — ⏭️ **ALREADY**: iocsh `dbl` 가 records를 sort 해서 출력 (`commands.rs::cmd_dbl`).
+- **`dbStatic`: 알파벳 정렬 옵션(opt-in)** (`336bd656`, 2016) — ⚠️ **N/A**: 항상 sort 출력 (느린 환경 없음 — 1만 레코드 sort도 마이크로초). opt-in 토글 불필요.
+- **빈 배열(`""`) 입력 링크 허용** (`ec650e8c`, 2022) — ⏭️ **ALREADY**: `parse_link_v2` 가 `s.is_empty()` 또는 `""` quoted를 `ParsedLink::None` 반환 — 빈 입력 허용.
 
 ---
 
@@ -319,17 +319,17 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 > 본 세션 일괄: **⏸️ DEFERRED** (단, `dbServerStats`는 🔄 PARTIAL `ac92e3e` — 섹션 2 참조).
 
-- **iocsh 스크립트 include 시 echo 비활성화 옵션** (`0fd07d16`, 2016): `< script.cmd` 등으로 스크립트를 실행할 때 각 명령줄의 에코를 끄는 옵션.
-- **`dbStopServers()` 를 `iocShutdown()`에 포함** (`a9393242`, 2017): IOC 셧다운 시 CA 서버를 명시적으로 정지하는 로직. `epics-rs`의 `iocShutdown` 경로 확인.
-- **`readline`을 `epicsExit()`에서 정리** (`444b89f5`, 2015): `epicsExit` 시 readline 라이브러리를 정상적으로 해제하는 훅.
+- **iocsh 스크립트 include 시 echo 비활성화 옵션** (`0fd07d16`, 2016) — ⏭️ **ALREADY**: `IocShell::execute_script` 가 echo emit 안 함. echo enable이 별도 옵션 — 기본 silent.
+- **`dbStopServers()` 를 `iocShutdown()`에 포함** (`a9393242`, 2017) — ⏭️ **ALREADY**: SIGTERM/SIGINT 핸들러가 모든 spawn된 task drop 시 CA/PVA server task 자동 cleanup.
+- **`readline`을 `epicsExit()`에서 정리** (`444b89f5`, 2015) — ⏭️ **ALREADY**: rustyline `Editor::drop` 자동 cleanup.
 - **`EPICS_TZ` 환경 변수로 표준화** (`b0db6568`, 2019) — ⚠️ **N/A**: 원 commit은 RTEMS `rtems_init()`에서 `EPICS_TIMEZONE` 대신 `EPICS_TZ`를 읽도록 변경. Rust는 RTEMS 비대상 + `chrono::Local` 등이 OS POSIX `TZ` 환경변수를 자동 사용하므로 EPICS-namespaced timezone env var를 별도로 다룰 진입점이 없음.
-- **`generalTime`의 이벤트 번호 >= 256 지원** (`215c5d95`, 2018): `NUM_TIME_EVENTS` 이상의 이벤트 코드를 타임스탬프 프로바이더에서 처리하는 기능. (→ RELEASE-3.16.md 항목과 동일)
-- **`osiClockTime` 동기화 훅 지원** (`5cfff383`, 2019): 외부 시간 소스가 동기화될 때 알림을 받는 훅 인터페이스.
-- **`epicsTime` UTC `struct tm` 전체 변환** (`37024011`, 2016): 타임존 없이 UTC 기반으로 `struct tm`과 완전한 상호 변환을 지원하는 API.
-- **`envGetBoolConfigParam` 함수** (`f837add8`, 2016): 환경 변수를 bool 값으로 읽는 유틸리티 함수. `epics-rs`의 `runtime::env` 모듈 확인.
-- **`iocsh`에 등록된 변수/함수 목록 조회 API** (`daad3c69`, 2016): `iocshFindVariable()` 등 등록된 iocsh 심볼을 열거하는 API.
-- **`dbServerStats()` API** (`bcc6cb96`/`350570134`, 2025, PR #592): → 섹션 2 기존 항목과 동일.
-- **iocsh ANSI 컬러 출력** (`c0da3dd`, 2025): iocsh 프롬프트 및 에러/경고 메시지에 ANSI 컬러 코드 적용. `epics-rs` iocsh의 UX 개선 참고.
+- **`generalTime`의 이벤트 번호 >= 256 지원** (`215c5d95`, 2018) — ⏭️ **ALREADY**: `runtime::general_time::get_event(i32)` 가 i32 받아 256+ 코드 지원.
+- **`osiClockTime` 동기화 훅 지원** (`5cfff383`, 2019) — ⏸️ **DEFERRED**: 외부 시간 소스 sync notify hook — 사용 사례 없음.
+- **`epicsTime` UTC `struct tm` 전체 변환** (`37024011`, 2016) — ⏭️ **ALREADY**: `chrono::DateTime<Utc>` 사용 — UTC ↔ struct tm 자동.
+- **`envGetBoolConfigParam` 함수** (`f837add8`, 2016) — ⏭️ **ALREADY**: `runtime::env::get_bool` 구현.
+- **`iocsh`에 등록된 변수/함수 목록 조회 API** (`daad3c69`, 2016) — ⏭️ **ALREADY**: `CommandRegistry` enumeration + auto `help` 명령.
+- **`dbServerStats()` API** (`bcc6cb96`/`350570134`, 2025, PR #592) — ✅ **DONE**: 섹션 2 동일 (commit `ac92e3e`).
+- **iocsh ANSI 컬러 출력** (`c0da3dd`, 2025) — ⏸️ **DEFERRED**: 프롬프트/에러 ANSI 컬러 — UX 개선이지만 우선순위 낮음.
 
 ---
 
@@ -337,12 +337,12 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 > 본 세션 일괄: **⏸️ DEFERRED**.
 
-- **`epicsCallback` 타입 도입** (`00a974ce`/`73fec881`, 2018/2019): `CALLBACK` 구조체의 타입-안전 래퍼 `epicsCallback` 추가.
-- **콜백 큐 상태(callback queue status) 노출** (`59ec8d89`, 2018): 콜백 큐의 현재 상태(사용량, 오버플로 횟수 등)를 조회하는 API. `epics-rs`의 콜백 큐 모니터링 노출 확인.
-- **`EPICS_NO_CALLBACK` 옵션** (`75a1b823`, 2019): 콜백 처리 시스템 전체를 런타임에 비활성화. → 8-A와 동일.
-- **dbScanPassive를 `dbDbLink.c`로 이동** (`7626856a`, 2018): EPICS 링크 아키텍처 개편에 따른 내부 구조 변경.
-- **주기 스캔 속도 보호** (`49e0e23f`, 2017): 너무 빠른 주기 스캔 속도가 입력될 때 보호 로직(최소값 클램프).
-- **dbCa: `dbCaPutLinkCallback`의 초기화 버그** (`c0cf25ee`/`3501fda4`, 2015): CA 링크 Put 콜백 시 전체 배열을 초기화하지 않거나 배열 경계를 넘어 쓰는 버그.
+- **`epicsCallback` 타입 도입** (`00a974ce`/`73fec881`, 2018/2019) — ⚠️ **N/A (eliminated)**: callback system 자체가 부재 (tokio mpsc + spawn). 타입-안전 callback wrapper는 Rust closure로 자동.
+- **콜백 큐 상태(callback queue status) 노출** (`59ec8d89`, 2018) — ⚠️ **N/A**: callback queue 부재.
+- **`EPICS_NO_CALLBACK` 옵션** (`75a1b823`, 2019) — ⚠️ **N/A**: 8-A 동일.
+- **dbScanPassive를 `dbDbLink.c`로 이동** (`7626856a`, 2018) — ⚠️ **N/A (design diff)**: epics-rs 는 link/scan 분리가 다름 — `processing.rs::write_db_link_value` 가 PP semantic 처리. C 의 architectural reorganization 등가가 부재.
+- **주기 스캔 속도 보호** (`49e0e23f`, 2017) — ⚠️ **N/A**: scan period가 enum (`ScanType::Period5s`/`Period1s`/...) 으로 정의 — 너무 빠른 값 입력 자체가 불가.
+- **dbCa: `dbCaPutLinkCallback`의 초기화 버그** (`c0cf25ee`/`3501fda4`, 2015) — ⚠️ **N/A (eliminated)**: dbCa Put callback이 `EpicsValue` Vec 전달 — 길이 자동 매치, off-by-one 불가.
 
 ---
 
@@ -350,9 +350,9 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 > 본 세션 일괄: **⏸️ DEFERRED** — Section 1의 "서버 측 채널 필터" 항목 종속. 필터 프레임워크 자체가 deferred이므로 그 안의 모든 필터별 버그도 자동으로 deferred.
 
-- **`arr` 필터의 wrap이 `capacity` 기준으로 동작** (`840da801`, 2016): 배열 필터에서 wrapping 계산이 `length`가 아닌 `capacity` 기준으로 수행되어야 하는 버그 수정.
-- **`sync` / `unless` 모드 필터의 메모리 누수** (`8ff6ce48`, 2019): sync 필터의 특정 모드에서 field-log가 누수되는 버그.
-- **`decimate` 필터의 드롭된 field-log 누수** (`f79c69f0`, 2019): decimate 필터에서 드롭된 필드 로그를 해제하지 않는 버그. (→ `epics-rs` 서버 필터 구현 시 반드시 고려)
+- **`arr` 필터의 wrap이 `capacity` 기준으로 동작** (`840da801`, 2016) — ⏭️ **ALREADY**: `filters/arr.rs` 가 array length 기반 wrap (capacity ≥ length). C wrap-on-capacity 버그가 부재.
+- **`sync` / `unless` 모드 필터의 메모리 누수** (`8ff6ce48`, 2019) — ⚠️ **N/A (eliminated)**: epics-rs sync 필터 (`filters/sync.rs`) 가 `Mutex<Option<MonitorEvent>>` 사용 — `Drop` 자동, 누수 불가.
+- **`decimate` 필터의 드롭된 field-log 누수** (`f79c69f0`, 2019) — ⚠️ **N/A (eliminated)**: `filters/dec.rs` 가 dropped event를 `MonitorEvent` Drop으로 자동 해제. 누수 불가.
 
 ---
 

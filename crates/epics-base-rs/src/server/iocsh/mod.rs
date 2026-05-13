@@ -198,7 +198,23 @@ impl IocShell {
     }
 
     /// Run the interactive REPL. Blocks until exit or EOF.
+    ///
+    /// When stdin is not a terminal (piped input, `<script.cmd` shell
+    /// redirect, here-doc, ...) the rustyline interactive editor is
+    /// skipped and lines come straight from `BufRead::lines()` with no
+    /// prompt — mirrors epics-base PR #848 ("Skip readline interactive
+    /// setup when not interactive"). Avoids `epics> ` prompt noise in
+    /// the captured stderr stream when an operator pipes a script in.
     pub fn run_repl(&self) -> Result<(), String> {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            self.run_repl_interactive()
+        } else {
+            self.run_repl_piped()
+        }
+    }
+
+    fn run_repl_interactive(&self) -> Result<(), String> {
         // History capacity from `EPICS_RS_IOCSH_HISTORY_SIZE` (default
         // 500). Mirrors epics-base PR #459 — bound the history so a
         // long-running IOC shell session does not grow unbounded.
@@ -238,6 +254,35 @@ impl IocShell {
             }
         }
 
+        Ok(())
+    }
+
+    fn run_repl_piped(&self) -> Result<(), String> {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match handle.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match self.execute_line(trimmed) {
+                        Ok(CommandOutcome::Continue) => {}
+                        Ok(CommandOutcome::Exit) => break,
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("stdin read error: {e}");
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 

@@ -55,7 +55,7 @@
 - **레코드 삭제 기능 (PR #505)** — ⏭️ **ALREADY**: `iocsh/commands.rs:24`에 `cmd_db_delete_record` 등록되어 있음.
 - **`getenv` 디바이스 지원 (3.15.4)** — ✅ **DONE** `7ed3baf`: 신규 모듈 `server/builtin_devices/getenv.rs`. `IocBuilder::new()`/`IocApplication::new()`에서 `DTYP="getenv"`로 자동 등록. INP의 `@` prefix 처리.
 - **출력 레코드의 `SIMM=RAW` 시뮬레이션 모드 (7.0.7)** — 🔄 **PARTIAL** `ac92e3e`: SIMM=2 명시 인식, RVAL-있는 레코드(ai/ao)에서 raw value path. RVAL 없는 레코드는 SIMM=YES와 동일 fallback.
-- **`longout` 레코드의 조건부 출력 `OOPT` 필드 (7.0.8)** — ✅ **DONE** `73b517c`: EpicsRecord derive를 manual `impl Record`로 교체, `should_output` override + 신규 trait method `on_output_complete` 추가, processing.rs의 device-write/soft-link 양 경로에 OOPT gate.
+- **`longout` 레코드의 조건부 출력 `OOPT` 필드 (7.0.8)** — ✅ **DONE** `73b517c` (+follow-up): EpicsRecord derive를 manual `impl Record`로 교체, `should_output` override + 신규 trait method `on_output_complete` 추가, processing.rs의 device-write/soft-link 양 경로에 OOPT gate. **Follow-up**: PR #6c573b4 first-cycle bug — OOPT=1/4/5 transition modes가 default val=pval=0으로 첫 cycle 출력을 swallow하는 문제 fix. `first_output_done: bool` flag 도입, `compute_should_output()`이 첫 cycle은 항상 emit하도록 early-return; `on_output_complete()`에서 flag set. 신규 테스트 2종 (`oopt_on_change_first_cycle_forces_output`, `oopt_when_zero_first_cycle_forces_output`).
 
 ---
 
@@ -474,7 +474,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 `documentation/new-notes/`에서 발굴한 현재 개발 중이거나 병합 예정인 기능들:
 
 - **PR #359: `aai`/`aao`/`subArray`/`waveform`의 `NORD` 필드 타임스탬프 버그 수정** — 🔄 **PARTIAL** `a02c310`: `aai`/`aao`/`subArray` 레코드 타입 자체는 신규 구현. NORD 타임스탬프 갱신 순서 fix는 별도 작업.
-- **PR #768: `iocInit`에서 로컬 CA 링크 연결 대기** — ⏸️ **DEFERRED**: 9-A high-priority 항목 — 우선 후보. C 구현은 `initOutstanding` 카운터 + `DBCA_CALLBACK_INIT_WAIT` flag + `CA_INIT_READY` action 3단계 동기화로 `initHookAfterIocRunning` 발화 전에 모든 로컬 CA `CP` 링크가 connect되도록 함. Rust 측은 dbCa 등가물(`parsed_inp = ParsedLink::Ca(...)`)을 추적할 별도 lifecycle counter + tokio Notify 페어 + post-iocInit drain 단계가 필요 (archaeology 항목: `717d69e` / `a46bd5a-dbca-iocInit-wait-local-links-connect.md`).
+- **PR #768: `iocInit`에서 로컬 CA 링크 연결 대기** — ✅ **DONE**: `IocApplication::run`이 `setup_cp_links` 직후 `PvDatabase::wait_for_external_links(timeout)`를 호출해 모든 등록된 LinkSet(dbCa/dbPv 양쪽)의 외부 링크가 connect될 때까지 대기. timeout은 `EPICS_RS_INIT_LINK_TIMEOUT` env (기본 10초, 0이면 wait skip). C의 `initOutstanding`/`DBCA_CALLBACK_INIT_WAIT` 카운터 + 별도 hook을 LinkSet trait의 `is_connected(name)` 폴링으로 단순화 — 결과 동등. `wait_for_external_links_*` 단위 테스트 3종(no lsets / quick-connect / partial-on-timeout).
 - **PR #788: `epicsThreadGetCPUs` 및 `callbackParallelThreads` CPU 어피니티 반영** — ⏭️ **ALREADY**: 섹션 3 보강 (Rust `std::thread::available_parallelism()`).
 - **PR #812: `dbCreateRecord` iocsh 명령어** — ⏭️ **ALREADY**: `cmd_db_create_record` (`crates/epics-base-rs/src/server/iocsh/commands.rs:680`)로 등록 + 5종 테스트(happy path + duplicate / bad name / unknown type / missing args).
 - **PR #817: `mbbi` 레코드의 `AFTC`/`LALM` 버그 수정** — ⏸️ **DEFERRED (scope)**: bi/mbbi 모두 `aftc`/`afvl` 필드는 선언되어 있으나(`crates/epics-base-rs/src/server/records/{bi,mbbi}.rs`) `process()`에서 알람 severity의 low-pass filter 로직이 미구현. PR #817은 (1) bi에 AFTC 동작 추가, (2) mbbi AFTC enable 버그 수정, (3) mbbi COSV 활성 시 LALM 갱신 버그 수정 — 3건 모두 process cycle 내 delta-t 기반 filter 구현이 선행되어야 함. 본 항목은 filter 로직 통합 작업으로 별도 PR.

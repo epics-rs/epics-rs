@@ -59,6 +59,14 @@ pub struct LongoutRecord {
     /// (transition modes) can detect changes. Initially zero; loops
     /// after the first successful output.
     pub pval: i32,
+    /// epics-base PR #6c573b4: track whether this record has ever
+    /// completed an output cycle. Transition-mode OOPT values
+    /// (1=On Change, 4=When Zero, 5=When Non-zero) compare `val` to
+    /// `pval` which both start at 0 — without forcing the first
+    /// output, an initial put of VAL=0 with OOPT=On Change would
+    /// silently skip device write. C EPICS handles this by always
+    /// emitting on the first cycle regardless of OOPT comparison.
+    pub first_output_done: bool,
 }
 
 impl Default for LongoutRecord {
@@ -94,6 +102,7 @@ impl Default for LongoutRecord {
             sims: 0,
             oopt: 0,
             pval: 0,
+            first_output_done: false,
         }
     }
 }
@@ -111,6 +120,14 @@ impl LongoutRecord {
     /// Public so unit tests don't have to spin up the full processing
     /// loop to exercise each menu value.
     pub fn compute_should_output(&self) -> bool {
+        // epics-base PR #6c573b4: force the very first process cycle
+        // to emit output regardless of OOPT comparison. Without this,
+        // transition-mode OOPT (1=On Change, 4=When Zero, 5=When
+        // Non-zero) silently swallow the initial put when val and
+        // pval are both at their default 0.
+        if !self.first_output_done {
+            return true;
+        }
         match self.oopt {
             0 => true,
             1 => self.val != self.pval,
@@ -491,8 +508,11 @@ impl Record for LongoutRecord {
 
     /// Latch PVAL after a successful output so OOPT=1/4/5 transition
     /// detection on the next cycle has the right reference point.
+    /// Also marks `first_output_done` so subsequent cycles apply the
+    /// real OOPT comparison rather than the first-cycle force-emit.
     fn on_output_complete(&mut self) {
         self.pval = self.val;
+        self.first_output_done = true;
     }
 }
 
@@ -510,6 +530,7 @@ mod tests {
     fn oopt_on_change() {
         let mut r = LongoutRecord::new(0);
         r.oopt = 1;
+        r.first_output_done = true; // simulate post-first-cycle state
         r.pval = 5;
         r.val = 5;
         assert!(!r.compute_should_output(), "val==pval suppresses output");
@@ -520,6 +541,7 @@ mod tests {
     #[test]
     fn oopt_when_zero_and_nonzero() {
         let mut r = LongoutRecord::new(0);
+        r.first_output_done = true;
         r.oopt = 2; // When Zero
         r.val = 0;
         assert!(r.compute_should_output());
@@ -536,6 +558,7 @@ mod tests {
     #[test]
     fn oopt_transitions() {
         let mut r = LongoutRecord::new(0);
+        r.first_output_done = true;
         r.oopt = 4; // Transition to Zero
         r.pval = 5;
         r.val = 0;
@@ -557,8 +580,50 @@ mod tests {
     fn oopt_unknown_value_suppresses_output() {
         // C EPICS treats unknown OOPT as "don't output" to fail-safe.
         let mut r = LongoutRecord::new(0);
+        r.first_output_done = true;
         r.oopt = 99;
         assert!(!r.compute_should_output());
+    }
+
+    /// epics-base PR #6c573b4: the very first process cycle must
+    /// always emit, even when OOPT is in a transition mode whose
+    /// comparison says "no change". Before the fix, OOPT=1/4 with
+    /// the default val=pval=0 would silently swallow the initial
+    /// device write.
+    #[test]
+    fn oopt_on_change_first_cycle_forces_output() {
+        let mut r = LongoutRecord::new(0);
+        r.oopt = 1; // On Change
+        // val == pval == 0, first_output_done still false (default).
+        assert!(
+            r.compute_should_output(),
+            "first cycle must force output regardless of OOPT comparison"
+        );
+        // Simulate the framework calling on_output_complete after
+        // the device write succeeds.
+        r.on_output_complete();
+        assert!(r.first_output_done);
+        // Next cycle with val still equal to pval honours OOPT=1.
+        assert!(
+            !r.compute_should_output(),
+            "post-first cycle val==pval honours OOPT=On Change suppression"
+        );
+    }
+
+    #[test]
+    fn oopt_when_zero_first_cycle_forces_output() {
+        // OOPT=4 (When Transition To Zero) compares pval!=0 && val==0.
+        // Without the first-cycle fix this would skip the very first
+        // process cycle even when the user wants the initial zero to
+        // reach the device.
+        let mut r = LongoutRecord::new(0);
+        r.oopt = 4;
+        assert!(r.compute_should_output(), "first cycle forces output");
+        r.on_output_complete();
+        assert!(
+            !r.compute_should_output(),
+            "post-first cycle 0→0 honours OOPT=4 suppression"
+        );
     }
 
     #[test]

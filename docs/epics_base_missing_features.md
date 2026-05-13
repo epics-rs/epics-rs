@@ -405,18 +405,18 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 > 본 세션 일괄: **⏸️ DEFERRED**.
 
-- **`histogramRecord` wdog 콜백이 `VAL` 대신 `bptr`로 이벤트 발송** (`4a0f488`, medium): 히스토그램 레코드의 잘못된 포인터로 모니터 이벤트 발송.
+- **`histogramRecord` wdog 콜백이 `VAL` 대신 `bptr`로 이벤트 발송** (`4a0f488`, medium) — ⚠️ **N/A (eliminated)**: histogram record 가 epics-rs 미구현. 추후 구현 시 `notify_field("VAL", …)` 패턴 강제 — `bptr` raw pointer 개념 자체가 부재.
 - **영(zero)원소 배열 읽기에 대한 고유 오류 코드** (`5d808b7`+`3b3261c`, medium) — ⏭️ **ALREADY (post-revert)**: 섹션 5 보강 참조. upstream이 `S_db_emptyArray`를 revert하여 다시 `S_db_badField` 사용, Rust `CaError::InvalidValue`가 동일 의미.
-- **`.DTYP` 없는 레코드 타입에서 `DTYP` 조회 시 크래시 대신 빈 문자열** (`6e7a715`, medium): 디바이스 지원이 없는 레코드에서 `.DTYP` 조회 시 안전하게 처리.
-- **`get_enum_strs` 포인터 산술이 `_FORTIFY_SOURCE=3`에서 경고** (`979dde8`, medium): 열거형 문자열 배열 접근 방식이 강화된 컴파일러 보안 검사에서 걸리는 패턴.
-- **`lsi`/`lso` `SIZV` 필드가 32767에서 오버플로** (`e5b4829`, medium → 7-B 항목 보강): `dbAddr::field_size`가 부호 있는 정수여서 32768 이상에서 오버플로.
-- **`compressRecord` `compress_scalar` 평균 계산 버그** (`11a4bed`, partial → 7-B 항목 보강).
-- **`compressRecord` `compress_array`: `PBUF=YES`일 때 부분 버퍼 거부** (`84f4771`, partial): 부분 채워진 버퍼로 압축 시 유효한 데이터를 잘못 거부하는 버그.
-- **`dbPutConvertJSON`: 빈 JSON 문자열이 yajl에 전달되어 파싱 오류** (`ec650e8`, partial): 빈 문자열 입력에 대한 사전 검사 누락.
-- **`epicsNAN`/`epicsINF`를 모든 플랫폼에서 진정한 const로** (`5485ada`, medium): 컴파일 타임 상수로 선언되었으나 일부 플랫폼에서 런타임에 초기화되는 문제.
-- **`DBF_CHAR` waveform 필드에 대한 상수 링크 문자열 초기화 실패** (`b36e526`, medium): `DBF_CHAR` 타입 배열 필드를 상수 링크로 초기화할 때 실패하는 엣지 케이스.
-- **`struct link::flags` 부호 있는 비트 필드 UB** (`e88a186`, medium): 비트 필드에 부호 없는 타입을 사용해야 UB를 방지. Rust에서는 구조적으로 해결됨(확인 필요).
-- **메뉴 필드 변환: 범위 초과 enum 인덱스에 대해 숫자 문자열 반환** (`b460c26`, partial): 유효 범위를 벗어난 enum 값을 숫자 문자열로 폴백해야 함.
+- **`.DTYP` 없는 레코드 타입에서 `DTYP` 조회 시 크래시 대신 빈 문자열** (`6e7a715`, medium) — ⏭️ **ALREADY**: `CommonFields::dtyp: String` (default empty), `get_common_field("DTYP")` 항상 `Some(String)` 반환. 빈 문자열도 valid String, NULL deref 불가.
+- **`get_enum_strs` 포인터 산술이 `_FORTIFY_SOURCE=3`에서 경고** (`979dde8`, medium) — ⚠️ **N/A (eliminated)**: C 매크로 raw pointer arithmetic. Rust enum strings는 `Vec<String>` + index — bounds check 강제, 보안 검사 대상 부재.
+- **`lsi`/`lso` `SIZV` 필드가 32767에서 오버플로** (`e5b4829`, medium → 7-B 항목 보강) — ⏭️ **ALREADY**: `LsiRecord::sizv`/`LsoRecord::sizv` 가 `i32`로 선언, 내부 buffer는 `String`으로 길이 제한 없음.
+- **`compressRecord` `compress_scalar` 평균 계산 버그** (`11a4bed`, partial → 7-B 항목 보강) — ⏭️ **ALREADY**: `compress.rs::flush_accum` 의 mean 분기가 `accum.iter().sum::<f64>() / accum.len() as f64` — divide-by-zero 가드 + Rust f64 산술.
+- **`compressRecord` `compress_array`: `PBUF=YES`일 때 부분 버퍼 거부** (`84f4771`, partial) — ⏭️ **ALREADY** (commit `52427bc`): `push_array` PBUF=YES 시 trailing partial chunk 즉시 emit.
+- **`dbPutConvertJSON`: 빈 JSON 문자열이 yajl에 전달되어 파싱 오류** (`ec650e8`, partial) — ⚠️ **N/A (design diff)**: epics-rs는 yajl 미사용; serde_json. 빈 문자열은 `serde_json::from_str("")` Err → `?`로 propagate. silent garbage 차단.
+- **`epicsNAN`/`epicsINF`를 모든 플랫폼에서 진정한 const로** (`5485ada`, medium) — ⚠️ **N/A (eliminated)**: Rust `f64::NAN`, `f64::INFINITY`, `f64::NEG_INFINITY` 모두 컴파일 타임 const.
+- **`DBF_CHAR` waveform 필드에 대한 상수 링크 문자열 초기화 실패** (`b36e526`, medium) — ⏭️ **ALREADY**: `WaveformRecord::put_field("VAL")` 의 `(EpicsValue::String(s), 1 | 2) => CharArray(s.as_bytes().to_vec())` coerce가 String → CharArray 변환 처리.
+- **`struct link::flags` 부호 있는 비트 필드 UB** (`e88a186`, medium) — ⚠️ **N/A (eliminated)**: Rust에 C bitfield 자체가 부재. `LinkProcessPolicy` / `MonitorSwitch` enum + 별도 boolean 필드.
+- **메뉴 필드 변환: 범위 초과 enum 인덱스에 대해 숫자 문자열 반환** (`b460c26`, partial) — ⏭️ **ALREADY**: `mbbi/mbbo` 등 string lookup이 valid 인덱스면 ZRST/ONST/...을 반환, out-of-range면 `format!("{}", val)` fallback.
 
 ---
 
@@ -425,9 +425,9 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 > 본 세션 일괄: **⏸️ DEFERRED**.
 
 - **`logClient`: 연결 끊김 시 미전송 버퍼 버리지 않기** (`0a3427c`, medium) — ⚠️ **N/A (design diff)** — 섹션 7-C 항목과 동일 (logClient TCP forwarder 미구현).
-- **필터가 DB 링크 읽기 경로(`dbDbGetValue`)에 적용되지 않음** (`17a8dbc`, medium): DB 링크로 값을 읽을 때 서버 필터가 바이패스되는 구조적 누락. → `db_db_link.rs`
-- **DB 링크가 `dbChannel` 대신 `DBADDR`를 저장하여 필터 메타데이터 손실** (`b1f4459`, medium): → 섹션 7-C의 `dbChannel` 교체 항목 보강.
-- **`logClient` 재연결 후 미전송 메시지 즉시 플러시되지 않음** (`9df98c1`, partial): 재연결 후 버퍼에 쌓인 로그가 즉시 전송되지 않는 문제.
+- **필터가 DB 링크 읽기 경로(`dbDbGetValue`)에 적용되지 않음** (`17a8dbc`, medium) — ⏸️ **DEFERRED**: epics-rs DB link read path (`processing.rs::read_link_value_soft`)는 필터 chain 적용 안 함. 현재 server-side filter framework는 CA/PVA 모니터 진입점에만 wire-through. DB link read path에 filter 적용은 별도 작업으로 추후.
+- **DB 링크가 `dbChannel` 대신 `DBADDR`를 저장하여 필터 메타데이터 손실** (`b1f4459`, medium) — ⚠️ **N/A (design diff)**: 섹션 7-C 동일 항목 참조 — `ParsedLink::Db(DbLink { record, field, policy, monitor_switch })` 가 DBADDR/dbChannel 분리 자체를 갖지 않음. 필터 chain이 추후 link 안에 들어오면 `DbLink` 에 Vec<FilterSpec> 필드 추가로 자연스럽게 확장.
+- **`logClient` 재연결 후 미전송 메시지 즉시 플러시되지 않음** (`9df98c1`, partial) — ⚠️ **N/A (eliminated)**: epics-rs는 `tracing` crate 사용. logClient TCP forwarder 자체가 부재.
 
 ---
 
@@ -449,10 +449,10 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 > 본 세션 일괄: **⏸️ DEFERRED**.
 
-- **`dbPut` long-string(nRequest>1) 경로에서 `get_array_info` 스킵** (`82ec539`, medium): 긴 문자열 Put 시 배열 정보를 가져오지 않아 쓰기 경로가 손상. → `db_access.rs`
-- **`db_field_log` DBE 마스크 누락으로 필터가 `DBE_PROPERTY` 구분 불가** (`235f8ed`, medium): → 섹션 7-A의 기존 항목 보강.
-- **`caput`으로 0원소 배열 쓰기 허용** (`a42197f`, medium): 빈 배열 전송을 지원. → 섹션 7-A 항목 보강.
-- **CA count=0이 가변 크기 배열 구독을 의미함을 문서화** (`8c99340`, low): count=0의 시맨틱 명확화.
+- **`dbPut` long-string(nRequest>1) 경로에서 `get_array_info` 스킵** (`82ec539`, medium) — ⚠️ **N/A (design diff)**: epics-rs는 long string을 `EpicsValue::String` 으로 단일 표현, 별도 `nRequest` parameter 없음. CA wire의 long string handling은 codec layer에서 길이-prefix 명시적 처리 — get_array_info skip 패턴 부재.
+- **`db_field_log` DBE 마스크 누락으로 필터가 `DBE_PROPERTY` 구분 불가** (`235f8ed`, medium) — ⚠️ **N/A (design diff)**: 섹션 7-A 동일 항목 — epics-rs filter chain이 받는 `FilteredMonitorEvent::posting_mask: EventMask` 가 시작부터 mask 정보 보유. db_field_log struct 자체가 부재.
+- **`caput`으로 0원소 배열 쓰기 허용** (`a42197f`, medium) — ⚠️ **N/A (semantic diff)**: 12cfd41 가드와 동일 — `field_io.rs:88-92` 가 빈 배열을 스칼라 필드로 coerce 시 명시적 reject. 빈 배열을 array 필드에 쓰는 것은 unsupported (현재 사용 사례 없음).
+- **CA count=0이 가변 크기 배열 구독을 의미함을 문서화** (`8c99340`, low) — ⏭️ **ALREADY**: CA 서버측 EVENT_ADD 핸들러가 count=0를 "send full array length on every monitor" semantic으로 처리. 명시적 docs 추가 필요 없음 (기존 행동).
 
 ---
 
@@ -460,12 +460,12 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 > 본 세션 일괄: **⏸️ DEFERRED**.
 
-- **`recGblRecordError`: 음수 상태 코드에 대한 오류 심볼 조회 건너뜀** (`4c20518`, medium): 음수 오류 코드를 받았을 때 심볼 이름 조회를 건너뛰어 오류 메시지가 불명확.
+- **`recGblRecordError`: 음수 상태 코드에 대한 오류 심볼 조회 건너뜀** (`4c20518`, medium) — ⚠️ **N/A (eliminated)**: epics-rs는 errSymbol 테이블 미사용; `CaError` enum 이 음수/양수 구분 없이 모든 variant가 `Display` 구현 — 메시지 누락 자체가 부재.
 - **`iocsh` 인자 분리기: EOF 센티널 (-1)이 유효 문자로 처리** (`3dbc9ea`, partial): `iocsh` 파서에서 -1이 EOF가 아닌 정수로 처리되는 버그. → `iocsh/mod.rs`
 - **`aSub` 레코드: 상수 입력 링크에 `dbGetLink` 호출 오류** (`d47fa4c`, partial) — ⏭️ **ALREADY**: 섹션 5/7-C 보강 참조 (multi-input fetch가 `ParsedLink::Constant`를 별도 분기로 처리).
-- **`subRecord`: 잘못된 `INP` 링크 오류를 조용히 성공으로 처리** (`832abbd`, partial): 불량 입력 링크의 오류를 무시하는 버그.
+- **`subRecord`: 잘못된 `INP` 링크 오류를 조용히 성공으로 처리** (`832abbd`, partial) — ⏭️ **ALREADY** (PR #4737901 cycle): `processing.rs::process_record_with_links_inner` 가 soft-channel INP read 가 None 반환하고 INP가 실제 Db/Ca/Pva 링크였을 때 `LINK_ALARM/INVALID` 자동 부착 (database_tests::test_soft_inp_read_failure_sets_link_alarm).
 - **`iocsh`에 `iocshSetError`로 오류 코드 전파** (`144f975`, partial): → 섹션 7-C 기존 항목 보강.
-- **`waveform` `NORD`가 타임스탬프 갱신 전에 발송 → 첫 CA 모니터에 미정의 타임스탬프** (`5ba8080`, medium): `NORD` 이벤트와 타임스탬프 갱신 순서 문제. → `waveform` 레코드
+- **`waveform` `NORD`가 타임스탬프 갱신 전에 발송 → 첫 CA 모니터에 미정의 타임스탬프** (`5ba8080`, medium) — ⏭️ **ALREADY** (cycle 1, PR #359): NORD post가 snapshot path를 통해 `apply_timestamp` 후 발송. 회귀 테스트 `test_array_records_nord_monitor_uses_post_process_timestamp` 4 ArrayKind 모두 cover.
 
 ---
 
@@ -503,24 +503,22 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 10-B. `pva-rs` — 서버 동작 & 세션 제어 (Server & Session)
 
-> 본 세션 일괄: **⏸️ DEFERRED**.
-
-- **공유 PV(SharedPV) 에러 경로 데드락 방지** (`b17f8207676d`, high): 에러 발생 시 내부 락(Lock) 해제 순서가 꼬여 데드락이 발생하는 문제 해결.
-- **잘못된 SID(Session ID) 처리** (`280919b3ec08`, medium): 존재하지 않거나 종료된 채널 ID로 들어오는 요청을 무시/로깅.
-- **채널 누수(Channel leak) 차단** (`289f508af6fe`, medium): 클라이언트의 비정상 종료 시 서버 쪽에 남은 댕글링 채널 리소스 해제.
-- **초기 ACK 없는 Monitor 처리** (`2f4484889186`, medium): 모니터 생성 후 첫 ACK가 오기 전 발생하는 업데이트 이벤트 큐잉/드롭 로직.
-- **GET_FIELD 마지막 연결 끊김 처리** (`5019744fa79c`, medium): 메타데이터 조회 중 클라이언트 연결이 끊겼을 때의 안전한 취소.
-- **`autoExec=false` PUT 중 원격 오류 처리** (`70735383350b`, medium): 지연 실행 모드에서 발생하는 오류가 올바른 콜백으로 전파되도록 수정.
-- **TX 버퍼 한계를 확인하여 스로틀링** (`8d58409481ef`, medium): 서버 송신 버퍼가 가득 찼을 때 이벤트를 버리거나 블로킹하는 배압(Back-pressure) 로직.
+- **공유 PV(SharedPV) 에러 경로 데드락 방지** (`b17f8207676d`, high) — ⚠️ **N/A (eliminated)**: pvxs `SharedPV` 의 errored-path lock release 순서 cycle 문제. epics-rs에는 pvxs SharedPV 등가 구조가 없음 — `Arc<RwLock<RecordInstance>>` 단일 잠금 모델로 lock 순서 cycle 가능성 부재.
+- **잘못된 SID(Session ID) 처리** (`280919b3ec08`, medium) — ⏭️ **ALREADY**: `server_native/tcp.rs::handle_*` 가 모두 `channels.get(&sid).match { Some(ch) => …, None => … }` 패턴으로 잘못된 SID를 silently 처리. CMD_DESTROY_CHANNEL의 `channels.remove(&sid)` 도 멱등 (이미 없으면 no-op).
+- **채널 누수(Channel leak) 차단** (`289f508af6fe`, medium) — ⏭️ **ALREADY**: tokio task가 drop되면 `Drop` impl로 모든 channel 상태 정리. 클라이언트 disconnect (TCP read=0 또는 IO error) 시 `handle_client` 가 task 종료, spawn된 모든 sub-task가 mpsc 닫힘으로 cascade 종료.
+- **초기 ACK 없는 Monitor 처리** (`2f4484889186`, medium) — ⏭️ **ALREADY**: epics-pva-rs monitor 는 `mpsc::channel(64)` + `coalesced: Mutex<Option>` 패턴 (`server_native/tcp.rs:587`). client ACK 등가는 mpsc capacity로, ACK 없으면 try_send fail → coalesced에 last-value 보관 — 누락 자체가 부재.
+- **GET_FIELD 마지막 연결 끊김 처리** (`5019744fa79c`, medium) — ⏭️ **ALREADY**: tokio future가 await에서 disconnect 감지, IO error 반환 → `handle_client` 가 정상 종료. C의 manual cleanup 등가 작업이 RAII로 자동.
+- **`autoExec=false` PUT 중 원격 오류 처리** (`70735383350b`, medium) — ⏸️ **DEFERRED**: epics-pva-rs는 PVA `init` 메시지의 `autoExec` 옵션 deferred-execution PUT 모드 미구현 (즉시 실행만 지원). autoExec=false 진입점 자체가 없으므로 그 안의 오류 콜백 분기도 부재. 추후 deferred PUT 구현 시 함께.
+- **TX 버퍼 한계를 확인하여 스로틀링** (`8d58409481ef`, medium) — ⏭️ **ALREADY**: `tcp.rs:587-625`에 dedicated writer task + mpsc backpressure + per-monitor coalesced slot 구조. mpsc full 시 `try_send` 실패하면 `coalesced` 에 last-value 저장 — 메모리 무한 증가 차단.
 
 ### 10-C. `pva-rs` — 와이어 프로토콜 & 디코딩 (Protocol & Decoding)
 
 - **`SetEndian` 제어 메시지 올바른 처리** (`cce797263d1d`, high) — ⏭️ **ALREADY**: `proto/command.rs::ControlCommand::SetByteOrder`가 정의되어 있고 `server_native/tcp.rs:574`에서 handshake에 emit + 클라이언트 측에서도 수신 처리.
-- **배열(Array) 디코드 버그 수정** (`cf91bc3033e2`, high): 특정 조건에서 가변 길이 배열 디코딩 크래시/잘림 해결.
-- **디코드 오류 시 원격 `file:line` 정보 추출** (`e9ce80880d92`, high): 오류 응답에 포함된 상대방 디버그 위치 파싱.
-- **`null` 문자열 디코딩** (`0356eee74037`, medium): 스칼라 문자열 타입에 `null`이 전달될 때의 기본값 처리.
-- **`CMD_MESSAGE` 처리 수정** (`0eea8fd1c7e0`, medium): PVA 메시지 명령어 패킷의 올바른 파싱 및 라우팅.
-- **자격 증명(Credentials) 디코드** (`7de1f7d32f63`, medium): 인증을 위한 Connection Request 내 자격 증명 블록 파싱 지원.
+- **배열(Array) 디코드 버그 수정** (`cf91bc3033e2`, high) — ⏭️ **ALREADY**: epics-pva-rs `pvdata::decode` 가 size prefix를 `decode_size`로 명시적 파싱 후 `Vec::with_capacity(n)` + element-by-element decode. C의 `vector.resize()` + raw memcpy 크래시 패턴이 부재 — Rust slice/Vec API가 모든 boundary check를 강제.
+- **디코드 오류 시 원격 `file:line` 정보 추출** (`e9ce80880d92`, high) — ⏸️ **DEFERRED (low value)**: pvxs는 자체 `decodeError(file, line, msg)` 매크로의 file:line을 STATUS 메시지에 포함시켜 양 끝단 디버깅 도움. epics-pva-rs는 `PvaError` enum으로 enum-variant 자체가 위치 정보 — 추가 file:line 직렬화는 wire 호환성 영향 적은 편이라 별도 PR.
+- **`null` 문자열 디코딩** (`0356eee74037`, medium) — ⏭️ **ALREADY**: epics-pva-rs `pvdata::decode::decode_string` 이 length=0 또는 length=-1 (varint sentinel) 모두 빈 String으로 normalise. `Option<String>` 변환은 위 레이어 (PvField → 사용자 type)에서 처리.
+- **`CMD_MESSAGE` 처리 수정** (`0eea8fd1c7e0`, medium) — ⏭️ **ALREADY**: `proto/command.rs::Command::Message` 가 디코드 + display + handler 모두 정의 (`server_native/tcp.rs::handle_message_command`).
+- **자격 증명(Credentials) 디코드** (`7de1f7d32f63`, medium) — ⏭️ **ALREADY**: PVA Connection Request 의 `auth` 필드 디코드는 `proto/auth.rs::ConnectionAuth` (`anonymous`/`ca`/`x509` 3가지 method). x509 mTLS 경우 peer cert에서 issuer DN 추출 (`tls::issuer_from_cert`).
 
 ### 10-D. `pva-rs` — UDP / 비콘 (Beacon) & 기타
 

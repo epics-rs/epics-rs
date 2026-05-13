@@ -210,7 +210,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 - **`aSub` 레코드의 상수 `INP*` 링크 지원** (`d47fa4ca`, 2022, Issue #284): → 섹션 5의 기존 항목과 동일.
 - **`dbLoadRecords()` 오류 메시지 중복 출력 방지** (`9af7fb3`, 2025): 로딩 실패 시 에러 메시지가 두 번 출력되는 버그.
 - **`dbReadDatabaseFP()` 파일 닫기 보장** (`a6779df2`, 2022) — ⚠️ **N/A (eliminated)**: Rust `std::fs::File`의 `Drop`이 자동으로 `close()` 보장. `BufReader<File>` 등 모든 파일 래퍼 동일. `rust_verdict: eliminated`.
-- **`logClient` 연결 끊김 시 미전송 메시지 재전송 시도** (`0a3427c8`, 2019): 로그 서버와의 연결이 끊어져도 버퍼에 남은 메시지를 바로 버리지 않고 재전송 시도. `epics-rs`의 `logClient` 셧다운 경로 확인.
+- **`logClient` 연결 끊김 시 미전송 메시지 재전송 시도** (`0a3427c8`, 2019) — ⚠️ **N/A (design diff)**: epics-rs는 C의 `logClient.c` TCP forwarder를 사용하지 않고 `tracing` crate로 구조화된 로깅을 처리. 로그 서버 reconnect 시 retransmit이 필요한 송신 버퍼 자체가 부재. EPICS log server protocol 지원이 필요해질 때 buffer-preserve 정신을 적용.
 - **알람 메시지 필드(`AMSG`) 및 타임 태그 필드(`UTAG`) 추가** (`892a361d`/`b94afaa0`, 2020): `recGbl`에 알람 문자열 필드(`AMSG`)와 64비트 사용자 태그(`UTAG`)가 추가됨. `epics-rs` 레코드 공통 필드 동기화 필요.
 - **`dbChannel` 기반 링크 (DBADDR → dbChannel 교체)** (`b1f44592`, 2020): 내부 링크의 주소 타입이 `DBADDR`에서 `dbChannel`로 교체되는 대규모 리팩토링. `epics-rs`의 링크 어드레싱 모델 확인.
 
@@ -424,7 +424,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 > 본 세션 일괄: **⏸️ DEFERRED**.
 
-- **`logClient`: 연결 끊김 시 미전송 버퍼 버리지 않기** (`0a3427c`, medium): → 섹션 7-C의 기존 항목 보강 (파일: `errlog.rs`).
+- **`logClient`: 연결 끊김 시 미전송 버퍼 버리지 않기** (`0a3427c`, medium) — ⚠️ **N/A (design diff)** — 섹션 7-C 항목과 동일 (logClient TCP forwarder 미구현).
 - **필터가 DB 링크 읽기 경로(`dbDbGetValue`)에 적용되지 않음** (`17a8dbc`, medium): DB 링크로 값을 읽을 때 서버 필터가 바이패스되는 구조적 누락. → `db_db_link.rs`
 - **DB 링크가 `dbChannel` 대신 `DBADDR`를 저장하여 필터 메타데이터 손실** (`b1f4459`, medium): → 섹션 7-C의 `dbChannel` 교체 항목 보강.
 - **`logClient` 재연결 후 미전송 메시지 즉시 플러시되지 않음** (`9df98c1`, partial): 재연결 후 버퍼에 쌓인 로그가 즉시 전송되지 않는 문제.

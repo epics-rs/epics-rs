@@ -173,13 +173,22 @@ pub async fn run_udp_responder_with_config(
         let mut last_set_hash: u64 = 0;
         let mut emitted: u32 = 0;
         let mut beacon_send_errs: HashSet<SocketAddr> = HashSet::new();
+        // pvxs cc5071cd22c4: fire the first beacon immediately on
+        // server start (the original C code armed the libevent timer
+        // with `&immediate = {0,0}`). Without this skip the first
+        // sleep delays client discovery by `beacon_period` seconds.
+        let mut first_beacon = true;
         loop {
             let cur_period = if emitted < beacon_burst_count as u32 {
                 beacon_period
             } else {
                 beacon_period_long
             };
-            tokio::time::sleep(cur_period).await;
+            if first_beacon {
+                first_beacon = false;
+            } else {
+                tokio::time::sleep(cur_period).await;
+            }
             // Compute a stable hash of the current PV set so we don't
             // hold an allocated Vec across the await above.
             let pvs = beacon_source.list_pvs().await;

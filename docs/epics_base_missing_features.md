@@ -64,7 +64,7 @@
 - **`iocshLoad` 명령어 미지원 (Issue #847)** — ✅ **DONE**: `IocShell::execute_line`이 `iocshLoad <path> [macros]` (space + C++ `iocshLoad("path","K=V,...")` paren form 양쪽 지원)을 인터셉트. `execute_script_with_macros`가 `db_loader::substitute_macros`로 라인별 `$(KEY)`/`${KEY}` 치환 후 재귀적으로 `execute_line` 디스패치. 빈 macros일 때는 substitution skip. 라인별 에러는 `execute_script`와 동일하게 다음 라인 진행 + 최종 Err 반환 (`iocshSetError` 등가). 테스트 5종: space form macro, paren form, no-macros, missing-path-error, per-line-error-propagate.
 - **가용 CPU 수치 과다 보고 방지 API (PR #788)** — ⏸️ **DEFERRED**: `taskset` 등 어피니티 제한 환경에서 실제 가용 CPU 수 보고 미구현.
 - **`SIGTERM` / `SIGINT` 수신 시 `atExit` 정상 종료 절차 (PR #671)** — 🔄 **PARTIAL**: CA 서버(`ca_server.rs`)·PVA 서버 runtime·`epics-tools-rs::procserv`에는 SIGTERM 핸들러 존재. `epics-base-rs::server::ioc_app`에는 명시 핸들러 없음(드롭 시 자연 종료에 의존).
-- **`iocsh` 내 `Ctrl+C` 처리 시 `stdin` 닫기 (PR #673)** — ⏸️ **DEFERRED**: 미구현.
+- **`iocsh` 내 `Ctrl+C` 처리 시 `stdin` 닫기 (PR #673)** — ⏸️ **DEFERRED**: upstream PR이 DRAFT 상태(미머지). 현재 Rust REPL은 rustyline의 표준 동작(`Ctrl+C` = 라인 취소 후 프롬프트 복귀, `Ctrl+D` = EOF로 종료)을 따름. PR이 머지되어 시맨틱이 확정되면 `ReadlineError::Interrupted` 경로 분기 결정.
 - **`iocsh` 멀티라인 문자열 지원 (PR #603)** — ✅ **DONE**: `join_backslash_continuations` (`crates/epics-base-rs/src/server/iocsh/mod.rs`)이 라인 끝의 `\`+newline을 다음 라인과 합침. `execute_script` / `execute_script_with_macros` 양쪽에 적용. 시나리오 5종 (upstream `multiline-input.txt` 8라인 + 라인 번호 추적 + CRLF + EOF-without-newline + end-to-end). 제약: rustyline 기반 REPL에는 미적용 (대화형에서 `\`+enter 입력 시 continuation 없음 — 별도 readline editor 단계 필요).
 
 ---

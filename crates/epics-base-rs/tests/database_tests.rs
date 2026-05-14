@@ -113,10 +113,17 @@ async fn test_soft_inp_read_failure_sets_link_alarm() {
 /// epics-base PR #d0cf47c regression: single-INP MS-class link must
 /// propagate STAT/SEVR/AMSG from the source record. Previously only
 /// the multi-input link path (INPA..INPL, calc/sub/aSub/sel) carried
-/// MS-class alarms; ai/longin/bi/mbbi/stringin INP=`SRC MSS` silently
-/// dropped them even though the link parser recorded the MS modifier.
+/// MS-class alarms; ai/longin/bi/mbbi/stringin INP=`SRC MS/MSS/MSI`
+/// silently dropped them even though the link parser recorded the
+/// modifier.
+///
+/// C `recGblInheritSevrMsg` (recGbl.c:260) per-flavour semantics:
+/// * **MS**  — DEST gets `LINK_ALARM` (NOT source stat), max-raised
+///             sevr, no amsg propagation.
+/// * **MSS** — DEST gets source stat + sevr + amsg.
+/// * **MSI** — same as MS, but only when source.sevr == INVALID.
 #[tokio::test]
-async fn test_single_inp_ms_class_propagates_source_alarm() {
+async fn test_single_inp_ms_propagates_link_alarm_no_msg() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
 
@@ -128,21 +135,16 @@ async fn test_single_inp_ms_class_propagates_source_alarm() {
         .await
         .unwrap();
 
-    // Force the source into MAJOR severity with a specific STAT and
-    // alarm message so we can verify both numeric fields and the
-    // amsg string propagate through the MS modifier.
+    // Force SRC into Major with a specific HIHI stat and a non-empty
+    // amsg. Under plain MS, DST must lift to Major but surface
+    // LINK_ALARM (NOT HIHI), and DST's amsg must NOT inherit "src-msg".
     if let Some(rec) = db.get_record("SRC").await {
         let mut inst = rec.write().await;
         inst.common.stat = alarm_status::HIHI_ALARM;
         inst.common.sevr = AlarmSeverity::Major;
-        inst.common.amsg = "src-major".to_string();
+        inst.common.amsg = "src-msg".to_string();
     }
 
-    // INP="SRC NPP MS" — NPP prevents PP=ProcessPassive from
-    // re-processing SRC and clearing the alarm state the test just
-    // installed; MS (Maximize) makes the link propagate STAT/SEVR/AMSG.
-    // Also clear DST's default UDF so its own UDF_ALARM/Invalid
-    // doesn't mask the lower-severity Major from SRC under maximize.
     if let Some(rec) = db.get_record("DST").await {
         let mut inst = rec.write().await;
         inst.put_common_field("INP", EpicsValue::String("SRC NPP MS".into()))
@@ -164,12 +166,60 @@ async fn test_single_inp_ms_class_propagates_source_alarm() {
     );
     assert_eq!(
         inst.common.stat,
+        alarm_status::LINK_ALARM,
+        "C parity: MS link MUST surface as LINK_ALARM, not the source's STAT"
+    );
+    assert!(
+        inst.common.amsg.is_empty(),
+        "C parity: MS link MUST NOT propagate amsg; got {:?}",
+        inst.common.amsg
+    );
+}
+
+/// MSS propagates source stat + sevr + amsg (PR d0cf47c).
+#[tokio::test]
+async fn test_single_inp_mss_propagates_stat_and_amsg() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    let db = PvDatabase::new();
+    db.add_record("SRC", Box::new(AoRecord::new(7.0)))
+        .await
+        .unwrap();
+    db.add_record("DST", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    if let Some(rec) = db.get_record("SRC").await {
+        let mut inst = rec.write().await;
+        inst.common.stat = alarm_status::HIHI_ALARM;
+        inst.common.sevr = AlarmSeverity::Major;
+        inst.common.amsg = "src-major".to_string();
+    }
+
+    if let Some(rec) = db.get_record("DST").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("SRC NPP MSS".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let dst = db.get_record("DST").await.expect("DST exists");
+    let inst = dst.read().await;
+    assert_eq!(inst.common.sevr, AlarmSeverity::Major);
+    assert_eq!(
+        inst.common.stat,
         alarm_status::HIHI_ALARM,
-        "MS link must carry source's STAT"
+        "MSS must carry source's STAT"
     );
     assert_eq!(
         inst.common.amsg, "src-major",
-        "MS link must carry source's AMSG"
+        "MSS must carry source's AMSG"
     );
 }
 

@@ -564,30 +564,47 @@ impl PvDatabase {
                 return Ok(());
             }
 
-            // MS/NMS alarm propagation from input links. Mirrors
-            // epics-base PR #568: alarm message string (`amsg`)
-            // travels alongside stat/sevr through MS-class links.
+            // MS-class alarm propagation from input links. Mirrors C
+            // `recGblInheritSevrMsg` (recGbl.c::260):
+            //
+            // * NMS  — do nothing.
+            // * MS   — DEST gets `LINK_ALARM` (NOT the source stat),
+            //          max-raised sevr, NO amsg propagation.
+            // * MSI  — same as MS, but only when source.sevr == INVALID.
+            // * MSS  — DEST gets source stat, max-raised sevr, source amsg
+            //          (PR d0cf47c is the only branch that propagates msg).
+            //
+            // Previous version treated Maximize and MaximizeStatus
+            // identically, propagating source stat + amsg through both
+            // — that matches MSS but is wrong for MS (and MSI), which
+            // C says should always surface as LINK_ALARM with no msg.
             for (ms, alarm) in &link_alarms {
-                use crate::server::recgbl::rec_gbl_set_sevr_msg;
+                use crate::server::recgbl::{alarm_status, rec_gbl_set_sevr, rec_gbl_set_sevr_msg};
                 use crate::server::record::MonitorSwitch;
                 match ms {
-                    MonitorSwitch::Maximize | MonitorSwitch::MaximizeStatus => {
+                    MonitorSwitch::Maximize => {
+                        rec_gbl_set_sevr(
+                            &mut instance.common,
+                            alarm_status::LINK_ALARM,
+                            alarm.sevr,
+                        );
+                    }
+                    MonitorSwitch::MaximizeIfInvalid => {
+                        if alarm.sevr == crate::server::record::AlarmSeverity::Invalid {
+                            rec_gbl_set_sevr(
+                                &mut instance.common,
+                                alarm_status::LINK_ALARM,
+                                alarm.sevr,
+                            );
+                        }
+                    }
+                    MonitorSwitch::MaximizeStatus => {
                         rec_gbl_set_sevr_msg(
                             &mut instance.common,
                             alarm.stat,
                             alarm.sevr,
                             alarm.amsg.clone(),
                         );
-                    }
-                    MonitorSwitch::MaximizeIfInvalid => {
-                        if alarm.sevr == crate::server::record::AlarmSeverity::Invalid {
-                            rec_gbl_set_sevr_msg(
-                                &mut instance.common,
-                                alarm.stat,
-                                alarm.sevr,
-                                alarm.amsg.clone(),
-                            );
-                        }
                     }
                     MonitorSwitch::NoMaximize => {} // NMS: do not propagate
                 }

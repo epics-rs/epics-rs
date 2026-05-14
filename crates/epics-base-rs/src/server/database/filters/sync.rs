@@ -25,8 +25,11 @@
 //! | `while`  | pass events while state is `1`; drop while `0`            |
 //! | `unless` | pass events while state is `0`; drop while `1`            |
 //!
-//! Alarm and property events always pass unchanged (446e0d4a rule)
-//! and never affect cached state, regardless of mode.
+//! Per epics-base `sync.c::filter` only `DBE_PROPERTY` (and read-
+//! context — Rust has no analog) bypasses the state machine
+//! unconditionally. `DBE_ALARM` events run through the configured
+//! mode just like value events — the 446e0d4a "always pass alarm"
+//! rule is dbnd-specific.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -175,9 +178,11 @@ impl SubscriptionFilter for SyncFilter {
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        // 446e0d4a rule: alarm and property events always pass and
-        // never affect the cached state or transition tracker.
-        if !event.mask.contains(EventMask::VALUE) {
+        // C `sync.c::filter`: only DBE_PROPERTY (and read context)
+        // bypass the state machine; DBE_ALARM runs through the
+        // configured mode just like a value event. The 446e0d4a rule
+        // applies to dbnd, not sync.
+        if event.mask.intersects(EventMask::PROPERTY) {
             return Some(event);
         }
         let actstate = self.state.get();
@@ -366,10 +371,10 @@ mod tests {
         assert_eq!(val(&emitted), 20.0);
     }
 
-    // ── 446e0d4a rule: alarm / property events bypass all modes ────
+    // ── Bypass: only DBE_PROPERTY short-circuits (sync.c parity) ────
 
     #[test]
-    fn alarm_event_passes_unconditionally_for_every_mode() {
+    fn property_event_passes_unconditionally_for_every_mode() {
         for mode in [
             SyncMode::Before,
             SyncMode::First,
@@ -378,18 +383,31 @@ mod tests {
             SyncMode::While,
             SyncMode::Unless,
         ] {
-            let f = SyncFilter::new(mode, "UNIT:T:ALARM");
-            // Even with state false (which would drop value events
-            // in modes like `while`/`first`), alarm passes.
-            assert!(
-                f.apply(ev(0.0, EventMask::ALARM)).is_some(),
-                "{mode:?} must pass alarm"
-            );
+            let f = SyncFilter::new(mode, "UNIT:T:PROP");
             assert!(
                 f.apply(ev(0.0, EventMask::PROPERTY)).is_some(),
                 "{mode:?} must pass property"
             );
         }
+    }
+
+    /// `while` mode with state=false drops DBE_ALARM along with the
+    /// usual value events — C `sync.c::syncModeWhile` doesn't
+    /// special-case the alarm bit.
+    #[test]
+    fn alarm_event_runs_through_state_machine_in_while_mode() {
+        let state_name = "UNIT:T:ALARM_GATED";
+        let f = SyncFilter::new(SyncMode::While, state_name);
+        db_state_registry().set(state_name, false);
+        assert!(
+            f.apply(ev(0.0, EventMask::ALARM)).is_none(),
+            "While + state=false must drop ALARM, matching sync.c"
+        );
+        db_state_registry().set(state_name, true);
+        assert!(
+            f.apply(ev(0.0, EventMask::ALARM)).is_some(),
+            "While + state=true passes ALARM"
+        );
     }
 
     // ── Registry semantics ─────────────────────────────────────────

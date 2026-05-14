@@ -198,11 +198,13 @@ async fn run_beacon_monitor_inner(
         Some("NO" | "no" | "0" | "false" | "FALSE")
     );
     let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
-    // EPICS_IOC_IGNORE_SERVERS snapshot (epics-base 6efe2924). Captured
-    // at task start so the beacon hot path stays env-read-free; admins
-    // restart the IOC to apply a new ignore list.
+    // EPICS_RS_CLIENT_IGNORE snapshot — Rust-only client-side IP
+    // quarantine (NOT C `EPICS_IOC_IGNORE_SERVERS`, which is
+    // server-side; see super::epics_rs_client_ignore docstring).
+    // Captured at task start so the beacon hot path stays env-read-
+    // free; admins restart the IOC to apply a new ignore list.
     let ignored_servers: std::collections::HashSet<Ipv4Addr> =
-        super::epics_ioc_ignore_servers().into_iter().collect();
+        super::epics_rs_client_ignore().into_iter().collect();
     // Beacons are 16 B but the repeater may concatenate VERSION + RSRV_IS_UP
     // and forward client-noop traffic. Use 4 KB so chained datagrams are
     // received intact.
@@ -478,10 +480,12 @@ fn handle_beacon(
     // as-is for beacon tracking — each IOC still has a unique port,
     // matching the approach used by the C CA client (libca).
     let server_ip = Ipv4Addr::from(hdr.available.to_be_bytes());
-    // EPICS_IOC_IGNORE_SERVERS (epics-base 6efe2924): silently drop
-    // beacons announcing a blacklisted server so the anomaly-poke
-    // path doesn't keep waking the search engine for a quarantined
-    // IOC. Filter applies only when the announced IP is concrete —
+    // EPICS_RS_CLIENT_IGNORE: silently drop beacons announcing a
+    // quarantined server so the anomaly-poke path doesn't keep
+    // waking the search engine for a quarantined IOC. Rust-only
+    // extension; NOT the C EPICS_IOC_IGNORE_SERVERS (server-side
+    // name list, different semantics — see
+    // client::epics_rs_client_ignore docstring). Filter applies only when the announced IP is concrete —
     // INADDR_ANY (0) means "I'm an IOC announcing myself, use the
     // UDP source," which the search engine resolves separately.
     if !server_ip.is_unspecified() && ignored_servers.contains(&server_ip) {

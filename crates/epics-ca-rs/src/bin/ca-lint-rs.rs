@@ -72,7 +72,11 @@ const KNOWN_ENV: &[&str] = &[
     "EPICS_CA_USE_SHELL_VARS",
     "EPICS_CA_DISCOVERY",
     "EPICS_CA_MCAST_TTL",
-    "EPICS_IOC_IGNORE_SERVERS",
+    // Rust-only client-side IP quarantine. The C
+    // EPICS_IOC_IGNORE_SERVERS lives on the server side and operates
+    // on server names (rsrv/qsrv) — different semantics, intentionally
+    // not surfaced here as a CA env to avoid the previous confusion.
+    "EPICS_RS_CLIENT_IGNORE",
     "EPICS_CAS_INTF_ADDR_LIST",
     "EPICS_CAS_BEACON_ADDR_LIST",
     "EPICS_CAS_AUTO_BEACON_ADDR_LIST",

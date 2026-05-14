@@ -2971,9 +2971,11 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let default_port = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(CA_SERVER_PORT);
-    // EPICS_IOC_IGNORE_SERVERS — drop matching IPs before they enter
-    // the search/connection planner (epics-base 6efe2924).
-    let ignore_ips = epics_ioc_ignore_servers();
+    // EPICS_RS_CLIENT_IGNORE — Rust-only client-side IP quarantine
+    // (NOT the C EPICS_IOC_IGNORE_SERVERS, which is server-side and
+    // operates on server NAMES, not IPs — see epics_rs_client_ignore
+    // docstring for the naming rationale).
+    let ignore_ips = epics_rs_client_ignore();
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
         for entry in list.split_whitespace() {
             let (host_raw, port) = if entry.contains(':') {
@@ -3003,7 +3005,7 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
                                 target: "epics_ca_rs::client",
                                 token = %entry,
                                 ip = %v4.ip(),
-                                "EPICS_IOC_IGNORE_SERVERS: dropping ADDR_LIST entry"
+                                "EPICS_RS_CLIENT_IGNORE: dropping ADDR_LIST entry"
                             );
                             continue;
                         }
@@ -3051,29 +3053,29 @@ mod ignore_servers_tests {
     #[test]
     #[serial(epics_env)]
     fn empty_when_unset() {
-        unsafe { std::env::remove_var("EPICS_IOC_IGNORE_SERVERS") };
-        assert!(epics_ioc_ignore_servers().is_empty());
+        unsafe { std::env::remove_var("EPICS_RS_CLIENT_IGNORE") };
+        assert!(epics_rs_client_ignore().is_empty());
     }
 
     #[test]
     #[serial(epics_env)]
     fn parses_ip_literals() {
-        unsafe { std::env::set_var("EPICS_IOC_IGNORE_SERVERS", "10.0.0.1 192.168.1.42") };
-        let v = epics_ioc_ignore_servers();
+        unsafe { std::env::set_var("EPICS_RS_CLIENT_IGNORE", "10.0.0.1 192.168.1.42") };
+        let v = epics_rs_client_ignore();
         assert_eq!(v.len(), 2);
         assert!(v.contains(&Ipv4Addr::new(10, 0, 0, 1)));
         assert!(v.contains(&Ipv4Addr::new(192, 168, 1, 42)));
-        unsafe { std::env::remove_var("EPICS_IOC_IGNORE_SERVERS") };
+        unsafe { std::env::remove_var("EPICS_RS_CLIENT_IGNORE") };
     }
 
     #[test]
     #[serial(epics_env)]
     fn strips_port_suffix() {
-        unsafe { std::env::set_var("EPICS_IOC_IGNORE_SERVERS", "10.0.0.1:5064") };
-        let v = epics_ioc_ignore_servers();
+        unsafe { std::env::set_var("EPICS_RS_CLIENT_IGNORE", "10.0.0.1:5064") };
+        let v = epics_rs_client_ignore();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], Ipv4Addr::new(10, 0, 0, 1));
-        unsafe { std::env::remove_var("EPICS_IOC_IGNORE_SERVERS") };
+        unsafe { std::env::remove_var("EPICS_RS_CLIENT_IGNORE") };
     }
 
     #[test]
@@ -3081,17 +3083,17 @@ mod ignore_servers_tests {
     fn silently_drops_garbage_entries() {
         unsafe {
             std::env::set_var(
-                "EPICS_IOC_IGNORE_SERVERS",
+                "EPICS_RS_CLIENT_IGNORE",
                 "1.2.3.4 not-an-ip-or-host-that-resolves.invalid 5.6.7.8",
             )
         };
-        let v = epics_ioc_ignore_servers();
+        let v = epics_rs_client_ignore();
         // The middle entry must be dropped (DNS resolution fails for
         // `.invalid` TLD per RFC 6761 — every resolver returns NXDOMAIN).
         assert!(v.contains(&Ipv4Addr::new(1, 2, 3, 4)));
         assert!(v.contains(&Ipv4Addr::new(5, 6, 7, 8)));
         assert_eq!(v.len(), 2);
-        unsafe { std::env::remove_var("EPICS_IOC_IGNORE_SERVERS") };
+        unsafe { std::env::remove_var("EPICS_RS_CLIENT_IGNORE") };
     }
 }
 
@@ -3285,22 +3287,35 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
 // legacy function's AUTO_ADDR_LIST + per-NIC broadcast + limited-
 // broadcast fallback semantics.
 
-/// Parse `EPICS_IOC_IGNORE_SERVERS` — whitespace-separated IPv4
-/// literals or hostnames whose resolved addresses should be ignored.
+/// Parse `EPICS_RS_CLIENT_IGNORE` — whitespace-separated IPv4
+/// literals or hostnames whose resolved addresses should be ignored
+/// by the CA **client**.
 ///
-/// Mirrors epics-base commit 6efe2924 (2017). Any CA server whose
-/// address appears in the list is silently dropped from
-/// EPICS_CA_ADDR_LIST, from beacon-discovered server tracking, and
-/// from SEARCH_REPLY consumption — the IOC behaves as if those
-/// servers don't exist on the network. Useful for excluding
-/// known-broken or quarantined upstream IOCs without removing them
-/// from a shared site-wide ADDR_LIST.
+/// ## Naming note (Rust extension — not C parity)
+///
+/// Earlier revisions of this function read
+/// `EPICS_IOC_IGNORE_SERVERS`, the env var added by epics-base
+/// commit `6efe2924` (2017). But that variable has a different
+/// meaning in C — `src/ioc/db/dbServer.c::dbRegisterServer` reads
+/// it on the **server** side and refuses to register a server
+/// (`rsrv`, `qsrv`, …) whose **name** appears in the list. It is
+/// not an IP / hostname list and it does not affect client
+/// behaviour. Conflating the two broke C IOC startup scripts that
+/// set `EPICS_IOC_IGNORE_SERVERS=rsrv` expecting the CA server to
+/// stay disabled.
+///
+/// The Rust client-side quarantine feature is real and useful, just
+/// not the same thing — so it now lives under `EPICS_RS_CLIENT_IGNORE`
+/// (a Rust-only extension; no C counterpart). The C-parity
+/// `EPICS_IOC_IGNORE_SERVERS` semantic (refuse-to-register on the
+/// server side) is a separate, not-yet-implemented item — tracked in
+/// the upstream-features backlog.
 ///
 /// Returns an empty `Vec` when the env var is unset or contains only
 /// unparseable entries. Reads at every call site so tests that mutate
 /// the env see the updated list without a process restart.
-pub(crate) fn epics_ioc_ignore_servers() -> Vec<Ipv4Addr> {
-    let Some(list) = epics_base_rs::runtime::env::get("EPICS_IOC_IGNORE_SERVERS") else {
+pub(crate) fn epics_rs_client_ignore() -> Vec<Ipv4Addr> {
+    let Some(list) = epics_base_rs::runtime::env::get("EPICS_RS_CLIENT_IGNORE") else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -3322,7 +3337,7 @@ pub(crate) fn epics_ioc_ignore_servers() -> Vec<Ipv4Addr> {
                 tracing::debug!(
                     target: "epics_ca_rs::client",
                     entry = %entry,
-                    "EPICS_IOC_IGNORE_SERVERS: dropped unresolvable entry"
+                    "EPICS_RS_CLIENT_IGNORE: dropped unresolvable entry"
                 );
             }
         }

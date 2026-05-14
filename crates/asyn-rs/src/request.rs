@@ -75,6 +75,11 @@ pub enum RequestOp {
     Connect,
     /// Disconnect from the port (bypass enabled/connected checks).
     Disconnect,
+    /// Permanently shut down a `ASYN_DESTRUCTIBLE` port. C parity:
+    /// `asynManager.c::shutdownPort` (lines 2251-2308). Marks the
+    /// port defunct so every subsequent request short-circuits;
+    /// idempotent; broadcasts `AsynException::Shutdown`.
+    ShutdownPort,
     /// Connect a specific device address (multi-device ports).
     ConnectAddr,
     /// Disconnect a specific device address (multi-device ports).

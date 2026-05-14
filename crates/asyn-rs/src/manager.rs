@@ -108,6 +108,35 @@ impl PortManager {
             .ok_or_else(|| AsynError::PortNotFound(name.to_string()))
     }
 
+    /// Permanently shut down a `ASYN_DESTRUCTIBLE` port — mirror of
+    /// C `asynManager::shutdownPort` at asynManager.c:2251-2308.
+    ///
+    /// Sends a `RequestOp::ShutdownPort` through the port's actor
+    /// queue (so the lifecycle runs in the same thread that owns the
+    /// driver), then drops the runtime handle. Returns
+    /// `Err(Status::Error)` if the port did not opt into the
+    /// `destructible` flag at registration. Idempotent — a second
+    /// call against a port already shut down returns Ok.
+    pub fn shutdown_port(&self, name: &str) -> AsynResult<()> {
+        // Drive the lifecycle inside the port's runtime so the
+        // driver's own shutdown() runs from its actor thread.
+        let handle = self
+            .port_handles
+            .lock()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| AsynError::PortNotFound(name.to_string()))?;
+        let user = crate::user::AsynUser::default();
+        let res = handle.submit_blocking(crate::request::RequestOp::ShutdownPort, user);
+        // Whether the lifecycle succeeded or hit the "not destructible"
+        // error, we leave the port registered so observers can still
+        // see the port-name → defunct state (matches C — the port
+        // structure remains in pasynManager's port list after
+        // shutdownPort completes). Callers that want full removal
+        // follow up with `unregister_port`.
+        res.map(|_| ())
+    }
+
     /// Unregister a port. Shuts down its runtime.
     pub fn unregister_port(&self, name: &str) {
         let mut ph = self.port_handles.lock();

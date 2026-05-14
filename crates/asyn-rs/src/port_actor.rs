@@ -220,6 +220,7 @@ impl PortActor {
                 | RequestOp::DisableAddr
                 | RequestOp::BlockProcess
                 | RequestOp::UnblockProcess
+                | RequestOp::ShutdownPort
         );
         let is_connect_priority = user.priority == QueuePriority::Connect;
 
@@ -330,6 +331,18 @@ impl PortActor {
             }
             RequestOp::Disconnect => {
                 self.driver.disconnect(user)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::ShutdownPort => {
+                // C `shutdownPort` lifecycle — opt-in via destructible
+                // flag. Calls the driver's own shutdown() hook *after*
+                // marking the lifecycle complete so the announcer sees
+                // the port already-defunct.
+                self.driver.base_mut().shutdown_lifecycle()?;
+                // Driver's own shutdown plumbing (release hardware
+                // handles, etc.). Errors are tolerated — the port is
+                // already defunct and there is no recovery path.
+                let _ = self.driver.shutdown();
                 Ok(RequestResult::write_ok())
             }
             RequestOp::ConnectAddr => {

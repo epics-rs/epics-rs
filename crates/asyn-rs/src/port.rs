@@ -78,10 +78,17 @@ pub struct PortFlags {
 
 impl Default for PortFlags {
     fn default() -> Self {
+        // `destructible: false` is the C asyn convention — see
+        // asynDriver.h:97 (`#define ASYN_DESTRUCTIBLE 0x0004`) — the
+        // attribute is opt-in via `pasynManager->registerPort(..., attr)`
+        // and `asynManager::shutdownPort` refuses to act on ports
+        // that did not opt in. Defaulting to `true` here over-applied
+        // shutdown rights to every driver that built PortFlags via
+        // `..PortFlags::default()`.
         Self {
             multi_device: false,
             can_block: false,
-            destructible: true,
+            destructible: false,
         }
     }
 }
@@ -106,6 +113,12 @@ pub struct PortDriverBase {
     pub connected: bool,
     pub enabled: bool,
     pub auto_connect: bool,
+    /// `defunct` — set by [`Self::shutdown_lifecycle`] when a
+    /// destructible port is torn down via `shutdown_port`. Once true,
+    /// the port refuses every new request through [`Self::check_ready`].
+    /// Mirrors the `dpCommon.defunct` flag at C asynManager.c:2284
+    /// — once defunct, the port cannot be re-enabled.
+    pub defunct: bool,
     /// Exception sink injected by [`crate::manager::PortManager`] on registration.
     pub exception_sink: Option<Arc<ExceptionManager>>,
     pub options: HashMap<String, String>,
@@ -132,6 +145,7 @@ impl PortDriverBase {
             connected: true,
             enabled: true,
             auto_connect: true,
+            defunct: false,
             exception_sink: None,
             options: HashMap::new(),
             input_eos: Vec::new(),
@@ -169,9 +183,27 @@ impl PortDriverBase {
         self.auto_connect
     }
 
-    /// Check that the port is both enabled and connected.
-    /// Returns `Err(Disabled)` or `Err(Disconnected)` otherwise.
+    /// Query whether the port has been marked defunct via
+    /// [`Self::shutdown_lifecycle`] — once true the port is gone for
+    /// good, mirroring C asynManager.c:2266-2269.
+    pub fn is_defunct(&self) -> bool {
+        self.defunct
+    }
+
+    /// Check that the port is enabled, connected, and not defunct.
+    /// Returns `Err(Disabled)`, `Err(Disconnected)`, or `Err(Disabled)`
+    /// (defunct => permanently disabled) otherwise.
     pub fn check_ready(&self) -> AsynResult<()> {
+        // C asyn parity: a defunct port short-circuits queueRequest
+        // (asynManager.c:2283 comment). Reject *before* the enabled
+        // check so the error message names the lifecycle phase, not
+        // just "disabled".
+        if self.defunct {
+            return Err(AsynError::Status {
+                status: AsynStatus::Disabled,
+                message: format!("port {} has been shut down (defunct)", self.port_name),
+            });
+        }
         if !self.enabled {
             return Err(AsynError::Status {
                 status: AsynStatus::Disabled,
@@ -184,6 +216,41 @@ impl PortDriverBase {
                 message: format!("port {} is disconnected", self.port_name),
             });
         }
+        Ok(())
+    }
+
+    /// Run the C `shutdownPort` lifecycle (asynManager.c:2251-2308):
+    ///
+    /// 1. Refuse if the port did not opt into `ASYN_DESTRUCTIBLE`
+    ///    (returns `Err(Status::Error)`).
+    /// 2. Short-circuit if already defunct (idempotent — returns Ok).
+    /// 3. Set `enabled = false`, `defunct = true` — every subsequent
+    ///    request through [`Self::check_ready`] fails.
+    /// 4. Broadcast `AsynException::Shutdown` so registered observers
+    ///    (CA gateways, monitor sinks) tear down their handles.
+    ///
+    /// Drivers should call this from their own shutdown plumbing and
+    /// then release any hardware-owned resources via their
+    /// [`PortDriver::shutdown`] implementation. Callers from outside
+    /// the runtime can drive the same lifecycle via
+    /// [`crate::manager::PortManager::shutdown_port`].
+    pub fn shutdown_lifecycle(&mut self) -> AsynResult<()> {
+        if self.defunct {
+            // Idempotent — C asynManager.c:2266-2269 returns asynSuccess.
+            return Ok(());
+        }
+        if !self.flags.destructible {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "port {} does not support shutting down (ASYN_DESTRUCTIBLE not set)",
+                    self.port_name
+                ),
+            });
+        }
+        self.enabled = false;
+        self.defunct = true;
+        self.announce_exception(AsynException::Shutdown, -1);
         Ok(())
     }
 
@@ -1363,9 +1430,63 @@ mod tests {
     }
 
     #[test]
-    fn test_port_flags_destructible_default() {
+    fn test_port_flags_destructible_default_is_opt_in() {
+        // C asyn parity: ASYN_DESTRUCTIBLE (0x0004, asynDriver.h:97) is
+        // a `registerPort` attribute that callers opt into. Default
+        // must be false so drivers don't accidentally accept a
+        // shutdownPort call. PortDriver authors that want shutdown
+        // support set `destructible: true` explicitly.
         let flags = PortFlags::default();
-        assert!(flags.destructible);
+        assert!(!flags.destructible, "destructible must be opt-in (C parity)");
+    }
+
+    #[test]
+    fn shutdown_lifecycle_refuses_non_destructible() {
+        let mut base = PortDriverBase::new(
+            "p_nondestr",
+            1,
+            PortFlags {
+                multi_device: false,
+                can_block: false,
+                destructible: false,
+            },
+        );
+        match base.shutdown_lifecycle() {
+            Err(AsynError::Status { message, .. }) => {
+                assert!(message.contains("ASYN_DESTRUCTIBLE"), "msg={message}");
+            }
+            other => panic!("expected ASYN_DESTRUCTIBLE refusal, got {other:?}"),
+        }
+        assert!(!base.is_defunct(), "non-destructible port must not flip defunct");
+        assert!(base.is_enabled(), "non-destructible port must stay enabled");
+    }
+
+    #[test]
+    fn shutdown_lifecycle_marks_destructible_defunct_and_idempotent() {
+        let mut base = PortDriverBase::new(
+            "p_destr",
+            1,
+            PortFlags {
+                multi_device: false,
+                can_block: false,
+                destructible: true,
+            },
+        );
+        assert!(base.is_enabled());
+        assert!(!base.is_defunct());
+        base.shutdown_lifecycle().unwrap();
+        assert!(!base.is_enabled(), "shutdown_lifecycle must flip enabled=false");
+        assert!(base.is_defunct(), "shutdown_lifecycle must flip defunct=true");
+        // Idempotent — second call is Ok and leaves state unchanged.
+        base.shutdown_lifecycle().unwrap();
+        assert!(base.is_defunct());
+        // check_ready surfaces the defunct state for every request.
+        match base.check_ready() {
+            Err(AsynError::Status { message, .. }) => {
+                assert!(message.contains("defunct"), "msg={message}");
+            }
+            other => panic!("expected defunct error, got {other:?}"),
+        }
     }
 
     // --- Phase 2B: per-addr connect/disconnect/enable/disable ---

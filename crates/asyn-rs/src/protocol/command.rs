@@ -4,33 +4,79 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PortCommand {
     Int32Read,
-    Int32Write { value: i32 },
+    Int32Write {
+        value: i32,
+    },
     Int64Read,
-    Int64Write { value: i64 },
+    Int64Write {
+        value: i64,
+    },
     Float64Read,
-    Float64Write { value: f64 },
-    OctetRead { buf_size: usize },
-    OctetWrite { data: Vec<u8> },
-    OctetWriteRead { data: Vec<u8>, buf_size: usize },
-    UInt32DigitalRead { mask: u32 },
-    UInt32DigitalWrite { value: u32, mask: u32 },
+    Float64Write {
+        value: f64,
+    },
+    OctetRead {
+        buf_size: usize,
+    },
+    OctetWrite {
+        data: Vec<u8>,
+    },
+    OctetWriteRead {
+        data: Vec<u8>,
+        buf_size: usize,
+    },
+    UInt32DigitalRead {
+        mask: u32,
+    },
+    UInt32DigitalWrite {
+        value: u32,
+        mask: u32,
+    },
     EnumRead,
-    EnumWrite { index: usize },
-    Int32ArrayRead { max_elements: usize },
-    Int32ArrayWrite { data: Vec<i32> },
-    Float64ArrayRead { max_elements: usize },
-    Float64ArrayWrite { data: Vec<f64> },
-    Int8ArrayRead { max_elements: usize },
-    Int8ArrayWrite { data: Vec<i8> },
-    Int16ArrayRead { max_elements: usize },
-    Int16ArrayWrite { data: Vec<i16> },
-    Int64ArrayRead { max_elements: usize },
-    Int64ArrayWrite { data: Vec<i64> },
-    Float32ArrayRead { max_elements: usize },
-    Float32ArrayWrite { data: Vec<f32> },
+    EnumWrite {
+        index: usize,
+    },
+    Int32ArrayRead {
+        max_elements: usize,
+    },
+    Int32ArrayWrite {
+        data: Vec<i32>,
+    },
+    Float64ArrayRead {
+        max_elements: usize,
+    },
+    Float64ArrayWrite {
+        data: Vec<f64>,
+    },
+    Int8ArrayRead {
+        max_elements: usize,
+    },
+    Int8ArrayWrite {
+        data: Vec<i8>,
+    },
+    Int16ArrayRead {
+        max_elements: usize,
+    },
+    Int16ArrayWrite {
+        data: Vec<i16>,
+    },
+    Int64ArrayRead {
+        max_elements: usize,
+    },
+    Int64ArrayWrite {
+        data: Vec<i64>,
+    },
+    Float32ArrayRead {
+        max_elements: usize,
+    },
+    Float32ArrayWrite {
+        data: Vec<f32>,
+    },
     Flush,
     Connect,
     Disconnect,
+    /// `ASYN_DESTRUCTIBLE` port shutdown — C asynManager.c:2251.
+    ShutdownPort,
     ConnectAddr,
     DisconnectAddr,
     EnableAddr,
@@ -39,10 +85,19 @@ pub enum PortCommand {
     GetBoundsInt64,
     BlockProcess,
     UnblockProcess,
-    DrvUserCreate { drv_info: String },
-    CallParamCallbacks { addr: i32 },
-    GetOption { key: String },
-    SetOption { key: String, value: String },
+    DrvUserCreate {
+        drv_info: String,
+    },
+    CallParamCallbacks {
+        addr: i32,
+    },
+    GetOption {
+        key: String,
+    },
+    SetOption {
+        key: String,
+        value: String,
+    },
 }
 
 #[cfg(test)]

@@ -1543,6 +1543,15 @@ impl RecordInstance {
                 EpicsValue::Short(self.common.stat as i16),
             ));
         }
+        // C parity (recGbl.c:216): post raised ACKS so sticky-alarm
+        // tracking screens see the update.
+        if alarm_result.acks_changed {
+            changed_fields.push((
+                "ACKS".to_string(),
+                EpicsValue::Short(self.common.acks as i16),
+            ));
+            event_mask |= EventMask::VALUE;
+        }
 
         // Add subscribed fields that actually changed since last notification.
         let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();

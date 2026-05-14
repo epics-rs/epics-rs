@@ -351,3 +351,67 @@ C 에서 EPICS_CAS_SERVER_PORT 는 **UDP+TCP 모두**를 같은 포트로 설정
 
 **상태**: clean (commit logic OK, wire-level enum fix 별도)
 
+### 85/161 — `f68f17c` feat(ca-server): wire dbServerStats bytes_in/bytes_out counters (PR #592)
+
+**검토**: C `dbServerStats` (dbServer.c:130) 는 `channels`/`clients` 만 카운트하고 bytes counter 없음 — Rust extension. handle_client 의 RX path 가 `bytes_in.fetch_add(n)` post-read, TX path 가 BufWriter::buffer().len() 을 flush 직전 캡처 후 `bytes_out.fetch_add` 호출. partial flush 실패 시 over-count 가능하나 connection drop 으로 mitigated.
+
+**상태**: clean (Rust-side extension, C 비교 대상 부재)
+
+### 86/161 — `d6ae617` fix(processing): single-INP MS-class link propagates STAT/SEVR/AMSG (PR #d0cf47c)
+
+**Round 1 defect**: Rust 가 `MonitorSwitch::Maximize` (MS) 와 `MaximizeStatus` (MSS) 를 동일 코드 패스로 처리해 둘 다 source stat + amsg 전파. C `recGblInheritSevrMsg` (recGbl.c:260) 는 분리:
+- `pvlOptMS`: `recGblSetSevr(LINK_ALARM, sevr)` — DEST 가 source stat 가 아닌 `LINK_ALARM` 으로 표시, **amsg 전파 안 함**.
+- `pvlOptMSI`: source.sevr == INVALID 일 때만 LINK_ALARM, msg 없음.
+- `pvlOptMSS`: source stat + sevr + msg.
+
+Rust 가 MS 에서도 source HIHI stat + "src-msg" 를 누설해 downstream OPI 가 잘못된 알람 attribute 표시.
+
+**Fix**: `09c4109` — match arm 분리. Maximize/MaximizeIfInvalid 가 `rec_gbl_set_sevr(LINK_ALARM, sevr)` 호출 (msg 없음), MaximizeStatus 만 `rec_gbl_set_sevr_msg(stat, sevr, amsg)` 유지. 기존 테스트 `test_single_inp_ms_class_propagates_source_alarm` 가 잘못된 동작 (source stat+amsg propagation through MS) 을 단언했으므로 두 테스트로 분리: `test_single_inp_ms_propagates_link_alarm_no_msg` (MS → LINK_ALARM, empty amsg), `test_single_inp_mss_propagates_stat_and_amsg` (MSS → source stat+amsg).
+
+**상태**: clean (round 2 after fix `09c4109`)
+
+### 87/161 — `2c1ae54` feat(subArray): INDX/MALM slicing semantics (PR #a02c310 follow-up)
+
+**검토**: `set_val` slicing 이 C `devSASoft::subset()` (devSASoft.c:39) 와 동치 — `start..min(start+take, src_len)` 에서 `src_len = min(arr.len(), malm)`. start >= src_len → valid=0/nord=0 (C 의 ecount=nRequest-indx<0 → 0 과 일치). INDX put_field 가 `v.min(malm-1)` 으로 clamp 하는 것도 C `readValue::indx >= malm → malm-1` 와 일치. MALM put 시 NELM clamp + INDX clamp 도 C `init_record` 와 매칭.
+
+기타 pre-existing gap (이 커밋 범위 외): ILIL/IHIL input range 필터링 미구현.
+
+**상태**: clean (round 1)
+
+### 88/161 — `14d0b03` feat(ca-server): wire dbServerStats subscription counters (PR #592)
+
+**검토**: C `dbServerStats` 에 subscription counter 없음 — Rust extension. EVENT_ADD 후 `SubscriptionOpened`, EVENT_CANCEL/CLEAR_CHANNEL/disconnect drain 시 `SubscriptionClosed` emit. ACF-revoke teardown path 가 conn_events 미보유로 미적용 — 작성자가 commit msg 에서 명시함 (known gap).
+
+**상태**: clean (Rust-side extension)
+
+### 89/161 — `9d26ad5` fix(processing): PUTF stays off for CP-chained targets (PR #3fb10b6)
+
+**검토**: C `processNotifyCommon(ppn, precord, first)` 의 `if (first) precord->putf = TRUE` 조건 (dbNotify.c:253) 과 동치. Rust `dispatch_cp_targets` 가 (not_already_active) branch 에서 `tg.common.putf = true` 를 제거 — CP-chained target 은 putf 갱신 안 함. 직접 dbPut 받은 record 의 putf 는 `field_io::put_field` 의 set/clear bracket 으로 유지.
+
+**상태**: clean (round 1)
+
+### 90/161 — `ea9a111` feat(ioc_app): SIGTERM/SIGINT handler races protocol runner (PR #671)
+
+**검토**: 표준 tokio::select!-with-signals 패턴. `biased` 로 protocol_runner 가 자연스럽게 완료되면 우선. `tokio::signal::ctrl_c` (SIGINT 크로스-플랫폼) + `SignalKind::terminate` (Unix only). Drop semantics 가 모든 spawn 을 abort.
+
+**상태**: clean (round 1)
+
+### 91/161 — `52427bc` feat(compress): push_array with PBUF=YES partial-buffer emit (PR #84f4771)
+
+**Round 1 defect (pre-existing wire-protocol mismatch, cross-cutting)**: Rust `CompressRecord::alg` 정수값이 C `menuCompressALG` (compressRecord.dbd.pod) 와 발산.
+
+C: 0=Low, 1=High, 2=N_to_1_Average, 3=Average (rolling), 4=Circular_Buffer, 5=N_to_1_Median.
+Rust (pre-fix): 0=Low, 1=High, 2=Mean, 3=Circular_Buffer. (Average rolling + Median 누락 + Circular 위치 1 위 시프트.)
+
+CA wire 가 ALG 을 DBR_SHORT 로 전송 — C 클라이언트가 ALG=4 (Circular) 설정 시 Rust 가 `_` 디폴트 branch (return 0.0) 로 처리해 broken. 반대로 Rust IOC 가 ALG=3 (Circular 의도) 전송 시 C OPI 가 "Average (rolling)" 으로 misdisplay.
+
+**Fix**: 별도 commit — `alg` 값 재배치 (default `alg: 3` → `alg: 4`), `push_value`/`push_array` 의 alg==3 branch → alg==4, `flush_accum` 에 `case 5: Median` 추가 (qsort + middle pick — `compressRecord.c:212` `psource[n/2]` 대응). `alg==3` (Average rolling) 는 not-implemented stub 으로 남김 (별도 작업 필요). 영향 받은 hard-coded literal alg=3 (Circular 의도) 5곳 갱신:
+- `crates/epics-base-rs/src/server/records/compress.rs` tests (4곳)
+- `crates/epics-base-rs/src/server/db_loader/mod.rs:826`
+- `crates/epics-base-rs/tests/database_tests.rs:2724`
+- `crates/epics-base-rs/tests/c_epics_parity.rs:1033`
+
+push_array 자체 로직 (full-chunk loop + PBUF=YES tail emit) 은 C `compress_array` (compressRecord.c:177-219) 의 nnew loop + `if (nnew < n && pbuf != YES) break` semantic 과 일치.
+
+**상태**: clean (round 2 after wire-protocol fix)
+

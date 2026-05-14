@@ -170,6 +170,15 @@ pub struct AsynDeviceSupport {
     /// Maximum number of array elements for array read operations.
     /// Default: 307200 (enough for 640x480 images).
     max_array_elements: usize,
+    /// Buffer cap for `asynOctet` reads, including the trailing NUL.
+    /// C asyn devAsynOctet.c:1103 passes `plsi->sizv` as the read
+    /// limit for lsi/lso/printf — the byte the driver leaves at
+    /// position `sizv` is overwritten with `\0` (line 1124). For
+    /// stringin/stringout the C path is the fixed 40-byte record
+    /// field; for waveform it uses NELM*FTVL. We pick the per-record
+    /// SIZV at init time when available; otherwise fall back to the
+    /// stringin-grade 256-byte default.
+    octet_max_size: usize,
     /// If true, read back the current driver value during init (for output records).
     initial_readback: bool,
     /// `info(asyn:READBACK, "1")` flag, asyn upstream PRs #60 / #208.
@@ -213,6 +222,7 @@ impl AsynDeviceSupport {
             iface,
             mask: 0xFFFFFFFF,
             max_array_elements: 307200,
+            octet_max_size: 256,
             last_alarm_status: 0,
             last_alarm_severity: 0,
             last_ts: None,
@@ -405,7 +415,9 @@ impl AsynDeviceSupport {
             "asynInt32" => Some(RequestOp::Int32Read),
             "asynInt64" => Some(RequestOp::Int64Read),
             "asynFloat64" => Some(RequestOp::Float64Read),
-            "asynOctet" => Some(RequestOp::OctetRead { buf_size: 256 }),
+            "asynOctet" => Some(RequestOp::OctetRead {
+                buf_size: self.octet_max_size,
+            }),
             "asynUInt32Digital" => Some(RequestOp::UInt32DigitalRead { mask: self.mask }),
             "asynEnum" => Some(RequestOp::EnumRead),
             "asynInt8Array" => Some(RequestOp::Int8ArrayRead {
@@ -562,6 +574,18 @@ impl DeviceSupport for AsynDeviceSupport {
         if let Some(EpicsValue::Long(nelm)) = record.get_field("NELM") {
             if nelm > 0 {
                 self.max_array_elements = nelm as usize;
+            }
+        }
+
+        // Read SIZV from lsi/lso/printf records to size the asynOctet
+        // read buffer. C parity: devAsynOctet.c:1103 passes
+        // `plsi->sizv` to initCommon as the per-record buffer size;
+        // the read path (line 1117-1124) then writes up to sizv-1
+        // bytes and stuffs `\0` at the boundary. For stringin /
+        // stringout (no SIZV) we keep the 256-byte default.
+        if let Some(EpicsValue::Short(sizv)) = record.get_field("SIZV") {
+            if sizv > 0 {
+                self.octet_max_size = sizv as usize;
             }
         }
 
@@ -1126,6 +1150,31 @@ mod tests {
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.reason, 0); // "VAL" is param index 0
+    }
+
+    /// C parity: devAsynOctet initCommon passes `plsi->sizv` as the
+    /// asynOctet read-buffer size; an lsi record with a non-default
+    /// SIZV must produce read ops sized accordingly, not the fixed
+    /// 256-byte stringin default.
+    #[test]
+    fn octet_buffer_picks_up_sizv_from_record() {
+        let mut ads = make_adapter(ScanType::Passive);
+        // The adapter only routes asynOctet through octet_max_size,
+        // so re-target it.
+        ads.set_iface_type("asynOctet");
+        // Default (no init yet) is the stringin fallback.
+        assert_eq!(ads.octet_max_size, 256);
+
+        use epics_base_rs::server::records::lsi::LsiRecord;
+        let mut rec = LsiRecord::new("");
+        // Default SIZV = 256 — still matches default.
+        ads.init(&mut rec).unwrap();
+        assert_eq!(ads.octet_max_size, 256);
+
+        // Bump SIZV and re-init: adapter must follow.
+        rec.sizv = 1024;
+        ads.init(&mut rec).unwrap();
+        assert_eq!(ads.octet_max_size, 1024);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

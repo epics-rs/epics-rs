@@ -865,14 +865,24 @@ pub fn universal_asyn_factory(
             adapter.write_only = true;
         } else {
             // Output records: read back current driver value on init.
+            // Mirrors C `initAo` / `initBo` / `initLongout` / `initMbbo`
+            // which call `pasynManager->queueRequest(... ASYN_INIT ...)`
+            // to pull the driver's current value into the record before
+            // record processing starts.
             adapter = adapter.with_initial_readback();
         }
-    } else {
-        // Input records: read current driver value on init so I/O Intr
-        // records start with the correct value instead of the template default.
-        // Matches C EPICS devAsynXxx init_common() behavior.
-        adapter = adapter.with_initial_readback();
     }
+    // Input records: do NOT auto-readback. C `initAi`/`initLongin`/
+    // `initMbbi`/`initBi` (devAsynInt32.c:812+, similar for Float64 /
+    // Int64 / UInt32Digital / Octet) only sets up the asynUser and
+    // gets bounds — the first value comes from `processAi` (driven by
+    // the scan task or an I/O Intr callback), not from a synchronous
+    // read at init. The previous "matches C init_common() behavior"
+    // comment was wrong: C devAsynOctet init_common() also only
+    // installs callbacks; the initial value flows through the scan
+    // path. Auto-readback on inputs caused two problems: a spurious
+    // blocking read against an unconnected driver, and overwriting a
+    // template's deliberate default value with a stale/zero readback.
 
     // UInt32Digital: apply mask
     if link_str.contains("@asynMask") {

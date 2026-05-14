@@ -346,7 +346,15 @@ impl Record for WaveformRecord {
                             "NELM must be positive, got {n}"
                         )));
                     }
-                    self.nelm = n;
+                    // C parity for subArray: clamp NELM <= MALM
+                    // (subArrayRecord.c:310-311 in `readValue`,
+                    // init at line 103-104). Other array kinds do
+                    // not have MALM and are unaffected.
+                    self.nelm = if matches!(self.kind, ArrayKind::SubArray) && self.malm > 0 {
+                        n.min(self.malm)
+                    } else {
+                        n
+                    };
                     self.reallocate_val();
                     Ok(())
                 } else {
@@ -367,28 +375,42 @@ impl Record for WaveformRecord {
                 }
             }
             "NORD" => Err(CaError::ReadOnlyField(name.to_string())),
-            "INDX" if matches!(self.kind, ArrayKind::SubArray) => match value {
-                EpicsValue::Long(v) => {
-                    self.indx = v.max(0);
-                    Ok(())
+            "INDX" if matches!(self.kind, ArrayKind::SubArray) => {
+                let v = match value {
+                    EpicsValue::Long(v) => v,
+                    EpicsValue::Short(v) => v as i32,
+                    _ => return Err(CaError::TypeMismatch("INDX".into())),
+                };
+                // C parity (subArrayRecord.c::readValue:313-314):
+                // `if (indx >= malm) indx = malm - 1`. When MALM is
+                // 0 (not yet configured) keep the legacy `max(0)`
+                // floor only.
+                let v = v.max(0);
+                self.indx = if self.malm > 0 {
+                    v.min(self.malm - 1)
+                } else {
+                    v
+                };
+                Ok(())
+            }
+            "MALM" if matches!(self.kind, ArrayKind::SubArray) => {
+                let v = match value {
+                    EpicsValue::Long(v) => v,
+                    EpicsValue::Short(v) => v as i32,
+                    _ => return Err(CaError::TypeMismatch("MALM".into())),
+                };
+                self.malm = v.max(0);
+                // C parity (subArrayRecord.c::init_record:103-104):
+                // shrinking MALM below NELM also clamps NELM. Apply
+                // the same re-clamp on each MALM put.
+                if self.malm > 0 && self.nelm > self.malm {
+                    self.nelm = self.malm;
                 }
-                EpicsValue::Short(v) => {
-                    self.indx = (v as i32).max(0);
-                    Ok(())
+                if self.malm > 0 && self.indx >= self.malm {
+                    self.indx = self.malm - 1;
                 }
-                _ => Err(CaError::TypeMismatch("INDX".into())),
-            },
-            "MALM" if matches!(self.kind, ArrayKind::SubArray) => match value {
-                EpicsValue::Long(v) => {
-                    self.malm = v.max(0);
-                    Ok(())
-                }
-                EpicsValue::Short(v) => {
-                    self.malm = (v as i32).max(0);
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("MALM".into())),
-            },
+                Ok(())
+            }
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }

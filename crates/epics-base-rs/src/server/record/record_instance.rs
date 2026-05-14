@@ -52,15 +52,24 @@ pub(crate) struct MetadataSnapshot {
 fn is_metadata_field(name: &str) -> bool {
     matches!(
         name,
-        // Display info (analog + integer + motor)
+        // Display info (analog + integer + motor) — `prop(YES)` in
+        // ai/ao/longin/longout DBDs.
         "EGU" | "PREC" | "HOPR" | "LOPR" | "HLM" | "LLM"
-        // Alarm limits (used by both display and the analog_alarm config)
+        // Alarm limits (used by both display and the analog_alarm config) —
+        // ai/ao/longin/longout `prop(YES)`.
         | "HIHI" | "HIGH" | "LOW" | "LOLO"
-        // Output ctrl limits
+        // Alarm severities for the four limit thresholds —
+        // ai/ao/longin/longout `prop(YES)` per upstream DBDs
+        // (`aiRecord.dbd.pod` lines 357-388).
+        | "HHSV" | "HSV" | "LSV" | "LLSV"
+        // Output ctrl limits — ao/longout `prop(YES)`.
         | "DRVH" | "DRVL"
-        // bi/bo/busy enum strings
+        // bi/bo/busy enum strings — `prop(YES)`.
         | "ZNAM" | "ONAM"
-        // mbbi/mbbo state strings (16 levels)
+        // bi/bo state severities — `biRecord.dbd.pod` / `boRecord.dbd.pod`
+        // `prop(YES)` for ZSV/OSV/COSV (zero / one / change-of-state).
+        | "ZSV" | "OSV" | "COSV"
+        // mbbi/mbbo state strings (16 levels) — `prop(YES)`.
         | "ZRST" | "ONST" | "TWST" | "THST" | "FRST" | "FVST" | "SXST" | "SVST"
         | "EIST" | "NIST" | "TEST" | "ELST" | "TVST" | "TTST" | "FTST" | "FFST"
     )

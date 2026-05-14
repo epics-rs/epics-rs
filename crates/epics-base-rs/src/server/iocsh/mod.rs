@@ -230,19 +230,22 @@ impl IocShell {
         let mut rl = rustyline::DefaultEditor::with_config(config)
             .map_err(|e| format!("failed to initialize readline: {e}"))?;
 
-        // epics-base 8-D `c0da3dd` ANSI color: tint the prompt cyan
-        // and route errors through bold red so an operator can scan a
-        // long terminal scrollback for command outcomes. Honour the
-        // `NO_COLOR=1` env var convention (https://no-color.org) and
-        // also fall through to plain output when stdout is not a TTY
-        // (already TTY-gated by `run_repl` dispatch but defensive).
+        // epics-base 8-D `c0da3dd` ANSI color: tint the prompt
+        // BRIGHT-GREEN (matching C `ANSI_GREEN` in errlog.h:282 —
+        // `\033[32;1m`) and route errors through bold red so an
+        // operator can scan a long terminal scrollback for command
+        // outcomes. Honour the `NO_COLOR=1` env var convention
+        // (https://no-color.org) and fall through to plain output
+        // when stdout is not a TTY (already TTY-gated by `run_repl`
+        // dispatch but defensive).
         let want_color = use_ansi_color();
         let prompt = if want_color {
-            // \x1b[36m = cyan; \x1b[0m = reset.
-            // Bracket as `\x01...\x02` so rustyline excludes the
-            // sequence from prompt-width / cursor-position tracking
-            // (otherwise the cursor lands several chars off).
-            "\x01\x1b[36m\x02epics> \x01\x1b[0m\x02"
+            // \x1b[32;1m = bright green (matches C ANSI_GREEN);
+            // \x1b[0m = reset. Bracket as `\x01...\x02` so rustyline
+            // excludes the sequence from prompt-width / cursor-
+            // position tracking (otherwise the cursor lands several
+            // chars off).
+            "\x01\x1b[32;1m\x02epics> \x01\x1b[0m\x02"
         } else {
             "epics> "
         };

@@ -31,6 +31,13 @@ epics = ["dep:epics-base-rs"]
 # `target.'cfg(unix)'`.
 ftdi-mpsse = []
 
+# Opt-in USBTMC hardware support. Same scaffold convention as
+# `ftdi-mpsse`: without this flag the `drivers::usbtmc::DrvAsynUsbtmcPort`
+# scaffold compiles cleanly but `connect()` errors with a "feature
+# not enabled" message. Adding the `nusb`/`rusb` dep belongs in a
+# follow-up PR once a use case lands.
+usbtmc = []
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

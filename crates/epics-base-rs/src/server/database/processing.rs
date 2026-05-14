@@ -845,6 +845,16 @@ impl PvDatabase {
                     EpicsValue::Short(instance.common.stat as i16),
                 ));
             }
+            // C parity (recGbl.c:216): when recGblResetAlarms raises
+            // `acks`, post it so operator screens that subscribe to
+            // ACKS see the sticky-alarm severity update.
+            if alarm_result.acks_changed {
+                changed_fields.push((
+                    "ACKS".to_string(),
+                    EpicsValue::Short(instance.common.acks as i16),
+                ));
+                event_mask |= EventMask::VALUE;
+            }
             if !event_mask.is_empty() {
                 changed_fields.push((
                     "UDF".to_string(),
@@ -1254,6 +1264,16 @@ impl PvDatabase {
                     "STAT".to_string(),
                     EpicsValue::Short(instance.common.stat as i16),
                 ));
+            }
+            // C parity (recGbl.c:216): when recGblResetAlarms raises
+            // `acks`, post it so operator screens that subscribe to
+            // ACKS see the sticky-alarm severity update.
+            if alarm_result.acks_changed {
+                changed_fields.push((
+                    "ACKS".to_string(),
+                    EpicsValue::Short(instance.common.acks as i16),
+                ));
+                event_mask |= EventMask::VALUE;
             }
             if !event_mask.is_empty() {
                 changed_fields.push((

@@ -1543,6 +1543,15 @@ impl RecordInstance {
                 EpicsValue::Short(self.common.stat as i16),
             ));
         }
+        // C parity (recGbl.c:216): post raised ACKS so sticky-alarm
+        // tracking screens see the update.
+        if alarm_result.acks_changed {
+            changed_fields.push((
+                "ACKS".to_string(),
+                EpicsValue::Short(self.common.acks as i16),
+            ));
+            event_mask |= EventMask::VALUE;
+        }
 
         // Add subscribed fields that actually changed since last notification.
         let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
@@ -1621,8 +1630,8 @@ impl RecordInstance {
             .or(self.common.alst)
             .unwrap_or(f64::NAN);
 
-        let monitor_trigger = mdel < 0.0 || mlst.is_nan() || (val - mlst).abs() > mdel;
-        let archive_trigger = adel < 0.0 || alst.is_nan() || (val - alst).abs() > adel;
+        let monitor_trigger = check_deadband(val, mlst, mdel);
+        let archive_trigger = check_deadband(val, alst, adel);
 
         if archive_trigger {
             self.put_coerced("ALST", val);
@@ -1854,6 +1863,52 @@ impl RecordInstance {
             subs.retain(|s| !s.tx.is_closed());
         }
     }
+}
+
+/// C `recGblCheckDeadband` parity (recGbl.c:345-370). The four branches
+/// the C path enumerates:
+///
+/// 1. Both `newval` and `oldval` finite: `delta = |old - new|`, fire when
+///    `delta > deadband`.
+/// 2. Exactly one of {newval, oldval} is NaN, the other not — OR exactly
+///    one is +/-inf, the other not: `delta = +inf`, always fires.
+/// 3. Both infinite with opposite signs: `delta = +inf`, always fires.
+/// 4. Otherwise (e.g. both NaN, both same-signed infinity): no fire.
+///
+/// `oldval = NaN` is treated as "never posted" and fires (matches the
+/// `mlst.is_nan() → trigger` short-circuit the Rust port already had).
+/// `deadband < 0` fires unconditionally (matches `delta > deadband`
+/// with a negative deadband — same effect on every numeric value).
+pub(crate) fn check_deadband(newval: f64, oldval: f64, deadband: f64) -> bool {
+    // Fire unconditionally when no prior posting has happened. C achieves
+    // the same effect through the field being default-initialised to a
+    // sentinel; Rust uses NaN-as-sentinel.
+    if oldval.is_nan() {
+        return true;
+    }
+    // Negative deadband short-circuits — any value passes.
+    if deadband < 0.0 {
+        return true;
+    }
+    let new_finite = newval.is_finite();
+    let old_finite = oldval.is_finite();
+    if new_finite && old_finite {
+        return (newval - oldval).abs() > deadband;
+    }
+    // From here on, at least one of the two is not finite. We've already
+    // ruled out oldval=NaN above, so any newval=NaN here is the "newval
+    // went NaN while oldval was finite/inf" case — must fire (C case 2).
+    if newval.is_nan() {
+        return true;
+    }
+    // Exactly one infinite, the other finite: C case 2 → fire.
+    if new_finite != old_finite {
+        return true;
+    }
+    // Both infinite. Opposite signs → fire (C case 3); same sign → no
+    // fire (C path leaves delta=0 and the `delta > deadband` check fails
+    // for any non-negative deadband).
+    newval != oldval
 }
 
 #[cfg(test)]
@@ -2269,5 +2324,81 @@ mod aftc_filter_tests {
             "after 5 s of steady raw=2 with aftc=1 s, output must reach 2"
         );
         assert!(afvl.abs() >= 1.99 && afvl.abs() <= 2.0);
+    }
+}
+
+#[cfg(test)]
+mod check_deadband_tests {
+    use super::check_deadband;
+
+    /// Sentinel: `oldval=NaN` means "no prior posting", always fire.
+    #[test]
+    fn nan_old_value_fires() {
+        assert!(check_deadband(0.0, f64::NAN, 1.0));
+        assert!(check_deadband(f64::NAN, f64::NAN, 1.0));
+    }
+
+    /// C path: `delta > deadband` with both finite. delta within deadband
+    /// must NOT fire.
+    #[test]
+    fn within_finite_deadband_does_not_fire() {
+        assert!(!check_deadband(10.0, 10.5, 1.0));
+        assert!(!check_deadband(10.0, 9.5, 1.0));
+        // Boundary: `delta == deadband` is NOT strictly greater.
+        assert!(!check_deadband(10.0, 11.0, 1.0));
+    }
+
+    /// `delta > deadband` with both finite, beyond → fire.
+    #[test]
+    fn beyond_finite_deadband_fires() {
+        assert!(check_deadband(10.0, 12.0, 1.0));
+    }
+
+    /// Negative deadband acts as "always fire" (C `delta > deadband` is
+    /// trivially true for any non-negative delta).
+    #[test]
+    fn negative_deadband_fires() {
+        assert!(check_deadband(10.0, 10.0, -1.0));
+    }
+
+    /// C parity bug fix (recGbl.c:355-358): exactly one of {newval,
+    /// oldval} is NaN — fire. Rust port previously short-circuited only
+    /// on `oldval=NaN`; `newval=NaN` with `oldval=finite` produced
+    /// `(NaN - finite).abs() = NaN`, `NaN > deadband = false` →
+    /// silently dropped the NaN transition. End effect: a record that
+    /// went UDF (e.g. divide-by-zero in calc) never posted the change
+    /// to monitors, leaving every camonitor seeing the last valid value.
+    #[test]
+    fn newval_nan_with_finite_oldval_fires() {
+        assert!(check_deadband(f64::NAN, 10.0, 1.0));
+    }
+
+    /// C path case 2 (recGbl.c:355): exactly one infinite, the other
+    /// finite — fire.
+    #[test]
+    fn one_finite_one_infinite_fires() {
+        assert!(check_deadband(f64::INFINITY, 10.0, 1.0));
+        assert!(check_deadband(10.0, f64::INFINITY, 1.0));
+        assert!(check_deadband(f64::NEG_INFINITY, 10.0, 1.0));
+    }
+
+    /// C path case 3 (recGbl.c:360-362): both infinite with opposite
+    /// signs — fire.
+    #[test]
+    fn opposite_signed_infinities_fire() {
+        assert!(check_deadband(f64::INFINITY, f64::NEG_INFINITY, 1.0));
+        assert!(check_deadband(f64::NEG_INFINITY, f64::INFINITY, 1.0));
+    }
+
+    /// Same-signed infinity → no fire (C path leaves `delta = 0`,
+    /// `0 > deadband` is false for any non-negative deadband).
+    #[test]
+    fn same_signed_infinity_does_not_fire() {
+        assert!(!check_deadband(f64::INFINITY, f64::INFINITY, 1.0));
+        assert!(!check_deadband(
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            1.0
+        ));
     }
 }

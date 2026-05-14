@@ -1642,10 +1642,29 @@ impl PvDatabase {
                             .find(|f| f.name == "RVAL")
                             .map(|f| f.dbf_type)
                             .unwrap_or(crate::types::DbFieldType::Long);
-                        let coerced = if siol_val.db_field_type() != rval_type {
-                            siol_val.convert_to(rval_type)
-                        } else {
-                            siol_val
+                        // C parity (aiRecord.c:495): `rval = (long)floor(sval)`.
+                        // Rust `convert_to(Long)` truncates toward zero,
+                        // diverging for negative bipolar-ADC raw values
+                        // (sval=-1.5 → C: -2, Rust as-cast: -1).
+                        // Floor explicitly when narrowing a float to
+                        // an integer RVAL.
+                        let coerced = match (&siol_val, rval_type) {
+                            (EpicsValue::Double(d), crate::types::DbFieldType::Long) => {
+                                EpicsValue::Long(d.floor() as i32)
+                            }
+                            (EpicsValue::Double(d), crate::types::DbFieldType::Int64) => {
+                                EpicsValue::Int64(d.floor() as i64)
+                            }
+                            (EpicsValue::Float(d), crate::types::DbFieldType::Long) => {
+                                EpicsValue::Long((*d as f64).floor() as i32)
+                            }
+                            (EpicsValue::Float(d), crate::types::DbFieldType::Int64) => {
+                                EpicsValue::Int64((*d as f64).floor() as i64)
+                            }
+                            _ if siol_val.db_field_type() != rval_type => {
+                                siol_val.convert_to(rval_type)
+                            }
+                            _ => siol_val,
                         };
                         let _ = instance.record.put_field("RVAL", coerced);
                         let _ = instance.record.process();

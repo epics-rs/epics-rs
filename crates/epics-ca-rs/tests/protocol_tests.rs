@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::protocol::*;
 use epics_ca_rs::server::CaServer;
+use serial_test::serial;
 
 // ---------------------------------------------------------------------------
 // CA protocol header encoding/decoding
@@ -339,6 +340,7 @@ async fn server_get_nonexistent_pv_returns_error() {
 /// updated by the read/flush hot path — operators saw `bytes in=0,
 /// out=0` no matter how much traffic flowed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn server_stats_bytes_in_out_track_real_traffic() {
     use std::time::Duration;
 
@@ -412,6 +414,7 @@ async fn server_stats_bytes_in_out_track_real_traffic() {
 /// that `subscriptions_opened_total` and `subscriptions_closed_total`
 /// both increment for a normal monitor lifecycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
     use std::time::Duration;
 

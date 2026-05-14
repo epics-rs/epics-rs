@@ -816,7 +816,7 @@ async fn recv_from_with_drop_count_one(
         });
 
         match res {
-            Ok(out) => return out,
+            Ok(out) => return Ok(out),
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
         }
@@ -846,7 +846,10 @@ unsafe fn sockaddr_storage_to_socketaddr(
                     "AF_INET sockaddr too short",
                 ));
             }
-            let sa = &*(storage as *const _ as *const libc::sockaddr_in);
+            // SAFETY: caller guarantees `storage` is initialized and
+            // `len` is at least size_of::<sockaddr_in>() (checked above);
+            // the cast targets the C-layout struct matching AF_INET.
+            let sa = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
             let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
             let port = u16::from_be(sa.sin_port);
             Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
@@ -858,7 +861,10 @@ unsafe fn sockaddr_storage_to_socketaddr(
                     "AF_INET6 sockaddr too short",
                 ));
             }
-            let sa = &*(storage as *const _ as *const libc::sockaddr_in6);
+            // SAFETY: caller guarantees `storage` is initialized and
+            // `len` is at least size_of::<sockaddr_in6>() (checked above);
+            // the cast targets the C-layout struct matching AF_INET6.
+            let sa = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
             let port = u16::from_be(sa.sin6_port);
             Ok(SocketAddr::new(ip.into(), port))

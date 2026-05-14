@@ -152,13 +152,13 @@ impl TraceInfoMask {
 /// Split a mask string on `|` or `+` (C asyn: see the do/while
 /// `*maskStr == '|' || == '+'` at asynShellCommands.c:693).
 fn split_mask_tokens(s: &str) -> impl Iterator<Item = &str> {
-    s.split(|c| c == '|' || c == '+')
+    s.split(['|', '+'])
 }
 
 /// Strip the `ASYN_` prefix (always tried) plus any of the
 /// `category_prefixes` (e.g. `TRACE_`, `TRACEIO_`, `TRACEINFO_`),
-/// uppercase the result. Mirrors the `STARTSWITH(maskStr, ASYN_)`
-/// + `STARTSWITH(maskStr, TRACE_) || STARTSWITH(maskStr, TRACEIO_)`
+/// uppercase the result. Mirrors the `STARTSWITH(maskStr, ASYN_) +
+/// STARTSWITH(maskStr, TRACE_) || STARTSWITH(maskStr, TRACEIO_)`
 /// pattern that asynShellCommands.c uses to fold long forms
 /// (`ASYN_TRACEIO_DEVICE`) into short ones (`DEVICE`).
 fn strip_c_prefixes(tok: &str, category_prefixes: &[&str]) -> String {
@@ -182,7 +182,9 @@ fn parse_numeric(tok: &str) -> Option<u32> {
         // for parity with C asyn's symbolic-or-numeric token
         // handling. Plain "0" (no following digits) parses as 0
         // via the strip-fail branch below.
-        u32::from_str_radix(rest, 8).ok().or_else(|| tok.parse::<u32>().ok())
+        u32::from_str_radix(rest, 8)
+            .ok()
+            .or_else(|| tok.parse::<u32>().ok())
     } else {
         tok.parse::<u32>().ok()
     }

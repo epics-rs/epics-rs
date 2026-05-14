@@ -1149,7 +1149,10 @@ mod tests {
     #[test]
     fn dtyp_normalize_aai_aao_array_in_out() {
         // Float64 — most common aai/aao pattern.
-        assert_eq!(normalize_asyn_dtyp("asynFloat64ArrayIn"), "asynFloat64Array");
+        assert_eq!(
+            normalize_asyn_dtyp("asynFloat64ArrayIn"),
+            "asynFloat64Array"
+        );
         assert_eq!(
             normalize_asyn_dtyp("asynFloat64ArrayOut"),
             "asynFloat64Array"

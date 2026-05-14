@@ -117,8 +117,7 @@ impl DrvAsynPrologixPort {
         } else {
             format!("{host}:{DEFAULT_TCP_PORT} TCP")
         };
-        let inner =
-            super::ip_port::DrvAsynIPPort::new(&format!("{port_name}_TCP"), &ip_spec)?;
+        let inner = super::ip_port::DrvAsynIPPort::new(&format!("{port_name}_TCP"), &ip_spec)?;
         let mut base = PortDriverBase::new(
             port_name,
             // GPIB primary addresses 0..30 → 31 slots; secondary
@@ -308,8 +307,7 @@ impl PortDriver for DrvAsynPrologixPort {
                         message: "Prologix: version string too long".into(),
                     });
                 }
-                if acc.len() >= 2 && acc[acc.len() - 2] == b'\r' && acc[acc.len() - 1] == b'\n'
-                {
+                if acc.len() >= 2 && acc[acc.len() - 2] == b'\r' && acc[acc.len() - 1] == b'\n' {
                     let v = String::from_utf8_lossy(&acc[..acc.len() - 2]).to_string();
                     self.state.lock().unwrap().version = v;
                     break;
@@ -605,9 +603,7 @@ mod tests {
                             stream.write_all(b"Prologix Test 1.0\r\n").unwrap();
                             version_sent = true;
                         }
-                        if !read_replied
-                            && acc.windows(11).any(|w| w == b"++read eoi\n")
-                        {
+                        if !read_replied && acc.windows(11).any(|w| w == b"++read eoi\n") {
                             stream.write_all(b"42.5\n\xEF").unwrap();
                             read_replied = true;
                         }
@@ -658,9 +654,7 @@ mod tests {
                             stream.write_all(b"Prologix Test 1.0\r\n").unwrap();
                             version_sent = true;
                         }
-                        if !read_replied
-                            && acc.windows(10).any(|w| w == b"++read 10\n")
-                        {
+                        if !read_replied && acc.windows(10).any(|w| w == b"++read 10\n") {
                             stream.write_all(b"OK\n").unwrap();
                             read_replied = true;
                         }
@@ -702,11 +696,7 @@ mod tests {
         drv.write_octet(&mut user_w, b"A+B").unwrap();
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
         let captured = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let post_init_idx = captured
-            .windows(6)
-            .position(|w| w == b"++ver\n")
-            .unwrap()
-            + 6;
+        let post_init_idx = captured.windows(6).position(|w| w == b"++ver\n").unwrap() + 6;
         let post = &captured[post_init_idx..];
         // After `++addr 0\n` the payload should be `A\x1B+B\n`.
         assert!(

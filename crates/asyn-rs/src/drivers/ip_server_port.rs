@@ -43,8 +43,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -357,12 +357,11 @@ impl DrvAsynIPServerPort {
         } else {
             socket2::Domain::IPV6
         };
-        let sock =
-            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("UDP socket() failed: {e}"),
-                })?;
+        let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP socket() failed: {e}"),
+            })?;
         sock.set_reuse_address(true)
             .map_err(|e| AsynError::Status {
                 status: AsynStatus::Error,

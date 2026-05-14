@@ -10,14 +10,16 @@
 //!
 //! # Configuration string
 //!
-//! `"host:port [TCP|UDP] [SO_REUSEPORT]"` — same syntax as
-//! [`super::ip_port::IpPortConfig::parse`], with two extras:
+//! `"host:port [TCP|UDP]"` — matches C `drvAsynIPServerPort.c`
+//! `sscanf(":%u %5s", &portNumber, protocol)` (lines 580-600). Only
+//! `tcp` (default) / `udp` are accepted as the protocol token.
+//! `SO_REUSEADDR` is set unconditionally on the listening socket
+//! (`drvAsynIPServerPort.c:430`); there is **no `SO_REUSEPORT` token
+//! in upstream C asyn** — earlier versions of this module accepted
+//! one but it has been removed for parity. See [the audit doc] for
+//! the divergence note.
 //!
 //! - `host` may be `"0.0.0.0"` (all IPv4) or a specific bind address.
-//! - The trailing `SO_REUSEPORT` token (case-insensitive, optional)
-//!   sets the Linux/BSD `SO_REUSEPORT` socket option so multiple
-//!   independent listeners can share the bound port for kernel-level
-//!   load balancing — matches asyn PR #109's `RUL` reuse flag.
 //!
 //! # Connection lifecycle
 //!
@@ -91,11 +93,6 @@ pub struct IpServerConfig {
     pub bind_port: u16,
     /// Transport protocol — TCP listener or UDP receiver.
     pub protocol: IpServerProtocol,
-    /// Enable `SO_REUSEPORT` (asyn PR #109). On Linux/macOS this
-    /// allows multiple processes / threads to bind the same port for
-    /// kernel-level load balancing across listening sockets. No-op
-    /// on platforms without the option.
-    pub reuse_port: bool,
     /// Slot table cap — see [`DEFAULT_MAX_CLIENTS`]. Ignored in UDP
     /// mode (no per-peer slots).
     pub max_clients: usize,
@@ -108,10 +105,12 @@ pub struct IpServerConfig {
 impl IpServerConfig {
     /// Parse a `drvAsynIPServerPortConfigure`-style spec.
     ///
-    /// Syntax: `"host:port [TCP] [SO_REUSEPORT]"` (the `TCP` token is
-    /// accepted-and-ignored — UDP server mode is not yet wired). The
-    /// host may be IPv4 (`0.0.0.0`, `127.0.0.1`, or specific NIC IP);
-    /// IPv6 bracket form `[::]:port` is also accepted.
+    /// Syntax: `"host:port [tcp|udp]"`. Matches C `sscanf(":%u %5s",
+    /// &portNumber, protocol)` in `drvAsynIPServerPort.c:582`; only
+    /// `tcp` (default) and `udp` are accepted. Unknown trailing
+    /// tokens are rejected. The host may be IPv4 (`0.0.0.0`,
+    /// `127.0.0.1`, or specific NIC IP); IPv6 bracket form
+    /// `[::]:port` is also accepted.
     pub fn parse(spec: &str) -> AsynResult<Self> {
         let trimmed = spec.trim();
         let mut tokens: Vec<&str> = trimmed.split_whitespace().collect();
@@ -122,10 +121,11 @@ impl IpServerConfig {
             });
         }
 
-        let mut reuse_port = false;
         let mut protocol = IpServerProtocol::Tcp;
-        // Strip option tokens from the tail.
-        while tokens.len() > 1 {
+        // Strip the optional protocol token from the tail. C asyn
+        // accepts only `tcp` / `udp` (case-insensitive); anything
+        // else is rejected — see drvAsynIPServerPort.c:591-600.
+        if tokens.len() == 2 {
             let last = tokens.last().unwrap().to_ascii_uppercase();
             match last.as_str() {
                 "TCP" => {
@@ -136,11 +136,15 @@ impl IpServerConfig {
                     protocol = IpServerProtocol::Udp;
                     tokens.pop();
                 }
-                "SO_REUSEPORT" | "REUSEPORT" => {
-                    reuse_port = true;
-                    tokens.pop();
+                _ => {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!(
+                            "unknown protocol token '{}' in '{spec}' (expected tcp or udp)",
+                            tokens.last().unwrap()
+                        ),
+                    });
                 }
-                _ => break,
             }
         }
         if tokens.len() != 1 {
@@ -189,7 +193,6 @@ impl IpServerConfig {
             bind_host: host,
             bind_port: port,
             protocol,
-            reuse_port,
             max_clients: DEFAULT_MAX_CLIENTS,
             read_timeout: None,
         })
@@ -321,8 +324,8 @@ impl DrvAsynIPServerPort {
             format!("{}:{}", self.config.bind_host, self.config.bind_port)
         };
 
-        // Use socket2 for SO_REUSEPORT control on Linux/BSD; fall
-        // through to plain TcpListener otherwise.
+        // socket2 path so SO_REUSEADDR is set explicitly — mirrors
+        // C asyn's unconditional setsockopt at drvAsynIPServerPort.c:430.
         let listener = self.bind_with_options(&bind_str)?;
         listener
             .set_nonblocking(false)
@@ -362,18 +365,14 @@ impl DrvAsynIPServerPort {
                 status: AsynStatus::Error,
                 message: format!("UDP socket() failed: {e}"),
             })?;
+        // C asyn sets SO_REUSEADDR unconditionally on the bound
+        // socket (drvAsynIPServerPort.c:430). No SO_REUSEPORT — that
+        // was an invented extension and has been removed.
         sock.set_reuse_address(true)
             .map_err(|e| AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("UDP SO_REUSEADDR failed: {e}"),
             })?;
-        if self.config.reuse_port {
-            #[cfg(unix)]
-            sock.set_reuse_port(true).map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("UDP SO_REUSEPORT failed: {e}"),
-            })?;
-        }
         sock.bind(&addr.into()).map_err(|e| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("UDP bind '{bind_str}' failed: {e}"),
@@ -428,28 +427,13 @@ impl DrvAsynIPServerPort {
                     status: AsynStatus::Error,
                     message: format!("socket() failed: {e}"),
                 })?;
+        // Unconditional SO_REUSEADDR (drvAsynIPServerPort.c:430).
         socket
             .set_reuse_address(true)
             .map_err(|e| AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("SO_REUSEADDR failed: {e}"),
             })?;
-        if self.config.reuse_port {
-            #[cfg(unix)]
-            {
-                if let Err(e) = socket.set_reuse_port(true) {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("SO_REUSEPORT failed: {e}"),
-                    });
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                // SO_REUSEPORT is Linux/BSD-only; ignore on Windows
-                // matching asyn PR #109's portable fallback.
-            }
-        }
         socket.bind(&addr.into()).map_err(|e| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("bind '{bind_str}' failed: {e}"),
@@ -823,7 +807,6 @@ mod tests {
         let cfg = IpServerConfig::parse("0.0.0.0:8080").unwrap();
         assert_eq!(cfg.bind_host, "0.0.0.0");
         assert_eq!(cfg.bind_port, 8080);
-        assert!(!cfg.reuse_port);
         assert_eq!(cfg.max_clients, DEFAULT_MAX_CLIENTS);
     }
 
@@ -832,15 +815,15 @@ mod tests {
         let cfg = IpServerConfig::parse("127.0.0.1:5000 TCP").unwrap();
         assert_eq!(cfg.bind_host, "127.0.0.1");
         assert_eq!(cfg.bind_port, 5000);
-        assert!(!cfg.reuse_port);
     }
 
     #[test]
-    fn parse_with_so_reuseport() {
-        let cfg = IpServerConfig::parse("0.0.0.0:9000 TCP SO_REUSEPORT").unwrap();
-        assert!(cfg.reuse_port);
-        let cfg2 = IpServerConfig::parse("0.0.0.0:9000 reuseport").unwrap();
-        assert!(cfg2.reuse_port);
+    fn parse_rejects_so_reuseport_token() {
+        // C asyn drvAsynIPServerPort.c:597 prints "Unknown protocol"
+        // and returns -1 for anything other than tcp/udp. Reject
+        // SO_REUSEPORT — it is not a valid token in C asyn.
+        assert!(IpServerConfig::parse("0.0.0.0:9000 SO_REUSEPORT").is_err());
+        assert!(IpServerConfig::parse("0.0.0.0:9000 TCP SO_REUSEPORT").is_err());
     }
 
     #[test]
@@ -856,9 +839,6 @@ mod tests {
         assert_eq!(cfg.protocol, IpServerProtocol::Udp);
         let cfg2 = IpServerConfig::parse("0.0.0.0:7000").unwrap();
         assert_eq!(cfg2.protocol, IpServerProtocol::Tcp, "default is TCP");
-        let cfg3 = IpServerConfig::parse("127.0.0.1:5000 UDP SO_REUSEPORT").unwrap();
-        assert_eq!(cfg3.protocol, IpServerProtocol::Udp);
-        assert!(cfg3.reuse_port);
     }
 
     /// UDP-mode end-to-end: bind ephemeral, two clients each fire one
@@ -961,11 +941,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_unknown_token() {
+    fn parse_rejects_unknown_protocol_token() {
         let err = IpServerConfig::parse("0.0.0.0:8080 BOGUS").unwrap_err();
         match err {
             AsynError::Status { message, .. } => {
-                assert!(message.contains("unexpected"), "msg={message}");
+                assert!(
+                    message.contains("unknown protocol token") || message.contains("BOGUS"),
+                    "msg={message}"
+                );
             }
             _ => panic!("expected Status err"),
         }
@@ -1011,7 +994,6 @@ mod tests {
             bind_host: "127.0.0.1".into(),
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
-            reuse_port: false,
             max_clients: 2,
             read_timeout: None,
         };
@@ -1053,7 +1035,6 @@ mod tests {
             bind_host: "127.0.0.1".into(),
             bind_port: 0,
             protocol: IpServerProtocol::Tcp,
-            reuse_port: false,
             max_clients: 1,
             read_timeout: None,
         };
@@ -1073,35 +1054,5 @@ mod tests {
         let _c2 = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
         assert_eq!(srv.accept_one().unwrap(), 0);
         assert!(srv.peer(0).is_some());
-    }
-
-    /// SO_REUSEPORT must allow a second listener on the same port
-    /// (Linux/BSD only — Windows path silently no-ops the option).
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-    #[test]
-    fn so_reuseport_allows_second_bind() {
-        let cfg1 = IpServerConfig {
-            bind_host: "127.0.0.1".into(),
-            bind_port: 0,
-            protocol: IpServerProtocol::Tcp,
-            reuse_port: true,
-            max_clients: 1,
-            read_timeout: None,
-        };
-        let mut srv1 = DrvAsynIPServerPort::with_config("ru1", cfg1).unwrap();
-        srv1.connect(&AsynUser::default()).unwrap();
-        let port = srv1.local_port();
-
-        let cfg2 = IpServerConfig {
-            bind_host: "127.0.0.1".into(),
-            bind_port: port,
-            protocol: IpServerProtocol::Tcp,
-            reuse_port: true,
-            max_clients: 1,
-            read_timeout: None,
-        };
-        let mut srv2 = DrvAsynIPServerPort::with_config("ru2", cfg2).unwrap();
-        srv2.connect(&AsynUser::default())
-            .expect("second SO_REUSEPORT bind on the same port must succeed");
     }
 }

@@ -398,7 +398,10 @@ fn process_command(
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = ioid;
-            if count > 0xFFFF {
+            // C parity (`comQueSend.cpp:285`): extended form for
+            // `nElem >= 0xffff`. See `build_read_notify_frame` in
+            // client/mod.rs for the same boundary in the slow path.
+            if count >= 0xFFFF {
                 hdr.set_payload_size(0, count);
             } else {
                 hdr.count = count as u16;
@@ -466,7 +469,9 @@ fn process_command(
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = subid;
-            if count > 0xFFFF {
+            // C parity (`comQueSend.cpp:285`): extended form for
+            // `nElem >= 0xffff`. Same boundary as READ_NOTIFY above.
+            if count >= 0xFFFF {
                 hdr.set_payload_size(16, count);
             } else {
                 hdr.count = count as u16;

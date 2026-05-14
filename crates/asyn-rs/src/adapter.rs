@@ -500,6 +500,51 @@ impl WriteCompletion for AsynAsyncWriteCompletion {
 }
 
 impl AsynDeviceSupport {
+    /// C parity for `devAsynInt32.c::initAi` (lines 821-828) +
+    /// `convertAi` (lines 437-454): query the driver's int32 / int64
+    /// bounds, then compute `ESLO = (EGUF - EGUL) / (high - low)` and
+    /// `EOFF = (high*EGUL - low*EGUF) / (high - low)` and write
+    /// them on the record. Caller has already verified the record
+    /// exposes ESLO and the interface is `asynInt32` / `asynInt64`.
+    fn apply_linear_eslo_eoff(&self, record: &mut dyn Record) {
+        let op = if self.iface_type == "asynInt64" {
+            RequestOp::GetBoundsInt64
+        } else {
+            RequestOp::GetBoundsInt32
+        };
+        let user = AsynUser::new(self.reason)
+            .with_addr(self.addr)
+            .with_timeout(self.timeout);
+        let result = match self.handle.submit_blocking(op, user) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let (low, high) = match result.bounds {
+            Some((l, h)) => (l as f64, h as f64),
+            None => return,
+        };
+        // C parity: `if (deviceHigh != deviceLow)` (convertAi:444).
+        // A degenerate driver that reports 0,0 (the "I don't know"
+        // sentinel — matches the early-out at initAi:824) leaves the
+        // existing ESLO/EOFF untouched.
+        if (high - low).abs() < f64::EPSILON {
+            return;
+        }
+        let eguf = match record.get_field("EGUF") {
+            Some(EpicsValue::Double(v)) => v,
+            _ => return,
+        };
+        let egul = match record.get_field("EGUL") {
+            Some(EpicsValue::Double(v)) => v,
+            _ => return,
+        };
+        let denom = high - low;
+        let eslo = (eguf - egul) / denom;
+        let eoff = (high * egul - low * eguf) / denom;
+        let _ = record.put_field("ESLO", EpicsValue::Double(eslo));
+        let _ = record.put_field("EOFF", EpicsValue::Double(eoff));
+    }
+
     /// Build a `RequestOp` for reading the current interface type.
     fn read_op(&self) -> Option<RequestOp> {
         match self.iface_type.as_str() {
@@ -698,6 +743,27 @@ impl DeviceSupport for AsynDeviceSupport {
             let shft = compute_mask_shift(self.mask);
             let _ = record.put_field("MASK", EpicsValue::Long(self.mask as i32));
             let _ = record.put_field("SHFT", EpicsValue::Short(shft as i16));
+        }
+
+        // ai/ao LINEAR ESLO/EOFF wiring.
+        //
+        // C devAsynInt32.c::initAi (line 822-828) / initAo / initAiAverage:
+        //
+        //     if (deviceLow == 0 && deviceHigh == 0) {
+        //         pasynInt32SyncIO->getBounds(..., &deviceLow, &deviceHigh);
+        //     }
+        //     convertAi(pr, 1);   // line 437-454: ESLO/EOFF from EGUF/EGUL+bounds
+        //
+        // The bounds query is only meaningful for asynInt32/asynInt64
+        // (asynFloat64 has no getBounds in C; mbbi/mbbo use the mask
+        // path computed above). The record only applies the result
+        // when LINR != NO_CONVERSION, but C writes ESLO/EOFF
+        // unconditionally and lets record processing decide whether
+        // to honour it.
+        if (self.iface_type == "asynInt32" || self.iface_type == "asynInt64")
+            && record.get_field("ESLO").is_some()
+        {
+            self.apply_linear_eslo_eoff(record);
         }
 
         if self.initial_readback {
@@ -1226,6 +1292,7 @@ mod tests {
         assert!(parse_asyn_mask_link("@asyn(port1, 0, 0xFF) BITS").is_err());
     }
 
+    use crate::error::AsynResult;
     use crate::interrupt::InterruptManager;
     use crate::param::ParamType;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
@@ -1249,6 +1316,57 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
+    }
+
+    /// Port that reports configurable getBounds — used for the ai
+    /// LINEAR ESLO/EOFF wiring tests.
+    struct BoundedPort {
+        base: PortDriverBase,
+        low32: i32,
+        high32: i32,
+    }
+    impl BoundedPort {
+        fn new(low32: i32, high32: i32) -> Self {
+            let mut base = PortDriverBase::new("test_bounds", 1, PortFlags::default());
+            base.create_param("VAL", ParamType::Int32).unwrap();
+            Self {
+                base,
+                low32,
+                high32,
+            }
+        }
+    }
+    impl PortDriver for BoundedPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+            Ok((self.low32, self.high32))
+        }
+    }
+
+    fn make_bounded_adapter(low: i32, high: i32, iface: &str) -> AsynDeviceSupport {
+        let driver = BoundedPort::new(low, high);
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-bounds-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test_bounds".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test_bounds".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
+        ads.set_record_info("TEST:AI", ScanType::Passive);
+        ads
     }
 
     fn make_adapter(scan: ScanType) -> AsynDeviceSupport {
@@ -1298,6 +1416,100 @@ mod tests {
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.reason, 0); // "VAL" is param index 0
+    }
+
+    // --- ai LINEAR ESLO/EOFF from getBounds (C devAsynInt32.c::convertAi) ---
+
+    /// C `convertAi` formula: ESLO=(EGUF-EGUL)/(high-low),
+    /// EOFF=(high*EGUL-low*EGUF)/(high-low). With low=0, high=4095,
+    /// EGUL=0.0, EGUF=10.0 → ESLO ≈ 10/4095 ≈ 0.002442, EOFF=0.0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ai_linear_eslo_eoff_filled_from_get_bounds_int32() {
+        let mut ads = make_bounded_adapter(0, 4095, "asynInt32");
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut rec = AiRecord::new(0.0);
+        // Configure EGUL/EGUF before init so convertAi has them.
+        rec.eguf = 10.0;
+        rec.egul = 0.0;
+        rec.linr = 2; // LINEAR (LINR codes: 0=NO_CONVERSION, 1=SLOPE, 2=LINEAR)
+        ads.init(&mut rec).unwrap();
+
+        let eslo = match rec.get_field("ESLO").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        let eoff = match rec.get_field("EOFF").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (eslo - 10.0 / 4095.0).abs() < 1e-9,
+            "ESLO must equal (EGUF-EGUL)/(high-low): got {eslo}"
+        );
+        assert!(
+            eoff.abs() < 1e-9,
+            "EOFF must equal 0 for symmetric range: got {eoff}"
+        );
+    }
+
+    /// EGUF=10, EGUL=-10 with bounds [-2048, 2047] → ESLO ≈ 20/4095.
+    /// EOFF = (2047*-10 - -2048*10)/4095 = (-20470 + 20480)/4095 = 10/4095.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ai_linear_eslo_eoff_signed_range() {
+        let mut ads = make_bounded_adapter(-2048, 2047, "asynInt32");
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut rec = AiRecord::new(0.0);
+        rec.eguf = 10.0;
+        rec.egul = -10.0;
+        rec.linr = 2;
+        ads.init(&mut rec).unwrap();
+        let eslo = match rec.get_field("ESLO").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        let eoff = match rec.get_field("EOFF").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        let denom = (2047 - -2048) as f64;
+        assert!((eslo - 20.0 / denom).abs() < 1e-9);
+        let expected_eoff = (2047.0 * -10.0 - -2048.0 * 10.0) / denom;
+        assert!(
+            (eoff - expected_eoff).abs() < 1e-9,
+            "EOFF expected {expected_eoff} got {eoff}"
+        );
+    }
+
+    /// Driver returning low==high (no usable range) must leave the
+    /// record's ESLO/EOFF unchanged — matches C `convertAi:444`
+    /// (`if (deviceHigh != deviceLow)`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ai_linear_skip_when_bounds_equal() {
+        let mut ads = make_bounded_adapter(0, 0, "asynInt32");
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut rec = AiRecord::new(0.0);
+        rec.eguf = 10.0;
+        rec.egul = 0.0;
+        rec.linr = 2;
+        // Pre-set ESLO/EOFF to sentinel values to detect untouched.
+        rec.eslo = 123.456;
+        rec.eoff = 42.0;
+        ads.init(&mut rec).unwrap();
+        assert!((rec.eslo - 123.456).abs() < 1e-9);
+        assert!((rec.eoff - 42.0).abs() < 1e-9);
+    }
+
+    /// Records without an ESLO field (e.g. longin) must skip the
+    /// LINEAR wiring entirely — the `record.get_field("ESLO").is_some()`
+    /// guard in `init()` prevents a wasted GetBoundsInt32 round-trip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longin_skips_linear_wiring() {
+        let mut ads = make_bounded_adapter(0, 4095, "asynInt32");
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut rec = LonginRecord::new(0);
+        // Should not error or block — just no-ops because LonginRecord
+        // doesn't expose ESLO.
+        ads.init(&mut rec).unwrap();
     }
 
     // --- asyn:FIFO ring buffer ---

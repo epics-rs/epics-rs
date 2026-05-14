@@ -245,3 +245,67 @@ C 에서 EPICS_CAS_SERVER_PORT 는 **UDP+TCP 모두**를 같은 포트로 설정
 
 **상태**: clean (round 2 after fix `cc1c4aa`)
 
+### 67/161 — `5142e0b` docs: mark DBE_PROPERTY ordering / mbbi gap as N/A (b7cc33c3, 9e7cd24)
+
+**검토**: docs-only. Rust 의 `MetadataSnapshot` (record_instance.rs:34, `metadata_cache`) 가 매 monitor snapshot 에 metadata(display/control/enums)를 항상 포함. C 의 별도 DBE_PROPERTY 이벤트 발송 자체가 Rust 디자인에 없으므로 순서 보장 / 누락 문제 부재. design-diff N/A 라벨 정확.
+
+**상태**: clean (round 1)
+
+### 68/161 — `4c7c45f` docs: mark db_field_log::mask as N/A pending filter framework (235f8ed2)
+
+**검토**: docs-only. epics-rs 는 filter framework 자체가 다음 commit (`9071c6b`, Stage 1) 부터 도입. C `db_field_log::mask` 는 filter 가 EventMask 분기 판단용 — 이미 Rust `FilteredMonitorEvent.mask: EventMask` (commit 9071c6b 의 framework) 로 도입됨. N/A 라벨 적절.
+
+**상태**: clean (round 1)
+
+### 69/161 — `9071c6b` feat(server): server-side channel filter framework + dbnd filter (3.15.7)
+
+**Round 1 defect (4건, dbnd.rs)**:
+
+1. **`>=` vs `>` 비교**: C `recGblCheckDeadband` (recGbl.c) 는 `if (delta > deadband)` 엄격 비교. Rust 는 `>=` 사용. `dbndTest.c` (test line 235/241) 가 `mustDrop("abs", 3., 3/4)` 로 `delta == deadband` drop 을 검증. Rust test 가 잘못된 "1.0 == threshold passes (>= semantics)" 주석 동반.
+2. **NaN/Inf delta 처리**: C `recGblCheckDeadband` 는 finite↔NaN, finite↔Inf, +inf↔-inf 전환 시 `delta = epicsINF` 로 설정해 deadband 무조건 trip. Rust 는 `(cur - prev).abs()` 만 사용 → NaN 결과, `NaN > threshold` false → 침묵 drop. `recGblCheckDeadbandTest.c` 케이스 4-18 미커버.
+3. **Zero-baseline relative fallback (Rust invention)**: Rust `last==0` 시 absolute fallback. C 는 `hyst = 0 * cval/100 = 0` 으로 모든 non-zero delta 통과 — fallback 불필요. Rust 의 발명된 동작.
+4. **ALARM/PROPERTY pass-through 시 `last_sent` 업데이트 누락**: C `recGblCheckDeadband` 의 `*poldval = newval` 은 mask 무관, `delta > deadband` 면 항상 발생 — ALARM-only 이벤트도 baseline 갱신. Rust 는 short-circuit 통해 `last` 업데이트 skip → 직후 VALUE 이벤트의 비교가 stale baseline 사용.
+
+**Fix**: `83ee47a` — `c_delta` C-style helper 도입, `>=` → `>`, last_sent 를 `Mutex<f64> = NaN` 으로 초기화, ALARM/PROPERTY 패스에서 `last` 무조건 갱신. 테스트 3개 수정 + 2개 추가 (NaN→finite, +inf→-inf).
+
+**상태**: clean (round 2 after fix `83ee47a`)
+
+### 70/161 — `88ce2e0` feat(server): add arr / ts / decimate channel filters (3.15.7 Stage 2)
+
+**Round 1 defect (3건)**:
+
+1. **arr.rs — alarm event 우회 잘못**: C `arr.c` 는 `channelRegisterPost` 로 등록되어 mask 무관 항상 slicing 수행. Rust 의 `if !event.mask.contains(VALUE) { return Some(event) }` 는 `dbnd`-specific 446e0d4a rule 의 잘못된 적용. 결과: `PV.{"arr":{"e":2}}` 구독자가 ALARM-only 이벤트에서 full array 수신 (slice 미적용) — slice view coherence 깨짐.
+2. **arr.rs — start out-of-range clamp 비대칭**: C `wrapArrayIndices` 는 `*start > no_elements → no_elements`, `*end >= no_elements → no_elements - 1` 으로 비대칭 clamp. Rust 는 둘 다 `clamp(0, len-1)`. `start=10, len=3` 시 C 는 `start=3, end=2 → start>end → 0 elements`, Rust 는 `start=2, end=2 → 1 element` 반환.
+3. **decimate.rs — ALARM 이벤트 slot 미소비**: C `decimate.c` 는 `if (pfl->mask & DBE_PROPERTY) return pfl` 만 short-circuit; DBE_ALARM 은 정상 decimation 로직 통과. Rust 는 446e0d4a rule 을 잘못 확장해 모든 non-VALUE 이벤트 (ALARM 포함) bypass — 카운터 안 움직임, downstream value emission 의 decimation 위상 어긋남.
+
+**Fix**: `6a0cc82` — arr `mask` short-circuit 제거, 비대칭 clamp `resolve_start`/`resolve_end` 분리; decimate `intersects(PROPERTY)` 로 변경; 테스트 2개 갱신 + 2개 추가.
+
+**관련 ts.rs feature gap**: C `ts` 는 `num=dbl|sec|nsec|ts`, `epoch=epics|unix`, `str=epics|iso` 모드 지원. Rust 는 default `Generate` 모드만 구현. JSON `{"ts":{}}` 는 정확히 동작하나 `{"ts":{"num":"sec"}}` 등은 silently ignored. 정식 defect 가 아닌 feature gap — 추후 별도 commit 권장.
+
+**상태**: clean (round 2 after fix `6a0cc82`); ts feature gap 는 known limitation.
+
+### 71/161 — `5404235` feat(server): PV-name JSON parser for channel filter chain (3.15.7 Stage 3)
+
+**Round 1 defect**: `build_dbnd` 의 `r` key 처리가 C 의 percent 시맨틱 무시. C `dbnd.c:87` 은 `my->hyst = val * my->cval/100.` 으로 cval 을 percent (e.g. `r=50` → 50%) 로 해석. Rust 는 `DeadbandFilter::new(r, Relative)` 로 직접 전달 — internal 은 fraction 저장이므로 `r=50` → 5000% (50x) 의 deadband. pvxs / C-style client 가 `{"r":50}` 으로 50% 의도 시 거의 모든 update 가 silence.
+
+**Fix**: `6489ef6` — parser 에서 `r / 100.0` 으로 wire boundary 변환. `d` key 는 절대값이므로 그대로.
+
+**상태**: clean (round 2 after fix `6489ef6`)
+
+### 72/161 — `c283c7f` feat(ca): wire channel filter chain through CA server (3.15.7 Stage 4)
+
+**검토**: CREATE_CHAN 에서 `split_channel_name` 으로 record_path/suffix 분리 → `find_entry(&record_path)` 사용 (suffix 미오염). EVENT_ADD 에서 `attach_filter_to_last_subscriber` 가 `add_subscriber` 직후 동일 write guard 내에서 호출 — race 없음. JSON parse 실패 시 빈 chain 반환 + warn (graceful). audit log 는 raw `pv_name` 유지 (분리 전).
+
+**상태**: clean (round 1)
+
+### 73/161 — `bf70c8e` feat(records): compress PBUF (partial buffer) field (7.0.8 partial)
+
+**Round 1 발견 (설계 발산, 작성자가 🔄 PARTIAL 라벨로 인지함)**:
+
+1. **PBUF 시맨틱 mismatch**: C `compressRecord.c:179,296` 는 PBUF 를 PROCESSING 시점 옵션으로 사용 — `pbuf=YES` 면 `inx < n` 이어도 매 push 마다 `put_value` 발행 (early-emit). 즉 N-to-1 알고리듬 윈도가 N 미만으로 채워져도 출력. Rust 는 PBUF 를 READ-side toggle 로 재해석해 `get_field("VAL")` 에서 NUSE-truncated 반환. 두 시맨틱이 같지 않으며 C client 가 PBUF=YES 로 early-emit 을 기대하면 Rust 에서는 normal-process 만 발생.
+2. **VAL read 시 NUSE clamp 누락 (pre-existing, PBUF=NO 노출)**: C `get_array_info` (compressRecord.c:428) 는 `*no_elements = nuse` 로 PBUF 무관 항상 NUSE clamp. Rust 는 default PBUF=NO 시 full NSAM-padded vector 반환 (trailing zeros). CA wire 가 NSAM 크기 전송 → C 와 다름. PBUF=YES opt-in 시에만 부분적으로 일치.
+
+**판단**: 작성자가 commit msg 에서 "N-to-1 partial-window compression remains a follow-up — depends on extending push_value to an array-input model" 로 deferred 명시. 본 review session 의 범위를 넘는 구조적 변경 필요 — 별도 commit 으로 진행 권장. 정확한 C semantic 구현 시 (a) push_value 가 PBUF=YES 면 early-emit, (b) get_field("VAL") 가 PBUF 무관 NUSE-truncated, (c) tests 갱신 필요.
+
+**상태**: clean (round 1, deferred — feature gap 작성자 인지 + 라벨)
+

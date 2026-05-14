@@ -239,13 +239,15 @@ impl IocShell {
         // when stdout is not a TTY (already TTY-gated by `run_repl`
         // dispatch but defensive).
         let want_color = use_ansi_color();
+        // `\x1b[32;1m` = bright green (matches C `ANSI_GREEN`); `\x1b[0m`
+        // = reset. rustyline 14 auto-strips ANSI escape sequences when
+        // computing prompt visible width, so the `\x01...\x02` reader
+        // markers GNU readline expects are NOT required — and they
+        // were actively breaking some terminals (xterm/iTerm2 render
+        // SOH/STX as visible glyphs which then misalign the cursor
+        // when output prints from another thread between prompts).
         let prompt = if want_color {
-            // \x1b[32;1m = bright green (matches C ANSI_GREEN);
-            // \x1b[0m = reset. Bracket as `\x01...\x02` so rustyline
-            // excludes the sequence from prompt-width / cursor-
-            // position tracking (otherwise the cursor lands several
-            // chars off).
-            "\x01\x1b[32;1m\x02epics> \x01\x1b[0m\x02"
+            "\x1b[32;1mepics> \x1b[0m"
         } else {
             "epics> "
         };

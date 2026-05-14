@@ -814,7 +814,11 @@ impl PortDriver for DrvAsynSerialPort {
                 }
             }
             #[cfg(target_os = "linux")]
-            "rs485_enable" | "rs485_rts_on_send" | "rs485_rts_after_send" => {
+            "rs485_enable"
+            | "rs485_rts_on_send"
+            | "rs485_rts_after_send"
+            | "rs485_delay_rts_before_send"
+            | "rs485_delay_rts_after_send" => {
                 self.set_rs485_option(&key, value)?;
             }
             _ => {
@@ -914,6 +918,12 @@ impl PortDriver for DrvAsynSerialPort {
                     Ok("N".to_string())
                 }
             }
+            #[cfg(target_os = "linux")]
+            "rs485_enable"
+            | "rs485_rts_on_send"
+            | "rs485_rts_after_send"
+            | "rs485_delay_rts_before_send"
+            | "rs485_delay_rts_after_send" => self.get_rs485_option(key),
             _ => self
                 .base
                 .options
@@ -925,61 +935,163 @@ impl PortDriver for DrvAsynSerialPort {
 }
 
 // --- RS485 support (Linux only) ---
+//
+// Mirror of `<linux/serial.h>` `struct serial_rs485` — same layout
+// used by `drvAsynSerialPort.c:76-77` (`struct serial_rs485 rs485`).
+// Layout: 4 + 4 + 4 + 5*4 = 32 bytes. Pre-Linux-4.20 kernels read the
+// full 32-byte buffer in TIOCGRS485 / TIOCSRS485 even though only the
+// first three u32 fields carry data; the 5-word padding tail MUST be
+// present or the ioctl silently writes garbage on some drivers.
+// (PR #22 originally tried to pass a single c_ulong — the kernel
+// read the next 24 bytes of stack as "padding" and some PCIe UART
+// drivers latched that as a multi-µs rts delay.)
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SerialRs485 {
+    flags: u32,
+    delay_rts_before_send: u32,
+    delay_rts_after_send: u32,
+    padding: [u32; 5],
+}
+
+#[cfg(target_os = "linux")]
+mod rs485_flags {
+    pub const SER_RS485_ENABLED: u32 = 1 << 0;
+    pub const SER_RS485_RTS_ON_SEND: u32 = 1 << 1;
+    pub const SER_RS485_RTS_AFTER_SEND: u32 = 1 << 2;
+}
+
+// TIOCGRS485 = 0x542E, TIOCSRS485 = 0x542F — asm-generic/ioctls.h.
+#[cfg(target_os = "linux")]
+const TIOCGRS485: libc::c_ulong = 0x542E;
+#[cfg(target_os = "linux")]
+const TIOCSRS485: libc::c_ulong = 0x542F;
+
 #[cfg(target_os = "linux")]
 impl DrvAsynSerialPort {
-    fn set_rs485_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
-        use std::mem::MaybeUninit;
+    fn rs485_get(&self, fd: RawFd) -> AsynResult<SerialRs485> {
+        let mut r: SerialRs485 = SerialRs485::default();
+        let ret = unsafe { libc::ioctl(fd, TIOCGRS485, &mut r as *mut SerialRs485) };
+        if ret < 0 {
+            return Err(AsynError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(r)
+    }
 
+    fn rs485_set(&self, fd: RawFd, r: &SerialRs485) -> AsynResult<()> {
+        let ret = unsafe { libc::ioctl(fd, TIOCSRS485, r as *const SerialRs485) };
+        if ret < 0 {
+            return Err(AsynError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    fn set_rs485_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
         let fd = self.io.fd.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Disconnected,
             message: "not connected".into(),
         })?;
 
-        // Read current RS485 config
-        let mut rs485 = unsafe {
-            let mut buf = MaybeUninit::<libc::c_ulong>::zeroed();
-            // SER_RS485_ENABLED = 1, ioctl TIOCGRS485 = 0x542E
-            let ret = libc::ioctl(fd, 0x542E_u64, buf.as_mut_ptr());
-            if ret < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
-            }
-            buf.assume_init()
-        };
+        let mut r = self.rs485_get(fd)?;
+        let prev = r;
 
-        let enabled = parse_bool_option(value).unwrap_or(false);
+        use rs485_flags::*;
         match key {
-            "rs485_enable" => {
-                if enabled {
-                    rs485 |= 1;
-                } else {
-                    rs485 &= !1;
-                } // SER_RS485_ENABLED
+            // C `drvAsynSerialPort.c:531-543`: "Y" sets ENABLED; "N"
+            // clears the whole flags word (not just the bit) — match
+            // that semantic exactly.
+            "rs485_enable" => match value.to_ascii_uppercase().as_str() {
+                "Y" => r.flags |= SER_RS485_ENABLED,
+                "N" => r.flags = 0,
+                _ => {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "Invalid rs485_enable value.".into(),
+                    });
+                }
+            },
+            "rs485_rts_on_send" => match value.to_ascii_uppercase().as_str() {
+                "Y" => r.flags |= SER_RS485_RTS_ON_SEND,
+                "N" => r.flags &= !SER_RS485_RTS_ON_SEND,
+                _ => {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "Invalid rs485_rts_on_send value.".into(),
+                    });
+                }
+            },
+            "rs485_rts_after_send" => match value.to_ascii_uppercase().as_str() {
+                "Y" => r.flags |= SER_RS485_RTS_AFTER_SEND,
+                "N" => r.flags &= !SER_RS485_RTS_AFTER_SEND,
+                _ => {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "Invalid rs485_rts_after_send value.".into(),
+                    });
+                }
+            },
+            "rs485_delay_rts_before_send" => {
+                r.delay_rts_before_send = value.parse::<u32>().map_err(|_| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "Bad number".into(),
+                })?;
             }
-            "rs485_rts_on_send" => {
-                if enabled {
-                    rs485 |= 2;
-                } else {
-                    rs485 &= !2;
-                } // SER_RS485_RTS_ON_SEND
-            }
-            "rs485_rts_after_send" => {
-                if enabled {
-                    rs485 |= 4;
-                } else {
-                    rs485 &= !4;
-                } // SER_RS485_RTS_AFTER_SEND
+            "rs485_delay_rts_after_send" => {
+                r.delay_rts_after_send = value.parse::<u32>().map_err(|_| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "Bad number".into(),
+                })?;
             }
             _ => {}
         }
 
-        // Apply
-        unsafe {
-            let ret = libc::ioctl(fd, 0x542F_u64, &rs485); // TIOCSRS485
-            if ret < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
-            }
+        // C `drvAsynSerialPort.c:608-613`: on TIOCSRS485 failure
+        // restore the previous struct state — note that an in-kernel
+        // failure may already have applied the change, but the
+        // userland copy must still reflect the last-known-good value.
+        if let Err(e) = self.rs485_set(fd, &r) {
+            let _ = self.rs485_set(fd, &prev);
+            return Err(e);
         }
         Ok(())
+    }
+
+    fn get_rs485_option(&self, key: &str) -> AsynResult<String> {
+        let fd = self.io.fd.ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Disconnected,
+            message: "not connected".into(),
+        })?;
+        let r = self.rs485_get(fd)?;
+        use rs485_flags::*;
+        // Format matches C drvAsynSerialPort.c:210-224 — 'Y'/'N' for
+        // flags, "%u" for the delay fields.
+        let s = match key {
+            "rs485_enable" => if r.flags & SER_RS485_ENABLED != 0 {
+                "Y"
+            } else {
+                "N"
+            }
+            .to_string(),
+            "rs485_rts_on_send" => if r.flags & SER_RS485_RTS_ON_SEND != 0 {
+                "Y"
+            } else {
+                "N"
+            }
+            .to_string(),
+            "rs485_rts_after_send" => if r.flags & SER_RS485_RTS_AFTER_SEND != 0 {
+                "Y"
+            } else {
+                "N"
+            }
+            .to_string(),
+            "rs485_delay_rts_before_send" => r.delay_rts_before_send.to_string(),
+            "rs485_delay_rts_after_send" => r.delay_rts_after_send.to_string(),
+            _ => {
+                return Err(AsynError::OptionNotFound(key.to_string()));
+            }
+        };
+        Ok(s)
     }
 }
 

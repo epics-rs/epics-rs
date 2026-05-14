@@ -178,6 +178,33 @@ re-implemented properly afterward.
 - **docs** `docs/asyn-rs-c-audit.md` — 22-item C-source audit
   refreshed, all items resolved.
 
+### Post-tag amendments (re-tagged 2026-05-14)
+
+The v0.17.0 tag was moved forward to include four follow-up commits
+that landed in the same day, after CI on Linux surfaced two issues
+invisible to our macOS pre-push pass:
+
+- **fix(net)** Linux-only `async_udp_v4.rs` — `try_io` closure
+  return is auto-flattened by `UdpSocket::try_io`, so the match arm
+  needs `return Ok(out)` not `return out` (E0308). Two raw-pointer
+  derefs in `sockaddr_storage_to_socketaddr` now have explicit
+  `unsafe { ... }` blocks per edition 2024
+  `unsafe-op-in-unsafe-fn`. Both fixes are `#[cfg(target_os =
+  "linux")]`-gated, so macOS hosts never compiled them. (`41e3273`)
+- **test(ca)** `protocol_tests.rs` — two CaClient tests that
+  mutate `EPICS_CA_*` via `std::env::set_var` raced under libtest's
+  multi-thread runner. Added `#[serial]` matching the convention
+  in `client_server.rs`. nextest sidesteps the race by giving each
+  test its own process; libtest does not. (`3dd5961`)
+- **ci** Switched the workflow from `cargo test --workspace` to
+  `cargo nextest run --workspace` so CI matches our local
+  pre-push pass (each test in its own process, no shared env
+  state). Added a separate `cargo test --doc --workspace` step
+  because nextest does not cover doctests. (`14149f4`)
+- **docs(readme)** Version refs in the install / Cargo.toml
+  snippets bumped from `0.15` to `0.17`, plus a v0.17.0 release
+  blurb. (`70bfcf3`)
+
 ## v0.16.2 — 2026-05-12
 
 Wire-faithful introspection for native PVA PVs registered by IOC code

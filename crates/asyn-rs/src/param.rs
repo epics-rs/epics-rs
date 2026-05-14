@@ -763,6 +763,86 @@ impl ParamList {
     }
 }
 
+/// Flat parameter-group helper — C++ `asynParamSet` equivalent.
+///
+/// C asyn (`asynPortDriver/asynParamSet.h`) defines:
+///
+/// ```cpp
+/// struct asynParam {
+///     const char* name;
+///     asynParamType type;
+///     int* index;
+/// };
+/// class asynParamSet {
+/// protected:
+///     void add(const char* name, asynParamType type, int* index);
+/// public:
+///     std::vector<asynParam> getParamDefinitions();
+/// };
+/// ```
+///
+/// and `asynPortDriver::createParams` (asynPortDriver.cpp:4115-4126)
+/// iterates the vector calling `createParam(name, type, index)` so the
+/// driver subclass gets its int member back-filled.
+///
+/// In Rust we cannot stash a `&mut i32` for the duration of the build,
+/// so the idiomatic equivalent is "register names + types, then run
+/// `create_all` and read back the assigned indices as a Vec keyed by
+/// add-order." Callers persist the returned `Vec<usize>` (or wrap it
+/// in a domain-specific struct) the same way C++ drivers persist
+/// their `int paramIdx` members.
+///
+/// The structure is intentionally a **flat list** — C asyn has no
+/// tree / topology layer for parameter groups; that idea is invented
+/// (see `docs/asyn-missing.md` notes on PVI).
+#[derive(Default, Debug, Clone)]
+pub struct AsynParamSet {
+    defs: Vec<(String, ParamType)>,
+}
+
+impl AsynParamSet {
+    pub fn new() -> Self {
+        Self { defs: Vec::new() }
+    }
+
+    /// Append a parameter definition. Mirrors C++ `asynParamSet::add`.
+    /// Returns the slot index — the position the param will occupy in
+    /// the `Vec<usize>` returned by [`Self::create_all`].
+    pub fn add(&mut self, name: &str, ty: ParamType) -> usize {
+        let slot = self.defs.len();
+        self.defs.push((name.to_string(), ty));
+        slot
+    }
+
+    /// C++ `asynPortDriver::createParams` (asynPortDriver.cpp:4119-4125):
+    /// iterate the definitions in registration order, call
+    /// `createParam` for each, abort with `asynError` on the first
+    /// failure. Returns the assigned indices in the same order as
+    /// [`Self::add`] calls so the caller can recover slot→index
+    /// without name lookup.
+    pub fn create_all(&self, params: &mut ParamList) -> AsynResult<Vec<usize>> {
+        let mut indices = Vec::with_capacity(self.defs.len());
+        for (name, ty) in &self.defs {
+            indices.push(params.create_param(name, *ty)?);
+        }
+        Ok(indices)
+    }
+
+    /// Number of definitions registered. Cheap inspector for tests.
+    pub fn len(&self) -> usize {
+        self.defs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.defs.is_empty()
+    }
+
+    /// Iterate definitions in registration order — read-only view.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, ParamType)> {
+        self.defs.iter().map(|(n, t)| (n.as_str(), *t))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,5 +1220,72 @@ mod tests {
         pl.set_int64(idx, 0, 100).unwrap();
         let changed = pl.take_changed(0).unwrap();
         assert_eq!(changed, vec![idx]);
+    }
+
+    // --- AsynParamSet (C++ asynParamSet equivalent) ---
+
+    #[test]
+    fn asyn_param_set_add_returns_slot_index_in_order() {
+        let mut set = AsynParamSet::new();
+        // C++ `add()` returns void; we expose the slot index so a
+        // Rust caller can recover indices via the Vec returned by
+        // create_all(). Order matters: registration order == slot
+        // order == result-Vec order.
+        assert_eq!(set.add("Temperature", ParamType::Float64), 0);
+        assert_eq!(set.add("Status", ParamType::Int32), 1);
+        assert_eq!(set.add("Tag", ParamType::Octet), 2);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn asyn_param_set_create_all_assigns_indices_in_order() {
+        let mut set = AsynParamSet::new();
+        let temp_slot = set.add("Temperature", ParamType::Float64);
+        let status_slot = set.add("Status", ParamType::Int32);
+        let tag_slot = set.add("Tag", ParamType::Octet);
+
+        let mut pl = ParamList::new(1, false);
+        let indices = set.create_all(&mut pl).unwrap();
+        assert_eq!(indices.len(), 3);
+        assert_eq!(indices[temp_slot], 0);
+        assert_eq!(indices[status_slot], 1);
+        assert_eq!(indices[tag_slot], 2);
+        // ParamList agrees on the names.
+        assert_eq!(pl.find_param("Temperature"), Some(0));
+        assert_eq!(pl.find_param("Status"), Some(1));
+        assert_eq!(pl.find_param("Tag"), Some(2));
+    }
+
+    #[test]
+    fn asyn_param_set_iter_preserves_registration_order() {
+        let mut set = AsynParamSet::new();
+        set.add("A", ParamType::Int32);
+        set.add("B", ParamType::Float64);
+        set.add("C", ParamType::Octet);
+        let names: Vec<&str> = set.iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn asyn_param_set_empty_create_all_is_noop() {
+        let set = AsynParamSet::new();
+        let mut pl = ParamList::new(1, false);
+        let idx = set.create_all(&mut pl).unwrap();
+        assert!(idx.is_empty());
+        assert!(pl.is_empty());
+    }
+
+    #[test]
+    fn asyn_param_set_duplicate_name_returns_existing_index() {
+        // ParamList::create_param returns the existing index on dup
+        // (silent dedup); AsynParamSet inherits that — two add()
+        // calls with the same name resolve to the same final index.
+        // Matches C asyn where createParam dedupes via name_to_index.
+        let mut set = AsynParamSet::new();
+        set.add("X", ParamType::Int32);
+        set.add("X", ParamType::Int32);
+        let mut pl = ParamList::new(1, false);
+        let idx = set.create_all(&mut pl).unwrap();
+        assert_eq!(idx, vec![0, 0]);
     }
 }

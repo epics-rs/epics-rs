@@ -847,6 +847,12 @@ impl RecordInstance {
                     }
                     self.common.out = s;
                     self.parsed_out = parse_link_v2(&self.common.out);
+                    // C `longoutRecord.c::special` (PR #6c573b4 part 2)
+                    // and similar OOCH-style hooks need `after=true`
+                    // to fire after the link has actually moved. The
+                    // earlier `validate_put` + `special(name, false)`
+                    // pair only covered the before-side.
+                    let _ = self.record.special(&name, true);
                 }
             }
             "DTYP" => {

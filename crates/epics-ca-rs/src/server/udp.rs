@@ -164,7 +164,15 @@ async fn run_single_responder(
                 Ok(h) => h,
                 Err(_) => break,
             };
-            let payload_size = align8(hdr.postsize as usize);
+            // C `rsrv/camessage.c:2452` rejects misaligned `m_postsize`.
+            // UDP path drops silently (no error response). Without this
+            // check, the `align8(postsize)` advancement would jump
+            // into the next message's body, mis-parsing chained
+            // SEARCH datagrams.
+            if (hdr.postsize as usize) & 0x7 != 0 {
+                break;
+            }
+            let payload_size = hdr.postsize as usize;
             let msg_len = CaHeader::SIZE + payload_size;
 
             if offset + msg_len > len {

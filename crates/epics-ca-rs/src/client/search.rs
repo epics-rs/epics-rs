@@ -576,7 +576,18 @@ async fn run_nameserver_connection(
                             Ok(v) => v,
                             Err(_) => break,
                         };
-                    let msg_size = hdr_size + align8(hdr.actual_postsize());
+                    let actual_post = hdr.actual_postsize();
+                    // C `tcpiiu.cpp::processIncoming:1198` rejects
+                    // misaligned `m_postsize`. Closing the connection
+                    // is the only safe action — silently rounding up
+                    // (the prior `align8`) would let a hostile name
+                    // server slide our framer into the middle of the
+                    // next message. Break the read loop; the
+                    // surrounding reconnect path will rebuild.
+                    if actual_post & 0x7 != 0 {
+                        break;
+                    }
+                    let msg_size = hdr_size + actual_post;
                     if accumulated.len() - consumed < msg_size {
                         break;
                     }
@@ -833,6 +844,17 @@ fn handle_udp_response(
         let Ok(hdr) = CaHeader::from_bytes(&data[offset..]) else {
             break;
         };
+
+        // C `rsrv/camessage.c:2452` rejects misaligned `m_postsize`.
+        // For UDP (where this loop runs), C silently drops the
+        // datagram without emitting an error — we do the same by
+        // breaking out of the chained-message parse. Without this
+        // guard, the `align8(postsize)` advancement would walk into
+        // the middle of the next message and stale parses would
+        // poison search/beacon state.
+        if (hdr.postsize as usize) & 0x7 != 0 {
+            break;
+        }
 
         match hdr.cmmd {
             CA_PROTO_VERSION => {

@@ -173,9 +173,17 @@ fn header_set_payload_boundary_at_0xfffe() {
 fn header_set_payload_count_boundary_at_0xffff() {
     let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
 
-    // count = 0xFFFF fits in normal form
-    hdr.set_payload_size(100, 0xFFFF);
+    // count = 0xFFFE fits in normal form
+    hdr.set_payload_size(100, 0xFFFE);
     assert!(!hdr.is_extended());
+    assert_eq!(hdr.count, 0xFFFE);
+
+    // count = 0xFFFF triggers extended (C `comQueSend.cpp:285` —
+    // `nElem < 0xffff` is the normal threshold, so exact `0xFFFF`
+    // requires extended form).
+    hdr.set_payload_size(100, 0xFFFF);
+    assert!(hdr.is_extended());
+    assert_eq!(hdr.actual_count(), 0xFFFF);
 
     // count = 0x10000 triggers extended
     hdr.set_payload_size(100, 0x10000);

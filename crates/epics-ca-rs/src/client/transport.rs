@@ -398,7 +398,10 @@ fn process_command(
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = ioid;
-            if count > 0xFFFF {
+            // C parity (`comQueSend.cpp:285`): extended form for
+            // `nElem >= 0xffff`. See `build_read_notify_frame` in
+            // client/mod.rs for the same boundary in the slow path.
+            if count >= 0xFFFF {
                 hdr.set_payload_size(0, count);
             } else {
                 hdr.count = count as u16;
@@ -466,7 +469,9 @@ fn process_command(
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = subid;
-            if count > 0xFFFF {
+            // C parity (`comQueSend.cpp:285`): extended form for
+            // `nElem >= 0xffff`. Same boundary as READ_NOTIFY above.
+            if count >= 0xFFFF {
                 hdr.set_payload_size(16, count);
             } else {
                 hdr.count = count as u16;
@@ -1031,7 +1036,24 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 }
             };
             let actual_post = hdr.actual_postsize();
-            let msg_len = hdr_size + align8(actual_post);
+            // C `tcpiiu.cpp::processIncoming` (line 1198) closes the
+            // connection if `m_postsize & 0x7 != 0`. The wire spec
+            // requires every payload to be 8-byte aligned; an
+            // unaligned postsize is either a malformed peer or an
+            // attempt to push our parser into reading the next
+            // message's header as the tail of this one. Silently
+            // rounding via `align8` (the prior behavior) lets a
+            // malicious server desync our framer. Match C: drop the
+            // connection so the reconnect loop can rebuild from a
+            // clean state.
+            if actual_post & 0x7 != 0 {
+                eprintln!(
+                    "CA: {server_addr}: misaligned payload (postsize={actual_post}), closing"
+                );
+                let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                return;
+            }
+            let msg_len = hdr_size + actual_post;
 
             if offset + msg_len > accumulated.len() {
                 break;

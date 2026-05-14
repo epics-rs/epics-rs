@@ -842,8 +842,33 @@ where
         while offset + CaHeader::SIZE <= accumulated.len() {
             let (hdr, hdr_size) = CaHeader::from_bytes_extended(&accumulated[offset..])?;
             let actual_post = hdr.actual_postsize();
-            let padded_post = align8(actual_post);
-            let msg_len = hdr_size + padded_post;
+            // C `rsrv/camessage.c:2452` rejects misaligned payloads
+            // ("CAS: Missaligned protocol rejected") with an
+            // ECA_INTERNAL error and disconnects the client. Our
+            // previous code silently rounded up via `align8`, which on
+            // a hostile peer would cause us to read into the next
+            // message's header and de-sync the stream. Now: emit
+            // CA_PROTO_ERROR + drop the connection (match C).
+            if actual_post & 0x7 != 0 {
+                tracing::warn!(
+                    peer = %state.peer,
+                    cmmd = hdr.cmmd,
+                    postsize = actual_post,
+                    "CAS: Missaligned protocol rejected"
+                );
+                let _ = send_ca_error(
+                    &writer,
+                    &hdr,
+                    ECA_INTERNAL,
+                    "CAS: Missaligned protocol rejected",
+                )
+                .await;
+                let _ = writer.lock().await.flush().await;
+                return Err(epics_base_rs::error::CaError::Protocol(
+                    "misaligned CA payload".into(),
+                ));
+            }
+            let msg_len = hdr_size + actual_post;
 
             if offset + msg_len > accumulated.len() {
                 break;
@@ -1041,16 +1066,50 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
     match hdr.cmmd {
         CA_PROTO_VERSION => {
             state.client_minor_version = hdr.count;
+            // C `rsrv_version_reply` (camessage.c:2115) emits VERSION
+            // with all fields zero except `m_count = CA_MINOR_PROTOCOL_REVISION`.
+            // The previous Rust defaults (`data_type=1, cid=1`) drifted
+            // from byte-exact parity — C clients only consult `m_count`
+            // (`tcpiiu.cpp::versionRespNotify`) so it was harmless in
+            // practice, but a strict peer or wire trace would diverge.
             let mut resp = CaHeader::new(CA_PROTO_VERSION);
-            resp.data_type = 1;
             resp.count = CA_MINOR_VERSION;
-            resp.cid = 1;
             let mut w = writer.lock().await;
             w.write_all(&resp.to_bytes()).await?;
             // flush deferred to handle_client outer loop (batched)
         }
 
         CA_PROTO_HOST_NAME => {
+            // C `camessage.c::host_name_action` (line ~795 onward)
+            // rejects HOST_NAME messages that arrive after the first
+            // channel has been created — once the client claims any
+            // channel, the host identity is fixed for the connection.
+            // Reuse the same wire response: CA_PROTO_ERROR with
+            // ECA_INTERNAL and a descriptive message.
+            if !state.channels.is_empty() {
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_INTERNAL,
+                    "attempts to use protocol to set host name \
+                     after creating first channel ignored by server",
+                )
+                .await?;
+                return Ok(());
+            }
+            // C `camessage.c:824-825`: `size = strnlen(pName, m_postsize)
+            // + 1; if (size > 512 || size > m_postsize) reject`.
+            // Our `end` here is the string length (null position or
+            // payload end), so `end + 1 > 512` ⇔ `end >= 512`.
+            let end = payload
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(payload.len());
+            if end >= 512 {
+                send_ca_error(writer, hdr, ECA_INTERNAL, "bad (very long) host name").await?;
+                return Ok(());
+            }
+
             // EPICS_CAS_USE_HOST_NAMES (default NO) controls whether we
             // trust the client-supplied hostname for ACF matching. When NO,
             // the peer IP set during accept() is authoritative.
@@ -1058,10 +1117,6 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 epics_base_rs::runtime::env::get_or("EPICS_CAS_USE_HOST_NAMES", "NO")
                     .eq_ignore_ascii_case("YES");
             if trust_client_hostname {
-                let end = payload
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(payload.len());
                 let claimed = String::from_utf8_lossy(&payload[..end]).to_string();
 
                 // Forward-DNS verification: resolve the client-supplied
@@ -1093,10 +1148,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         CA_PROTO_CLIENT_NAME => {
+            // C `camessage.c::client_name_action` rejects CLIENT_NAME
+            // after the first channel has been created (line ~898).
+            if !state.channels.is_empty() {
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_INTERNAL,
+                    "attempts to use protocol to set user name \
+                     after creating first channel ignored by server",
+                )
+                .await?;
+                return Ok(());
+            }
+            // C `camessage.c:911-912`: same 512-byte cap as host name.
             let end = payload
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(payload.len());
+            if end >= 512 {
+                send_ca_error(writer, hdr, ECA_INTERNAL, "a very long user name was specified")
+                    .await?;
+                return Ok(());
+            }
             let raw = String::from_utf8_lossy(&payload[..end]).to_string();
             // When a capability-token verifier is configured AND the
             // payload arrives in `cap:<token>` form, verify the token

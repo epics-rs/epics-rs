@@ -271,7 +271,14 @@ async fn run_beacon_monitor_inner(
             let Ok(hdr) = CaHeader::from_bytes(&buf[offset..len]) else {
                 break;
             };
-            let payload_padded = ((hdr.postsize as usize) + 7) & !7;
+            // C `rsrv/camessage.c:2452` rejects misaligned m_postsize.
+            // UDP path drops silently. Without this check, the
+            // round-up below would advance into the next message's
+            // header bytes.
+            if (hdr.postsize as usize) & 0x7 != 0 {
+                break;
+            }
+            let payload_padded = hdr.postsize as usize;
             let frame_len = (CaHeader::SIZE + payload_padded).max(CaHeader::SIZE);
             // Bail out before advancing if the announced frame
             // length runs past the datagram. Otherwise the

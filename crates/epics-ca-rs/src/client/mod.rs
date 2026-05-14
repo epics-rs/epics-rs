@@ -1142,7 +1142,12 @@ impl CaChannel {
         hdr.data_type = data_type;
         hdr.cid = sid;
         hdr.available = ioid;
-        if count > 0xFFFF {
+        // C parity (`comQueSend.cpp:285`): extended form is needed for
+        // `nElem >= 0xffff`, not just `> 0xffff`. Routing 0xFFFF
+        // through the normal branch would wedge `count = 0xFFFF` into
+        // `m_count` — which a strict peer interprets as an extended
+        // marker with missing annex bytes.
+        if count >= 0xFFFF {
             hdr.set_payload_size(0, count);
         } else {
             hdr.count = count as u16;

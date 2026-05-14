@@ -795,14 +795,18 @@ mod tests {
     /// (the Rust equivalent of `iocshSetError`). Pre-fix the command
     /// printed the error and returned `Ok(Continue)`, so a startup
     /// script silently succeeded. Verifies `execute_script` surfaces
-    /// the rejection as its overall result.
+    /// C `dbLexRoutines.c:1173-1180` parity: dbLoadRecords with a
+    /// duplicate record name of a DIFFERENT record_type must propagate
+    /// Err. Same-name + same-type merges (covered by
+    /// `commands::tests::test_db_load_records_same_type_duplicate_merges_fields`).
     #[test]
-    fn test_db_load_records_duplicate_rejection_propagates() {
+    fn test_db_load_records_different_type_duplicate_propagates() {
         let shell = make_shell();
-        // make_shell already added TEST_REC. Loading a .db with the same
-        // name must hit `add_record` rejection and surface Err.
+        // make_shell already added TEST_REC as an `ai`. Loading a .db
+        // that redefines it as `mbbo` must hit the type-mismatch
+        // branch and surface Err to the script chain.
         let db_path = std::env::temp_dir().join("iocsh_dup_load.db");
-        std::fs::write(&db_path, "record(ai, \"TEST_REC\") {}\n").unwrap();
+        std::fs::write(&db_path, "record(mbbo, \"TEST_REC\") {}\n").unwrap();
         let script_path = std::env::temp_dir().join("iocsh_dup_load.cmd");
         std::fs::write(
             &script_path,
@@ -814,7 +818,7 @@ mod tests {
         let _ = std::fs::remove_file(&script_path);
         assert!(
             result.is_err(),
-            "dbLoadRecords with duplicate record name must propagate Err"
+            "dbLoadRecords with type-mismatched duplicate must propagate Err"
         );
     }
 

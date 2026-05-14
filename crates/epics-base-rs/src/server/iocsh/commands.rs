@@ -929,20 +929,73 @@ fn cmd_db_load_records() -> CommandDef {
             let count = defs.len();
 
             for def in defs {
-                let mut record =
-                    db_loader::create_record(&def.record_type).map_err(|e| format!("{e}"))?;
-                let mut common_fields = Vec::new();
-                db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
-                    .map_err(|e| format!("{e}"))?;
-
                 let added: Result<(), String> = ctx.block_on(async {
-                    if let Err(e) = ctx.db().add_record(&def.name, record).await {
-                        return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
-                    }
+                    // C-parity (dbLexRoutines.c:1170-1188): the SAME
+                    // record name re-loaded with the SAME record_type
+                    // merges fields into the existing instance (the
+                    // standard ADCore convention — simDetector.template
+                    // overrides ColorMode menu choices declared by its
+                    // included NDArrayBase.template). A different
+                    // record_type is fatal. `dbRecordsOnceOnly` global
+                    // is not yet wired; tighten here if/when needed.
+                    let existing = if let Some(rec) = ctx.db().get_record(&def.name).await {
+                        let r = rec.read().await;
+                        let existing_type = r.record.record_type();
+                        if existing_type != def.record_type {
+                            return Err(format!(
+                                "dbLoadRecords: {} record '{}' already exists, can't load {} record",
+                                existing_type, def.name, def.record_type
+                            ));
+                        }
+                        drop(r);
+                        Some(rec)
+                    } else {
+                        None
+                    };
+
+                    let mut common_fields = Vec::new();
+                    let is_merge = existing.is_some();
+                    let rec_arc = if let Some(rec_arc) = existing {
+                        // Merge: apply field overrides directly to the
+                        // existing record instance. Init_record stays
+                        // skipped on merge — it was already run during
+                        // the first load, and re-running would clobber
+                        // state populated by intervening processing.
+                        {
+                            let mut inst = rec_arc.write().await;
+                            if let Err(e) = db_loader::apply_fields(
+                                &mut inst.record,
+                                &def.fields,
+                                &mut common_fields,
+                            ) {
+                                return Err(format!("{e}"));
+                            }
+                        }
+                        rec_arc
+                    } else {
+                        let mut record = db_loader::create_record(&def.record_type)
+                            .map_err(|e| format!("{e}"))?;
+                        if let Err(e) =
+                            db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
+                        {
+                            return Err(format!("{e}"));
+                        }
+                        if let Err(e) = ctx.db().add_record(&def.name, record).await {
+                            return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
+                        }
+                        ctx.db().get_record(&def.name).await.ok_or_else(|| {
+                            format!(
+                                "dbLoadRecords: '{}' vanished between add_record and get_record",
+                                def.name
+                            )
+                        })?
+                    };
 
                     // Register any aliases declared in the record body
                     // (epics-base PR #336). Failures are reported but
                     // don't abort the load — the record is already in.
+                    // For a merge, aliases declared in the new block
+                    // are also registered (C parser appends).
                     for alias in &def.aliases {
                         if let Err(e) = ctx.db().add_alias(alias, &def.name).await {
                             eprintln!(
@@ -952,7 +1005,7 @@ fn cmd_db_load_records() -> CommandDef {
                         }
                     }
 
-                    if let Some(rec_arc) = ctx.db().get_record(&def.name).await {
+                    {
                         let mut instance = rec_arc.write().await;
                         // info(key, value) directives — last write
                         // wins. Populated before common-field application
@@ -999,7 +1052,20 @@ fn cmd_db_load_records() -> CommandDef {
                                 }
                             }
                         }
-                        // TODO: refactor to global two-pass if inter-record init dependencies arise
+                        // TODO: refactor to global two-pass if inter-record init dependencies arise.
+                        // C `iocInit` calls init_record once per record AFTER
+                        // all dbLoadRecords blocks, so init_record always
+                        // sees the final merged field set. Rust shortcuts by
+                        // running init_record inline at dbLoadRecords; on a
+                        // merge we re-run it so the new field values
+                        // (LINR / ESLO / ZRST / ...) take effect in
+                        // convert routines and post-init derived state.
+                        // The cost: stateful records (compress accum,
+                        // first_output_done) get re-initialised. The
+                        // alternative (skip init on merge) silently
+                        // ignored field overrides that affect init —
+                        // worse for typical use.
+                        let _ = is_merge;
                         if let Err(e) = instance.record.init_record(0) {
                             eprintln!("init_record(0) failed for {}: {e}", def.name);
                         }
@@ -1478,6 +1544,113 @@ mod tests {
         let args = parse_args(&[], &cmd.args).unwrap();
         let result = cmd.handler.call(&args, &ctx);
         assert!(matches!(result, Ok(CommandOutcome::Exit)));
+    }
+
+    /// C `dbLexRoutines.c:1170-1188` parity: dbLoadRecords MUST allow
+    /// the same record name to be re-loaded with the SAME record type
+    /// and merge fields into the existing instance. ADCore convention
+    /// (simDetector.template overriding ColorMode menu from the
+    /// included NDArrayBase.template) depends on this.
+    #[test]
+    fn test_db_load_records_same_type_duplicate_merges_fields() {
+        use std::io::Write;
+        let (db, ctx) = make_ctx();
+
+        // Write a tiny .db with the duplicate-record pattern: an mbbo
+        // declared twice, with the second block overriding ZRST.
+        let tmp = tempfile::Builder::new()
+            .suffix(".db")
+            .tempfile()
+            .expect("tempfile");
+        writeln!(
+            tmp.as_file(),
+            r#"
+record(mbbo, "DUP:CM") {{
+    field(DESC, "first")
+    field(ZRST, "Mono")
+    field(ONST, "Bayer")
+}}
+
+record(mbbo, "DUP:CM") {{
+    field(DESC, "second")
+    field(ZRST, "Mono-Override")
+}}
+"#
+        )
+        .expect("write tempfile");
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+        let args = parse_args(&[tmp.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let result = cmd.handler.call(&args, &ctx);
+        assert!(
+            matches!(result, Ok(CommandOutcome::Continue)),
+            "merge-duplicate must succeed; got Err? {}",
+            result.is_err()
+        );
+
+        ctx.block_on(async {
+            let rec = db
+                .get_record("DUP:CM")
+                .await
+                .expect("DUP:CM must be registered exactly once");
+            let inst = rec.read().await;
+            // Last-write-wins: DESC + ZRST should reflect the SECOND
+            // record block. ONST stays from the FIRST block since
+            // the second didn't override it.
+            assert_eq!(inst.common.desc, "second", "second block's DESC must win");
+            assert_eq!(
+                inst.record.get_field("ZRST"),
+                Some(crate::types::EpicsValue::String("Mono-Override".into())),
+                "second block's ZRST must override the first"
+            );
+            assert_eq!(
+                inst.record.get_field("ONST"),
+                Some(crate::types::EpicsValue::String("Bayer".into())),
+                "ONST from first block survives (no override)"
+            );
+        });
+    }
+
+    /// Different record type for the same name is fatal — mirrors C
+    /// `dbLexRoutines.c:1173-1180` "record '%s' already exists, can't
+    /// load %s record".
+    #[test]
+    fn test_db_load_records_different_type_duplicate_rejected() {
+        use std::io::Write;
+        let (db, ctx) = make_ctx();
+        // Pre-register DUP:CM as an `ai`.
+        ctx.block_on(async {
+            db.add_record("DUP:CM", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        });
+        let tmp = tempfile::Builder::new()
+            .suffix(".db")
+            .tempfile()
+            .expect("tempfile");
+        writeln!(
+            tmp.as_file(),
+            r#"
+record(mbbo, "DUP:CM") {{
+    field(ZRST, "Mono")
+}}
+"#
+        )
+        .expect("write tempfile");
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+        let args = parse_args(&[tmp.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        let result = cmd.handler.call(&args, &ctx);
+        match result {
+            Err(e) => assert!(
+                e.contains("already exists, can't load mbbo"),
+                "expected type-mismatch error; got {e}"
+            ),
+            Ok(_) => panic!("different-type duplicate must error, but call succeeded"),
+        }
     }
 
     #[test]

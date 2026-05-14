@@ -535,9 +535,20 @@ impl Record for AoRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // SPC_LINCONV parity (aoRecord.c:242-267): LINR / EGUF / EGUL
+            // are tagged `special(SPC_LINCONV)` in aoRecord.dbd. C path
+            // rebases `eoff = egul` when LINR=LINEAR before invoking the
+            // device-support `special_linconv` callback. Rust soft-channel
+            // ports have no such callback, so the eoff rebase is the only
+            // visible effect. ao has no smoothing, so `init` is not reset
+            // here (mirroring that aoRecord.c does set init=TRUE but never
+            // consumes it from convert()).
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -545,6 +556,9 @@ impl Record for AoRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -552,6 +566,9 @@ impl Record for AoRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -702,5 +719,45 @@ impl Record for AoRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELDS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SPC_LINCONV parity (aoRecord.c:242-267): writing LINR / EGUF / EGUL
+    /// under LINR=LINEAR (2) must rebase `eoff = egul`. Without this fix
+    /// the C path's `eoff = egul` step (which the device-support
+    /// `special_linconv` callback then refines) was silently skipped on
+    /// the Rust port, so a user retuning EGUL via CA put kept the stale
+    /// eoff and computed `RVAL = (val - stale_eoff) / eslo` — the
+    /// hardware ended up driven by a constant offset the operator never
+    /// configured.
+    #[test]
+    fn egul_put_under_linear_rebases_eoff() {
+        let mut rec = AoRecord::default();
+        rec.linr = 2; // LINEAR
+        rec.eoff = 1.5;
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+
+        assert_eq!(rec.eoff, 7.25, "EGUL put under LINEAR must set eoff=egul");
+    }
+
+    /// SLOPE mode (LINR=1) preserves user-configured eoff/eslo across EGUL
+    /// edits — the C path only rebases eoff when LINR == menuConvertLINEAR.
+    #[test]
+    fn egul_put_under_slope_does_not_touch_eoff() {
+        let mut rec = AoRecord::default();
+        rec.linr = 1; // SLOPE
+        rec.eoff = 1.5;
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+
+        assert_eq!(
+            rec.eoff, 1.5,
+            "EGUL put under SLOPE must leave user-configured eoff alone"
+        );
     }
 }

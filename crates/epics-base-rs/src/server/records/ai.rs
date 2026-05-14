@@ -361,9 +361,22 @@ impl Record for AiRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // SPC_LINCONV parity (aiRecord.c:181-200): LINR / EGUF / EGUL
+            // are tagged `special(SPC_LINCONV)` in aiRecord.dbd. Every put
+            // must (1) clear the smoothing-primed flag so the next
+            // process() reprimes the SMOO filter under the new linearisation,
+            // and (2) for LINR=LINEAR rebase `eoff` to `egul` (the C path
+            // sets eoff=egul before calling the device-support
+            // `special_linconv` callback; Rust ports usually don't carry
+            // such a callback, so the eoff-rebase is the only visible
+            // effect for soft-channel records).
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
+                    self.init = false;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -371,6 +384,10 @@ impl Record for AiRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
+                    self.init = false;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -378,6 +395,10 @@ impl Record for AiRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
+                    self.init = false;
+                    if self.linr == 2 {
+                        self.eoff = self.egul;
+                    }
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -498,5 +519,64 @@ impl Record for AiRecord {
 
     fn set_device_did_compute(&mut self, did_compute: bool) {
         self.skip_convert = did_compute;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SPC_LINCONV parity (aiRecord.c:181-200): writing LINR / EGUF / EGUL
+    /// must clear the smoothing-primed flag so the next process() reprimes
+    /// the SMOO filter under the new linearisation. Without this fix the
+    /// SMOO low-pass blended pre-LINR-change and post-LINR-change values
+    /// together, leaking the old engineering unit into the new one for
+    /// every subsequent sample until lcnt or restart cleared it.
+    #[test]
+    fn linr_put_resets_init_flag_for_smoothing_prime() {
+        let mut rec = AiRecord::default();
+        rec.init = true; // simulate post-first-process primed state
+        rec.smoo = 0.5;
+
+        rec.put_field("LINR", EpicsValue::Short(2)).unwrap();
+
+        assert!(
+            !rec.init,
+            "LINR put must clear init so next process reprimes SMOO"
+        );
+    }
+
+    /// SPC_LINCONV parity (aiRecord.c:188-198): in LINR=LINEAR mode, the
+    /// C path rebases `eoff = egul` before invoking the device-support
+    /// `special_linconv` callback. Rust soft-channel ports carry no such
+    /// callback, so the eoff-rebase is the only visible effect — but it
+    /// is the one users actually depend on when retuning LINR or EGUL
+    /// from CA/PVA.
+    #[test]
+    fn egul_put_rebases_eoff_under_linear_mode() {
+        let mut rec = AiRecord::default();
+        rec.linr = 2; // LINEAR
+        rec.eoff = 1.5;
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+
+        assert_eq!(rec.eoff, 7.25, "EGUL put under LINEAR must set eoff=egul");
+        assert_eq!(rec.egul, 7.25);
+    }
+
+    /// SLOPE (LINR=1) preserves user-configured eoff/eslo across EGUL
+    /// edits — the C path only rebases eoff when LINR == menuConvertLINEAR.
+    #[test]
+    fn egul_put_under_slope_mode_does_not_touch_eoff() {
+        let mut rec = AiRecord::default();
+        rec.linr = 1; // SLOPE
+        rec.eoff = 1.5;
+
+        rec.put_field("EGUL", EpicsValue::Double(7.25)).unwrap();
+
+        assert_eq!(
+            rec.eoff, 1.5,
+            "EGUL put under SLOPE must leave user-configured eoff alone"
+        );
     }
 }

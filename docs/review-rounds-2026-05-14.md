@@ -125,3 +125,85 @@ C 에서 EPICS_CAS_SERVER_PORT 는 **UDP+TCP 모두**를 같은 포트로 설정
 
 **상태**: clean (round 2 after `bd9d1c7`)
 
+### 11/161 — `a02c310` feat(records): aai / aao / subArray array record types
+
+**Round 1 defect**: C `subArrayRecord.c` (init_record:103-104, readValue:310-314) clamps `NELM <= MALM` 와 `INDX < MALM`. Rust SubArray put_field 는 `INDX >= 0` 만, NELM 는 positive 검증만 — MALM 비교 없음. INDX=999 / MALM=10 일 때 C 는 9 로 클램프, Rust 는 999 그대로 → 디바이스 슬라이싱이 소스 배열 끝 너머 읽음.
+
+**Fix**: 본 라운드 — `INDX min(malm-1)`, `NELM min(malm)` 클램프 + MALM put 시 NELM/INDX 재클램프 (C init guard 와 일치).
+
+**상태**: clean (round 2 after fix `0d99c44` — pending verification)
+
+### 12/161 — `ac92e3e` feat(ca,base): SIMM=RAW path + dbServerStats counter expansion
+
+**Round 1 defect**: C `aiRecord.c:495` SIMM=RAW: `rval = (long)floor(sval)` — floor toward -∞. Rust `convert_to(Long)` 는 `f64 as i32` truncation toward zero. 음수 RAW (bipolar ADC) 에서 sval=-1.5 → C: -2, Rust: -1. Silent 값 다름.
+
+**Fix**: 본 라운드 — SIMM=RAW 경로의 Double/Float→Long/Int64 narrowing 만 `.floor() as i32/i64` 로 변경 (다른 convert_to 호출은 영향 없음).
+
+**상태**: clean (round 2 after fix — pending hash)
+
+### 13/161 — `ec739d9` docs: annotate upstream-tracking with per-item implementation status
+
+**검토**: 순수 docs.
+
+**상태**: clean (round 1)
+
+### 14/161 — `97300ce` feat(records,base): bi Raw Soft Channel routes INP to RVAL + applies MASK
+
+**검토**: C `devBiSoftRaw.c::readLocked:50-55` 는 `dbGetLink(DBR_ULONG, &rval)` + `rval &= mask`. Rust `bi.rs::apply_raw_input:204-209` 는 `to_f64() as i32` + `rval &= mask`. 일반 single-bit mask 에선 동등. Edge case: u32 high-bit (>=0x80000000) 인 값은 f64 intermediary 가 i32 negative 로 해석.
+
+**상태**: clean (round 1, u32 high-bit edge-case note)
+
+### 15/161 — `366b707` feat(iocsh): iocshLoad command + multiline backslash continuations
+
+**C ref**: epics-base Issue #847 (`iocsh.cpp::iocshLoad`:1340-1346 → iocshBody with macros). C++ paren form `iocshLoad("path","K=V,N=2")` 도 정상 작동.
+
+**검토**: Rust `execute_script_with_macros` 가 line별 `substitute_macros` + `tokenize` 의 env expand 2단계. `tokenize::split_comma_args` quote-aware → C++ paren form 의 macros 문자열 내 콤마도 정확히 보존. `join_backslash_continuations` 가 trailing `\\n` 잇기. macros vs env 우선순위 (C MAC_HANDLE 와 동일하게 macros 먼저).
+
+**상태**: clean (round 1)
+
+### 16/161 — `c8c3284` fix(iocsh): dbLoadRecords propagates add_record rejection (144f975)
+
+**검토**: `return Err(e)` 만 추가 — `execute_script` 의 last_err 체인이 받음. C `iocshSetError` 와 시맨틱 동등.
+
+**상태**: clean (round 1)
+
+### 17/161 — `e77358b` fix(ca,pva): guard CLI timeout against NaN/Inf/non-positive (1655d68e analog)
+
+**검토**: caget/cainfo/camonitor/caput 4 도구 모두 `cli::timeout_duration` 경유. NaN/Inf/≤0 → DEFAULT clamp (CA 1.0s 는 C `tool_lib.h:51 DEFAULT_TIMEOUT 1.0` 일치). C 1655d68e (RTEMS-osdEvent) 는 NaN→`RTEMS_NO_TIMEOUT` (wait forever) 인데 본 커밋은 fail-fast — commit msg 가 "analog" (mirror 아님) 라고 의도 표명.
+
+**상태**: clean (round 1, intentional analog deviation)
+
+### 18/161 — `f3341e5` docs(upstream-tracking): mark already-implemented and eliminated items
+
+**상태**: clean (pure docs)
+
+### 19/161 — `c7b2242` docs: mark iocsh tokenizer sentinel bug as ALREADY (3dbc9ea2)
+
+**상태**: clean (pure docs)
+
+### 20/161 — `b62fbcf` docs: mark callbackSetQueueSize sanity check as N/A (baa4cb54)
+
+**상태**: clean (pure docs)
+
+### 21/161 — `a9b3ddb` docs: mark caget DBR_INT→SHORT cast as N/A (PR #629)
+
+**상태**: clean (pure docs)
+
+### 22/161 — `8b4e30e` feat(iocsh): dbgf escapes non-printable bytes in CHAR arrays (dc70dfd6)
+
+**검토**: C `epicsStrnEscapedFromRaw` (epicsString.c:135-154) 와 비교 — Rust 는 `\0`, `\'` 두 케이스 short-form 미적용 (각각 `\x00`, raw `'` 출력). commit msg 자체에 "exactly enough for the dbgf use case" 라고 명시. 의미 손실 없는 display 차이.
+
+**상태**: clean (round 1, minor display divergence note)
+
+### 23/161 — `9eb4d48` feat(iocsh): skip rustyline interactive setup on non-TTY stdin (PR #848)
+
+**검토**: `IsTerminal::is_terminal()` 가 C `isatty(0)` 와 동등. piped 분기는 `BufRead::lines()` 로 prompt 없이 read. PR #848 시맨틱 일치.
+
+**상태**: clean (round 1)
+
+### 24-44/161 — pure docs (21 commits): `6909b2b`, `d73a060`, `7a40ec9`, `0bad7f6`, `ce08396`, `8ac5c68`, `1d75744`, `57bcf92`, `7dce27f`, `6fc5185`, `9f8b9b4`, `93236e3`, `a908386`, `7d72d72`, `ee02b30`, `eda6621`, `28f7717`, `c835efd`, `c9c1e14`, `74daeb5`, `f876f08`
+
+모두 upstream-tracking doc status markers (ALREADY / N/A / DEFERRED). 코드 변경 없음.
+
+**상태**: clean (pure docs, all 21)
+

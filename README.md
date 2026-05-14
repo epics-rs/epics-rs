@@ -40,17 +40,22 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
-**Current release: v0.15.0** — closes five Layer-2 feature-map gaps with
-end-to-end fixes (`DBR_CLASS_NAME`, `CaChannel::search_attempts`,
-`PvaClient::pvput_build`, per-client `ca_add_exception_event`,
-`$(VAR)` expansion across every PVA path/addr env field). See
+**Current release: v0.17.0** — 192-commit upstream-features release.
+Closes the asyn-rs C-source audit (drvAsynIPServerPort, RS485,
+Prologix GPIB, USBTMC/VXI-11 scaffolds, asyn:FIFO, ai LINEAR ESLO/EOFF
+from getBounds, asynMask SHFT propagation), PVA IPv6 stages 1-6,
+server-side channel filter wire-through, and 13 record/processing/
+filter C-parity fixes from a commit-by-commit C-source review.
+Wire-protocol breaking changes: `alarm_status` and `menuCompressALG`
+enum tables renumbered to match the C reference (Rust↔C mixed
+deployments must update together). See
 [`CHANGELOG.md`](./CHANGELOG.md) for the full list.
 
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.15", features = ["ad"] }
+epics-rs = { version = "0.17", features = ["ad"] }
 ```
 
 This single dependency pulls in everything needed. In your code:
@@ -81,14 +86,14 @@ use epics_rs::asyn;        // port driver framework
 | `optics` | Optics (table, monochromator, slit, filter, BPM) | no |
 | `full` | Everything above | no |
 
-> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.15"` directly when needed.
+> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.17"` directly when needed.
 
 ```toml
 # Motor + areaDetector
-epics-rs = { version = "0.15", features = ["motor", "ad"] }
+epics-rs = { version = "0.17", features = ["motor", "ad"] }
 
 # Everything
-epics-rs = { version = "0.15", features = ["full"] }
+epics-rs = { version = "0.17", features = ["full"] }
 ```
 
 ### Individual Crates
@@ -97,8 +102,8 @@ You can also depend on sub-crates directly if you only need specific functionali
 
 ```toml
 [dependencies]
-ad-plugins-rs = "0.15"  # just the areaDetector plugins
-epics-base-rs = "0.15"  # just the IOC runtime
+ad-plugins-rs = "0.17"  # just the areaDetector plugins
+epics-base-rs = "0.17"  # just the IOC runtime
 ```
 
 ## Workspace Structure
@@ -350,11 +355,11 @@ either way.
 ```toml
 [dependencies]
 # Client + server, both protocols (recommended for new projects):
-epics-rs = { version = "0.15", features = ["pva"] }   # ca enabled by default
+epics-rs = { version = "0.17", features = ["pva"] }   # ca enabled by default
 
 # Or per-protocol, no umbrella:
-epics-ca-rs  = "0.15"
-epics-pva-rs = "0.15"
+epics-ca-rs  = "0.17"
+epics-pva-rs = "0.17"
 ```
 
 Standard EPICS environment variables (`EPICS_CA_ADDR_LIST` /

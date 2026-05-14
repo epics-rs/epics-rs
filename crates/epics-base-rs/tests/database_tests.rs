@@ -708,7 +708,11 @@ async fn test_sdis_disable_skips_process() {
 
     let rec = db.get_record("TARGET").await.unwrap();
     let inst = rec.read().await;
-    assert_eq!(inst.common.stat, 14);
+    // C `menuAlarmStat.dbd`: DISABLE = 18.
+    assert_eq!(
+        inst.common.stat,
+        epics_base_rs::server::recgbl::alarm_status::DISABLE_ALARM
+    );
     assert_eq!(inst.common.sevr, AlarmSeverity::Minor);
 
     drop(inst);
@@ -722,7 +726,10 @@ async fn test_sdis_disable_skips_process() {
 
     let rec = db.get_record("TARGET").await.unwrap();
     let inst = rec.read().await;
-    assert_ne!(inst.common.stat, 14);
+    assert_ne!(
+        inst.common.stat,
+        epics_base_rs::server::recgbl::alarm_status::DISABLE_ALARM
+    );
 }
 
 #[tokio::test]

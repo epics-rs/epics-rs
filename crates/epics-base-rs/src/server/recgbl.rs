@@ -1,26 +1,33 @@
 use crate::server::record::{AlarmSeverity, CommonFields};
 
-/// Alarm status codes matching EPICS base.
+/// Alarm status codes matching EPICS base's `menuAlarmStat.dbd` /
+/// `epicsAlarmCondition` (libcom/src/misc/alarm.h) wire format. The
+/// numeric values are baked into the CA wire protocol's `stat` byte,
+/// so they MUST match C — a Rust IOC sending `LINK_ALARM = 13` would
+/// be decoded by a C client as `SCAN` (which is 13 in C).
 pub mod alarm_status {
     pub const NO_ALARM: u16 = 0;
-    pub const HIGH_ALARM: u16 = 1;
-    pub const LOW_ALARM: u16 = 2;
+    pub const READ_ALARM: u16 = 1;
+    pub const WRITE_ALARM: u16 = 2;
     pub const HIHI_ALARM: u16 = 3;
-    pub const LOLO_ALARM: u16 = 4;
-    pub const STATE_ALARM: u16 = 5;
-    pub const COS_ALARM: u16 = 6;
-    pub const READ_ALARM: u16 = 7;
-    pub const WRITE_ALARM: u16 = 8;
+    pub const HIGH_ALARM: u16 = 4;
+    pub const LOLO_ALARM: u16 = 5;
+    pub const LOW_ALARM: u16 = 6;
+    pub const STATE_ALARM: u16 = 7;
+    pub const COS_ALARM: u16 = 8;
     pub const COMM_ALARM: u16 = 9;
     pub const TIMEOUT_ALARM: u16 = 10;
     pub const HW_LIMIT_ALARM: u16 = 11;
-    pub const SCAN_ALARM: u16 = 12;
-    pub const LINK_ALARM: u16 = 13;
-    pub const DISABLE_ALARM: u16 = 14;
-    pub const SIMM_ALARM: u16 = 15;
-    pub const SOFT_ALARM: u16 = 16;
+    pub const CALC_ALARM: u16 = 12;
+    pub const SCAN_ALARM: u16 = 13;
+    pub const LINK_ALARM: u16 = 14;
+    pub const SOFT_ALARM: u16 = 15;
+    pub const BAD_SUB_ALARM: u16 = 16;
     pub const UDF_ALARM: u16 = 17;
-    pub const CALC_ALARM: u16 = 18;
+    pub const DISABLE_ALARM: u16 = 18;
+    pub const SIMM_ALARM: u16 = 19;
+    pub const READ_ACCESS_ALARM: u16 = 20;
+    pub const WRITE_ACCESS_ALARM: u16 = 21;
 }
 
 /// Event mask bits for monitor posting (matches EPICS DBE_*).

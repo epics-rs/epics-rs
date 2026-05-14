@@ -749,7 +749,11 @@ fn test_lcnt_alarm_threshold() {
     }
     assert!(instance.common.lcnt >= 10);
     assert_eq!(instance.common.sevr, AlarmSeverity::Invalid);
-    assert_eq!(instance.common.stat, 12); // SCAN_ALARM
+    // C `menuAlarmStat.dbd`: SCAN_ALARM = 13.
+    assert_eq!(
+        instance.common.stat,
+        epics_base_rs::server::recgbl::alarm_status::SCAN_ALARM
+    );
 }
 
 #[test]

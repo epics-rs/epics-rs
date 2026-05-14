@@ -1,123 +1,143 @@
-//! Averaging device interfaces (asyn Issue #30).
+//! Averaging device-support helper — matches C asyn's `*Average` DTYP variants.
 //!
-//! Mirror of C asyn's `asynInt32Average` / `asynFloat64Average`. A
-//! driver registering these interfaces accumulates samples internally
-//! and exposes an averaged readback on demand:
+//! ## C reference
 //!
-//! - `read_*_average(user)` returns the mean of every sample the
-//!   driver has buffered since the previous read AND clears the
-//!   accumulator (sample-and-reset semantic — matches C asyn).
-//! - `read_*_average_peek(user)` returns the mean without clearing,
-//!   for clients that want to observe the rolling average without
-//!   disturbing the next caller's window.
+//! C asyn has **no separate `asynInt32Average` interface**. The
+//! `"asynInt32Average"` DTYP variant uses the regular `asynInt32`
+//! interface; averaging is done on the device-support side inside
+//! `interruptCallbackAverage` (`devAsynInt32.c:647-702`). The state is
+//! just two scalars in `devPvt`:
 //!
-//! Records that use this interface (typically an `ai` with
-//! `DTYP="asynInt32Average"`) get a fresh window-mean on every
-//! process cycle — useful for hardware oversampling drivers that
-//! tick faster than the record scan rate.
+//! ```c
+//! double sum;       // devAsynInt32.c:98
+//! int    numAverage;
+//! ```
 //!
-//! ## Implementation notes
+//! Every interrupt callback does:
 //!
-//! - The interface trait is intentionally small: just `read` +
-//!   `peek` + `reset`. Drivers maintain their own buffer; helpers
-//!   below provide a ready-to-use `RingAverager<T>` for the common
-//!   case (fixed-size circular buffer, drop oldest sample on full).
-//! - `f64` is the canonical accumulator type because it can hold an
-//!   `i32` sample range without precision loss and the mean
-//!   computation is one floating-point divide regardless of the
-//!   stored type.
+//! ```c
+//! pPvt->numAverage++;
+//! pPvt->sum += (double)value;
+//! if (numAverage >= SVAL) {
+//!     dval = sum / numAverage;     // arithmetic mean
+//!     dval += (sum > 0.0) ? 0.5 : -0.5;  // round-to-nearest for Int32
+//!     pPvt->numAverage = 0;
+//!     pPvt->sum = 0.;
+//! }
+//! ```
+//!
+//! No bounded buffer, no drop-on-overflow, no oldest-sample eviction —
+//! the accumulator simply grows in sum/count terms until the SVAL
+//! threshold fires the mean computation and the reset.
+//!
+//! ## What this module provides
+//!
+//! [`SumAverager`] — a `(sum: f64, count: u64)` pair with the same
+//! accumulate-then-reset semantic, available to Rust drivers that
+//! want to mirror the C behaviour without re-implementing the
+//! arithmetic. The interface is intentionally type-agnostic
+//! (`push(sample: f64)`) so the same struct serves both Int32Average
+//! and Float64Average DTYP equivalents.
+//!
+//! No trait surface is exposed: drivers that need the averaged
+//! readback simply call `read_and_reset()` from their normal
+//! `read_int32` / `read_float64` implementation when the DTYP is the
+//! `*Average` variant — same as C devAsynInt32.
 
-use crate::error::AsynResult;
-use crate::user::AsynUser;
-use std::collections::VecDeque;
 use std::sync::Mutex;
 
-/// `asynInt32Average` interface — averages i32 samples, returns f64.
-pub trait AsynInt32Average: Send + Sync {
-    /// Return the mean of buffered samples and clear the accumulator.
-    /// Returns `0.0` for an empty buffer (canonical C asyn behaviour;
-    /// callers can distinguish "no data" via `peek_count` if needed).
-    fn read_int32_average(&mut self, user: &AsynUser) -> AsynResult<f64>;
-
-    /// Return the mean without clearing the accumulator. Idempotent
-    /// — multiple peeks between reads yield the same value.
-    fn peek_int32_average(&self, user: &AsynUser) -> AsynResult<f64>;
-
-    /// How many samples are currently buffered.
-    fn peek_count(&self, user: &AsynUser) -> AsynResult<usize>;
-
-    /// Drop every buffered sample without computing a mean. Useful
-    /// when an operator wants to start a fresh averaging window
-    /// without taking the sample-and-reset side-effect on a read.
-    fn reset_average(&mut self, user: &AsynUser) -> AsynResult<()>;
+/// Sum-and-count averager. Matches C `devPvt.sum` + `devPvt.numAverage`
+/// algorithm from `devAsynInt32.c:98-99`.
+///
+/// Locking is internal so the same instance can be shared across the
+/// async interrupt callback and the synchronous record-process path
+/// without external synchronisation.
+pub struct SumAverager {
+    state: Mutex<AverState>,
 }
 
-/// `asynFloat64Average` interface — averages f64 samples, returns f64.
-pub trait AsynFloat64Average: Send + Sync {
-    fn read_float64_average(&mut self, user: &AsynUser) -> AsynResult<f64>;
-    fn peek_float64_average(&self, user: &AsynUser) -> AsynResult<f64>;
-    fn peek_count(&self, user: &AsynUser) -> AsynResult<usize>;
-    fn reset_average(&mut self, user: &AsynUser) -> AsynResult<()>;
+#[derive(Default)]
+struct AverState {
+    sum: f64,
+    count: u64,
 }
 
-/// Reusable fixed-size circular sample buffer for drivers that want
-/// the canonical "accumulate, drop oldest on full" averaging behavior.
-/// Generic over the sample type — both `i32` and `f64` work via
-/// `Into<f64>` for the mean computation.
-pub struct RingAverager<T: Copy + Into<f64>> {
-    samples: Mutex<VecDeque<T>>,
-    capacity: usize,
+impl Default for SumAverager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl<T: Copy + Into<f64>> RingAverager<T> {
-    pub fn new(capacity: usize) -> Self {
+impl SumAverager {
+    pub fn new() -> Self {
         Self {
-            samples: Mutex::new(VecDeque::with_capacity(capacity)),
-            capacity: capacity.max(1),
+            state: Mutex::new(AverState::default()),
         }
     }
 
-    /// Append a sample. When the buffer is full the oldest sample is
-    /// dropped — matching C asyn's drop-on-overflow policy.
-    pub fn push(&self, sample: T) {
-        let mut g = self.samples.lock().unwrap();
-        if g.len() >= self.capacity {
-            g.pop_front();
-        }
-        g.push_back(sample);
+    /// Accumulate one sample. C: `numAverage++; sum += (double)value;`
+    /// (`devAsynInt32.c:665-666`).
+    pub fn push(&self, sample: f64) {
+        let mut s = self.state.lock().unwrap();
+        s.sum += sample;
+        s.count += 1;
     }
 
-    /// Return the mean and clear the buffer.
+    /// Return the arithmetic mean and clear sum/count.
+    /// Empty accumulator returns `0.0` (matches C — the threshold
+    /// check `numAverage >= SVAL` prevents zero-divide; if a caller
+    /// pulls before any sample has arrived, the natural value is 0).
     pub fn read_and_reset(&self) -> f64 {
-        let mut g = self.samples.lock().unwrap();
-        let m = compute_mean(&g);
-        g.clear();
+        let mut s = self.state.lock().unwrap();
+        let m = if s.count == 0 {
+            0.0
+        } else {
+            s.sum / s.count as f64
+        };
+        s.sum = 0.0;
+        s.count = 0;
         m
     }
 
-    /// Return the mean without clearing.
+    /// Same mean computation without clearing — useful for diagnostics.
     pub fn peek(&self) -> f64 {
-        let g = self.samples.lock().unwrap();
-        compute_mean(&g)
+        let s = self.state.lock().unwrap();
+        if s.count == 0 {
+            0.0
+        } else {
+            s.sum / s.count as f64
+        }
     }
 
-    /// Current sample count (≤ capacity).
-    pub fn count(&self) -> usize {
-        self.samples.lock().unwrap().len()
+    /// Current sample count.
+    pub fn count(&self) -> u64 {
+        self.state.lock().unwrap().count
     }
 
-    /// Drop every buffered sample.
+    /// Drop accumulated samples without computing a mean.
     pub fn reset(&self) {
-        self.samples.lock().unwrap().clear();
+        let mut s = self.state.lock().unwrap();
+        s.sum = 0.0;
+        s.count = 0;
     }
-}
 
-fn compute_mean<T: Copy + Into<f64>>(q: &VecDeque<T>) -> f64 {
-    if q.is_empty() {
-        return 0.0;
+    /// Apply C's round-to-nearest for Int32 conversion
+    /// (`devAsynInt32.c:680` — `dval += (sum>0.0) ? 0.5 : -0.5`),
+    /// then truncate. Useful when the consuming record is an
+    /// `aiRecord` reading an averaged Int32 channel.
+    pub fn read_and_reset_int32(&self) -> i32 {
+        let mut s = self.state.lock().unwrap();
+        let n = s.count;
+        let sum = s.sum;
+        s.sum = 0.0;
+        s.count = 0;
+        if n == 0 {
+            return 0;
+        }
+        let mut dval = sum / n as f64;
+        dval += if sum > 0.0 { 0.5 } else { -0.5 };
+        dval as i32
     }
-    let sum: f64 = q.iter().map(|s| (*s).into()).sum();
-    sum / q.len() as f64
 }
 
 #[cfg(test)]
@@ -125,58 +145,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ring_int32_mean_of_window() {
-        let r: RingAverager<i32> = RingAverager::new(8);
-        for v in [10, 20, 30, 40] {
-            r.push(v);
+    fn mean_of_four_samples() {
+        let a = SumAverager::new();
+        for v in [10.0, 20.0, 30.0, 40.0] {
+            a.push(v);
         }
-        assert_eq!(r.count(), 4);
-        assert!((r.peek() - 25.0).abs() < 1e-9);
-        // Reading must clear.
-        assert!((r.read_and_reset() - 25.0).abs() < 1e-9);
-        assert_eq!(r.count(), 0);
-        // Empty mean is 0.0 (canonical C asyn behaviour).
-        assert_eq!(r.peek(), 0.0);
-        assert_eq!(r.read_and_reset(), 0.0);
+        assert_eq!(a.count(), 4);
+        assert!((a.peek() - 25.0).abs() < 1e-9);
+        assert!((a.read_and_reset() - 25.0).abs() < 1e-9);
+        assert_eq!(a.count(), 0);
     }
 
     #[test]
-    fn ring_drops_oldest_on_overflow() {
-        let r: RingAverager<i32> = RingAverager::new(3);
-        for v in [1, 2, 3, 4, 5] {
-            r.push(v);
+    fn empty_returns_zero_mean() {
+        let a = SumAverager::new();
+        assert_eq!(a.peek(), 0.0);
+        assert_eq!(a.read_and_reset(), 0.0);
+    }
+
+    #[test]
+    fn accumulator_unbounded_no_drop_on_overflow() {
+        // C asyn does NOT drop samples — sum/count grow until reset.
+        // Verify the sum reflects every push (not a bounded window).
+        let a = SumAverager::new();
+        for v in 1..=100 {
+            a.push(v as f64);
         }
-        assert_eq!(r.count(), 3);
-        // window is now [3, 4, 5] → mean 4.0
-        assert!((r.peek() - 4.0).abs() < 1e-9);
+        assert_eq!(a.count(), 100);
+        // Sum of 1..=100 = 5050 → mean 50.5
+        assert!((a.peek() - 50.5).abs() < 1e-9);
     }
 
     #[test]
-    fn ring_float64_mean() {
-        let r: RingAverager<f64> = RingAverager::new(4);
-        for v in [1.0, 2.0, 3.0] {
-            r.push(v);
-        }
-        assert!((r.peek() - 2.0).abs() < 1e-9);
-        assert!((r.read_and_reset() - 2.0).abs() < 1e-9);
+    fn read_and_reset_int32_rounds_positive() {
+        // C: dval += (sum>0) ? 0.5 : -0.5 → 25.49 + 0.5 = 25.99 → 25
+        //                                  25.51 + 0.5 = 26.01 → 26
+        let a = SumAverager::new();
+        a.push(25.0);
+        a.push(26.0);
+        // mean = 25.5 → 25.5 + 0.5 = 26.0 → 26
+        assert_eq!(a.read_and_reset_int32(), 26);
     }
 
     #[test]
-    fn reset_does_not_consume_or_compute_mean() {
-        let r: RingAverager<i32> = RingAverager::new(4);
-        r.push(100);
-        r.push(200);
-        r.reset();
-        assert_eq!(r.count(), 0);
-        assert_eq!(r.peek(), 0.0);
+    fn read_and_reset_int32_rounds_negative() {
+        let a = SumAverager::new();
+        a.push(-25.0);
+        a.push(-26.0);
+        // mean = -25.5 → -25.5 - 0.5 = -26.0 → -26
+        assert_eq!(a.read_and_reset_int32(), -26);
     }
 
     #[test]
-    fn zero_capacity_is_clamped_to_one() {
-        // RingAverager(0) → still functions with capacity=1 (no panic).
-        let r: RingAverager<i32> = RingAverager::new(0);
-        r.push(99);
-        assert_eq!(r.count(), 1);
-        assert!((r.peek() - 99.0).abs() < 1e-9);
+    fn read_and_reset_int32_empty_returns_zero() {
+        let a = SumAverager::new();
+        assert_eq!(a.read_and_reset_int32(), 0);
+    }
+
+    #[test]
+    fn reset_clears_without_computing() {
+        let a = SumAverager::new();
+        a.push(100.0);
+        a.push(200.0);
+        a.reset();
+        assert_eq!(a.count(), 0);
+        assert_eq!(a.peek(), 0.0);
     }
 }

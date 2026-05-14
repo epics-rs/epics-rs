@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use super::{
     ArrayFilter, ArrayFilterConfig, DeadbandFilter, DeadbandMode, DecimateFilter, FilterChain,
-    SubscriptionFilter, TimestampFilter,
+    SubscriptionFilter,
 };
 
 /// Result of splitting a raw CA/PVA channel name into its three
@@ -104,11 +104,61 @@ fn build_filter(name: &str, cfg: &serde_json::Value) -> Option<Arc<dyn Subscript
     match name {
         "dbnd" => build_dbnd(cfg),
         "arr" => build_arr(cfg),
-        "ts" => Some(Arc::new(TimestampFilter::new())),
+        "ts" => build_ts(cfg),
         "dec" => build_decimate(cfg),
         "sync" => build_sync(cfg),
         _ => None,
     }
+}
+
+/// C `ts.c` JSON schema:
+/// * `{"ts":{}}` — default Generate mode.
+/// * `{"ts":{"num":"dbl"|"sec"|"nsec"|"ts","epoch":"epics"|"unix"}}` —
+///   numeric / array output, optional epoch override.
+/// * `{"ts":{"str":"epics"}}` — formatted string output.
+fn build_ts(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
+    use super::ts::{TimestampFilter, TsEpoch, TsMode};
+    let Some(obj) = cfg.as_object() else {
+        // Bare `{"ts":{}}` decodes as an empty Map → build_filter
+        // routes here with an object. `as_object()` only fails on
+        // non-object cfg (e.g. `{"ts":42}`) which we skip with warn.
+        return None;
+    };
+    // String mode wins over numeric — C `parse_finished` sets
+    // `mode = tsModeString` whenever `str` is provided.
+    if let Some(s) = obj.get("str").and_then(|v| v.as_str()) {
+        match s {
+            "epics" => return Some(Arc::new(TimestampFilter::with_mode(TsMode::StringEpics))),
+            // `iso` is documented in C but its tsStringIso path is
+            // gated on MSVC and treated as identical to epics on
+            // non-Windows. Fall back to the EPICS format.
+            "iso" => return Some(Arc::new(TimestampFilter::with_mode(TsMode::StringEpics))),
+            _ => {
+                tracing::warn!(value = %s, "unknown ts `str` value; ignoring");
+                return None;
+            }
+        }
+    }
+    let epoch = match obj.get("epoch").and_then(|v| v.as_str()) {
+        Some("unix") => TsEpoch::Unix,
+        Some("epics") | None => TsEpoch::Epics,
+        Some(other) => {
+            tracing::warn!(value = %other, "unknown ts `epoch` value; defaulting to epics");
+            TsEpoch::Epics
+        }
+    };
+    let mode = match obj.get("num").and_then(|v| v.as_str()) {
+        None => TsMode::Generate,
+        Some("dbl") => TsMode::Double,
+        Some("sec") => TsMode::Seconds,
+        Some("nsec") => TsMode::Nanoseconds,
+        Some("ts") => TsMode::Array,
+        Some(other) => {
+            tracing::warn!(value = %other, "unknown ts `num` value; defaulting to Generate");
+            TsMode::Generate
+        }
+    };
+    Some(Arc::new(TimestampFilter::with_mode_epoch(mode, epoch)))
 }
 
 fn build_dbnd(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {

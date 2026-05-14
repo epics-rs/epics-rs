@@ -38,6 +38,14 @@ ftdi-mpsse = []
 # follow-up PR once a use case lands.
 usbtmc = []
 
+# Opt-in VXI-11 hardware support. Without this flag the
+# `drivers::vxi11::DrvVxi11Port` scaffold compiles cleanly but
+# `connect()` errors with a "feature not enabled" message. The ONC
+# RPC `create_link` / `device_write` / `device_read` /
+# `destroy_link` plumbing belongs in a follow-up PR (`onc-rpc` or
+# `sunrpc` crate).
+vxi11 = []
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

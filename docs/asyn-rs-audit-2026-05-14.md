@@ -101,19 +101,19 @@
 |---|---|---|---|
 | W1 #19 | TCP&/UDP&/UDP* swap fix | ✅ done | `9ff5659` |
 | W2 #20 | asynSetTrace*Mask 토큰 이름 | ✅ done | `9691605` |
-| W3 #21 | FTDI 9 positional iocshArg | ⏳ pending | — |
-| I1 #22 | UInt64/UInt64Array — invented 표기 또는 제거 | ⏳ pending | — |
-| I2 #23 | Average algorithm fix (sum+numAverage) | ⏳ pending | — |
-| I3 #24 | SO_REUSEPORT server 토큰 제거 | ⏳ pending | — |
+| W3 #21 | FTDI 9 positional iocshArg | ✅ done | `5d2253c` |
+| I1 #22 | UInt64/UInt64Array — invented 표기 또는 제거 | ✅ done | `2bbbb45` |
+| I2 #23 | Average algorithm fix (sum+numAverage) | ✅ done | `7befd0e` |
+| I3 #24 | SO_REUSEPORT server 토큰 제거 | ✅ done | `1ec01f3` |
 | I4 #25 | ASYN_TRACE_STATE 0x40 비트 제거 | ✅ done | `9691605` (W2 와 함께) |
-| P1 #26 | RS485 5 키 + struct serial_rs485 + getOption | ⏳ pending | — |
-| P2 #27 | hostInfo protocol 갱신 | ⏳ pending | — |
-| P3 #28 | TCP server child port 모델 | ⏳ pending | — |
-| P4 #29 | asyn:READBACK info-tag 자동 인식 | ⏳ pending | — |
-| P5 #30 | 초기값 동기화 input 제거 | ⏳ pending | — |
-| P6 #31 | lsi/lso/printf 어댑터 | ⏳ pending | — |
-| P7 #32 | ASYN_DESTRUCTIBLE shutdown lifecycle | ⏳ pending | — |
-| P8 #33 | EOS connect-wait 정책 | ⏳ pending | — |
-| P9 #34 | asynMask shift computeShift + right-align | ⏳ pending | — |
+| P1 #26 | RS485 5 키 + struct serial_rs485 + getOption | ✅ done | `38e7743` |
+| P2 #27 | hostInfo protocol 갱신 | ✅ done | `40fa1d0` |
+| P3 #28 | TCP server child port 모델 | ✅ done | `1e2716a` |
+| P4 #29 | asyn:READBACK info-tag 자동 인식 | ✅ done | `f2370af` |
+| P5 #30 | 초기값 동기화 input 제거 | ✅ done | `4b6e2f7` |
+| P6 #31 | lsi/lso/printf 어댑터 | ✅ done | `55dc8fd` |
+| P7 #32 | ASYN_DESTRUCTIBLE shutdown lifecycle | ✅ done | `a20aede` |
+| P8 #33 | EOS connect-wait 정책 | ✅ done | `726ddba` |
+| P9 #34 | asynMask shift computeShift + right-align | ✅ done | `e96561b` |
 
-**진행 요약**: 16 항목 중 3 완료 (W1, W2, I4), 13 pending. 다음 세션에서 W3 부터 재개 권장 — 남은 항목별 C source 인용 + Rust 위치는 위 분류 섹션에 모두 기록됨.
+**진행 요약**: 16 / 16 완료. 모든 항목 C 소스 참조 + 회귀 테스트 포함; 워크스페이스 nextest 통과 (3459/3459).

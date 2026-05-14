@@ -22,9 +22,19 @@ pub struct CompressRecord {
     pub alg: i16,    // See top-of-struct doc — matches menuCompressALG
     pub n: i32,      // Number of values to compress
     pub nuse: i32,   // Number of elements used
-    pub off: i32,    // Current write offset
+    pub off: i32,    // Current write offset (see `put_one` for BALG-dependent role)
     pub res: i16,    // Reset flag
-    pub balg: i16,   // 0=FIFO, 1=LIFO
+    pub balg: i16,   // 0=FIFO, 1=LIFO — `menuBufferingALG`
+    /// `ILIL` (input low limit). When `ILIL < IHIL`, samples outside
+    /// `[ILIL, IHIL]` are dropped before compression (C
+    /// `compress_array` skip loop, compressRecord.c:163-170).
+    pub ilil: f64,
+    /// `IHIL` (input high limit). See [`Self::ilil`].
+    pub ihil: f64,
+    /// `INX` cycle counter for alg=Average. C `prec->inx` —
+    /// increments on every accumulator update, resets to 0 after the
+    /// N-th waveform when the average is emitted.
+    pub inx: i32,
     /// `PBUF` (partial buffer) — epics-base 7.0.8.
     /// `0 = NO` (default): VAL is read by clients as the whole NSAM
     /// vector; the leading `NUSE` elements are valid, the rest are
@@ -53,6 +63,9 @@ impl Default for CompressRecord {
             res: 0,
             balg: 0,
             pbuf: 0,
+            ilil: 0.0,
+            ihil: 0.0,
+            inx: 0,
             accum: Vec::new(),
         }
     }
@@ -68,28 +81,107 @@ impl CompressRecord {
         }
     }
 
+    /// True when ILIL < IHIL and `input` falls outside the limits.
+    /// C `compress_array` (compressRecord.c:163-170) drops these
+    /// samples before compression so the configured algorithm
+    /// (min/max/mean/median) never sees spurious outliers.
+    #[inline]
+    fn ilil_ihil_rejects(&self, input: f64) -> bool {
+        self.ilil < self.ihil && (input < self.ilil || input > self.ihil)
+    }
+
+    /// Write one value into the circular buffer, advancing `off`
+    /// and `nuse` per BALG. Mirrors C `put_value` (compressRecord.c).
+    fn put_one(&mut self, value: f64) {
+        let nsam = self.nsam.max(1) as usize;
+        if self.balg == 1 {
+            // LIFO: pre-decrement modulo nsam, then write.
+            self.off = ((self.off - 1).rem_euclid(nsam as i32)) as i32;
+            self.val[self.off as usize] = value;
+        } else {
+            // FIFO: write at off, post-increment.
+            let idx = self.off as usize % nsam;
+            self.val[idx] = value;
+            self.off = ((self.off as i64 + 1) % nsam as i64) as i32;
+        }
+        if (self.nuse as usize) < nsam {
+            self.nuse += 1;
+        }
+    }
+
     /// Push a value into the compress record.
     pub fn push_value(&mut self, input: f64) {
+        if self.ilil_ihil_rejects(input) {
+            return;
+        }
         match self.alg {
             // menuCompressALG_Circular_Buffer
-            4 => {
-                let idx = self.off as usize % self.nsam as usize;
-                self.val[idx] = input;
-                self.off += 1;
-                if (self.nuse as usize) < self.nsam as usize {
-                    self.nuse += 1;
-                }
-            }
-            // N-to-1 algorithms (Low/High/N_to_1_Average/Median).
-            // alg=3 (Average rolling) currently falls through here
-            // but is not implemented properly — flush_accum returns
-            // 0.0 for unsupported algs.
+            4 => self.put_one(input),
+            // alg=3 (Average rolling) is array-oriented in C
+            // (`array_average` operates on a whole waveform). A
+            // scalar push degrades to a 1-element array call so the
+            // running average behaves predictably for either input
+            // shape.
+            3 => self.push_array_average(&[input]),
+            // N-to-1 algorithms (Low/High/N_to_1_Average/Median):
+            // accumulate N samples then compress.
             _ => {
                 self.accum.push(input);
                 if self.accum.len() >= self.n as usize {
                     self.flush_accum();
                 }
             }
+        }
+    }
+
+    /// C `array_average` (compressRecord.c:223-270) per-cycle entry.
+    /// Element-wise sums up to N consecutive waveforms in a
+    /// `nsam`-sized accumulator (`sptr` in C, `accum` here), divides
+    /// by N after the N-th waveform, emits one `put_one` per
+    /// accumulator slot. Caller is expected to be `push_array`
+    /// (single-waveform `push_value` degrades to a one-element call).
+    fn push_array_average(&mut self, input: &[f64]) {
+        let nsam = self.nsam.max(1) as usize;
+        // C `nuse = min(nsam, no_elements)`. Effective length of the
+        // averaged output for this call.
+        let nuse = nsam.min(input.len());
+        if nuse == 0 {
+            return;
+        }
+        // Accumulator is the C `sptr` — `nsam` doubles sized.
+        // `accum.len() != nsam` triggers a fresh allocation either
+        // on first call or when NSAM was retuned mid-life.
+        if self.accum.len() != nsam {
+            self.accum = vec![0.0; nsam];
+        }
+        if self.inx == 0 {
+            // Start of a new N-cycle: replace contents with the
+            // incoming waveform (zero-pad the tail to nuse..nsam).
+            for (i, slot) in self.accum.iter_mut().take(nuse).enumerate() {
+                *slot = input[i];
+            }
+            for slot in self.accum.iter_mut().take(nsam).skip(nuse) {
+                *slot = 0.0;
+            }
+        } else {
+            for i in 0..nuse {
+                self.accum[i] += input[i];
+            }
+        }
+        self.inx += 1;
+        let n = self.n.max(1);
+        if self.inx < n {
+            return;
+        }
+        // N waveforms accumulated — divide and emit.
+        let multiplier = 1.0 / n as f64;
+        let mut out = Vec::with_capacity(nuse);
+        for slot in self.accum.iter().take(nuse) {
+            out.push(slot * multiplier);
+        }
+        self.inx = 0;
+        for v in out {
+            self.put_one(v);
         }
     }
 
@@ -107,31 +199,50 @@ impl CompressRecord {
     /// samples available" behaviour — partial accumulation persists
     /// for the next array.
     pub fn push_array(&mut self, input: &[f64]) {
-        // Circular Buffer (alg=4) treats every sample independently;
-        // the partial-buffer question doesn't apply.
-        if self.alg == 4 {
-            for &v in input {
-                self.push_value(v);
+        match self.alg {
+            // Circular Buffer (alg=4): every sample independent.
+            4 => {
+                for &v in input {
+                    self.push_value(v);
+                }
             }
-            return;
-        }
-        for &v in input {
-            self.accum.push(v);
-            if self.accum.len() >= self.n as usize {
-                self.flush_accum();
+            // Average (rolling, alg=3): single array_average call.
+            3 => {
+                // ILIL/IHIL apply per element; reject before averaging.
+                if self.ilil < self.ihil {
+                    let filtered: Vec<f64> = input
+                        .iter()
+                        .copied()
+                        .filter(|v| !(*v < self.ilil || *v > self.ihil))
+                        .collect();
+                    self.push_array_average(&filtered);
+                } else {
+                    self.push_array_average(input);
+                }
             }
-        }
-        // Tail handling: anything still in the accumulator is a
-        // partial chunk. PBUF=YES emits it now (PR #84f4771).
-        if self.pbuf != 0 && !self.accum.is_empty() {
-            self.flush_accum();
+            // N-to-1 algorithms (Low/High/N_to_1_Average/Median).
+            _ => {
+                for &v in input {
+                    if self.ilil_ihil_rejects(v) {
+                        continue;
+                    }
+                    self.accum.push(v);
+                    if self.accum.len() >= self.n as usize {
+                        self.flush_accum();
+                    }
+                }
+                if self.pbuf != 0 && !self.accum.is_empty() {
+                    self.flush_accum();
+                }
+            }
         }
     }
 
     /// Compress `self.accum` via the configured algorithm and push
-    /// the result into the circular VAL buffer. Clears `accum`
-    /// regardless of partial vs full — callers decide *whether* to
-    /// flush; this just executes it.
+    /// the result into the circular VAL buffer via [`Self::put_one`]
+    /// so BALG (FIFO vs LIFO) is honoured. Clears `accum` regardless
+    /// of partial vs full — callers decide *whether* to flush; this
+    /// just executes it.
     fn flush_accum(&mut self) {
         if self.accum.is_empty() {
             return;
@@ -151,18 +262,36 @@ impl CompressRecord {
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 sorted[sorted.len() / 2]
             }
-            // alg=3 (Average rolling) is not yet implemented — fall
-            // through to 0.0. A C client selecting this mode gets the
-            // same as a Rust IOC running an unknown alg.
+            // alg=3 (Average rolling) doesn't use the N-element
+            // accumulator — push_array_average handles it directly.
             _ => 0.0,
         };
-        let idx = self.off as usize % self.nsam as usize;
-        self.val[idx] = compressed;
-        self.off += 1;
-        if (self.nuse as usize) < self.nsam as usize {
-            self.nuse += 1;
-        }
         self.accum.clear();
+        self.put_one(compressed);
+    }
+
+    /// Linearise the circular buffer per BALG: returns NUSE elements
+    /// in oldest-to-newest order (FIFO) or newest-to-oldest (LIFO).
+    /// Mirrors C `get_array_info` (compressRecord.c:409-431).
+    pub(crate) fn linearise_val(&self) -> Vec<f64> {
+        let nsam = self.nsam.max(0) as usize;
+        let nuse = self.nuse.max(0) as usize;
+        if nuse == 0 || nsam == 0 {
+            return Vec::new();
+        }
+        let off = self.off.rem_euclid(nsam as i32) as usize;
+        let start = if self.balg == 0 {
+            // FIFO: `(off + nsam - nuse) % nsam`.
+            (off + nsam - nuse) % nsam
+        } else {
+            // LIFO: `off` already points at the newest element.
+            off
+        };
+        let mut out = Vec::with_capacity(nuse);
+        for i in 0..nuse {
+            out.push(self.val[(start + i) % nsam]);
+        }
+        out
     }
 }
 
@@ -212,6 +341,21 @@ static COMPRESS_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "ILIL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IHIL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INX",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
 ];
 
 impl Record for CompressRecord {
@@ -234,17 +378,13 @@ impl Record for CompressRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => {
-                // epics-base 7.0.8 `PBUF` semantics: when YES, expose
-                // only the valid leading prefix while the buffer is
-                // still filling. Defaults (PBUF=NO) and full-buffer
-                // case keep the historic behaviour — whole NSAM-sized
-                // vector with trailing zeros for unused slots.
-                let valid = self.nuse.max(0) as usize;
-                if self.pbuf != 0 && valid < self.val.len() {
-                    Some(EpicsValue::DoubleArray(self.val[..valid].to_vec()))
-                } else {
-                    Some(EpicsValue::DoubleArray(self.val.clone()))
-                }
+                // C `get_array_info` (compressRecord.c:409-431):
+                // `*no_elements = nuse` regardless of PBUF, with the
+                // circular buffer linearised per BALG. The PBUF field
+                // is purely a processing-time control (early-emit for
+                // N-to-1 algorithms); it does NOT change what a CA
+                // client sees on read.
+                Some(EpicsValue::DoubleArray(self.linearise_val()))
             }
             "INP" => Some(EpicsValue::String(self.inp.clone())),
             "NSAM" => Some(EpicsValue::Long(self.nsam)),
@@ -255,6 +395,9 @@ impl Record for CompressRecord {
             "N" => Some(EpicsValue::Long(self.n)),
             "OFF" => Some(EpicsValue::Long(self.off)),
             "PBUF" => Some(EpicsValue::Short(self.pbuf)),
+            "ILIL" => Some(EpicsValue::Double(self.ilil)),
+            "IHIL" => Some(EpicsValue::Double(self.ihil)),
+            "INX" => Some(EpicsValue::Long(self.inx)),
             _ => None,
         }
     }
@@ -327,7 +470,21 @@ impl Record for CompressRecord {
                 }
                 _ => Err(CaError::TypeMismatch("PBUF".into())),
             },
-            "NSAM" | "OFF" | "NUSE" => Err(CaError::ReadOnlyField(name.to_string())),
+            "ILIL" => match value {
+                EpicsValue::Double(v) => {
+                    self.ilil = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("ILIL".into())),
+            },
+            "IHIL" => match value {
+                EpicsValue::Double(v) => {
+                    self.ihil = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("IHIL".into())),
+            },
+            "NSAM" | "OFF" | "NUSE" | "INX" => Err(CaError::ReadOnlyField(name.to_string())),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -345,33 +502,38 @@ impl Record for CompressRecord {
 mod pbuf_tests {
     use super::*;
 
-    /// PBUF defaults to NO (0) — historic behaviour. VAL returns
-    /// the full NSAM-sized vector with trailing zeros for unused slots.
+    /// C `get_array_info` (compressRecord.c:409-431) returns
+    /// `*no_elements = nuse` regardless of PBUF — only the valid
+    /// elements are exposed on the wire. PBUF is a processing-time
+    /// option (early N-to-1 emit), not a read-side toggle.
     #[test]
-    fn pbuf_default_no_returns_full_array() {
-        let mut rec = CompressRecord::new(4, 4); // circular buffer NSAM=4 (alg=4)
+    fn val_read_always_nuse_clamped_regardless_of_pbuf() {
+        let mut rec = CompressRecord::new(4, 4); // circular buffer NSAM=4
         rec.push_value(1.0);
         rec.push_value(2.0);
-        // nuse=2 < nsam=4. PBUF=NO → full vec exposed.
+        // nuse=2 < nsam=4: VAL must surface exactly the 2 valid samples.
         match rec.get_field("VAL").unwrap() {
             EpicsValue::DoubleArray(v) => {
-                assert_eq!(v.len(), 4);
-                assert_eq!(v[0], 1.0);
-                assert_eq!(v[1], 2.0);
-                assert_eq!(v[2], 0.0);
-                assert_eq!(v[3], 0.0);
+                assert_eq!(v, vec![1.0, 2.0]);
+            }
+            other => panic!("expected DoubleArray, got {other:?}"),
+        }
+        // Setting PBUF doesn't change what the reader sees — same 2
+        // valid samples.
+        rec.pbuf = 1;
+        match rec.get_field("VAL").unwrap() {
+            EpicsValue::DoubleArray(v) => {
+                assert_eq!(v, vec![1.0, 2.0]);
             }
             other => panic!("expected DoubleArray, got {other:?}"),
         }
     }
 
-    /// PBUF=YES exposes only the valid leading prefix while the
-    /// buffer is still filling. After it fills, VAL is the full
-    /// NSAM vector again.
+    /// Buffer fill progresses incrementally; VAL grows with NUSE.
+    /// When the buffer fills, VAL reaches its final NSAM length.
     #[test]
-    fn pbuf_yes_truncates_to_nuse_while_filling() {
+    fn val_grows_with_nuse_to_full_buffer() {
         let mut rec = CompressRecord::new(4, 4);
-        rec.pbuf = 1;
         rec.push_value(10.0);
         rec.push_value(20.0);
         match rec.get_field("VAL").unwrap() {
@@ -380,7 +542,6 @@ mod pbuf_tests {
         }
         rec.push_value(30.0);
         rec.push_value(40.0);
-        // nuse == nsam → full array exposed.
         match rec.get_field("VAL").unwrap() {
             EpicsValue::DoubleArray(v) => assert_eq!(v, vec![10.0, 20.0, 30.0, 40.0]),
             other => panic!("expected DoubleArray, got {other:?}"),
@@ -470,14 +631,82 @@ mod pbuf_tests {
 
     #[test]
     fn push_array_circular_buffer_passes_through_unchanged() {
-        // alg=3 doesn't compress; every element lands in the circular
-        // buffer directly. PBUF flag is irrelevant for this path.
+        // alg=4 (Circular Buffer) doesn't compress; every element lands
+        // in the circular buffer directly. VAL reads NUSE-clamped per
+        // C `get_array_info`.
         let mut rec = CompressRecord::new(4, 4);
         rec.push_array(&[1.0, 2.0, 3.0]);
         assert_eq!(rec.nuse, 3);
         if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
-            assert_eq!(v.len(), 4);
-            assert_eq!(&v[..3], &[1.0, 2.0, 3.0]);
+            assert_eq!(v, vec![1.0, 2.0, 3.0]);
+        } else {
+            panic!("expected DoubleArray");
+        }
+    }
+
+    /// LIFO mode (BALG=1): newest sample is exposed FIRST on read.
+    /// Mirrors C `put_value`'s pre-decrement + `get_array_info`'s
+    /// LIFO branch.
+    #[test]
+    fn lifo_reads_newest_first() {
+        let mut rec = CompressRecord::new(4, 4);
+        rec.balg = 1; // LIFO
+        rec.push_value(10.0);
+        rec.push_value(20.0);
+        rec.push_value(30.0);
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert_eq!(v, vec![30.0, 20.0, 10.0], "LIFO emits newest→oldest");
+        } else {
+            panic!("expected DoubleArray");
+        }
+    }
+
+    /// ILIL/IHIL input range filter (C `compress_array`
+    /// compressRecord.c:163-170): samples outside `[ILIL, IHIL]` are
+    /// dropped before compression.
+    #[test]
+    fn ilil_ihil_filters_out_of_range_samples() {
+        let mut rec = CompressRecord::new(8, 2);
+        rec.n = 3;
+        rec.ilil = 0.0;
+        rec.ihil = 100.0;
+        // 50 and 75 pass, -5 and 200 rejected. After 3 valid samples
+        // the mean (10+50+75)/3 = 45 is emitted.
+        rec.push_array(&[10.0, -5.0, 50.0, 200.0, 75.0]);
+        assert_eq!(
+            rec.nuse, 1,
+            "exactly one chunk emitted after 3 valid samples"
+        );
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert!((v[0] - 45.0).abs() < 1e-9, "mean of {{10,50,75}} == 45");
+        } else {
+            panic!("expected DoubleArray");
+        }
+    }
+
+    /// Average (rolling, alg=3) — C `array_average` semantic.
+    /// Accumulate N waveforms element-wise then divide by N.
+    #[test]
+    fn average_rolling_emits_after_n_waveforms() {
+        // NSAM=4, ALG=Average (3), N=3 — average 3 input waveforms.
+        let mut rec = CompressRecord::new(4, 3);
+        rec.n = 3;
+        rec.push_array(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(rec.nuse, 0, "no output until N waveforms accumulated");
+        rec.push_array(&[10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(rec.nuse, 0, "still accumulating");
+        rec.push_array(&[100.0, 200.0, 300.0, 400.0]);
+        // After 3 waveforms: ((1+10+100)/3, (2+20+200)/3, ...).
+        // Output is one ARRAY of nuse=4 elements via 4 put_one calls
+        // → ends up as 4 separate entries in the circular buffer.
+        assert_eq!(rec.nuse, 4);
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            // (1+10+100)/3 = 37; (2+20+200)/3 = 222/3 = 74; (3+30+300)/3 = 111;
+            // (4+40+400)/3 = 444/3 = 148.
+            assert!((v[0] - 37.0).abs() < 1e-9);
+            assert!((v[1] - 74.0).abs() < 1e-9);
+            assert!((v[2] - 111.0).abs() < 1e-9);
+            assert!((v[3] - 148.0).abs() < 1e-9);
         } else {
             panic!("expected DoubleArray");
         }

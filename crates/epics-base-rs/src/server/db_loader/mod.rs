@@ -823,16 +823,16 @@ mod tests {
         use crate::server::record::Record;
         use crate::server::records::compress::CompressRecord;
 
-        let mut rec = CompressRecord::new(5, 4); // nsam=5, alg=Circular Buffer (menuCompressALG=4)
+        let mut rec = CompressRecord::new(5, 4); // nsam=5, alg=Circular Buffer
         for i in 0..7 {
             rec.push_value(i as f64);
         }
-        // Buffer should have last 5 values wrapped around
+        // C `get_array_info` linearises FIFO oldest→newest. After
+        // 7 pushes to nsam=5: nuse saturates at 5, the last 5 values
+        // are [2, 3, 4, 5, 6].
         match rec.get_field("VAL") {
             Some(EpicsValue::DoubleArray(arr)) => {
-                assert_eq!(arr.len(), 5);
-                // offset=7 → indices written: 0,1,2,3,4,5(=0),6(=1)
-                assert!((arr[2] - 2.0).abs() < 1e-10); // unchanged
+                assert_eq!(arr, vec![2.0, 3.0, 4.0, 5.0, 6.0]);
             }
             other => panic!("expected DoubleArray, got {:?}", other),
         }

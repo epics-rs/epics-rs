@@ -1027,29 +1027,47 @@ fn waveform_ftvl_types() {
 // compressTest.c — Compress Record (circular buffer + algorithms)
 // ============================================================
 
-/// C EPICS: testFIFOCirc — FIFO circular buffer
+/// C EPICS: testFIFOCirc — FIFO circular buffer. C `put_value`
+/// (compressRecord.c) wraps `prec->off` modulo NSAM on every push, so
+/// `off` is bounded in `[0, NSAM)`. The read path (`get_array_info`)
+/// derives the oldest-element index from the wrapped `off + nsam -
+/// nuse`. The test pins both the wrapped-`off` invariant and the
+/// linearised read order.
 #[test]
 fn compress_fifo_circular_buffer() {
-    let mut rec = CompressRecord::new(4, 4); // NSAM=4, ALG=Circular Buffer (menuCompressALG=4)
+    use epics_base_rs::server::record::Record;
+    let mut rec = CompressRecord::new(4, 4); // NSAM=4, ALG=Circular Buffer
 
-    // Push values into circular buffer
     rec.push_value(1.1);
     assert_eq!(rec.off, 1);
-
     rec.push_value(2.1);
     rec.push_value(3.1);
     rec.push_value(4.1);
-    assert_eq!(rec.off, 4); // wraps next
+    assert_eq!(rec.off, 0, "C wraps `off` modulo NSAM on each push");
 
-    // Buffer full, next push overwrites oldest (FIFO)
+    // After 4 pushes nuse=4 (saturated), and linearise_val returns
+    // oldest-to-newest [1.1, 2.1, 3.1, 4.1].
+    if let Some(epics_base_rs::types::EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+        assert_eq!(v, vec![1.1, 2.1, 3.1, 4.1]);
+    } else {
+        panic!("expected DoubleArray");
+    }
+
+    // 5th push overwrites the oldest slot (FIFO).
     rec.push_value(5.1);
-    assert_eq!(rec.off, 5);
-    // Buffer should be [5.1, 2.1, 3.1, 4.1] in storage order
-    // Reading in order: [2.1, 3.1, 4.1, 5.1]
+    assert_eq!(rec.off, 1);
+    if let Some(epics_base_rs::types::EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+        assert_eq!(v, vec![2.1, 3.1, 4.1, 5.1], "oldest-to-newest after wrap");
+    } else {
+        panic!("expected DoubleArray");
+    }
 
     rec.push_value(6.1);
-    // Buffer should be [5.1, 6.1, 3.1, 4.1] in storage order
-    // Reading in order: [3.1, 4.1, 5.1, 6.1]
+    if let Some(epics_base_rs::types::EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+        assert_eq!(v, vec![3.1, 4.1, 5.1, 6.1]);
+    } else {
+        panic!("expected DoubleArray");
+    }
 }
 
 /// C EPICS: testNto1Average — N to 1 average compression

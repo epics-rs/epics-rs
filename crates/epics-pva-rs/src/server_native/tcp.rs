@@ -313,19 +313,15 @@ struct OpState {
     /// the event cause the iteration to continue without sending.
     /// Empty chain (the default) is a no-op.
     monitor_filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
-    /// epics-base PR `70735383350b` (autoExec=false PUT support):
-    /// when a PUT op's INIT pvRequest carries
-    /// `record._options.autoExec=false`, the regular PUT subcmd
-    /// queues the value instead of writing it immediately. A
-    /// subsequent regular PUT subcmd commits the queued write.
-    /// `true` (default) preserves the historic immediate-execute
-    /// behaviour.
+    /// `record._options.autoExec` from the INIT pvRequest. pvxs
+    /// uses this purely client-side to decide whether to send the
+    /// PUT EXEC immediately after INIT or wait for an explicit
+    /// `reExec()` call (clientget.cpp:123). The server has no
+    /// queueing role — pvxs `serverget.cpp:488-492` calls `onPut`
+    /// the moment a CMD_PUT with !init arrives, regardless of the
+    /// client's autoExec setting. We keep the field for diagnostic
+    /// echoing but DO NOT gate write commits on it.
     put_auto_exec: bool,
-    /// Queued PUT payload while `put_auto_exec == false`. Cleared
-    /// on commit (or when the op is destroyed). `None` means "no
-    /// pending value yet — the client hasn't sent the data
-    /// payload".
-    put_pending: Option<crate::pvdata::PvField>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1469,11 +1465,11 @@ async fn handle_op(
             Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
         };
 
-        // epics-base PR `70735383350b` parity: parse autoExec from
-        // pvRequest's `record._options.autoExec` field. Default true
-        // preserves immediate-execute semantics; "false" defers the
-        // PUT until a second regular PUT subcmd commits the queued
-        // value (used by clients doing atomic multi-step writes).
+        // pvxs autoExec is purely client-side timing control
+        // (clientget.cpp:123 — controls when the client sends the
+        // PUT EXEC frame). The server-side handler runs onPut
+        // unconditionally on every CMD_PUT !init regardless of
+        // autoExec. We parse the option for diagnostic echo only.
         let put_auto_exec = if kind == OpKind::Put {
             put_autoexec_from_request(req_value.as_ref()).unwrap_or(true)
         } else {
@@ -1493,7 +1489,6 @@ async fn handle_op(
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 monitor_filters,
                 put_auto_exec,
-                put_pending: None,
             },
         );
 
@@ -1589,13 +1584,14 @@ async fn handle_op(
             // Read bitset (which fields client is putting) + value.
             let _changed =
                 BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-            // For autoExec=false PUT, the client may send the value
-            // payload as either (a) the full descriptor + body for
-            // the queued write, or (b) an empty/no-op body to commit
-            // the previously queued value. We tentatively decode and
-            // fall back to the queued path on decode-error if a
-            // pending value exists.
-            let decoded = decode_pv_field(&intro, &mut cur, order).ok();
+            // pvxs `serverget.cpp:488-492` calls `onPut` immediately
+            // on every CMD_PUT !init — the client's autoExec setting
+            // is purely a client-side timing knob (clientget.cpp:213)
+            // for whether the PUT EXEC fires automatically after INIT
+            // or waits for `reExec()`. Each EXEC frame still carries
+            // exactly one value and triggers exactly one write.
+            let value = decode_pv_field(&intro, &mut cur, order)
+                .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
             let pv_name = ch.name.clone();
             // Round 42: type-state PUT gate. The token's
             // `allows_write()` is checked by `put_value_checked`;
@@ -1608,50 +1604,13 @@ async fn handle_op(
                 method: cred.method.clone(),
                 host: cred.host.clone(),
             };
-            // epics-base PR `70735383350b` autoExec=false handling.
-            // - autoExec=true (default): execute immediately, ack OK.
-            // - autoExec=false, no pending value, fresh value arrived:
-            //     queue, ack OK without writing.
-            // - autoExec=false, pending value exists: commit the queued
-            //     value (any incoming body is ignored — pvxs sends an
-            //     empty payload for the EXEC frame).
-            let (value_to_write, was_queue_ack) =
-                if !ch.ops.get(&ioid).map(|s| s.put_auto_exec).unwrap_or(true) {
-                    // autoExec=false branch.
-                    let pending = ch.ops.get_mut(&ioid).and_then(|s| s.put_pending.take());
-                    match (pending, decoded) {
-                        (Some(pending_v), _) => (Some(pending_v), false), // commit
-                        (None, Some(new_v)) => {
-                            // Queue the value, send OK without writing.
-                            if let Some(s) = ch.ops.get_mut(&ioid) {
-                                s.put_pending = Some(new_v);
-                            }
-                            (None, true)
-                        }
-                        (None, None) => {
-                            // No pending value AND no decoded body — nothing
-                            // to do. Treat as a no-op queue ack.
-                            (None, true)
-                        }
-                    }
-                } else {
-                    // autoExec=true (default): the decoded value MUST be
-                    // present; surface the decode error if not.
-                    let value = decoded
-                        .ok_or_else(|| PvaError::Decode("PUT requires a value payload".into()))?;
-                    (Some(value), false)
-                };
 
-            let result = if let Some(value) = value_to_write {
+            let result = {
                 let checked = source
                     .access_gate()
                     .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
                     .await;
                 source.put_value_checked(checked, value, ctx.clone()).await
-            } else {
-                // Queued — no execute this round, just ack.
-                let _ = was_queue_ack; // silence dead_assign if optimised away
-                Ok(())
             };
 
             let mut payload = Vec::new();
@@ -2490,7 +2449,6 @@ mod tests {
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
                 put_auto_exec: true,
-                put_pending: None,
             },
         );
         channels.insert(

@@ -120,17 +120,17 @@ impl LongoutRecord {
     /// Public so unit tests don't have to spin up the full processing
     /// loop to exercise each menu value.
     pub fn compute_should_output(&self) -> bool {
-        // epics-base PR #6c573b4: force the very first process cycle
-        // to emit output regardless of OOPT comparison. Without this,
-        // transition-mode OOPT (1=On Change, 4=When Zero, 5=When
-        // Non-zero) silently swallow the initial put when val and
-        // pval are both at their default 0.
-        if !self.first_output_done {
-            return true;
-        }
+        // C parity (longoutRecord.c::conditional_write,
+        // PR #6c573b4): the first-cycle force-emit applies **only**
+        // to OOPT=On_Change (case 1 — `outpvt == EXEC_OUTPUT`).
+        // Modes When_Zero / When_Non_zero / Transitions evaluate
+        // their condition normally on the first cycle. Earlier this
+        // fn generalised the force-emit across every OOPT, which
+        // silently emitted output on initial putValues for the
+        // value-only modes (e.g. When_Non_zero + initial val=0).
         match self.oopt {
             0 => true,
-            1 => self.val != self.pval,
+            1 => !self.first_output_done || self.val != self.pval,
             2 => self.val == 0,
             3 => self.val != 0,
             4 => self.pval != 0 && self.val == 0,
@@ -611,18 +611,26 @@ mod tests {
     }
 
     #[test]
-    fn oopt_when_zero_first_cycle_forces_output() {
-        // OOPT=4 (When Transition To Zero) compares pval!=0 && val==0.
-        // Without the first-cycle fix this would skip the very first
-        // process cycle even when the user wants the initial zero to
-        // reach the device.
+    fn oopt_transition_modes_do_not_force_first_cycle() {
+        // C parity (longoutRecord.c::conditional_write,
+        // PR #6c573b4): only OOPT=On_Change (case 1) gets the
+        // first-cycle force-emit via `outpvt == EXEC_OUTPUT`.
+        // Transition modes (4=To_Zero, 5=To_Non_zero) and value
+        // modes (2=When_Zero, 3=When_Non_zero) evaluate their
+        // condition normally on the first cycle. With val == pval
+        // == 0:
+        //   OOPT=4 (To Zero):    pval!=0 && val==0 → false → no out
+        //   OOPT=5 (To Non-zero): pval==0 && val!=0 → false → no out
         let mut r = LongoutRecord::new(0);
         r.oopt = 4;
-        assert!(r.compute_should_output(), "first cycle forces output");
-        r.on_output_complete();
         assert!(
             !r.compute_should_output(),
-            "post-first cycle 0→0 honours OOPT=4 suppression"
+            "OOPT=4 (Transition_To_Zero) first cycle val==pval==0: no output"
+        );
+        r.oopt = 5;
+        assert!(
+            !r.compute_should_output(),
+            "OOPT=5 (Transition_To_Non_zero) first cycle val==pval==0: no output"
         );
     }
 

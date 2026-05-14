@@ -1,5 +1,183 @@
 # Changelog
 
+## v0.17.0 — 2026-05-14
+
+Upstream-features release: 192 commits closing out asyn-rs C-source
+audit, PVA IPv6 stages 1-6, server-side channel filters, record-layer
+processing parity, and a commit-by-commit C-source review pass that
+produced 13 targeted fixes (`docs/review-rounds-2026-05-14.md`).
+
+### Wire-protocol breaking changes
+
+Two enum value tables on the CA/PVA wire have been renumbered to match
+the C reference. Mixed Rust-vs-C client/server deployments must update
+together; pure-Rust deployments are unaffected internally but observers
+attached via `caget` / `pvget` will see the C-correct values.
+
+- **fix(recgbl)** `alarm_status` enum renumbered to match
+  `menuAlarmStat.dbd` wire order (e.g. `LINK_ALARM` was 13, now 14).
+  Also adds the missing `BAD_SUB`, `READ_ACCESS`, `WRITE_ACCESS`
+  values. Commit `da3230c`.
+- **fix(compress)** `menuCompressALG` enum renumbered to match
+  `menuCompressALG.dbd` wire order: Circular Buffer is alg=4 (was 3),
+  Average is alg=3, Median (alg=5) added. Commit `e0cb6c8`.
+
+### asyn-rs — C source audit closure
+
+Full audit of `~/codes/epics-modules/asyn` against `crates/asyn-rs`.
+Every item in `docs/asyn-rs-c-audit.md` is now verified, ported, or
+explicitly skipped with a one-line rationale.
+
+- **feat** `drvAsynIPServerPort` — full TCP child-port model with
+  `parent:N` subports and TCP/UDP/UDP* protocol suffixes
+  (`598d81b`, `1e2716a`, `cee7d7d`, `9ff5659`).
+- **feat** UDP server mode (SOCK_DGRAM) — port of
+  `drvAsynIPServerPort.c` UDP path (`cee7d7d`).
+- **feat** RS485 — full `struct serial_rs485` with 5 `setOption` keys
+  and `getOption` (`38e7743`).
+- **feat** Prologix GPIB driver — port of `drvPrologixGPIB.c`
+  (`c2a3f6f`).
+- **feat** USBTMC + VXI-11 driver scaffolds matching C iocsh
+  (`448724e`, `2b67092`).
+- **feat** `asyn:FIFO` ring buffer matching C `devAsynInt32
+  createRingBuffer` (`04ef574`).
+- **feat** `ai` LINEAR ESLO/EOFF from `getBounds` — matches C
+  `convertAi` (`614e7eb`).
+- **feat** `ASYN_DESTRUCTIBLE` shutdown lifecycle (opt-in) (`a20aede`).
+- **feat** `AsynParamSet` flat group helper — matches C++
+  `asynParamSet` (`5817fad`).
+- **fix** `asynMask` propagates `computeShift(mask)` into record
+  `SHFT`/`MASK` (`e96561b`).
+- **fix** `asynOctet` buffer size — `SIZV`-driven for `lsi`/`lso`/
+  `printf` (`55dc8fd`).
+- **fix** `asyn:INITIAL_READBACK` auto-parse + correct READBACK docs;
+  removed invented init-readback on input records
+  (`f2370af`, `4b6e2f7`).
+- **fix** `hostInfo setOption` — full protocol reparse + socket close
+  delay (`40fa1d0`).
+- **fix** trace mask token parsing — match C asyn, removed invented
+  `STATE` bit (`9691605`).
+- **fix** `TCP&`/`UDP&`/`UDP*` protocol suffix semantics — match C
+  asyn (`9ff5659`).
+- **fix** FTDI 9 positional `iocshArg` — match C
+  `drvAsynFTDIPortConfigure` (`5d2253c`).
+- **fix** `RingAverager` replaced with `SumAverager` — match C
+  `devAsynInt32` average (`7befd0e`).
+
+### PVA — IPv6 + filters + autoExec parity
+
+- **feat** PVA IPv6 Stages 1-6 — server/client TCP bind, UDP SEARCH
+  emit + recv, multicast beacon emit + recv (PR #205)
+  (`835e2c5`, `4cc40a8`, `abf9344`, `312d578`, `e25d281`, `0cd85a5`,
+  `a3e7c74`).
+- **feat** server-side channel filter wire-through (PR #205
+  follow-up) (`69c7999`).
+- **feat** `decodeError` carries source `file:line` for diagnostics
+  (`d525ace`).
+- **fix(pva)** IPv6 UDP responder must set `IPV6_V6ONLY=1` to avoid
+  v4 overlap (`9b27f5b`).
+- **fix(pva)** server PUT executes immediately; `autoExec` is a
+  client-only knob. Removed invented `put_pending` queue/commit
+  (`65db161`).
+- **fix(pva)** emit first beacon immediately on server start
+  (matches pvxs `cc5071cd22c4`) (`763681d`).
+- **fix(pva)** skip name-server reconnect during `PvaClient`
+  shutdown (matches pvxs `4d12da87205e`) (`809baa9`).
+- **feat(net)** UDP RX overflow detection via Linux `SO_RXQ_OVFL`
+  (pvxs `a064677e3625`) (`2a9b52a`, `6738aa3`).
+
+### epics-base-rs — record / processing / filter parity
+
+13 fixes from the commit-by-commit review (see
+`docs/review-rounds-2026-05-14.md`):
+
+- **feat(filters)** `ts` filter — full num/epoch/str modes
+  (`Generate`/`Double`/`Seconds`/`Nanoseconds`/`Array`/`StringEpics`,
+  Epics vs Unix epoch). C `ts.c` parity (`9a1c324`).
+- **feat(filters)** `sync` filter — all 6 modes via `dbState` model
+  (`710fe62`).
+- **feat(compress)** C-parity closure — `NUSE` clamp via
+  `linearise_val`, ILIL/IHIL fields, INX cycle counter,
+  `push_array_average` for alg=3, `put_one` LIFO via pre-decrement
+  (`d77f7d5`).
+- **feat(longout)** OOCH-driven OUT-change force-write — first PR
+  `#6c573b4` analog, routed via `Record::special` hook
+  (`f823a0f`, `82049f4`).
+- **fix(filters)** `dbnd` C-parity — strict `>`, C-style NaN/Inf
+  `c_delta` helper, alarm passes update `last_sent`; JSON `r` is C
+  percent → fraction (`83ee47a`, `6489ef6`).
+- **fix(filters)** `arr` is a transformation filter — alarm bypass
+  removed; asymmetric `resolve_start`/`resolve_end` clamps
+  (`6a0cc82`).
+- **fix(filters)** `decimate` / `sync` — only `DBE_PROPERTY`
+  bypasses (not `DBE_ALARM`) (`6a0cc82`, `e26af3e`).
+- **fix(processing)** MS-class link propagation matches C
+  `recGblInheritSevrMsg` — MS/MSI use LINK_ALARM no msg, MSS keeps
+  source stat+msg (`09c4109`).
+- **fix(processing)** `SIMM=RAW` float→int floor narrowing — C
+  parity (`1cc2629`).
+- **fix(processing)** `complete_async_record` subscriber-snapshot
+  gated on actual change (`2054ab7`).
+- **fix(records)** `subArray` `INDX`/`NELM` clamp to `MALM` — C
+  parity (`29199b3`).
+- **fix(records)** `longout` `OOPT` first-cycle force only for
+  `On_Change` — C parity (`bd9d1c7`).
+- **fix(records)** `is_metadata_field` — add `HHSV`/`HSV`/`LSV`/
+  `LLSV` + `ZSV`/`OSV`/`COSV` (`cc1c4aa`).
+- **fix(iocsh)** `dbLoadRecords` merges same-type duplicates —
+  match C `dbLexRoutines::dbloadRecord` (`48e225b`).
+- **fix(iocsh)** prompt color is bright green (C `ANSI_GREEN`),
+  drop `\x01\x02` brackets that break cursor on some terminals
+  (`1be96ec`, `91daa1b`).
+- **fix(types)** drop spurious octal parse for Float/Double — C
+  parity (`87c645d`).
+
+### CA — server stats + repeater + access control
+
+- **feat(ca-server)** wire `dbServerStats` subscription +
+  bytes_in/bytes_out counters (PR #592)
+  (`14d0b03`, `f68f17c`).
+- **feat(ca-server,acf)** wire mTLS identity into ACF
+  `METHOD`/`AUTHORITY` (PR #641) (`23360e6`).
+- **feat(ca-server)** split TCP/UDP server ports via
+  `EPICS_CAS_SERVER_PORT` (`9d8a34b`).
+- **feat(ca-repeater)** `-d`/`-dd` debug switch (closes
+  epics-base PR #831) (`d0d59f7`).
+- **feat(ca-client)** honor `EPICS_RS_CLIENT_IGNORE` quarantine
+  list (renamed from `EPICS_IOC_IGNORE_SERVERS`)
+  (`8615bb4`, `f3738ce`).
+- **feat(ca-client)** shorten echo probe on suspend wake (Issue
+  #190) (`a409311`).
+- **fix(ca,pva)** guard CLI timeout against NaN/Inf/non-positive
+  (pvxs `1655d68e` analog) (`e77358b`).
+- **fix(ca-server)** `EPICS_CAS_SERVER_PORT` — UDP and TCP use the
+  same port for C parity (`d20f8b7`).
+
+### Miscellaneous
+
+- **feat** iocsh ANSI color + HAG DNS TTL refresh (closes
+  `c0da3dd` + PR #862/#863) (`60188d3`).
+- **feat** bulk 9-A archaeology audit closure — 12 high + 13
+  medium upstream items (`22fd25d`).
+- **feat** `lnkCalc` + `autoExec=false` PUT + filter on read +
+  FTDI scaffold (`d545303`).
+- **feat** PI mutex + serial break + averaging device +
+  camonitor type-change (`e1387d8`).
+
+### Reverts (all on this branch; not on main)
+
+Six reverts in the asyn-rs work — speculative scaffolds that drifted
+from the C source were rolled back after audit (`9bae27e`, `2f32958`,
+`f589453`, `1eeb5ae`, `b29d7b5`, `c88262a`). Several were
+re-implemented properly afterward.
+
+### Internal
+
+- **docs** `docs/review-rounds-2026-05-14.md` — 161-commit
+  commit-by-commit C-source review log producing 13 fixes.
+- **docs** `docs/asyn-rs-c-audit.md` — 22-item C-source audit
+  refreshed, all items resolved.
+
 ## v0.16.2 — 2026-05-12
 
 Wire-faithful introspection for native PVA PVs registered by IOC code

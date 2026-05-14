@@ -717,18 +717,47 @@ impl PortDriver for DrvAsynIPPort {
                     value == "Y" || value == "y" || value == "1" || value == "yes";
             }
             "hostInfo" => {
-                // Parse new host:port, disconnect, update config
+                // Mirror C drvAsynIPPort.c::parseHostInfo (lines 273-401):
+                //
+                //   if (fd != INVALID_SOCKET) {
+                //       flags |= FLAG_SHUTDOWN;
+                //       closeConnection(...);
+                //       epicsThreadSleep(CLOSE_SOCKET_DELAY);   // 0.02s
+                //   }
+                //   ... full reparse: protocol, FLAG_BROADCAST,
+                //       FLAG_SO_REUSEPORT, hostname, port, localPort
+                //   flags &= ~FLAG_SHUTDOWN;
+                //
+                // Earlier this branch updated only host/port/local_port,
+                // so a runtime switch like "udp tcp" or "udp& udp*"
+                // left the previous protocol/flags active and the next
+                // connect() bound the wrong socket type.
+                //
+                // We parse first (no observable state change on
+                // parse error) and only then drop the live socket and
+                // overwrite config.
                 let new_config = IpPortConfig::parse(value)?;
-                if self.base.connected {
+                let was_connected = self.base.connected;
+                if self.io.inner.is_some() {
+                    // Drop in-flight socket; matches C closeConnection.
                     self.io.inner = None;
                     self.base.connected = false;
-                    self.base.announce_exception(AsynException::Connect, -1);
+                    if was_connected {
+                        self.base.announce_exception(AsynException::Connect, -1);
+                    }
+                    // C's "if this delay is not present then the sockets
+                    // are not always really closed cleanly" — same 20ms
+                    // settle to ensure the kernel actually tears down
+                    // the prior socket before we rebind on a fresh one
+                    // (especially relevant for UDP+SO_REUSEPORT swaps).
+                    std::thread::sleep(Duration::from_millis(20));
                 }
                 self.config.host = new_config.host;
                 self.config.port = new_config.port;
-                if new_config.local_port.is_some() {
-                    self.config.local_port = new_config.local_port;
-                }
+                self.config.local_port = new_config.local_port;
+                self.config.protocol = new_config.protocol;
+                // connect_timeout / no_delay are first-set-only in C
+                // too — parseHostInfo doesn't touch them.
             }
             _ => {
                 self.base.options.insert(key.to_string(), value.to_string());
@@ -1056,6 +1085,48 @@ mod tests {
         drv.set_option("hostInfo", "127.0.0.1:9999").unwrap();
         assert!(!drv.base().connected);
         assert_eq!(drv.config.port, 9999);
+    }
+
+    /// hostInfo runtime reparse must update the protocol field too,
+    /// matching C parseHostInfo (drvAsynIPPort.c:356-391). Previously
+    /// only host/port/local_port were copied, so switching from TCP
+    /// to UDP at runtime left the socket type unchanged.
+    #[test]
+    fn host_info_reparse_updates_protocol_and_flags() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+        assert_eq!(drv.config.protocol, IpProtocol::Tcp);
+
+        drv.set_option("hostInfo", "127.0.0.1:5026 udp").unwrap();
+        assert_eq!(drv.config.protocol, IpProtocol::Udp);
+        assert_eq!(drv.config.port, 5026);
+
+        drv.set_option("hostInfo", "127.0.0.1:5027 udp*").unwrap();
+        assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcast);
+
+        drv.set_option("hostInfo", "127.0.0.1:5028 udp&").unwrap();
+        assert_eq!(drv.config.protocol, IpProtocol::UdpReusePort);
+
+        drv.set_option("hostInfo", "127.0.0.1:5029 udp*&").unwrap();
+        assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcastReusePort);
+
+        drv.set_option("hostInfo", "127.0.0.1:5030 tcp&").unwrap();
+        assert_eq!(drv.config.protocol, IpProtocol::TcpReusePort);
+    }
+
+    /// hostInfo reparse must clear `local_port` when the new spec
+    /// omits the second-colon field. C parseHostInfo only sets
+    /// tty->localAddr when it parses a value (line 339-348); the
+    /// previous Rust impl preserved the old local_port on omission,
+    /// which silently bound the new socket to the prior outgoing port.
+    #[test]
+    fn host_info_reparse_clears_omitted_local_port() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025:12345 tcp").unwrap();
+        assert_eq!(drv.config.local_port, Some(12345));
+        drv.set_option("hostInfo", "127.0.0.1:5026 tcp").unwrap();
+        assert_eq!(
+            drv.config.local_port, None,
+            "local_port must reset on hostInfo reparse"
+        );
     }
 
     // --- Protocol suffix parsing — C parity (drvAsynIPPort.c:355-391) ---

@@ -1055,6 +1055,36 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         CA_PROTO_HOST_NAME => {
+            // C `camessage.c::host_name_action` (line ~795 onward)
+            // rejects HOST_NAME messages that arrive after the first
+            // channel has been created — once the client claims any
+            // channel, the host identity is fixed for the connection.
+            // Reuse the same wire response: CA_PROTO_ERROR with
+            // ECA_INTERNAL and a descriptive message.
+            if !state.channels.is_empty() {
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_INTERNAL,
+                    "attempts to use protocol to set host name \
+                     after creating first channel ignored by server",
+                )
+                .await?;
+                return Ok(());
+            }
+            // C `camessage.c:824-825`: `size = strnlen(pName, m_postsize)
+            // + 1; if (size > 512 || size > m_postsize) reject`.
+            // Our `end` here is the string length (null position or
+            // payload end), so `end + 1 > 512` ⇔ `end >= 512`.
+            let end = payload
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(payload.len());
+            if end >= 512 {
+                send_ca_error(writer, hdr, ECA_INTERNAL, "bad (very long) host name").await?;
+                return Ok(());
+            }
+
             // EPICS_CAS_USE_HOST_NAMES (default NO) controls whether we
             // trust the client-supplied hostname for ACF matching. When NO,
             // the peer IP set during accept() is authoritative.
@@ -1062,10 +1092,6 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 epics_base_rs::runtime::env::get_or("EPICS_CAS_USE_HOST_NAMES", "NO")
                     .eq_ignore_ascii_case("YES");
             if trust_client_hostname {
-                let end = payload
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(payload.len());
                 let claimed = String::from_utf8_lossy(&payload[..end]).to_string();
 
                 // Forward-DNS verification: resolve the client-supplied
@@ -1097,10 +1123,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         CA_PROTO_CLIENT_NAME => {
+            // C `camessage.c::client_name_action` rejects CLIENT_NAME
+            // after the first channel has been created (line ~898).
+            if !state.channels.is_empty() {
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_INTERNAL,
+                    "attempts to use protocol to set user name \
+                     after creating first channel ignored by server",
+                )
+                .await?;
+                return Ok(());
+            }
+            // C `camessage.c:911-912`: same 512-byte cap as host name.
             let end = payload
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(payload.len());
+            if end >= 512 {
+                send_ca_error(writer, hdr, ECA_INTERNAL, "a very long user name was specified")
+                    .await?;
+                return Ok(());
+            }
             let raw = String::from_utf8_lossy(&payload[..end]).to_string();
             // When a capability-token verifier is configured AND the
             // payload arrives in `cap:<token>` form, verify the token

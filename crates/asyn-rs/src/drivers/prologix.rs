@@ -314,7 +314,7 @@ impl PortDriver for DrvAsynPrologixPort {
                 }
             }
         }
-        self.base.connected = true;
+        self.base.set_connected(true);
         Ok(())
     }
 
@@ -322,7 +322,7 @@ impl PortDriver for DrvAsynPrologixPort {
         if user.addr < 0 {
             self.inner.disconnect(user)?;
         }
-        self.base.connected = false;
+        self.base.set_connected(false);
         Ok(())
     }
 

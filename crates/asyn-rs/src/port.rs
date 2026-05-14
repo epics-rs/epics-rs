@@ -173,6 +173,40 @@ impl PortDriverBase {
         self.connected
     }
 
+    /// Single owner-API for the port-level `connected` transition.
+    ///
+    /// C parity: `exceptionConnect` (asynManager.c:2151-2160) and
+    /// `exceptionDisconnect` (:2174-2185) fire
+    /// `asynExceptionConnect` only when the state actually changes.
+    /// All driver code that toggles connection state MUST go through
+    /// this helper — directly assigning `base.connected = ...`
+    /// followed by `announce_exception(Connect, -1)` bypasses the
+    /// edge guard and fans spurious duplicates out to listeners
+    /// (CA gateway shadow tasks, asynRecord, monitor relays).
+    ///
+    /// Returns `true` if the state actually changed (a fan-out
+    /// happened); `false` if the call was a no-op.
+    pub fn set_connected(&mut self, connected: bool) -> bool {
+        if self.connected == connected {
+            return false;
+        }
+        self.connected = connected;
+        self.announce_exception(AsynException::Connect, -1);
+        true
+    }
+
+    /// Per-address variant — for multi-device ports. Same edge
+    /// guarantee as [`Self::set_connected`].
+    pub fn set_addr_connected(&mut self, addr: i32, connected: bool) -> bool {
+        let was = self.device_state(addr).connected;
+        if was == connected {
+            return false;
+        }
+        self.device_state(addr).connected = connected;
+        self.announce_exception(AsynException::Connect, addr);
+        true
+    }
+
     /// Query whether the port is enabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled
@@ -317,25 +351,20 @@ impl PortDriverBase {
     /// (asynManager.c:2151-2160 — `exceptionConnect` rejects
     /// already-connected; we keep an Ok return for idempotency but
     /// suppress the duplicate fan-out so subscribers don't see
-    /// spurious connect events).
+    /// spurious connect events). Thin wrapper over
+    /// [`Self::set_addr_connected`] for callers that prefer the
+    /// directional verb.
     pub fn connect_addr(&mut self, addr: i32) {
-        let was_connected = self.device_state(addr).connected;
-        self.device_state(addr).connected = true;
-        if !was_connected {
-            self.announce_exception(AsynException::Connect, addr);
-        }
+        self.set_addr_connected(addr, true);
     }
 
     /// Set a specific device address as disconnected.
     ///
     /// C parity: announce only on actual transition
-    /// (asynManager.c:2174-2185).
+    /// (asynManager.c:2174-2185). Thin wrapper over
+    /// [`Self::set_addr_connected`].
     pub fn disconnect_addr(&mut self, addr: i32) {
-        let was_connected = self.device_state(addr).connected;
-        self.device_state(addr).connected = false;
-        if was_connected {
-            self.announce_exception(AsynException::Connect, addr);
-        }
+        self.set_addr_connected(addr, false);
     }
 
     /// Enable a specific device address.
@@ -604,29 +633,13 @@ pub trait PortDriver: Send + Sync + 'static {
     // --- AsynCommon ---
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        // C parity: exceptionConnect (asynManager.c:2151-2160) only
-        // announces if the prior state was disconnected. A redundant
-        // connect on an already-connected port is a no-op for
-        // subscribers in C (and an asynError there); we keep the
-        // Ok-but-silent variant so existing call sites that "ensure
-        // connected" don't spam listeners.
-        let was_connected = self.base().connected;
-        self.base_mut().connected = true;
-        if !was_connected {
-            self.base().announce_exception(AsynException::Connect, -1);
-        }
+        // Single owner-API: edge-guarded fire is in PortDriverBase::set_connected.
+        self.base_mut().set_connected(true);
         Ok(())
     }
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        // C parity: exceptionDisconnect (asynManager.c:2174-2185) only
-        // announces if the prior state was connected — a redundant
-        // disconnect must not fan out a duplicate event.
-        let was_connected = self.base().connected;
-        self.base_mut().connected = false;
-        if was_connected {
-            self.base().announce_exception(AsynException::Connect, -1);
-        }
+        self.base_mut().set_connected(false);
         Ok(())
     }
 

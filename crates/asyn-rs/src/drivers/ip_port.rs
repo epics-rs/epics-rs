@@ -593,8 +593,7 @@ impl PortDriver for DrvAsynIPPort {
                 self.io.inner = Some(IpIoInner::Tcp(stream));
             }
         }
-        self.base.connected = true;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.base.set_connected(true);
         asyn_trace!(
             Some(self.base.trace),
             &self.base.port_name,
@@ -615,8 +614,7 @@ impl PortDriver for DrvAsynIPPort {
             "disconnect"
         );
         self.io.inner = None;
-        self.base.connected = false;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.base.set_connected(false);
         Ok(())
     }
 
@@ -642,8 +640,7 @@ impl PortDriver for DrvAsynIPPort {
                 // HTTP: disconnect after each read (connect-per-transaction)
                 if self.config.protocol == IpProtocol::Http {
                     self.io.inner = None;
-                    self.base.connected = false;
-                    self.base.announce_exception(AsynException::Connect, -1);
+                    self.base.set_connected(false);
                 }
                 Ok(r.nbytes_transferred)
             }
@@ -676,8 +673,7 @@ impl PortDriver for DrvAsynIPPort {
                         "read error, disconnecting: {e}"
                     );
                     self.io.inner = None;
-                    self.base.connected = false;
-                    self.base.announce_exception(AsynException::Connect, -1);
+                    self.base.set_connected(false);
                 }
                 result.map(|r| r.nbytes_transferred)
             }
@@ -737,14 +733,13 @@ impl PortDriver for DrvAsynIPPort {
                 // parse error) and only then drop the live socket and
                 // overwrite config.
                 let new_config = IpPortConfig::parse(value)?;
-                let was_connected = self.base.connected;
                 if self.io.inner.is_some() {
                     // Drop in-flight socket; matches C closeConnection.
                     self.io.inner = None;
-                    self.base.connected = false;
-                    if was_connected {
-                        self.base.announce_exception(AsynException::Connect, -1);
-                    }
+                    // Owner-API: set_connected handles the edge-guarded
+                    // fan-out, so a redundant call here is a no-op for
+                    // listeners just like C's exceptionDisconnect.
+                    self.base.set_connected(false);
                     // C's "if this delay is not present then the sockets
                     // are not always really closed cleanly" — same 20ms
                     // settle to ensure the kernel actually tears down

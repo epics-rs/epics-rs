@@ -546,8 +546,7 @@ impl PortDriver for DrvAsynSerialPort {
             unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
         }
 
-        self.base.connected = true;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.base.set_connected(true);
         asyn_trace!(
             Some(self.base.trace),
             &self.base.port_name,
@@ -578,8 +577,7 @@ impl PortDriver for DrvAsynSerialPort {
         }
         self.saved_termios = None;
 
-        self.base.connected = false;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.base.set_connected(false);
         Ok(())
     }
 

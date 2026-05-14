@@ -370,8 +370,7 @@ impl DrvAsynIPServerPort {
                 message: format!("set_nonblocking failed: {e}"),
             })?;
         *self.listener.lock().unwrap() = Some(listener);
-        self.base.connected = true;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.base.set_connected(true);
         Ok(())
     }
 
@@ -439,8 +438,7 @@ impl DrvAsynIPServerPort {
 
         *self.udp_socket.lock().unwrap() = Some(socket);
         *self.udp_thread.lock().unwrap() = Some(handle);
-        self.base.connected = true;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.base.set_connected(true);
         Ok(())
     }
 
@@ -664,8 +662,7 @@ impl PortDriver for DrvAsynIPServerPort {
         *self.udp_socket.lock().unwrap() = None;
         self.udp_cache.lock().unwrap().clear();
         *self.listener.lock().unwrap() = None;
-        self.base.connected = false;
-        self.base.announce_exception(AsynException::Connect, -1);
+        self.base.set_connected(false);
         Ok(())
     }
 
@@ -934,7 +931,7 @@ impl PortDriver for DrvAsynIPSubport {
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // Passive sync — child port's connection is driven by the
         // parent's accept loop, not by an outbound dial.
-        self.base.connected = self.slot.is_occupied();
+        self.base.set_connected(self.slot.is_occupied());
         if !self.base.connected {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,
@@ -946,12 +943,14 @@ impl PortDriver for DrvAsynIPSubport {
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // Subport disconnect drops the slot — same effect as the
-        // parent's drop_client(idx).
+        // parent's drop_client(idx). Slot clear is an explicit
+        // ownership boundary (the slot owns the announce for
+        // per-addr); the port-level Connect transition is owner-API.
         if self.slot.is_occupied() {
             self.slot.clear();
             self.base.announce_exception(AsynException::Connect, 0);
         }
-        self.base.connected = false;
+        self.base.set_connected(false);
         Ok(())
     }
 
@@ -973,8 +972,15 @@ impl PortDriver for DrvAsynIPSubport {
             Ok(0) => {
                 drop(stream_guard);
                 self.slot.clear();
-                self.base.connected = false;
+                // Per-addr Connect carries addr=0 (this is the
+                // subport's single device slot). The port-level
+                // set_connected(false) handles the port-level
+                // transition exactly once thanks to its edge
+                // guard. Both fan-outs are necessary because
+                // observers can listen at either the port or
+                // the device granularity.
                 self.base.announce_exception(AsynException::Connect, 0);
+                self.base.set_connected(false);
                 Err(AsynError::Status {
                     status: AsynStatus::Disconnected,
                     message: "peer closed".into(),

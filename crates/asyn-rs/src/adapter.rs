@@ -193,18 +193,74 @@ pub struct AsynDeviceSupport {
     write_only: bool,
     /// RAII interrupt subscription — dropping unsubscribes.
     interrupt_sub: Option<InterruptSubscription>,
-    /// Shared cache for the latest interrupt value and its timestamp. Written by
-    /// the I/O Intr forwarding task, read by read(). When an I/O Intr record is
-    /// processed due to an interrupt, read() uses this cached value instead of
-    /// sending a blocking read to the port driver. This matches C EPICS behavior
-    /// where the interrupt callback directly provides the value.
-    interrupt_cache: Arc<std::sync::Mutex<Option<CachedInterrupt>>>,
+    /// Per-record ring buffer of interrupt values, FIFO-ordered. The
+    /// I/O Intr forwarding task pushes; `read()` pops the oldest
+    /// entry. C parity: `devAsynInt32.c::ringBuffer` (DEFAULT 10,
+    /// configurable via `info("asyn:FIFO")`). Overflow policy:
+    /// drop-oldest + `overflows++`; the record-process wakeup is
+    /// **only** sent on a fresh-entry add (not on overflow
+    /// overwrite) so the dbScan queue does not flood.
+    interrupt_fifo: Arc<std::sync::Mutex<InterruptFifo>>,
 }
 
 /// Cached interrupt value with metadata for alarm/timestamp propagation.
 struct CachedInterrupt {
     value: crate::param::ParamValue,
     timestamp: SystemTime,
+}
+
+/// Per-record ring buffer for I/O Intr callbacks. Mirrors C
+/// `devAsynInt32.c::ringBuffer` + `ringSize` + `ringBufferOverflows`.
+struct InterruptFifo {
+    entries: std::collections::VecDeque<CachedInterrupt>,
+    /// Maximum entries (`asyn:FIFO` info-tag, default
+    /// `DEFAULT_RING_BUFFER_SIZE`).
+    ring_size: usize,
+    /// Running count of drop-oldest overwrites since the last
+    /// successful pop. Logged + reset by `pop_callback_value`.
+    overflows: u64,
+}
+
+/// C `DEFAULT_RING_BUFFER_SIZE` at `devAsynInt32.c:63`.
+const DEFAULT_RING_BUFFER_SIZE: usize = 10;
+
+impl InterruptFifo {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::with_capacity(DEFAULT_RING_BUFFER_SIZE),
+            ring_size: DEFAULT_RING_BUFFER_SIZE,
+            overflows: 0,
+        }
+    }
+
+    /// Producer-side: push a fresh interrupt entry, dropping the
+    /// oldest if full. Returns `true` if this push corresponds to a
+    /// *new* entry (and therefore the caller should schedule a record
+    /// process); `false` on overflow (no scanIoRequest in C parity).
+    fn push_with_overflow(&mut self, entry: CachedInterrupt) -> bool {
+        if self.entries.len() >= self.ring_size {
+            self.entries.pop_front();
+            self.overflows += 1;
+            self.entries.push_back(entry);
+            false
+        } else {
+            self.entries.push_back(entry);
+            true
+        }
+    }
+
+    /// Consumer-side: pop the oldest entry. Returns `None` when
+    /// empty. The `overflows` counter is reset by the caller via
+    /// `take_overflows` so the trace warning fires once per drain
+    /// (C `getCallbackValue` behaviour).
+    fn pop(&mut self) -> Option<CachedInterrupt> {
+        self.entries.pop_front()
+    }
+
+    /// Read and clear the overflow counter for a single warning emit.
+    fn take_overflows(&mut self) -> u64 {
+        std::mem::take(&mut self.overflows)
+    }
 }
 
 impl AsynDeviceSupport {
@@ -232,7 +288,7 @@ impl AsynDeviceSupport {
             asyn_readback: false,
             write_only: false,
             interrupt_sub: None,
-            interrupt_cache: Arc::new(std::sync::Mutex::new(None)),
+            interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
         }
     }
 
@@ -277,6 +333,25 @@ impl AsynDeviceSupport {
     /// "asyn:INITIAL_READBACK")` at `devAsynOctet.c:357`).
     pub fn set_initial_readback(&mut self, on: bool) {
         self.initial_readback = on;
+    }
+
+    /// Override the I/O Intr ring buffer size. The framework
+    /// auto-parses `info("asyn:FIFO", "<n>")` via
+    /// [`Self::apply_record_info`]; this manual setter exists for
+    /// callers outside the IocApplication wiring. C parity:
+    /// `devAsynInt32.c::createRingBuffer` at line 354-365 — sets
+    /// `pPvt->ringSize` to `atoi(info)` or `DEFAULT_RING_BUFFER_SIZE`
+    /// when the info tag is absent.
+    pub fn set_fifo_size(&mut self, n: usize) {
+        let mut g = self.interrupt_fifo.lock().unwrap();
+        g.ring_size = n.max(1);
+        // Drop any over-capacity entries already buffered so the new
+        // limit takes effect immediately. Counts the truncation as
+        // overflows so the trace warning fires.
+        while g.entries.len() > g.ring_size {
+            g.entries.pop_front();
+            g.overflows = g.overflows.saturating_add(1);
+        }
     }
 
     /// Set the driver info string (used for `drv_user_create` during init).
@@ -659,12 +734,25 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(DeviceReadOutcome::ok());
         }
 
-        // For I/O Intr records, use the cached interrupt value instead of
-        // sending a blocking read to the port. This matches C EPICS behavior
-        // where the interrupt callback directly provides the new value.
+        // For I/O Intr records, pop the oldest entry from the ring
+        // buffer. C parity: `devAsynInt32.c::getCallbackValue` —
+        // returns the next FIFO entry, logs+resets the overflow
+        // counter on consume.
         if self.scan == ScanType::IoIntr {
-            let cached = self.interrupt_cache.lock().unwrap().take();
-            if let Some(ci) = cached {
+            let (entry, overflows) = {
+                let mut fifo = self.interrupt_fifo.lock().unwrap();
+                (fifo.pop(), fifo.take_overflows())
+            };
+            if overflows > 0 {
+                tracing::warn!(
+                    target: "asyn_rs::adapter",
+                    port = %self.handle.port_name(),
+                    record = %self.record_name,
+                    overflows = overflows,
+                    "ring buffer overflows (C asyn ASYN_TRACE_WARNING)"
+                );
+            }
+            if let Some(ci) = entry {
                 if let Some(val) = param_value_to_epics_value(&ci.value) {
                     let _ = record.set_val(val);
                 }
@@ -756,6 +844,19 @@ impl DeviceSupport for AsynDeviceSupport {
         if let Some(raw) = info.get("asyn:INITIAL_READBACK") {
             self.set_initial_readback(parse_info_bool(raw));
         }
+        // C parity: `info("asyn:FIFO", "<n>")` at
+        // devAsynInt32.c:361-362 — `atoi(sizeString)` overrides
+        // DEFAULT_RING_BUFFER_SIZE (10). C uses raw `atoi`, which
+        // returns 0 for unparseable input; we mirror that by
+        // ignoring zero / negative values so the default isn't
+        // accidentally clobbered by a typo.
+        if let Some(raw) = info.get("asyn:FIFO") {
+            if let Ok(n) = raw.trim().parse::<i64>() {
+                if n > 0 {
+                    self.set_fifo_size(n as usize);
+                }
+            }
+        }
     }
 
     fn write_begin(
@@ -818,14 +919,25 @@ impl DeviceSupport for AsynDeviceSupport {
         // consumed by setup_io_intr(). The mailbox already coalesces intermediate
         // updates, so no data is lost even if the record processes slowly.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let cache = self.interrupt_cache.clone();
+        let fifo = self.interrupt_fifo.clone();
         tokio::spawn(async move {
             while let Some(iv) = intr_rx.recv().await {
-                *cache.lock().unwrap() = Some(CachedInterrupt {
+                let entry = CachedInterrupt {
                     value: iv.value,
                     timestamp: iv.timestamp,
-                });
-                if tx.send(()).await.is_err() {
+                };
+                // C parity (devAsynInt32.c:564-576):
+                //   - On overflow (ring full), drop oldest +
+                //     overflows++ and DO NOT call scanIoRequest.
+                //     The already-pending process will pick up the
+                //     newer tail; a duplicate request would just
+                //     flood dbScan.
+                //   - On normal add, request the record to process.
+                let was_fresh_add = {
+                    let mut g = fifo.lock().unwrap();
+                    g.push_with_overflow(entry)
+                };
+                if was_fresh_add && tx.send(()).await.is_err() {
                     break;
                 }
             }
@@ -1186,6 +1298,117 @@ mod tests {
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.reason, 0); // "VAL" is param index 0
+    }
+
+    // --- asyn:FIFO ring buffer ---
+
+    fn intr_entry(v: i32, t_ms: u64) -> CachedInterrupt {
+        CachedInterrupt {
+            value: crate::param::ParamValue::Int32(v),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_millis(t_ms),
+        }
+    }
+
+    #[test]
+    fn fifo_default_size_matches_c_constant() {
+        // C devAsynInt32.c:63 → DEFAULT_RING_BUFFER_SIZE = 10.
+        let f = InterruptFifo::new();
+        assert_eq!(f.ring_size, 10);
+        assert!(f.entries.is_empty());
+        assert_eq!(f.overflows, 0);
+    }
+
+    #[test]
+    fn fifo_push_pop_fifo_order() {
+        let mut f = InterruptFifo::new();
+        assert!(f.push_with_overflow(intr_entry(1, 1)));
+        assert!(f.push_with_overflow(intr_entry(2, 2)));
+        assert!(f.push_with_overflow(intr_entry(3, 3)));
+        let popped: Vec<_> = std::iter::from_fn(|| f.pop())
+            .map(|c| match c.value {
+                crate::param::ParamValue::Int32(v) => v,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(popped, vec![1, 2, 3], "FIFO order, not LIFO");
+        assert_eq!(f.take_overflows(), 0);
+    }
+
+    #[test]
+    fn fifo_overflow_drops_oldest_and_counts() {
+        // C parity: devAsynInt32.c:566-571 — when ringHead wraps onto
+        // ringTail, advance ringTail (drop oldest) + overflows++.
+        let mut f = InterruptFifo::new();
+        f.ring_size = 3;
+        assert!(f.push_with_overflow(intr_entry(1, 1)));
+        assert!(f.push_with_overflow(intr_entry(2, 2)));
+        assert!(f.push_with_overflow(intr_entry(3, 3)));
+        // Now full: every additional push must be reported as overflow.
+        assert!(!f.push_with_overflow(intr_entry(4, 4)));
+        assert!(!f.push_with_overflow(intr_entry(5, 5)));
+        assert_eq!(f.overflows, 2);
+        // Buffer now holds [3, 4, 5] — oldest two dropped.
+        let popped: Vec<_> = std::iter::from_fn(|| f.pop())
+            .map(|c| match c.value {
+                crate::param::ParamValue::Int32(v) => v,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(popped, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn fifo_take_overflows_resets() {
+        let mut f = InterruptFifo::new();
+        f.ring_size = 1;
+        f.push_with_overflow(intr_entry(1, 1));
+        f.push_with_overflow(intr_entry(2, 2)); // overflow
+        f.push_with_overflow(intr_entry(3, 3)); // overflow
+        assert_eq!(f.take_overflows(), 2);
+        // Second call must return 0 — counter was reset.
+        assert_eq!(f.take_overflows(), 0);
+    }
+
+    #[test]
+    fn set_fifo_size_truncates_existing_entries() {
+        let mut ads = make_adapter(ScanType::IoIntr);
+        {
+            let mut g = ads.interrupt_fifo.lock().unwrap();
+            g.ring_size = 10;
+            g.push_with_overflow(intr_entry(1, 1));
+            g.push_with_overflow(intr_entry(2, 2));
+            g.push_with_overflow(intr_entry(3, 3));
+            g.push_with_overflow(intr_entry(4, 4));
+        }
+        // Shrink — must drop the 2 oldest and count them as overflows.
+        ads.set_fifo_size(2);
+        let g = ads.interrupt_fifo.lock().unwrap();
+        assert_eq!(g.entries.len(), 2);
+        assert_eq!(g.overflows, 2);
+    }
+
+    #[test]
+    fn apply_record_info_parses_asyn_fifo() {
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut info = std::collections::HashMap::new();
+        info.insert("asyn:FIFO".to_string(), "32".to_string());
+        ads.apply_record_info(&info);
+        assert_eq!(ads.interrupt_fifo.lock().unwrap().ring_size, 32);
+
+        // C atoi("garbage") = 0 → keep default (we additionally
+        // require n > 0).
+        info.insert("asyn:FIFO".to_string(), "garbage".to_string());
+        ads.apply_record_info(&info);
+        assert_eq!(
+            ads.interrupt_fifo.lock().unwrap().ring_size,
+            32,
+            "non-numeric must not clobber size"
+        );
+
+        // Negative / zero is rejected too.
+        info.insert("asyn:FIFO".to_string(), "0".to_string());
+        ads.apply_record_info(&info);
+        assert_eq!(ads.interrupt_fifo.lock().unwrap().ring_size, 32);
     }
 
     #[test]

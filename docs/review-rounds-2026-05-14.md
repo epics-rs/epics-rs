@@ -415,3 +415,122 @@ push_array 자체 로직 (full-chunk loop + PBUF=YES tail emit) 은 C `compress_
 
 **상태**: clean (round 2 after wire-protocol fix)
 
+
+### 92-94/161 — `683c6ea`, `7b5b9ac`, `710fe62` — SIMM=RAW + sync filter (3 modes → 6 modes)
+
+- **92** `683c6ea` SIMM=RAW: 이전 review session fix `1cc2629` 가 Float→Long floor 처리, 본 commit 의 convert_to fallback 는 비-float 타입에만 적용 — C-correct.
+- **93** `7b5b9ac` sync filter "after" 모드: Rust-invented "trigger pulse" 모델, C-divergent. **94** 에서 dbState 기반 6 modes 로 재설계.
+- **94** `710fe62` sync 6 modes: 5/6 modes 정확. **Defect**: alarm event 가 `if !VALUE { return Some }` 단축회로로 state machine 우회. C `sync.c::filter` 는 `DBE_PROPERTY` 만 우회 — DBE_ALARM 은 정상 통과. 446e0d4a 가 dbnd 한정인데 sync 에 잘못 적용.
+
+**Fix**: `e26af3e` — sync `intersects(PROPERTY)` 만 우회로 변경. `while` 모드 + state=false 일 때 ALARM 도 drop (C 일치). 테스트 2개 갱신.
+
+**상태**: clean (round 2)
+
+### 95/161 — `69c7999` feat(pva): server-side channel filter wire-through
+
+**검토**: client-side `PvRequestExpr::encode()` 에 `to_pv_field()` + `encode_pv_field()` 추가 — pvxs `clientget.cpp:351-352` `to_wire(type) + to_wire_full(value)` 패턴 일치. 이전에 type descriptor 만 전송해 pipeline/queueSize/_filter 등 record_options 무음 전파되던 버그 수정. PVA `_filter` option key 는 Rust extension (pvxs 미사용).
+
+**상태**: clean (client encode fix C-aligned)
+
+### 96-98/161 — `0b4e89a`, `2054ab7`, `1400bd8` — NORD invariant test + async-gate fix + NORD side-effect
+
+- **96** test-only NORD timestamp ordering.
+- **97** `complete_async_record` subscriber-gate fix — mirror main path's last_posted gate.
+- **98** `put_pv_and_post` waveform NORD side-effect propagation.
+
+**상태**: clean (all rounds 1)
+
+### 99-103/161 — test-only commits
+
+`9dea925` `06aa884` `4e4fd49` `f80f15a` `9d3036c` — 모두 invariant 검증용 테스트. 코드 변경 없음.
+
+**상태**: clean (pure tests)
+
+### 104-109/161 — SO_RXQ_OVFL helper + wire-through
+
+- **104** `2a9b52a` AsyncUdpV4::enable_so_rxq_ovfl + recv_from_with_drop_count_socket. C pvxs `osdSockExt.cpp:60` `setsockopt(SOL_SOCKET, SO_RXQ_OVFL, 1)` 동치. cmsg walk 도 정확.
+- **105** `047bd2d` docs.
+- **106** `6738aa3` PVA UDP collector wire-through.
+- **107** `17e6021` chore.
+- **108** `b3e0fe0` CA SEARCH/UDP server wire-through.
+- **109** `aff1ee5` CA beacon RX + repeater wire-through.
+
+**상태**: clean (모두 standard wire-through pattern)
+
+### 110/161 — `22fd25d` bulk 9-A archaeology audit (mbboDirect init + compress RES)
+
+- **mbboDirect** `post_init_finalize_undef` hook: C `init_record` (mbboDirectRecord.c:139-160) 의 UDF-based VAL ↔ Bx priority logic 과 동치.
+- **compress RES**: nuse/off/res/accum/val clear, C `reset()` (compressRecord.c) 와 일치. C 의 `inx`/`cvb`/`sptr` (Average rolling 용) 는 Rust 미구현이라 무관.
+
+**상태**: clean
+
+### 111-115/161 — ca-repeater debug + docs + asyn-rs (Stage 2 audit)
+
+- **111** `d0d59f7` ca-repeater `-d/-dd` PR #831 port — mechanical.
+- **112-114** docs/audit closure.
+- **115** `598d81b` asyn-rs IP server port + TRACE_STATE (이미 prev session 에서 fix `9691605` 로 STATE bit 제거 — current HEAD C-correct).
+
+**상태**: clean
+
+### 116/161 — `60188d3` feat: iocsh ANSI color + HAG DNS TTL refresh
+
+**Round 1 defect**: prompt color cyan (`\x1b[36m`). C `c0da3dd1f` + errlog.h:282 `ANSI_ESC_GREEN "\033[32;1m"` — bright green. cosmetic but C-divergent.
+
+**Fix**: `1be96ec` — `\x1b[32;1m` 로 변경 (C ANSI_GREEN 매크로 일치).
+
+**상태**: clean (round 2 after `1be96ec`)
+
+### 117/161 — `d525ace` feat: PVA decodeError file:line + general_time sync hook
+
+**검토**: `Status::error_with_location(file, line, msg)` 가 wire stack-trace 필드에 `"file:line"` 포맷. `source_location` 가 `rsplit_once(':')` 로 Windows `C:\` 경로 round-trip 안전. pvxs `e9ce80880d92` convention 일치.
+
+**상태**: clean
+
+### 118/161 — `e1387d8` feat: PI mutex + serial break + averaging device + camonitor type-change
+
+PI Mutex / serial BREAK / averaging device 는 asyn-rs / Linux RT extension, wire 영향 없음. NativeTypeChanged event 는 C `1687757752` camonitor type-change 와 의미적 일치 (broadcast pattern 차이 있으나 end-goal 동일).
+
+**상태**: clean
+
+### 119/161 — `d545303` feat: lnkCalc + autoExec=false PUT + filter on read + FTDI
+
+**Round 1 defect (PVA autoExec=false interop)**: Rust 가 server-side 에서 "first PUT queues, second PUT commits" two-step pattern 도입. pvxs `serverget.cpp:488-492` 는 모든 CMD_PUT !init 에 `onPut` 즉시 호출 — server 는 autoExec 무관. pvxs `clientget.cpp:123` autoExec 는 client-side timing 만 제어 (auto vs `reExec()`). pvxs PR `7073538` 는 client-side error handling 만 변경.
+
+증상: pvxs client `.autoExec(false).reExec(v)` 호출 시 Rust 가 v 를 queue 하고 OK ack — write 미발생. 두 번째 reExec(v2) 시 첫 v 가 commit, v2 가 queue. 매 write 가 한 round delay.
+
+**Fix**: `65db161` — `OpState::put_pending` 제거, PUT 실행 path 무조건 `put_value_checked` 호출. `put_auto_exec` field 는 diagnostic echo 용으로만 유지.
+
+기타 (lnkCalc + filter-on-read + FTDI) 는 Rust extension / asyn-rs work.
+
+**상태**: clean (round 2 after `65db161`)
+
+### 120-130/161 — 9-A audit fact-check + asyn-rs work + reverts
+
+- **120** docs fact-check.
+- **121-127** asyn-rs UDP/Prologix/FIFO/VXI-11/HiSLIP/PVI scaffolds.
+- **128-130** REVERTS of 125-127 (invented work).
+
+asyn-rs work was deep-audited in earlier session (`docs/asyn-rs-audit-2026-05-14.md`). 22 items, 6 verified / 9 partial / 4 invented / 3 wrong. All 16 items closed by commit `60416c1`.
+
+**상태**: clean (relies on prior session asyn audit)
+
+### 131-161/161 — asyn-rs C-source audit fixes (W1/W2/I4 + 13 items)
+
+31 commits applying audit findings from `docs/asyn-rs-audit-2026-05-14.md` + `docs/asyn-missing.md`. Earlier session reviewed each commit individually against `~/codes/epics-modules/asyn/...` C sources. Fixes include:
+- `9ff5659` TCP&/UDP&/UDP* protocol suffix semantics
+- `9691605` trace mask STATE bit removed
+- `5d2253c` FTDI iocshArg
+- `7befd0e` SumAverager (replaces RingAverager)
+- `1ec01f3` drvAsynIPServerPort SO_REUSEPORT removal
+- `38e7743` RS485 struct
+- `40fa1d0` hostInfo setOption
+- `1e2716a` IP server child port model
+- `4b6e2f7`, `f2370af` INITIAL_READBACK
+- `55dc8fd` asynOctet SIZV
+- `a20aede` ASYN_DESTRUCTIBLE
+- `e96561b` asynMask SHFT/MASK propagation
+- `04ef574` asyn:FIFO ring buffer
+- `614e7eb` ai LINEAR ESLO/EOFF
+- Various scaffolds (USBTMC, VXI-11)
+
+**상태**: clean (rely on prior session audit; current HEAD is post-fix state)

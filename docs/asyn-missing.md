@@ -4,34 +4,44 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 
 먼저, `epics-rs`는 놀랍게도 최근 C++ `asyn`에 추가된 많은 최신 기능들과 이슈 수정 사항들을 이미 꼼꼼하게 반영하고 있습니다.
 
-## 이미 구현 (verified ✓)
+## 이미 구현 (verified ✓ — 2026-05-14 audit 반영)
 
 | 항목 | C asyn 출처 | 위치 |
 |---|---|---|
-| `UInt64`/`UInt64Array` 인터페이스 | Issue #231 | `interfaces/uint64.rs` |
-| RS485 시리얼 지원 | PR #22 | `drivers/serial_port.rs` |
+| RS485 시리얼 지원 (5 키 + struct serial_rs485 + getOption) | PR #22 | `drivers/serial_port.rs` (audit P1, commit `38e7743`) |
 | Serial BREAK 전송 (`send_break`) | PR #188 | `drivers/serial_port.rs::send_break` |
-| TCP `TCP&` (비동기 연결) / UDP `UDP&` (broadcast) / `UDP*` (multicast) | PR #109 | `drivers/ip_port.rs::IpProtocol` |
-| `SO_REUSEPORT` 지원 | PR #109 | `drivers/ip_server_port.rs::IpServerConfig::reuse_port` |
+| TCP `TCP&` / UDP `UDP&` (REUSEPORT) / `UDP*` (broadcast) / `UDP*&` | PR #109 + audit W1 fix | `drivers/ip_port.rs::IpProtocol` (audit W1 swap fix, commit `9ff5659`) |
 | Unix Domain Socket | Issue #31 | `drivers/ip_port.rs::IpProtocol::Unix` |
 | `disconnectOnReadTimeout` | PR #6 | `drivers/ip_port.rs::IpPortConfig::disconnect_on_read_timeout` |
-| 런타임 `hostInfo` (`set_option("hostInfo")`) | Issue #12 | `drivers/ip_port.rs` (set_option) |
+| 런타임 `hostInfo` 전체 reparse + 20ms close delay | Issue #12 | `drivers/ip_port.rs::set_option("hostInfo")` (audit P2, commit `40fa1d0`) |
 | Interpose 필터 (`asynInterposeDelay`/`Echo`/`Eos`/`Flush`) | PR #79 | `interpose/{delay,echo,eos,flush}.rs` |
-| TCP 서버 모드 (`drvAsynIPServerPort`) | PR #148/#109 | `drivers/ip_server_port.rs` |
-| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | `drvAsynIPServerPort.c` SOCK_DGRAM | `drivers/ip_server_port.rs::IpServerProtocol::Udp` — single shared `UdpCache` (C parity, source addr 무시), recv 워커 스레드 (cache empty 일 때만 recv), `read_octet` 가 cache drain 후 0 반환 (non-blocking, C parity), `write_octet` 가 read-only 에러. UDP_MAX_DATAGRAM=65507. 4× 회귀 테스트. |
-| `ASYN_TRACE_STATE` 마스크 비트 | PR #67 | `trace.rs::TraceMask::STATE` |
-| `asynSetTrace*Mask` 문자열 파싱 | PR #76 | `trace.rs::*::from_symbolic` |
-| `asynInt32Average`/`asynFloat64Average` + `RingAverager` | Issue #30 | `interfaces/average.rs` |
-| `asyn:READBACK` info-tag | PR #60 / #208 | `adapter.rs::asyn_readback` field + auto-detect |
-| 초기값 동기화 (initial readback) | Issue #24 / PR #27 | `adapter.rs::with_initial_readback` |
-| `lsi`/`lso`/`printf` 어댑터 매핑 | PR #104 | `adapter.rs::asynOctet` 경로가 String/CharArray ↔ EpicsValue 변환 처리 |
-| `ASYN_DESTRUCTIBLE` / shutdown | PR #171 | `port.rs::PortFlags::destructible` + `PortDriver::shutdown` |
-| FTDI 드라이버 스캐폴드 | PR #88 | `drivers/ftdi.rs` (config parser + scaffold, hardware path feature-gated) |
-| Prologix GPIB 드라이버 | `drvPrologixGPIB.c` | `drivers/prologix.rs` — embedded `DrvAsynIPPort` (`<port>_TCP`), per-write `setAddress(user.addr)` (addr/100 primary + addr%100+96 secondary), on-connect 8-line init burst (`++savecfg`/`++mode`/`++ifc`/`++eos`/`++eoi`/`++eot_char`/`++eot_enable`/`++ver`) + version-string capture, char escaping (`\r`/`\n`/`\033`/`+` → `\033`-prefix), EOS append + `\n` terminator, `++read eoi`/`++read <eos>` flow with EOT-marker strip + binary-mode disambiguation. 5× loopback 회귀 테스트. |
+| TCP 서버 모드 + child port (`parent:N`) | PR #148/#109 | `drivers/ip_server_port.rs::DrvAsynIPSubport` (audit P3, commit `1e2716a`) |
+| UDP 서버 모드 (`drvAsynIPServerPort UDP`) | `drvAsynIPServerPort.c` SOCK_DGRAM | `drivers/ip_server_port.rs::IpServerProtocol::Udp` — single shared `UdpCache` (C parity, source addr 무시), recv 워커 스레드 (cache empty 일 때만 recv), `read_octet` 가 cache drain 후 0 반환 (non-blocking, C parity), `write_octet` 가 read-only 에러. UDP_MAX_DATAGRAM=65507. |
+| `asynSetTrace*Mask` 문자열 파싱 (C 토큰 이름) | PR #76 + audit W2 fix | `trace.rs::*::from_symbolic` (audit W2, commit `9691605`) |
+| `asynInt32Average`/`asynFloat64Average` DTYP — `SumAverager` (C `sum`+`numAverage`) | Issue #30 + audit I2 fix | `interfaces/average.rs::SumAverager` (audit I2, commit `7befd0e`) |
+| `asyn:READBACK` info-tag 자동 인식 + `asyn:INITIAL_READBACK` | PR #60 / #208 | `adapter.rs::apply_record_info` (audit P4, commit `f2370af`) |
+| 초기값 동기화 — output 한정 (input 제거) | Issue #24 / PR #27 + audit P5 fix | `adapter.rs::universal_asyn_factory` (audit P5, commit `4b6e2f7`) |
+| `lsi`/`lso`/`printf` SIZV-driven asynOctet 버퍼 | PR #104 + audit P6 fix | `adapter.rs::octet_max_size` (audit P6, commit `55dc8fd`) |
+| `ASYN_DESTRUCTIBLE` shutdown lifecycle (opt-in, default false) | PR #171 + audit P7 | `port.rs::shutdown_lifecycle` + `manager.rs::shutdown_port` (audit P7, commit `a20aede`) |
+| FTDI 드라이버 스캐폴드 (9 positional iocshArg) | PR #88 + audit W3 fix | `drivers/ftdi.rs` (audit W3, commit `5d2253c`) |
+| Prologix GPIB 드라이버 | `drvPrologixGPIB.c` | `drivers/prologix.rs` |
 | 양방향 파라미터 notification | Issue #46 | `interrupt.rs::Interrupt` + `call_param_callbacks` |
-| EOS 설정자 atomic update | Issue #103 | `interpose/eos.rs` Mutex-protected |
-| `asynMask` shift | Issue #166 | record-layer SHFT (mbbiDirect/mbboDirect) — asyn-side mask는 bit selection만 |
-| `aai`/`aao` 레코드 어댑터 매핑 | PR #162 | `epics-base-rs` `WaveformRecord::with_kind(Aai/Aao)` + `asyn-rs::adapter::normalize_asyn_dtyp` (asynFloat64ArrayIn/Out → asynFloat64Array). `dtyp_normalize_aai_aao_array_in_out` 회귀 테스트로 fence |
+| EOS 설정자 atomic update (Rust는 in-memory only — issue #103 reproduce 불가) | Issue #103 | `interpose/eos.rs` + `port.rs` EOS section (audit P8, commit `726ddba`) |
+| `asynMask` shift — `computeShift(mask)` + MASK/SHFT 자동 전파 | Issue #166 + audit P9 fix | `adapter.rs::compute_mask_shift` + `apply_linear_eslo_eoff` (audit P9, commit `e96561b`) |
+| `aai`/`aao` 레코드 어댑터 매핑 | PR #162 | `epics-base-rs` `WaveformRecord::with_kind` + `adapter.rs::normalize_asyn_dtyp` |
+| `asyn:FIFO` 링 버퍼 (DEFAULT=10, atoi override, scanIoRequest only-on-fresh-add) | `devAsynInt32::createRingBuffer` | `adapter.rs::InterruptFifo` (missing M1, commit `04ef574`) |
+| `getBounds_int32/int64` ↔ ai LINEAR ESLO/EOFF | `devAsynInt32::initAi`/`convertAi` | `adapter.rs::apply_linear_eslo_eoff` (missing M2, commit `614e7eb`) |
+| `asynParamSet` 평탄 그룹 helper | `asynPortDriver/asynParamSet.h` | `param.rs::AsynParamSet` (missing M3, commit `5817fad`) |
+| USBTMC 드라이버 스캐폴드 (6 positional iocshArg + BTAG 프레이밍) | `drvAsynUSBTMC.c` | `drivers/usbtmc.rs` (missing M4, commit `448724e`) |
+| VXI-11 드라이버 스캐폴드 (7 positional iocshArg + RPC 상수) | `vxi11/drvVxi11.c` | `drivers/vxi11.rs` (missing M5, commit `2b67092`) |
+
+### Rust extensions (C asyn 부재 — 명시)
+
+| 항목 | C asyn 상태 | 위치 |
+|---|---|---|
+| `UInt64`/`UInt64Array` 인터페이스 | Issue #231 unmerged — C asyn 부재 | `interfaces/uint64.rs` — module docstring 에 Rust extension 표기 (audit I1, commit `2bbbb45`) |
+| `ASYN_TRACE_STATE` 마스크 비트 | C `asynDriver.h:211-216` 에 6비트만 존재 | audit I4 에서 제거 (commit `9691605`) |
+| `SO_REUSEPORT` server 토큰 | C `drvAsynIPServerPort.c` server 측은 `[tcp\|udp]`만 | audit I3 에서 제거 (commit `1ec01f3`) |
 
 ## 진짜 미구현 (verified gaps — C asyn 소스 대비)
 

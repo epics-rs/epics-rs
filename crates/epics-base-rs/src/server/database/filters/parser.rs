@@ -117,7 +117,15 @@ fn build_dbnd(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
         return Some(Arc::new(DeadbandFilter::new(d, DeadbandMode::Absolute)));
     }
     if let Some(r) = obj.get("r").and_then(|v| v.as_f64()) {
-        return Some(Arc::new(DeadbandFilter::new(r, DeadbandMode::Relative)));
+        // C `dbnd.c`: `my->hyst = val * my->cval/100.` — JSON `r` is
+        // interpreted as a percent (e.g. `{"r":50}` means 50%). The
+        // internal `DeadbandFilter` stores the relative threshold as
+        // a fraction (`threshold * |last|` per call), so divide by
+        // 100 at the wire boundary to match C semantics.
+        return Some(Arc::new(DeadbandFilter::new(
+            r / 100.0,
+            DeadbandMode::Relative,
+        )));
     }
     None
 }

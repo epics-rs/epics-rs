@@ -758,15 +758,35 @@ pub async fn run_udp_responder_v6(
     protocol: &'static str,
     ignore_addrs: Vec<(IpAddr, u16)>,
 ) -> PvaResult<()> {
-    let bind_addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), udp_port);
-    let socket = tokio::net::UdpSocket::bind(bind_addr)
-        .await
+    use socket2::{Domain, Protocol, Socket, Type};
+    // Build the v6 socket explicitly via socket2 so we can force
+    // `IPV6_V6ONLY=1`. On Linux the kernel default is `0` (dual-stack):
+    // a `[::]:port` socket would also claim v4 traffic and overlap
+    // with the parallel v4 responder bundle, causing surprising
+    // duplicate handling or EADDRINUSE on the per-NIC binds. Mirroring
+    // `bind_beacon_send_v6` keeps the v4 and v6 responder lanes
+    // strictly disjoint regardless of platform default.
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
         .map_err(crate::error::PvaError::Io)?;
+    if let Err(e) = sock.set_only_v6(true) {
+        debug!("v6 responder: set_only_v6 failed: {e}");
+    }
+    // SO_REUSEADDR so a restart picks up the same port without TIME_WAIT.
+    if let Err(e) = sock.set_reuse_address(true) {
+        debug!("v6 responder: set_reuse_address failed: {e}");
+    }
+    sock.set_nonblocking(true)
+        .map_err(crate::error::PvaError::Io)?;
+    let bind_addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), udp_port);
+    sock.bind(&bind_addr.into())
+        .map_err(crate::error::PvaError::Io)?;
+    let std_sock: std::net::UdpSocket = sock.into();
+    let socket = tokio::net::UdpSocket::from_std(std_sock).map_err(crate::error::PvaError::Io)?;
     if let Err(e) = enable_so_rxq_ovfl_for_socket(&socket) {
         debug!("v6 SO_RXQ_OVFL enable failed (non-fatal): {e}");
     }
     let socket = Arc::new(socket);
-    debug!(?udp_port, "IPv6 UDP search responder started");
+    debug!(?udp_port, "IPv6 UDP search responder started (V6ONLY=1)");
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut prev_drops_v6: u32 = 0;

@@ -309,3 +309,45 @@ C 에서 EPICS_CAS_SERVER_PORT 는 **UDP+TCP 모두**를 같은 포트로 설정
 
 **상태**: clean (round 1, deferred — feature gap 작성자 인지 + 라벨)
 
+### 74-82/161 — `835e2c5`, `4cc40a8`, `abf9344`, `312d578`, `2c1c8ee`, `e25d281`, `0cd85a5`, `19551c5`, `a3e7c74` (PR #205 IPv6 Stages 1-6 + 보조 fix/doc)
+
+**Round 1 defect (1건)**:
+
+`abf9344` (Stage 2 v6 SEARCH responder) 의 `run_udp_responder_v6` 가 `IPV6_V6ONLY` flag 미설정. 동일 commit 의 `bind_beacon_send_v6` 는 `set_only_v6(true)` 호출하나 RX socket 만 누락된 비대칭. Linux 기본 `IPV6_V6ONLY=0` → `[::]:port` 가 v4 와 dual-stack 으로 동작해 v4 per-NIC bundle 과 ports/destinations 충돌 (EADDRINUSE 또는 silent duplicate). BSD/macOS 기본은 `V6ONLY=1` 라서 우연히 동작.
+
+**Fix**: `9b27f5b` — socket2 로 명시적 `set_only_v6(true)` + `set_reuse_address(true)` 추가. v4/v6 lane 을 strictly disjoint 하게 분리. 모든 platform 에서 일관된 동작.
+
+**기타 (clean)**:
+- `835e2c5` Stage 1: `Ipv4Addr` → `IpAddr` 타입 widening, default 유지 → no behavior change for v4.
+- `4cc40a8` Stage 1 cont'd: `client_config()` peer family 미러링 (`Ipv4Addr::LOCALHOST` vs `Ipv6Addr::LOCALHOST`).
+- `312d578` Stage 3: ADDR_LIST v6 entries 1회성 warn + drop (graceful degradation).
+- `2c1c8ee` Stage 1 doc.
+- `e25d281` Stage 4: client v6 SEARCH 소켓 `IPV6_V6ONLY=1` + `ff0e::400` multicast group 일관 적용. `rewrite_loopback` peer family 미러링.
+- `0cd85a5` Stage 5: v6 multicast beacon emit, 동일한 V6ONLY 패턴.
+- `19551c5` legacy `rewrite_loopback_target` 도 peer family 미러링 (Stage 4 와 일치).
+- `a3e7c74` Stage 6: client v6 beacon recv, `SO_REUSEADDR/SO_REUSEPORT + IPV6_V6ONLY=1` 일관.
+
+**상태**: clean (round 2 after fix `9b27f5b`)
+
+### 83/161 — `b9f3e41` fix(longout): OOPT first cycle force-emits (epics-base PR #6c573b4)
+
+**Round 1 defect**: 원 commit 의 `compute_should_output` 가 `if !self.first_output_done { return true; }` 로 first-cycle force 를 모든 OOPT 값 (Every Time/On Change/When Zero/When Non-zero/Transition_*) 에 적용. C `conditional_write` (longoutRecord.c:455-487) 는 `outpvt == EXEC_OUTPUT` 체크가 `case longoutOOPT_On_Change` arm 안에만 존재 — 다른 OOPT 는 자기 조건 그대로 평가. 즉 OOPT=When_Zero+초기 val=0 같은 케이스에서 Rust 는 first-cycle force 로 write 발생, C 는 정상 평가.
+
+**Fix**: 이전 review session 에서 `bd9d1c7` 로 force 를 `1 => !self.first_output_done || self.val != self.pval` arm 안으로 이동시켜 fix 됨. 현 HEAD (longout.rs:131-139) C semantic 과 일치.
+
+**참고 (별도 항목으로 처리)**: C PR `6c573b4` 는 두 번째 feature 포함 — `special()` 에서 OUT field 변경 시 `ooch == YES` 면 `outpvt = EXEC_OUTPUT` 재설정. Rust 는 OOCH field 미구현. mid-life OUT redirect 시 next-cycle force 미발생. Feature gap — 추후 필요 시 OOCH 추가 + put_field("OUT") hook 필요.
+
+**상태**: clean (이전 fix `bd9d1c7` 로 완료, current HEAD verified C-parity)
+
+### 84/161 — `a493cf2` fix(processing): soft-channel INP read failures raise LINK_ALARM (PR #4737901)
+
+**검토**: Rust 의 LINK_ALARM/INVALID 적용 로직 자체는 C `devAiSoft.c::read_ai` + `dbLink.c::setLinkAlarm` 와 일치 (raise-only `recGblSetSevr`). gate `is_soft && matches!(inp_parsed, Db|Ca|Pva)` 도 C 의 soft device support 컨텍스트와 부합.
+
+**Round 1 발견 (pre-existing cross-cutting, 별도 fix 로 처리)**: Rust `alarm_status::*` enum 값들이 C `menuAlarmStat.dbd` / `epicsAlarmCondition` (libcom/src/misc/alarm.h) 와 다름. CA wire `stat` byte 가 이 정수값 그대로 전송되므로 fundamental 한 wire-level protocol 발산. 예: Rust `LINK_ALARM=13`, C wire 는 `13=SCAN`; Rust `DISABLE_ALARM=14`, C wire 는 `14=LINK`. CA client (caget/camonitor/IOC) 가 Rust IOC 의 STAT 을 잘못 decode.
+
+또한 누락된 항목: `BAD_SUB_ALARM` (C: 16), `READ_ACCESS_ALARM` (C: 20), `WRITE_ACCESS_ALARM` (C: 21).
+
+**Fix**: 별도 commit — `alarm_status::*` 를 menuAlarmStat.dbd 순서로 renumber + 누락 3개 추가. 영향 받는 hard-coded numeric assertion 2개 test 갱신 (`database_tests.rs:711` DISABLE=18, `record_tests.rs:752` SCAN=13). 정적 use site 들은 named constant 라 자동 호환.
+
+**상태**: clean (commit logic OK, wire-level enum fix 별도)
+

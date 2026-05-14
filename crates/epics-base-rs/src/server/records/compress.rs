@@ -3,11 +3,23 @@ use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// Compress record — circular buffer with compression algorithms.
+///
+/// `alg` follows C `menuCompressALG` (compressRecord.dbd.pod):
+///   0 = N to 1 Low Value
+///   1 = N to 1 High Value
+///   2 = N to 1 Average
+///   3 = Average (rolling) — not yet implemented; falls through to 0.0
+///   4 = Circular Buffer
+///   5 = N to 1 Median — not yet implemented; falls through to 0.0
+///
+/// The numeric values are CA-wire-visible (DBR_SHORT) and must match
+/// `menuCompressALG` so a C client setting `ALG=4` reaches the
+/// Circular-Buffer code path.
 pub struct CompressRecord {
     pub val: Vec<f64>,
     pub nsam: i32,   // Number of samples (buffer size)
     pub inp: String, // input link
-    pub alg: i16,    // 0=N to 1 Low, 1=N to 1 High, 2=N to 1 Mean, 3=Circular Buffer
+    pub alg: i16,    // See top-of-struct doc — matches menuCompressALG
     pub n: i32,      // Number of values to compress
     pub nuse: i32,   // Number of elements used
     pub off: i32,    // Current write offset
@@ -34,7 +46,7 @@ impl Default for CompressRecord {
             val: vec![0.0; 10],
             nsam: 10,
             inp: String::new(),
-            alg: 3, // Circular Buffer by default
+            alg: 4, // Circular Buffer by default (menuCompressALG_Circular_Buffer)
             n: 1,
             nuse: 0,
             off: 0,
@@ -59,8 +71,8 @@ impl CompressRecord {
     /// Push a value into the compress record.
     pub fn push_value(&mut self, input: f64) {
         match self.alg {
-            3 => {
-                // Circular buffer
+            // menuCompressALG_Circular_Buffer
+            4 => {
                 let idx = self.off as usize % self.nsam as usize;
                 self.val[idx] = input;
                 self.off += 1;
@@ -68,8 +80,11 @@ impl CompressRecord {
                     self.nuse += 1;
                 }
             }
+            // N-to-1 algorithms (Low/High/N_to_1_Average/Median).
+            // alg=3 (Average rolling) currently falls through here
+            // but is not implemented properly — flush_accum returns
+            // 0.0 for unsupported algs.
             _ => {
-                // N-to-1 algorithms
                 self.accum.push(input);
                 if self.accum.len() >= self.n as usize {
                     self.flush_accum();
@@ -92,9 +107,9 @@ impl CompressRecord {
     /// samples available" behaviour — partial accumulation persists
     /// for the next array.
     pub fn push_array(&mut self, input: &[f64]) {
-        // Circular Buffer (alg=3) treats every sample independently;
+        // Circular Buffer (alg=4) treats every sample independently;
         // the partial-buffer question doesn't apply.
-        if self.alg == 3 {
+        if self.alg == 4 {
             for &v in input {
                 self.push_value(v);
             }
@@ -122,9 +137,23 @@ impl CompressRecord {
             return;
         }
         let compressed = match self.alg {
-            0 => self.accum.iter().cloned().fold(f64::INFINITY, f64::min), // Low
-            1 => self.accum.iter().cloned().fold(f64::NEG_INFINITY, f64::max), // High
-            2 => self.accum.iter().sum::<f64>() / self.accum.len() as f64, // Mean
+            // menuCompressALG_N_to_1_Low_Value
+            0 => self.accum.iter().cloned().fold(f64::INFINITY, f64::min),
+            // menuCompressALG_N_to_1_High_Value
+            1 => self.accum.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            // menuCompressALG_N_to_1_Average
+            2 => self.accum.iter().sum::<f64>() / self.accum.len() as f64,
+            // menuCompressALG_N_to_1_Median: middle element after sort.
+            // C `compressRecord.c:212` uses `psource[n/2]` after `qsort`
+            // — identical for integer-indexed mid pick.
+            5 => {
+                let mut sorted = self.accum.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                sorted[sorted.len() / 2]
+            }
+            // alg=3 (Average rolling) is not yet implemented — fall
+            // through to 0.0. A C client selecting this mode gets the
+            // same as a Rust IOC running an unknown alg.
             _ => 0.0,
         };
         let idx = self.off as usize % self.nsam as usize;
@@ -320,7 +349,7 @@ mod pbuf_tests {
     /// the full NSAM-sized vector with trailing zeros for unused slots.
     #[test]
     fn pbuf_default_no_returns_full_array() {
-        let mut rec = CompressRecord::new(4, 3); // circular buffer NSAM=4
+        let mut rec = CompressRecord::new(4, 4); // circular buffer NSAM=4 (alg=4)
         rec.push_value(1.0);
         rec.push_value(2.0);
         // nuse=2 < nsam=4. PBUF=NO → full vec exposed.
@@ -341,7 +370,7 @@ mod pbuf_tests {
     /// NSAM vector again.
     #[test]
     fn pbuf_yes_truncates_to_nuse_while_filling() {
-        let mut rec = CompressRecord::new(4, 3);
+        let mut rec = CompressRecord::new(4, 4);
         rec.pbuf = 1;
         rec.push_value(10.0);
         rec.push_value(20.0);
@@ -380,7 +409,7 @@ mod pbuf_tests {
     /// panicked underflow.
     #[test]
     fn pbuf_yes_empty_buffer_returns_empty() {
-        let mut rec = CompressRecord::new(4, 3);
+        let mut rec = CompressRecord::new(4, 4);
         rec.pbuf = 1;
         match rec.get_field("VAL").unwrap() {
             EpicsValue::DoubleArray(v) => assert!(v.is_empty()),
@@ -443,7 +472,7 @@ mod pbuf_tests {
     fn push_array_circular_buffer_passes_through_unchanged() {
         // alg=3 doesn't compress; every element lands in the circular
         // buffer directly. PBUF flag is irrelevant for this path.
-        let mut rec = CompressRecord::new(4, 3);
+        let mut rec = CompressRecord::new(4, 4);
         rec.push_array(&[1.0, 2.0, 3.0]);
         assert_eq!(rec.nuse, 3);
         if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {

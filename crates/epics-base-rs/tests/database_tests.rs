@@ -2721,7 +2721,7 @@ async fn test_compress_res_write_posts_val_monitor() {
     use epics_base_rs::types::DbFieldType;
 
     let db = PvDatabase::new();
-    db.add_record("CMP_RES", Box::new(CompressRecord::new(8, 3)))
+    db.add_record("CMP_RES", Box::new(CompressRecord::new(8, 4)))
         .await
         .unwrap();
 

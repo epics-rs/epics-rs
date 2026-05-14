@@ -823,7 +823,7 @@ mod tests {
         use crate::server::record::Record;
         use crate::server::records::compress::CompressRecord;
 
-        let mut rec = CompressRecord::new(5, 3); // nsam=5, alg=Circular Buffer
+        let mut rec = CompressRecord::new(5, 4); // nsam=5, alg=Circular Buffer (menuCompressALG=4)
         for i in 0..7 {
             rec.push_value(i as f64);
         }

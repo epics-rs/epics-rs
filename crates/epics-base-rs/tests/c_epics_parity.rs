@@ -1030,7 +1030,7 @@ fn waveform_ftvl_types() {
 /// C EPICS: testFIFOCirc — FIFO circular buffer
 #[test]
 fn compress_fifo_circular_buffer() {
-    let mut rec = CompressRecord::new(4, 3); // NSAM=4, ALG=Circular Buffer
+    let mut rec = CompressRecord::new(4, 4); // NSAM=4, ALG=Circular Buffer (menuCompressALG=4)
 
     // Push values into circular buffer
     rec.push_value(1.1);

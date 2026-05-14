@@ -22,9 +22,15 @@ pub struct PortManager {
 
 impl PortManager {
     pub fn new() -> Self {
+        let exceptions = Arc::new(ExceptionManager::new());
+        let trace = Arc::new(TraceManager::new());
+        // Wire the exception sink so `setTrace*` setters announce
+        // `asynExceptionTrace*` to subscribers, matching C
+        // asynManager.c:2790/2832/2874/2923/2956.
+        trace.set_exception_sink(exceptions.clone());
         Self {
-            exceptions: Arc::new(ExceptionManager::new()),
-            trace: Arc::new(TraceManager::new()),
+            exceptions,
+            trace,
             port_handles: Mutex::new(HashMap::new()),
             runtime_handles: Mutex::new(HashMap::new()),
         }

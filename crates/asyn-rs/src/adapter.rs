@@ -246,15 +246,27 @@ impl AsynDeviceSupport {
 
     /// Enable `asyn:READBACK` mode (asyn upstream PRs #60 / #208).
     ///
-    /// On output records that carry the `info(asyn:READBACK, "1")`
-    /// info-tag, callers should flip this flag so the adapter
-    /// subscribes to driver value changes and reprocesses the record
-    /// even outside `SCAN="I/O Intr"`. The wiring of the info-tag
-    /// itself is the caller's responsibility (epics-rs db_loader does
-    /// not yet capture info-tags); this method exposes the contract
-    /// so when info-tag plumbing lands the toggle is already in place.
+    /// Manual override. The framework auto-parses
+    /// `info("asyn:READBACK", "...")` from the record's info map via
+    /// [`Self::apply_record_info`] — `wire_device_support` and
+    /// `IocBuilder` both call that hook automatically, so this manual
+    /// setter is only needed for callers that construct an adapter
+    /// outside the IocApplication wiring (e.g. unit tests, embedded
+    /// scripts). C asyn parity: matches `asynDbGetInfo(pr,
+    /// "asyn:READBACK")` calls in `devAsynInt32.c:329`,
+    /// `devAsynFloat64.c:218`, `devAsynInt64.c:257`,
+    /// `devAsynUInt32Digital.c:286`, `devAsynOctet.c:337`,
+    /// `devAsynXXXArray.cpp:172`.
     pub fn set_asyn_readback(&mut self, on: bool) {
         self.asyn_readback = on;
+    }
+
+    /// Override initial-readback mode. The framework auto-parses
+    /// `info("asyn:INITIAL_READBACK", "...")` via
+    /// [`Self::apply_record_info`] (mirror of `asynDbGetInfo(precord,
+    /// "asyn:INITIAL_READBACK")` at `devAsynOctet.c:357`).
+    pub fn set_initial_readback(&mut self, on: bool) {
+        self.initial_readback = on;
     }
 
     /// Set the driver info string (used for `drv_user_create` during init).
@@ -298,6 +310,22 @@ impl AsynDeviceSupport {
     pub fn write_op_pub(&self, val: &EpicsValue) -> Option<RequestOp> {
         self.write_op(val)
     }
+}
+
+/// Parse an `info(...)` tag value as a boolean.
+///
+/// Truthy: non-empty and not `0` / `no` / `false` (case-insensitive).
+/// Mirrors the broader EPICS convention; C asyn uses `atoi` directly
+/// (`devAsynInt32.c:330` — `enableCallbacks = atoi(callbackString)`),
+/// which only treats `"0"` / non-numeric as falsey. Our parse is a
+/// strict superset for the documented `"1"` / `"0"` values and
+/// additionally accepts the human-friendly `"Y"` / `"true"` forms.
+fn parse_info_bool(raw: &str) -> bool {
+    let v = raw.trim();
+    !v.is_empty()
+        && !v.eq_ignore_ascii_case("0")
+        && !v.eq_ignore_ascii_case("no")
+        && !v.eq_ignore_ascii_case("false")
 }
 
 fn asyn_to_ca_error(e: AsynError) -> CaError {
@@ -650,18 +678,23 @@ impl DeviceSupport for AsynDeviceSupport {
     }
 
     fn apply_record_info(&mut self, info: &std::collections::HashMap<String, String>) {
-        // asyn upstream PRs #60 / #208 — `info("asyn:READBACK", "1")`
-        // on output records causes them to follow driver-side changes
-        // even when SCAN is not "I/O Intr". Truthiness mirrors EPICS
-        // base: any non-empty value other than "0", "no", "false"
-        // (case-insensitive) enables the flag.
+        // C parity: `asynDbGetInfo(pr, "asyn:READBACK")` +
+        // `asynDbGetInfo(pr, "asyn:INITIAL_READBACK")` at
+        // devAsynInt32.c:329, devAsynFloat64.c:218,
+        // devAsynInt64.c:257, devAsynUInt32Digital.c:286,
+        // devAsynOctet.c:337+357, devAsynXXXArray.cpp:172.
+        // C semantics: a non-NULL info-string is fed through `atoi`,
+        // any non-zero numeric result enables the flag — which means
+        // "0", "0x0", "00" disable; "1", "Y" (atoi → 0!), garbage
+        // strings (atoi → 0) disable. We use the broader EPICS-style
+        // "truthy / falsey" parse here so values like "Y" or "true"
+        // also work (they would NOT work under strict atoi parity,
+        // but the broader parse is a strict superset for "1" / "0").
         if let Some(raw) = info.get("asyn:READBACK") {
-            let v = raw.trim();
-            let on = !v.is_empty()
-                && !v.eq_ignore_ascii_case("0")
-                && !v.eq_ignore_ascii_case("no")
-                && !v.eq_ignore_ascii_case("false");
-            self.set_asyn_readback(on);
+            self.set_asyn_readback(parse_info_bool(raw));
+        }
+        if let Some(raw) = info.get("asyn:INITIAL_READBACK") {
+            self.set_initial_readback(parse_info_bool(raw));
         }
     }
 
@@ -1120,6 +1153,28 @@ mod tests {
                 "value {falsey:?} must not enable readback"
             );
         }
+    }
+
+    /// C parity for `asynDbGetInfo(precord, "asyn:INITIAL_READBACK")`
+    /// at devAsynOctet.c:357 — info tag overrides the per-record
+    /// default. Verifies the auto-parse path: the framework calls
+    /// `apply_record_info`, which must flip `initial_readback`
+    /// without the caller having to invoke `set_initial_readback`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_record_info_handles_initial_readback_tag() {
+        let mut ads = make_adapter(ScanType::Passive);
+        // Starts off (default for adapters built with from_handle).
+        assert!(!ads.initial_readback);
+
+        let mut info = std::collections::HashMap::new();
+        info.insert("asyn:INITIAL_READBACK".to_string(), "1".to_string());
+        ads.apply_record_info(&info);
+        assert!(ads.initial_readback, "info tag must enable readback");
+
+        // Falsey value resets it.
+        info.insert("asyn:INITIAL_READBACK".to_string(), "0".to_string());
+        ads.apply_record_info(&info);
+        assert!(!ads.initial_readback, "value '0' must disable readback");
     }
 
     #[test]

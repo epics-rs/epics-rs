@@ -1041,10 +1041,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
     match hdr.cmmd {
         CA_PROTO_VERSION => {
             state.client_minor_version = hdr.count;
+            // C `rsrv_version_reply` (camessage.c:2115) emits VERSION
+            // with all fields zero except `m_count = CA_MINOR_PROTOCOL_REVISION`.
+            // The previous Rust defaults (`data_type=1, cid=1`) drifted
+            // from byte-exact parity — C clients only consult `m_count`
+            // (`tcpiiu.cpp::versionRespNotify`) so it was harmless in
+            // practice, but a strict peer or wire trace would diverge.
             let mut resp = CaHeader::new(CA_PROTO_VERSION);
-            resp.data_type = 1;
             resp.count = CA_MINOR_VERSION;
-            resp.cid = 1;
             let mut w = writer.lock().await;
             w.write_all(&resp.to_bytes()).await?;
             // flush deferred to handle_client outer loop (batched)

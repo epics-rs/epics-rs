@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
+#[cfg(feature = "cap-tokens")]
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -41,25 +43,49 @@ pub async fn run_beacon_emitter(
     // groups when a site fans out beacons across routed segments.
     let _ = socket.set_multicast_ttl_v4(epics_base_rs::runtime::net::ca_mcast_ttl());
 
-    // Resolve the server's local IP via routing. Prefer the first beacon
-    // destination as a probe so multi-NIC hosts pick the matching outgoing
-    // interface; fall back to limited broadcast.
-    let probe_dest = beacon_addrs
-        .first()
-        .copied()
-        .unwrap_or(SocketAddr::from((Ipv4Addr::BROADCAST, CA_REPEATER_PORT)));
-    let server_ip: u32 = {
+    // C `online_notify.c::rsrv_online_notify_task` (line 69-72) emits
+    // beacons with `memset(&msg, 0, sizeof msg)` then sets only m_cmmd,
+    // m_count (server port), m_dataType (CA_MINOR_PROTOCOL_REVISION),
+    // and m_cid (beacon counter) per iteration. `m_available` is left
+    // as 0 (INADDR_ANY) on the wire — and C client `udpiiu.cpp`
+    // explicitly documents (line 762): "new servers: always set this
+    // field to INADDR_ANY". When non-zero, the client treats it as
+    // the OVERRIDING server IP and bypasses the source-address
+    // resolution that handles NAT / multi-NIC / repeater fan-out.
+    //
+    // Our previous probe-based resolution wrote the resolved IP into
+    // `m_available`, which (a) drifted from C byte-exact, (b) made
+    // us look like an OLD server per the spec, and (c) could give
+    // wrong results on multi-homed hosts where the probe destination
+    // doesn't route through the correct NIC for every recipient.
+    // Beacon fan-out (repeater + per-NIC sendto) already uses the
+    // correct source IP per datagram, so the client can derive the
+    // server address from the receive metadata.
+    //
+    // Signed-beacon companion (cap-tokens feature) still binds the
+    // resolved IP into its OWN signed payload, so a probe is kept for
+    // that path. The companion datagram is a separate cmmd=0xCAFE
+    // message that C clients ignore; it is not the main beacon.
+    #[cfg(feature = "cap-tokens")]
+    let server_ip: u32 = if signer.is_some() {
+        let probe_dest = beacon_addrs
+            .first()
+            .copied()
+            .unwrap_or(SocketAddr::from((Ipv4Addr::BROADCAST, CA_REPEATER_PORT)));
         let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok();
-        let ip = probe.and_then(|s| {
-            s.connect(probe_dest).ok()?;
-            match s.local_addr().ok()? {
-                SocketAddr::V4(a) if !a.ip().is_unspecified() => {
-                    Some(u32::from_be_bytes(a.ip().octets()))
+        probe
+            .and_then(|s| {
+                s.connect(probe_dest).ok()?;
+                match s.local_addr().ok()? {
+                    SocketAddr::V4(a) if !a.ip().is_unspecified() => {
+                        Some(u32::from_be_bytes(a.ip().octets()))
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        });
-        ip.unwrap_or(0)
+            })
+            .unwrap_or(0)
+    } else {
+        0
     };
 
     let mut beacon_id: u32 = 0;
@@ -84,12 +110,15 @@ pub async fn run_beacon_emitter(
     }
 
     loop {
-        // Build beacon message: CA_PROTO_RSRV_IS_UP
+        // Build beacon message: CA_PROTO_RSRV_IS_UP.
+        //
+        // m_available stays 0 (INADDR_ANY) per C `online_notify.c:69`
+        // and the client-side comment in `udpiiu.cpp:762`. See the
+        // top-of-loop block above for the full reasoning.
         let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
         hdr.data_type = CA_MINOR_VERSION;
         hdr.count = server_port;
         hdr.cid = beacon_id;
-        hdr.available = server_ip;
         let bytes = hdr.to_bytes();
 
         for addr in &beacon_addrs {

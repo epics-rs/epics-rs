@@ -159,16 +159,24 @@ fn event_add_request_header() {
 #[test]
 fn rsrv_is_up_beacon() {
     // CA_PROTO_RSRV_IS_UP (0x000D): minor=13, port=5064, beacon_id=42,
-    // server_ip = 10.0.0.5 → 0x0a000005.
+    // m_available = 0 (INADDR_ANY).
+    //
+    // Per C `online_notify.c:69-72` (`rsrv_online_notify_task`), new
+    // servers emit beacons with `memset 0` then set only m_cmmd,
+    // m_count (port), m_dataType (minor version), and m_cid (counter).
+    // `m_available` stays 0. Client `udpiiu.cpp:762` documents the
+    // contract: "new servers: always set this field to INADDR_ANY";
+    // a non-zero value is interpreted as overriding the source IP
+    // (legacy fan-out compat). Our server emitter holds to this.
     let mut h = CaHeader::new(CA_PROTO_RSRV_IS_UP);
     h.data_type = 13;
     h.count = 5064;
     h.cid = 42;
-    h.available = 0x0a00_0005;
+    // h.available stays 0 (the C-spec semantic).
     let bytes = h.to_bytes();
     assert_hex(
         &bytes,
-        "000d 0000 000d 13c8 0000002a 0a000005",
+        "000d 0000 000d 13c8 0000002a 00000000",
         "RSRV_IS_UP",
     );
 }

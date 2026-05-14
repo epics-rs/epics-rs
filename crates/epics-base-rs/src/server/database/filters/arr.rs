@@ -8,19 +8,21 @@
 //! PV.{"arr":{"s":start,"i":incr,"e":end}}
 //! ```
 //!
-//! Semantics (matching pvxs `arr.cpp`):
+//! Semantics (matching epics-base `arr.c`):
 //! * `start` / `end` default to `0` / `-1` (full array). Negative
 //!   indices count from the end (`-1` == last element).
 //! * `incr` defaults to `1`. Must be ≥ 1; values < 1 are treated as 1.
 //! * Resulting slice carries the same array variant as the input.
 //! * Scalar (non-array) values pass through unchanged.
-//! * Alarm / property events always pass through (446e0d4a) — array
-//!   slicing on a property-only emission is a no-op.
+//! * Slicing is unconditional regardless of `mask` — `arr` is a
+//!   transformation filter (`channelRegisterPost`), not a gate. The
+//!   446e0d4a fix applies only to value-gating filters (`dbnd`); an
+//!   alarm-tagged emission carrying the array value MUST be sliced
+//!   so the client receives a coherent slice-view.
 
 use parking_lot::Mutex;
 
 use super::{FilteredMonitorEvent, SubscriptionFilter};
-use crate::server::recgbl::EventMask;
 use crate::types::EpicsValue;
 
 pub struct ArrayFilter {
@@ -64,10 +66,6 @@ impl SubscriptionFilter for ArrayFilter {
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        // Pass through events that don't carry a fresh value.
-        if !event.mask.contains(EventMask::VALUE) {
-            return Some(event);
-        }
         let cfg = self.config;
         let mut event = event;
         event.event.snapshot.value = match event.event.snapshot.value {
@@ -87,17 +85,25 @@ impl SubscriptionFilter for ArrayFilter {
 
 /// Apply `start..=end` (negative indices wrap from `len`) with stride
 /// `incr`. Returns a fresh `Vec` whenever the slice is non-trivial.
+/// Mirrors C `arr.c::wrapArrayIndices` — note the asymmetric clamps:
+/// `start` clamps to `[0, len]` (one past last) while `end` clamps to
+/// `[0, len-1]`, so a `start > len-1` request resolves to `start > end`
+/// and yields 0 elements (not 1).
 fn slice_with<T: Clone>(input: Vec<T>, cfg: ArrayFilterConfig) -> Vec<T> {
     let len = input.len() as i64;
     if len == 0 {
         return input;
     }
-    let resolve = |idx: i64| -> i64 {
+    let resolve_start = |idx: i64| -> i64 {
+        let r = if idx < 0 { len + idx } else { idx };
+        r.clamp(0, len)
+    };
+    let resolve_end = |idx: i64| -> i64 {
         let r = if idx < 0 { len + idx } else { idx };
         r.clamp(0, len - 1)
     };
-    let start = resolve(cfg.start);
-    let end = resolve(cfg.end);
+    let start = resolve_start(cfg.start);
+    let end = resolve_end(cfg.end);
     if start > end {
         return Vec::new();
     }
@@ -114,6 +120,7 @@ fn slice_with<T: Clone>(input: Vec<T>, cfg: ArrayFilterConfig) -> Vec<T> {
 mod tests {
     use super::*;
     use crate::server::pv::MonitorEvent;
+    use crate::server::recgbl::EventMask;
     use crate::server::snapshot::Snapshot;
     use std::time::SystemTime;
 
@@ -227,18 +234,37 @@ mod tests {
         );
     }
 
-    /// Alarm-only events pass through without touching the array.
+    /// Alarm events are ALSO sliced — `arr` is a transformation
+    /// filter (C `channelRegisterPost`), not a value gate. 446e0d4a
+    /// applies to `dbnd` only.
     #[test]
-    fn alarm_pass_through_preserves_array() {
+    fn alarm_event_is_also_sliced() {
         let f = ArrayFilter::new(ArrayFilterConfig {
             start: 0,
             incr: 1,
-            end: 0, // would otherwise slice to single element
+            end: 0, // slice to single element
         });
         let mut ev = ev_array(vec![1.0, 2.0, 3.0]);
         ev.mask = EventMask::ALARM;
         let out = f.apply(ev).unwrap();
-        // Slice was NOT applied because the mask doesn't carry VALUE.
-        assert_eq!(unpack(out), vec![1.0, 2.0, 3.0]);
+        assert_eq!(unpack(out), vec![1.0]);
+    }
+
+    /// Out-of-range start (greater than `len-1`) clamps to `len` per
+    /// C `wrapArrayIndices`, so `start > end` and the slice is empty.
+    /// Without the asymmetric start/end clamp the resolved indices
+    /// collapse to `len-1` and the slice incorrectly returns 1 element.
+    #[test]
+    fn start_beyond_len_yields_empty() {
+        let f = ArrayFilter::new(ArrayFilterConfig {
+            start: 10,
+            incr: 1,
+            end: -1,
+        });
+        let out = f.apply(ev_array(vec![1.0, 2.0, 3.0])).unwrap();
+        assert!(
+            unpack(out).is_empty(),
+            "C parity: start>len returns 0 elements"
+        );
     }
 }

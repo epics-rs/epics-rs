@@ -10,13 +10,17 @@
 //!
 //! pvxs JSON syntax: `PV.{"dec":{"n":N,"offset":K}}`.
 //!
-//! Alarm and property events always pass through (446e0d4a) and do
-//! NOT consume a decimation slot — they are out-of-band signals.
+//! Per epics-base `decimate.c` only `DBE_PROPERTY` events bypass the
+//! decimator (`if (pfl->mask & DBE_PROPERTY) return pfl`). `DBE_ALARM`
+//! emissions DO consume a slot and may be dropped — the 446e0d4a
+//! "alarm always passes" rule is dbnd-specific. The Rust `offset`
+//! parameter is a Rust extension (C `decimate.c` only accepts `n`).
 //!
-//! pvxs `decimate.cpp` clamps `n < 1` to `1` (no decimation), which we
-//! match. The decimator stores its position counter inside a small
-//! `Mutex<u64>` so the same filter handle can be shared between
-//! subscribers without ABA hazards on the counter.
+//! C `parse_ok` rejects `n < 1` outright; we clamp to 1 (no
+//! decimation) to keep client subscriptions alive rather than tearing
+//! them down on a bad config. The decimator stores its position
+//! counter inside a small `Mutex<u64>` so the same filter handle can
+//! be shared between subscribers without ABA hazards on the counter.
 
 use parking_lot::Mutex;
 
@@ -52,11 +56,11 @@ impl SubscriptionFilter for DecimateFilter {
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        // 446e0d4a: alarm / property events pass without consuming
-        // a decimation slot. Otherwise an alarm-only emission could
-        // shift the counter and silence the next value update that
-        // would otherwise have fired.
-        if !event.mask.contains(EventMask::VALUE) {
+        // C `decimate.c`: only `DBE_PROPERTY` (and read context) bypass
+        // the counter. `DBE_ALARM` runs through the decimation logic
+        // and may be dropped — matches the C `if (pfl->mask &
+        // DBE_PROPERTY) return pfl` short-circuit exactly.
+        if event.mask.intersects(EventMask::PROPERTY) {
             return Some(event);
         }
         let mut counter = self.counter.lock();
@@ -126,20 +130,36 @@ mod tests {
         assert_eq!(kept, vec![false, false, true, false, false, true]);
     }
 
-    /// Alarm-only emissions pass through and DO NOT consume a slot.
+    /// `DBE_PROPERTY` events bypass the decimator unconditionally
+    /// — matches C `decimate.c`'s `if (pfl->mask & DBE_PROPERTY)
+    /// return pfl` short-circuit.
     #[test]
-    fn alarm_passes_without_consuming_slot() {
+    fn property_bypasses_decimator() {
         let f = DecimateFilter::every(3);
-        // 1st value: pass.
-        assert!(f.apply(ev(0.0, EventMask::VALUE)).is_some());
-        // Alarm: pass, counter unchanged.
-        assert!(f.apply(ev(0.0, EventMask::ALARM)).is_some());
-        assert!(f.apply(ev(0.0, EventMask::ALARM)).is_some());
-        // Next two value events drop (positions 1, 2 of the window).
+        assert!(f.apply(ev(0.0, EventMask::VALUE)).is_some()); // 1st VALUE: pass
+        // PROPERTY events pass without consuming a slot.
+        assert!(f.apply(ev(0.0, EventMask::PROPERTY)).is_some());
+        assert!(f.apply(ev(0.0, EventMask::PROPERTY)).is_some());
+        // Next two VALUE events drop (positions 1, 2 of the window).
         assert!(f.apply(ev(1.0, EventMask::VALUE)).is_none());
         assert!(f.apply(ev(2.0, EventMask::VALUE)).is_none());
-        // The 4th value event passes (position 0 of next window).
+        // The 4th VALUE event passes (position 0 of next window).
         assert!(f.apply(ev(3.0, EventMask::VALUE)).is_some());
+    }
+
+    /// `DBE_ALARM` events DO consume a decimation slot — C
+    /// `decimate.c` only special-cases PROPERTY. An alarm at
+    /// position 1 of a `every(3)` window is dropped, not bypassed.
+    #[test]
+    fn alarm_consumes_a_slot() {
+        let f = DecimateFilter::every(3);
+        assert!(f.apply(ev(0.0, EventMask::VALUE)).is_some()); // pos 0 — pass
+        // pos 1 — ALARM gets DROPPED (counter advances).
+        assert!(f.apply(ev(0.0, EventMask::ALARM)).is_none());
+        // pos 2 — VALUE dropped.
+        assert!(f.apply(ev(1.0, EventMask::VALUE)).is_none());
+        // pos 3 ≡ 0 — pass.
+        assert!(f.apply(ev(2.0, EventMask::VALUE)).is_some());
     }
 
     /// `offset >= n` is folded into the valid range modulo n.

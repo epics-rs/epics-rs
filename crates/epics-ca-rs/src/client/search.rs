@@ -1650,7 +1650,7 @@ mod tests {
         // Track maximum bucket load observed at the moment of
         // processing — that is the per-tick send rate ceiling.
         let mut max_per_tick = 0usize;
-        let mut buckets_visited = vec![false; N_SEARCH_BUCKETS];
+        let mut buckets_visited = [false; N_SEARCH_BUCKETS];
 
         let mut current = 0;
         for _ in 0..TICKS {

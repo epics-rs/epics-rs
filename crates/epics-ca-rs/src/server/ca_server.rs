@@ -1014,8 +1014,7 @@ impl CaServer {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
             let path = self.acf_source_path();
-            if secs > 0 && path.is_some() {
-                let path = path.unwrap();
+            if let (true, Some(path)) = (secs > 0, path) {
                 let acf = self.acf.clone();
                 let reload_tx = self.acf_reload_tx.clone();
                 Some(epics_base_rs::runtime::task::spawn(async move {

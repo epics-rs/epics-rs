@@ -752,23 +752,28 @@ impl EpicsValue {
 /// digits means octal; everything else is parsed as a decimal float so
 /// `"1.5"`, `"1e6"`, `"-3.14"` continue to work.
 fn parse_string_to_f64(s: &str) -> Option<f64> {
+    // C parity for `epicsParseDouble` → `epicsStrtod`
+    // (libcom/src/misc/epicsStdlib.c:347-374):
+    //
+    //   - Strip whitespace, optional `+`/`-`.
+    //   - `"0x"` prefix (case-insensitive) → `strtoll`/`strtoull`
+    //     with base 16 (hex literal accepted).
+    //   - Otherwise → `strtod` (decimal / scientific). Leading `0`
+    //     is **NOT** treated as octal — `strtod("0377")` returns
+    //     377.0, not 255.0.
+    //
+    // PR #678 extends the dbpf path so a string `"0xFF"` lands as
+    // 255.0 on a DOUBLE/FLOAT field; the PR does NOT introduce
+    // octal handling for floats (`epicsStrtod` never had any).
+    // Earlier this fn accepted `"0377"` as octal 255.0 — a real
+    // C-divergence that silently changed caput payloads. Removed.
     let trimmed = s.trim();
-    // Handle optional leading sign for hex/octal: e.g. "-0x1A" -> -26.
     let (sign, body) = match trimmed.strip_prefix('-') {
         Some(rest) => (-1.0f64, rest),
         None => (1.0f64, trimmed.strip_prefix('+').unwrap_or(trimmed)),
     };
     if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         if let Ok(v) = u64::from_str_radix(hex, 16) {
-            return Some(sign * v as f64);
-        }
-    } else if body.len() > 1
-        && body.starts_with('0')
-        && body.bytes().skip(1).all(|b| b.is_ascii_digit())
-        && !body.contains('.')
-        && !body.contains(['e', 'E'])
-    {
-        if let Ok(v) = u64::from_str_radix(&body[1..], 8) {
             return Some(sign * v as f64);
         }
     }
@@ -813,10 +818,14 @@ mod parse_radix_tests {
     }
 
     #[test]
-    fn parse_octal_to_double() {
+    fn parse_leading_zero_to_double_is_decimal_not_octal() {
+        // C parity: epicsStrtod("0377") -> 377.0 via strtod (decimal
+        // with a meaningless leading zero); octal recognition lives
+        // only on the int-parse path (strtol base 0). Earlier this
+        // test asserted octal 255.0 — a real C-divergence.
         assert_eq!(
             EpicsValue::parse(DbFieldType::Double, "0377").unwrap(),
-            EpicsValue::Double(255.0)
+            EpicsValue::Double(377.0)
         );
     }
 

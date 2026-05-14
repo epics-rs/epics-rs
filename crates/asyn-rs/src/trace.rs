@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
 
+use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
+
 bitflags! {
     /// What to trace — control message categories.
     ///
@@ -271,6 +273,13 @@ pub struct TraceManager {
     port_configs: Mutex<HashMap<String, TraceConfig>>,
     /// Per-device overrides keyed by (portName, addr).
     device_configs: Mutex<HashMap<(String, i32), TraceConfig>>,
+    /// Optional sink for trace-mutator exceptions. C asyn fires
+    /// `asynExceptionTrace{Mask,IOMask,InfoMask,File,IOTruncateSize}`
+    /// from every `setTrace*` (asynManager.c:2790/2832/2874/2923/2956).
+    /// `Mutex` rather than `OnceCell` so a manager can install the sink
+    /// after construction (PortManager builds both objects, then wires
+    /// the trace sink after).
+    exception_sink: Mutex<Option<Arc<ExceptionManager>>>,
 }
 
 impl TraceManager {
@@ -279,6 +288,35 @@ impl TraceManager {
             global_config: Mutex::new(TraceConfig::default()),
             port_configs: Mutex::new(HashMap::new()),
             device_configs: Mutex::new(HashMap::new()),
+            exception_sink: Mutex::new(None),
+        }
+    }
+
+    /// Install the exception sink used by every `set_trace_*` mutator.
+    /// Mirrors C asyn where `setTraceMask` / `setTraceIOMask` /
+    /// `setTraceInfoMask` / `setTraceFile` / `setTraceIOTruncateSize`
+    /// each call `announceExceptionOccurred`. Callers that want trace
+    /// listeners (asynShellCommands UI, asynRecord, monitor relays)
+    /// to react to trace re-configuration must install the sink.
+    pub fn set_exception_sink(&self, sink: Arc<ExceptionManager>) {
+        if let Ok(mut slot) = self.exception_sink.lock() {
+            *slot = Some(sink);
+        }
+    }
+
+    /// Fire a trace exception to the registered sink, if any.
+    /// `port = None` corresponds to a global change.
+    fn announce(&self, port: Option<&str>, exception: AsynException) {
+        let sink = match self.exception_sink.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return,
+        };
+        if let Some(sink) = sink {
+            sink.announce(&ExceptionEvent {
+                port_name: port.unwrap_or("").to_string(),
+                exception,
+                addr: -1,
+            });
         }
     }
 
@@ -316,12 +354,24 @@ impl TraceManager {
     }
 
     /// Set trace configuration for a specific device address.
+    ///
+    /// C parity: asynManager.c:2788-2791 fires `asynExceptionTraceMask`
+    /// for the per-device mutation case.
     pub fn set_device_trace_mask(&self, port: &str, addr: i32, mask: TraceMask) {
         if let Ok(mut configs) = self.device_configs.lock() {
             configs
                 .entry((port.to_string(), addr))
                 .or_insert_with(TraceConfig::default)
                 .trace_mask = mask;
+        }
+        // Per-device announce — addr included.
+        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            sink.announce(&ExceptionEvent {
+                port_name: port.to_string(),
+                exception: AsynException::TraceMask,
+                addr,
+            });
         }
     }
 
@@ -396,6 +446,9 @@ impl TraceManager {
 
     // --- Configuration mutators ---
 
+    /// C parity: asynManager.c:2790/2800 fires `asynExceptionTraceMask`
+    /// after the mutation, for either the per-port path or the
+    /// "no pasynUser → global" path.
     pub fn set_trace_mask(&self, port: Option<&str>, mask: TraceMask) {
         match port {
             Some(name) => {
@@ -412,8 +465,10 @@ impl TraceManager {
                 }
             }
         }
+        self.announce(port, AsynException::TraceMask);
     }
 
+    /// C parity: asynManager.c:2832/2842 fires `asynExceptionTraceIOMask`.
     pub fn set_trace_io_mask(&self, port: Option<&str>, mask: TraceIoMask) {
         match port {
             Some(name) => {
@@ -430,8 +485,10 @@ impl TraceManager {
                 }
             }
         }
+        self.announce(port, AsynException::TraceIoMask);
     }
 
+    /// C parity: asynManager.c:2874/2884 fires `asynExceptionTraceInfoMask`.
     pub fn set_trace_info_mask(&self, port: Option<&str>, mask: TraceInfoMask) {
         match port {
             Some(name) => {
@@ -448,8 +505,13 @@ impl TraceManager {
                 }
             }
         }
+        self.announce(port, AsynException::TraceInfoMask);
     }
 
+    /// C parity: asynManager.c:2923 fires `asynExceptionTraceFile`
+    /// after the mutation completes (the C path always implies a
+    /// port-scoped pasynUser; we mirror that by only firing when a
+    /// port name is supplied).
     pub fn set_trace_file(&self, port: Option<&str>, file: TraceFile) {
         match port {
             Some(name) => {
@@ -466,8 +528,15 @@ impl TraceManager {
                 }
             }
         }
+        // C `setTraceFile` only announces when `puserPvt->pport` is
+        // non-null (asynManager.c:2923) — port-scoped only.
+        if port.is_some() {
+            self.announce(port, AsynException::TraceFile);
+        }
     }
 
+    /// C parity: asynManager.c:2956 fires
+    /// `asynExceptionTraceIOTruncateSize` after the mutation.
     pub fn set_io_truncate_size(&self, port: Option<&str>, size: usize) {
         match port {
             Some(name) => {
@@ -483,6 +552,11 @@ impl TraceManager {
                     cfg.io_truncate_size = size;
                 }
             }
+        }
+        // C `setTraceIOTruncateSize` only announces when
+        // `puserPvt->pport` is non-null (asynManager.c:2956).
+        if port.is_some() {
+            self.announce(port, AsynException::TraceIoTruncateSize);
         }
     }
 
@@ -937,5 +1011,107 @@ mod tests {
         let contents = std::fs::read_to_string(&temp).unwrap();
         assert_eq!(contents, "line one\nline two\n");
         let _ = std::fs::remove_file(&temp);
+    }
+
+    /// C parity regression: every `setTrace*` mutator must fire its
+    /// matching `asynExceptionTrace*` to the exception sink, matching
+    /// C asynManager.c:2790/2832/2874/2923/2956. Without this,
+    /// listeners (asynShellCommands UI, asynRecord, monitor sinks)
+    /// never see the trace-config change.
+    #[test]
+    fn test_set_trace_mask_fires_exception() {
+        use crate::exception::AsynException;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering as O;
+
+        let exc = Arc::new(ExceptionManager::new());
+        let mgr = TraceManager::new();
+        mgr.set_exception_sink(exc.clone());
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::<AsynException>::new()));
+        let n2 = n.clone();
+        let captured2 = captured.clone();
+        exc.add_callback(move |ev| {
+            n2.fetch_add(1, O::Relaxed);
+            captured2.lock().unwrap().push(ev.exception);
+        });
+
+        // Each setter fires exactly its own exception type.
+        mgr.set_trace_mask(Some("p"), TraceMask::FLOW);
+        mgr.set_trace_io_mask(Some("p"), TraceIoMask::HEX);
+        mgr.set_trace_info_mask(Some("p"), TraceInfoMask::TIME);
+        let file = TraceFile::Stderr;
+        mgr.set_trace_file(Some("p"), file);
+        mgr.set_io_truncate_size(Some("p"), 16);
+        mgr.set_device_trace_mask("p", 3, TraceMask::ERROR);
+
+        assert_eq!(n.load(O::Relaxed), 6);
+        let exps = captured.lock().unwrap().clone();
+        assert!(exps.contains(&AsynException::TraceMask));
+        assert!(exps.contains(&AsynException::TraceIoMask));
+        assert!(exps.contains(&AsynException::TraceInfoMask));
+        assert!(exps.contains(&AsynException::TraceFile));
+        assert!(exps.contains(&AsynException::TraceIoTruncateSize));
+    }
+
+    /// C parity: `setTraceMask` with no pasynUser is the "global"
+    /// path (asynManager.c:2774-2776). Rust mirrors with
+    /// `set_trace_mask(None, ...)`. The global path still announces
+    /// (asynManager.c:2800 announces `pport=NULL` per-port and
+    /// 2790/2796 announces per-device; for the "no user" entrypoint
+    /// C skips into the global slot at line 2776 without firing —
+    /// matching that, our `None` path fires once with an empty port
+    /// name so listeners can still observe a global re-config).
+    #[test]
+    fn test_global_trace_mask_announce() {
+        use crate::exception::AsynException;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering as O;
+
+        let exc = Arc::new(ExceptionManager::new());
+        let mgr = TraceManager::new();
+        mgr.set_exception_sink(exc.clone());
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        exc.add_callback(move |ev| {
+            if ev.exception == AsynException::TraceMask && ev.port_name.is_empty() {
+                n2.fetch_add(1, O::Relaxed);
+            }
+        });
+        mgr.set_trace_mask(None, TraceMask::FLOW);
+        assert_eq!(n.load(O::Relaxed), 1);
+    }
+
+    /// `setTraceFile` and `setTraceIOTruncateSize` only announce when
+    /// `puserPvt->pport` is non-null (asynManager.c:2923, :2956).
+    /// Our `None` (= "no user, global") path therefore must NOT fire
+    /// those two exceptions.
+    #[test]
+    fn test_global_file_and_truncate_do_not_announce() {
+        use crate::exception::AsynException;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering as O;
+
+        let exc = Arc::new(ExceptionManager::new());
+        let mgr = TraceManager::new();
+        mgr.set_exception_sink(exc.clone());
+        let file_hits = Arc::new(AtomicUsize::new(0));
+        let trunc_hits = Arc::new(AtomicUsize::new(0));
+        let f2 = file_hits.clone();
+        let t2 = trunc_hits.clone();
+        exc.add_callback(move |ev| match ev.exception {
+            AsynException::TraceFile => {
+                f2.fetch_add(1, O::Relaxed);
+            }
+            AsynException::TraceIoTruncateSize => {
+                t2.fetch_add(1, O::Relaxed);
+            }
+            _ => {}
+        });
+        mgr.set_trace_file(None, TraceFile::Stderr);
+        mgr.set_io_truncate_size(None, 32);
+        assert_eq!(file_hits.load(O::Relaxed), 0);
+        assert_eq!(trunc_hits.load(O::Relaxed), 0);
     }
 }

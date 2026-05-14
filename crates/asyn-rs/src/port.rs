@@ -173,6 +173,40 @@ impl PortDriverBase {
         self.connected
     }
 
+    /// Single owner-API for the port-level `connected` transition.
+    ///
+    /// C parity: `exceptionConnect` (asynManager.c:2151-2160) and
+    /// `exceptionDisconnect` (:2174-2185) fire
+    /// `asynExceptionConnect` only when the state actually changes.
+    /// All driver code that toggles connection state MUST go through
+    /// this helper — directly assigning `base.connected = ...`
+    /// followed by `announce_exception(Connect, -1)` bypasses the
+    /// edge guard and fans spurious duplicates out to listeners
+    /// (CA gateway shadow tasks, asynRecord, monitor relays).
+    ///
+    /// Returns `true` if the state actually changed (a fan-out
+    /// happened); `false` if the call was a no-op.
+    pub fn set_connected(&mut self, connected: bool) -> bool {
+        if self.connected == connected {
+            return false;
+        }
+        self.connected = connected;
+        self.announce_exception(AsynException::Connect, -1);
+        true
+    }
+
+    /// Per-address variant — for multi-device ports. Same edge
+    /// guarantee as [`Self::set_connected`].
+    pub fn set_addr_connected(&mut self, addr: i32, connected: bool) -> bool {
+        let was = self.device_state(addr).connected;
+        if was == connected {
+            return false;
+        }
+        self.device_state(addr).connected = connected;
+        self.announce_exception(AsynException::Connect, addr);
+        true
+    }
+
     /// Query whether the port is enabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled
@@ -181,6 +215,28 @@ impl PortDriverBase {
     /// Query whether auto-connect is enabled.
     pub fn is_auto_connect(&self) -> bool {
         self.auto_connect
+    }
+
+    /// Toggle the auto-connect flag at runtime.
+    ///
+    /// C parity: `autoConnectAsyn` (asynManager.c:2310-2324) always
+    /// fires `asynExceptionAutoConnect` regardless of prior state
+    /// (no state-change guard). Mirror that — every call announces.
+    /// Driver constructors that initialise `base.auto_connect`
+    /// directly during `PortDriver::new()` keep the silent path
+    /// (the port is not yet registered, so no listeners exist).
+    pub fn set_auto_connect(&mut self, yes: bool) {
+        self.auto_connect = yes;
+        self.announce_exception(AsynException::AutoConnect, -1);
+    }
+
+    /// Per-address variant — for multi-device ports. C parity:
+    /// `autoConnectAsyn` walks dpCommon via findDpCommon so a per-
+    /// device pasynUser hits the device's dpc, otherwise the port's
+    /// dpc (asynManager.c:2314 + findDpCommon).
+    pub fn set_auto_connect_addr(&mut self, addr: i32, yes: bool) {
+        self.device_state(addr).auto_connect = yes;
+        self.announce_exception(AsynException::AutoConnect, addr);
     }
 
     /// Query whether the port has been marked defunct via
@@ -290,15 +346,25 @@ impl PortDriverBase {
     }
 
     /// Set a specific device address as connected.
+    ///
+    /// C parity: announce only on actual transition
+    /// (asynManager.c:2151-2160 — `exceptionConnect` rejects
+    /// already-connected; we keep an Ok return for idempotency but
+    /// suppress the duplicate fan-out so subscribers don't see
+    /// spurious connect events). Thin wrapper over
+    /// [`Self::set_addr_connected`] for callers that prefer the
+    /// directional verb.
     pub fn connect_addr(&mut self, addr: i32) {
-        self.device_state(addr).connected = true;
-        self.announce_exception(AsynException::Connect, addr);
+        self.set_addr_connected(addr, true);
     }
 
     /// Set a specific device address as disconnected.
+    ///
+    /// C parity: announce only on actual transition
+    /// (asynManager.c:2174-2185). Thin wrapper over
+    /// [`Self::set_addr_connected`].
     pub fn disconnect_addr(&mut self, addr: i32) {
-        self.device_state(addr).connected = false;
-        self.announce_exception(AsynException::Connect, addr);
+        self.set_addr_connected(addr, false);
     }
 
     /// Enable a specific device address.
@@ -567,14 +633,13 @@ pub trait PortDriver: Send + Sync + 'static {
     // --- AsynCommon ---
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().connected = true;
-        self.base().announce_exception(AsynException::Connect, -1);
+        // Single owner-API: edge-guarded fire is in PortDriverBase::set_connected.
+        self.base_mut().set_connected(true);
         Ok(())
     }
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().connected = false;
-        self.base().announce_exception(AsynException::Connect, -1);
+        self.base_mut().set_connected(false);
         Ok(())
     }
 
@@ -1618,5 +1683,88 @@ mod tests {
 
         base.enable_addr(2);
         assert_eq!(last_addr.load(Ordering::Relaxed), 2);
+    }
+
+    /// C parity (asynManager.c:2151-2160 exceptionConnect,
+    /// :2174-2185 exceptionDisconnect): redundant connect/disconnect
+    /// on a port already in that state must NOT fan out a duplicate
+    /// `asynExceptionConnect`. Subscribers depend on the event
+    /// edge — duplicate fan-out causes them to e.g. re-subscribe or
+    /// re-arm timers that should fire exactly once per transition.
+    #[test]
+    fn test_connect_disconnect_announce_only_on_transition() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut base = PortDriverBase::new(
+            "edge",
+            4,
+            PortFlags {
+                multi_device: true,
+                can_block: false,
+                destructible: true,
+            },
+        );
+        base.create_param("V", ParamType::Int32).unwrap();
+        let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
+        base.exception_sink = Some(exc_mgr.clone());
+
+        let connect_hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = connect_hits.clone();
+        exc_mgr.add_callback(move |event| {
+            if event.exception == AsynException::Connect {
+                hits2.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // device starts connected by DeviceState::default — a redundant
+        // connect_addr is a no-op.
+        base.connect_addr(2);
+        assert_eq!(
+            connect_hits.load(Ordering::Relaxed),
+            0,
+            "redundant connect_addr must not fan out"
+        );
+
+        // First transition fires once.
+        base.disconnect_addr(2);
+        assert_eq!(connect_hits.load(Ordering::Relaxed), 1);
+
+        // Redundant disconnect is silent.
+        base.disconnect_addr(2);
+        assert_eq!(
+            connect_hits.load(Ordering::Relaxed),
+            1,
+            "redundant disconnect_addr must not fan out"
+        );
+
+        // Re-connect fires the transition.
+        base.connect_addr(2);
+        assert_eq!(connect_hits.load(Ordering::Relaxed), 2);
+    }
+
+    /// C parity: `autoConnectAsyn` (asynManager.c:2310-2324) fires
+    /// `asynExceptionAutoConnect` unconditionally — even setting the
+    /// same value as the current one. Rust mirrors that so observers
+    /// can refresh their UI after a re-confirmation, not just an edge.
+    #[test]
+    fn test_set_auto_connect_fires_unconditionally() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut base = PortDriverBase::new("ac", 1, PortFlags::default());
+        let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
+        base.exception_sink = Some(exc_mgr.clone());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        exc_mgr.add_callback(move |event| {
+            if event.exception == AsynException::AutoConnect {
+                hits2.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        // base.auto_connect defaults to true — setting true again
+        // still must fire (no state-change guard in C).
+        base.set_auto_connect(true);
+        base.set_auto_connect(false);
+        base.set_auto_connect(false);
+        assert_eq!(hits.load(Ordering::Relaxed), 3);
     }
 }

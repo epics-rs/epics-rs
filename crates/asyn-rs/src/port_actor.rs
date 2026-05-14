@@ -283,6 +283,17 @@ impl PortActor {
                 Ok(RequestResult::octet_read(buf, n))
             }
             RequestOp::OctetWriteRead { data, buf_size } => {
+                // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
+                // does flush() → write() → read() under a single
+                // queueLockPort. The flush drains any stale bytes
+                // left in the driver's input buffer from a prior
+                // read so that the post-write read returns only the
+                // response to *this* command (e.g. echoes from a
+                // serial line, leftover prompts from a TCP device).
+                // Skipping the flush leaks pre-existing input into
+                // the response and breaks every command-response
+                // protocol when the line was warm.
+                self.driver.io_flush(user)?;
                 self.driver.io_write_octet(user, data)?;
                 let mut buf = vec![0u8; *buf_size];
                 let n = self.driver.io_read_octet(user, &mut buf)?;
@@ -563,6 +574,7 @@ mod tests {
     use super::*;
     use crate::param::ParamType;
     use crate::port::{PortDriverBase, PortFlags};
+    use std::sync::Arc;
     use std::time::Duration;
 
     struct TestDriver {
@@ -659,6 +671,79 @@ mod tests {
         let user = AsynUser::new(2).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 256 }, user).unwrap();
         assert_eq!(&result.data.unwrap()[..5], b"hello");
+    }
+
+    /// C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
+    /// calls flush() before write() so any stale input bytes (echoes,
+    /// half-received responses from a previous command) are drained
+    /// out of the driver's input buffer before the new write+read
+    /// pair. The atomic OctetWriteRead op must do the same.
+    #[test]
+    fn actor_octet_write_read_calls_flush_first() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FlushTracker {
+            base: PortDriverBase,
+            flush_calls: Arc<AtomicUsize>,
+            write_calls: Arc<AtomicUsize>,
+            sequence: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        }
+        impl PortDriver for FlushTracker {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                self.flush_calls.fetch_add(1, Ordering::Relaxed);
+                self.sequence.lock().push("flush");
+                Ok(())
+            }
+            fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+                self.write_calls.fetch_add(1, Ordering::Relaxed);
+                self.sequence.lock().push("write");
+                Ok(())
+            }
+            fn io_read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> AsynResult<usize> {
+                self.sequence.lock().push("read");
+                let resp = b"RSP";
+                let n = resp.len().min(buf.len());
+                buf[..n].copy_from_slice(&resp[..n]);
+                Ok(n)
+            }
+        }
+
+        let flush_calls = Arc::new(AtomicUsize::new(0));
+        let write_calls = Arc::new(AtomicUsize::new(0));
+        let sequence = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let drv = FlushTracker {
+            base: PortDriverBase::new("flush_test", 1, PortFlags::default()),
+            flush_calls: flush_calls.clone(),
+            write_calls: write_calls.clone(),
+            sequence: sequence.clone(),
+        };
+        let tx = spawn_actor(drv);
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(
+            &tx,
+            RequestOp::OctetWriteRead {
+                data: b"CMD".to_vec(),
+                buf_size: 16,
+            },
+            user,
+        )
+        .unwrap();
+        assert_eq!(result.data.unwrap(), b"RSP".to_vec());
+        assert_eq!(flush_calls.load(Ordering::Relaxed), 1, "flush called once");
+        assert_eq!(write_calls.load(Ordering::Relaxed), 1);
+        // Order must be: flush, then write, then read.
+        let seq = sequence.lock().clone();
+        assert_eq!(seq, vec!["flush", "write", "read"]);
     }
 
     #[test]

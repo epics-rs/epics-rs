@@ -59,14 +59,31 @@ pub struct LongoutRecord {
     /// (transition modes) can detect changes. Initially zero; loops
     /// after the first successful output.
     pub pval: i32,
-    /// epics-base PR #6c573b4: track whether this record has ever
-    /// completed an output cycle. Transition-mode OOPT values
-    /// (1=On Change, 4=When Zero, 5=When Non-zero) compare `val` to
-    /// `pval` which both start at 0 — without forcing the first
-    /// output, an initial put of VAL=0 with OOPT=On Change would
-    /// silently skip device write. C EPICS handles this by always
-    /// emitting on the first cycle regardless of OOPT comparison.
+    /// Mirrors C `prec->outpvt` (longoutRecord.c).
+    ///
+    /// * `true` — force a write on the next process cycle regardless
+    ///   of the OOPT=On_Change `val != pval` comparison.
+    /// * `false` — On_Change uses the normal comparison.
+    ///
+    /// Set true at construction (= C `init_record`'s
+    /// `outpvt = EXEC_OUTPUT`), cleared after every successful
+    /// output (`on_output_complete`), re-set to true when
+    /// `put_field("OUT")` runs and `ooch == 1` (PR #6c573b4 part 2,
+    /// `longoutRecord.c:222-225`). Field name preserved for
+    /// backward-compat with downstream tests; the legacy
+    /// "first_output_done" semantic is the opposite polarity but
+    /// equivalent for the initial state.
     pub first_output_done: bool,
+    /// `OUT` output link string — currently only stored so
+    /// `put_field("OUT")` can detect a re-direction and trigger the
+    /// OOCH force write. The framework wires the actual output
+    /// dispatch through INP/DOL elsewhere.
+    pub out: String,
+    /// `OOCH` (Output Exec. on OUT Change) — C `menuYesNo`. When YES
+    /// (1), changing the OUT field at runtime forces the very next
+    /// process cycle to write the current VAL regardless of OOPT
+    /// (epics-base PR #6c573b4 part 2, `longoutRecord.c:223`).
+    pub ooch: i16,
 }
 
 impl Default for LongoutRecord {
@@ -103,6 +120,8 @@ impl Default for LongoutRecord {
             oopt: 0,
             pval: 0,
             first_output_done: false,
+            out: String::new(),
+            ooch: 0,
         }
     }
 }
@@ -291,6 +310,16 @@ static LONGOUT_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         read_only: true,
     },
+    FieldDesc {
+        name: "OUT",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OOCH",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for LongoutRecord {
@@ -334,6 +363,8 @@ impl Record for LongoutRecord {
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "PVAL" => Some(EpicsValue::Long(self.pval)),
+            "OUT" => Some(EpicsValue::String(self.out.clone())),
+            "OOCH" => Some(EpicsValue::Short(self.ooch)),
             _ => None,
         }
     }
@@ -489,6 +520,25 @@ impl Record for LongoutRecord {
             "PVAL" => {
                 // Read-only — validate_put already rejected the call.
                 return Err(CaError::ReadOnlyField("PVAL".into()));
+            }
+            "OUT" => {
+                // C `longoutRecord.c::special` (PR #6c573b4 part 2):
+                // changing OUT at runtime forces the very next
+                // process cycle to write VAL when OOCH=YES.
+                // `first_output_done` doubles as the C
+                // `outpvt == EXEC_OUTPUT` flag (re-trigger semantics
+                // documented on the field).
+                if let EpicsValue::String(v) = value {
+                    self.out = v;
+                    if self.ooch == 1 {
+                        self.first_output_done = false;
+                    }
+                }
+            }
+            "OOCH" => {
+                if let EpicsValue::Short(v) = value {
+                    self.ooch = v;
+                }
             }
             _ => return Err(CaError::FieldNotFound(name.to_string())),
         }
@@ -647,5 +697,46 @@ mod tests {
         let mut r = LongoutRecord::new(0);
         let err = r.put_field("PVAL", EpicsValue::Long(42)).unwrap_err();
         assert!(matches!(err, CaError::ReadOnlyField(_)));
+    }
+
+    /// PR #6c573b4 part 2 (`longoutRecord.c:222-225`): writing OUT at
+    /// runtime with `OOCH = YES` re-arms the next-cycle write under
+    /// OOPT=On_Change. Without OOCH=YES the OUT change is silent (C
+    /// requires the explicit opt-in).
+    #[test]
+    fn ooch_yes_out_change_forces_next_on_change_write() {
+        let mut r = LongoutRecord::new(0);
+        r.oopt = 1; // On_Change
+        r.first_output_done = true; // post-first-cycle: no force pending
+        r.val = 5;
+        r.pval = 5; // val == pval — normally On_Change would skip.
+        assert!(
+            !r.compute_should_output(),
+            "baseline: val==pval should suppress On_Change output"
+        );
+        // OOCH=YES then change OUT → force-bit re-armed.
+        r.ooch = 1;
+        r.put_field("OUT", EpicsValue::String("new:target.VAL".into()))
+            .unwrap();
+        assert!(
+            r.compute_should_output(),
+            "OOCH=YES + OUT change must force the next On_Change write"
+        );
+    }
+
+    #[test]
+    fn ooch_no_out_change_is_silent() {
+        let mut r = LongoutRecord::new(0);
+        r.oopt = 1; // On_Change
+        r.first_output_done = true;
+        r.val = 5;
+        r.pval = 5;
+        // OOCH=NO (default 0) — OUT change must NOT trigger a write.
+        r.put_field("OUT", EpicsValue::String("new:target.VAL".into()))
+            .unwrap();
+        assert!(
+            !r.compute_should_output(),
+            "OOCH=NO: OUT change is silent, val==pval still suppresses output"
+        );
     }
 }

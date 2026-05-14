@@ -14,10 +14,16 @@ pub mod uint32_digital;
 pub mod uint64;
 
 /// Type-safe interface type enum replacing string-based dispatch.
+///
+/// Note: `UInt64` is a **Rust extension** with no upstream asyn C
+/// counterpart (upstream issue #231 unmerged). The `"asynUInt64"`
+/// token below is recognised so internal Rust drivers can request it,
+/// but a real C asyn manager will not advertise this interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InterfaceType {
     Int32,
     Int64,
+    /// Rust extension — see module docstring.
     UInt64,
     Float64,
     Octet,

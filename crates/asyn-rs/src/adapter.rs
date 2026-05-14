@@ -322,6 +322,22 @@ impl AsynDeviceSupport {
     }
 }
 
+/// Mirror of C asyn `computeShift(epicsUInt32 mask)` at
+/// `devAsynUInt32Digital.c:627-636`: returns the position of the
+/// lowest set bit (0..=32). A mask of 0 falls through the loop and
+/// returns 32 — but mbbi/mbbo treat 0 as "use the full word", so
+/// callers should guard before invoking.
+fn compute_mask_shift(mask: u32) -> u32 {
+    let mut bit: u32 = 1;
+    for i in 0..32 {
+        if (mask & bit) != 0 {
+            return i;
+        }
+        bit <<= 1;
+    }
+    32
+}
+
 /// Parse an `info(...)` tag value as a boolean.
 ///
 /// Truthy: non-empty and not `0` / `no` / `false` (case-insensitive).
@@ -587,6 +603,26 @@ impl DeviceSupport for AsynDeviceSupport {
             if sizv > 0 {
                 self.octet_max_size = sizv as usize;
             }
+        }
+
+        // asynUInt32Digital MASK/SHFT propagation. C devAsynUInt32Digital.c
+        // (init paths for mbbi/mbbo/mbbiDirect/mbboDirect at lines 881,
+        // 925, 1010, 1054) sets:
+        //
+        //     pr->mask = pPvt->mask;
+        //     pr->shft = computeShift(pPvt->mask);
+        //
+        // so the record's standard RVAL→VAL conversion shifts the
+        // masked bits down to bit 0. Without this, a link like
+        // `@asynMask(port,0,0xFF00) BITS` reads RVAL with bits 8-15
+        // set but the record's shft stays 0 and VAL ends up
+        // 65280-shaped instead of 0-255. Apply this regardless of
+        // mask value — a fully-set 0xFFFFFFFF mask shifts by 0
+        // (no-op) which is the correct contract for "every bit".
+        if self.iface_type == "asynUInt32Digital" && self.mask != 0 {
+            let shft = compute_mask_shift(self.mask);
+            let _ = record.put_field("MASK", EpicsValue::Long(self.mask as i32));
+            let _ = record.put_field("SHFT", EpicsValue::Short(shft as i16));
         }
 
         if self.initial_readback {
@@ -1150,6 +1186,45 @@ mod tests {
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.reason, 0); // "VAL" is param index 0
+    }
+
+    #[test]
+    fn compute_mask_shift_matches_c() {
+        // C devAsynUInt32Digital.c:627-636 — position of lowest set bit.
+        assert_eq!(compute_mask_shift(0x0001), 0);
+        assert_eq!(compute_mask_shift(0x0002), 1);
+        assert_eq!(compute_mask_shift(0x0080), 7);
+        assert_eq!(compute_mask_shift(0x0F00), 8);
+        assert_eq!(compute_mask_shift(0xFF00), 8);
+        assert_eq!(compute_mask_shift(0x8000_0000), 31);
+        // 0 mask is the "no bits" sentinel — C falls through to 32 too.
+        assert_eq!(compute_mask_shift(0), 32);
+    }
+
+    /// C devAsynUInt32Digital.c:881 / 925 / 1010 / 1054 sets
+    /// `pr->mask` and `pr->shft = computeShift(mask)` from the link
+    /// mask so the record's RVAL→VAL conversion shifts the bits to
+    /// bit-0. Verify the Rust adapter writes both fields at init.
+    #[test]
+    fn uint32_digital_init_propagates_mask_and_shft_to_record() {
+        let mut ads = make_adapter(ScanType::Passive);
+        ads.set_iface_type("asynUInt32Digital");
+        ads = ads.with_mask(0xFF00);
+
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let mut rec = MbbiRecord::default();
+        ads.init(&mut rec).unwrap();
+
+        assert_eq!(
+            rec.get_field("MASK"),
+            Some(EpicsValue::Long(0xFF00)),
+            "MASK must propagate"
+        );
+        assert_eq!(
+            rec.get_field("SHFT"),
+            Some(EpicsValue::Short(8)),
+            "SHFT must equal computeShift(0xFF00) = 8"
+        );
     }
 
     /// C parity: devAsynOctet initCommon passes `plsi->sizv` as the

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{CaError, CaResult};
-use crate::runtime::net::CA_SERVER_PORT;
+use crate::runtime::net::cas_server_port;
 use crate::server::record::{self, Record, SubroutineFn};
 
 use crate::server::database::PvDatabase;
@@ -104,7 +104,9 @@ impl IocApplication {
             }),
         );
         Self {
-            port: CA_SERVER_PORT,
+            // SERVER-side port: caservertask.c:491-498 honours
+            // EPICS_CAS_SERVER_PORT > EPICS_CA_SERVER_PORT > 5064.
+            port: cas_server_port(),
             tcp_port: None,
             device_factories,
             dynamic_device_factory: None,
@@ -487,16 +489,16 @@ impl IocApplication {
         }
 
         // Phase 3: Hand off to protocol runner.
-        // Resolve TCP port: explicit `.tcp_port(...)` wins, then
-        // EPICS_CAS_SERVER_PORT, otherwise inherit the UDP discovery
-        // port (epics-base PR #69 semantics). Read the env here at run
-        // time so tests / wrappers that set the var after constructing
-        // the app still pick up the value.
-        let tcp_port = tcp_port.or_else(|| {
-            std::env::var("EPICS_CAS_SERVER_PORT")
-                .ok()
-                .and_then(|s| s.parse::<u16>().ok())
-        });
+        // C parity (caservertask.c:491-499): the server-side env var
+        // EPICS_CAS_SERVER_PORT sets `ca_server_port`, and
+        // `ca_udp_port = ca_server_port` — so UDP and TCP bind the
+        // same value unless the Rust-extension `.tcp_port(...)`
+        // explicitly splits them. The `port` field already
+        // incorporates the CAS / CA / default precedence via
+        // `cas_server_port()` (see `IocApplication::new`).
+        // `tcp_port` here remains `Some(...)` only when the caller
+        // explicitly invoked `.tcp_port(...)`; otherwise the runner
+        // will inherit `port`.
         let config = IocRunConfig {
             db,
             port,

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::runtime::net::ca_server_port;
+use epics_base_rs::runtime::net::cas_server_port;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 
@@ -71,7 +71,9 @@ impl CaServerBuilder {
     pub fn new() -> Self {
         Self {
             ioc: ioc_builder::IocBuilder::new(),
-            port: ca_server_port(),
+            // SERVER-side port reader honours EPICS_CAS_SERVER_PORT >
+            // EPICS_CA_SERVER_PORT > 5064 (caservertask.c:491-498).
+            port: cas_server_port(),
             tcp_port: None,
             acf: None,
             acf_path: None,
@@ -273,17 +275,13 @@ impl CaServerBuilder {
         });
         let (conn_tx, _) = tokio::sync::broadcast::channel(64);
         let (acf_reload_tx, _) = tokio::sync::broadcast::channel(16);
-        // Explicit `.tcp_port(...)` wins; otherwise honor
-        // EPICS_CAS_SERVER_PORT; otherwise fall back to the UDP port.
-        // Reading the env here (rather than at `new()`) means callers
-        // can `unsafe { set_var(...) }` after `CaServer::builder()` and
-        // still pick up the override.
-        let tcp_port = self.tcp_port.unwrap_or_else(|| {
-            std::env::var("EPICS_CAS_SERVER_PORT")
-                .ok()
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(self.port)
-        });
+        // C parity (caservertask.c:491-499): `ca_udp_port =
+        // ca_server_port` — UDP and TCP bind the same value unless
+        // the Rust-extension `.tcp_port(...)` was used to split. The
+        // `self.port` field already incorporates the
+        // `EPICS_CAS_SERVER_PORT > EPICS_CA_SERVER_PORT` precedence
+        // via cas_server_port() at builder construction.
+        let tcp_port = self.tcp_port.unwrap_or(self.port);
         Ok(CaServer {
             db,
             port: self.port,

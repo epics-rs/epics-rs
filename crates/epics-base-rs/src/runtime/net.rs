@@ -9,23 +9,36 @@ pub const CA_REPEATER_PORT: u16 = 5065;
 pub const PVA_SERVER_PORT: u16 = 5075;
 pub const PVA_BROADCAST_PORT: u16 = 5076;
 
-/// Returns the CA server port, allowing override via `EPICS_CA_SERVER_PORT`.
+/// Client-side CA server-port reader — where to **send** SEARCH.
+/// Honours `EPICS_CA_SERVER_PORT` only; the server-only
+/// `EPICS_CAS_SERVER_PORT` does **not** affect client behaviour.
 ///
-/// This is the *UDP discovery port* — clients send SEARCH packets here.
-/// On a multi-IOC host every IOC must agree on the same UDP port so that
-/// one search reaches them all; the TCP port can vary per IOC and is
-/// controlled by [`cas_server_port`].
+/// C parity: matches the client path's `envGetInetPortConfigParam
+/// (&EPICS_CA_SERVER_PORT, CA_SERVER_PORT)` — the server-specific
+/// variable is intentionally invisible to clients so a process that
+/// hosts both a client and a server (e.g. a gateway) does not get
+/// its client routing redirected by a server-side override.
 pub fn ca_server_port() -> u16 {
     env::get_u16("EPICS_CA_SERVER_PORT", CA_SERVER_PORT)
 }
 
-/// Returns the CA server *TCP* port, allowing override via
-/// `EPICS_CAS_SERVER_PORT`. Falls back to [`ca_server_port`] when unset.
+/// Server-side CA bind-port reader — where the server **binds** the
+/// UDP discovery socket and the TCP listener (same value for both,
+/// matching `caservertask.c:491-499` —
+/// `ca_udp_port = ca_server_port`).
 ///
-/// Mirrors epics-base PR #69: lets multiple IOCs on one host bind unique
-/// TCP ports while all sharing the canonical UDP search port (5064).
-/// The UDP responder advertises this TCP port back in SEARCH_REPLY so
-/// clients connect to the right listener.
+/// Precedence: `EPICS_CAS_SERVER_PORT` > `EPICS_CA_SERVER_PORT` >
+/// [`CA_SERVER_PORT`] (5064). Mirrors C
+/// `caservertask.c::ca_initialize` exactly — the CAS-specific
+/// variable lets a gateway-style process override the *server-side*
+/// port without disturbing its client routing.
+///
+/// For the multi-IOC "shared UDP search port, distinct TCP ports"
+/// deployment, callers should use [`crate::server::ioc_app::IocApplication::tcp_port`]
+/// (or the equivalent `CaServerBuilder::tcp_port`) to override the
+/// TCP port *only*. The env-var path keeps strict C parity so a
+/// startup script that sets `EPICS_CAS_SERVER_PORT=6064` lands UDP
+/// and TCP on the same port, as it would under a C IOC.
 pub fn cas_server_port() -> u16 {
     env::get_u16("EPICS_CAS_SERVER_PORT", ca_server_port())
 }
@@ -168,12 +181,34 @@ mod tests {
     #[test]
     #[serial(epics_env)]
     fn test_cas_server_port_overrides_ca_server_port() {
+        // C parity regression (caservertask.c:491-499):
+        //   ca_server_port = EPICS_CAS_SERVER_PORT (if set) else
+        //                    EPICS_CA_SERVER_PORT else default 5064
+        //   ca_udp_port = ca_server_port    <-- UDP follows the same value
+        //
+        // Earlier this fn was named cas_server_port() but documented as
+        // a "TCP-only" override with UDP staying at 5064 — that
+        // diverged from C and broke startup scripts that set
+        // EPICS_CAS_SERVER_PORT expecting both ports to follow.
         unsafe {
             std::env::set_var("EPICS_CA_SERVER_PORT", "5064");
             std::env::set_var("EPICS_CAS_SERVER_PORT", "9064");
         }
-        assert_eq!(ca_server_port(), 5064, "UDP discovery port stays at 5064");
-        assert_eq!(cas_server_port(), 9064, "TCP port follows CAS-specific var");
+        // C parity: client semantic only honours EPICS_CA_SERVER_PORT
+        // (`envGetInetPortConfigParam(&EPICS_CA_SERVER_PORT, ...)`).
+        assert_eq!(
+            ca_server_port(),
+            5064,
+            "client semantic ignores EPICS_CAS_SERVER_PORT"
+        );
+        // C parity: server-side bind port honours EPICS_CAS_SERVER_PORT
+        // first (caservertask.c:491). Both UDP and TCP follow this
+        // value unless the caller splits via `.tcp_port(...)`.
+        assert_eq!(
+            cas_server_port(),
+            9064,
+            "server-side bind picks up EPICS_CAS_SERVER_PORT"
+        );
         unsafe {
             std::env::remove_var("EPICS_CAS_SERVER_PORT");
             std::env::remove_var("EPICS_CA_SERVER_PORT");

@@ -842,8 +842,33 @@ where
         while offset + CaHeader::SIZE <= accumulated.len() {
             let (hdr, hdr_size) = CaHeader::from_bytes_extended(&accumulated[offset..])?;
             let actual_post = hdr.actual_postsize();
-            let padded_post = align8(actual_post);
-            let msg_len = hdr_size + padded_post;
+            // C `rsrv/camessage.c:2452` rejects misaligned payloads
+            // ("CAS: Missaligned protocol rejected") with an
+            // ECA_INTERNAL error and disconnects the client. Our
+            // previous code silently rounded up via `align8`, which on
+            // a hostile peer would cause us to read into the next
+            // message's header and de-sync the stream. Now: emit
+            // CA_PROTO_ERROR + drop the connection (match C).
+            if actual_post & 0x7 != 0 {
+                tracing::warn!(
+                    peer = %state.peer,
+                    cmmd = hdr.cmmd,
+                    postsize = actual_post,
+                    "CAS: Missaligned protocol rejected"
+                );
+                let _ = send_ca_error(
+                    &writer,
+                    &hdr,
+                    ECA_INTERNAL,
+                    "CAS: Missaligned protocol rejected",
+                )
+                .await;
+                let _ = writer.lock().await.flush().await;
+                return Err(epics_base_rs::error::CaError::Protocol(
+                    "misaligned CA payload".into(),
+                ));
+            }
+            let msg_len = hdr_size + actual_post;
 
             if offset + msg_len > accumulated.len() {
                 break;

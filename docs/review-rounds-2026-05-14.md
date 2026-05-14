@@ -207,3 +207,41 @@ C 에서 EPICS_CAS_SERVER_PORT 는 **UDP+TCP 모두**를 같은 포트로 설정
 
 **상태**: clean (pure docs, all 21)
 
+### 45-49/161 — pure docs (5 commits): `db774af` `3e7e4d1` `6776f03` `92c8e99` `e98cf5b`
+
+**상태**: clean (pure docs)
+
+### 50/161 — `809baa9` fix(pva): skip name-server reconnect during PvaClient shutdown
+
+**검토**: pvxs `client.cpp:210` `context->state == ContextImpl::Running` 와 Rust `!pool.is_shutdown()` AtomicBool gate 시맨틱 동등. PvaClient lifecycle 2-state (active / shutdown) 라 충분.
+
+**상태**: clean (round 1)
+
+### 51/161 — `8dd8a8e` feat(ca): ca-repeater detaches stdio to /dev/null
+
+**검토**: C `caRepeater.cpp` (commit 6dba2ec): 2 fds (O_RDONLY + O_WRONLY) + dup2(/dev/null, 0/1/2). Rust: 1 fd RDWR + dup2. 결과 동등. `-v` flag 양쪽 지원.
+
+**상태**: clean (round 1)
+
+### 52-58/161 — pure docs (7 commits): `31640e8` `8af8be7` `f2b724d` `4b90f6d` `9a4076b` `cb0c184` `f936f9e`
+
+**상태**: clean (pure docs)
+
+### 59/161 — `763681d` fix(pva): emit first beacon immediately
+
+**검토**: pvxs `cc5071cd22c4` 의 `event_add(beaconTimer, &immediate{0,0})` 와 Rust `first_beacon: bool` 플래그 동등.
+
+**상태**: clean (round 1)
+
+### 60-65/161 — pure docs (6 commits): `3274dc0` `fbcbcd2` `6b65d73` `015e70d` `d24c9da` `a3c0e59`
+
+**상태**: clean (pure docs)
+
+### 66/161 — `895bff9` fix(records): DBE_PROPERTY emits only when metadata actually changed (faac1df1)
+
+**Round 1 defect**: Rust `is_metadata_field` (record_instance.rs:52-67) 가 C `prop(YES)` 필드 집합 불완전 — HHSV/HSV/LSV/LLSV (ai/ao/longin/longout 알람 severity) + ZSV/OSV/COSV (bi/bo) 누락. dbpf 로 HHSV 변경 시 Rust IOC 는 DBE_PROPERTY notify 안 함.
+
+**Fix**: `cc1c4aa` — 7개 필드 추가. State-severity ZRSV..FFSV 는 upstream DBD 에서 `prop(YES)` 가 아니므로 정확히 제외 유지.
+
+**상태**: clean (round 2 after fix `cc1c4aa`)
+

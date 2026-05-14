@@ -37,39 +37,33 @@ C++ `epics-modules/asyn`의 2019년 이후 모든 주요 Commit, Issue, PR을 �
 
 ### 1. 하드웨어 계측기 통신 프로토콜 드라이버
 
-| 항목 | C asyn 출처 | 비고 |
-|---|---|---|
-| **USBTMC** (`drvAsynUSBTMC`) | `drvAsynUSBTMC.c` | iocshArg: `(portName, vendorId int, productId int, serialNumber*, priority int, flags int)`. libusb 기반 (`libusb_init`/`libusb_open_device_with_vid_pid`). bulk OUT/IN BTAG/EOM 프레이밍. |
-| **VXI-11** (`drvVxi11`) | `vxi11/drvVxi11.c` | iocshArg: `(dn, hostName, flags, vxiName, ...)`. ONC RPC (Sun RPC `clnt_create`). create_link / device_write / device_read / device_clear / destroy_link / abort 채널. |
-| **HiSLIP** | Issue #130 (미머지) | C asyn 에 코드 자체 없음 — 공식 driver 가 아직 추가되지 않은 상태. 추가하려면 IVI-6.1 spec 기반 신규 구현 필요. |
+| 항목 | C asyn 출처 | 상태 | Commit |
+|---|---|---|---|
+| **USBTMC** (`drvAsynUSBTMC`) | `drvAsynUSBTMC.c` | ✅ scaffold | `448724e` (M4) |
+| **VXI-11** (`drvVxi11`) | `vxi11/drvVxi11.c` | ✅ scaffold | `2b67092` (M5) |
+| **HiSLIP** | Issue #130 (미머지) | ⛔ skip — C asyn 에 코드 자체 없음. invented 가 됨 |
 
-### 2. 어댑터 / 레코드 계층 누락
+USBTMC/VXI-11은 FTDI 와 동일한 scaffold 컨벤션 — iocshArg 위치 인자 + 프로토콜 상수 (BULK_IO_HEADER_SIZE=12, MESSAGE_ID 1/2, BTAG 0xFF→1 wrap, pad4 / DEVICE_CORE=0x0607AF v1, FLAG bits 0x1/0x2/0x4, link-kind heuristic) + Cargo feature gate (`usbtmc` / `vxi11`). HW path (nusb/rusb / onc-rpc) 는 별도 PR 로 후속.
 
-| 항목 | C asyn 출처 | 비고 |
-|---|---|---|
-| `asyn:FIFO` info-tag 링 버퍼 | `devEpics/devAsynInt32.c::createRingBuffer` 등 | per-record `ringBuffer[ringSize+1]` (default `ringSize = DEFAULT_RING_BUFFER_SIZE = 10`, `atoi(asynDbGetInfo(pr, "asyn:FIFO"))` overrides). drop-oldest on overflow + `ringBufferOverflows++`. **`scanIoRequest` 는 새 entry 추가시에만 호출 — overflow 로 overwrite 할 때는 호출 안 함** (process queue flooding 방지). 해당 디바이스 서포트 6종 모두 (Int32, Int64, Float64, Octet, UInt32Digital, XXXArray) 같은 패턴. |
-| `getBounds` ↔ ai/ao LINEAR ESLO/EOFF | `devEpics/devAsynInt32.c::initAi` 등 | C asyn 의 `getBounds` 는 asynInt32/asynInt64 만 보유 (`asynInt32.h` L36). `(int* low, int* high)` 시그니처. `devAsynInt32::initAi/initAiAverage` 가 init 시 `pasynInt32SyncIO->getBounds` 호출 → `pPvt->deviceLow/deviceHigh` 저장 → `convertAi` 가 LINR=LINEAR 모드에서 ESLO/EOFF 계산 사용. **DRVL/DRVH/HOPR/LOPR 는 set 하지 않음** (사용자 .db 필드). asyn-rs 의 `port.rs::get_bounds_int32`/`int64` 는 trait 에 존재하나 adapter 측 LINEAR convert 호출 사이트 미존재. |
-| `getLimits` 인터페이스 | (Issue #218 미머지) | C asyn 에 `getLimits` 는 존재 자체가 없음 — Issue #218 은 feature request 이며 머지되지 않음. asynFloat64 에는 `getBounds` 도 없음. |
+### 2. 어댑터 / 레코드 계층
+
+| 항목 | C asyn 출처 | 상태 | Commit |
+|---|---|---|---|
+| `asyn:FIFO` info-tag 링 버퍼 | `devEpics/devAsynInt32.c::createRingBuffer` 등 | ✅ done | `04ef574` (M1) |
+| `getBounds` ↔ ai LINEAR ESLO/EOFF | `devEpics/devAsynInt32.c::initAi`/`convertAi` | ✅ done | `614e7eb` (M2) |
+| `getLimits` 인터페이스 | (Issue #218 미머지) | ⛔ skip — C asyn 에 존재 자체 없음 |
 
 ### 3. 아키텍처
 
-| 항목 | C asyn 출처 | 비고 |
-|---|---|---|
-| `asynParamSet` 파라미터 그룹 | `asynPortDriver/asynParamSet.h` | C++ 클래스: `std::vector<asynParam{name, type, int*}>` + `add()` + `getParamDefinitions()`. asynPortDriver 생성자가 받아서 createParam 일괄 호출. **평탄 리스트 (트리 아님).** |
-| **PVI** (PVInterface) | (없음) | C asyn 에 PVI / 트리 구조 파라미터 토폴로지는 존재하지 않음. PR 후보 단계도 확인 안 됨. |
+| 항목 | C asyn 출처 | 상태 | Commit |
+|---|---|---|---|
+| `asynParamSet` 평탄 그룹 헬퍼 | `asynPortDriver/asynParamSet.h` | ✅ done | `5817fad` (M3) |
+| **PVI** (PVInterface) | (없음) | ⛔ skip — C asyn 부재 |
 
 ---
 
-## 다음 우선순위 (C asyn 소스 대비 정확 구현)
+### 종합 요약 (2026-05-14 update)
 
-1. **`asyn:FIFO` adapter wiring** — `devAsynInt32::createRingBuffer` 패턴 (default 10, atoi only, overflow 시 scanIoRequest 안 함) — medium
-2. **`getBounds_int32/int64` ↔ LINEAR ESLO/EOFF** — `devAsynInt32::initAi`/`convertAi` 와 동일한 init→deviceLow/High→convert 흐름 — medium
-5. **USBTMC driver** — libusb-rs (rusb/nusb) + iocshArg-style config (vid, pid, serial, priority, flags) + BTAG/EOM 프레이밍 — large
-6. **VXI-11 driver** — ONC RPC (`onc-rpc` crate 후보) + iocshArg-style config (dn, hostName, flags, vxiName) — large
-7. **HiSLIP driver** — C asyn 에 없음, IVI-6.1 spec 기반 신규 — large
-8. **`asynParamSet` 평탄 그룹 헬퍼** — `vector<asynParam>` 등가 — small (PVI 는 C asyn 에 부재 → 미구현 항목 아님)
+5/8 우선순위 항목 완료 — `M1` asyn:FIFO, `M2` LINEAR ESLO/EOFF, `M3` AsynParamSet, `M4` USBTMC scaffold, `M5` VXI-11 scaffold. 모두 C asyn 원본 시그니처/세만틱 / 상수에 1:1 매핑됨. 워크스페이스 nextest 3485/3485 통과.
 
----
-
-### 종합 요약
-`asyn-rs`는 단순한 포팅을 넘어 C++ 버전의 고질적 버그와 최신 요구사항(TCP 비동기 커넥션, RS485 지원, SO_REUSEPORT, BREAK, AVERAGE 등)을 이미 매우 높은 수준으로 선제 반영. 본 audit 에서 이전 세션의 일부 invented scaffold (USBTMC/Prologix/VXI-11/HiSLIP scaffold, `getLimits` trait, PVI ParamTree, UDP-server peer-routing, A1-A3 wiring) 가 C asyn 소스 대비 검증 실패로 revert. 남은 작업은 C asyn 원본 시그니처/세만틱 대비 정확한 구현으로 다시 접근.
+남은 3 항목 (HiSLIP, getLimits, PVI)은 모두 C asyn 부재 — 추가 구현은 invention 으로 분류되므로 본 audit 의 scope 밖. M4/M5 의 HW path 활성화는 use case 확정 후 별도 PR.

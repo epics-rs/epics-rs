@@ -890,6 +890,29 @@ pub trait PortDriver: Send + Sync + 'static {
     }
 
     // --- Octet EOS (delegates to interpose stack by default) ---
+    //
+    // ## EOS connect-wait policy (C asyn issue #103)
+    //
+    // C asyn `asynOctetSyncIO::setInputEos` / `setOutputEos`
+    // (`asynOctetSyncIO.c:300-321`, 346-367) call `lockPort` ahead of
+    // the actual `setInputEos` — `lockPort` waits up to the user's
+    // timeout for the port to be connected, by `epicsEventWait`-ing
+    // on the connect event published from `connectIt`. On IOC init
+    // and exit this serialises EOS configuration against the connect
+    // task, but it also means a `setInputEos` issued before the port
+    // has ever connected blocks the calling thread (issue #103
+    // captured the symptom: IOC startup pauses for the full asyn
+    // timeout when the device is off-line).
+    //
+    // The Rust path here is purely in-memory: `set_input_eos` and
+    // `set_output_eos` write the bytes into `PortDriverBase` and the
+    // EOS interpose stack reads from those fields at next read/write
+    // time. No connect-wait, no lock contention with the connect
+    // task — so issue #103's symptom cannot reproduce. If a future
+    // refactor introduces a connect-gated EOS path (e.g. a driver
+    // that owns the EOS state inside its connect()-allocated
+    // resource), authors MUST keep the wait optional / bounded so
+    // the connect-wait failure mode doesn't return.
 
     fn set_input_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
         if eos.len() > 2 {
@@ -1437,7 +1460,10 @@ mod tests {
         // shutdownPort call. PortDriver authors that want shutdown
         // support set `destructible: true` explicitly.
         let flags = PortFlags::default();
-        assert!(!flags.destructible, "destructible must be opt-in (C parity)");
+        assert!(
+            !flags.destructible,
+            "destructible must be opt-in (C parity)"
+        );
     }
 
     #[test]
@@ -1457,7 +1483,10 @@ mod tests {
             }
             other => panic!("expected ASYN_DESTRUCTIBLE refusal, got {other:?}"),
         }
-        assert!(!base.is_defunct(), "non-destructible port must not flip defunct");
+        assert!(
+            !base.is_defunct(),
+            "non-destructible port must not flip defunct"
+        );
         assert!(base.is_enabled(), "non-destructible port must stay enabled");
     }
 
@@ -1475,8 +1504,14 @@ mod tests {
         assert!(base.is_enabled());
         assert!(!base.is_defunct());
         base.shutdown_lifecycle().unwrap();
-        assert!(!base.is_enabled(), "shutdown_lifecycle must flip enabled=false");
-        assert!(base.is_defunct(), "shutdown_lifecycle must flip defunct=true");
+        assert!(
+            !base.is_enabled(),
+            "shutdown_lifecycle must flip enabled=false"
+        );
+        assert!(
+            base.is_defunct(),
+            "shutdown_lifecycle must flip defunct=true"
+        );
         // Idempotent — second call is Ok and leaves state unchanged.
         base.shutdown_lifecycle().unwrap();
         assert!(base.is_defunct());

@@ -183,7 +183,7 @@
 #### 5. `6ea50bd` — SEARCH reply `m_cid = ~0U` sentinel + TCP `m_postsize = 0`
 
 - **Anchor**: `search_reply` builder
-- **Why**: C `camessage.c::search_reply`: `m_cid = ~0U` sentinel (search-reply 모드). 기존 Rust는 `local_ip_for(src)` 임베드 — 두 모드 모두 libca 클라이언트에서 디코드 가능하나 byte-exact는 sentinel 형태. multi-NIC 라우팅 이점은 cap-tokens companion이 시그니처로 묶으니 손실 아님. 더불어 TCP SEARCH-reply prefix에서 `m_postsize = 0`(minor-version trailer 없음) — C와 일치.
+- **Why**: C `camessage.c::search_reply`: `m_cid = ~0U` sentinel (search-reply 모드). 기존 Rust는 `local_ip_for(src)` 임베드 — `0.0.0.0:0` 소켓을 클라이언트로 `connect`하여 커널이 고른 outgoing-interface IP를 사용. multi-homed 호스트에서 이 추측이 클라이언트가 실제로 reach한 인터페이스와 다를 수 있어 도달 불가 IP로 클라이언트를 보낼 위험이 있었음. C sentinel은 IP 결정을 수신 측에 위임(클라이언트가 보는 UDP source IP = 서버가 답한 인터페이스) → 커널이 정확. multi-NIC 라우팅 기능은 별도 경로로 보존: 서버 측 per-interface UDP binding(`server/addr_list.rs` + `server/udp.rs`의 `EPICS_CAS_INTF_ADDR_LIST` per-NIC responder task)이 SEARCH 도착 인터페이스에서 그대로 reply 송신하고, 클라이언트가 sentinel을 "UDP src IP 사용"으로 디코드하여 정확한 인터페이스 IP를 얻음. cap-tokens companion(`signed_beacon.rs`)은 직교한 인증 기능(Ed25519 over `server_ip‖port‖beacon_id‖ts`)으로, multi-NIC 라우팅과 무관. 더불어 TCP SEARCH-reply prefix에서 `m_postsize = 0`(minor-version trailer 없음) — C와 일치.
 
 테스트: 2.
 

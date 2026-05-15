@@ -535,10 +535,23 @@ fn handle_beacon(
     ignored_servers: &std::collections::HashSet<Ipv4Addr>,
 ) {
     // count = server TCP port (CA v4.1+), data_type = protocol version.
+    //
+    // C `udpiiu::beaconAction` (`modules/ca/src/client/udpiiu.cpp:
+    // 770-779`): when `msg.m_count == 0` (old V<4.1 server with
+    // no port in the beacon), the client uses `this->serverPort` —
+    // which is set from the EPICS_CA_SERVER_PORT env var at
+    // udpiiu construction (`udpiiu.cpp:155-156`,
+    // `envGetInetPortConfigParam`). Pre-fix Rust hardcoded
+    // CA_SERVER_PORT (= 5064), ignoring the env override. A site
+    // that runs its IOCs on a non-default port (via
+    // EPICS_CA_SERVER_PORT) would see old-style beacons routed to
+    // 5064 — effectively dropped because no listener is there.
     let server_port = if hdr.count != 0 {
         hdr.count
     } else {
-        CA_SERVER_PORT
+        epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(CA_SERVER_PORT)
     };
     let beacon_id = hdr.cid;
 

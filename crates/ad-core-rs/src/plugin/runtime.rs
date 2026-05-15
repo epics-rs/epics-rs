@@ -501,6 +501,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                             value,
                             timestamp: ts,
                             uint32_changed_mask: 0,
+                            ..Default::default()
                         });
                 }
             }

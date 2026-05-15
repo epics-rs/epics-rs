@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use tokio::sync::broadcast;
 
+use crate::error::AsynStatus;
 use crate::param::ParamValue;
 
 /// Filter for selecting which interrupts to receive.
@@ -20,6 +21,21 @@ pub struct InterruptFilter {
 }
 
 /// Value delivered through the interrupt system.
+///
+/// C parity: every `asynPortDriver::int32Callback` /
+/// `float64Callback` / `octetCallback` walks the interrupt list and
+/// before invoking each subscriber callback writes
+/// `pInterrupt->pasynUser->auxStatus` / `alarmStatus` /
+/// `alarmSeverity` / `timestamp` from the param's stored status
+/// (`asynPortDriver.cpp:631-642,675-678,721-723,765-767,810-812`).
+/// Drivers / records read these on the consumer side to escalate
+/// alarms and report I/O status. The Rust port carries the same
+/// fields on `InterruptValue` so subscribers see what C would set on
+/// the `pasynUser`.
+///
+/// New fields are `Default::default()`-friendly so callers that do
+/// not need them can rely on the struct-update syntax
+/// (`..Default::default()`).
 #[derive(Debug, Clone)]
 pub struct InterruptValue {
     pub reason: usize,
@@ -28,6 +44,28 @@ pub struct InterruptValue {
     pub timestamp: SystemTime,
     /// For UInt32Digital: bitmask of which bits changed (for per-callback filtering).
     pub uint32_changed_mask: u32,
+    /// C parity: `pasynUser->auxStatus` set on every callback emission.
+    /// Carries the originating param status (asynPortDriver.cpp:633).
+    pub aux_status: AsynStatus,
+    /// C parity: `pasynUser->alarmStatus` (asynPortDriver.cpp:634).
+    pub alarm_status: u16,
+    /// C parity: `pasynUser->alarmSeverity` (asynPortDriver.cpp:635).
+    pub alarm_severity: u16,
+}
+
+impl Default for InterruptValue {
+    fn default() -> Self {
+        Self {
+            reason: 0,
+            addr: 0,
+            value: ParamValue::Undefined,
+            timestamp: SystemTime::UNIX_EPOCH,
+            uint32_changed_mask: 0,
+            aux_status: AsynStatus::Success,
+            alarm_status: 0,
+            alarm_severity: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +325,7 @@ mod tests {
             value: ParamValue::Float64(3.14),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
         let v = rx.recv().await.unwrap();
         assert_eq!(v.reason, 1);
@@ -303,6 +342,7 @@ mod tests {
             value: ParamValue::Int32(99),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
         let v1 = rx1.recv().await.unwrap();
         let v2 = rx2.recv().await.unwrap();
@@ -326,6 +366,7 @@ mod tests {
             value: ParamValue::Int32(10),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         // Send reason 1 — should be received
@@ -335,6 +376,7 @@ mod tests {
             value: ParamValue::Int32(20),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         let v = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
@@ -364,6 +406,7 @@ mod tests {
             value: ParamValue::Int32(1),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
         im.notify(InterruptValue {
             reason: 0,
@@ -371,6 +414,7 @@ mod tests {
             value: ParamValue::Int32(2),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         let v = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
@@ -391,6 +435,7 @@ mod tests {
             value: ParamValue::Float64(1.5),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         let v = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
@@ -438,6 +483,7 @@ mod tests {
             value: ParamValue::Int32(10),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
         im.notify(InterruptValue {
             reason: 1,
@@ -445,6 +491,7 @@ mod tests {
             value: ParamValue::Int32(20),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         let v1 = tokio::time::timeout(std::time::Duration::from_millis(100), rx1.recv())
@@ -469,6 +516,7 @@ mod tests {
             value: ParamValue::Int32(1),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
     }
 
@@ -487,6 +535,7 @@ mod tests {
             value: ParamValue::Int32(1),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
         im.notify(InterruptValue {
             reason: 0,
@@ -494,6 +543,7 @@ mod tests {
             value: ParamValue::Int32(2),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
         im.notify(InterruptValue {
             reason: 0,
@@ -501,6 +551,7 @@ mod tests {
             value: ParamValue::Int32(3),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         // Consumer should see only the latest value (3).
@@ -537,6 +588,7 @@ mod tests {
             value: ParamValue::Int32(42),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         let v = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
@@ -572,6 +624,7 @@ mod tests {
                 value: ParamValue::Int32(i as i32),
                 timestamp: SystemTime::now(),
                 uint32_changed_mask: 0,
+                ..Default::default()
             });
         }
 

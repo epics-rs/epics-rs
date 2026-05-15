@@ -274,6 +274,7 @@ mod tests {
             value: crate::param::ParamValue::Int32(77),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
@@ -317,6 +318,7 @@ mod tests {
             value: crate::param::ParamValue::Int32(10),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         // Send reason=1, should pass
@@ -326,6 +328,7 @@ mod tests {
             value: crate::param::ParamValue::Int32(20),
             timestamp: SystemTime::now(),
             uint32_changed_mask: 0,
+            ..Default::default()
         });
 
         let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())

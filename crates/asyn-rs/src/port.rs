@@ -596,12 +596,24 @@ impl PortDriverBase {
                 .params
                 .get_uint32_interrupt_mask(reason, addr)
                 .unwrap_or(0);
+            // C parity: asynPortDriver.cpp:631-642 sets
+            // `pInterrupt->pasynUser->auxStatus/alarmStatus/alarmSeverity`
+            // from the param's stored status before invoking each
+            // subscriber callback. Pull those here so subscribers see
+            // the same triplet C consumers do.
+            let (aux_status, alarm_status, alarm_severity) = self
+                .params
+                .get_param_status(reason, addr)
+                .unwrap_or((AsynStatus::Success, 0, 0));
             self.interrupts.notify(InterruptValue {
                 reason,
                 addr,
                 value,
                 timestamp: ts,
                 uint32_changed_mask: uint32_mask,
+                aux_status,
+                alarm_status,
+                alarm_severity,
             });
         }
         Ok(())
@@ -619,12 +631,20 @@ impl PortDriverBase {
                 .params
                 .get_uint32_interrupt_mask(reason, addr)
                 .unwrap_or(0);
+            // C parity: see `call_param_callbacks` above.
+            let (aux_status, alarm_status, alarm_severity) = self
+                .params
+                .get_param_status(reason, addr)
+                .unwrap_or((AsynStatus::Success, 0, 0));
             self.interrupts.notify(InterruptValue {
                 reason,
                 addr,
                 value,
                 timestamp: ts,
                 uint32_changed_mask: uint32_mask,
+                aux_status,
+                alarm_status,
+                alarm_severity,
             });
         }
         Ok(())
@@ -1171,6 +1191,48 @@ mod tests {
         let v2 = rx.try_recv().unwrap();
         assert_eq!(v2.reason, 1);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_call_param_callbacks_propagates_aux_status_and_alarm() {
+        // C parity: asynPortDriver.cpp:631-642 writes the param's stored
+        // status / alarmStatus / alarmSeverity onto the subscriber's
+        // pasynUser before invoking the callback. The Rust port carries
+        // those fields on InterruptValue.
+        let mut drv = TestDriver::new();
+        let mut rx = drv.base_mut().interrupts.subscribe_async();
+
+        drv.base_mut().set_int32_param(0, 0, 99).unwrap();
+        drv.base_mut()
+            .params
+            .set_param_status(0, 0, crate::error::AsynStatus::Timeout, 4, 2)
+            .unwrap();
+        drv.base_mut().call_param_callbacks(0).unwrap();
+
+        let iv = rx.try_recv().unwrap();
+        assert_eq!(iv.reason, 0);
+        assert!(matches!(iv.aux_status, crate::error::AsynStatus::Timeout));
+        assert_eq!(iv.alarm_status, 4);
+        assert_eq!(iv.alarm_severity, 2);
+    }
+
+    #[test]
+    fn test_call_param_callback_single_propagates_aux_status() {
+        // Mirror for the single-flush path (call_param_callback).
+        let mut drv = TestDriver::new();
+        let mut rx = drv.base_mut().interrupts.subscribe_async();
+
+        drv.base_mut().set_int32_param(0, 0, 1).unwrap();
+        drv.base_mut()
+            .params
+            .set_param_status(0, 0, crate::error::AsynStatus::Disconnected, 7, 3)
+            .unwrap();
+        drv.base_mut().call_param_callback(0, 0).unwrap();
+
+        let iv = rx.try_recv().unwrap();
+        assert!(matches!(iv.aux_status, crate::error::AsynStatus::Disconnected));
+        assert_eq!(iv.alarm_status, 7);
+        assert_eq!(iv.alarm_severity, 3);
     }
 
     #[test]

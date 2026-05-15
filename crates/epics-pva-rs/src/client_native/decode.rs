@@ -31,15 +31,62 @@ impl Frame {
     }
 }
 
+/// Local role of the peer that is *reading* the wire. Used by
+/// [`try_parse_frame_role`] to enforce the direction-bit invariant from
+/// pvxs `conn.cpp:160` (`isClient ^ !!(header[2]&pva_flags::Server)`):
+/// a server's inbound frames must have the `Server` flag CLEAR (client →
+/// server direction), and a client's inbound frames must have it SET
+/// (server → client). Reject mismatches as a protocol fault so a peer
+/// can't echo our own outbound traffic back at us — defense-in-depth
+/// against simple replay or loopback misconfigurations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    /// The local end is a PVA server reading frames from a client.
+    Server,
+    /// The local end is a PVA client reading frames from a server.
+    Client,
+    /// Role-agnostic (sniffers, mixed-mode CLI tools, unit tests).
+    Either,
+}
+
 /// Try to decode a single frame from the start of `buf`. On success returns
 /// the frame plus the number of bytes consumed; on incomplete input returns
 /// `Ok(None)` so the caller can read more.
+///
+/// Role-agnostic — equivalent to `try_parse_frame_role(buf, PeerRole::Either)`.
+/// Production read loops should use [`try_parse_frame_role`] with their
+/// actual role so the direction-bit check engages.
 pub fn try_parse_frame(buf: &[u8]) -> PvaResult<Option<(Frame, usize)>> {
+    try_parse_frame_role(buf, PeerRole::Either)
+}
+
+/// Role-aware variant of [`try_parse_frame`]. Enforces the pvxs direction
+/// invariant: a [`PeerRole::Server`] reader expects the `Server` flag bit
+/// to be CLEAR on inbound frames; a [`PeerRole::Client`] reader expects
+/// it SET. Mismatches return `Err(Protocol)` so the caller can drop the
+/// connection. [`PeerRole::Either`] skips the check entirely.
+pub fn try_parse_frame_role(buf: &[u8], role: PeerRole) -> PvaResult<Option<(Frame, usize)>> {
     if buf.len() < PvaHeader::SIZE {
         return Ok(None);
     }
     let mut cur = Cursor::new(buf);
     let header = PvaHeader::decode(&mut cur).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let from_server = header.flags.is_server();
+    match role {
+        PeerRole::Server if from_server => {
+            return Err(PvaError::Protocol(format!(
+                "inbound frame has Server direction bit set (cmd=0x{:02X}, flags=0x{:02X}) — expected client→server",
+                header.command, header.flags.0
+            )));
+        }
+        PeerRole::Client if !from_server => {
+            return Err(PvaError::Protocol(format!(
+                "inbound frame has Server direction bit clear (cmd=0x{:02X}, flags=0x{:02X}) — expected server→client",
+                header.command, header.flags.0
+            )));
+        }
+        _ => {}
+    }
     if header.flags.is_control() {
         // Control messages have no body; payload_length carries the data word.
         return Ok(Some((
@@ -561,5 +608,52 @@ mod tests {
             }
             other => panic!("expected init, got {other:?}"),
         }
+    }
+
+    /// pvxs `conn.cpp:160` defense-in-depth: a server's read path must
+    /// reject inbound frames that have the `Server` direction bit set
+    /// (those originated from another server, not a client). And a
+    /// client's read path must reject frames with the bit clear.
+    /// `PeerRole::Either` skips the check (sniffers, mixed-mode tests).
+    #[test]
+    fn try_parse_frame_role_rejects_wrong_direction() {
+        // Build a header with Server flag SET (server-originated frame).
+        let order = ByteOrder::Little;
+        let header = PvaHeader::application(true, order, Command::CreateChannel.code(), 0);
+        let mut bytes = Vec::new();
+        header.write_into(&mut bytes);
+
+        // PeerRole::Either accepts either direction.
+        assert!(matches!(
+            try_parse_frame_role(&bytes, PeerRole::Either),
+            Ok(Some(_))
+        ));
+        // PeerRole::Client expects Server bit set — accepted here.
+        assert!(matches!(
+            try_parse_frame_role(&bytes, PeerRole::Client),
+            Ok(Some(_))
+        ));
+        // PeerRole::Server expects Server bit CLEAR — rejected.
+        let err = try_parse_frame_role(&bytes, PeerRole::Server).unwrap_err();
+        assert!(
+            matches!(err, PvaError::Protocol(_)),
+            "expected Protocol error, got {err:?}"
+        );
+
+        // Same payload but Server flag CLEAR.
+        let header2 = PvaHeader::application(false, order, Command::CreateChannel.code(), 0);
+        let mut bytes2 = Vec::new();
+        header2.write_into(&mut bytes2);
+        // PeerRole::Server expects Server bit clear — accepted here.
+        assert!(matches!(
+            try_parse_frame_role(&bytes2, PeerRole::Server),
+            Ok(Some(_))
+        ));
+        // PeerRole::Client expects Server bit SET — rejected.
+        let err = try_parse_frame_role(&bytes2, PeerRole::Client).unwrap_err();
+        assert!(
+            matches!(err, PvaError::Protocol(_)),
+            "expected Protocol error, got {err:?}"
+        );
     }
 }

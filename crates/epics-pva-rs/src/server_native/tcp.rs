@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, warn};
 
-use crate::client_native::decode::{Frame, try_parse_frame};
+use crate::client_native::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
     BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, PVA_VERSION, PvaHeader, Status,
@@ -1148,7 +1148,12 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     max_msg_size: usize,
 ) -> PvaResult<Frame> {
     loop {
-        if let Some((frame, n)) = try_parse_frame(rx_buf)? {
+        // Role-aware parse: a server's inbound frames must have the
+        // Server direction bit CLEAR (pvxs `conn.cpp:160` —
+        // `isClient ^ !!(header[2]&pva_flags::Server)`). Reject and
+        // tear down the connection if the peer echoes our own
+        // outbound shape back at us.
+        if let Some((frame, n)) = try_parse_frame_role(rx_buf, PeerRole::Server)? {
             rx_buf.drain(..n);
             return Ok(frame);
         }

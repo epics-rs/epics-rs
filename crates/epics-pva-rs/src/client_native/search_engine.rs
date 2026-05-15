@@ -34,7 +34,7 @@ use crate::error::{PvaError, PvaResult};
 use crate::proto::{Command, PvaHeader, ReadExt, decode_size, decode_string, ip_from_bytes};
 
 use super::beacon_throttle::BeaconTracker;
-use super::decode::{decode_search_response, try_parse_frame};
+use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
 
 /// Search retry backoff sequence (seconds), matching pvxs `clientdiscover.cpp`.
 pub const BACKOFF_SECS: &[u64] = &[1, 1, 2, 5, 10, 15, 30, 60, 120, 210];
@@ -1447,7 +1447,8 @@ fn handle_search_response(
     ignore_guids: &std::collections::HashSet<[u8; 12]>,
     peer: SocketAddr,
 ) -> usize {
-    let Ok(Some((frame, consumed))) = try_parse_frame(bytes) else {
+    // Server-originated UDP — enforce direction bit (pvxs `conn.cpp:160`).
+    let Ok(Some((frame, consumed))) = try_parse_frame_role(bytes, PeerRole::Client) else {
         return 0;
     };
     let Ok(resp) = decode_search_response(&frame) else {
@@ -1499,7 +1500,9 @@ fn handle_beacon(
     ignore_guids: &std::collections::HashSet<[u8; 12]>,
     peer: SocketAddr,
 ) -> usize {
-    let Ok(Some((frame, consumed))) = try_parse_frame(bytes) else {
+    // Beacons are server-originated — enforce direction bit
+    // (pvxs `conn.cpp:160`).
+    let Ok(Some((frame, consumed))) = try_parse_frame_role(bytes, PeerRole::Client) else {
         return 0;
     };
     if frame.header.command != Command::Beacon.code() {

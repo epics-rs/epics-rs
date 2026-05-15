@@ -40,7 +40,8 @@ use crate::proto::{
 };
 
 use super::decode::{
-    Frame, decode_connection_validated, decode_connection_validation_request, try_parse_frame,
+    Frame, PeerRole, decode_connection_validated, decode_connection_validation_request,
+    try_parse_frame_role,
 };
 
 /// How often we send heartbeat ECHO_REQUEST.
@@ -312,7 +313,14 @@ impl ServerConn {
                                     }
                                 }
                             }
-                            while let Ok(Some((frame, fn_)) ) = try_parse_frame(&buf) {
+                            // Role-aware parse: a client's inbound frames must
+                            // have the Server direction bit SET (pvxs
+                            // `conn.cpp:160`). Reject mismatches so we can't
+                            // be fooled by a peer that echoes our own
+                            // outbound shape back.
+                            while let Ok(Some((frame, fn_))) =
+                                try_parse_frame_role(&buf, PeerRole::Client)
+                            {
                                 buf.drain(..fn_);
                                 if frame.header.flags.is_control() {
                                     handle_control_frame(&frame, &writer_tx_reader, order_reader);
@@ -666,7 +674,10 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
     op_timeout: Duration,
 ) -> PvaResult<Frame> {
     loop {
-        if let Some((frame, n)) = try_parse_frame(rx_buf)? {
+        // Role-aware: read_one_frame is used by client connections, so
+        // require the Server direction bit on inbound frames (pvxs
+        // `conn.cpp:160` parity).
+        if let Some((frame, n)) = try_parse_frame_role(rx_buf, PeerRole::Client)? {
             rx_buf.drain(..n);
             return Ok(frame);
         }

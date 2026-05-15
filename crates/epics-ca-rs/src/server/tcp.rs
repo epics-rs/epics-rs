@@ -2098,6 +2098,35 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 let mut w = writer.lock().await;
                 w.write_all(&resp.to_bytes()).await?;
                 // flush deferred to handle_client outer loop (batched)
+            } else {
+                // C `event_cancel_reply` (`camessage.c:1998-2021`):
+                // when the sub-id (m_available of the request) does
+                // not match any active subscription on the addressed
+                // channel, send `send_err(ECA_BADMONID,
+                // RECORD_NAME(pciu->dbch))`. The previous Rust
+                // behaviour was a silent ignore, leaving libca-driven
+                // tools that race a CLEAR_CHANNEL against an
+                // EVENT_CANCEL with a stale sub-id waiting for an
+                // exception that never arrives (the stale request
+                // was discarded).
+                //
+                // The diagnostic string uses the resolved PV name
+                // when the m_cid in the request still maps to a
+                // channel; otherwise we fall back to "unknown"
+                // (matches C, which would log via `logBadId` and
+                // return RSRV_ERROR — we degrade to a NORMAL reply
+                // path with a descriptive diag).
+                let req_sid = hdr.cid;
+                let (chan_cid, diag) = match state.channels.get(&req_sid) {
+                    Some(entry) => (entry.cid, entry.pv_name.clone()),
+                    None => (0xFFFF_FFFFu32, "unknown".to_string()),
+                };
+                tracing::debug!(
+                    sub_id,
+                    sid = req_sid,
+                    "EVENT_CANCEL for unknown sub-id; replying ECA_BADMONID"
+                );
+                send_ca_error(writer, hdr, ECA_BADMONID, chan_cid, &diag).await?;
             }
         }
 

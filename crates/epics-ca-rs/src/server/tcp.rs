@@ -860,6 +860,7 @@ where
                     &writer,
                     &hdr,
                     ECA_INTERNAL,
+                    0xFFFF_FFFF,
                     "CAS: Missaligned protocol rejected",
                 )
                 .await;
@@ -1091,6 +1092,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     writer,
                     hdr,
                     ECA_INTERNAL,
+                    0xFFFF_FFFF,
                     "attempts to use protocol to set host name \
                      after creating first channel ignored by server",
                 )
@@ -1106,7 +1108,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .position(|&b| b == 0)
                 .unwrap_or(payload.len());
             if end >= 512 {
-                send_ca_error(writer, hdr, ECA_INTERNAL, "bad (very long) host name").await?;
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_INTERNAL,
+                    0xFFFF_FFFF,
+                    "bad (very long) host name",
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -1155,6 +1164,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     writer,
                     hdr,
                     ECA_INTERNAL,
+                    0xFFFF_FFFF,
                     "attempts to use protocol to set user name \
                      after creating first channel ignored by server",
                 )
@@ -1171,6 +1181,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     writer,
                     hdr,
                     ECA_INTERNAL,
+                    0xFFFF_FFFF,
                     "a very long user name was specified",
                 )
                 .await?;

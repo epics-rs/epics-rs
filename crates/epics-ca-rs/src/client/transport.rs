@@ -860,6 +860,25 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     let mut unresponsive_notified = false;
     let mut server_minor_version: u16 = 0;
     let mut beacon_rx_open = true;
+    // C `claim_ciu_reply` (`rsrv/camessage.c:1149-1175`) emits the
+    // CA_PROTO_ACCESS_RIGHTS frame BEFORE the CA_PROTO_CREATE_CHAN
+    // reply on the same TCP stream. The coordinator's
+    // `AccessRightsChanged` handler at `mod.rs:2531` looks up the
+    // channel by cid — but the channel doesn't exist in the
+    // coordinator's map until `ChannelCreated` arrives second. So
+    // the access bits get silently dropped, and the
+    // `ChannelCreated` event hard-coded `AccessRights::from_u32(0x3)`
+    // (full READ+WRITE) regardless of what the server actually
+    // granted. Result: a Rust client against a read-only PV could
+    // attempt writes that the server rejects later (ECA_NOWTACCESS),
+    // instead of refusing them client-side from the access cache.
+    //
+    // Stash by cid; consumed when the matching CREATE_CHAN reply
+    // arrives. If multiple ACCESS_RIGHTS frames arrive between
+    // CREATE_CHAN cycles (rare but legal — server may emit
+    // mid-stream on ACF reload), only the most recent is kept.
+    let mut pending_access: std::collections::HashMap<u32, AccessRights> =
+        std::collections::HashMap::new();
 
     // Single long-lived `Sleep` whose deadline we mutate in place
     // via `Sleep::reset`. This is what makes the libca model
@@ -1078,18 +1097,32 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     });
                 }
                 CA_PROTO_ACCESS_RIGHTS => {
+                    let access = AccessRights::from_u32(hdr.available);
+                    // Stash for the next CREATE_CHAN reply on this
+                    // cid (C orders ACCESS_RIGHTS first; the
+                    // coordinator's update-by-cid is a no-op
+                    // pre-channel).
+                    pending_access.insert(hdr.cid, access);
                     let _ = event_tx.send(TransportEvent::AccessRightsChanged {
                         cid: hdr.cid,
-                        access: AccessRights::from_u32(hdr.available),
+                        access,
                     });
                 }
                 CA_PROTO_CREATE_CHAN => {
+                    // Consume the stashed ACCESS_RIGHTS for this cid
+                    // if any (C `claim_ciu_reply` always emits one
+                    // first; falls back to NoAccess if missing —
+                    // defensive default since we can't assume
+                    // RW on an open channel).
+                    let access = pending_access
+                        .remove(&hdr.cid)
+                        .unwrap_or(AccessRights::from_u32(0));
                     let _ = event_tx.send(TransportEvent::ChannelCreated {
                         cid: hdr.cid,
                         sid: hdr.available,
                         data_type: hdr.data_type,
                         element_count: hdr.actual_count(),
-                        access: AccessRights::from_u32(0x3),
+                        access,
                         server_addr,
                     });
                 }

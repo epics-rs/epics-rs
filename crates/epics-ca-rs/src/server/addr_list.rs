@@ -251,6 +251,47 @@ pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
     out
 }
 
+/// Return the IPv4 broadcast address of the up, non-loopback interface
+/// whose primary IP equals `match_ip`. Mirrors the
+/// `pMatchAddr->ia.sin_addr.s_addr != htonl(INADDR_ANY)` branch in libcom
+/// `osdNetIfAddrs.c::osiSockDiscoverBroadcastAddresses` — the C IOC
+/// builds a list of broadcast addrs filtered to the matching interface
+/// before binding the secondary `udpbcast` socket in
+/// `caservertask.c::start_tcp_server_tasks` (lines 670-708).
+///
+/// Returns `None` when:
+///   * `match_ip` is the unspecified address (caller should never call
+///     in that case — the primary 0.0.0.0 socket already gets broadcasts);
+///   * `match_ip` is loopback (C special-cases this to "loopback as
+///     broadcast", but a loopback responder never needs a second
+///     broadcast bind);
+///   * no matching interface was found, or that interface lacks a
+///     broadcast addr (point-to-point links / odd kernel configs);
+///   * the discovered broadcast is `0.0.0.0` (libcom drops these).
+pub fn broadcast_for_ip(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
+    if match_ip.is_unspecified() || match_ip.is_loopback() {
+        return None;
+    }
+    let ifs = if_addrs::get_if_addrs().ok()?;
+    for iface in ifs {
+        if iface.is_loopback() {
+            continue;
+        }
+        let if_addrs::IfAddr::V4(v4) = iface.addr else {
+            continue;
+        };
+        if v4.ip != match_ip {
+            continue;
+        }
+        let b = v4.broadcast?;
+        if b.is_unspecified() {
+            return None;
+        }
+        return Some(b);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +311,26 @@ mod tests {
             v,
             vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)]
         );
+    }
+
+    #[test]
+    fn broadcast_for_ip_rejects_unspecified_and_loopback() {
+        // C `osdNetIfAddrs.c:42-54` special-cases loopback (returns
+        // INADDR_LOOPBACK as the "broadcast") but `caservertask.c:677`
+        // gates the secondary-bind path on `!= INADDR_ANY`. We collapse
+        // both cases by returning None for unspecified and loopback
+        // inputs — the caller (`udp.rs::run_single_responder`) only
+        // ever opens a second responder when the result is `Some`.
+        assert_eq!(broadcast_for_ip(Ipv4Addr::UNSPECIFIED), None);
+        assert_eq!(broadcast_for_ip(Ipv4Addr::LOCALHOST), None);
+    }
+
+    #[test]
+    fn broadcast_for_ip_unknown_address_returns_none() {
+        // 198.51.100.0/24 is RFC 5737 documentation space — no host
+        // machine will have it on a real interface. Lookup must
+        // gracefully return None rather than fabricating a broadcast.
+        assert_eq!(broadcast_for_ip(Ipv4Addr::new(198, 51, 100, 1)), None);
     }
 
     #[test]

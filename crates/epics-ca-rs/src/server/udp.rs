@@ -66,6 +66,79 @@ async fn run_single_responder(
     tcp_port: u16,
     ignore_addrs: Vec<Ipv4Addr>,
 ) -> CaResult<()> {
+    let socket = bind_responder_socket(bind_ip, port)?;
+    let socket = Arc::new(socket);
+
+    // C `caservertask.c::start_tcp_server_tasks` (lines 670-708) opens a
+    // *second* UDP responder bound to the interface's broadcast address
+    // whenever the primary socket is bound to a specific (non-INADDR_ANY)
+    // interface IP. The comment at line 671 documents the BSD-sockets
+    // oddity: a unicast-bound socket on POSIX does NOT receive UDP
+    // datagrams whose destination is the interface's broadcast addr —
+    // only the secondary socket bound to the broadcast addr will.
+    // Without this second responder, every libca client SEARCH that
+    // targets the broadcast network address (the default
+    // `EPICS_CA_ADDR_LIST` fan-out shape) goes unanswered on a Rust IOC
+    // configured with a specific `EPICS_CAS_INTF_ADDR_LIST` entry —
+    // PVs become invisible to broadcast clients despite the server
+    // running and accepting unicast searches.
+    //
+    // On Windows the kernel behaviour differs (a specific-IP-bound
+    // socket receives broadcasts), so C `caservertask.c:670, 728`
+    // guards the secondary socket with `#if !(_WIN32 || __CYGWIN__)`.
+    // Mirror that gate.
+    let bcast_socket: Option<Arc<UdpSocket>> = {
+        #[cfg(any(windows, target_os = "windows"))]
+        {
+            None
+        }
+        #[cfg(not(any(windows, target_os = "windows")))]
+        {
+            super::addr_list::broadcast_for_ip(bind_ip).and_then(|bcast_ip| {
+                match bind_responder_socket(bcast_ip, port) {
+                    Ok(s) => Some(Arc::new(s)),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "epics_ca_rs::server::udp",
+                            %bind_ip,
+                            %bcast_ip,
+                            error = %e,
+                            "CA server bcast responder bind failed; broadcast SEARCHes \
+                             to this interface will not be answered"
+                        );
+                        None
+                    }
+                }
+            })
+        }
+    };
+
+    let udp_rl = Arc::new(UdpRateLimiter::from_env());
+    let primary = recv_loop(
+        socket.clone(),
+        db.clone(),
+        bind_ip,
+        tcp_port,
+        ignore_addrs.clone(),
+        udp_rl.clone(),
+    );
+
+    match bcast_socket {
+        Some(bsock) => {
+            let secondary = recv_loop(bsock, db, bind_ip, tcp_port, ignore_addrs, udp_rl);
+            // First task to error wins; the other is dropped when this
+            // future returns. tokio::try_join is `Drop` on cancel, so the
+            // surviving loop's recv() future cancels cleanly.
+            tokio::try_join!(primary, secondary).map(|_| ())
+        }
+        None => primary.await,
+    }
+}
+
+/// Build and configure the per-bind UDP socket. Centralised so the
+/// primary (interface IP) and secondary (interface broadcast addr)
+/// sockets share identical socket-option setup.
+fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     // libcom commits 19146a5 + 5064931 + 65ef6e9: SO_REUSEADDR has dangerous
     // hijack semantics on Windows (any process can rebind), so it's POSIX-only.
@@ -107,7 +180,17 @@ async fn run_single_responder(
             "SO_RXQ_OVFL enable failed (non-fatal)"
         );
     }
+    Ok(socket)
+}
 
+async fn recv_loop(
+    socket: Arc<UdpSocket>,
+    db: Arc<PvDatabase>,
+    bind_ip: Ipv4Addr,
+    tcp_port: u16,
+    ignore_addrs: Vec<Ipv4Addr>,
+    udp_rl: Arc<UdpRateLimiter>,
+) -> CaResult<()> {
     // 64 KB receive buffer — IPv4 maximum datagram size. The previous
     // 4 KB cap silently truncated bursts of multi-PV searches in
     // active facilities (each search message is ~24 bytes inc. PV
@@ -118,11 +201,6 @@ async fn run_single_responder(
     // and the `Box<[u8]>` cost is amortized over the listener's
     // lifetime — one allocation, reused on every recv.
     let mut buf = vec![0u8; 64 * 1024];
-    // Per-source-IP token bucket. Off by default; when
-    // EPICS_CAS_UDP_SEARCH_RATE_LIMIT is set, drops excess packets to
-    // mitigate amplification attacks where a tiny search reflects a
-    // larger response.
-    let udp_rl = UdpRateLimiter::from_env();
 
     // Tracks the previously-observed SO_RXQ_OVFL counter for this
     // socket. Logged on transitions only — pvxs `udp_collector.cpp:55-67`.

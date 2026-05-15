@@ -38,7 +38,7 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "RDIF",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::Int64,
         read_only: true,
     },
     FieldDesc {
@@ -53,22 +53,22 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "RVAL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::Int64,
         read_only: false,
     },
     FieldDesc {
         name: "RRBV",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::Int64,
         read_only: true,
     },
     FieldDesc {
         name: "RMP",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::Int64,
         read_only: true,
     },
     FieldDesc {
         name: "REP",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::Int64,
         read_only: true,
     },
     // Conversion
@@ -132,6 +132,16 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
+    FieldDesc {
+        name: "RSTM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOADPOS_BLOCK",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // Velocity
     FieldDesc {
         name: "VELO",
@@ -166,6 +176,16 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "ACCL",
         dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ACCS",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ACCU",
+        dbf_type: DbFieldType::Short,
         read_only: false,
     },
     FieldDesc {
@@ -257,6 +277,16 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "DLLM",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RHLM",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RLLM",
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
@@ -372,6 +402,11 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "RVEL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
     // PID
     FieldDesc {
         name: "PCOF",
@@ -409,6 +444,38 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
+    // Sync trigger (write-only semantic; C: 82c26005)
+    FieldDesc {
+        name: "SYNC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    // Position-compare output (C: 05b25c1d, PR #248)
+    FieldDesc {
+        name: "PCO_START",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PCO_END",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PCO_INC",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PCO_PW",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PCO_ENABLE",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     // Timing
     FieldDesc {
         name: "DLY",
@@ -435,13 +502,13 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "RLV" => Some(EpicsValue::Double(rec.pos.rlv)),
         "OFF" => Some(EpicsValue::Double(rec.pos.off)),
         "DIFF" => Some(EpicsValue::Double(rec.pos.diff)),
-        "RDIF" => Some(EpicsValue::Long(rec.pos.rdif)),
+        "RDIF" => Some(EpicsValue::Int64(rec.pos.rdif)),
         "DVAL" => Some(EpicsValue::Double(rec.pos.dval)),
         "DRBV" => Some(EpicsValue::Double(rec.pos.drbv)),
-        "RVAL" => Some(EpicsValue::Long(rec.pos.rval)),
-        "RRBV" => Some(EpicsValue::Long(rec.pos.rrbv)),
-        "RMP" => Some(EpicsValue::Long(rec.pos.rmp)),
-        "REP" => Some(EpicsValue::Long(rec.pos.rep)),
+        "RVAL" => Some(EpicsValue::Int64(rec.pos.rval)),
+        "RRBV" => Some(EpicsValue::Int64(rec.pos.rrbv)),
+        "RMP" => Some(EpicsValue::Int64(rec.pos.rmp)),
+        "REP" => Some(EpicsValue::Int64(rec.pos.rep)),
         // Conversion
         "DIR" => Some(EpicsValue::Short(rec.conv.dir as i16)),
         "FOFF" => Some(EpicsValue::Short(rec.conv.foff as i16)),
@@ -455,6 +522,12 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "URIP" => Some(EpicsValue::Short(if rec.conv.urip { 1 } else { 0 })),
         "RRES" => Some(EpicsValue::Double(rec.conv.rres)),
         "RDBL_VAL" => Some(EpicsValue::Double(rec.conv.rdbl_value.unwrap_or(0.0))),
+        "RSTM" => Some(EpicsValue::Short(rec.conv.rstm as i16)),
+        "LOADPOS_BLOCK" => Some(EpicsValue::Short(if rec.conv.loadpos_blocked {
+            1
+        } else {
+            0
+        })),
         // Velocity
         "VELO" => Some(EpicsValue::Double(rec.vel.velo)),
         "VBAS" => Some(EpicsValue::Double(rec.vel.vbas)),
@@ -463,6 +536,8 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "SBAS" => Some(EpicsValue::Double(rec.vel.sbas)),
         "SMAX" => Some(EpicsValue::Double(rec.vel.smax)),
         "ACCL" => Some(EpicsValue::Double(rec.vel.accl)),
+        "ACCS" => Some(EpicsValue::Double(rec.vel.accs)),
+        "ACCU" => Some(EpicsValue::Short(rec.vel.accu as i16)),
         "BVEL" => Some(EpicsValue::Double(rec.vel.bvel)),
         "BACC" => Some(EpicsValue::Double(rec.vel.bacc)),
         "HVEL" => Some(EpicsValue::Double(rec.vel.hvel)),
@@ -483,6 +558,8 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "LLM" => Some(EpicsValue::Double(rec.limits.llm)),
         "DHLM" => Some(EpicsValue::Double(rec.limits.dhlm)),
         "DLLM" => Some(EpicsValue::Double(rec.limits.dllm)),
+        "RHLM" => Some(EpicsValue::Double(rec.limits.rhlm)),
+        "RLLM" => Some(EpicsValue::Double(rec.limits.rllm)),
         "LVIO" => Some(EpicsValue::Short(if rec.limits.lvio { 1 } else { 0 })),
         "HLS" => Some(EpicsValue::Short(if rec.limits.hls { 1 } else { 0 })),
         "LLS" => Some(EpicsValue::Short(if rec.limits.lls { 1 } else { 0 })),
@@ -507,6 +584,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "TDIR" => Some(EpicsValue::Short(if rec.stat.tdir { 1 } else { 0 })),
         "ATHM" => Some(EpicsValue::Short(if rec.stat.athm { 1 } else { 0 })),
         "STUP" => Some(EpicsValue::Short(rec.stat.stup)),
+        "RVEL" => Some(EpicsValue::Double(rec.stat.rvel)),
         // PID
         "PCOF" => Some(EpicsValue::Double(rec.pid.pcof)),
         "ICOF" => Some(EpicsValue::Double(rec.pid.icof)),
@@ -516,6 +594,14 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "PREC" => Some(EpicsValue::Short(rec.disp.prec)),
         "ADEL" => Some(EpicsValue::Double(rec.disp.adel)),
         "MDEL" => Some(EpicsValue::Double(rec.disp.mdel)),
+        // SYNC is a write-only trigger; readback always 0.
+        "SYNC" => Some(EpicsValue::Short(0)),
+        // Position-compare output
+        "PCO_START" => Some(EpicsValue::Double(rec.pco.start)),
+        "PCO_END" => Some(EpicsValue::Double(rec.pco.end)),
+        "PCO_INC" => Some(EpicsValue::Double(rec.pco.increment)),
+        "PCO_PW" => Some(EpicsValue::Double(rec.pco.pulse_width_us)),
+        "PCO_ENABLE" => Some(EpicsValue::Short(if rec.pco.enable { 1 } else { 0 })),
         // Timing
         "DLY" => Some(EpicsValue::Double(rec.timing.dly)),
         "NTM" => Some(EpicsValue::Short(if rec.timing.ntm { 1 } else { 0 })),
@@ -537,6 +623,11 @@ pub(crate) fn motor_put_field(
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
             if rec.conv.set && !rec.conv.igset {
+                // #231: LOAD_POS blocked — refuse the SET-mode redefinition so
+                // DVAL/OFF stay consistent with the controller.
+                if rec.conv.loadpos_blocked {
+                    return Ok(());
+                }
                 if rec.conv.foff == FreezeOffset::Variable {
                     // SET+FOFF=Variable: recalculate offset, DVAL stays, SetPosition
                     if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
@@ -591,6 +682,10 @@ pub(crate) fn motor_put_field(
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
             if rec.conv.set && !rec.conv.igset {
+                // #231: LOAD_POS blocked — refuse SET-mode redefinition.
+                if rec.conv.loadpos_blocked {
+                    return Ok(());
+                }
                 if rec.conv.foff == FreezeOffset::Variable {
                     // SET+FOFF=Variable: recalculate offset, signal SetPosition
                     if let Ok((val, rval, off)) = coordinate::cascade_from_dval(
@@ -637,11 +732,18 @@ pub(crate) fn motor_put_field(
             Ok(())
         }
         "RVAL" => {
-            let v = match value {
-                EpicsValue::Long(v) => v,
+            // RVAL is 64-bit (epics-modules/motor #192). Accept Int64 or a
+            // 32-bit Long from older clients.
+            let v: i64 = match value {
+                EpicsValue::Int64(v) => v,
+                EpicsValue::Long(v) => v as i64,
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
             if rec.conv.set && !rec.conv.igset {
+                // #231: LOAD_POS blocked — refuse SET-mode redefinition.
+                if rec.conv.loadpos_blocked {
+                    return Ok(());
+                }
                 if rec.conv.foff == FreezeOffset::Variable {
                     // SET+FOFF=Variable: recalculate offset, signal SetPosition
                     let (val, dval, off) = coordinate::cascade_from_rval(
@@ -867,6 +969,20 @@ pub(crate) fn motor_put_field(
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
+        "RSTM" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.rstm = RestoreMode::from_i16(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LOADPOS_BLOCK" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.loadpos_blocked = v != 0;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Velocity -- C: cross-calculate EGU/s <-> rev/s pairs
         "VELO" => match value {
             EpicsValue::Double(v) => {
@@ -875,6 +991,8 @@ pub(crate) fn motor_put_field(
                 if urev_abs > 0.0 {
                     rec.vel.s = v / urev_abs;
                 }
+                // C: 7291b556 — recalc ACCL/ACCS based on ACCU
+                apply_accu_cascade(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -886,6 +1004,7 @@ pub(crate) fn motor_put_field(
                 if urev_abs > 0.0 {
                     rec.vel.sbas = v / urev_abs;
                 }
+                apply_accu_cascade(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -938,6 +1057,34 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 // C: ACCL must be > 0 (forces to 0.1 if <= 0)
                 rec.vel.accl = if v <= 0.0 { 0.1 } else { v };
+                // C: 36177f7b — writing ACCL switches ACCU to Accl and recalcs ACCS
+                rec.vel.accu = AccsUsed::Accl;
+                let span = rec.vel.velo - rec.vel.vbas;
+                if rec.vel.accl > 0.0 && span > 0.0 {
+                    rec.vel.accs = span / rec.vel.accl;
+                }
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ACCS" => match value {
+            EpicsValue::Double(v) => {
+                // C: ACCS must be > 0 (use 1.0 fallback)
+                rec.vel.accs = if v <= 0.0 { 1.0 } else { v };
+                // C: 36177f7b — writing ACCS switches ACCU to Accs and recalcs ACCL
+                rec.vel.accu = AccsUsed::Accs;
+                let span = rec.vel.velo - rec.vel.vbas;
+                if rec.vel.accs > 0.0 && span > 0.0 {
+                    rec.vel.accl = span / rec.vel.accs;
+                }
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ACCU" => match value {
+            EpicsValue::Short(v) => {
+                // C: 63bfe5d0 — ACCU is autosave/CA-writable; does not recompute.
+                rec.vel.accu = AccsUsed::from_i16(v);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1056,6 +1203,7 @@ pub(crate) fn motor_put_field(
                     rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
                     rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
                 }
+                detect_inverted_limits(&mut rec.limits);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1075,6 +1223,7 @@ pub(crate) fn motor_put_field(
                     rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
                     rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
                 }
+                detect_inverted_limits(&mut rec.limits);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1094,6 +1243,7 @@ pub(crate) fn motor_put_field(
                 );
                 rec.limits.hlm = hlm;
                 rec.limits.llm = llm;
+                detect_inverted_limits(&mut rec.limits);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1104,6 +1254,42 @@ pub(crate) fn motor_put_field(
                 if rec.conv.mres != 0.0 {
                     rec.limits.rllm = v / rec.conv.mres;
                 }
+                let (hlm, llm) = coordinate::dial_limits_to_user(
+                    rec.limits.dhlm,
+                    rec.limits.dllm,
+                    rec.conv.dir,
+                    rec.pos.off,
+                );
+                rec.limits.hlm = hlm;
+                rec.limits.llm = llm;
+                detect_inverted_limits(&mut rec.limits);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RHLM" => match value {
+            EpicsValue::Double(v) => {
+                // C: 2e89b552 — raw input drives dial/user (raw-master path).
+                rec.limits.rhlm = v;
+                rec.limits.dhlm = v * rec.conv.mres;
+                normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
+                let (hlm, llm) = coordinate::dial_limits_to_user(
+                    rec.limits.dhlm,
+                    rec.limits.dllm,
+                    rec.conv.dir,
+                    rec.pos.off,
+                );
+                rec.limits.hlm = hlm;
+                rec.limits.llm = llm;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RLLM" => match value {
+            EpicsValue::Double(v) => {
+                rec.limits.rllm = v;
+                rec.limits.dllm = v * rec.conv.mres;
+                normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
                 let (hlm, llm) = coordinate::dial_limits_to_user(
                     rec.limits.dhlm,
                     rec.limits.dllm,
@@ -1295,18 +1481,89 @@ pub(crate) fn motor_put_field(
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
-        // Sync
-        "SYNC" => {
-            rec.last_write = Some(CommandSource::Sync);
-            Ok(())
-        }
+        // Sync — write-only trigger. C: `82c26005` (2010-04). Only fires on
+        // non-zero put; VAL/DVAL/RVAL get reseeded from RBV/DRBV/RRBV in
+        // command_planner::sync_positions().
+        "SYNC" => match value {
+            EpicsValue::Short(v) => {
+                if v != 0 {
+                    rec.last_write = Some(CommandSource::Sync);
+                }
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        // Position-compare output config. C: 05b25c1d (PR #248).
+        // Config fields just store; PCO_ENABLE triggers SetPcoConfig+EnablePco.
+        "PCO_START" => match value {
+            EpicsValue::Double(v) => {
+                rec.pco.start = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "PCO_END" => match value {
+            EpicsValue::Double(v) => {
+                rec.pco.end = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "PCO_INC" => match value {
+            EpicsValue::Double(v) => {
+                rec.pco.increment = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "PCO_PW" => match value {
+            EpicsValue::Double(v) => {
+                rec.pco.pulse_width_us = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "PCO_ENABLE" => match value {
+            EpicsValue::Short(v) => {
+                rec.pco.enable = v != 0;
+                rec.last_write = Some(CommandSource::PcoEnable);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         _ => Err(CaError::FieldNotFound(name.into())),
+    }
+}
+
+/// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
+/// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
+fn apply_accu_cascade(rec: &mut MotorRecord) {
+    let span = rec.vel.velo - rec.vel.vbas;
+    if span <= 0.0 {
+        return; // C: span must be positive; otherwise leave master untouched
+    }
+    match rec.vel.accu {
+        AccsUsed::Accl => {
+            if rec.vel.accl > 0.0 {
+                rec.vel.accs = span / rec.vel.accl;
+            }
+        }
+        AccsUsed::Accs => {
+            if rec.vel.accs > 0.0 {
+                rec.vel.accl = span / rec.vel.accs;
+            }
+        }
     }
 }
 
 /// Apply velocity and limit cascade after MRES changes.
 /// Used by MRES, SREV, and UREV handlers to avoid duplication.
-fn apply_mres_cascade(rec: &mut MotorRecord, _old_mres: f64) {
+///
+/// C: `2e89b552` (PR #193) — raw limits (RHLM/RLLM in motor steps) are the
+/// invariant across MRES changes. Dial and user limits are recomputed.
+/// `fd808eb2` (PR #206) — when MRES < 0, the high/low pair must be ordered
+/// so DHLM >= DLLM.
+fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
     let urev_abs = rec.conv.urev.abs();
     if urev_abs > 0.0 {
         rec.vel.velo = urev_abs * rec.vel.s;
@@ -1314,13 +1571,46 @@ fn apply_mres_cascade(rec: &mut MotorRecord, _old_mres: f64) {
         rec.vel.bvel = urev_abs * rec.vel.sbak;
         rec.vel.vmax = urev_abs * rec.vel.smax;
     }
-    // Update RHLM/RLLM from current dial limits with new MRES
-    // This preserves the user-set dial limits across MRES changes.
-    // C uses RHLM/RLLM set at init_record; since Rust templates set
-    // DHLM/DLLM directly, we keep dial limits as the source of truth
-    // and only update the raw step equivalents.
-    if rec.conv.mres != 0.0 {
-        rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
-        rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
+    if rec.conv.mres == 0.0 {
+        return;
+    }
+    // Seed raw limits from dial on first call (init): when RHLM/RLLM start at
+    // their default 0, treat the existing dial limits as the source. From then
+    // on, raw limits stay invariant under MRES change.
+    let raw_unset = rec.limits.rhlm == 0.0 && rec.limits.rllm == 0.0;
+    if raw_unset && old_mres != 0.0 {
+        rec.limits.rhlm = rec.limits.dhlm / old_mres;
+        rec.limits.rllm = rec.limits.dllm / old_mres;
+    }
+    // Raw is invariant — recompute dial.
+    rec.limits.dhlm = rec.limits.rhlm * rec.conv.mres;
+    rec.limits.dllm = rec.limits.rllm * rec.conv.mres;
+    normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
+    let (hlm, llm) = crate::coordinate::dial_limits_to_user(
+        rec.limits.dhlm,
+        rec.limits.dllm,
+        rec.conv.dir,
+        rec.pos.off,
+    );
+    rec.limits.hlm = hlm;
+    rec.limits.llm = llm;
+}
+
+/// Detect inverted soft-limit configurations and mark LVIO immediately.
+/// C: `270347df` (PR #108) — if the user/dial high/low pair is inverted
+/// (LLM > HLM or DLLM > DHLM), set LVIO without waiting for the next poll
+/// so clients see the error state on the same put cycle.
+fn detect_inverted_limits(limits: &mut LimitFields) {
+    if limits.dllm > limits.dhlm || limits.llm > limits.hlm {
+        limits.lvio = true;
+    }
+}
+
+/// When MRES < 0, dial limits derived from raw end up with DHLM < DLLM.
+/// C `fd808eb2` (PR #206) swaps the pair so the high/low semantics hold.
+fn normalize_raw_limit_pair(limits: &mut LimitFields, mres: f64) {
+    if mres < 0.0 && limits.dhlm < limits.dllm {
+        std::mem::swap(&mut limits.dhlm, &mut limits.dllm);
+        std::mem::swap(&mut limits.rhlm, &mut limits.rllm);
     }
 }

@@ -17,12 +17,37 @@ impl MotorRecord {
             | CommandSource::Stop
             | CommandSource::Sync
             | CommandSource::Set
-            | CommandSource::Cnen => {}
+            | CommandSource::Cnen
+            | CommandSource::PcoEnable => {}
             _ => {
                 if !self.can_accept_command() {
                     return effects;
                 }
+                // C: db5da2f0 + 7493d50b — when URIP=Yes and the external
+                // RDBL link is in error, refuse to start a new motion. If a
+                // motion is in flight, emit a STOP so the axis halts.
+                if self.conv.urip && self.conv.rdbl_error {
+                    if self.stat.phase != MotionPhase::Idle {
+                        self.stat.mip.insert(MipFlags::STOP);
+                        effects.commands.push(MotorCommand::Stop {
+                            acceleration: self.move_accel_egu(),
+                        });
+                    }
+                    return effects;
+                }
             }
+        }
+
+        // C: 0aaf02d7 (2025-02 PR #224) — if a VAL/DVAL/RVAL/RLV write
+        // arrives while a home is in progress, clear the HOMF/HOMR buttons.
+        // Without this, the next do_work pass re-issues HOME and loops.
+        if matches!(
+            src,
+            CommandSource::Val | CommandSource::Dval | CommandSource::Rval | CommandSource::Rlv
+        ) && self.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR)
+        {
+            self.ctrl.homf = false;
+            self.ctrl.homr = false;
         }
 
         match src {
@@ -45,7 +70,7 @@ impl MotorRecord {
                             self.internal.pending_retarget = Some(self.pos.dval);
                             self.stat.mip.insert(MipFlags::STOP);
                             effects.commands.push(MotorCommand::Stop {
-                                acceleration: self.vel.accl,
+                                acceleration: self.move_accel_egu(),
                             });
                             effects.request_poll = true;
                             effects.suppress_forward_link = true;
@@ -105,6 +130,14 @@ impl MotorRecord {
                     self.ctrl.jogr
                 };
                 if starting {
+                    // epics-modules/motor #170 — latest-wins: a fresh jog
+                    // command clears a still-latched opposite-direction
+                    // button so JOGF and JOGR are never both active.
+                    if forward {
+                        self.ctrl.jogr = false;
+                    } else {
+                        self.ctrl.jogf = false;
+                    }
                     self.start_jog(forward, &mut effects);
                 } else {
                     self.stop_jog(&mut effects);
@@ -130,7 +163,7 @@ impl MotorRecord {
                 self.pos.diff = self.pos.dval - self.pos.drbv;
                 // C: rdif = NINT(diff / mres)
                 self.pos.rdif = if self.conv.mres != 0.0 {
-                    (self.pos.diff / self.conv.mres).round() as i32
+                    (self.pos.diff / self.conv.mres).round() as i64
                 } else {
                     0
                 };
@@ -146,6 +179,19 @@ impl MotorRecord {
             CommandSource::Cnen => {
                 effects.commands.push(MotorCommand::SetClosedLoop {
                     enable: self.ctrl.cnen,
+                });
+            }
+            CommandSource::PcoEnable => {
+                // C: 05b25c1d (PR #248) — push the latched PCO configuration
+                // first, then enable/disable so the driver uses fresh params.
+                effects.commands.push(MotorCommand::SetPcoConfig {
+                    start: self.pco.start,
+                    end: self.pco.end,
+                    increment: self.pco.increment,
+                    pulse_width_us: self.pco.pulse_width_us,
+                });
+                effects.commands.push(MotorCommand::EnablePco {
+                    enable: self.pco.enable,
                 });
             }
         }
@@ -308,7 +354,7 @@ impl MotorRecord {
                 move_target - self.pos.drbv,
                 move_target,
                 self.vel.velo,
-                self.vel.accl,
+                self.move_accel_egu(),
             );
         } else if !backlash || (preferred && same_vel) {
             // Case 1: No backlash or preferred with matching vel/accel
@@ -319,7 +365,7 @@ impl MotorRecord {
                 position_error * frac,
                 self.pos.drbv + position_error * frac,
                 self.vel.velo,
-                self.vel.accl,
+                self.move_accel_egu(),
             );
         } else if within_backlash_range {
             // Case 2: Preferred direction, within backlash range
@@ -330,7 +376,7 @@ impl MotorRecord {
                 position_error * frac,
                 self.pos.drbv + position_error * frac,
                 self.vel.bvel,
-                self.vel.bacc,
+                self.backlash_accel_egu(),
             );
         } else {
             // Preferred direction, outside backlash range, vel differs
@@ -341,7 +387,7 @@ impl MotorRecord {
                 position_error * frac,
                 self.pos.drbv + position_error * frac,
                 self.vel.velo,
-                self.vel.accl,
+                self.move_accel_egu(),
             );
         }
         effects.request_poll = true;
@@ -356,7 +402,7 @@ impl MotorRecord {
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
             effects.commands.push(MotorCommand::Stop {
-                acceleration: self.vel.accl,
+                acceleration: self.move_accel_egu(),
             });
             // Sync VAL to RBV after stop
             self.pos.val = self.pos.rbv;
@@ -376,7 +422,7 @@ impl MotorRecord {
             } | MipFlags::STOP;
             self.internal.backlash_pending = false;
             effects.commands.push(MotorCommand::Stop {
-                acceleration: self.vel.accl,
+                acceleration: self.move_accel_egu(),
             });
             effects.request_poll = true;
             effects.suppress_forward_link = true;
@@ -389,6 +435,21 @@ impl MotorRecord {
             MotionDirection::Negative
         };
         if self.is_blocked_by_hw_limit(dir) {
+            return;
+        }
+
+        // C: 9e5b5432 PR #99 — refuse a jog command that would push past a
+        // soft limit further. Without this the record stays in MIP=JOG_REQ
+        // and the button must be released manually. The opposite direction
+        // (back inside the soft window) is still allowed.
+        if self.jog_violates_soft_limit(forward) {
+            if forward {
+                self.ctrl.jogf = false;
+            } else {
+                self.ctrl.jogr = false;
+            }
+            self.limits.lvio = true;
+            effects.suppress_forward_link = true;
             return;
         }
 
@@ -420,7 +481,7 @@ impl MotorRecord {
         effects.commands.push(MotorCommand::MoveVelocity {
             direction: forward,
             velocity: self.vel.jvel,
-            acceleration: self.vel.jar,
+            acceleration: self.jog_accel_egu(),
         });
         effects.request_poll = true;
         effects.suppress_forward_link = true;
@@ -431,11 +492,7 @@ impl MotorRecord {
         self.stat.mip.insert(MipFlags::JOG_STOP);
         self.set_phase(MotionPhase::JogStopping);
         effects.commands.push(MotorCommand::Stop {
-            acceleration: if self.vel.jar > 0.0 {
-                self.vel.jar
-            } else {
-                self.vel.accl
-            },
+            acceleration: self.jog_accel_egu(),
         });
     }
 
@@ -451,7 +508,7 @@ impl MotorRecord {
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
             effects.commands.push(MotorCommand::Stop {
-                acceleration: self.vel.accl,
+                acceleration: self.move_accel_egu(),
             });
             effects.request_poll = true;
             effects.suppress_forward_link = true;
@@ -512,7 +569,7 @@ impl MotorRecord {
         effects.commands.push(MotorCommand::Home {
             forward: hw_forward,
             velocity: self.vel.hvel,
-            acceleration: self.vel.accl,
+            acceleration: self.move_accel_egu(),
         });
         effects.request_poll = true;
         effects.suppress_forward_link = true;
@@ -572,7 +629,7 @@ impl MotorRecord {
                     self.internal.backlash_pending = false;
                     self.internal.pending_retarget = None;
                     effects.commands.push(MotorCommand::Stop {
-                        acceleration: self.vel.accl,
+                        acceleration: self.move_accel_egu(),
                     });
                     // Sync VAL = RBV
                     self.pos.val = self.pos.rbv;
@@ -590,7 +647,7 @@ impl MotorRecord {
                     self.stat.mip.insert(MipFlags::STOP);
                     self.internal.pending_retarget = None;
                     effects.commands.push(MotorCommand::Stop {
-                        acceleration: self.vel.accl,
+                        acceleration: self.move_accel_egu(),
                     });
                 }
             }
@@ -637,6 +694,64 @@ impl MotorRecord {
                 velocity,
                 acceleration,
             });
+        }
+    }
+
+    /// Effective base velocity for acceleration math. Drivers that do not
+    /// support a base velocity advertise it via MSTA bit 15
+    /// (`VBAS_UNSUPPORTED`, epics-modules/motor #76); for those VBAS is
+    /// treated as 0.
+    fn effective_vbas(&self) -> f64 {
+        if self.stat.msta.contains(MstaFlags::VBAS_UNSUPPORTED) {
+            0.0
+        } else {
+            self.vel.vbas
+        }
+    }
+
+    /// Acceleration sent to the driver for a normal move, in EGU/sec².
+    /// C: `accEGUfromVelo()` = `(velo - vbas) / accl`; when ACCU=Accs the
+    /// EGU/sec² value ACCS is used directly. When `velo == vbas` the rate
+    /// would be 0, so fall back to `velo / accl` (C: `b201e40e`, PR #75).
+    pub(crate) fn move_accel_egu(&self) -> f64 {
+        if self.vel.accu == AccsUsed::Accs && self.vel.accs > 0.0 {
+            return self.vel.accs;
+        }
+        let accl = if self.vel.accl > 0.0 {
+            self.vel.accl
+        } else {
+            0.1
+        };
+        let span = self.vel.velo - self.effective_vbas();
+        if span > 0.0 {
+            span / accl
+        } else {
+            self.vel.velo / accl
+        }
+    }
+
+    /// Acceleration for a backlash move, EGU/sec². Uses BVEL/BACC.
+    pub(crate) fn backlash_accel_egu(&self) -> f64 {
+        let bacc = if self.vel.bacc > 0.0 {
+            self.vel.bacc
+        } else {
+            0.1
+        };
+        let span = self.vel.bvel - self.effective_vbas();
+        if span > 0.0 {
+            span / bacc
+        } else {
+            self.vel.bvel / bacc
+        }
+    }
+
+    /// Acceleration for a jog, EGU/sec². JAR is already an EGU/sec² rate;
+    /// fall back to the normal move acceleration when JAR is unset.
+    pub(crate) fn jog_accel_egu(&self) -> f64 {
+        if self.vel.jar > 0.0 {
+            self.vel.jar
+        } else {
+            self.move_accel_egu()
         }
     }
 
@@ -707,6 +822,20 @@ impl MotorRecord {
         match dir {
             MotionDirection::Positive => self.limits.hls,
             MotionDirection::Negative => self.limits.lls,
+        }
+    }
+
+    /// Whether a velocity jog in the requested direction would push past a
+    /// soft limit in user coordinates. C: `9e5b5432` PR #99.
+    fn jog_violates_soft_limit(&self, forward: bool) -> bool {
+        // C: soft limits disabled when HLM == LLM == 0.0
+        if self.limits.hlm == self.limits.llm && self.limits.llm == 0.0 {
+            return false;
+        }
+        if forward {
+            self.pos.val >= self.limits.hlm
+        } else {
+            self.pos.val <= self.limits.llm
         }
     }
 

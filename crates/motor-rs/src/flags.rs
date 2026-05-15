@@ -43,6 +43,11 @@ bitflags! {
         const COMM_ERR        = 0x1000; // bit 12: CNTRL_COMM_ERR
         const MINUS_LS        = 0x2000; // bit 13: RA_MINUS_LS
         const HOMED           = 0x4000; // bit 14: RA_HOMED
+        /// Driver does not support a base velocity (VBAS).
+        /// epics-modules/motor issue #76 (proposal PR #80/#81, unmerged).
+        /// When set, record-level acceleration calculations should treat
+        /// VBAS as effectively 0.
+        const VBAS_UNSUPPORTED = 0x8000; // bit 15
     }
 }
 
@@ -123,6 +128,60 @@ impl FreezeOffset {
     }
 }
 
+/// Restore mode for autosaved position at IOC startup.
+/// C: `2906f3d8` (2020-06) / PR #160 — `menu(motorRSTM)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RestoreMode {
+    Never = 0,
+    Always = 1,
+    #[default]
+    NearZero = 2,
+    Conditional = 3,
+}
+
+impl RestoreMode {
+    pub fn from_i16(v: i16) -> Self {
+        match v {
+            0 => Self::Never,
+            1 => Self::Always,
+            3 => Self::Conditional,
+            _ => Self::NearZero,
+        }
+    }
+
+    /// Whether the device support should write the autosaved DVAL back to the
+    /// driver at init. `use_rel` is true when the driver supports incremental
+    /// (relative) moves only; `dval_non_zero_pos_near_zero` is true when the
+    /// autosaved DVAL is non-zero and the driver's current readback is near
+    /// zero (matches C: `devMotorAsyn.c:199`).
+    pub fn should_restore(self, use_rel: bool, dval_non_zero_pos_near_zero: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Always => true,
+            Self::NearZero => dval_non_zero_pos_near_zero,
+            Self::Conditional => use_rel || dval_non_zero_pos_near_zero,
+        }
+    }
+}
+
+/// Which acceleration field drives motion — matches C motorRecord
+/// `menu(motorACCSused)`: `Accl` (time-to-velocity, sec) or `Accs` (EGU/sec²).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccsUsed {
+    #[default]
+    Accl = 0,
+    Accs = 1,
+}
+
+impl AccsUsed {
+    pub fn from_i16(v: i16) -> Self {
+        match v {
+            1 => Self::Accs,
+            _ => Self::Accl,
+        }
+    }
+}
+
 /// Retry mode — matches C motorRecord RMOD enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RetryMode {
@@ -171,6 +230,8 @@ pub enum CommandSource {
     Sync,
     Set,
     Cnen,
+    /// PCO_ENABLE write — pushes PCO config then enable/disable (PR #248).
+    PcoEnable,
 }
 
 /// Commands to send to the motor driver.
@@ -196,6 +257,12 @@ pub enum MotorCommand {
         velocity: f64,
         acceleration: f64,
     },
+    /// Absolute move to a controller-defined home position (C: a6f64591).
+    MoveToHome {
+        position: f64,
+        velocity: f64,
+        acceleration: f64,
+    },
     Stop {
         acceleration: f64,
     },
@@ -216,6 +283,17 @@ pub enum MotorCommand {
     ProfileExecute,
     ProfileAbort,
     ProfileReadback,
+    /// Enable or disable position-compare output (C: `05b25c1d`, PR #248).
+    EnablePco {
+        enable: bool,
+    },
+    /// Configure position-compare output (C: `05b25c1d`, PR #248).
+    SetPcoConfig {
+        start: f64,
+        end: f64,
+        increment: f64,
+        pulse_width_us: f64,
+    },
 }
 
 /// Effects returned by process logic.

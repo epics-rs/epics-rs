@@ -5,6 +5,22 @@ impl MotorRecord {
     pub fn check_completion(&mut self) -> ProcessEffects {
         let mut effects = ProcessEffects::default();
 
+        // C: db5da2f0 — if the external URIP readback is in error while a
+        // motion is in progress, stop the axis immediately. New moves are
+        // already blocked at plan_motion.
+        if self.conv.urip
+            && self.conv.rdbl_error
+            && self.stat.phase != MotionPhase::Idle
+            && !self.stat.mip.contains(MipFlags::STOP)
+        {
+            self.stat.mip.insert(MipFlags::STOP);
+            effects.commands.push(MotorCommand::Stop {
+                acceleration: self.move_accel_egu(),
+            });
+            effects.suppress_forward_link = true;
+            return effects;
+        }
+
         // C: after DLY expires and fresh readback arrives, evaluate for retry
         if self.stat.mip.contains(MipFlags::DELAY_ACK) {
             self.stat.mip.remove(MipFlags::DELAY_ACK);
@@ -53,7 +69,7 @@ impl MotorRecord {
                 effects.commands.push(MotorCommand::Home {
                     forward: hw_forward,
                     velocity: self.vel.hvel,
-                    acceleration: self.vel.accl,
+                    acceleration: self.move_accel_egu(),
                 });
                 effects.request_poll = true;
                 effects.suppress_forward_link = true;
@@ -68,7 +84,7 @@ impl MotorRecord {
                 effects.commands.push(MotorCommand::MoveVelocity {
                     direction: forward,
                     velocity: self.vel.jvel,
-                    acceleration: self.vel.jar,
+                    acceleration: self.jog_accel_egu(),
                 });
                 effects.request_poll = true;
                 effects.suppress_forward_link = true;
@@ -125,7 +141,17 @@ impl MotorRecord {
                 self.finalize_motion(&mut effects);
             }
             MotionPhase::Idle => {
-                // Already idle, nothing to do
+                // C: ea063f5f — if the record marked an externally initiated
+                // move (MIP_EXTERNAL set during process_motor_info), close
+                // the loop once the driver reports done. Reseed VAL/DVAL/RVAL
+                // from the readback and clear MIP.
+                if self.stat.mip.contains(MipFlags::EXTERNAL)
+                    && self.stat.msta.contains(MstaFlags::DONE)
+                    && !self.stat.movn
+                {
+                    self.sync_positions();
+                    self.finalize_motion(&mut effects);
+                }
             }
         }
 
@@ -155,6 +181,14 @@ impl MotorRecord {
         self.internal.backlash_pending = false;
         self.internal.pending_retarget = None;
         self.internal.verify_retarget_on_completion = false;
+        // C: 9c8a8e8c (PR #56) — clear motion buttons. When the controller
+        // stops on its own (internal limit, fault, host-issued stop) the
+        // JOGF/JOGR/HOMF/HOMR buttons must reset, otherwise the next process
+        // pass re-fires the motion.
+        self.ctrl.jogf = false;
+        self.ctrl.jogr = false;
+        self.ctrl.homf = false;
+        self.ctrl.homr = false;
         // Sync last values
         self.internal.lval = self.pos.val;
         self.internal.ldvl = self.pos.dval;
@@ -245,14 +279,14 @@ impl MotorRecord {
                 effects.commands.push(MotorCommand::MoveRelative {
                     distance: rel_distance,
                     velocity: self.vel.velo,
-                    acceleration: self.vel.accl,
+                    acceleration: self.move_accel_egu(),
                 });
             } else {
                 let position = self.pos.dval + frac * (retry_target - self.pos.dval);
                 effects.commands.push(MotorCommand::MoveAbsolute {
                     position,
                     velocity: self.vel.velo,
-                    acceleration: self.vel.accl,
+                    acceleration: self.move_accel_egu(),
                 });
             }
             effects.request_poll = true;
@@ -311,7 +345,7 @@ impl MotorRecord {
                 effects.commands.push(MotorCommand::MoveRelative {
                     distance: rel_distance,
                     velocity: self.vel.velo,
-                    acceleration: self.vel.accl,
+                    acceleration: self.move_accel_egu(),
                 });
             } else {
                 // C: absolute retry uses dval as base, FRAC interpolates
@@ -320,7 +354,7 @@ impl MotorRecord {
                 effects.commands.push(MotorCommand::MoveAbsolute {
                     position,
                     velocity: self.vel.velo,
-                    acceleration: self.vel.accl,
+                    acceleration: self.move_accel_egu(),
                 });
             }
             effects.request_poll = true;
@@ -411,7 +445,7 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
                 velocity: self.vel.bvel,
-                acceleration: self.vel.bacc,
+                acceleration: self.backlash_accel_egu(),
             });
         } else {
             // C absolute: position = pretarget + frac * (dval - pretarget)
@@ -421,7 +455,7 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
                 velocity: self.vel.bvel,
-                acceleration: self.vel.bacc,
+                acceleration: self.backlash_accel_egu(),
             });
         }
         effects.request_poll = true;
@@ -441,13 +475,13 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: pretarget - self.pos.drbv,
                 velocity: self.vel.velo,
-                acceleration: self.vel.accl,
+                acceleration: self.move_accel_egu(),
             });
         } else {
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position: pretarget,
                 velocity: self.vel.velo,
-                acceleration: self.vel.accl,
+                acceleration: self.move_accel_egu(),
             });
         }
         effects.request_poll = true;
@@ -465,14 +499,14 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
                 velocity: self.vel.bvel,
-                acceleration: self.vel.bacc,
+                acceleration: self.backlash_accel_egu(),
             });
         } else {
             let position = pretarget + frac * (self.pos.dval - pretarget);
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
                 velocity: self.vel.bvel,
-                acceleration: self.vel.bacc,
+                acceleration: self.backlash_accel_egu(),
             });
         }
         effects.request_poll = true;

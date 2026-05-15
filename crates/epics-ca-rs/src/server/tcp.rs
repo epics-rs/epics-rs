@@ -1535,11 +1535,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 ar.cid = client_cid;
                 ar.available = access;
 
+                // C `claim_ciu_reply` (camessage.c:1157-1167): clients
+                // whose minor version is below CA_V49 (= 9) cannot parse
+                // extended-form headers. For those peers, `nElem` is
+                // capped at 0xfffe so the CREATE_CHAN reply stays in
+                // normal-form (16-byte) layout; V4.9+ clients receive
+                // the true count via the extended header.
+                let nelem = if state.client_minor_version < 9 && element_count >= 0xffff {
+                    0xfffe
+                } else {
+                    element_count
+                };
                 let mut resp = CaHeader::new(CA_PROTO_CREATE_CHAN);
                 resp.data_type = dbr_type as u16;
                 resp.cid = client_cid;
                 resp.available = sid;
-                resp.set_payload_size(0, element_count);
+                resp.set_payload_size(0, nelem);
 
                 let mut w = writer.lock().await;
                 w.write_all(&ar.to_bytes()).await?;

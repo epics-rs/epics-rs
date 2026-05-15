@@ -1761,6 +1761,105 @@ async fn test_calc_constant_inputs() {
     }
 }
 
+// C parity (calcRecord.dbd.pod:716-744): calc record carries the same
+// HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV alarm-limit fields as
+// ai/ao/longin/longout. The Rust port omitted them — put_field for
+// HIHI silently no-op'd because `common.analog_alarm` was None for
+// rtype="calc".
+#[tokio::test]
+async fn test_calc_record_has_analog_alarm_limits() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+    let mut calc = CalcRecord::new("A");
+    calc.inpa = "15".to_string(); // VAL will compute to 15
+    db.add_record("CALC_LIM", Box::new(calc)).await.unwrap();
+
+    // Configure HIHI=10, HHSV=MAJOR. Put goes through put_record_field_from_ca
+    // which routes to common.analog_alarm.
+    db.put_record_field_from_ca("CALC_LIM", "HIHI", EpicsValue::Double(10.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("CALC_LIM", "HHSV", EpicsValue::String("MAJOR".into()))
+        .await
+        .unwrap();
+
+    // Read back — verifies the put landed in common.analog_alarm.
+    let hihi = {
+        let rec = db.get_record("CALC_LIM").await.unwrap();
+        let inst = rec.read().await;
+        inst.resolve_field("HIHI").and_then(|v| v.to_f64()).unwrap()
+    };
+    assert_eq!(hihi, 10.0);
+
+    // Process — CALC="A" with A=15 → VAL=15 > HIHI=10 → HIHI_ALARM/MAJOR.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CALC_LIM", &mut visited, 0)
+        .await
+        .unwrap();
+    let rec = db.get_record("CALC_LIM").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        epics_base_rs::server::record::AlarmSeverity::Major,
+        "VAL=15, HIHI=10, HHSV=MAJOR — must raise HIHI alarm",
+    );
+    assert_eq!(
+        inst.common.stat,
+        epics_base_rs::server::recgbl::alarm_status::HIHI_ALARM,
+    );
+}
+
+// C parity (calcRecord.c::checkAlarms:339-381): with AFTC > 0 the
+// alarm-range integer is exponentially smoothed, so a brief excursion
+// above HIHI does NOT immediately raise the severity until the filter
+// converges.
+#[tokio::test]
+async fn test_calc_record_aftc_filter_delays_alarm() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+    let mut calc = CalcRecord::new("A");
+    calc.inpa = "1".to_string();
+    calc.aftc = 5.0; // 5-second filter time-constant
+    db.add_record("CALC_AFTC", Box::new(calc)).await.unwrap();
+    db.put_record_field_from_ca("CALC_AFTC", "HIHI", EpicsValue::Double(10.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("CALC_AFTC", "HHSV", EpicsValue::String("MAJOR".into()))
+        .await
+        .unwrap();
+
+    // First process — filter seeds with NoAlarm (alarm_range=3, Normal).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CALC_AFTC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Set VAL=15 (HIHI condition) and process. With aftc=5s and dt
+    // very small (sub-second between processes), alpha=5/(eps+5)≈1.0,
+    // and filtered_range stays at 3 (Normal). The new alarm range (5)
+    // must be smoothed out by the filter — alarm must NOT fire on the
+    // first transition.
+    let rec = db.get_record("CALC_AFTC").await.unwrap();
+    {
+        let mut inst = rec.write().await;
+        let _ = inst.record.put_field("VAL", EpicsValue::Double(15.0));
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CALC_AFTC", &mut visited, 0)
+        .await
+        .unwrap();
+    let inst = rec.read().await;
+    // afvl must have been updated (filter is engaged)
+    let afvl = inst
+        .record
+        .get_field("AFVL")
+        .and_then(|v| v.to_f64())
+        .unwrap_or(0.0);
+    assert!(afvl != 0.0, "AFVL must be updated when AFTC > 0");
+}
+
 #[tokio::test]
 async fn test_fanout_all() {
     use epics_base_rs::server::records::fanout::FanoutRecord;

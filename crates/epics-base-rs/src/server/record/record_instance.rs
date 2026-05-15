@@ -174,7 +174,15 @@ impl RecordInstance {
     pub fn new_boxed(name: String, record: Box<dyn Record>) -> Self {
         let rtype = record.record_type();
         let analog_alarm = match rtype {
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" => {
+            // C parity: every record type whose dbd carries
+            // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV gets an analog-alarm
+            // config slot. Previously calc / calcout were missing —
+            // their put_field for those fields silently no-op'd
+            // because `self.common.analog_alarm` was None at the
+            // mutation site. Confirmed via
+            // calcRecord.dbd.pod:716-744 (HIHI..LLSV) and
+            // calcoutRecord.dbd.pod:1103+ (same).
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout" => {
                 Some(AnalogAlarmConfig::default())
             }
             _ => None,
@@ -1137,7 +1145,7 @@ impl RecordInstance {
         }
 
         match rtype {
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" => {
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout" => {
                 if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
                     let val = match self.record.val() {
                         Some(EpicsValue::Double(v)) => v,
@@ -1360,25 +1368,73 @@ impl RecordInstance {
         // C-style per-level hysteresis: alarm fires if val passes the level,
         // OR if we were already at that alarm level (lalm == alev) and val
         // hasn't retreated past the hysteresis margin.
-        let (new_sevr, new_stat, alev) = if cfg.hhsv != AlarmSeverity::NoAlarm
+        //
+        // `alarm_range` is the C-style integer level: 1=Lolo, 2=Low,
+        // 3=Normal, 4=High, 5=Hihi. Required for the calc-record AFTC
+        // filter (`calcRecord.c::checkAlarms:339-381`) which filters
+        // on the range level (not on severity) and re-maps back.
+        let (mut new_sevr, mut new_stat, mut alev, mut alarm_range) = if cfg.hhsv
+            != AlarmSeverity::NoAlarm
             && (val >= cfg.hihi || (lalm == cfg.hihi && val >= cfg.hihi - hyst))
         {
-            (cfg.hhsv, alarm_status::HIHI_ALARM, cfg.hihi)
+            (cfg.hhsv, alarm_status::HIHI_ALARM, cfg.hihi, 5u16)
         } else if cfg.llsv != AlarmSeverity::NoAlarm
             && (val <= cfg.lolo || (lalm == cfg.lolo && val <= cfg.lolo + hyst))
         {
-            (cfg.llsv, alarm_status::LOLO_ALARM, cfg.lolo)
+            (cfg.llsv, alarm_status::LOLO_ALARM, cfg.lolo, 1u16)
         } else if cfg.hsv != AlarmSeverity::NoAlarm
             && (val >= cfg.high || (lalm == cfg.high && val >= cfg.high - hyst))
         {
-            (cfg.hsv, alarm_status::HIGH_ALARM, cfg.high)
+            (cfg.hsv, alarm_status::HIGH_ALARM, cfg.high, 4u16)
         } else if cfg.lsv != AlarmSeverity::NoAlarm
             && (val <= cfg.low || (lalm == cfg.low && val <= cfg.low + hyst))
         {
-            (cfg.lsv, alarm_status::LOW_ALARM, cfg.low)
+            (cfg.lsv, alarm_status::LOW_ALARM, cfg.low, 2u16)
         } else {
-            (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, 0.0)
+            (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, val, 3u16)
         };
+
+        // C parity: calcRecord.c::checkAlarms applies the AFTC low-pass
+        // filter on `alarmRange` and re-maps. calcoutRecord.c does NOT
+        // (no AFTC field on calcout — confirmed via
+        // calcoutRecord.dbd.pod). Only `calc` runs the filter.
+        if self.record.record_type() == "calc" {
+            let aftc = self
+                .record
+                .get_field("AFTC")
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0);
+            let afvl = self
+                .record
+                .get_field("AFVL")
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0);
+            if aftc > 0.0 {
+                let now = crate::runtime::general_time::get_current();
+                let (filtered_range, new_afvl) =
+                    Self::aftc_filter(alarm_range, aftc, afvl, self.common.time, now);
+                let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
+                if filtered_range != alarm_range {
+                    // Re-map filtered range back to (sevr, stat, alev).
+                    let (mapped_sevr, mapped_stat, mapped_alev) = match filtered_range {
+                        5 => (cfg.hhsv, alarm_status::HIHI_ALARM, cfg.hihi),
+                        4 => (cfg.hsv, alarm_status::HIGH_ALARM, cfg.high),
+                        2 => (cfg.lsv, alarm_status::LOW_ALARM, cfg.low),
+                        1 => (cfg.llsv, alarm_status::LOLO_ALARM, cfg.lolo),
+                        _ => (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, val),
+                    };
+                    new_sevr = mapped_sevr;
+                    new_stat = mapped_stat;
+                    alev = mapped_alev;
+                    alarm_range = filtered_range;
+                }
+            } else {
+                // aftc <= 0 disables filter; C also clears afvl on
+                // UDF/initial-pass — leave afvl untouched here (no
+                // active filter state to maintain).
+            }
+        }
+        let _ = alarm_range; // suppress unused-var on non-calc paths
 
         if new_sevr != AlarmSeverity::NoAlarm {
             recgbl::rec_gbl_set_sevr(&mut self.common, new_stat, new_sevr);
@@ -2395,10 +2451,6 @@ mod check_deadband_tests {
     #[test]
     fn same_signed_infinity_does_not_fire() {
         assert!(!check_deadband(f64::INFINITY, f64::INFINITY, 1.0));
-        assert!(!check_deadband(
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-            1.0
-        ));
+        assert!(!check_deadband(f64::NEG_INFINITY, f64::NEG_INFINITY, 1.0));
     }
 }

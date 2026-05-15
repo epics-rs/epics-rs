@@ -87,6 +87,12 @@ pub struct CalcRecord {
     pub lu: f64,
     // CALC_ALARM flag: set when calcPerform fails
     pub calc_alarm: bool,
+    // Alarm-range time-constant filter (epics-base calcRecord.c::checkAlarms).
+    // AFTC > 0 enables an exponential smoothing of the integer alarmRange
+    // (1=Lolo..5=Hihi) so transient excursions don't immediately alarm.
+    // AFVL is the filter accumulator state (sign encodes rounding hysteresis).
+    pub aftc: f64,
+    pub afvl: f64,
     // Cached compiled expression (RPCL equivalent)
     rpcl: Option<crate::calc::CompiledExpr>,
 }
@@ -169,6 +175,8 @@ impl Default for CalcRecord {
             lt: 0.0,
             lu: 0.0,
             calc_alarm: false,
+            aftc: 0.0,
+            afvl: 0.0,
             rpcl: None,
         }
     }
@@ -293,6 +301,16 @@ static CALC_FIELDS: &[FieldDesc] = &[
         name: "MDEL",
         dbf_type: DbFieldType::Double,
         read_only: false,
+    },
+    FieldDesc {
+        name: "AFTC",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "AFVL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
     },
     FieldDesc {
         name: "LALM",
@@ -708,6 +726,8 @@ impl Record for CalcRecord {
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "ADEL" => Some(EpicsValue::Double(self.adel)),
             "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "AFTC" => Some(EpicsValue::Double(self.aftc)),
+            "AFVL" => Some(EpicsValue::Double(self.afvl)),
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
@@ -835,6 +855,20 @@ impl Record for CalcRecord {
             "MDEL" => match value {
                 EpicsValue::Double(v) => {
                     self.mdel = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "AFTC" => match value {
+                EpicsValue::Double(v) => {
+                    self.aftc = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "AFVL" => match value {
+                EpicsValue::Double(v) => {
+                    self.afvl = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

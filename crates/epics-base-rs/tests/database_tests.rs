@@ -1391,6 +1391,59 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
     assert_eq!(inst.common.amsg, "Async in progress");
 }
 
+// C `dbAccess.c:539-541` — when TPRO is set on a record whose PACT is
+// true, dbProcess prints "<thread>: dbProcess of Active '<name>' with
+// RPRO=<n>" before the bail decision. The Rust port emits the same
+// line via eprintln; this test exercises the path and verifies (a)
+// TPRO=true does not interfere with the bail decision (lcnt still
+// increments) and (b) RPRO state is preserved through the guard so
+// the diagnostic value is meaningful.
+#[tokio::test]
+async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_TPRO", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Set TPRO=true and RPRO=true so the diagnostic line carries
+    // observable state.
+    {
+        let rec = db.get_record("ASYNC_TPRO").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.tpro = true;
+        inst.common.rpro = true;
+    }
+
+    // Cycle 1: drive into PACT.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_TPRO", &mut visited, 0)
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("ASYNC_TPRO").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "must enter PACT");
+        assert!(inst.common.tpro, "TPRO must be preserved");
+        assert!(inst.common.rpro, "RPRO must be preserved across PACT entry");
+    }
+
+    // Re-entry while PACT=true: bail with lcnt increment. Diagnostic
+    // is emitted as a side effect (eprintln) but the bail outcome
+    // matches the non-TPRO case (verified by the silent-bail test).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_TPRO", &mut visited, 0)
+        .await
+        .unwrap();
+    let rec = db.get_record("ASYNC_TPRO").await.unwrap();
+    let inst = rec.read().await;
+    assert!(inst.is_processing(), "still PACT after bail");
+    assert_eq!(inst.common.lcnt, 1, "lcnt must have advanced");
+    assert!(
+        inst.common.rpro,
+        "RPRO must remain unchanged by the diagnostic path"
+    );
+}
+
 // After PACT clears via complete_async_record, the next process must
 // reset lcnt to 0 (mirrors C `else { precord->lcnt = 0; }`).
 #[tokio::test]

@@ -130,6 +130,24 @@ impl PvDatabase {
             const MAX_LOCK: i16 = 10;
             let mut instance = rec.write().await;
             if instance.is_processing() {
+                // C `dbAccess.c:539-541` — when TPRO is set on a record
+                // whose PACT is true, print the diagnostic line before
+                // the bail decision. The C path emits:
+                //   "%s: dbProcess of Active '%s' with RPRO=%d"
+                // mirroring the same context format the regular trace
+                // path below uses (thread/client name + record name +
+                // current RPRO bit). Without this, an operator
+                // debugging a stuck async record sees NO sign that the
+                // entry guard is firing — they only notice the
+                // eventual SCAN_ALARM after MAX_LOCK=10 attempts.
+                if instance.common.tpro {
+                    eprintln!(
+                        "[TPRO] {}: dbProcess of Active '{}' with RPRO={}",
+                        instance.name,
+                        instance.name,
+                        if instance.common.rpro { 1 } else { 0 },
+                    );
+                }
                 let stat = instance.common.stat;
                 let already_invalid =
                     instance.common.sevr >= crate::server::record::AlarmSeverity::Invalid;

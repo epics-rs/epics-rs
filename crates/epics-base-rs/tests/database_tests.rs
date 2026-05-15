@@ -2195,6 +2195,93 @@ async fn test_dfanout_value_write() {
     }
 }
 
+/// C `dfanoutRecord.c:115-122` reads VAL from DOL on every process
+/// cycle when `omsl == menuOmslclosed_loop`. The Rust port previously
+/// omitted dfanout from the DOL-eligible record-type list in
+/// `processing.rs::process_record_with_links_inner`, so a dfanout
+/// configured with OMSL=closed_loop never sourced VAL from DOL —
+/// every cycle silently kept the previously-cached VAL.
+#[tokio::test]
+async fn test_dfanout_omsl_closed_loop_sources_val_from_dol() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+
+    let db = PvDatabase::new();
+
+    // Upstream setpoint source.
+    db.add_record("DOL_SRC", Box::new(AoRecord::new(7.5)))
+        .await
+        .unwrap();
+
+    // dfanout with OMSL=closed_loop and DOL=DOL_SRC. SELM=0 (All)
+    // distributes VAL to OUTA + OUTB.
+    let mut dfan = DfanoutRecord::new(0.0);
+    dfan.selm = 0;
+    dfan.outa = "DFAN_DEST_A".to_string();
+    dfan.outb = "DFAN_DEST_B".to_string();
+    dfan.dol = "DOL_SRC".to_string();
+    dfan.omsl = 1; // closed_loop (menuOmslclosed_loop)
+    db.add_record("DFAN_OMSL", Box::new(dfan)).await.unwrap();
+
+    db.add_record("DFAN_DEST_A", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("DFAN_DEST_B", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DFAN_OMSL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // DOL_SRC's VAL (7.5) must have flowed through DOL → dfanout.VAL → OUTA/OUTB.
+    let val_a = db.get_pv("DFAN_DEST_A").await.unwrap();
+    assert!(
+        matches!(val_a, EpicsValue::Double(v) if (v - 7.5).abs() < 1e-10),
+        "DFAN_DEST_A must reflect DOL_SRC (=7.5), got {val_a:?}"
+    );
+    let val_b = db.get_pv("DFAN_DEST_B").await.unwrap();
+    assert!(
+        matches!(val_b, EpicsValue::Double(v) if (v - 7.5).abs() < 1e-10),
+        "DFAN_DEST_B must reflect DOL_SRC (=7.5), got {val_b:?}"
+    );
+}
+
+/// Companion to the OMSL=closed_loop test: with OMSL=supervisory
+/// (default), DOL must NOT be evaluated even if a DOL link is set —
+/// VAL remains under operator control. This pins the gating so a
+/// future refactor cannot silently widen the closed-loop scope.
+#[tokio::test]
+async fn test_dfanout_omsl_supervisory_ignores_dol() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("DOL_SRC2", Box::new(AoRecord::new(99.0)))
+        .await
+        .unwrap();
+
+    let mut dfan = DfanoutRecord::new(3.0);
+    dfan.selm = 0;
+    dfan.outa = "DFAN_DEST_A2".to_string();
+    dfan.dol = "DOL_SRC2".to_string();
+    dfan.omsl = 0; // supervisory (menuOmslsupervisory)
+    db.add_record("DFAN_SUP", Box::new(dfan)).await.unwrap();
+    db.add_record("DFAN_DEST_A2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DFAN_SUP", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let val_a = db.get_pv("DFAN_DEST_A2").await.unwrap();
+    assert!(
+        matches!(val_a, EpicsValue::Double(v) if (v - 3.0).abs() < 1e-10),
+        "OMSL=supervisory must keep the operator-staged VAL (=3.0), got {val_a:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_seq_dol_lnk_dispatch() {
     use epics_base_rs::server::records::seq::SeqRecord;

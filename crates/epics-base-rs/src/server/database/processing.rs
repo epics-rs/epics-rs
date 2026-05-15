@@ -296,10 +296,27 @@ impl PvDatabase {
             let inp = instance.parsed_inp.clone();
             let is_soft = crate::server::device_support::is_soft_dtyp(&instance.common.dtyp);
 
-            // DOL link info for output records with OMSL=CLOSED_LOOP
+            // DOL link info for output records with OMSL=CLOSED_LOOP.
+            //
+            // C parity: every record type whose DBD declares both an
+            // OMSL `menuOmsl` field AND a DOL link field must honour
+            // the closed-loop binding. `dfanoutRecord.c:115-122` shows
+            // dfanout doing this directly via `dbGetLink(&prec->dol,
+            // DBR_DOUBLE, &prec->val, ...)` when `omsl ==
+            // menuOmslclosed_loop`. The Rust port previously omitted
+            // `dfanout`, so a dfanout configured with OMSL=closed_loop
+            // never sourced VAL from DOL — every cycle silently used
+            // the previously-cached VAL, breaking any cascaded
+            // setpoint-distribution chain that relied on dfanout to
+            // re-read the input.
+            //
+            // The `aao` (array analog output) record is the only other
+            // OMSL-bearing C record; the Rust port does not implement
+            // aao (confirmed: no `crates/epics-base-rs/src/server/records/aao*.rs`),
+            // so it is a future gap, not a same-defect-not-fixed site.
             let dol = match rtype {
                 "ao" | "longout" | "int64out" | "bo" | "mbbo" | "mbboDirect" | "stringout"
-                | "lso" => {
+                | "lso" | "dfanout" => {
                     let omsl = instance
                         .record
                         .get_field("OMSL")

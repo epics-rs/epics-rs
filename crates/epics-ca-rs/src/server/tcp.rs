@@ -1271,6 +1271,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .position(|&b| b == 0)
                 .unwrap_or(payload.len());
             if end >= 512 {
+                // C `host_name_action` (camessage.c:825-836): a name
+                // longer than 511 bytes is a protocol violation —
+                // send_err + return RSRV_ERROR (disconnect). The
+                // post-claim freeze branch above returns RSRV_OK
+                // (recoverable misuse), but the size cap is a
+                // wire-malformation reject.
                 send_ca_error(
                     writer,
                     hdr,
@@ -1279,7 +1285,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     "bad (very long) host name",
                 )
                 .await?;
-                return Ok(());
+                return Err(epics_base_rs::error::CaError::Protocol(
+                    "HOST_NAME exceeds 511-byte cap (matches C host_name_action RSRV_ERROR)".into(),
+                ));
             }
 
             // EPICS_CAS_USE_HOST_NAMES (default NO) controls whether we
@@ -1340,6 +1348,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .position(|&b| b == 0)
                 .unwrap_or(payload.len());
             if end >= 512 {
+                // C `client_name_action` (camessage.c:912-923): same
+                // 511-byte cap as host_name; send_err + RSRV_ERROR
+                // (disconnect). Post-claim freeze branch returns
+                // RSRV_OK; size cap returns RSRV_ERROR.
                 send_ca_error(
                     writer,
                     hdr,
@@ -1348,7 +1360,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     "a very long user name was specified",
                 )
                 .await?;
-                return Ok(());
+                return Err(epics_base_rs::error::CaError::Protocol(
+                    "CLIENT_NAME exceeds 511-byte cap (matches C client_name_action RSRV_ERROR)"
+                        .into(),
+                ));
             }
             let raw = String::from_utf8_lossy(&payload[..end]).to_string();
             // When a capability-token verifier is configured AND the

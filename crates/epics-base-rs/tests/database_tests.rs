@@ -2030,6 +2030,93 @@ async fn test_notify_field_respects_mask() {
     assert!(alarm_rx.try_recv().is_err());
 }
 
+/// C `dbAccess.c:575-577` clears `precord->rpro = FALSE; precord->putf =
+/// FALSE` and arms `callNotifyCompletion = TRUE` BEFORE the alarm
+/// check whenever SDIS evaluates to DISV. Pre-fix Round 4 Rust only
+/// reset nsta/nsev and updated the alarm — rpro/putf leaked into the
+/// next cycle and pending dbNotify completion callbacks stalled.
+#[tokio::test]
+async fn test_sdis_disable_clears_rpro_and_putf() {
+    let db = PvDatabase::new();
+    db.add_record("DIS_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("DIS_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("DIS_TGT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("SDIS", EpicsValue::String("DIS_SW".into()))
+            .unwrap();
+        // Pre-set rpro=true, putf=true so the disable path's clear is
+        // observable.
+        inst.common.rpro = true;
+        inst.common.putf = true;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DIS_TGT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("DIS_TGT").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        !inst.common.rpro,
+        "SDIS disable must clear rpro (C dbAccess.c:575). Pre-fix this leaked."
+    );
+    assert!(
+        !inst.common.putf,
+        "SDIS disable must clear putf (C dbAccess.c:576). Pre-fix this leaked."
+    );
+}
+
+/// C `dbAccess.c:622-623` runs `dbNotifyCompletion(precord)` at
+/// `all_done` for the disable bail path because `callNotifyCompletion
+/// = TRUE` was set at line 577. A CA WRITE_NOTIFY landing on a
+/// disabled record must release its caller. Pre-fix Round 4 the
+/// put_notify_tx was never fired, stranding the call until socket
+/// disconnect.
+#[tokio::test]
+async fn test_sdis_disable_fires_put_notify_completion() {
+    let db = PvDatabase::new();
+    db.add_record("DIS_NOT_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("DIS_NOT_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("DIS_NOT_TGT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("SDIS", EpicsValue::String("DIS_NOT_SW".into()))
+            .unwrap();
+    }
+
+    // Arm put_notify_tx on the disabled target. The disable path must
+    // take it (consume tx) and send completion, releasing the rx.
+    let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
+    {
+        let rec = db.get_record("DIS_NOT_TGT").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_notify_tx = Some(tx);
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DIS_NOT_TGT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // rx should be ready — completion was sent via the disable bail.
+    rx.await
+        .expect("disable bail must fire put_notify_tx (C dbAccess.c:622)");
+    // tx must be taken (not left dangling for the next cycle).
+    let rec = db.get_record("DIS_NOT_TGT").await.unwrap();
+    assert!(
+        rec.read().await.put_notify_tx.is_none(),
+        "put_notify_tx must be cleared after firing"
+    );
+}
+
 #[tokio::test]
 async fn test_sdis_disable_notifies_alarm() {
     let db = PvDatabase::new();

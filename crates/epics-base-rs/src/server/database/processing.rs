@@ -205,7 +205,19 @@ impl PvDatabase {
             instance.common.lcnt = 0;
         }
 
-        // 0. SDIS disable check
+        // 0. SDIS disable check — C parity dbAccess.c:562-592.
+        //
+        // When the SDIS link evaluates to a value equal to DISV, the
+        // record is disabled and bails before record support runs. C
+        // ALWAYS clears rpro/putf and triggers dbNotifyCompletion at
+        // this point — regardless of whether the alarm transition
+        // fires — because a disabled record must not leave behind
+        // pending reprocess requests or stranded put_notify completion
+        // callbacks. Pre-fix Round 4 the Rust port only reset
+        // nsta/nsev and updated the alarm state, leaking rpro/putf
+        // into the next cycle and stalling CA WRITE_NOTIFY callers
+        // (the put_notify_tx never fired so the CA dispatcher waited
+        // until socket disconnect to release the operation).
         {
             let (sdis_link, disv, diss) = {
                 let instance = rec.read().await;
@@ -231,32 +243,68 @@ impl PvDatabase {
 
             let disa = rec.read().await.common.disa;
             if disa == disv {
-                let mut instance = rec.write().await;
-                // Reset nsta/nsev to prevent stale alarm from bleeding into next cycle
-                instance.common.nsta = 0;
-                instance.common.nsev = crate::server::record::AlarmSeverity::NoAlarm;
-                let prev_sevr = instance.common.sevr;
-                let prev_stat = instance.common.stat;
-                instance.common.sevr = diss;
-                instance.common.stat = crate::server::recgbl::alarm_status::DISABLE_ALARM;
-                if instance.common.sevr != prev_sevr || instance.common.stat != prev_stat {
-                    let mut changed_fields = Vec::new();
-                    changed_fields.push((
-                        "SEVR".to_string(),
-                        EpicsValue::Short(instance.common.sevr as i16),
-                    ));
-                    changed_fields.push((
-                        "STAT".to_string(),
-                        EpicsValue::Short(instance.common.stat as i16),
-                    ));
-                    if let Some(val) = instance.record.val() {
-                        changed_fields.push(("VAL".to_string(), val));
+                let put_notify_tx = {
+                    let mut instance = rec.write().await;
+                    // C `dbAccess.c:575-577` — clear rpro/putf and arm
+                    // notifyCompletion BEFORE the alarm check. Disabled
+                    // records skip processing entirely, so any pending
+                    // reprocess request is dropped (the next non-
+                    // disabled cycle will pick up fresh state) and the
+                    // CA put_notify caller must be released.
+                    instance.common.rpro = false;
+                    instance.common.putf = false;
+                    let tx = instance.put_notify_tx.take();
+
+                    // Reset nsta/nsev so stale alarm state doesn't bleed
+                    // into a subsequent (re-enabled) cycle. C resets
+                    // them after the sevr/stat transition; doing it
+                    // first here is observationally identical because
+                    // the SDIS bail short-circuits any record-support
+                    // path that could read them.
+                    instance.common.nsta = 0;
+                    instance.common.nsev = crate::server::record::AlarmSeverity::NoAlarm;
+
+                    // C `dbAccess.c:580-581` — if already in
+                    // DISABLE_ALARM, the alarm post is skipped entirely
+                    // (the alarm cycle is debounced). The rpro/putf
+                    // clear above still ran, matching C's pre-`goto
+                    // all_done` ordering.
+                    if instance.common.stat != crate::server::recgbl::alarm_status::DISABLE_ALARM {
+                        instance.common.sevr = diss;
+                        instance.common.stat = crate::server::recgbl::alarm_status::DISABLE_ALARM;
+                        // Post STAT/SEVR with DBE_VALUE only, then VAL
+                        // with DBE_VALUE|DBE_ALARM — match the C order
+                        // `db_post_events(&stat, DBE_VALUE);
+                        // db_post_events(&sevr, DBE_VALUE);
+                        // db_post_events(&val, DBE_VALUE|DBE_ALARM)`.
+                        let mut changed_fields = Vec::new();
+                        changed_fields.push((
+                            "STAT".to_string(),
+                            EpicsValue::Short(instance.common.stat as i16),
+                        ));
+                        changed_fields.push((
+                            "SEVR".to_string(),
+                            EpicsValue::Short(instance.common.sevr as i16),
+                        ));
+                        if let Some(val) = instance.record.val() {
+                            changed_fields.push(("VAL".to_string(), val));
+                        }
+                        let snapshot = crate::server::record::ProcessSnapshot {
+                            changed_fields,
+                            event_mask: crate::server::recgbl::EventMask::VALUE
+                                | crate::server::recgbl::EventMask::ALARM,
+                        };
+                        instance.notify_from_snapshot(&snapshot);
                     }
-                    let snapshot = crate::server::record::ProcessSnapshot {
-                        changed_fields,
-                        event_mask: crate::server::recgbl::EventMask::ALARM,
-                    };
-                    instance.notify_from_snapshot(&snapshot);
+                    tx
+                };
+                // Fire dbNotifyCompletion outside the record lock —
+                // C `dbAccess.c:622-623` runs it at `all_done` after
+                // the disable bail. Without this, a CA WRITE_NOTIFY
+                // landing on a disabled record stalls until socket
+                // disconnect.
+                if let Some(tx) = put_notify_tx {
+                    let _ = tx.send(());
                 }
                 return Ok(());
             }

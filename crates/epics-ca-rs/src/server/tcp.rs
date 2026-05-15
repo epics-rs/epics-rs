@@ -2500,6 +2500,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     "EVENT_CANCEL for unknown sub-id; replying ECA_BADMONID"
                 );
                 send_ca_error(writer, hdr, ECA_BADMONID, chan_cid, &diag).await?;
+                // C `event_cancel_reply` (camessage.c:2016-2021):
+                // after `send_err(ECA_BADMONID)`, return RSRV_ERROR
+                // which tears the connection down. Pre-fix Rust kept
+                // the connection; a peer racing CLEAR_CHANNEL against
+                // EVENT_CANCEL on the same sub-id could spam the
+                // server with stale cancels indefinitely.
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "EVENT_CANCEL for unknown sub-id {} \
+                     (matches C event_cancel_reply ECA_BADMONID + RSRV_ERROR)",
+                    sub_id
+                )));
             }
         }
 

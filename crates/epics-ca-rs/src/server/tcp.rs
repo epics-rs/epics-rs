@@ -1839,6 +1839,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let write_type = match DbFieldType::from_u16(hdr.data_type) {
                 Ok(t) => t,
                 Err(_) => {
+                    // C `write_notify_action` (camessage.c:1647-1651) and
+                    // `write_action` (camessage.c:753-766) both treat
+                    // unsupported data types as a protocol violation:
+                    // emit the appropriate error reply, then return
+                    // RSRV_ERROR which tears the connection down. The
+                    // C source classifies this as "client doesn't
+                    // recover" — a peer sending an unsupported DBR
+                    // either has a corrupted dispatcher or is probing
+                    // for protocol weaknesses; either way the right
+                    // response is to drop.
                     if is_notify {
                         send_cmd_error(
                             writer,
@@ -1848,8 +1858,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             ioid,
                         )
                         .await?;
+                    } else {
+                        send_ca_error(writer, hdr, ECA_BADTYPE, hdr.cid, "bad data type").await?;
                     }
-                    return Ok(());
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "WRITE with unsupported DBR type {} (matches C write_action RSRV_ERROR)",
+                        hdr.data_type
+                    )));
                 }
             };
 
@@ -1915,6 +1930,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let new_value = match EpicsValue::from_bytes_array(write_type, payload, count) {
                 Ok(v) => v,
                 Err(_) => {
+                    // Same C parity rule as the data_type gate above:
+                    // bad payload bytes (wrong length, malformed wire
+                    // bytes) is a protocol violation → emit error +
+                    // drop the connection. C `caNetConvert` failure
+                    // in `write_action` returns RSRV_ERROR.
                     if is_notify {
                         send_cmd_error(
                             writer,
@@ -1924,8 +1944,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             ioid,
                         )
                         .await?;
+                    } else {
+                        send_ca_error(writer, hdr, ECA_BADTYPE, hdr.cid, "bad WRITE payload bytes")
+                            .await?;
                     }
-                    return Ok(());
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "WRITE payload conversion failed for type {} count {} (matches C caNetConvert RSRV_ERROR)",
+                        hdr.data_type, count
+                    )));
                 }
             };
 

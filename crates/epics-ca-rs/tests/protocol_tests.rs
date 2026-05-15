@@ -1151,3 +1151,133 @@ async fn server_tcp_version_below_minimum_drops_connection() {
          (C tcp_version_action parity); instead read {n} bytes"
     );
 }
+
+/// C `write_notify_action` (`rsrv/camessage.c:1647-1651`) emits a
+/// CA_PROTO_WRITE_NOTIFY error reply (`putNotifyErrorReply` with
+/// `m_cid = ECA_BADTYPE`) when the WRITE_NOTIFY data type exceeds
+/// `LAST_BUFFER_TYPE` (= DBR_CLASS_NAME = 38), then returns
+/// `RSRV_ERROR` which tears the connection down. Pre-fix Rust sent
+/// the error reply but kept the connection open, letting a peer
+/// flood the server with bad-type WRITE_NOTIFYs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_write_notify_bad_type_replies_error_and_disconnects() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("WRBAD:PV", EpicsValue::Double(0.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // VERSION handshake
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut hello = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+        .await
+        .expect("VERSION reply timed out")
+        .expect("read VERSION");
+
+    // CLIENT_NAME + HOST_NAME (required before CREATE_CHAN)
+    for (cmd, name) in [
+        (CA_PROTO_CLIENT_NAME, "testuser\0"),
+        (CA_PROTO_HOST_NAME, "testhost\0"),
+    ] {
+        let mut h = CaHeader::new(cmd);
+        let mut body = name.as_bytes().to_vec();
+        while body.len() % 8 != 0 {
+            body.push(0);
+        }
+        h.set_payload_size(body.len(), 0);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&h.to_bytes());
+        frame.extend_from_slice(&body);
+        sock.write_all(&frame).await.unwrap();
+    }
+
+    // CREATE_CHAN on WRBAD:PV to get a valid SID
+    let mut create = CaHeader::new(CA_PROTO_CREATE_CHAN);
+    create.cid = 0xCAFEBABE;
+    let pv_name = b"WRBAD:PV\0";
+    let mut create_body = pv_name.to_vec();
+    while create_body.len() % 8 != 0 {
+        create_body.push(0);
+    }
+    create.set_payload_size(create_body.len(), 0);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&create.to_bytes());
+    frame.extend_from_slice(&create_body);
+    sock.write_all(&frame).await.unwrap();
+
+    // Drain ACCESS_RIGHTS + CREATE_CHAN reply (read up to 64 bytes)
+    let mut buf = [0u8; 128];
+    let _ = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await;
+    // Find the CREATE_CHAN reply to extract SID. ACCESS_RIGHTS comes
+    // first (16 bytes); CREATE_CHAN reply follows. Parse second header.
+    let create_resp = CaHeader::from_bytes(&buf[16..32]).expect("parse CREATE_CHAN");
+    assert_eq!(create_resp.cmmd, CA_PROTO_CREATE_CHAN);
+    let sid = create_resp.available;
+
+    // Send WRITE_NOTIFY with data_type = 100 (well past
+    // LAST_BUFFER_TYPE = 38). Payload size 0; C rejects on type
+    // alone before reading payload.
+    let mut bad = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+    bad.data_type = 100;
+    bad.count = 1;
+    bad.cid = sid;
+    bad.available = 0xDEAD_BEEF; // ioid
+    sock.write_all(&bad.to_bytes()).await.unwrap();
+
+    // Expect CA_PROTO_WRITE_NOTIFY error reply with cid = ECA_BADTYPE.
+    let mut resp = [0u8; 64];
+    let mut total = 0;
+    while total < 16 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+            .await
+            .expect("error reply timed out")
+            .expect("read error reply");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(total >= 16, "expected error reply, got {total} bytes");
+    let err_hdr = CaHeader::from_bytes(&resp[..16]).expect("parse error reply");
+    assert_eq!(err_hdr.cmmd, CA_PROTO_WRITE_NOTIFY);
+    assert_eq!(
+        err_hdr.cid, ECA_BADTYPE,
+        "cid carries ECA status per putNotifyErrorReply convention"
+    );
+    assert_eq!(err_hdr.available, 0xDEAD_BEEF, "ioid echoed");
+
+    // Server must disconnect after the error reply.
+    let mut tail = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
+        .await
+        .expect("server did not close after WRITE_NOTIFY bad type")
+        .expect("read after error");
+    assert_eq!(
+        n, 0,
+        "server must drop the connection after WRITE_NOTIFY bad type \
+         (C write_notify_action RSRV_ERROR parity); got {n} more bytes"
+    );
+}

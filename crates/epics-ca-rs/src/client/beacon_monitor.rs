@@ -303,10 +303,27 @@ async fn run_beacon_monitor_inner(
                 if let Some(ref v) = verifier {
                     let frame = &buf[frame_start..frame_start + frame_len];
                     // G3: bind the signed payload's announced server_ip
-                    // to the UDP source IP. A recorded valid companion
-                    // can otherwise be replayed from anywhere; combined
-                    // with the unbounded verified_tuples map below this
-                    // is a poison amplifier.
+                    // to the UDP source IP — but only when the datagram
+                    // didn't transit a repeater. The CA repeater
+                    // (`repeater.cpp:626-630`, our `repeater.rs:224-228`)
+                    // forwards the companion verbatim while the kernel
+                    // rewrites the L3 source to the repeater's local
+                    // socket address (typically 127.0.0.1). Under the
+                    // standard production topology the client beacon
+                    // socket is bound to LOCALHOST (line 160) and ONLY
+                    // receives via the repeater, so `meta.src` is
+                    // always loopback and a strict G3 binding would
+                    // reject every legitimate companion.
+                    //
+                    // Replay protection without G3 here rests on (a)
+                    // the cryptographic signature over (server_ip,
+                    // server_port, beacon_id, ts) — an attacker can't
+                    // mint a fresh tuple without the signing key —
+                    // and (b) the `ts` freshness window enforced in
+                    // SignedBeaconVerifier::verify. G3 still fires
+                    // when a non-loopback path is observed (e.g. a
+                    // future direct-LAN deployment without a
+                    // repeater).
                     let src_ip = match meta.src.ip() {
                         std::net::IpAddr::V4(v) => v,
                         std::net::IpAddr::V6(_) => {
@@ -315,8 +332,11 @@ async fn run_beacon_monitor_inner(
                             continue;
                         }
                     };
+                    let via_repeater = src_ip.is_loopback();
                     match v.verify(frame) {
-                        Ok((ip, port, beacon_id)) if Ipv4Addr::from(ip) != src_ip => {
+                        Ok((ip, port, beacon_id))
+                            if !via_repeater && Ipv4Addr::from(ip) != src_ip =>
+                        {
                             tracing::debug!(
                                 announced = %Ipv4Addr::from(ip),
                                 actual = %src_ip,
@@ -373,21 +393,46 @@ async fn run_beacon_monitor_inner(
                 let max_age = std::time::Duration::from_secs(v.max_age_secs.max(1));
                 let now = std::time::Instant::now();
                 verified_tuples.retain(|_, t| now.duration_since(*t) <= max_age);
-                // Round 7: the regular beacon emits `m_available=0`
-                // (INADDR_ANY) by C convention (`online_notify.c:69`
-                // / `server/beacon.rs::run_beacon_emitter`), so keying
-                // the verified-tuple lookup off `hdr.available` would
-                // never hit — the companion side (line 341) inserts
-                // with the signed payload's `server_ip`, which by the
-                // G3 check is the UDP source IP. Use the actual
-                // datagram source IP here so the keys line up; this is
-                // also what authenticates "the regular beacon came
-                // from the same peer as a verified companion".
-                let src_ip_u32 = match meta.src.ip() {
-                    std::net::IpAddr::V4(v) => u32::from_be_bytes(v.octets()),
-                    std::net::IpAddr::V6(_) => 0,
+                // Round 8: anchor the lookup on `hdr.available` so the
+                // key matches the companion-side insert under the
+                // standard production topology (client receives via
+                // the CA repeater on LOCALHOST). The CA server emits
+                // `m_available = 0` per C `online_notify.c:69`, and
+                // the repeater rewrites the field to the original
+                // server's source IP before forwarding (C
+                // `repeater.cpp:626-630`; our `repeater.rs:224-228`).
+                // The companion datagram carries `server_ip` in its
+                // signed payload (`signed_beacon.rs::build_packet`
+                // bytes 12..16), which `verify()` returns as the same
+                // BE-bytes-as-u32 coordinate. The two coordinates now
+                // line up regardless of whether the matching beacon
+                // arrives directly or via a repeater.
+                //
+                // Round 7's `meta.src.ip()` keying was correct in
+                // synthetic direct-LAN tests but broke production: a
+                // loopback-bound monitor socket only ever sees
+                // `meta.src = 127.0.0.1:<repeater_port>` from the
+                // repeater, so the lookup key was always
+                // `(127.0.0.1, port, beacon_id)` while the insert key
+                // was `(real_server_ip, port, beacon_id)` — every
+                // legitimate signed beacon was rejected with
+                // `EPICS_CA_BEACON_REQUIRE_SIGNED=YES`. See
+                // `verified_tuple_key_matches_via_repeater` for the
+                // regression case.
+                //
+                // Fall back to `meta.src.ip()` when `hdr.available` is
+                // zero (e.g. a malformed or non-rewritten beacon).
+                // That key won't hit under the loopback topology, but
+                // it lets the direct-LAN path keep working.
+                let lookup_ip_u32 = if hdr.available != 0 {
+                    hdr.available
+                } else {
+                    match meta.src.ip() {
+                        std::net::IpAddr::V4(v) => u32::from_be_bytes(v.octets()),
+                        std::net::IpAddr::V6(_) => 0,
+                    }
                 };
-                let key = (src_ip_u32, hdr.count, hdr.cid);
+                let key = (lookup_ip_u32, hdr.count, hdr.cid);
                 if !verified_tuples.contains_key(&key) {
                     metrics::counter!("ca_client_unsigned_beacon_drops_total").increment(1);
                     if require_signed {
@@ -1729,23 +1774,30 @@ mod tests {
         assert_eq!(s.count, 50);
     }
 
-    /// Round 7 regression: the verified-tuple lookup key (post-fix:
-    /// `(src_ip, hdr.count, hdr.cid)`) must match the companion-side
-    /// insert key (`(signed_ip, signed_port, signed_beacon_id)`)
-    /// after the G3 source-IP-binding check (`signed_ip == src_ip`).
+    /// Round 8 regression: under the standard production topology the
+    /// client receives beacons via the CA repeater on LOCALHOST (see
+    /// `run_beacon_monitor_inner` bind at line 160). The repeater
+    /// rewrites `m_available` on the regular `CA_PROTO_RSRV_IS_UP`
+    /// beacon to the original sender's source IP (`repeater.cpp:
+    /// 626-630`, our `repeater.rs:224-228`); the 0xCAFE companion is
+    /// forwarded verbatim and the kernel rewrites the L3 source IP
+    /// to the repeater's loopback. The verified-tuple lookup key
+    /// (post-fix: `(hdr.available, hdr.count, hdr.cid)`) therefore
+    /// matches the companion-side insert key
+    /// (`(signed_ip, signed_port, signed_beacon_id)`) without needing
+    /// the L3 source IP to equal the announced server IP.
     ///
-    /// Before the fix the lookup keyed off `hdr.available`, which the
-    /// server emits as 0 (INADDR_ANY) per C `online_notify.c:69` —
-    /// so the key was always `(0, port, beacon_id)` while the insert
-    /// was `(real_ip, port, beacon_id)`, and **every** legitimate
-    /// signed beacon was rejected.
+    /// Round 7 used `meta.src.ip()` for the lookup, which produced
+    /// `127.0.0.1` under this topology — every legitimate signed
+    /// beacon was dropped (`EPICS_CA_BEACON_REQUIRE_SIGNED=YES`,
+    /// default). This test fixes the failure mode in place.
     #[cfg(feature = "cap-tokens")]
     #[test]
-    fn verified_tuple_key_matches_with_source_ip_binding() {
+    fn verified_tuple_key_matches_via_repeater() {
         use crate::server::signed_beacon::{SignedBeaconEmitter, SignedBeaconVerifier};
         use ed25519_dalek::SigningKey;
         use rand_core::OsRng;
-        use std::net::{IpAddr, Ipv4Addr};
+        use std::net::Ipv4Addr;
         use std::time::SystemTime;
 
         // Build a signed-beacon companion as the server would emit.
@@ -1769,53 +1821,125 @@ mod tests {
         let emitter = SignedBeaconEmitter::new(signing_key.clone(), socket, vec![]);
         let packet = emitter.build_packet(server_ip_u32, server_port, beacon_id, ts);
 
-        // Verifier path (server-companion side).
+        // Verifier path (companion side).
         let mut verifier = SignedBeaconVerifier::new();
         verifier.trust(signing_key.verifying_key());
         let (verified_ip, verified_port, verified_bid) =
             verifier.verify(&packet).expect("signature verifies");
 
-        // Simulate the G3 source-IP-binding check that gates the
-        // verified_tuples insert. In production this is the actual UDP
-        // datagram source IP; here it must equal the announced
-        // `verified_ip`.
-        let src_ip = IpAddr::V4(Ipv4Addr::from(server_ip_u32));
-        let src_ip_u32 = match src_ip {
-            IpAddr::V4(v) => u32::from_be_bytes(v.octets()),
-            IpAddr::V6(_) => panic!("ipv6 in test"),
-        };
-        assert_eq!(
-            Ipv4Addr::from(verified_ip),
-            Ipv4Addr::from(server_ip_u32),
-            "G3 binding precondition: signed payload IP equals UDP source IP"
+        // G3 source-IP binding: in the repeater topology meta.src is
+        // 127.0.0.1, so the binding is intentionally relaxed. The
+        // companion-frame insert proceeds because `via_repeater =
+        // src_ip.is_loopback()` short-circuits the strict equality
+        // check at line 319.
+        let meta_src_via_repeater = Ipv4Addr::LOCALHOST;
+        assert!(
+            meta_src_via_repeater.is_loopback(),
+            "topology precondition: client beacon socket binds to LOCALHOST"
         );
 
-        // Insert as the companion path does.
+        // Insert as the companion path does — under the verifier
+        // policy, the insert uses the SIGNED payload's announced ip.
         let mut verified_tuples: HashMap<(u32, u16, u32), Instant> = HashMap::new();
         verified_tuples.insert((verified_ip, verified_port, verified_bid), Instant::now());
 
-        // Lookup as the regular-beacon path does (post-Round-7 fix:
-        // keyed by UDP source IP). The regular CA beacon has
-        // `hdr.available = 0` so the key is built from `meta.src` not
-        // `hdr.available`.
+        // Lookup as the regular-beacon path does (post-Round-8 fix:
+        // keyed by `hdr.available`, which the repeater rewrites to
+        // the real server IP — equal to `verified_ip` here).
         let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
-        hdr.data_type = 0; // CA_MINOR_VERSION irrelevant to lookup
+        hdr.data_type = 0;
         hdr.count = server_port;
         hdr.cid = beacon_id;
-        hdr.available = 0; // INADDR_ANY — the server's C-parity convention
+        // Repeater rewrite: hdr.available = original server's source IP.
+        hdr.available = server_ip_u32;
 
-        let key = (src_ip_u32, hdr.count, hdr.cid);
+        let lookup_ip_u32 = if hdr.available != 0 {
+            hdr.available
+        } else {
+            u32::from_be_bytes(meta_src_via_repeater.octets())
+        };
+        let key = (lookup_ip_u32, hdr.count, hdr.cid);
         assert!(
             verified_tuples.contains_key(&key),
-            "regression: regular beacon with hdr.available=0 must still hit \
-             the verified_tuple entry inserted by the signed companion"
+            "regression: regular beacon with hdr.available rewritten by \
+             the repeater must hit the companion-inserted tuple"
         );
 
-        // Sanity: the pre-fix key (hdr.available, count, cid) would have missed.
-        let pre_fix_key = (hdr.available, hdr.count, hdr.cid);
+        // Sanity: the Round-7 key shape (meta.src.ip(), count, cid)
+        // would have missed under the repeater topology.
+        let r7_key = (
+            u32::from_be_bytes(meta_src_via_repeater.octets()),
+            hdr.count,
+            hdr.cid,
+        );
         assert!(
-            !verified_tuples.contains_key(&pre_fix_key),
-            "pre-fix key shape no longer used: documents the failure mode"
+            !verified_tuples.contains_key(&r7_key),
+            "documents Round-7 failure mode: meta.src=127.0.0.1 key never matches"
+        );
+    }
+
+    /// Direct-LAN fallback: when no repeater rewrites
+    /// `hdr.available`, the lookup falls back to `meta.src.ip()` so
+    /// the key still aligns with the companion-side insert. This is
+    /// the original Round-7 scenario, preserved for the case where
+    /// a future caller binds the monitor socket to a non-loopback
+    /// NIC.
+    #[cfg(feature = "cap-tokens")]
+    #[test]
+    fn verified_tuple_key_falls_back_to_src_for_direct_lan() {
+        use crate::server::signed_beacon::{SignedBeaconEmitter, SignedBeaconVerifier};
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        use std::net::Ipv4Addr;
+        use std::time::SystemTime;
+
+        let mut csprng = OsRng;
+        let signing_key = SigningKey::generate(&mut csprng);
+        let socket = std::sync::Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap() }),
+        );
+
+        let server_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let server_ip_u32 = u32::from_be_bytes(server_ip.octets());
+        let server_port: u16 = 5064;
+        let beacon_id: u32 = 99;
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let emitter = SignedBeaconEmitter::new(signing_key.clone(), socket, vec![]);
+        let packet = emitter.build_packet(server_ip_u32, server_port, beacon_id, ts);
+        let mut verifier = SignedBeaconVerifier::new();
+        verifier.trust(signing_key.verifying_key());
+        let (verified_ip, verified_port, verified_bid) =
+            verifier.verify(&packet).expect("signature verifies");
+
+        let mut verified_tuples: HashMap<(u32, u16, u32), Instant> = HashMap::new();
+        verified_tuples.insert((verified_ip, verified_port, verified_bid), Instant::now());
+
+        // Direct-LAN: server emits hdr.available=0, no repeater
+        // rewrites it. meta.src.ip() is the real server IP.
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.data_type = 0;
+        hdr.count = server_port;
+        hdr.cid = beacon_id;
+        hdr.available = 0;
+        let meta_src = server_ip;
+
+        let lookup_ip_u32 = if hdr.available != 0 {
+            hdr.available
+        } else {
+            u32::from_be_bytes(meta_src.octets())
+        };
+        let key = (lookup_ip_u32, hdr.count, hdr.cid);
+        assert!(
+            verified_tuples.contains_key(&key),
+            "direct-LAN fallback: meta.src.ip() lookup must hit when \
+             hdr.available is zero"
         );
     }
 }

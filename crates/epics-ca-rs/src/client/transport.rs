@@ -1153,15 +1153,31 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     let _ = event_tx.send(TransportEvent::ChannelCreateFailed { cid: hdr.cid });
                 }
                 CA_PROTO_ERROR => {
-                    // CA_PROTO_ERROR wire layout (server send_ca_error):
-                    //   resp.cid = ECA status code (caerr.h)
-                    //   payload  = original 16-byte header copy + msg
-                    // hdr is the response header — hdr.cid carries the
-                    // ECA status. The first u16 of the payload is the
-                    // original request's CMD byte (READ_NOTIFY etc.),
-                    // useful as diagnostic context but distinct from
-                    // the ECA code.
-                    let eca_status = hdr.cid;
+                    // CA_PROTO_ERROR wire layout per C `vsend_err`
+                    // (`rsrv/camessage.c:139-224`):
+                    //   resp.m_cid       = channel cid (or
+                    //                      0xFFFFFFFF for non-channel-
+                    //                      scoped commands like SEARCH
+                    //                      or unknown-cmd reject)
+                    //   resp.m_available = ECA status code (caerr.h)
+                    //   payload          = original 16-byte header copy
+                    //                      + NUL-terminated diag msg
+                    //
+                    // libca `cac::exceptionRespAction`
+                    // (`modules/ca/src/client/cac.cpp:1118`) passes
+                    // `hdr.m_available` as the status to the per-cmd
+                    // exception stub — `m_available` is authoritative.
+                    //
+                    // Round-2 21240ad fixed the same field-swap on the
+                    // Rust SERVER side; this round closes it on the
+                    // Rust CLIENT side. Pre-fix Rust read `hdr.cid` as
+                    // the ECA status, so a CA_PROTO_ERROR from a C IOC
+                    // surfaced the channel cid as the user-facing
+                    // `CaException.status` — the actual ECA code (and
+                    // therefore the entire exception-callback contract)
+                    // was wrong. Symptom: clients can't distinguish
+                    // ECA_BADTYPE from ECA_NORDACCESS etc.
+                    let eca_status = hdr.available;
                     let orig_cmd = if actual_post >= 16 {
                         let orig_hdr_bytes = &accumulated[data_start..data_start + 16];
                         Some(u16::from_be_bytes([orig_hdr_bytes[0], orig_hdr_bytes[1]]))

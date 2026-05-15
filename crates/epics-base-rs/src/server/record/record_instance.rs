@@ -1638,11 +1638,6 @@ impl RecordInstance {
         })
     }
 
-    /// Check deadband (MDEL/ADEL) for VAL monitor/archive filtering.
-    /// Returns (monitor_trigger, archive_trigger).
-    /// Updates ALST/MLST in the record when triggered.
-    /// For records without MDEL/ADEL fields (e.g. motor), defaults to MDEL=0
-    /// (trigger on any actual change) and uses CommonFields.mlst/alst as fallback.
     /// Put a f64 value into a record field, coercing to the field's native type.
     pub(crate) fn put_coerced(&mut self, field: &str, val: f64) {
         use crate::types::EpicsValue;
@@ -1655,6 +1650,34 @@ impl RecordInstance {
         let _ = self.record.put_field(field, coerced);
     }
 
+    /// Check MDEL/ADEL deadbands for VAL monitor/archive filtering.
+    /// Returns `(monitor_trigger, archive_trigger)`.
+    ///
+    /// Updates `MLST`/`ALST` (record-owned) and the `CommonFields`
+    /// `mlst/alst` shadow when a trigger fires. Records without
+    /// MDEL/ADEL (e.g. motor) default to deadband=0 (any actual
+    /// change triggers).
+    ///
+    /// Delegates per-axis deadband comparison to the free function
+    /// [`check_deadband`] below — see that function's docstring for
+    /// the four-quadrant NaN/infinity rule mirroring C
+    /// `recGblCheckDeadband` (recGbl.c:345-370).
+    ///
+    /// **C-parity design note**: the Rust port uses `NaN` as the
+    /// "never posted" sentinel for `MLST`/`ALST`. C achieves the
+    /// same first-publish guarantee by allocating MLST/ALST in
+    /// BSS-zeroed storage with a value of 0.0 that the C code is
+    /// allowed to match against — but the first observed value is
+    /// not necessarily 0.0, and the C rule "MLST==0 means never
+    /// posted" relies on the deadband comparison `abs(val - 0.0)`
+    /// firing on any non-zero first value. NaN is strictly more
+    /// correct for the Rust port because a legitimate first
+    /// `val=0.0` still fires on `NaN.is_nan() → true`. This
+    /// sentinel-as-design is intentional, documented inside
+    /// [`check_deadband`] (the `oldval.is_nan() → return true` short
+    /// circuit). It is NOT a deviation inherited from a Round-1/2
+    /// silent compromise — `record_tests.rs::deadband_*` pins both
+    /// the NaN-sentinel behaviour and the C four-quadrant transitions.
     pub fn check_deadband_ext(&mut self) -> (bool, bool) {
         let val = match self.record.val().and_then(|v| v.to_f64()) {
             Some(v) => v,

@@ -396,6 +396,56 @@ async fn test_putf_survives_async_round_trip_and_clears_on_completion() {
     }
 }
 
+/// C `dbAccess.c::dbPut:1410-1411` clears `precord->udf = FALSE`
+/// synchronously when the put target is the record-type's primary
+/// value field (`dbIsValueField`). The clear runs INSIDE dbPut —
+/// BEFORE dbProcess. Pre-fix the Rust port deferred UDF clearing
+/// to the process-cycle's own `if instance.record.clears_udf()`
+/// branch (processing.rs:839). The processing path drops the put's
+/// write lock and re-acquires inside `process_record_with_links`,
+/// so a second reader between the put and the process could
+/// observe `(VAL=new, udf=true)` — a C-illegal pair. For async
+/// records the window spans the entire device round trip until
+/// `complete_async_record` runs its own clear. This test pins the
+/// C-parity invariant: post-put, pre-process, UDF must already be
+/// false on a primary-field write.
+#[tokio::test]
+async fn test_put_record_field_from_ca_clears_udf_on_primary_field_write() {
+    let db = PvDatabase::new();
+    db.add_record("UDF_ASYNC", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Record starts with udf=true (default).
+    {
+        let rec = db.get_record("UDF_ASYNC").await.unwrap();
+        assert!(
+            rec.read().await.common.udf,
+            "AsyncRecord starts undefined (udf=true)"
+        );
+    }
+
+    let _ = db
+        .put_record_field_from_ca("UDF_ASYNC", "VAL", EpicsValue::Double(7.0))
+        .await;
+
+    // AsyncRecord returns AsyncPending; PACT is set, process bailed
+    // before its own UDF clear at processing.rs:840 ran. The put-time
+    // clear in field_io.rs must have already fired.
+    let rec = db.get_record("UDF_ASYNC").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        inst.is_processing(),
+        "AsyncRecord should be mid-async (PACT=true)"
+    );
+    assert!(
+        !inst.common.udf,
+        "primary-field CA put must clear UDF synchronously \
+         (dbAccess.c::dbPut:1411 parity) — observable before \
+         complete_async_record runs"
+    );
+}
+
 /// epics-base PR #3fb10b6 regression: only the record directly
 /// receiving a dbPut should carry PUTF=1 during chain processing.
 /// Pre-fix the CP-target dispatch set PUTF=true on every chained

@@ -481,6 +481,30 @@ impl PvDatabase {
                 Ok(()) => {
                     instance.record.on_put(&field);
                     let _ = instance.record.special(&field, true);
+                    // C `dbAccess.c::dbPut:1410-1411` clears
+                    // `precord->udf = FALSE` synchronously when the
+                    // put target is the record-type's primary value
+                    // field (`dbIsValueField`). The clear happens
+                    // BEFORE `dbProcess` runs, so any reader between
+                    // the put and the process-cycle's own clear sees
+                    // the new value with a consistent UDF=false.
+                    //
+                    // Rust's processing path also clears UDF via
+                    // `clears_udf()` in process/complete_async_record,
+                    // but that runs AFTER the put lock drops and the
+                    // process re-acquires — leaving a small window
+                    // where another reader can observe (new VAL,
+                    // udf=true). For async records the window spans
+                    // the entire device round trip. Clear here to
+                    // close the window. The same clear already exists
+                    // in `put_pv_and_post` (line 256-262); mirror it.
+                    if field == instance.record.primary_field() {
+                        instance.common.udf = false;
+                        if instance.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM {
+                            instance.common.stat = 0;
+                            instance.common.sevr = crate::server::record::AlarmSeverity::NoAlarm;
+                        }
+                    }
                     CommonFieldPutResult::NoChange
                 }
                 Err(CaError::FieldNotFound(_)) => instance.put_common_field(&field, value)?,

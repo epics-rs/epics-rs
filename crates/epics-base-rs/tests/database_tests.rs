@@ -2348,17 +2348,30 @@ async fn test_sdis_cp_link_registration() {
     assert_eq!(targets, vec!["GUARDED"]);
 }
 
+/// C `epicsTimeEventBestTime = -1` (epicsTime.h:103). The C path
+/// (`recGbl.c::recGblGetTimeStampSimm:324-328`) calls
+/// `epicsTimeGetEvent(-1)` unconditionally — that delegates to
+/// `generalTimeGetEventPriority(-1)` (BestTime providers). A device
+/// support that wants to keep its own timestamp must signal
+/// TSE = -2 (epicsTimeEventDeviceTime), not -1.
+///
+/// Regression: the pre-fix Rust port read TSE=-1 as
+/// "device-provided with BestTime fallback" and gated the call on
+/// UNIX_EPOCH. A stale device write of any non-epoch SystemTime
+/// suppressed every subsequent BestTime refresh.
 #[tokio::test]
-async fn test_tse_minus1_preserves_device_timestamp() {
+async fn test_tse_minus1_always_overwrites_via_best_time() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    let device_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567);
+    // Stale but non-epoch timestamp — exactly the case the pre-fix
+    // path mis-classified as "device-provided, keep".
+    let stale = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567);
     if let Some(rec) = db.get_record("REC").await {
         let mut inst = rec.write().await;
         inst.common.tse = -1;
-        inst.common.time = device_time;
+        inst.common.time = stale;
     }
     let mut visited = HashSet::new();
     db.process_record_with_links("REC", &mut visited, 0)
@@ -2366,7 +2379,11 @@ async fn test_tse_minus1_preserves_device_timestamp() {
         .unwrap();
     let rec = db.get_record("REC").await.unwrap();
     let inst = rec.read().await;
-    assert_eq!(inst.common.time, device_time);
+    assert_ne!(
+        inst.common.time, stale,
+        "TSE=-1 must always overwrite via generalTime BestTime, matching \
+         C `epicsTimeGetEvent(-1)` called unconditionally"
+    );
 }
 
 #[tokio::test]

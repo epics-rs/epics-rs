@@ -29,6 +29,21 @@ pub fn parse_pv_name(name: &str) -> (&str, &str) {
 
 /// Apply timestamp to a record based on its TSE field.
 /// `is_soft` indicates a Soft Channel device type.
+///
+/// Mirrors C `recGblGetTimeStampSimm` (recGbl.c:310-343). The TSE
+/// constants are defined in `epicsTime.h:102-104`:
+///
+///   - `epicsTimeEventCurrentTime = 0` → wall-clock now
+///   - `epicsTimeEventBestTime    = -1` → generalTime BestTime providers
+///   - `epicsTimeEventDeviceTime  = -2` → device support already set time
+///   - `1..` → event-number providers
+///
+/// The C path is symmetric: every non-`-2` case unconditionally
+/// overwrites `precord->time` via `epicsTimeGetEvent(tse)`, which
+/// delegates to `epicsTimeGetCurrent` for `tse==0` and to
+/// `generalTimeGetEventPriority` otherwise. Only `-2` (device time)
+/// is left untouched because the device support has already written
+/// the timestamp before `recGblGetTimeStamp` is called.
 fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
     match common.tse {
         0 => {
@@ -37,16 +52,29 @@ fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
             common.time = crate::runtime::general_time::get_current();
         }
         -1 => {
-            // Device-provided time; fallback to generalTime BestTime if not set
-            if common.time == std::time::SystemTime::UNIX_EPOCH {
-                common.time = crate::runtime::general_time::get_event(-1);
-            }
+            // C `epicsTimeEventBestTime` (epicsTime.h:103). The C path
+            // calls `epicsTimeGetEvent(-1)` unconditionally, which
+            // routes to `generalTimeGetEventPriority(-1)` — the
+            // BestTime ratchet across current-time providers.
+            //
+            // The pre-fix Rust port read this as "device-provided time
+            // with BestTime fallback" and gated the call on
+            // `common.time == UNIX_EPOCH`. That misreads C: device
+            // time is signalled by TSE=-2 (epicsTimeEventDeviceTime),
+            // not TSE=-1. The conditional fallback also produced
+            // monotonic stalls when a device incidentally wrote a
+            // stale (but non-epoch) time to `common.time` before the
+            // first BestTime call: BestTime was never queried and the
+            // record kept the stale stamp across every cycle.
+            common.time = crate::runtime::general_time::get_event(-1);
         }
         -2 => {
-            // Keep TIME field as-is
+            // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device
+            // support has already written `common.time`; leave it
+            // alone (C recGbl.c:333-343 also skips the assignment).
         }
         _ => {
-            // generalTime event time
+            // Positive event number — event providers via generalTime.
             common.time = crate::runtime::general_time::get_event(common.tse as i32);
         }
     }
@@ -821,6 +849,60 @@ impl PvDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `recGblGetTimeStampSimm` (recGbl.c:310-343) maps TSE values
+    /// to epicsTime sources via the constants in `epicsTime.h:102-104`.
+    /// The Rust port previously misread TSE=-1 as "device-provided
+    /// with BestTime fallback" and gated the BestTime call on a
+    /// UNIX_EPOCH check. C calls `epicsTimeGetEvent(-1)`
+    /// unconditionally; only TSE=-2 (epicsTimeEventDeviceTime) leaves
+    /// `precord->time` untouched.
+    ///
+    /// Regression: a stale device write (any non-epoch SystemTime)
+    /// suppressed every BestTime refresh thereafter.
+    #[test]
+    fn apply_timestamp_tse_minus_one_always_overwrites_with_best_time() {
+        use crate::server::record::CommonFields;
+        use std::time::{Duration, SystemTime};
+
+        // Pre-populate `time` with a stale but non-epoch sentinel.
+        let stale = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut common = CommonFields::default();
+        common.tse = -1;
+        common.time = stale;
+
+        apply_timestamp(&mut common, false);
+
+        // BestTime must have run unconditionally — `common.time` is
+        // no longer the stale sentinel.
+        assert_ne!(
+            common.time, stale,
+            "TSE=-1 must always overwrite via generalTime BestTime, \
+             matching C epicsTimeGetEvent(-1) called unconditionally"
+        );
+    }
+
+    /// C `epicsTimeEventDeviceTime = -2` (epicsTime.h:104). The C
+    /// path does NOT call `epicsTimeGetEvent` for this TSE value;
+    /// device support has already set `precord->time` before the
+    /// recGbl call. The Rust port must leave `common.time` untouched.
+    #[test]
+    fn apply_timestamp_tse_minus_two_preserves_device_provided_time() {
+        use crate::server::record::CommonFields;
+        use std::time::{Duration, SystemTime};
+
+        let device_time = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let mut common = CommonFields::default();
+        common.tse = -2;
+        common.time = device_time;
+
+        apply_timestamp(&mut common, false);
+
+        assert_eq!(
+            common.time, device_time,
+            "TSE=-2 (epicsTimeEventDeviceTime) must preserve device-provided time"
+        );
+    }
 
     #[tokio::test]
     async fn test_select_link_indices() {

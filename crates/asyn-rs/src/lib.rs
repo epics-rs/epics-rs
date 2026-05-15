@@ -13,7 +13,7 @@ pub mod drivers;
 pub mod error;
 pub(crate) mod exception;
 pub mod interfaces;
-pub(crate) mod interpose;
+pub mod interpose;
 pub mod interrupt;
 pub mod manager;
 pub mod param;

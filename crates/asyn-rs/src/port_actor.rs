@@ -278,9 +278,9 @@ impl PortActor {
             }
             RequestOp::OctetRead { buf_size } => {
                 let mut buf = vec![0u8; *buf_size];
-                let n = self.driver.io_read_octet(user, &mut buf)?;
+                let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
                 buf.truncate(n);
-                Ok(RequestResult::octet_read(buf, n))
+                Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
             RequestOp::OctetWriteRead { data, buf_size } => {
                 // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
@@ -296,9 +296,9 @@ impl PortActor {
                 self.driver.io_flush(user)?;
                 self.driver.io_write_octet(user, data)?;
                 let mut buf = vec![0u8; *buf_size];
-                let n = self.driver.io_read_octet(user, &mut buf)?;
+                let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
                 buf.truncate(n);
-                Ok(RequestResult::octet_read(buf, n))
+                Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
             RequestOp::Int32Write { value } => {
                 self.driver.io_write_int32(user, *value)?;
@@ -740,6 +740,91 @@ mod tests {
         // Order must be: flush, then write, then read.
         let seq = sequence.lock().clone();
         assert_eq!(seq, vec!["flush", "write", "read"]);
+    }
+
+    /// C parity: `asynOctet::read` returns `nbytes` together with
+    /// `int *eomReason` (`interfaces/asynOctet.h:38-40`). Drivers
+    /// that override `io_read_octet_eom` must have their EOM flags
+    /// propagated through `RequestResult::eom_reason` so consumers
+    /// (e.g. asynRecord `EOMR`) can distinguish "byte count" /
+    /// "EOS match" / "END indicator" terminations.
+    #[test]
+    fn actor_octet_read_eom_propagates_driver_flags() {
+        use crate::interpose::EomReason;
+
+        struct EomDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for EomDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> AsynResult<(usize, EomReason)> {
+                let payload = b"ABC";
+                let n = payload.len().min(buf.len());
+                buf[..n].copy_from_slice(&payload[..n]);
+                // Driver explicitly reports both EOS match and END indicator
+                // (e.g. a GPIB END line plus terminator detection).
+                Ok((n, EomReason::EOS | EomReason::END))
+            }
+        }
+        let drv = EomDriver {
+            base: PortDriverBase::new("eom_test", 1, PortFlags::default()),
+        };
+        let tx = spawn_actor(drv);
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 16 }, user).unwrap();
+        assert_eq!(result.data.as_deref(), Some(&b"ABC"[..]));
+        let eom = EomReason::from_bits_truncate(result.eom_reason);
+        assert!(eom.contains(EomReason::EOS));
+        assert!(eom.contains(EomReason::END));
+        assert!(!eom.contains(EomReason::CNT));
+    }
+
+    /// Default `io_read_octet_eom` (drivers that override only the
+    /// non-eom `io_read_octet`) must synthesize `CNT` when the
+    /// buffer filled — C `asynOctetSyncIO::read` synthesises the
+    /// same flag at the syncIO level (`asynOctetSyncIO.c:213-217`).
+    #[test]
+    fn actor_octet_read_eom_default_synthesizes_cnt_on_buffer_full() {
+        use crate::interpose::EomReason;
+
+        struct FillDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for FillDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+                // Always fill the buffer to completion.
+                for b in buf.iter_mut() {
+                    *b = b'X';
+                }
+                Ok(buf.len())
+            }
+        }
+        let drv = FillDriver {
+            base: PortDriverBase::new("fill_test", 1, PortFlags::default()),
+        };
+        let tx = spawn_actor(drv);
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 4 }, user).unwrap();
+        assert_eq!(result.nbytes, 4);
+        let eom = EomReason::from_bits_truncate(result.eom_reason);
+        assert!(eom.contains(EomReason::CNT));
+        assert!(!eom.contains(EomReason::EOS));
+        assert!(!eom.contains(EomReason::END));
     }
 
     #[test]

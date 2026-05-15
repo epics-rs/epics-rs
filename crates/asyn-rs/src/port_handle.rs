@@ -234,6 +234,29 @@ impl PortHandle {
         })
     }
 
+    /// Read variant that also surfaces the end-of-message reason
+    /// flags. C parity: `asynOctet::read(... int *eomReason)`
+    /// (`interfaces/asynOctet.h:38-40`) — consumers like asynRecord
+    /// (`EOMR` field, `asynRecord.c`) need the flag bitmap to tell
+    /// "byte count reached" from "EOS matched" from "END asserted".
+    pub async fn read_octet_eom(
+        &self,
+        reason: usize,
+        addr: i32,
+        buf_size: usize,
+    ) -> AsynResult<(Vec<u8>, crate::interpose::EomReason)> {
+        let user = AsynUser::new(reason).with_addr(addr);
+        let result = self
+            .submit_async(RequestOp::OctetRead { buf_size }, user)
+            .await?;
+        let data = result.data.ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: "octet read returned no data".into(),
+        })?;
+        let eom = crate::interpose::EomReason::from_bits_truncate(result.eom_reason);
+        Ok((data, eom))
+    }
+
     pub async fn write_octet(&self, reason: usize, addr: i32, data: Vec<u8>) -> AsynResult<()> {
         let user = AsynUser::new(reason).with_addr(addr);
         self.submit_async(RequestOp::OctetWrite { data }, user)

@@ -211,6 +211,15 @@ pub struct RequestResult {
     pub option_value: Option<String>,
     /// Int64 bounds (from GetBoundsInt32/Int64).
     pub bounds: Option<(i64, i64)>,
+    /// End-of-message reason flags from an octet read.
+    ///
+    /// C parity: `asynOctet::read` returns `nbytes` together with
+    /// `int *eomReason` (`interfaces/asynOctet.h:38-40`). The flags
+    /// `ASYN_EOM_CNT | ASYN_EOM_EOS | ASYN_EOM_END` mirror
+    /// [`crate::interpose::EomReason`]. Stored as `u32` so the
+    /// request layer stays bitflag-crate-free; converters live on
+    /// `EomReason::from_bits_truncate`.
+    pub eom_reason: u32,
 }
 
 impl RequestResult {
@@ -237,6 +246,7 @@ impl RequestResult {
             timestamp: None,
             option_value: None,
             bounds: None,
+            eom_reason: 0,
         }
     }
 

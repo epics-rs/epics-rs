@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, warn};
 
-use crate::client_native::decode::{Frame, try_parse_frame};
+use crate::client_native::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
     BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, PVA_VERSION, PvaHeader, Status,
@@ -196,6 +196,25 @@ fn put_autoexec_from_request(req: Option<&PvField>) -> Option<bool> {
         "false" | "no" | "0" => Some(false),
         _ => None,
     }
+}
+
+/// Consume the optional u32 `nack` (initial pipeline window) that a
+/// pvxs client appends to a MONITOR INIT body when it sets the
+/// pipeline bit (pvxs `servermon.cpp:493` / `clientmon.cpp:341-342`).
+/// Returns `Some(nack)` when the bit is set AND the four bytes are
+/// present; `None` otherwise (kind mismatch, bit clear, or short
+/// payload — the last case mirrors pvxs's "pipeline monitor w/o
+/// initial nack incompatible" warn-but-accept policy).
+fn parse_monitor_init_nack(
+    kind: OpKind,
+    subcmd: u8,
+    cur: &mut std::io::Cursor<&[u8]>,
+    order: ByteOrder,
+) -> Option<u32> {
+    if kind != OpKind::Monitor || (subcmd & 0x80) == 0 {
+        return None;
+    }
+    cur.get_u32(order).ok()
 }
 
 /// Inspect a decoded pvRequest for `record._options.pipeline` and
@@ -746,7 +765,14 @@ async fn handle_connection_io(
     let _ = tx.send(set_bo).await;
 
     // Step 2: send CONNECTION_VALIDATION request (server → client).
-    let val_req = build_server_connection_validation(order, 87_040, 32_767, &["ca", "anonymous"]);
+    // pvxs `serverconn.cpp:100-115` advertises auth methods in
+    // reverse-priority order ("anonymous" then "ca" pushed onto the
+    // wire); the client should pick `ca` when its libca credentials
+    // resolved. Keep the same set here so the validation check below
+    // accepts both.
+    const ADVERTISED_AUTH_METHODS: &[&str] = &["ca", "anonymous"];
+    let val_req =
+        build_server_connection_validation(order, 87_040, 32_767, ADVERTISED_AUTH_METHODS);
     let _ = tx.send(val_req).await;
 
     // Step 3+: drive the read loop.
@@ -880,14 +906,34 @@ async fn handle_connection_io(
                 // introspection_size (u16), qos (u16); read selected method
                 // (string); when method == "ca", read the type+value of the
                 // auth Value and pull out the `user` / `host` fields. Pure
-                // metadata for audit/logging — we still respond OK either
-                // way (matches pvxs serverconn.cpp:200-234, which also
-                // doesn't gate the ack on auth content).
+                // metadata for audit/logging.
                 cred = parse_client_credentials(&frame, order).unwrap_or(cred);
                 debug!(?peer, method = %cred.method, account = %cred.account,
                     roles = ?cred.roles, "PVA client credentials");
+                // pvxs `serverconn.cpp:238-241` parity: when the client
+                // picks an auth method we never advertised, reply
+                // CONNECTION_VALIDATED with Status::Error so the client
+                // knows its elevated identity claim was rejected. pvxs
+                // keeps the connection open and falls back to whatever
+                // identity is recorded (typically anonymous via the
+                // empty-method path inside parse_client_credentials);
+                // matches "No practical way to handle auth failure. So
+                // we accept all credentials, but may not grant rights."
+                let advertised = ADVERTISED_AUTH_METHODS
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(&cred.method));
+                let validated_status = if advertised {
+                    Status::ok()
+                } else {
+                    debug!(
+                        ?peer,
+                        method = %cred.method,
+                        "PVA client selects unadvertised auth method — replying Status::Error"
+                    );
+                    Status::error("Client selects unadvertised auth".to_string())
+                };
                 let mut payload = Vec::new();
-                Status::ok().write_into(order, &mut payload);
+                validated_status.write_into(order, &mut payload);
                 let h = PvaHeader::application(
                     true,
                     order,
@@ -918,36 +964,25 @@ async fn handle_connection_io(
         // Application messages
         match Command::from_code(frame.header.command) {
             Some(Command::CreateChannel) => {
-                if channels.len() >= config.max_channels_per_connection {
-                    warn!(
-                        ?peer,
-                        "rejecting CREATE_CHANNEL: per-connection limit reached"
-                    );
-                    // Reject by sending an error CreateChannel response with cid=u32::MAX.
-                    let mut payload = Vec::new();
-                    payload.put_u32(u32::MAX, order);
-                    payload.put_u32(0u32, order);
-                    Status::error("max channels per connection reached".to_string())
-                        .write_into(order, &mut payload);
-                    let h = PvaHeader::application(
-                        true,
-                        order,
-                        Command::CreateChannel.code(),
-                        payload.len() as u32,
-                    );
-                    let mut buf = Vec::new();
-                    h.write_into(&mut buf);
-                    buf.extend_from_slice(&payload);
-                    let _ = tx.send(buf).await;
-                    continue;
-                }
+                // pvxs `serverchan.cpp:269-358` allows `count > 1`
+                // (cid, name) pairs in one frame; the per-connection
+                // cap check is now per-pair inside the handler.
                 let before = channels.len();
-                handle_create_channel(&source, &frame, &tx, &mut channels, order).await?;
+                handle_create_channel(
+                    &source,
+                    &frame,
+                    &tx,
+                    &mut channels,
+                    order,
+                    config.max_channels_per_connection,
+                    peer,
+                )
+                .await?;
                 // F-G7: track channel-add success via the HashMap
-                // delta. Avoids threading peer_entry into every
-                // handler; the size check is O(1) and the rare
-                // duplicate-cid path naturally evaluates to no-op.
-                if channels.len() > before {
+                // delta — works for both count=1 and count>1 since
+                // we count net inserts.
+                let added = channels.len().saturating_sub(before);
+                for _ in 0..added {
                     peer_entry.channel_added();
                 }
             }
@@ -1148,7 +1183,12 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     max_msg_size: usize,
 ) -> PvaResult<Frame> {
     loop {
-        if let Some((frame, n)) = try_parse_frame(rx_buf)? {
+        // Role-aware parse: a server's inbound frames must have the
+        // Server direction bit CLEAR (pvxs `conn.cpp:160` —
+        // `isClient ^ !!(header[2]&pva_flags::Server)`). Reject and
+        // tear down the connection if the peer echoes our own
+        // outbound shape back at us.
+        if let Some((frame, n)) = try_parse_frame_role(rx_buf, PeerRole::Server)? {
             rx_buf.drain(..n);
             return Ok(frame);
         }
@@ -1216,25 +1256,84 @@ fn build_server_connection_validation(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_create_channel(
     source: &DynSource,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
+    max_channels_per_connection: usize,
+    peer: SocketAddr,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
-    let _count = cur
+    // pvxs `serverchan.cpp:269-358`: a single CREATE_CHANNEL frame
+    // can carry `count` (cid, name) pairs and the server must emit
+    // one CREATE_CHANNEL response frame per pair, in arrival order.
+    // The Java pvAccess client batches multiple new channels in one
+    // frame after a SEARCH response; we used to only honour the
+    // first pair and leave the remaining bytes unconsumed.
+    let count = cur
         .get_u16(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let cid = cur
-        .get_u32(order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let name = crate::proto::decode_string(&mut cur, order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?
-        .unwrap_or_default();
+    for _ in 0..count {
+        let cid = match cur.get_u32(order) {
+            Ok(v) => v,
+            Err(_) => break, // truncated → emulate pvxs `M.good()` break
+        };
+        let name = match crate::proto::decode_string(&mut cur, order) {
+            Ok(Some(s)) => s,
+            Ok(None) => String::new(), // pvxs `name.empty()` triggers break
+            Err(_) => break,
+        };
+        if name.is_empty() {
+            break;
+        }
+        // A-G1 per-channel cap check moved inside the per-pair loop
+        // so a multi-name CREATE_CHANNEL can't sneak past the per-
+        // connection limit by amortising the gate against the first
+        // pair only.
+        if channels.len() >= max_channels_per_connection {
+            warn!(
+                ?peer,
+                pv = %name,
+                "rejecting CREATE_CHANNEL: per-connection limit reached"
+            );
+            let mut payload = Vec::new();
+            payload.put_u32(cid, order);
+            payload.put_u32(0u32, order);
+            Status::error("max channels per connection reached".to_string())
+                .write_into(order, &mut payload);
+            let h = PvaHeader::application(
+                true,
+                order,
+                Command::CreateChannel.code(),
+                payload.len() as u32,
+            );
+            let mut buf = Vec::new();
+            h.write_into(&mut buf);
+            buf.extend_from_slice(&payload);
+            let _ = tx.send(buf).await;
+            continue;
+        }
+        emit_create_channel_reply(source, channels, tx, cid, &name, order).await?;
+    }
+    Ok(())
+}
 
-    if !source.has_pv(&name).await {
+/// One iteration of pvxs `handle_CREATE_CHANNEL`'s inner loop:
+/// resolve the PV, allocate a SID (or reject), and emit the
+/// `cid + sid + status` response frame. Factored so the count > 1
+/// loop above is a single straight-line concern.
+async fn emit_create_channel_reply(
+    source: &DynSource,
+    channels: &mut HashMap<u32, ChannelState>,
+    tx: &SrvTx,
+    cid: u32,
+    name: &str,
+    order: ByteOrder,
+) -> PvaResult<()> {
+    if !source.has_pv(name).await {
         let mut payload = Vec::new();
         payload.put_u32(cid, order);
         payload.put_u32(0u32, order); // sid (placeholder)
@@ -1253,11 +1352,11 @@ async fn handle_create_channel(
     }
 
     let sid = alloc_sid();
-    let intro = source.get_introspection(&name).await;
+    let intro = source.get_introspection(name).await;
     channels.insert(
         sid,
         ChannelState {
-            name: name.clone(),
+            name: name.to_string(),
             cid,
             sid,
             introspection: intro,
@@ -1469,11 +1568,23 @@ async fn handle_op(
             .as_ref()
             .and_then(monitor_pipeline_options)
             .filter(|o| o.enabled);
+        // pvxs `servermon.cpp:493` — when the client sets the pipeline
+        // bit on MONITOR INIT (`subcmd & 0x80`) it appends a u32 `nack`
+        // (initial window credit) after the pvRequest. Read and consume
+        // those bytes so any data following INIT in the same segment
+        // decodes from the correct offset, and prefer the wire value
+        // over the pvRequest `queueSize` so the negotiated initial
+        // window matches what the client requested. We tolerate a
+        // truncated nack (legacy clients sometimes omit it even with
+        // the bit set — pvxs warns "pipeline monitor w/o initial nack
+        // incompatible" but accepts the operation).
+        let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, order);
         let (monitor_window, monitor_window_notify) = if kind == OpKind::Monitor
             && let Some(opt) = pipeline_opt
         {
+            let initial = pipeline_initial_nack.unwrap_or(opt.queue_size);
             (
-                Some(Arc::new(std::sync::atomic::AtomicU32::new(opt.queue_size))),
+                Some(Arc::new(std::sync::atomic::AtomicU32::new(initial))),
                 Some(Arc::new(tokio::sync::Notify::new())),
             )
         } else {
@@ -2594,6 +2705,52 @@ mod tests {
             }
             other => panic!("expected monitor data, got {other:?}"),
         }
+    }
+
+    /// pvxs `servermon.cpp:493` parity: when the client sets the
+    /// pipeline bit (`subcmd & 0x80`) on MONITOR INIT, the body
+    /// carries a trailing u32 `nack` (initial window). The handler
+    /// must consume those four bytes so subsequent reads from the
+    /// cursor see the correct offset, AND surface the parsed value
+    /// to override the pvRequest queueSize-based default.
+    #[test]
+    fn parse_monitor_init_nack_consumes_window_byte_when_pipeline_bit_set() {
+        let order = ByteOrder::Little;
+
+        // Bit clear → no-op even on Monitor.
+        let bytes = [0u8; 8];
+        let mut cur = std::io::Cursor::new(bytes.as_slice());
+        assert_eq!(
+            parse_monitor_init_nack(OpKind::Monitor, 0x08, &mut cur, order),
+            None
+        );
+        assert_eq!(cur.position(), 0, "cursor must not advance when bit clear");
+
+        // Bit set, kind != Monitor → no-op (matches pvxs which only
+        // honours the pipeline shape on the MONITOR command code).
+        let mut cur = std::io::Cursor::new(bytes.as_slice());
+        assert_eq!(
+            parse_monitor_init_nack(OpKind::Get, 0x88, &mut cur, order),
+            None
+        );
+        assert_eq!(cur.position(), 0);
+
+        // Bit set, four bytes available → return decoded value.
+        let mut buf = Vec::new();
+        buf.put_u32(0x1234_5678, order);
+        buf.extend_from_slice(b"trailing");
+        let mut cur = std::io::Cursor::new(buf.as_slice());
+        let parsed = parse_monitor_init_nack(OpKind::Monitor, 0x88, &mut cur, order);
+        assert_eq!(parsed, Some(0x1234_5678));
+        assert_eq!(cur.position(), 4, "must advance exactly four bytes");
+
+        // Bit set, fewer than four bytes → tolerate (pvxs warns but
+        // accepts; we surface `None` so the caller falls back to the
+        // pvRequest queueSize-based default).
+        let buf = vec![0x11, 0x22];
+        let mut cur = std::io::Cursor::new(buf.as_slice());
+        let parsed = parse_monitor_init_nack(OpKind::Monitor, 0x88, &mut cur, order);
+        assert_eq!(parsed, None);
     }
 
     /// pvxs `serverchan.cpp:382-386`: when the SID in DESTROY_CHANNEL

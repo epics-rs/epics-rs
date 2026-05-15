@@ -1724,6 +1724,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         resp.available = ioid;
                         let mut w = writer.lock().await;
                         w.write_all(&resp.to_bytes()).await?;
+                    } else {
+                        // C `write_action` (`rsrv/camessage.c:741-750`)
+                        // emits `send_err(mp, ECA_NOWTACCESS, client,
+                        // RECORD_NAME(pciu->dbch))` even for the no-
+                        // notify WRITE. Without this branch the Rust
+                        // server dropped denied PROTO_WRITEs silently —
+                        // C libca's `cac::exception` path never fired,
+                        // so a `caput` from a read-only peer looked
+                        // like it had succeeded (no error callback)
+                        // even though the value never reached the DB.
+                        send_ca_error(writer, hdr, denied.eca_code(), hdr.cid, &audit_pv).await?;
                     }
                     state.audit("caput", &audit_pv, "", "denied").await;
                     return Ok(());

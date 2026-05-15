@@ -27,6 +27,19 @@ pub enum AsynError {
     #[error("param index out of range: {0}")]
     ParamIndexOutOfRange(usize),
 
+    /// C parity: `asynParamUndefined` —
+    /// `paramVal::getInteger/getInteger64/getDouble/getUInt32/getString`
+    /// throws `ParamValNotDefined` when the value has never been set, and
+    /// `paramList::getInteger/...` translates that to `asynParamUndefined`
+    /// (`asynPortDriver/asynPortDriver.cpp:301-401,543-566`). The lax Rust
+    /// getters (`ParamList::get_int32` etc.) return the type default
+    /// (`0`, `0.0`, `""`) silently — that mirrors many existing call sites
+    /// that use `.unwrap_or(...)`. Use the `_strict` variants
+    /// (`ParamList::get_int32_strict` etc.) to surface this status the way
+    /// C reportGetParamErrors does.
+    #[error("param undefined: index {0}")]
+    ParamUndefined(usize),
+
     #[error("type mismatch: expected {expected}, got {actual}")]
     TypeMismatch {
         expected: &'static str,

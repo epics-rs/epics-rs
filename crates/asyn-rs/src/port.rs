@@ -412,12 +412,24 @@ impl PortDriverBase {
         self.params.get_int32(index, addr)
     }
 
+    /// Strict variant — returns [`AsynError::ParamUndefined`] when the
+    /// cache entry has never been set (C parity for `asynParamUndefined`).
+    /// See [`crate::param::ParamList::get_int32_strict`].
+    pub fn get_int32_param_strict(&self, index: usize, addr: i32) -> AsynResult<i32> {
+        self.params.get_int32_strict(index, addr)
+    }
+
     pub fn set_int64_param(&mut self, index: usize, addr: i32, value: i64) -> AsynResult<()> {
         self.params.set_int64(index, addr, value)
     }
 
     pub fn get_int64_param(&self, index: usize, addr: i32) -> AsynResult<i64> {
         self.params.get_int64(index, addr)
+    }
+
+    /// Strict variant — see [`crate::param::ParamList::get_int64_strict`].
+    pub fn get_int64_param_strict(&self, index: usize, addr: i32) -> AsynResult<i64> {
+        self.params.get_int64_strict(index, addr)
     }
 
     pub fn set_float64_param(&mut self, index: usize, addr: i32, value: f64) -> AsynResult<()> {
@@ -428,12 +440,22 @@ impl PortDriverBase {
         self.params.get_float64(index, addr)
     }
 
+    /// Strict variant — see [`crate::param::ParamList::get_float64_strict`].
+    pub fn get_float64_param_strict(&self, index: usize, addr: i32) -> AsynResult<f64> {
+        self.params.get_float64_strict(index, addr)
+    }
+
     pub fn set_string_param(&mut self, index: usize, addr: i32, value: String) -> AsynResult<()> {
         self.params.set_string(index, addr, value)
     }
 
     pub fn get_string_param(&self, index: usize, addr: i32) -> AsynResult<&str> {
         self.params.get_string(index, addr)
+    }
+
+    /// Strict variant — see [`crate::param::ParamList::get_string_strict`].
+    pub fn get_string_param_strict(&self, index: usize, addr: i32) -> AsynResult<&str> {
+        self.params.get_string_strict(index, addr)
     }
 
     pub fn set_uint32_param(
@@ -448,6 +470,11 @@ impl PortDriverBase {
 
     pub fn get_uint32_param(&self, index: usize, addr: i32) -> AsynResult<u32> {
         self.params.get_uint32(index, addr)
+    }
+
+    /// Strict variant — see [`crate::param::ParamList::get_uint32_strict`].
+    pub fn get_uint32_param_strict(&self, index: usize, addr: i32) -> AsynResult<u32> {
+        self.params.get_uint32_strict(index, addr)
     }
 
     pub fn get_enum_param(&self, index: usize, addr: i32) -> AsynResult<(usize, Arc<[EnumEntry]>)> {

@@ -996,3 +996,106 @@ async fn server_event_cancel_unknown_subid_replies_eca_badmonid() {
         resp_hdr.cid
     );
 }
+
+/// C `bad_tcp_cmd_action` (`rsrv/camessage.c:337-352`) on an unknown
+/// TCP command: (1) emit `CA_PROTO_ERROR` with `ECA_INTERNAL` and the
+/// channel-cid 0xFFFFFFFF sentinel (per `vsend_err` non-channel-scoped
+/// convention), then (2) return `RSRV_ERROR` so the dispatcher
+/// (`camessage.c:2519-2524`) breaks out of the message loop, which
+/// tears down the connection. The C source comment is explicit:
+/// "by default, clients don't recover from this".
+///
+/// Pre-fix Rust handler emitted the CA_PROTO_ERROR but kept the
+/// connection open — a malicious peer could flood the server with
+/// unknown commands and force one reply per frame indefinitely. This
+/// test verifies the server now drops the TCP connection after the
+/// error reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_unknown_tcp_command_replies_error_and_disconnects() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("BAD:CMD", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // Handshake: send VERSION, drain server's VERSION reply.
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut buf = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .expect("server VERSION reply timed out")
+        .expect("read VERSION");
+
+    // Send a TCP frame with an unknown command code. CA_PROTO_LAST_CMMD
+    // in C is 27 (CA_PROTO_SERVER_DISCONN); 250 is comfortably past
+    // every defined command across all minor versions.
+    let mut unknown = CaHeader::new(250);
+    unknown.cid = 0xDEAD_BEEF;
+    sock.write_all(&unknown.to_bytes()).await.unwrap();
+
+    // Expect CA_PROTO_ERROR with ECA_INTERNAL + 0xFFFFFFFF sentinel cid.
+    let mut resp = [0u8; 256];
+    let mut total = 0;
+    while total < 16 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+            .await
+            .expect("server error-reply timed out")
+            .expect("read error reply");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(
+        total >= 16,
+        "expected at least one CA_PROTO_ERROR header before disconnect, got {total}"
+    );
+    let err_hdr = CaHeader::from_bytes(&resp[..16]).expect("parse error header");
+    assert_eq!(err_hdr.cmmd, CA_PROTO_ERROR);
+    assert_eq!(err_hdr.available, ECA_INTERNAL);
+    assert_eq!(err_hdr.cid, 0xFFFF_FFFF);
+
+    // Drain any trailing payload bytes the server queued before
+    // closing (the original-header echo + diagnostic string).
+    let drain_start = total;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        sock.read(&mut resp[drain_start..]),
+    )
+    .await;
+
+    // Server must close the connection: a subsequent read returns 0
+    // (EOF) within a reasonable timeout.
+    let mut tail = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
+        .await
+        .expect("server did not close TCP connection after unknown command")
+        .expect("read after error");
+    assert_eq!(
+        n, 0,
+        "server must drop the connection after CA_PROTO_ERROR on unknown command \
+         (C bad_tcp_cmd_action parity); instead read {n} more bytes"
+    );
+}

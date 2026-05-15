@@ -2589,14 +2589,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         _ => {
-            // Unknown command — send CA_PROTO_ERROR with ECA status
-            // and original header echoed.  Per C `vsend_err`
-            // (`camessage.c:179-181`), commands that aren't
-            // channel-scoped (i.e. fell through every case label and
-            // can't carry a channel cid we trust) use the
-            // 0xFFFFFFFF sentinel as the outer `m_cid`.
+            // Unknown command — match C `bad_tcp_cmd_action`
+            // (`camessage.c:337-352`): send CA_PROTO_ERROR with
+            // ECA_INTERNAL and the 0xFFFFFFFF cid sentinel (per
+            // `vsend_err` non-channel-scoped convention), then
+            // tear down the connection. C returns `RSRV_ERROR`
+            // which breaks the dispatcher's message loop
+            // (`camessage.c:2519-2524`) — its comment is
+            // explicit: "by default, clients don't recover from
+            // this". Without the tear-down, a misbehaving or
+            // malicious peer can flood the server with unknown
+            // commands and force one CA_PROTO_ERROR reply per
+            // frame indefinitely.
             let error_msg = format!("Unsupported command {}", hdr.cmmd);
             send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, &error_msg).await?;
+            return Err(epics_base_rs::error::CaError::Protocol(format!(
+                "unsupported TCP command {} (matches C bad_tcp_cmd_action drop)",
+                hdr.cmmd
+            )));
         }
     }
 

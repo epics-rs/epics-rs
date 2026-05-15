@@ -30,6 +30,21 @@ pub const CA_PROTO_CREATE_CH_FAIL: u16 = 26;
 pub const CA_SERVER_PORT: u16 = 5064;
 pub const CA_REPEATER_PORT: u16 = 5065;
 
+/// Resolved CA repeater UDP port. Mirrors libca
+/// `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)` (e.g.
+/// `repeater.cpp:511`, `udpiiu.cpp:168`, `casw.cpp:103`): the env var
+/// `EPICS_CA_REPEATER_PORT` takes precedence; otherwise the compiled
+/// default [`CA_REPEATER_PORT`] (5065) is used. Returning a value
+/// outside u16 (or a non-numeric value) falls back to the default;
+/// C `envGetInetPortConfigParam` similarly clamps. Centralizing this
+/// keeps the repeater daemon bind, the client REGISTER target, and
+/// the beacon-monitor REGISTER target in lockstep with operator env.
+pub fn repeater_port() -> u16 {
+    epics_base_rs::runtime::env::get("EPICS_CA_REPEATER_PORT")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(CA_REPEATER_PORT)
+}
+
 // CA protocol version
 pub const CA_MINOR_VERSION: u16 = 13;
 
@@ -429,6 +444,50 @@ mod tests {
         assert_eq!(align8(7), 8);
         assert_eq!(align8(8), 8);
         assert_eq!(align8(9), 16);
+    }
+
+    /// `repeater_port()` honours `EPICS_CA_REPEATER_PORT`, falls back
+    /// to the compiled default when the env var is absent, and clamps
+    /// to the default on garbage input — matching libca
+    /// `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)` shape.
+    ///
+    /// Sequential because all three branches mutate process env. Use
+    /// `serial_test::serial` to keep them out of each other's way.
+    #[test]
+    #[serial_test::serial]
+    fn repeater_port_honours_env_with_default_fallback() {
+        // Save & clear to make the test idempotent.
+        let saved = std::env::var("EPICS_CA_REPEATER_PORT").ok();
+        // SAFETY: serial_test::serial; mutations are confined to this
+        // test and the saved value is restored in a finally block at
+        // the end.
+        unsafe { std::env::remove_var("EPICS_CA_REPEATER_PORT") };
+
+        assert_eq!(
+            repeater_port(),
+            CA_REPEATER_PORT,
+            "no env → compiled default"
+        );
+
+        // SAFETY: see comment above.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", "5165") };
+        assert_eq!(repeater_port(), 5165, "valid u16 env override");
+
+        // SAFETY: see comment above.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", "not-a-port") };
+        assert_eq!(
+            repeater_port(),
+            CA_REPEATER_PORT,
+            "garbage env → compiled default"
+        );
+
+        // SAFETY: see comment above. Restore for subsequent serial tests.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("EPICS_CA_REPEATER_PORT", v),
+                None => std::env::remove_var("EPICS_CA_REPEATER_PORT"),
+            }
+        }
     }
 
     #[test]

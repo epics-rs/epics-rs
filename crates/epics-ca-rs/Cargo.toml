@@ -106,6 +106,7 @@ cap-tokens = [
     "dep:serde",
     "dep:serde_json",
     "dep:thiserror",
+    "dep:sha2",
 ]
 
 [dev-dependencies]

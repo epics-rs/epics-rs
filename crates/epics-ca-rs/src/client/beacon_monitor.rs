@@ -307,7 +307,7 @@ async fn run_beacon_monitor_inner(
                     // can otherwise be replayed from anywhere; combined
                     // with the unbounded verified_tuples map below this
                     // is a poison amplifier.
-                    let src_ip = match _src.ip() {
+                    let src_ip = match meta.src.ip() {
                         std::net::IpAddr::V4(v) => v,
                         std::net::IpAddr::V6(_) => {
                             metrics::counter!("ca_client_signed_beacon_failures_total")

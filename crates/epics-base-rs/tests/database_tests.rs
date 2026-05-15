@@ -223,6 +223,179 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
     );
 }
 
+/// C `recGbl.c:194/210-211` — when only `amsg` changes (no SEVR/STAT
+/// transition), `stat_mask` is set to `DBE_ALARM` and STAT/AMSG/VAL
+/// are still posted. The Rust port previously only checked
+/// `alarm_changed` (sevr-or-stat) and silently dropped the AMSG-only
+/// update, leaving subscribers reading a stale message string.
+///
+/// Reproduce via MSS link: source carries Major severity. Cycle 1
+/// propagates the source amsg into the dest, raising sevr 0→Major
+/// (alarm_changed=true; AMSG flows in the normal path). Cycle 2
+/// changes the source amsg but keeps the same severity — dest's
+/// reset_alarms sees sevr Major→Major (alarm_changed=false) but
+/// amsg "msg1"→"msg2" (amsg_changed=true). The fix posts AMSG for
+/// this case so the subscriber sees the new message.
+#[tokio::test]
+async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
+    use epics_base_rs::server::recgbl::{EventMask, alarm_status};
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("SRC_AMSG", Box::new(AoRecord::new(7.0)))
+        .await
+        .unwrap();
+    db.add_record("DST_AMSG", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Source: Major severity with first amsg.
+    if let Some(rec) = db.get_record("SRC_AMSG").await {
+        let mut inst = rec.write().await;
+        inst.common.stat = alarm_status::HIHI_ALARM;
+        inst.common.sevr = AlarmSeverity::Major;
+        inst.common.amsg = "msg1".to_string();
+    }
+    // Dest: MSS link to source. Subscribe to AMSG with ALARM mask
+    // (C posts AMSG with stat_mask = DBE_ALARM on amsg-only change).
+    if let Some(rec) = db.get_record("DST_AMSG").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("SRC_AMSG NPP MSS".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    // Cycle 1: drives sevr 0→Major, amsg ""→"msg1" (alarm_changed=true).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST_AMSG", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Now subscribe to AMSG with ALARM mask AFTER cycle 1, so
+    // last_posted seeds at "msg1".
+    let mut amsg_rx = {
+        let rec = db.get_record("DST_AMSG").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.add_subscriber("AMSG", 11, DbFieldType::String, EventMask::ALARM.bits())
+    }
+    .expect("AMSG subscription must be accepted");
+
+    // Source: keep severity Major, change amsg only.
+    if let Some(rec) = db.get_record("SRC_AMSG").await {
+        let mut inst = rec.write().await;
+        inst.common.amsg = "msg2".to_string();
+    }
+
+    // Cycle 2: dest picks up msg2. sevr stays Major (alarm_changed=false),
+    // amsg "msg1"→"msg2" (amsg_changed=true). AMSG event must flow.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST_AMSG", &mut visited, 0)
+        .await
+        .unwrap();
+
+    {
+        let rec = db.get_record("DST_AMSG").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(inst.common.sevr, AlarmSeverity::Major, "sevr unchanged");
+        assert_eq!(inst.common.amsg, "msg2", "amsg propagated");
+    }
+
+    let event = amsg_rx
+        .try_recv()
+        .expect("AMSG-only change must produce an event on DBE_ALARM-class subscribers");
+    assert!(
+        matches!(event.snapshot.value, EpicsValue::String(ref s) if s == "msg2"),
+        "AMSG event payload should be the new message, got {:?}",
+        event.snapshot.value
+    );
+}
+
+/// C `dbAccess.c::dbPutField:1276` sets `precord->putf = TRUE`
+/// IMMEDIATELY before calling `dbProcess`. The flag stays TRUE
+/// throughout the entire process cycle and is cleared in
+/// `recGblFwdLink` (`recGbl.c:302`) after the forward-link
+/// dispatch — i.e. observable for the WHOLE put-driven processing
+/// cycle. Async records keep PUTF=TRUE through the device round
+/// trip; it clears only when the completion path runs FLNK.
+///
+/// Pre-fix the Rust port cleared PUTF in `put_record_field_from_ca`
+/// BEFORE the `process_record_with_links` call (field_io.rs:497),
+/// so any consumer reading PUTF during the process cycle (TPRO
+/// trace, monitor on .PUTF, async-completion path's
+/// "put-driven vs scan-driven" classifier) always saw PUTF=0.
+#[tokio::test]
+async fn test_putf_clears_after_synchronous_put_completion() {
+    // AoRecord is synchronous Soft Channel (process() returns
+    // Complete immediately). The synchronous-completion clear
+    // point in `put_record_field_from_ca` runs after the
+    // `process_record_with_links` call returns — so the
+    // test-observable end state is PUTF=false. The companion
+    // async test below differentiates "stays set through round
+    // trip" vs the pre-fix "always false during process".
+    let db = PvDatabase::new();
+    db.add_record("PUTF_SYNC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let _ = db
+        .put_record_field_from_ca("PUTF_SYNC", "VAL", EpicsValue::Double(42.0))
+        .await;
+
+    let rec = db.get_record("PUTF_SYNC").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        !inst.common.putf,
+        "after synchronous put completion, PUTF must clear (mirrors C recGblFwdLink:302)"
+    );
+}
+
+/// Async-completion path: for a record that returns AsyncPending,
+/// PUTF must remain TRUE across the device round trip and clear
+/// only when `complete_async_record` runs. C parity:
+/// `dbAccess.c::dbPutField:1276` sets putf=TRUE; the async device's
+/// completion eventually calls `dbProcess` again, which runs through
+/// `recGblFwdLink` (clears putf).
+#[tokio::test]
+async fn test_putf_survives_async_round_trip_and_clears_on_completion() {
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_PUTF", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Drive a CA put. AsyncRecord returns AsyncPending, so the
+    // process call returns with PACT=true; PUTF must stay TRUE.
+    let _ = db
+        .put_record_field_from_ca("ASYNC_PUTF", "VAL", EpicsValue::Double(7.0))
+        .await;
+
+    {
+        let rec = db.get_record("ASYNC_PUTF").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "async pending → PACT=true");
+        assert!(
+            inst.common.putf,
+            "PUTF must remain TRUE across the async round trip — \
+             pre-fix the Rust port cleared it before the process call \
+             so async-completion logic could not classify the trigger \
+             as put-driven"
+        );
+    }
+
+    // Now fire the async completion. PUTF must clear (mirrors C
+    // recGblFwdLink:302 after the FLNK dispatch).
+    db.complete_async_record("ASYNC_PUTF").await.unwrap();
+    {
+        let rec = db.get_record("ASYNC_PUTF").await.unwrap();
+        let inst = rec.read().await;
+        assert!(!inst.is_processing(), "completion clears PACT");
+        assert!(
+            !inst.common.putf,
+            "complete_async_record_inner must clear PUTF (recGblFwdLink parity)"
+        );
+    }
+}
+
 /// epics-base PR #3fb10b6 regression: only the record directly
 /// receiving a dbPut should carry PUTF=1 during chain processing.
 /// Pre-fix the CP-target dispatch set PUTF=true on every chained
@@ -1391,6 +1564,59 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
     assert_eq!(inst.common.amsg, "Async in progress");
 }
 
+// C `dbAccess.c:539-541` — when TPRO is set on a record whose PACT is
+// true, dbProcess prints "<thread>: dbProcess of Active '<name>' with
+// RPRO=<n>" before the bail decision. The Rust port emits the same
+// line via eprintln; this test exercises the path and verifies (a)
+// TPRO=true does not interfere with the bail decision (lcnt still
+// increments) and (b) RPRO state is preserved through the guard so
+// the diagnostic value is meaningful.
+#[tokio::test]
+async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_TPRO", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Set TPRO=true and RPRO=true so the diagnostic line carries
+    // observable state.
+    {
+        let rec = db.get_record("ASYNC_TPRO").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.tpro = true;
+        inst.common.rpro = true;
+    }
+
+    // Cycle 1: drive into PACT.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_TPRO", &mut visited, 0)
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("ASYNC_TPRO").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "must enter PACT");
+        assert!(inst.common.tpro, "TPRO must be preserved");
+        assert!(inst.common.rpro, "RPRO must be preserved across PACT entry");
+    }
+
+    // Re-entry while PACT=true: bail with lcnt increment. Diagnostic
+    // is emitted as a side effect (eprintln) but the bail outcome
+    // matches the non-TPRO case (verified by the silent-bail test).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_TPRO", &mut visited, 0)
+        .await
+        .unwrap();
+    let rec = db.get_record("ASYNC_TPRO").await.unwrap();
+    let inst = rec.read().await;
+    assert!(inst.is_processing(), "still PACT after bail");
+    assert_eq!(inst.common.lcnt, 1, "lcnt must have advanced");
+    assert!(
+        inst.common.rpro,
+        "RPRO must remain unchanged by the diagnostic path"
+    );
+}
+
 // After PACT clears via complete_async_record, the next process must
 // reset lcnt to 0 (mirrors C `else { precord->lcnt = 0; }`).
 #[tokio::test]
@@ -2054,6 +2280,93 @@ async fn test_dfanout_value_write() {
     }
 }
 
+/// C `dfanoutRecord.c:115-122` reads VAL from DOL on every process
+/// cycle when `omsl == menuOmslclosed_loop`. The Rust port previously
+/// omitted dfanout from the DOL-eligible record-type list in
+/// `processing.rs::process_record_with_links_inner`, so a dfanout
+/// configured with OMSL=closed_loop never sourced VAL from DOL —
+/// every cycle silently kept the previously-cached VAL.
+#[tokio::test]
+async fn test_dfanout_omsl_closed_loop_sources_val_from_dol() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+
+    let db = PvDatabase::new();
+
+    // Upstream setpoint source.
+    db.add_record("DOL_SRC", Box::new(AoRecord::new(7.5)))
+        .await
+        .unwrap();
+
+    // dfanout with OMSL=closed_loop and DOL=DOL_SRC. SELM=0 (All)
+    // distributes VAL to OUTA + OUTB.
+    let mut dfan = DfanoutRecord::new(0.0);
+    dfan.selm = 0;
+    dfan.outa = "DFAN_DEST_A".to_string();
+    dfan.outb = "DFAN_DEST_B".to_string();
+    dfan.dol = "DOL_SRC".to_string();
+    dfan.omsl = 1; // closed_loop (menuOmslclosed_loop)
+    db.add_record("DFAN_OMSL", Box::new(dfan)).await.unwrap();
+
+    db.add_record("DFAN_DEST_A", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("DFAN_DEST_B", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DFAN_OMSL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // DOL_SRC's VAL (7.5) must have flowed through DOL → dfanout.VAL → OUTA/OUTB.
+    let val_a = db.get_pv("DFAN_DEST_A").await.unwrap();
+    assert!(
+        matches!(val_a, EpicsValue::Double(v) if (v - 7.5).abs() < 1e-10),
+        "DFAN_DEST_A must reflect DOL_SRC (=7.5), got {val_a:?}"
+    );
+    let val_b = db.get_pv("DFAN_DEST_B").await.unwrap();
+    assert!(
+        matches!(val_b, EpicsValue::Double(v) if (v - 7.5).abs() < 1e-10),
+        "DFAN_DEST_B must reflect DOL_SRC (=7.5), got {val_b:?}"
+    );
+}
+
+/// Companion to the OMSL=closed_loop test: with OMSL=supervisory
+/// (default), DOL must NOT be evaluated even if a DOL link is set —
+/// VAL remains under operator control. This pins the gating so a
+/// future refactor cannot silently widen the closed-loop scope.
+#[tokio::test]
+async fn test_dfanout_omsl_supervisory_ignores_dol() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("DOL_SRC2", Box::new(AoRecord::new(99.0)))
+        .await
+        .unwrap();
+
+    let mut dfan = DfanoutRecord::new(3.0);
+    dfan.selm = 0;
+    dfan.outa = "DFAN_DEST_A2".to_string();
+    dfan.dol = "DOL_SRC2".to_string();
+    dfan.omsl = 0; // supervisory (menuOmslsupervisory)
+    db.add_record("DFAN_SUP", Box::new(dfan)).await.unwrap();
+    db.add_record("DFAN_DEST_A2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DFAN_SUP", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let val_a = db.get_pv("DFAN_DEST_A2").await.unwrap();
+    assert!(
+        matches!(val_a, EpicsValue::Double(v) if (v - 3.0).abs() < 1e-10),
+        "OMSL=supervisory must keep the operator-staged VAL (=3.0), got {val_a:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_seq_dol_lnk_dispatch() {
     use epics_base_rs::server::records::seq::SeqRecord;
@@ -2207,17 +2520,30 @@ async fn test_sdis_cp_link_registration() {
     assert_eq!(targets, vec!["GUARDED"]);
 }
 
+/// C `epicsTimeEventBestTime = -1` (epicsTime.h:103). The C path
+/// (`recGbl.c::recGblGetTimeStampSimm:324-328`) calls
+/// `epicsTimeGetEvent(-1)` unconditionally — that delegates to
+/// `generalTimeGetEventPriority(-1)` (BestTime providers). A device
+/// support that wants to keep its own timestamp must signal
+/// TSE = -2 (epicsTimeEventDeviceTime), not -1.
+///
+/// Regression: the pre-fix Rust port read TSE=-1 as
+/// "device-provided with BestTime fallback" and gated the call on
+/// UNIX_EPOCH. A stale device write of any non-epoch SystemTime
+/// suppressed every subsequent BestTime refresh.
 #[tokio::test]
-async fn test_tse_minus1_preserves_device_timestamp() {
+async fn test_tse_minus1_always_overwrites_via_best_time() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    let device_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567);
+    // Stale but non-epoch timestamp — exactly the case the pre-fix
+    // path mis-classified as "device-provided, keep".
+    let stale = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567);
     if let Some(rec) = db.get_record("REC").await {
         let mut inst = rec.write().await;
         inst.common.tse = -1;
-        inst.common.time = device_time;
+        inst.common.time = stale;
     }
     let mut visited = HashSet::new();
     db.process_record_with_links("REC", &mut visited, 0)
@@ -2225,7 +2551,11 @@ async fn test_tse_minus1_preserves_device_timestamp() {
         .unwrap();
     let rec = db.get_record("REC").await.unwrap();
     let inst = rec.read().await;
-    assert_eq!(inst.common.time, device_time);
+    assert_ne!(
+        inst.common.time, stale,
+        "TSE=-1 must always overwrite via generalTime BestTime, matching \
+         C `epicsTimeGetEvent(-1)` called unconditionally"
+    );
 }
 
 #[tokio::test]

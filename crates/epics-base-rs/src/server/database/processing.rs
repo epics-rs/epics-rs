@@ -130,6 +130,24 @@ impl PvDatabase {
             const MAX_LOCK: i16 = 10;
             let mut instance = rec.write().await;
             if instance.is_processing() {
+                // C `dbAccess.c:539-541` — when TPRO is set on a record
+                // whose PACT is true, print the diagnostic line before
+                // the bail decision. The C path emits:
+                //   "%s: dbProcess of Active '%s' with RPRO=%d"
+                // mirroring the same context format the regular trace
+                // path below uses (thread/client name + record name +
+                // current RPRO bit). Without this, an operator
+                // debugging a stuck async record sees NO sign that the
+                // entry guard is firing — they only notice the
+                // eventual SCAN_ALARM after MAX_LOCK=10 attempts.
+                if instance.common.tpro {
+                    eprintln!(
+                        "[TPRO] {}: dbProcess of Active '{}' with RPRO={}",
+                        instance.name,
+                        instance.name,
+                        if instance.common.rpro { 1 } else { 0 },
+                    );
+                }
                 let stat = instance.common.stat;
                 let already_invalid =
                     instance.common.sevr >= crate::server::record::AlarmSeverity::Invalid;
@@ -162,6 +180,14 @@ impl PvDatabase {
                 changed_fields.push((
                     "STAT".to_string(),
                     EpicsValue::Short(instance.common.stat as i16),
+                ));
+                // Include AMSG so subscribers reading the alarm text
+                // observe "Async in progress" alongside the SCAN_ALARM
+                // transition (C `recGbl.c:210-211` posts STAT and AMSG
+                // together when `stat_mask` is non-zero).
+                changed_fields.push((
+                    "AMSG".to_string(),
+                    EpicsValue::String(instance.common.amsg.clone()),
                 ));
                 let snapshot = crate::server::record::ProcessSnapshot {
                     changed_fields,
@@ -270,10 +296,27 @@ impl PvDatabase {
             let inp = instance.parsed_inp.clone();
             let is_soft = crate::server::device_support::is_soft_dtyp(&instance.common.dtyp);
 
-            // DOL link info for output records with OMSL=CLOSED_LOOP
+            // DOL link info for output records with OMSL=CLOSED_LOOP.
+            //
+            // C parity: every record type whose DBD declares both an
+            // OMSL `menuOmsl` field AND a DOL link field must honour
+            // the closed-loop binding. `dfanoutRecord.c:115-122` shows
+            // dfanout doing this directly via `dbGetLink(&prec->dol,
+            // DBR_DOUBLE, &prec->val, ...)` when `omsl ==
+            // menuOmslclosed_loop`. The Rust port previously omitted
+            // `dfanout`, so a dfanout configured with OMSL=closed_loop
+            // never sourced VAL from DOL — every cycle silently used
+            // the previously-cached VAL, breaking any cascaded
+            // setpoint-distribution chain that relied on dfanout to
+            // re-read the input.
+            //
+            // The `aao` (array analog output) record is the only other
+            // OMSL-bearing C record; the Rust port does not implement
+            // aao (confirmed: no `crates/epics-base-rs/src/server/records/aao*.rs`),
+            // so it is a future gap, not a same-defect-not-fixed site.
             let dol = match rtype {
                 "ao" | "longout" | "int64out" | "bo" | "mbbo" | "mbboDirect" | "stringout"
-                | "lso" => {
+                | "lso" | "dfanout" => {
                     let omsl = instance
                         .record
                         .get_field("OMSL")
@@ -904,7 +947,14 @@ impl PvDatabase {
             if include_archive {
                 event_mask |= EventMask::LOG;
             }
-            if alarm_result.alarm_changed {
+            if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                // C `recGbl.c:194/203` — amsg-only OR sevr-changed sets
+                // `stat_mask = DBE_ALARM`, which raises `val_mask =
+                // DBE_ALARM` at line 212. Without this, an alarm whose
+                // sevr/stat is unchanged but whose amsg shifted (e.g.
+                // device re-flagging the same severity with a different
+                // human-readable cause) silently drops the AMSG event
+                // and any DBE_ALARM-only subscribers stay stale.
                 event_mask |= EventMask::ALARM;
             }
 
@@ -922,6 +972,7 @@ impl PvDatabase {
                     && field != "VAL"
                     && field != "SEVR"
                     && field != "STAT"
+                    && field != "AMSG"
                     && field != "UDF"
                 {
                     if let Some(val) = instance.resolve_field(field) {
@@ -950,6 +1001,18 @@ impl PvDatabase {
                 changed_fields.push((
                     "STAT".to_string(),
                     EpicsValue::Short(instance.common.stat as i16),
+                ));
+            }
+            // C `recGbl.c:210-211` — AMSG is posted whenever
+            // `stat_mask` is non-zero, i.e. on sevr-change, stat-change,
+            // OR amsg-change. The Rust port previously only posted AMSG
+            // when sevr/stat changed; an amsg-only update was silently
+            // dropped, leaving CA / PVA subscribers reading the stale
+            // pre-cycle message string.
+            if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                changed_fields.push((
+                    "AMSG".to_string(),
+                    EpicsValue::String(instance.common.amsg.clone()),
                 ));
             }
             // C parity (recGbl.c:216): when recGblResetAlarms raises
@@ -1359,7 +1422,10 @@ impl PvDatabase {
             if include_archive {
                 event_mask |= EventMask::LOG;
             }
-            if alarm_result.alarm_changed {
+            if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                // C `recGbl.c:194/203` — same parity rule as the main
+                // process path above (see comment there): amsg-only OR
+                // sevr/stat change → DBE_ALARM.
                 event_mask |= EventMask::ALARM;
             }
 
@@ -1379,6 +1445,16 @@ impl PvDatabase {
                     EpicsValue::Short(instance.common.stat as i16),
                 ));
             }
+            // C `recGbl.c:210-211` — AMSG is posted whenever
+            // `stat_mask` is non-zero. Mirror the main-path AMSG branch
+            // (process_record_with_links_inner) so async completions
+            // also surface amsg-only updates.
+            if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                changed_fields.push((
+                    "AMSG".to_string(),
+                    EpicsValue::String(instance.common.amsg.clone()),
+                ));
+            }
             // C parity (recGbl.c:216): when recGblResetAlarms raises
             // `acks`, post it so operator screens that subscribe to
             // ACKS see the sticky-alarm severity update.
@@ -1395,7 +1471,7 @@ impl PvDatabase {
                     EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
                 ));
             }
-            // Add subscribed non-{VAL,SEVR,STAT,UDF} fields that
+            // Add subscribed non-{VAL,SEVR,STAT,AMSG,UDF} fields that
             // actually changed since last notification — mirrors the
             // main-path snapshot gate (process_record_with_links_inner
             // L794-820). Without this, every async-completion cycle
@@ -1409,6 +1485,7 @@ impl PvDatabase {
                     && field != "VAL"
                     && field != "SEVR"
                     && field != "STAT"
+                    && field != "AMSG"
                     && field != "UDF"
                 {
                     if let Some(val) = instance.resolve_field(field) {
@@ -1590,6 +1667,20 @@ impl PvDatabase {
 
         // CP link targets
         self.dispatch_cp_targets(name, visited, depth).await;
+
+        // C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` after
+        // the forward-link dispatch. The same clearing must happen
+        // at the tail of the async-completion path (this is the moral
+        // equivalent of the synchronous completion path in
+        // `put_record_field_from_ca` which clears after
+        // `process_record_with_links` returns). Without this, a
+        // record that completed an async write triggered by a
+        // CA put would keep `putf=1` forever, leaking into every
+        // subsequent scan-driven process cycle.
+        {
+            let mut guard = rec.write().await;
+            guard.common.putf = false;
+        }
 
         Ok(())
     }

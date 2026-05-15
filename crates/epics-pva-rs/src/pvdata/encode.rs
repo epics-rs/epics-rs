@@ -567,11 +567,16 @@ fn encode_structure_body_cached(
 pub type TypeCache = std::collections::HashMap<u16, FieldDesc>;
 
 /// Hard ceiling on FieldDesc / PvField nesting depth during decode.
-/// pvxs uses the same convention (`Decoder::max_depth = 64`); without
-/// it an adversarial peer can craft a deeply-nested Structure tree
-/// that blows the per-task stack (tokio default 2 MB / ~256 KB on
-/// macOS — well within reach at ~50K levels of recursion).
-const MAX_FIELD_DEPTH: u32 = 64;
+/// Matches pvxs `dataencode.cpp:71` (`from_wire(... depth) { if(depth>20)
+/// fault; }`) — without parity here, a Rust-emitted FieldDesc with depth
+/// 21..=64 would round-trip through Rust but be rejected by pvxs as an
+/// invalid descriptor, breaking interop with the reference client/server.
+/// 20 is also the value the spec doc implies (typical NT* trees nest ≤6).
+/// An adversarial peer can no longer craft a deeply-nested Structure
+/// tree to blow the per-task stack (tokio default 2 MB / ~256 KB on
+/// macOS — well within reach of the previous 64-level cap at ~50K
+/// recursion frames).
+const MAX_FIELD_DEPTH: u32 = 20;
 
 /// Decode a top-level `FieldDesc` (`name` + type description).
 pub fn decode_field_desc(
@@ -1764,5 +1769,47 @@ mod tests {
 
         let merged = fill_unmarked_from_prior(&desc, &bs, 0, decoded, &prior);
         assert!(matches!(merged, PvField::Scalar(ScalarValue::Int(99))));
+    }
+
+    /// Build a Structure tree nested `n` levels deep:
+    /// `Struct { f0: Struct { f0: ... { f0: Scalar(Int) } } }`.
+    fn nested_struct(n: u32) -> FieldDesc {
+        let mut d = FieldDesc::Scalar(ScalarType::Int);
+        for _ in 0..n {
+            d = FieldDesc::Structure {
+                struct_id: String::new(),
+                fields: vec![("f0".into(), d)],
+            };
+        }
+        d
+    }
+
+    /// pvxs `dataencode.cpp:71` rejects FieldDesc with nesting depth >20.
+    /// Rust must reach the same conclusion or a Rust client could ingest
+    /// a 30-deep tree that the pvxs reference server would have rejected
+    /// — interop divergence.
+    #[test]
+    fn decode_field_desc_caps_nesting_at_pvxs_parity_depth() {
+        // depth = 20 (the cap) must decode fine.
+        let ok = nested_struct(19); // 19 levels of Struct wrapping = depth 20 at innermost Struct's check
+        let mut buf = Vec::new();
+        encode_type_desc(&ok, ByteOrder::Little, &mut buf);
+        let mut cur = Cursor::new(buf.as_slice());
+        let decoded =
+            decode_type_desc(&mut cur, ByteOrder::Little).expect("depth-20 descriptor must decode");
+        assert_eq!(format!("{decoded}"), format!("{ok}"));
+
+        // depth = 25 (>20) must be rejected: the per-level cap engages.
+        let too_deep = nested_struct(25);
+        let mut buf2 = Vec::new();
+        encode_type_desc(&too_deep, ByteOrder::Little, &mut buf2);
+        let mut cur2 = Cursor::new(buf2.as_slice());
+        let err = decode_type_desc(&mut cur2, ByteOrder::Little)
+            .expect_err("depth-25 descriptor must be rejected (pvxs parity)");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("MAX_FIELD_DEPTH"),
+            "expected MAX_FIELD_DEPTH error, got: {msg}"
+        );
     }
 }

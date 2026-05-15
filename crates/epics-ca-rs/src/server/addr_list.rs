@@ -63,13 +63,24 @@ pub fn from_env() -> CasUdpConfig {
         })
         .unwrap_or(CA_REPEATER_PORT);
 
-    // Beacon addr list: explicit EPICS_CAS_BEACON_ADDR_LIST first; otherwise
-    // fall back to EPICS_CA_ADDR_LIST so a single setting can drive both
-    // sides at small sites.
+    // Beacon addr list: only EPICS_CAS_BEACON_ADDR_LIST. The C IOC
+    // server (rsrv/caservertask.c:413) calls
+    // `addAddrToChannelAccessAddressList ( &temp,
+    //   &EPICS_CAS_BEACON_ADDR_LIST, ca_beacon_port, 0 )` with no
+    // fallback. The fallback to EPICS_CA_ADDR_LIST was intentionally
+    // removed in EPICS 3.15 (documentation/RELEASE-3.15.md): "CA
+    // servers (RSRV and PCAS) would build the beacon address list
+    // using EPICS_CA_ADDR_LIST if EPICS_CAS_BEACON_ADDR_LIST was no
+    // set. This is no longer done. Sites depending on this should set
+    // both environment variables to the same value." The previous
+    // Rust behaviour silently re-enabled the deprecated fallback,
+    // sending beacons to every search target on the client list —
+    // unwanted UDP fan-out on sites that intentionally separated
+    // client search targets from beacon destinations. Note: the
+    // standalone `caRepeater` daemon (repeater.cpp:545-547) DOES still
+    // fall back; that path lives in `repeater.rs` and is unaffected.
     let mut beacon_addrs: Vec<SocketAddr> = Vec::new();
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_ADDR_LIST") {
-        beacon_addrs.extend(parse_addr_list(&list, beacon_port));
-    } else if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_ADDR_LIST") {
         beacon_addrs.extend(parse_addr_list(&list, beacon_port));
     }
 
@@ -216,5 +227,94 @@ mod tests {
     fn empty_list_returns_empty() {
         assert!(parse_addr_list("", 5065).is_empty());
         assert!(parse_ipv4_list("   ").is_empty());
+    }
+
+    /// `from_env` MUST NOT fall back to `EPICS_CA_ADDR_LIST` for the
+    /// IOC beacon list. C IOC `rsrv/caservertask.c:413` removed that
+    /// fallback in EPICS 3.15 (RELEASE-3.15.md). Sites now must set
+    /// both env vars; Rust no longer silently re-enables the
+    /// deprecated path. The standalone caRepeater (`repeater.rs`)
+    /// path keeps the fallback for documented parity with
+    /// `epics-base/modules/ca/src/client/repeater.cpp:545-547`.
+    #[test]
+    #[serial_test::serial]
+    fn from_env_does_not_fall_back_to_ca_addr_list() {
+        let saved_beacon = std::env::var("EPICS_CAS_BEACON_ADDR_LIST").ok();
+        let saved_ca = std::env::var("EPICS_CA_ADDR_LIST").ok();
+        let saved_auto = std::env::var("EPICS_CAS_AUTO_BEACON_ADDR_LIST").ok();
+        // SAFETY: gated by `serial_test::serial`; mutations confined
+        // to this test, restored before return.
+        unsafe {
+            std::env::remove_var("EPICS_CAS_BEACON_ADDR_LIST");
+            std::env::set_var("EPICS_CA_ADDR_LIST", "203.0.113.42:5070");
+            // Disable auto-discovery so the result is deterministic
+            // (no host broadcast addrs creeping in).
+            std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
+        }
+
+        let cfg = from_env();
+        let leaked = cfg
+            .beacon_addrs
+            .iter()
+            .any(|a| matches!(a, SocketAddr::V4(v4) if v4.ip().octets() == [203, 0, 113, 42]));
+        assert!(
+            !leaked,
+            "EPICS_CA_ADDR_LIST entry leaked into beacon_addrs: {:?}",
+            cfg.beacon_addrs
+        );
+
+        // SAFETY: same scoping as above.
+        unsafe {
+            match saved_beacon {
+                Some(v) => std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_BEACON_ADDR_LIST"),
+            }
+            match saved_ca {
+                Some(v) => std::env::set_var("EPICS_CA_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CA_ADDR_LIST"),
+            }
+            match saved_auto {
+                Some(v) => std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST"),
+            }
+        }
+    }
+
+    /// When `EPICS_CAS_BEACON_ADDR_LIST` is set, its entries appear.
+    /// Companion assertion to confirm the env-reading branch still
+    /// works after removing the fallback.
+    #[test]
+    #[serial_test::serial]
+    fn from_env_uses_beacon_addr_list_when_set() {
+        let saved_beacon = std::env::var("EPICS_CAS_BEACON_ADDR_LIST").ok();
+        let saved_auto = std::env::var("EPICS_CAS_AUTO_BEACON_ADDR_LIST").ok();
+        // SAFETY: serial_test::serial.
+        unsafe {
+            std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", "198.51.100.7:5099");
+            std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
+        }
+
+        let cfg = from_env();
+        let hit = cfg.beacon_addrs.iter().any(|a| {
+            matches!(a, SocketAddr::V4(v4)
+                if v4.ip().octets() == [198, 51, 100, 7] && v4.port() == 5099)
+        });
+        assert!(
+            hit,
+            "EPICS_CAS_BEACON_ADDR_LIST entry missing from beacon_addrs: {:?}",
+            cfg.beacon_addrs
+        );
+
+        // SAFETY: same scoping as above.
+        unsafe {
+            match saved_beacon {
+                Some(v) => std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_BEACON_ADDR_LIST"),
+            }
+            match saved_auto {
+                Some(v) => std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST"),
+            }
+        }
     }
 }

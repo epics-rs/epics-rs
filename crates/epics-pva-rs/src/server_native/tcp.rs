@@ -1122,11 +1122,15 @@ async fn handle_unsupported_op(
     let mut cur = frame.cursor();
     let _sid = cur.get_u32(order).unwrap_or(0);
     let ioid = cur.get_u32(order).unwrap_or(0);
-    let _subcmd = cur.get_u8().unwrap_or(0);
+    let subcmd = cur.get_u8().unwrap_or(0);
 
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
-    payload.put_u8(0x00); // subcmd 0 = data response
+    // Echo the request subcmd per pvxs `serverget.cpp:83`. The
+    // unsupported-op error mirrors the regular op error response
+    // shape so pvxs / pvAccessJava clients surface the message
+    // verbatim instead of a protocol-violation diagnostic.
+    payload.put_u8(subcmd);
     let status = Status::error(format!("{label} not supported by this server"));
     status.write_into(order, &mut payload);
 
@@ -1589,7 +1593,14 @@ async fn handle_op(
             };
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
-            payload.put_u8(0x00);
+            // pvxs `serverget.cpp:83` echoes the request `subcmd`
+            // verbatim. For GET data phase pvxs client always sends
+            // `subcmd=0x00` (clientget.cpp:303 `state==Exec`) so the
+            // observable byte happens to match the hardcoded 0x00, but
+            // mirroring the request is the parity-correct shape and
+            // future-proofs the response when the client adds new
+            // QoS bits (e.g. `0x04` PROCESS).
+            payload.put_u8(subcmd);
             Status::ok().write_into(order, &mut payload);
             // Emit only the fields the client's pvRequest selected.
             mask.write_into(order, &mut payload);
@@ -1642,7 +1653,16 @@ async fn handle_op(
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
-            payload.put_u8(0x00);
+            // pvxs `serverget.cpp:83` echoes the request `subcmd`. For
+            // a plain PUT EXEC the client sends `0x00`; for PUT_GET
+            // (readback) the client sends `0x40` (clientget.cpp:300,
+            // `state==GetOPut`). Hardcoding `0x00` makes the response
+            // header lie to the client: pvxs `clientget.cpp:362-370`
+            // dispatches the response decode on `subcmd & 0x40`, so a
+            // PUT_GET reply with `subcmd=0x00` was parsed as
+            // status-only and the readback bytes (status+bitset+value)
+            // were silently dropped on the floor.
+            payload.put_u8(subcmd);
             match result {
                 Ok(()) => {
                     // PUT_GET (subcmd bit 0x40 set on the request): client
@@ -2234,7 +2254,12 @@ async fn handle_op(
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
-            payload.put_u8(0x00);
+            // pvxs `serverget.cpp:83` echoes the request `subcmd`.
+            // RPC EXEC always sends `0x00`, but mirror the request
+            // for parity-correctness — pvxs validates the response
+            // subcmd against the local op state and treats a mismatch
+            // as a protocol fault.
+            payload.put_u8(subcmd);
             match result {
                 Ok((resp_desc, resp_value)) => {
                     Status::ok().write_into(order, &mut payload);
@@ -2624,6 +2649,254 @@ mod tests {
         // Header (8) + ioid placeholder isn't part of DESTROY_CHANNEL;
         // payload is sid (4) + cid (4) = 8 total, so frame length = 16.
         assert_eq!(reply.len(), PvaHeader::SIZE + 8);
+    }
+
+    /// pvxs `serverget.cpp:83` echoes the request `subcmd` byte in the
+    /// PUT data response. The PUT_GET (readback) case sets bit 0x40 in
+    /// the client subcmd; pvxs `clientget.cpp:362-370` dispatches the
+    /// reply decode based on that bit. A server response that hardcodes
+    /// 0x00 makes the client decode the wrong shape: the bitset + value
+    /// bytes carried in the frame are misread as trailing garbage and
+    /// the PUT_GET readback is silently lost.
+    #[tokio::test]
+    async fn put_get_response_echoes_request_subcmd() {
+        use crate::pvdata::FieldDesc;
+        use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+        use crate::server_native::tcp::ClientCredentials;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 100;
+
+        // Build a SharedSource with one PV "dut" of type NTScalar<f64>.
+        let pv = SharedPV::new();
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
+        initial
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        pv.open(intro.clone(), PvField::Structure(initial));
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        // Pre-populate a ChannelState as if CREATE_CHANNEL had already
+        // run, so we can drive the PUT INIT + EXEC frames directly.
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // PUT INIT: sid + ioid + subcmd=0x08 + pvRequest(type + value).
+        // Use an empty Structure pvRequest (full mask).
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let req_val = PvField::Structure(PvStructure::new(""));
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08); // INIT
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Put, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT INIT ok");
+        // Drain INIT response — not the focus of this test.
+        let _init_resp = rx.try_recv().expect("INIT response emitted");
+
+        // PUT EXEC with subcmd=0x40 (PUT_GET readback): sid + ioid +
+        // subcmd + bitset + value.
+        let new_val = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.5))));
+            PvField::Structure(s)
+        };
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x40); // PUT_GET readback
+        let bs = BitSet::all_set(intro.total_bits());
+        bs.write_into(order, &mut exec_payload);
+        crate::pvdata::encode::encode_pv_field(&new_val, &intro, order, &mut exec_payload);
+        let exec_frame = synth_frame(Command::Put, order, exec_payload);
+
+        handle_op(
+            &source,
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT EXEC ok");
+
+        let resp = rx.try_recv().expect("PUT EXEC response emitted");
+        // Skip 8-byte header; payload = ioid (4) + subcmd (1) + ...
+        assert!(resp.len() >= PvaHeader::SIZE + 5);
+        let resp_subcmd = resp[PvaHeader::SIZE + 4];
+        assert_eq!(
+            resp_subcmd, 0x40,
+            "PUT_GET reply subcmd must echo the 0x40 readback bit (pvxs serverget.cpp:83)"
+        );
+    }
+
+    /// Companion: a plain PUT EXEC (subcmd=0x00, no readback bit) must
+    /// still emit `subcmd=0x00` in the response. Confirms the echo
+    /// behaviour is symmetric — neither leaking 0x40 when not requested
+    /// nor regressing the common case.
+    #[tokio::test]
+    async fn put_exec_response_echoes_zero_subcmd() {
+        use crate::pvdata::FieldDesc;
+        use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+        use crate::server_native::tcp::ClientCredentials;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 200;
+
+        let pv = SharedPV::new();
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
+        initial
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        pv.open(intro.clone(), PvField::Structure(initial));
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let req_val = PvField::Structure(PvStructure::new(""));
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Put, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT INIT ok");
+        let _ = rx.try_recv().expect("INIT resp");
+
+        // Plain PUT EXEC: subcmd=0x00.
+        let new_val = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+            PvField::Structure(s)
+        };
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x00);
+        let bs = BitSet::all_set(intro.total_bits());
+        bs.write_into(order, &mut exec_payload);
+        crate::pvdata::encode::encode_pv_field(&new_val, &intro, order, &mut exec_payload);
+        let exec_frame = synth_frame(Command::Put, order, exec_payload);
+
+        handle_op(
+            &source,
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT EXEC ok");
+        let resp = rx.try_recv().expect("PUT EXEC response emitted");
+        assert!(resp.len() >= PvaHeader::SIZE + 5);
+        let resp_subcmd = resp[PvaHeader::SIZE + 4];
+        assert_eq!(
+            resp_subcmd, 0x00,
+            "plain PUT EXEC reply subcmd must echo 0x00"
+        );
     }
 }
 

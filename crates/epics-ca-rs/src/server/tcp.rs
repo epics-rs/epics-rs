@@ -1254,11 +1254,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     "rejecting CREATE_CHAN: per-client channel limit reached"
                 );
                 metrics::counter!("ca_server_channel_limit_rejects_total").increment(1);
-                let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
-                fail.cid = hdr.cid;
-                let mut w = writer.lock().await;
-                w.write_all(&fail.to_bytes()).await?;
-                // flush deferred to handle_client outer loop (batched)
+                // C parity: `claim_ciu_action` (rsrv/camessage.c:1229-1239)
+                // routes channel-allocation failure through
+                // `send_err(mp, ECA_ALLOCMEM, …)`, NOT
+                // CREATE_CH_FAIL. CREATE_CH_FAIL is reserved for the
+                // `dbChannel_create` (PV/field not found) branch
+                // (camessage.c:1212-1219). libca
+                // `exceptionRespAction` surfaces the ECA_ALLOCMEM
+                // status to the user-level callback so the client
+                // knows "server out of resources" vs CREATE_CH_FAIL's
+                // "PV does not exist on this server" — the existing
+                // Rust path conflated the two, leading clients to
+                // remove our address from their resolution cache on
+                // a transient server saturation. Per `vsend_err`'s
+                // switch, CA_PROTO_CREATE_CHAN falls to `default`
+                // and uses `0xffffffff` for `m_cid`.
+                send_ca_error(writer, hdr, ECA_ALLOCMEM, u32::MAX, "channel limit reached").await?;
                 return Ok(());
             }
 

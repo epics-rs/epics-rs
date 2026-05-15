@@ -111,6 +111,7 @@ fn bench_interrupt_event_throughput(c: &mut Criterion) {
                     value: ParamValue::Int32(i),
                     timestamp: std::time::SystemTime::now(),
                     uint32_changed_mask: 0,
+                    ..Default::default()
                 });
             }
         });

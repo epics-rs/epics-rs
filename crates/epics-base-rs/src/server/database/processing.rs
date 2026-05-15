@@ -181,6 +181,14 @@ impl PvDatabase {
                     "STAT".to_string(),
                     EpicsValue::Short(instance.common.stat as i16),
                 ));
+                // Include AMSG so subscribers reading the alarm text
+                // observe "Async in progress" alongside the SCAN_ALARM
+                // transition (C `recGbl.c:210-211` posts STAT and AMSG
+                // together when `stat_mask` is non-zero).
+                changed_fields.push((
+                    "AMSG".to_string(),
+                    EpicsValue::String(instance.common.amsg.clone()),
+                ));
                 let snapshot = crate::server::record::ProcessSnapshot {
                     changed_fields,
                     event_mask: crate::server::recgbl::EventMask::VALUE
@@ -922,7 +930,14 @@ impl PvDatabase {
             if include_archive {
                 event_mask |= EventMask::LOG;
             }
-            if alarm_result.alarm_changed {
+            if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                // C `recGbl.c:194/203` — amsg-only OR sevr-changed sets
+                // `stat_mask = DBE_ALARM`, which raises `val_mask =
+                // DBE_ALARM` at line 212. Without this, an alarm whose
+                // sevr/stat is unchanged but whose amsg shifted (e.g.
+                // device re-flagging the same severity with a different
+                // human-readable cause) silently drops the AMSG event
+                // and any DBE_ALARM-only subscribers stay stale.
                 event_mask |= EventMask::ALARM;
             }
 
@@ -940,6 +955,7 @@ impl PvDatabase {
                     && field != "VAL"
                     && field != "SEVR"
                     && field != "STAT"
+                    && field != "AMSG"
                     && field != "UDF"
                 {
                     if let Some(val) = instance.resolve_field(field) {
@@ -968,6 +984,18 @@ impl PvDatabase {
                 changed_fields.push((
                     "STAT".to_string(),
                     EpicsValue::Short(instance.common.stat as i16),
+                ));
+            }
+            // C `recGbl.c:210-211` — AMSG is posted whenever
+            // `stat_mask` is non-zero, i.e. on sevr-change, stat-change,
+            // OR amsg-change. The Rust port previously only posted AMSG
+            // when sevr/stat changed; an amsg-only update was silently
+            // dropped, leaving CA / PVA subscribers reading the stale
+            // pre-cycle message string.
+            if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                changed_fields.push((
+                    "AMSG".to_string(),
+                    EpicsValue::String(instance.common.amsg.clone()),
                 ));
             }
             // C parity (recGbl.c:216): when recGblResetAlarms raises
@@ -1377,7 +1405,10 @@ impl PvDatabase {
             if include_archive {
                 event_mask |= EventMask::LOG;
             }
-            if alarm_result.alarm_changed {
+            if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                // C `recGbl.c:194/203` — same parity rule as the main
+                // process path above (see comment there): amsg-only OR
+                // sevr/stat change → DBE_ALARM.
                 event_mask |= EventMask::ALARM;
             }
 
@@ -1397,6 +1428,16 @@ impl PvDatabase {
                     EpicsValue::Short(instance.common.stat as i16),
                 ));
             }
+            // C `recGbl.c:210-211` — AMSG is posted whenever
+            // `stat_mask` is non-zero. Mirror the main-path AMSG branch
+            // (process_record_with_links_inner) so async completions
+            // also surface amsg-only updates.
+            if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                changed_fields.push((
+                    "AMSG".to_string(),
+                    EpicsValue::String(instance.common.amsg.clone()),
+                ));
+            }
             // C parity (recGbl.c:216): when recGblResetAlarms raises
             // `acks`, post it so operator screens that subscribe to
             // ACKS see the sticky-alarm severity update.
@@ -1413,7 +1454,7 @@ impl PvDatabase {
                     EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
                 ));
             }
-            // Add subscribed non-{VAL,SEVR,STAT,UDF} fields that
+            // Add subscribed non-{VAL,SEVR,STAT,AMSG,UDF} fields that
             // actually changed since last notification — mirrors the
             // main-path snapshot gate (process_record_with_links_inner
             // L794-820). Without this, every async-completion cycle
@@ -1427,6 +1468,7 @@ impl PvDatabase {
                     && field != "VAL"
                     && field != "SEVR"
                     && field != "STAT"
+                    && field != "AMSG"
                     && field != "UDF"
                 {
                     if let Some(val) = instance.resolve_field(field) {

@@ -223,6 +223,94 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
     );
 }
 
+/// C `recGbl.c:194/210-211` — when only `amsg` changes (no SEVR/STAT
+/// transition), `stat_mask` is set to `DBE_ALARM` and STAT/AMSG/VAL
+/// are still posted. The Rust port previously only checked
+/// `alarm_changed` (sevr-or-stat) and silently dropped the AMSG-only
+/// update, leaving subscribers reading a stale message string.
+///
+/// Reproduce via MSS link: source carries Major severity. Cycle 1
+/// propagates the source amsg into the dest, raising sevr 0→Major
+/// (alarm_changed=true; AMSG flows in the normal path). Cycle 2
+/// changes the source amsg but keeps the same severity — dest's
+/// reset_alarms sees sevr Major→Major (alarm_changed=false) but
+/// amsg "msg1"→"msg2" (amsg_changed=true). The fix posts AMSG for
+/// this case so the subscriber sees the new message.
+#[tokio::test]
+async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
+    use epics_base_rs::server::recgbl::{EventMask, alarm_status};
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("SRC_AMSG", Box::new(AoRecord::new(7.0)))
+        .await
+        .unwrap();
+    db.add_record("DST_AMSG", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Source: Major severity with first amsg.
+    if let Some(rec) = db.get_record("SRC_AMSG").await {
+        let mut inst = rec.write().await;
+        inst.common.stat = alarm_status::HIHI_ALARM;
+        inst.common.sevr = AlarmSeverity::Major;
+        inst.common.amsg = "msg1".to_string();
+    }
+    // Dest: MSS link to source. Subscribe to AMSG with ALARM mask
+    // (C posts AMSG with stat_mask = DBE_ALARM on amsg-only change).
+    if let Some(rec) = db.get_record("DST_AMSG").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("SRC_AMSG NPP MSS".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    // Cycle 1: drives sevr 0→Major, amsg ""→"msg1" (alarm_changed=true).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST_AMSG", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Now subscribe to AMSG with ALARM mask AFTER cycle 1, so
+    // last_posted seeds at "msg1".
+    let mut amsg_rx = {
+        let rec = db.get_record("DST_AMSG").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.add_subscriber("AMSG", 11, DbFieldType::String, EventMask::ALARM.bits())
+    }
+    .expect("AMSG subscription must be accepted");
+
+    // Source: keep severity Major, change amsg only.
+    if let Some(rec) = db.get_record("SRC_AMSG").await {
+        let mut inst = rec.write().await;
+        inst.common.amsg = "msg2".to_string();
+    }
+
+    // Cycle 2: dest picks up msg2. sevr stays Major (alarm_changed=false),
+    // amsg "msg1"→"msg2" (amsg_changed=true). AMSG event must flow.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST_AMSG", &mut visited, 0)
+        .await
+        .unwrap();
+
+    {
+        let rec = db.get_record("DST_AMSG").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(inst.common.sevr, AlarmSeverity::Major, "sevr unchanged");
+        assert_eq!(inst.common.amsg, "msg2", "amsg propagated");
+    }
+
+    let event = amsg_rx
+        .try_recv()
+        .expect("AMSG-only change must produce an event on DBE_ALARM-class subscribers");
+    assert!(
+        matches!(event.snapshot.value, EpicsValue::String(ref s) if s == "msg2"),
+        "AMSG event payload should be the new message, got {:?}",
+        event.snapshot.value
+    );
+}
+
 /// epics-base PR #3fb10b6 regression: only the record directly
 /// receiving a dbPut should carry PUTF=1 during chain processing.
 /// Pre-fix the CP-target dispatch set PUTF=true on every chained

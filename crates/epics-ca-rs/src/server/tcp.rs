@@ -1724,6 +1724,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         resp.available = ioid;
                         let mut w = writer.lock().await;
                         w.write_all(&resp.to_bytes()).await?;
+                    } else {
+                        // C `write_action` (`rsrv/camessage.c:741-750`)
+                        // emits `send_err(mp, ECA_NOWTACCESS, client,
+                        // RECORD_NAME(pciu->dbch))` even for the no-
+                        // notify WRITE. Without this branch the Rust
+                        // server dropped denied PROTO_WRITEs silently —
+                        // C libca's `cac::exception` path never fired,
+                        // so a `caput` from a read-only peer looked
+                        // like it had succeeded (no error callback)
+                        // even though the value never reached the DB.
+                        send_ca_error(writer, hdr, denied.eca_code(), hdr.cid, &audit_pv).await?;
                     }
                     state.audit("caput", &audit_pv, "", "denied").await;
                     return Ok(());
@@ -2301,6 +2312,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         CA_PROTO_SEARCH => {
             // TCP search — only supported for clients with minor version >= 4
             if state.client_minor_version < 4 {
+                return Ok(());
+            }
+            // C `search_reply_tcp` (rsrv/camessage.c:2246) rejects
+            // SEARCH whose `m_postsize <= 1` and silently returns
+            // RSRV_OK. Mirror that here so an attacker's empty-name
+            // SEARCH burst on an open TCP connection cannot drive
+            // `db.has_name("")` per frame nor trigger a NOT_FOUND
+            // amplification when CA_DO_REPLY is set.
+            if hdr.postsize <= 1 {
                 return Ok(());
             }
             let end = payload

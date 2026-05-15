@@ -95,9 +95,17 @@ pub fn from_env() -> CasUdpConfig {
         cfg.ignore_addrs = parse_ipv4_list(&list);
     }
 
-    if let Some(period) = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_PERIOD")
-        .and_then(|s| s.parse::<f64>().ok())
-    {
+    // C `online_notify.c::rsrv_online_notify_task:52-57` reads
+    // `EPICS_CAS_BEACON_PERIOD` and falls back to the deprecated
+    // `EPICS_CA_BEACON_PERIOD` if the server-side var is unset. The
+    // legacy var is still declared in libcom `envDefs.h:62` as
+    // "deprecated" precisely because old operator deployments rely on
+    // it. Honour the same fallback so a site migrating from a C IOC
+    // doesn't silently revert to the default 15s when only the legacy
+    // var is in their environment.
+    let raw_period = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_PERIOD")
+        .or_else(|| epics_base_rs::runtime::env::get("EPICS_CA_BEACON_PERIOD"));
+    if let Some(period) = raw_period.and_then(|s| s.parse::<f64>().ok()) {
         let secs = period.max(0.1);
         cfg.beacon_period = Duration::from_secs_f64(secs);
     }

@@ -3033,21 +3033,51 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
     if auto_addr.eq_ignore_ascii_case("YES") {
         let server_port = default_port;
-        for bcast in crate::server::addr_list::discover_broadcast_addrs() {
-            let sock = SocketAddr::V4(SocketAddrV4::new(bcast, server_port));
-            if !addrs.iter().any(|e| e.sock == sock) {
-                addrs.push(AddrEntry::new(sock, None, server_port));
-            }
-        }
-        // Limited broadcast as a last-resort fallback (multi-NIC
-        // enumeration may have returned nothing useful — e.g. on
-        // point-to-point links).
-        let fallback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, server_port));
-        if !addrs.iter().any(|e| e.sock == fallback) {
-            addrs.push(AddrEntry::new(fallback, None, server_port));
-        }
+        let bcasts = crate::server::addr_list::discover_broadcast_addrs();
+        append_auto_addr_entries(&mut addrs, &bcasts, server_port);
     }
     Ok(addrs)
+}
+
+/// AUTO_ADDR_LIST=YES expansion: append broadcast NICs, then a C-parity
+/// loopback fallback (when bcast enumeration is empty), then the
+/// Rust-only limited-broadcast safety net. Extracted from
+/// `parse_addr_list_with_hostnames` so the bcast list can be injected
+/// in unit tests (real-NIC enumeration is environment-dependent).
+fn append_auto_addr_entries(addrs: &mut Vec<AddrEntry>, bcasts: &[Ipv4Addr], server_port: u16) {
+    for bcast in bcasts {
+        let sock = SocketAddr::V4(SocketAddrV4::new(*bcast, server_port));
+        if !addrs.iter().any(|e| e.sock == sock) {
+            addrs.push(AddrEntry::new(sock, None, server_port));
+        }
+    }
+    // C parity (libca `iocinf.cpp::configureChannelAccessAddressList`,
+    // lines 199-223): when AUTO=YES AND broadcast-interface
+    // enumeration returns nothing, add `INADDR_LOOPBACK` so a
+    // pure-localhost setup (CI container, single-NIC dev box, host
+    // with only `lo`) still surfaces an in-host IOC. Without this,
+    // the only fallback below (`255.255.255.255`) reaches no
+    // interface on a host without a routable subnet, and
+    // localhost-only IOCs become invisible. Distinct from the
+    // explicit `EPICS_CA_ADDR_LIST` path above — that one already
+    // handles operators who name their loopback IOC explicitly.
+    if bcasts.is_empty() {
+        let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port));
+        if !addrs.iter().any(|e| e.sock == loopback) {
+            addrs.push(AddrEntry::new(loopback, None, server_port));
+        }
+    }
+    // Rust-only safety net (no C analogue): limited broadcast as a
+    // last-resort fallback. Multi-NIC enumeration may return only
+    // unusable broadcasts (point-to-point, IPv6-only), and
+    // `255.255.255.255` is the kernel's degenerate destination that
+    // the routing table usually pins to the default-route NIC.
+    // Cheap to include — `removeDuplicateAddresses` upstream is the
+    // CA-side dedupe, ours is the `!any` guard above.
+    let fallback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, server_port));
+    if !addrs.iter().any(|e| e.sock == fallback) {
+        addrs.push(AddrEntry::new(fallback, None, server_port));
+    }
 }
 
 #[cfg(test)]
@@ -3099,6 +3129,92 @@ mod ignore_servers_tests {
         assert!(v.contains(&Ipv4Addr::new(5, 6, 7, 8)));
         assert_eq!(v.len(), 2);
         unsafe { std::env::remove_var("EPICS_RS_CLIENT_IGNORE") };
+    }
+}
+
+#[cfg(test)]
+mod auto_addr_list_tests {
+    use super::*;
+
+    fn sock(ip: Ipv4Addr, port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(ip, port))
+    }
+
+    /// C parity — `iocinf.cpp::configureChannelAccessAddressList`
+    /// lines 199-223 add INADDR_LOOPBACK when broadcast enumeration
+    /// returns nothing. Without this, a pure-localhost host hits the
+    /// 255.255.255.255 path only and loopback IOCs are invisible.
+    #[test]
+    fn loopback_added_when_no_broadcasts() {
+        let mut addrs: Vec<AddrEntry> = Vec::new();
+        append_auto_addr_entries(&mut addrs, &[], 5064);
+        assert!(
+            addrs
+                .iter()
+                .any(|e| e.sock == sock(Ipv4Addr::LOCALHOST, 5064))
+        );
+        assert!(
+            addrs
+                .iter()
+                .any(|e| e.sock == sock(Ipv4Addr::BROADCAST, 5064))
+        );
+    }
+
+    /// When real broadcast NICs exist, loopback is NOT injected
+    /// (matches C: `if ellCount(&tmpList) == 0` gate).
+    #[test]
+    fn loopback_not_added_when_broadcasts_present() {
+        let mut addrs: Vec<AddrEntry> = Vec::new();
+        let bcasts = vec![Ipv4Addr::new(192, 168, 1, 255)];
+        append_auto_addr_entries(&mut addrs, &bcasts, 5064);
+        assert!(
+            addrs
+                .iter()
+                .any(|e| e.sock == sock(Ipv4Addr::new(192, 168, 1, 255), 5064))
+        );
+        assert!(
+            !addrs
+                .iter()
+                .any(|e| e.sock == sock(Ipv4Addr::LOCALHOST, 5064))
+        );
+        // Rust-only safety net still added.
+        assert!(
+            addrs
+                .iter()
+                .any(|e| e.sock == sock(Ipv4Addr::BROADCAST, 5064))
+        );
+    }
+
+    /// Dedup: pre-populated entries (e.g. explicit ADDR_LIST) are not
+    /// re-added even when AUTO=YES would otherwise propose them.
+    #[test]
+    fn does_not_duplicate_existing_entries() {
+        let mut addrs: Vec<AddrEntry> =
+            vec![AddrEntry::new(sock(Ipv4Addr::LOCALHOST, 5064), None, 5064)];
+        append_auto_addr_entries(&mut addrs, &[], 5064);
+        let count = addrs
+            .iter()
+            .filter(|e| e.sock == sock(Ipv4Addr::LOCALHOST, 5064))
+            .count();
+        assert_eq!(count, 1, "loopback must not be duplicated");
+    }
+
+    /// Custom EPICS_CA_SERVER_PORT carries into all synthesized
+    /// entries (loopback + safety-net broadcast).
+    #[test]
+    fn respects_custom_server_port() {
+        let mut addrs: Vec<AddrEntry> = Vec::new();
+        append_auto_addr_entries(&mut addrs, &[], 5066);
+        assert!(
+            addrs
+                .iter()
+                .any(|e| e.sock == sock(Ipv4Addr::LOCALHOST, 5066))
+        );
+        assert!(
+            addrs
+                .iter()
+                .any(|e| e.sock == sock(Ipv4Addr::BROADCAST, 5066))
+        );
     }
 }
 

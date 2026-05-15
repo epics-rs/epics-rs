@@ -27,6 +27,12 @@ pub struct SimMotor {
     /// Profile move support
     profile_positions: Vec<f64>,
     profile_readbacks: Vec<f64>,
+    /// Position-compare output state (C: PR #248)
+    pub pco_enabled: bool,
+    pub pco_start: f64,
+    pub pco_end: f64,
+    pub pco_increment: f64,
+    pub pco_pulse_width_us: f64,
 }
 
 impl SimMotor {
@@ -50,6 +56,11 @@ impl SimMotor {
             deferred_moves: Vec::new(),
             profile_positions: Vec::new(),
             profile_readbacks: Vec::new(),
+            pco_enabled: false,
+            pco_start: 0.0,
+            pco_end: 0.0,
+            pco_increment: 0.0,
+            pco_pulse_width_us: 0.0,
         }
     }
 
@@ -258,6 +269,26 @@ impl AsynMotor for SimMotor {
 
     fn readback_profile(&mut self, _user: &AsynUser) -> AsynResult<Vec<f64>> {
         Ok(self.profile_readbacks.clone())
+    }
+
+    fn enable_pco(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
+        self.pco_enabled = enable;
+        Ok(())
+    }
+
+    fn set_pco_config(
+        &mut self,
+        _user: &AsynUser,
+        start: f64,
+        end: f64,
+        increment: f64,
+        pulse_width_us: f64,
+    ) -> AsynResult<()> {
+        self.pco_start = start;
+        self.pco_end = end;
+        self.pco_increment = increment;
+        self.pco_pulse_width_us = pulse_width_us;
+        Ok(())
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {

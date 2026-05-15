@@ -39,6 +39,11 @@ pub struct MotorStatus {
     pub gain_support: bool,
     /// True if an encoder is present.
     pub has_encoder: bool,
+    /// True if the controller exposes a usable base velocity (VBAS).
+    /// epics-modules/motor issue #76. Drivers that ignore VBAS should set
+    /// this to `false`; the record-level layer then treats VBAS as 0 in
+    /// acceleration math.
+    pub vbas_supported: bool,
 }
 
 impl Default for MotorStatus {
@@ -60,6 +65,7 @@ impl Default for MotorStatus {
             homed: false,
             gain_support: false,
             has_encoder: false,
+            vbas_supported: true,
         }
     }
 }
@@ -67,6 +73,10 @@ impl Default for MotorStatus {
 /// Motor interface trait.
 ///
 /// Provides motor axis control for motor-capable drivers.
+///
+/// Units: `velocity` is in EGU/sec and `acceleration` is in EGU/sec²
+/// (matching C `accEGUfromVelo`). The motor record converts its ACCL
+/// (time-to-velocity, sec) field into an EGU/sec² rate before calling.
 pub trait AsynMotor: Send + Sync {
     /// Move to an absolute position.
     fn move_absolute(
@@ -152,5 +162,42 @@ pub trait AsynMotor: Send + Sync {
     /// Read back actual positions after profile execution.
     fn readback_profile(&mut self, _user: &AsynUser) -> AsynResult<Vec<f64>> {
         Ok(vec![])
+    }
+
+    /// Move to a named "home" position defined by the controller.
+    /// Distinct from `home()` (limit-switch seek): this is an absolute move
+    /// to a pre-defined position, typical of model-3 controllers.
+    /// C: `a6f64591` + `5f421e9a` (2011-07).
+    fn move_to_home(
+        &mut self,
+        user: &AsynUser,
+        position: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.move_absolute(user, position, velocity, acceleration)
+    }
+
+    /// Enable or disable position-compare output (PCO) on this axis.
+    /// C: `05b25c1d` (PR #248) — adds `enablePCO(bool)` to asynMotorAxis.
+    /// Drivers that support PCO (Aerotech, Newport XPS, Galil, ACSMotion) override
+    /// this; the default is a no-op for axes without PCO hardware.
+    fn enable_pco(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// Configure position-compare output parameters. C: `05b25c1d` — five asyn
+    /// parameters PCO_START/END/INCREMENT/PULSE_WIDTH/ENABLE. The default does
+    /// nothing; PCO-capable drivers override and persist the configuration so
+    /// the next `enable_pco(true)` uses these values.
+    fn set_pco_config(
+        &mut self,
+        _user: &AsynUser,
+        _start: f64,
+        _end: f64,
+        _increment: f64,
+        _pulse_width_us: f64,
+    ) -> AsynResult<()> {
+        Ok(())
     }
 }

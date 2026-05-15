@@ -87,7 +87,8 @@ fn backlash_positive_bdst_negative_move() {
     {
         assert!((*position - (-10.0)).abs() < 1e-10);
         assert_eq!(*velocity, 5.0); // BVEL
-        assert_eq!(*acceleration, 0.5); // BACC
+        // EGU/sec²: (BVEL - VBAS) / BACC = (5.0 - 0.0) / 0.5
+        assert_eq!(*acceleration, 10.0);
     } else {
         panic!("expected MoveAbsolute");
     }
@@ -132,6 +133,63 @@ fn backlash_negative_bdst_positive_move() {
     complete_move(&mut rec, 10.0);
     let _effects = rec.check_completion();
     assert!(rec.stat.dmov);
+}
+
+#[test]
+fn negative_bdst_relative_move_preferred_direction() {
+    // C: 524696a8 PR #182 / issue #181 — negative BDST with RTRY>0 and a
+    // relative-move axis (UEIP). Negative move + negative BDST is the
+    // preferred direction: no backlash pretarget, single move to target.
+    let mut rec = make_record();
+    rec.retry.bdst = -1.0;
+    rec.retry.rtry = 3;
+    rec.conv.ueip = true; // → use_relative_moves() == true
+    rec.pos.drbv = 0.0;
+
+    rec.put_field("VAL", EpicsValue::Double(-10.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    // Preferred direction: no backlash
+    assert!(!rec.internal.backlash_pending);
+    // Relative move axis → MoveRelative emitted
+    let dist = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveRelative { distance, .. } => Some(*distance),
+        _ => None,
+    });
+    assert_eq!(dist, Some(-10.0), "relative distance should be -10");
+}
+
+#[test]
+fn negative_bdst_relative_move_non_preferred_uses_backlash() {
+    // Negative BDST, positive (non-preferred) move on a relative-move axis:
+    // backlash pretarget = dval - bdst = 10 - (-1) = 11, then final to 10.
+    let mut rec = make_record();
+    rec.retry.bdst = -1.0;
+    rec.retry.rtry = 3;
+    rec.conv.ueip = true;
+    rec.pos.drbv = 0.0;
+
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    assert!(rec.internal.backlash_pending);
+    // Phase 1 relative distance to pretarget 11 (from drbv 0)
+    let dist = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveRelative { distance, .. } => Some(*distance),
+        _ => None,
+    });
+    assert_eq!(dist, Some(11.0));
+
+    complete_move(&mut rec, 11.0);
+    let effects = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::BacklashFinal);
+    // Final approach to dval=10
+    let pos = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveRelative { distance, .. } => Some(11.0 + *distance),
+        MotorCommand::MoveAbsolute { position, .. } => Some(*position),
+        _ => None,
+    });
+    assert!((pos.unwrap() - 10.0).abs() < 1e-9);
 }
 
 #[test]

@@ -1063,9 +1063,14 @@ impl PvDatabase {
             instance.notify_from_snapshot(&snapshot);
         }
 
+        // Snapshot source PUTF for the C `processTarget` invariant (see
+        // `write_db_link_value` doc). Captured once here so every OUT /
+        // multi-OUT / FLNK dispatch in this cycle propagates the same bit.
+        let src_putf = rec.read().await.common.putf;
+
         // 4. OUT link
         if let Some((ref link, ref out_val)) = out_info {
-            self.write_db_link_value(link, out_val.clone(), visited, depth)
+            self.write_db_link_value(link, out_val.clone(), src_putf, visited, depth)
                 .await;
             // OOPT 7.0.8: latch the record's post-output state so the
             // next cycle's `should_output` sees the right pval.
@@ -1113,23 +1118,35 @@ impl PvDatabase {
                 for (link_str, val) in pairs {
                     let parsed = crate::server::record::parse_link_v2(&link_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        self.write_db_link_value(db, val, visited, depth).await;
+                        self.write_db_link_value(db, val, src_putf, visited, depth)
+                            .await;
                     }
                 }
             }
         }
 
-        // 5. FLNK -- only process if target is Passive (like C dbScanFwdLink)
+        // 5. FLNK -- only process if target is Passive (like C dbScanFwdLink).
+        // FLNK goes through C `dbScanPassive` -> `processTarget`, which
+        // propagates `src_putf` to the target the same way OUT links do.
         if let Some(ref flnk) = flnk_name {
-            let is_passive = if let Some(rec) = self.get_record(flnk).await {
-                rec.read().await.common.scan == crate::server::record::ScanType::Passive
-            } else {
-                false
-            };
-            if is_passive {
-                let _ = self
-                    .process_record_with_links(flnk, visited, depth + 1)
-                    .await;
+            if let Some(target_rec) = self.get_record(flnk).await {
+                let (target_scan, should_process) = {
+                    let mut tg = target_rec.write().await;
+                    let pact = tg.is_processing();
+                    let on_chain = visited.contains(flnk);
+                    if !pact {
+                        tg.common.putf = src_putf;
+                    } else if src_putf && !on_chain {
+                        tg.common.rpro = true;
+                        tg.common.putf = false;
+                    }
+                    (tg.common.scan, !pact)
+                };
+                if should_process && target_scan == crate::server::record::ScanType::Passive {
+                    let _ = self
+                        .process_record_with_links(flnk, visited, depth + 1)
+                        .await;
+                }
             }
         }
 
@@ -1159,6 +1176,27 @@ impl PvDatabase {
         // This handles WriteDbLink, ReadDbLink, and ReprocessAfter actions.
         self.execute_process_actions(name, &rec, process_actions, visited, depth)
             .await;
+
+        // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the
+        // tail of every synchronous process cycle, NOT just on the
+        // foreign-entry path. When this record was driven through an
+        // OUT-link propagation (write_db_link_value set our putf), the
+        // target record's own process cycle must clear it before
+        // returning — same lifecycle as the source record's PUTF
+        // (which `put_record_field_from_ca` separately clears at the
+        // foreign-entry boundary, and the async branch clears in
+        // `complete_async_record_inner`). Async-pending records skip
+        // this clear: their FLNK / putf-clear happens later in
+        // `complete_async_record_inner` once the device round-trip
+        // completes.
+        {
+            let guard = rec.read().await;
+            if !guard.is_processing() {
+                drop(guard);
+                let mut guard = rec.write().await;
+                guard.common.putf = false;
+            }
+        }
 
         Ok(())
     }
@@ -1255,9 +1293,10 @@ impl PvDatabase {
                 }
                 ProcessAction::WriteDbLink { link_field, value } => {
                     // 1. Get the link string (record fields → common fields)
-                    let link_str = {
+                    // and the source PUTF for processTarget propagation.
+                    let (link_str, src_putf) = {
                         let instance = rec.read().await;
-                        instance
+                        let link = instance
                             .resolve_field(link_field)
                             .and_then(|v| {
                                 if let EpicsValue::String(s) = v {
@@ -1266,7 +1305,8 @@ impl PvDatabase {
                                     None
                                 }
                             })
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        (link, instance.common.putf)
                     };
                     if link_str.is_empty() {
                         continue;
@@ -1274,7 +1314,7 @@ impl PvDatabase {
                     // 2. Parse and write to the linked PV
                     let parsed = crate::server::record::parse_link_v2(&link_str);
                     if let crate::server::record::ParsedLink::Db(ref db_link) = parsed {
-                        self.write_db_link_value(db_link, value, visited, depth)
+                        self.write_db_link_value(db_link, value, src_putf, visited, depth)
                             .await;
                     }
                 }
@@ -1601,9 +1641,15 @@ impl PvDatabase {
             instance.notify_from_snapshot(&snapshot);
         }
 
+        // Snapshot source PUTF for processTarget propagation (see
+        // `write_db_link_value` doc). For the async-completion path PUTF
+        // would have been set when the put landed on the record; it must
+        // propagate through the (now-completing) OUT / FLNK chain.
+        let src_putf = rec.read().await.common.putf;
+
         // OUT link
         if let Some((link, out_val)) = out_info {
-            self.write_db_link_value(&link, out_val, visited, depth)
+            self.write_db_link_value(&link, out_val, src_putf, visited, depth)
                 .await;
         }
 
@@ -1645,23 +1691,35 @@ impl PvDatabase {
                 for (link_str, val) in pairs {
                     let parsed = crate::server::record::parse_link_v2(&link_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        self.write_db_link_value(db, val, visited, depth).await;
+                        self.write_db_link_value(db, val, src_putf, visited, depth)
+                            .await;
                     }
                 }
             }
         }
 
-        // FLNK -- only process if target is Passive
+        // FLNK -- only process if target is Passive (C `dbScanFwdLink` ->
+        // `dbScanPassive` -> `processTarget` propagates PUTF the same way
+        // OUT links do).
         if let Some(ref flnk) = flnk_name {
-            let is_passive = if let Some(rec) = self.get_record(flnk).await {
-                rec.read().await.common.scan == crate::server::record::ScanType::Passive
-            } else {
-                false
-            };
-            if is_passive {
-                let _ = self
-                    .process_record_with_links(flnk, visited, depth + 1)
-                    .await;
+            if let Some(target_rec) = self.get_record(flnk).await {
+                let (target_scan, should_process) = {
+                    let mut tg = target_rec.write().await;
+                    let pact = tg.is_processing();
+                    let on_chain = visited.contains(flnk);
+                    if !pact {
+                        tg.common.putf = src_putf;
+                    } else if src_putf && !on_chain {
+                        tg.common.rpro = true;
+                        tg.common.putf = false;
+                    }
+                    (tg.common.scan, !pact)
+                };
+                if should_process && target_scan == crate::server::record::ScanType::Passive {
+                    let _ = self
+                        .process_record_with_links(flnk, visited, depth + 1)
+                        .await;
+                }
             }
         }
 

@@ -39,9 +39,9 @@ impl Default for DeviceState {
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
-use crate::interpose::{OctetInterpose, OctetInterposeStack};
+use crate::interpose::{EomReason, OctetInterpose, OctetInterposeStack};
 use crate::interrupt::{InterruptManager, InterruptValue};
-use crate::param::{EnumEntry, ParamList, ParamType};
+use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType};
 use crate::trace::TraceManager;
 use crate::user::AsynUser;
 
@@ -837,6 +837,48 @@ pub trait PortDriver: Send + Sync + 'static {
         self.base_mut().call_param_callbacks(user.addr)
     }
 
+    /// Configure rising / falling interrupt masks for a
+    /// UInt32Digital parameter. C parity:
+    /// `asynPortDriver::setInterruptUInt32Digital`
+    /// (`asynPortDriver.cpp:2346-2369`) → routes to
+    /// `paramList::setUInt32Interrupt`. The default delegates to the
+    /// param store; drivers that need to push the configuration to
+    /// hardware (e.g. real GPIB cards toggling SRQ enable) override
+    /// it.
+    fn set_interrupt_uint32_digital(
+        &mut self,
+        user: &AsynUser,
+        mask: u32,
+        reason: InterruptReason,
+    ) -> AsynResult<()> {
+        self.base_mut()
+            .params
+            .set_uint32_interrupt(user.reason, user.addr, mask, reason)
+    }
+
+    /// Clear bits from rising AND falling masks. C parity:
+    /// `asynPortDriver::clearInterruptUInt32Digital`
+    /// (`asynPortDriver.cpp:2392-2415`). Mirrors C — the call does
+    /// not take an `interruptReason`; both masks are cleared.
+    fn clear_interrupt_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<()> {
+        self.base_mut()
+            .params
+            .clear_uint32_interrupt(user.reason, user.addr, mask)
+    }
+
+    /// Read the configured rising / falling / combined mask. C
+    /// parity: `asynPortDriver::getInterruptUInt32Digital`
+    /// (`asynPortDriver.cpp:2438-2461`).
+    fn get_interrupt_uint32_digital(
+        &self,
+        user: &AsynUser,
+        reason: InterruptReason,
+    ) -> AsynResult<u32> {
+        self.base()
+            .params
+            .get_uint32_interrupt(user.reason, user.addr, reason)
+    }
+
     // --- Enum I/O (cache-based defaults) ---
 
     fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
@@ -954,6 +996,30 @@ pub trait PortDriver: Send + Sync + 'static {
 
     fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         self.read_octet(user, buf)
+    }
+
+    /// Octet read that also reports the end-of-message reason — C
+    /// parity for `asynOctet::read(... int *eomReason)`
+    /// (`asynOctet.h:38-40`). The default implementation delegates to
+    /// [`Self::io_read_octet`] and reconstructs a synthetic
+    /// [`EomReason`]: `CNT` when the buffer filled, `empty` otherwise.
+    /// Drivers that have native EOM information
+    /// (`asynOctetSyncIO::readRaw`, GPIB END, EOS match) must
+    /// override this method so consumers — `asynRecord::EOMR`,
+    /// `asynOctetSyncIO::readRaw` mirrors — receive the real flags.
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        let cap = buf.len();
+        let n = self.io_read_octet(user, buf)?;
+        let eom = if n >= cap && cap > 0 {
+            EomReason::CNT
+        } else {
+            EomReason::empty()
+        };
+        Ok((n, eom))
     }
 
     fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
@@ -1858,5 +1924,54 @@ mod tests {
         base.set_auto_connect(false);
         base.set_auto_connect(false);
         assert_eq!(hits.load(Ordering::Relaxed), 3);
+    }
+
+    /// C parity: `asynPortDriver::setInterruptUInt32Digital` /
+    /// `clearInterruptUInt32Digital` / `getInterruptUInt32Digital`
+    /// (`asynPortDriver.cpp:2346-2461`) route through paramList. The
+    /// PortDriver trait default delegates to the param store; we
+    /// verify the round-trip end-to-end through the trait surface.
+    #[test]
+    fn test_port_driver_uint32_interrupt_round_trip() {
+        struct UInt32Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for UInt32Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut base = PortDriverBase::new("uint32_int", 1, PortFlags::default());
+        let idx = base
+            .params
+            .create_param("BITS", ParamType::UInt32Digital)
+            .unwrap();
+        let mut drv = UInt32Drv { base };
+        let user = AsynUser::new(idx).with_addr(0);
+
+        drv.set_interrupt_uint32_digital(&user, 0xF0, InterruptReason::ZeroToOne)
+            .unwrap();
+        drv.set_interrupt_uint32_digital(&user, 0x0F, InterruptReason::OneToZero)
+            .unwrap();
+        assert_eq!(
+            drv.get_interrupt_uint32_digital(&user, InterruptReason::Both)
+                .unwrap(),
+            0xFF
+        );
+        drv.clear_interrupt_uint32_digital(&user, 0x11).unwrap();
+        assert_eq!(
+            drv.get_interrupt_uint32_digital(&user, InterruptReason::ZeroToOne)
+                .unwrap(),
+            0xE0
+        );
+        assert_eq!(
+            drv.get_interrupt_uint32_digital(&user, InterruptReason::OneToZero)
+                .unwrap(),
+            0x0E
+        );
     }
 }

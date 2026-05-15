@@ -88,6 +88,21 @@ pub enum RequestOp {
     EnableAddr,
     /// Disable a specific device address (multi-device ports).
     DisableAddr,
+    /// Enable / disable the entire port. C parity:
+    /// `pasynManager->enable(pasynUser, enable)`
+    /// (`asynManager.c::enable`, fired by asynRecord `ENBL` writes
+    /// at `asynRecord.c:484-486`).
+    SetEnable {
+        yes: bool,
+    },
+    /// Enable / disable auto-connect for the port. C parity:
+    /// `pasynManager->autoConnect(pasynUser, autoConnect)`
+    /// (`asynManager.c::autoConnect`, fired by asynRecord `AUCT`
+    /// writes at `asynRecord.c:481-482`). `asynExceptionAutoConnect`
+    /// is emitted unconditionally on every call.
+    SetAutoConnect {
+        yes: bool,
+    },
     /// Query int32 bounds (low, high).
     GetBoundsInt32,
     /// Query int64 bounds (low, high).
@@ -211,6 +226,15 @@ pub struct RequestResult {
     pub option_value: Option<String>,
     /// Int64 bounds (from GetBoundsInt32/Int64).
     pub bounds: Option<(i64, i64)>,
+    /// End-of-message reason flags from an octet read.
+    ///
+    /// C parity: `asynOctet::read` returns `nbytes` together with
+    /// `int *eomReason` (`interfaces/asynOctet.h:38-40`). The flags
+    /// `ASYN_EOM_CNT | ASYN_EOM_EOS | ASYN_EOM_END` mirror
+    /// [`crate::interpose::EomReason`]. Stored as `u32` so the
+    /// request layer stays bitflag-crate-free; converters live on
+    /// `EomReason::from_bits_truncate`.
+    pub eom_reason: u32,
 }
 
 impl RequestResult {
@@ -237,6 +261,7 @@ impl RequestResult {
             timestamp: None,
             option_value: None,
             bounds: None,
+            eom_reason: 0,
         }
     }
 
@@ -248,6 +273,20 @@ impl RequestResult {
         Self {
             nbytes,
             data: Some(buf),
+            ..Self::base()
+        }
+    }
+
+    /// Variant of [`Self::octet_read`] that carries the
+    /// end-of-message reason flags returned by
+    /// [`crate::port::PortDriver::io_read_octet_eom`]. The raw `u32`
+    /// is decoded with `EomReason::from_bits_truncate` on the
+    /// consumer side.
+    pub fn octet_read_eom(buf: Vec<u8>, nbytes: usize, eom_reason: u32) -> Self {
+        Self {
+            nbytes,
+            data: Some(buf),
+            eom_reason,
             ..Self::base()
         }
     }

@@ -14,6 +14,20 @@ pub struct EnumEntry {
     pub severity: u16,
 }
 
+/// UInt32Digital interrupt-reason selector — C parity for
+/// `interruptReason` (`interfaces/asynUInt32Digital.h:25-27`).
+///
+/// `ZeroToOne` (rising) and `OneToZero` (falling) configure each
+/// mask in isolation; `Both` overwrites them together on set and
+/// returns `rising | falling` on get (matching
+/// `asynPortDriver.cpp:480-535`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptReason {
+    ZeroToOne,
+    OneToZero,
+    Both,
+}
+
 /// Parameter data types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamType {
@@ -122,6 +136,16 @@ struct ParamEntry {
     /// UInt32Digital: bitmask of bits that changed (for interrupt filtering).
     /// C parity: uInt32CallbackMask in paramVal.
     uint32_interrupt_mask: u32,
+    /// UInt32Digital: bits the driver wants to fire callbacks on when
+    /// they transition `0 → 1`. C parity: `paramVal::uInt32RisingMask`
+    /// (`asynPortDriver/paramVal.h:45`) — written by
+    /// `paramList::setUInt32Interrupt(idx, mask, interruptOnZeroToOne)`
+    /// (`asynPortDriver.cpp:480-497`), read by `report`/`getInterrupt`.
+    uint32_rising_mask: u32,
+    /// UInt32Digital: bits the driver wants to fire callbacks on when
+    /// they transition `1 → 0`. C parity: `paramVal::uInt32FallingMask`
+    /// (`asynPortDriver/paramVal.h:46`).
+    uint32_falling_mask: u32,
 }
 
 impl ParamEntry {
@@ -165,6 +189,8 @@ impl ParamEntry {
             value_changed: false,
             timestamp: None,
             uint32_interrupt_mask: 0,
+            uint32_rising_mask: 0,
+            uint32_falling_mask: 0,
         }
     }
 }
@@ -219,10 +245,47 @@ impl ParamList {
 
     /// Create a parameter. Returns its index.
     /// The parameter is created at all addresses.
+    ///
+    /// Lax variant — when `name` already exists this returns the
+    /// existing index silently (`asynSuccess`). That matches the
+    /// idempotent build pattern used by `ad-core-rs::ADDriverParams`
+    /// and `ad-plugins-rs::NDArrayDriverParams` (the latter create the
+    /// shared `ACQUIRE`/`ACQUIRE_BUSY`/`WAIT_FOR_PLUGINS` params, then
+    /// `ADDriverParams::create` re-issues `create_param` on the same
+    /// names).
+    ///
+    /// Use [`Self::create_param_strict`] when you need C parity for
+    /// `asynParamAlreadyExists` — `paramList::createParam`
+    /// (`asynPortDriver/asynPortDriver.cpp:126-138`) returns that
+    /// status on duplicate and the wrapper at
+    /// `asynPortDriver::createParam(int list, ...)` (lines 991-1011)
+    /// translates it to `asynError` with an `ASYN_TRACE_ERROR` log.
     pub fn create_param(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
         if let Some(&idx) = self.name_to_index.get(name) {
             return Ok(idx);
         }
+        self.append_param(name, param_type)
+    }
+
+    /// Strict variant of [`Self::create_param`] — surfaces
+    /// [`AsynError::ParamAlreadyExists`] on duplicate, matching the C
+    /// `asynParamAlreadyExists` status returned by
+    /// `paramList::createParam` (`asynPortDriver.cpp:126-138`).
+    ///
+    /// Use this from new callers that should match the C semantics.
+    /// Existing callers (`ad-core-rs`, `ad-plugins-rs`) keep using the
+    /// lax [`Self::create_param`] until they migrate; switching them
+    /// requires teaching the duplicate-name shared-base-class build
+    /// to look up the existing index instead of re-issuing
+    /// `create_param`.
+    pub fn create_param_strict(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
+        if self.name_to_index.contains_key(name) {
+            return Err(AsynError::ParamAlreadyExists(name.to_string()));
+        }
+        self.append_param(name, param_type)
+    }
+
+    fn append_param(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
         let index = if self.params[0].is_empty() {
             0
         } else {
@@ -571,6 +634,82 @@ impl ParamList {
     /// Get the UInt32Digital interrupt mask (which bits changed on last set).
     pub fn get_uint32_interrupt_mask(&self, index: usize, addr: i32) -> AsynResult<u32> {
         Ok(self.get_entry(index, addr)?.uint32_interrupt_mask)
+    }
+
+    /// Configure which bits of a UInt32Digital parameter should fire
+    /// interrupts on transition.
+    ///
+    /// C parity: `paramList::setUInt32Interrupt`
+    /// (`asynPortDriver/asynPortDriver.cpp:480-497`). The reason
+    /// argument decides which mask (rising-only, falling-only, or
+    /// both) is overwritten.
+    pub fn set_uint32_interrupt(
+        &mut self,
+        index: usize,
+        addr: i32,
+        mask: u32,
+        reason: InterruptReason,
+    ) -> AsynResult<()> {
+        let entry = self.get_entry_mut(index, addr)?;
+        if entry.param_type != ParamType::UInt32Digital {
+            return Err(AsynError::TypeMismatch {
+                expected: "UInt32Digital",
+                actual: entry.value.type_name(),
+            });
+        }
+        match reason {
+            InterruptReason::ZeroToOne => entry.uint32_rising_mask = mask,
+            InterruptReason::OneToZero => entry.uint32_falling_mask = mask,
+            InterruptReason::Both => {
+                entry.uint32_rising_mask = mask;
+                entry.uint32_falling_mask = mask;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear bits from BOTH rising and falling masks for a
+    /// UInt32Digital parameter — C parity:
+    /// `paramList::clearUInt32Interrupt`
+    /// (`asynPortDriver.cpp:504-511`). The C function does not
+    /// accept an `interruptReason`; rising and falling masks are
+    /// always cleared together.
+    pub fn clear_uint32_interrupt(&mut self, index: usize, addr: i32, mask: u32) -> AsynResult<()> {
+        let entry = self.get_entry_mut(index, addr)?;
+        if entry.param_type != ParamType::UInt32Digital {
+            return Err(AsynError::TypeMismatch {
+                expected: "UInt32Digital",
+                actual: entry.value.type_name(),
+            });
+        }
+        entry.uint32_rising_mask &= !mask;
+        entry.uint32_falling_mask &= !mask;
+        Ok(())
+    }
+
+    /// Read the configured rising / falling / combined mask.
+    ///
+    /// C parity: `paramList::getUInt32Interrupt`
+    /// (`asynPortDriver.cpp:519-535`). For `Both`, the combined mask
+    /// is `rising | falling` (matching the C semantics).
+    pub fn get_uint32_interrupt(
+        &self,
+        index: usize,
+        addr: i32,
+        reason: InterruptReason,
+    ) -> AsynResult<u32> {
+        let entry = self.get_entry(index, addr)?;
+        if entry.param_type != ParamType::UInt32Digital {
+            return Err(AsynError::TypeMismatch {
+                expected: "UInt32Digital",
+                actual: entry.value.type_name(),
+            });
+        }
+        Ok(match reason {
+            InterruptReason::ZeroToOne => entry.uint32_rising_mask,
+            InterruptReason::OneToZero => entry.uint32_falling_mask,
+            InterruptReason::Both => entry.uint32_rising_mask | entry.uint32_falling_mask,
+        })
     }
 
     // --- Array getters/setters ---
@@ -1006,6 +1145,136 @@ mod tests {
         assert_eq!(pl.find_param("NOPE"), None);
         // Duplicate create returns same index
         assert_eq!(pl.create_param("TEMP", ParamType::Float64).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_create_param_strict_duplicate_returns_already_exists() {
+        // C parity: paramList::createParam (asynPortDriver.cpp:130) —
+        // a second createParam with an already-known name returns
+        // `asynParamAlreadyExists`; the asynPortDriver wrapper
+        // (asynPortDriver.cpp:991-1011) translates that to
+        // `asynError` with a TRACE_ERROR log. The lax `create_param`
+        // intentionally absorbs the duplicate for `ad-core-rs` /
+        // `ad-plugins-rs` idempotent build chains; the strict
+        // variant is what C-parity-sensitive callers reach for.
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param_strict("VAL", ParamType::Int32).unwrap();
+        assert_eq!(idx, 0);
+        match pl.create_param_strict("VAL", ParamType::Int32) {
+            Err(AsynError::ParamAlreadyExists(name)) => assert_eq!(name, "VAL"),
+            other => panic!("expected ParamAlreadyExists, got {other:?}"),
+        }
+        // Strict and lax variants share the registry: a name created
+        // via the lax path must still be visible to strict and
+        // produce ParamAlreadyExists.
+        match pl.create_param_strict("VAL", ParamType::Int32) {
+            Err(AsynError::ParamAlreadyExists(_)) => {}
+            other => panic!("strict must observe lax-created names, got {other:?}"),
+        }
+        // ...and vice versa.
+        assert_eq!(pl.create_param("VAL", ParamType::Int32).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_create_param_strict_distinct_names_succeed() {
+        let mut pl = ParamList::new(1, false);
+        let a = pl.create_param_strict("A", ParamType::Int32).unwrap();
+        let b = pl.create_param_strict("B", ParamType::Float64).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        assert_eq!(pl.find_param("A"), Some(0));
+        assert_eq!(pl.find_param("B"), Some(1));
+    }
+
+    #[test]
+    fn test_uint32_set_get_clear_interrupt_masks() {
+        // C parity: paramList::setUInt32Interrupt /
+        // paramList::clearUInt32Interrupt / paramList::getUInt32Interrupt
+        // at asynPortDriver.cpp:480-535. ZeroToOne writes the rising
+        // mask only; OneToZero writes the falling mask only; Both
+        // overwrites them together. clear strips bits from BOTH
+        // masks. get(Both) returns rising | falling.
+        let mut pl = ParamList::new(1, false);
+        let idx = pl
+            .create_param_strict("BITS", ParamType::UInt32Digital)
+            .unwrap();
+
+        pl.set_uint32_interrupt(idx, 0, 0xF0, InterruptReason::ZeroToOne)
+            .unwrap();
+        assert_eq!(
+            pl.get_uint32_interrupt(idx, 0, InterruptReason::ZeroToOne)
+                .unwrap(),
+            0xF0
+        );
+        assert_eq!(
+            pl.get_uint32_interrupt(idx, 0, InterruptReason::OneToZero)
+                .unwrap(),
+            0x00
+        );
+
+        pl.set_uint32_interrupt(idx, 0, 0x0F, InterruptReason::OneToZero)
+            .unwrap();
+        assert_eq!(
+            pl.get_uint32_interrupt(idx, 0, InterruptReason::Both)
+                .unwrap(),
+            0xFF
+        );
+
+        // clear strips from both masks.
+        pl.clear_uint32_interrupt(idx, 0, 0x10).unwrap();
+        assert_eq!(
+            pl.get_uint32_interrupt(idx, 0, InterruptReason::ZeroToOne)
+                .unwrap(),
+            0xE0
+        );
+        // No falling bit at 0x10 to begin with; clear is a no-op there.
+        assert_eq!(
+            pl.get_uint32_interrupt(idx, 0, InterruptReason::OneToZero)
+                .unwrap(),
+            0x0F
+        );
+
+        // Both overwrites symmetric.
+        pl.set_uint32_interrupt(idx, 0, 0xAA, InterruptReason::Both)
+            .unwrap();
+        assert_eq!(
+            pl.get_uint32_interrupt(idx, 0, InterruptReason::ZeroToOne)
+                .unwrap(),
+            0xAA
+        );
+        assert_eq!(
+            pl.get_uint32_interrupt(idx, 0, InterruptReason::OneToZero)
+                .unwrap(),
+            0xAA
+        );
+        assert_eq!(
+            pl.get_uint32_interrupt(idx, 0, InterruptReason::Both)
+                .unwrap(),
+            0xAA
+        );
+    }
+
+    #[test]
+    fn test_uint32_interrupt_type_mismatch_rejects_non_uint32() {
+        // C parity: setUInt32Interrupt/getUInt32Interrupt/clearUInt32Interrupt
+        // return `asynParamWrongType` when called on a non-UInt32Digital
+        // param (asynPortDriver.cpp:483/507/522).
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param("VAL", ParamType::Int32).unwrap();
+        match pl.set_uint32_interrupt(idx, 0, 0xFF, InterruptReason::Both) {
+            Err(AsynError::TypeMismatch { expected, .. }) => {
+                assert_eq!(expected, "UInt32Digital")
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+        match pl.clear_uint32_interrupt(idx, 0, 0xFF) {
+            Err(AsynError::TypeMismatch { .. }) => {}
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+        match pl.get_uint32_interrupt(idx, 0, InterruptReason::Both) {
+            Err(AsynError::TypeMismatch { .. }) => {}
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
     }
 
     #[test]

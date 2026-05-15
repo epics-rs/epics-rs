@@ -2493,7 +2493,12 @@ async fn run_coordinator(
                                 diag.subscriptions_restored.fetch_add(restored as u64, Ordering::Relaxed);
                                 diag.subscriptions_stale.fetch_add(stale as u64, Ordering::Relaxed);
                                 diag.record(DiagEvent::Reconnected { pv: ch.pv_name.to_string(), restored, stale });
-                                eprintln!("CA: {}: restored {restored} subscriptions ({stale} stale removed)", ch.pv_name);
+                                tracing::debug!(
+                                    pv = %ch.pv_name,
+                                    restored,
+                                    stale,
+                                    "CA reconnect: subscriptions restored"
+                                );
                             }
 
                             // Notify search engine of successful connect (clears penalty).

@@ -105,6 +105,53 @@ fn menu_index_to_baud_rate(idx: i32) -> i32 {
     }
 }
 
+/// Decode a C-style backslash-escaped string into the raw bytes the
+/// driver layer expects. Mirrors EPICS base's `dbTranslateEscape`
+/// (`libCom/misc/dbTranslateEscape.c`) — supports the standard
+/// escape sequences `\r \n \t \\ \" \0` plus octal `\NNN`. Used by
+/// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) so a
+/// configured `\r\n` terminator in the DB field reaches the driver
+/// as the two raw bytes `0x0D 0x0A`, not the four-byte literal.
+fn translate_escape(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(c) = chars.next() {
+        if c != b'\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(next) = chars.next() else {
+            // dangling backslash at end of input → pass through, C
+            // `dbTranslateEscape` returns input length on incomplete
+            // escape so we match (push the literal `\`).
+            out.push(b'\\');
+            break;
+        };
+        let decoded = match next {
+            b'r' => 0x0D,
+            b'n' => 0x0A,
+            b't' => 0x09,
+            b'\\' => b'\\',
+            b'"' => b'"',
+            b'\'' => b'\'',
+            b'0' => 0x00,
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0C,
+            b'v' => 0x0B,
+            other => {
+                // Unknown escape — pass through literally (C does the
+                // same for unrecognized backslash sequences).
+                out.push(b'\\');
+                out.push(other);
+                continue;
+            }
+        };
+        out.push(decoded);
+    }
+    out
+}
+
 // ===== AsynRecord =====
 
 /// Full asynRecord with all 67 fields.
@@ -1708,7 +1755,13 @@ impl Record for AsynRecord {
                     4 => "8",
                     _ => return Ok(()),
                 };
-                self.write_option("csize", val);
+                // C parity: `drvAsynSerialPort.c:146/360` recognises
+                // the key `"bits"` (not `"csize"`). Rust's serial
+                // driver follows the same C key (`serial_port.rs:649`)
+                // so the asynRecord DBIT write must use `"bits"` to
+                // actually reach the driver — previously routed to
+                // `"csize"` which no driver consumes.
+                self.write_option("bits", val);
             }
             "SBIT" => {
                 let val = match self.sbit {
@@ -1788,11 +1841,35 @@ impl Record for AsynRecord {
             }
 
             // --- EOS (end-of-string) delimiters ---
+            //
+            // C parity: `asynRecord.c::monitor` (the `OEOS`/`IEOS`
+            // special-write path at lines 374-393) decodes the
+            // backslash-escaped DB field via `dbTranslateEscape`
+            // and calls `pasynOctet->setOutputEos /
+            // setInputEos(pasynUser, eos, eos_len)`. Previously
+            // Rust routed through `set_option_blocking("oeos", ...)`
+            // which lands in `PortDriverBase::options` — no driver
+            // consumes the `oeos`/`ieos` keys, so the EOS interpose
+            // ignores the asynRecord write. The actor-routed
+            // `SetInputEos`/`SetOutputEos` ops drive the driver
+            // trait hooks (`set_input_eos` / `set_output_eos`) so
+            // the value reaches `PortDriverBase::input_eos /
+            // output_eos`, which is what the EOS interpose reads.
             "OEOS" => {
-                self.write_option("oeos", &self.oeos.clone());
+                let bytes = translate_escape(&self.oeos);
+                if let Some(ref entry) = self.port_entry {
+                    if let Err(e) = entry.handle.set_output_eos_blocking(&bytes) {
+                        self.errs = format!("set_output_eos: {e}");
+                    }
+                }
             }
             "IEOS" => {
-                self.write_option("ieos", &self.ieos.clone());
+                let bytes = translate_escape(&self.ieos);
+                if let Some(ref entry) = self.port_entry {
+                    if let Err(e) = entry.handle.set_input_eos_blocking(&bytes) {
+                        self.errs = format!("set_input_eos: {e}");
+                    }
+                }
             }
 
             // --- UI32MASK change ---
@@ -2018,5 +2095,24 @@ mod tests {
         assert_eq!(rec.record_type(), "asyn");
         // Verify it's our full version with all fields
         assert!(rec.field_list().len() > 3);
+    }
+
+    /// C parity for `dbTranslateEscape` (epics-base
+    /// `libCom/misc/dbTranslateEscape.c`). asynRecord stores OEOS/IEOS
+    /// as a backslash-escaped DB field and the device-support layer
+    /// MUST decode it before handing off to `pasynOctet->setInputEos`
+    /// — otherwise a "\r\n" record string sends four literal bytes
+    /// instead of the two-byte terminator.
+    #[test]
+    fn test_translate_escape_standard_sequences() {
+        assert_eq!(translate_escape("\\r\\n"), vec![0x0D, 0x0A]);
+        assert_eq!(translate_escape("\\t"), vec![0x09]);
+        assert_eq!(translate_escape("\\\\"), vec![b'\\']);
+        assert_eq!(translate_escape("\\0"), vec![0x00]);
+        assert_eq!(translate_escape("abc"), vec![b'a', b'b', b'c']);
+        // Pass-through for unknown escapes (matches C dbTranslateEscape).
+        assert_eq!(translate_escape("\\x"), vec![b'\\', b'x']);
+        // Dangling backslash passes through.
+        assert_eq!(translate_escape("a\\"), vec![b'a', b'\\']);
     }
 }

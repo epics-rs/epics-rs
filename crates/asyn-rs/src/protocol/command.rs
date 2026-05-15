@@ -112,6 +112,16 @@ pub enum PortCommand {
     Report {
         level: i32,
     },
+    /// Set input EOS bytes — C `pasynOctet->setInputEos` /
+    /// asynRecord IEOS.
+    SetInputEos {
+        eos: Vec<u8>,
+    },
+    /// Set output EOS bytes — C `pasynOctet->setOutputEos` /
+    /// asynRecord OEOS.
+    SetOutputEos {
+        eos: Vec<u8>,
+    },
 }
 
 #[cfg(test)]

@@ -196,6 +196,18 @@ pub enum RequestOp {
     Report {
         level: i32,
     },
+    /// Set the port's input EOS bytes — C `pasynOctet->setInputEos`.
+    /// Drives the same `PortDriver::set_input_eos(&[u8])` hook the EOS
+    /// interpose layer reads, so asynRecord IEOS writes survive a
+    /// round trip through the actor (previously routed through the
+    /// generic option HashMap which no driver consumes).
+    SetInputEos {
+        eos: Vec<u8>,
+    },
+    /// Set the port's output EOS bytes — C `pasynOctet->setOutputEos`.
+    SetOutputEos {
+        eos: Vec<u8>,
+    },
 }
 
 /// Result returned by the worker after executing a request.

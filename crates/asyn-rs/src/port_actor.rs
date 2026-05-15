@@ -576,6 +576,20 @@ impl PortActor {
                 self.driver.report(*level);
                 Ok(RequestResult::write_ok())
             }
+            RequestOp::SetInputEos { eos } => {
+                // C parity: asynRecord IEOS write at asynRecord.c:391
+                // calls `pasynOctet->setInputEos(pasynUser, eos, len)`.
+                // Route through the driver trait so the EOS interpose
+                // layer (interpose/eos.rs) reads from a single source
+                // of truth (`PortDriverBase::input_eos`) rather than
+                // the orphaned options HashMap.
+                self.driver.set_input_eos(eos)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetOutputEos { eos } => {
+                self.driver.set_output_eos(eos)?;
+                Ok(RequestResult::write_ok())
+            }
         };
 
         // Attach alarm/timestamp metadata on successful reads

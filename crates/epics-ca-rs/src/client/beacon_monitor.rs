@@ -373,7 +373,21 @@ async fn run_beacon_monitor_inner(
                 let max_age = std::time::Duration::from_secs(v.max_age_secs.max(1));
                 let now = std::time::Instant::now();
                 verified_tuples.retain(|_, t| now.duration_since(*t) <= max_age);
-                let key = (hdr.available, hdr.count, hdr.cid);
+                // Round 7: the regular beacon emits `m_available=0`
+                // (INADDR_ANY) by C convention (`online_notify.c:69`
+                // / `server/beacon.rs::run_beacon_emitter`), so keying
+                // the verified-tuple lookup off `hdr.available` would
+                // never hit — the companion side (line 341) inserts
+                // with the signed payload's `server_ip`, which by the
+                // G3 check is the UDP source IP. Use the actual
+                // datagram source IP here so the keys line up; this is
+                // also what authenticates "the regular beacon came
+                // from the same peer as a verified companion".
+                let src_ip_u32 = match meta.src.ip() {
+                    std::net::IpAddr::V4(v) => u32::from_be_bytes(v.octets()),
+                    std::net::IpAddr::V6(_) => 0,
+                };
+                let key = (src_ip_u32, hdr.count, hdr.cid);
                 if !verified_tuples.contains_key(&key) {
                     metrics::counter!("ca_client_unsigned_beacon_drops_total").increment(1);
                     if require_signed {
@@ -1713,5 +1727,95 @@ mod tests {
             "different-port entry must not be touched"
         );
         assert_eq!(s.count, 50);
+    }
+
+    /// Round 7 regression: the verified-tuple lookup key (post-fix:
+    /// `(src_ip, hdr.count, hdr.cid)`) must match the companion-side
+    /// insert key (`(signed_ip, signed_port, signed_beacon_id)`)
+    /// after the G3 source-IP-binding check (`signed_ip == src_ip`).
+    ///
+    /// Before the fix the lookup keyed off `hdr.available`, which the
+    /// server emits as 0 (INADDR_ANY) per C `online_notify.c:69` —
+    /// so the key was always `(0, port, beacon_id)` while the insert
+    /// was `(real_ip, port, beacon_id)`, and **every** legitimate
+    /// signed beacon was rejected.
+    #[cfg(feature = "cap-tokens")]
+    #[test]
+    fn verified_tuple_key_matches_with_source_ip_binding() {
+        use crate::server::signed_beacon::{SignedBeaconEmitter, SignedBeaconVerifier};
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::SystemTime;
+
+        // Build a signed-beacon companion as the server would emit.
+        let mut csprng = OsRng;
+        let signing_key = SigningKey::generate(&mut csprng);
+        let socket = std::sync::Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap() }),
+        );
+
+        let server_ip_u32 = u32::from_be_bytes([10, 0, 0, 5]);
+        let server_port: u16 = 5064;
+        let beacon_id: u32 = 42;
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let emitter = SignedBeaconEmitter::new(signing_key.clone(), socket, vec![]);
+        let packet = emitter.build_packet(server_ip_u32, server_port, beacon_id, ts);
+
+        // Verifier path (server-companion side).
+        let mut verifier = SignedBeaconVerifier::new();
+        verifier.trust(signing_key.verifying_key());
+        let (verified_ip, verified_port, verified_bid) =
+            verifier.verify(&packet).expect("signature verifies");
+
+        // Simulate the G3 source-IP-binding check that gates the
+        // verified_tuples insert. In production this is the actual UDP
+        // datagram source IP; here it must equal the announced
+        // `verified_ip`.
+        let src_ip = IpAddr::V4(Ipv4Addr::from(server_ip_u32));
+        let src_ip_u32 = match src_ip {
+            IpAddr::V4(v) => u32::from_be_bytes(v.octets()),
+            IpAddr::V6(_) => panic!("ipv6 in test"),
+        };
+        assert_eq!(
+            Ipv4Addr::from(verified_ip),
+            Ipv4Addr::from(server_ip_u32),
+            "G3 binding precondition: signed payload IP equals UDP source IP"
+        );
+
+        // Insert as the companion path does.
+        let mut verified_tuples: HashMap<(u32, u16, u32), Instant> = HashMap::new();
+        verified_tuples.insert((verified_ip, verified_port, verified_bid), Instant::now());
+
+        // Lookup as the regular-beacon path does (post-Round-7 fix:
+        // keyed by UDP source IP). The regular CA beacon has
+        // `hdr.available = 0` so the key is built from `meta.src` not
+        // `hdr.available`.
+        let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+        hdr.data_type = 0; // CA_MINOR_VERSION irrelevant to lookup
+        hdr.count = server_port;
+        hdr.cid = beacon_id;
+        hdr.available = 0; // INADDR_ANY — the server's C-parity convention
+
+        let key = (src_ip_u32, hdr.count, hdr.cid);
+        assert!(
+            verified_tuples.contains_key(&key),
+            "regression: regular beacon with hdr.available=0 must still hit \
+             the verified_tuple entry inserted by the signed companion"
+        );
+
+        // Sanity: the pre-fix key (hdr.available, count, cid) would have missed.
+        let pre_fix_key = (hdr.available, hdr.count, hdr.cid);
+        assert!(
+            !verified_tuples.contains_key(&pre_fix_key),
+            "pre-fix key shape no longer used: documents the failure mode"
+        );
     }
 }

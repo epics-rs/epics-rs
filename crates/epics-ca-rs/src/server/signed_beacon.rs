@@ -105,7 +105,13 @@ impl SignedBeaconEmitter {
         }
     }
 
-    fn build_packet(&self, server_ip: u32, server_port: u16, beacon_id: u32, ts: u64) -> Vec<u8> {
+    pub(crate) fn build_packet(
+        &self,
+        server_ip: u32,
+        server_port: u16,
+        beacon_id: u32,
+        ts: u64,
+    ) -> Vec<u8> {
         let mut signed = [0u8; 18];
         signed[0..4].copy_from_slice(&server_ip.to_be_bytes());
         signed[4..6].copy_from_slice(&server_port.to_be_bytes());

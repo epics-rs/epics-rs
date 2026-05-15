@@ -198,6 +198,25 @@ fn put_autoexec_from_request(req: Option<&PvField>) -> Option<bool> {
     }
 }
 
+/// Consume the optional u32 `nack` (initial pipeline window) that a
+/// pvxs client appends to a MONITOR INIT body when it sets the
+/// pipeline bit (pvxs `servermon.cpp:493` / `clientmon.cpp:341-342`).
+/// Returns `Some(nack)` when the bit is set AND the four bytes are
+/// present; `None` otherwise (kind mismatch, bit clear, or short
+/// payload — the last case mirrors pvxs's "pipeline monitor w/o
+/// initial nack incompatible" warn-but-accept policy).
+fn parse_monitor_init_nack(
+    kind: OpKind,
+    subcmd: u8,
+    cur: &mut std::io::Cursor<&[u8]>,
+    order: ByteOrder,
+) -> Option<u32> {
+    if kind != OpKind::Monitor || (subcmd & 0x80) == 0 {
+        return None;
+    }
+    cur.get_u32(order).ok()
+}
+
 /// Inspect a decoded pvRequest for `record._options.pipeline` and
 /// `record._options.queueSize`. pvxs `Subscription` defaults to
 /// `queueSize = 4` when pipeline is enabled; we follow.
@@ -1474,11 +1493,23 @@ async fn handle_op(
             .as_ref()
             .and_then(monitor_pipeline_options)
             .filter(|o| o.enabled);
+        // pvxs `servermon.cpp:493` — when the client sets the pipeline
+        // bit on MONITOR INIT (`subcmd & 0x80`) it appends a u32 `nack`
+        // (initial window credit) after the pvRequest. Read and consume
+        // those bytes so any data following INIT in the same segment
+        // decodes from the correct offset, and prefer the wire value
+        // over the pvRequest `queueSize` so the negotiated initial
+        // window matches what the client requested. We tolerate a
+        // truncated nack (legacy clients sometimes omit it even with
+        // the bit set — pvxs warns "pipeline monitor w/o initial nack
+        // incompatible" but accepts the operation).
+        let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, order);
         let (monitor_window, monitor_window_notify) = if kind == OpKind::Monitor
             && let Some(opt) = pipeline_opt
         {
+            let initial = pipeline_initial_nack.unwrap_or(opt.queue_size);
             (
-                Some(Arc::new(std::sync::atomic::AtomicU32::new(opt.queue_size))),
+                Some(Arc::new(std::sync::atomic::AtomicU32::new(initial))),
                 Some(Arc::new(tokio::sync::Notify::new())),
             )
         } else {
@@ -2599,6 +2630,52 @@ mod tests {
             }
             other => panic!("expected monitor data, got {other:?}"),
         }
+    }
+
+    /// pvxs `servermon.cpp:493` parity: when the client sets the
+    /// pipeline bit (`subcmd & 0x80`) on MONITOR INIT, the body
+    /// carries a trailing u32 `nack` (initial window). The handler
+    /// must consume those four bytes so subsequent reads from the
+    /// cursor see the correct offset, AND surface the parsed value
+    /// to override the pvRequest queueSize-based default.
+    #[test]
+    fn parse_monitor_init_nack_consumes_window_byte_when_pipeline_bit_set() {
+        let order = ByteOrder::Little;
+
+        // Bit clear → no-op even on Monitor.
+        let bytes = [0u8; 8];
+        let mut cur = std::io::Cursor::new(bytes.as_slice());
+        assert_eq!(
+            parse_monitor_init_nack(OpKind::Monitor, 0x08, &mut cur, order),
+            None
+        );
+        assert_eq!(cur.position(), 0, "cursor must not advance when bit clear");
+
+        // Bit set, kind != Monitor → no-op (matches pvxs which only
+        // honours the pipeline shape on the MONITOR command code).
+        let mut cur = std::io::Cursor::new(bytes.as_slice());
+        assert_eq!(
+            parse_monitor_init_nack(OpKind::Get, 0x88, &mut cur, order),
+            None
+        );
+        assert_eq!(cur.position(), 0);
+
+        // Bit set, four bytes available → return decoded value.
+        let mut buf = Vec::new();
+        buf.put_u32(0x1234_5678, order);
+        buf.extend_from_slice(b"trailing");
+        let mut cur = std::io::Cursor::new(buf.as_slice());
+        let parsed = parse_monitor_init_nack(OpKind::Monitor, 0x88, &mut cur, order);
+        assert_eq!(parsed, Some(0x1234_5678));
+        assert_eq!(cur.position(), 4, "must advance exactly four bytes");
+
+        // Bit set, fewer than four bytes → tolerate (pvxs warns but
+        // accepts; we surface `None` so the caller falls back to the
+        // pvRequest queueSize-based default).
+        let buf = vec![0x11, 0x22];
+        let mut cur = std::io::Cursor::new(buf.as_slice());
+        let parsed = parse_monitor_init_nack(OpKind::Monitor, 0x88, &mut cur, order);
+        assert_eq!(parsed, None);
     }
 
     /// pvxs `serverchan.cpp:382-386`: when the SID in DESTROY_CHANNEL

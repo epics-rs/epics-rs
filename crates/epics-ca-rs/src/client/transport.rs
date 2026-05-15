@@ -628,18 +628,23 @@ async fn connect_server(
     let pending_frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (beacon_arrival_tx, beacon_arrival_rx) = mpsc::unbounded_channel::<bool>();
 
-    // Build initial CA handshake (VERSION + HOST + CLIENT) — same on
-    // both plaintext and TLS paths.
+    // Build initial CA handshake.
+    //
+    // C `tcpiiu` constructor (`modules/ca/src/client/tcpiiu.cpp:755-762`)
+    // queues messages in this exact order:
+    //   1. versionMessage           → CA_PROTO_VERSION
+    //   2. userNameSetRequest       → CA_PROTO_CLIENT_NAME
+    //   3. hostNameSetRequest       → CA_PROTO_HOST_NAME
+    //
+    // Pre-fix Rust emitted VERSION → HOST_NAME → CLIENT_NAME (the
+    // last two swapped). Server `host_name_action` /
+    // `client_name_action` accept either order in isolation, but
+    // ACF rules that consult both fields and frame-byte-exact wire
+    // captures (Wireshark CA dissector, fuzzers) diverge.
     let mut handshake = Vec::new();
     let mut version_hdr = CaHeader::new(CA_PROTO_VERSION);
     version_hdr.count = CA_MINOR_VERSION;
     handshake.extend_from_slice(&version_hdr.to_bytes());
-    let hostname = epics_base_rs::runtime::env::hostname();
-    let host_payload = pad_string(&hostname);
-    let mut host_hdr = CaHeader::new(CA_PROTO_HOST_NAME);
-    host_hdr.postsize = host_payload.len() as u16;
-    handshake.extend_from_slice(&host_hdr.to_bytes());
-    handshake.extend_from_slice(&host_payload);
     let username = epics_base_rs::runtime::env::get("USER")
         .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
         .unwrap_or_else(|| "unknown".to_string());
@@ -648,6 +653,12 @@ async fn connect_server(
     user_hdr.postsize = user_payload.len() as u16;
     handshake.extend_from_slice(&user_hdr.to_bytes());
     handshake.extend_from_slice(&user_payload);
+    let hostname = epics_base_rs::runtime::env::hostname();
+    let host_payload = pad_string(&hostname);
+    let mut host_hdr = CaHeader::new(CA_PROTO_HOST_NAME);
+    host_hdr.postsize = host_payload.len() as u16;
+    handshake.extend_from_slice(&host_hdr.to_bytes());
+    handshake.extend_from_slice(&host_payload);
     pending_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _ = write_tx.send(handshake);
 

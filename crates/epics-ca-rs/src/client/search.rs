@@ -522,15 +522,12 @@ async fn run_nameserver_connection(
 
         // Send initial VERSION + HOST_NAME + CLIENT_NAME so the nameserver
         // accepts our search frames (mirrors transport.rs handshake).
+        // libca handshake order (`tcpiiu.cpp:755-762`):
+        // VERSION → CLIENT_NAME → HOST_NAME. Mirror exactly.
         let mut handshake = Vec::new();
         let mut version = CaHeader::new(CA_PROTO_VERSION);
         version.count = CA_MINOR_VERSION;
         handshake.extend_from_slice(&version.to_bytes());
-        let host_payload = pad_string(&epics_base_rs::runtime::env::hostname());
-        let mut host = CaHeader::new(CA_PROTO_HOST_NAME);
-        host.postsize = host_payload.len() as u16;
-        handshake.extend_from_slice(&host.to_bytes());
-        handshake.extend_from_slice(&host_payload);
         let user = epics_base_rs::runtime::env::get("USER")
             .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
             .unwrap_or_else(|| "unknown".to_string());
@@ -539,6 +536,11 @@ async fn run_nameserver_connection(
         client.postsize = user_payload.len() as u16;
         handshake.extend_from_slice(&client.to_bytes());
         handshake.extend_from_slice(&user_payload);
+        let host_payload = pad_string(&epics_base_rs::runtime::env::hostname());
+        let mut host = CaHeader::new(CA_PROTO_HOST_NAME);
+        host.postsize = host_payload.len() as u16;
+        handshake.extend_from_slice(&host.to_bytes());
+        handshake.extend_from_slice(&host_payload);
         if writer.write_all(&handshake).await.is_err() {
             tokio::time::sleep(backoff).await;
             continue;

@@ -170,6 +170,31 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
 
         let action = decode_datagram(&buf[..len], &hdr, src);
         if action.register {
+            // C `register_new_client` (repeater.cpp:374-424) rejects
+            // REPEATER_REGISTER from non-AF_INET peers and, for
+            // non-loopback sources, requires `bind()` to the source
+            // address to succeed (proving the IP belongs to a local
+            // interface). The intent: the repeater and its clients
+            // must be on the same host — beacon fan-out from a
+            // remote peer would silently expose PV existence to
+            // unauthorised observers via the registered-clients
+            // list.
+            //
+            // Rust simplifies the C check to loopback-only. The C
+            // bind-test is a 3.13-era compatibility quirk that
+            // allowed the first non-loopback interface as well
+            // (clients alternated between addresses during the
+            // transition); modern libca always uses 127.0.0.1
+            // (`repeater.cpp:466-478` `caRepeaterRegistrationMessage`
+            // sets the destination to loopback explicitly).
+            if !src.ip().is_loopback() {
+                tracing::warn!(
+                    src = %src,
+                    "caRepeater: REPEATER_REGISTER from non-loopback source rejected"
+                );
+                metrics::counter!("ca_repeater_register_non_loopback_rejects_total").increment(1);
+                continue;
+            }
             register_client_debug(&mut clients, src, debug);
         }
         if let Some(data) = action.fanout {

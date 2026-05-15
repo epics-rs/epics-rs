@@ -205,7 +205,19 @@ impl PvDatabase {
             instance.common.lcnt = 0;
         }
 
-        // 0. SDIS disable check
+        // 0. SDIS disable check — C parity dbAccess.c:562-592.
+        //
+        // When the SDIS link evaluates to a value equal to DISV, the
+        // record is disabled and bails before record support runs. C
+        // ALWAYS clears rpro/putf and triggers dbNotifyCompletion at
+        // this point — regardless of whether the alarm transition
+        // fires — because a disabled record must not leave behind
+        // pending reprocess requests or stranded put_notify completion
+        // callbacks. Pre-fix Round 4 the Rust port only reset
+        // nsta/nsev and updated the alarm state, leaking rpro/putf
+        // into the next cycle and stalling CA WRITE_NOTIFY callers
+        // (the put_notify_tx never fired so the CA dispatcher waited
+        // until socket disconnect to release the operation).
         {
             let (sdis_link, disv, diss) = {
                 let instance = rec.read().await;
@@ -231,32 +243,68 @@ impl PvDatabase {
 
             let disa = rec.read().await.common.disa;
             if disa == disv {
-                let mut instance = rec.write().await;
-                // Reset nsta/nsev to prevent stale alarm from bleeding into next cycle
-                instance.common.nsta = 0;
-                instance.common.nsev = crate::server::record::AlarmSeverity::NoAlarm;
-                let prev_sevr = instance.common.sevr;
-                let prev_stat = instance.common.stat;
-                instance.common.sevr = diss;
-                instance.common.stat = crate::server::recgbl::alarm_status::DISABLE_ALARM;
-                if instance.common.sevr != prev_sevr || instance.common.stat != prev_stat {
-                    let mut changed_fields = Vec::new();
-                    changed_fields.push((
-                        "SEVR".to_string(),
-                        EpicsValue::Short(instance.common.sevr as i16),
-                    ));
-                    changed_fields.push((
-                        "STAT".to_string(),
-                        EpicsValue::Short(instance.common.stat as i16),
-                    ));
-                    if let Some(val) = instance.record.val() {
-                        changed_fields.push(("VAL".to_string(), val));
+                let put_notify_tx = {
+                    let mut instance = rec.write().await;
+                    // C `dbAccess.c:575-577` — clear rpro/putf and arm
+                    // notifyCompletion BEFORE the alarm check. Disabled
+                    // records skip processing entirely, so any pending
+                    // reprocess request is dropped (the next non-
+                    // disabled cycle will pick up fresh state) and the
+                    // CA put_notify caller must be released.
+                    instance.common.rpro = false;
+                    instance.common.putf = false;
+                    let tx = instance.put_notify_tx.take();
+
+                    // Reset nsta/nsev so stale alarm state doesn't bleed
+                    // into a subsequent (re-enabled) cycle. C resets
+                    // them after the sevr/stat transition; doing it
+                    // first here is observationally identical because
+                    // the SDIS bail short-circuits any record-support
+                    // path that could read them.
+                    instance.common.nsta = 0;
+                    instance.common.nsev = crate::server::record::AlarmSeverity::NoAlarm;
+
+                    // C `dbAccess.c:580-581` — if already in
+                    // DISABLE_ALARM, the alarm post is skipped entirely
+                    // (the alarm cycle is debounced). The rpro/putf
+                    // clear above still ran, matching C's pre-`goto
+                    // all_done` ordering.
+                    if instance.common.stat != crate::server::recgbl::alarm_status::DISABLE_ALARM {
+                        instance.common.sevr = diss;
+                        instance.common.stat = crate::server::recgbl::alarm_status::DISABLE_ALARM;
+                        // Post STAT/SEVR with DBE_VALUE only, then VAL
+                        // with DBE_VALUE|DBE_ALARM — match the C order
+                        // `db_post_events(&stat, DBE_VALUE);
+                        // db_post_events(&sevr, DBE_VALUE);
+                        // db_post_events(&val, DBE_VALUE|DBE_ALARM)`.
+                        let mut changed_fields = Vec::new();
+                        changed_fields.push((
+                            "STAT".to_string(),
+                            EpicsValue::Short(instance.common.stat as i16),
+                        ));
+                        changed_fields.push((
+                            "SEVR".to_string(),
+                            EpicsValue::Short(instance.common.sevr as i16),
+                        ));
+                        if let Some(val) = instance.record.val() {
+                            changed_fields.push(("VAL".to_string(), val));
+                        }
+                        let snapshot = crate::server::record::ProcessSnapshot {
+                            changed_fields,
+                            event_mask: crate::server::recgbl::EventMask::VALUE
+                                | crate::server::recgbl::EventMask::ALARM,
+                        };
+                        instance.notify_from_snapshot(&snapshot);
                     }
-                    let snapshot = crate::server::record::ProcessSnapshot {
-                        changed_fields,
-                        event_mask: crate::server::recgbl::EventMask::ALARM,
-                    };
-                    instance.notify_from_snapshot(&snapshot);
+                    tx
+                };
+                // Fire dbNotifyCompletion outside the record lock —
+                // C `dbAccess.c:622-623` runs it at `all_done` after
+                // the disable bail. Without this, a CA WRITE_NOTIFY
+                // landing on a disabled record stalls until socket
+                // disconnect.
+                if let Some(tx) = put_notify_tx {
+                    let _ = tx.send(());
                 }
                 return Ok(());
             }
@@ -1063,9 +1111,14 @@ impl PvDatabase {
             instance.notify_from_snapshot(&snapshot);
         }
 
+        // Snapshot source PUTF for the C `processTarget` invariant (see
+        // `write_db_link_value` doc). Captured once here so every OUT /
+        // multi-OUT / FLNK dispatch in this cycle propagates the same bit.
+        let src_putf = rec.read().await.common.putf;
+
         // 4. OUT link
         if let Some((ref link, ref out_val)) = out_info {
-            self.write_db_link_value(link, out_val.clone(), visited, depth)
+            self.write_db_link_value(link, out_val.clone(), src_putf, visited, depth)
                 .await;
             // OOPT 7.0.8: latch the record's post-output state so the
             // next cycle's `should_output` sees the right pval.
@@ -1113,23 +1166,35 @@ impl PvDatabase {
                 for (link_str, val) in pairs {
                     let parsed = crate::server::record::parse_link_v2(&link_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        self.write_db_link_value(db, val, visited, depth).await;
+                        self.write_db_link_value(db, val, src_putf, visited, depth)
+                            .await;
                     }
                 }
             }
         }
 
-        // 5. FLNK -- only process if target is Passive (like C dbScanFwdLink)
+        // 5. FLNK -- only process if target is Passive (like C dbScanFwdLink).
+        // FLNK goes through C `dbScanPassive` -> `processTarget`, which
+        // propagates `src_putf` to the target the same way OUT links do.
         if let Some(ref flnk) = flnk_name {
-            let is_passive = if let Some(rec) = self.get_record(flnk).await {
-                rec.read().await.common.scan == crate::server::record::ScanType::Passive
-            } else {
-                false
-            };
-            if is_passive {
-                let _ = self
-                    .process_record_with_links(flnk, visited, depth + 1)
-                    .await;
+            if let Some(target_rec) = self.get_record(flnk).await {
+                let (target_scan, should_process) = {
+                    let mut tg = target_rec.write().await;
+                    let pact = tg.is_processing();
+                    let on_chain = visited.contains(flnk);
+                    if !pact {
+                        tg.common.putf = src_putf;
+                    } else if src_putf && !on_chain {
+                        tg.common.rpro = true;
+                        tg.common.putf = false;
+                    }
+                    (tg.common.scan, !pact)
+                };
+                if should_process && target_scan == crate::server::record::ScanType::Passive {
+                    let _ = self
+                        .process_record_with_links(flnk, visited, depth + 1)
+                        .await;
+                }
             }
         }
 
@@ -1159,6 +1224,27 @@ impl PvDatabase {
         // This handles WriteDbLink, ReadDbLink, and ReprocessAfter actions.
         self.execute_process_actions(name, &rec, process_actions, visited, depth)
             .await;
+
+        // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the
+        // tail of every synchronous process cycle, NOT just on the
+        // foreign-entry path. When this record was driven through an
+        // OUT-link propagation (write_db_link_value set our putf), the
+        // target record's own process cycle must clear it before
+        // returning — same lifecycle as the source record's PUTF
+        // (which `put_record_field_from_ca` separately clears at the
+        // foreign-entry boundary, and the async branch clears in
+        // `complete_async_record_inner`). Async-pending records skip
+        // this clear: their FLNK / putf-clear happens later in
+        // `complete_async_record_inner` once the device round-trip
+        // completes.
+        {
+            let guard = rec.read().await;
+            if !guard.is_processing() {
+                drop(guard);
+                let mut guard = rec.write().await;
+                guard.common.putf = false;
+            }
+        }
 
         Ok(())
     }
@@ -1255,9 +1341,10 @@ impl PvDatabase {
                 }
                 ProcessAction::WriteDbLink { link_field, value } => {
                     // 1. Get the link string (record fields → common fields)
-                    let link_str = {
+                    // and the source PUTF for processTarget propagation.
+                    let (link_str, src_putf) = {
                         let instance = rec.read().await;
-                        instance
+                        let link = instance
                             .resolve_field(link_field)
                             .and_then(|v| {
                                 if let EpicsValue::String(s) = v {
@@ -1266,7 +1353,8 @@ impl PvDatabase {
                                     None
                                 }
                             })
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        (link, instance.common.putf)
                     };
                     if link_str.is_empty() {
                         continue;
@@ -1274,7 +1362,7 @@ impl PvDatabase {
                     // 2. Parse and write to the linked PV
                     let parsed = crate::server::record::parse_link_v2(&link_str);
                     if let crate::server::record::ParsedLink::Db(ref db_link) = parsed {
-                        self.write_db_link_value(db_link, value, visited, depth)
+                        self.write_db_link_value(db_link, value, src_putf, visited, depth)
                             .await;
                     }
                 }
@@ -1601,9 +1689,15 @@ impl PvDatabase {
             instance.notify_from_snapshot(&snapshot);
         }
 
+        // Snapshot source PUTF for processTarget propagation (see
+        // `write_db_link_value` doc). For the async-completion path PUTF
+        // would have been set when the put landed on the record; it must
+        // propagate through the (now-completing) OUT / FLNK chain.
+        let src_putf = rec.read().await.common.putf;
+
         // OUT link
         if let Some((link, out_val)) = out_info {
-            self.write_db_link_value(&link, out_val, visited, depth)
+            self.write_db_link_value(&link, out_val, src_putf, visited, depth)
                 .await;
         }
 
@@ -1645,23 +1739,35 @@ impl PvDatabase {
                 for (link_str, val) in pairs {
                     let parsed = crate::server::record::parse_link_v2(&link_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        self.write_db_link_value(db, val, visited, depth).await;
+                        self.write_db_link_value(db, val, src_putf, visited, depth)
+                            .await;
                     }
                 }
             }
         }
 
-        // FLNK -- only process if target is Passive
+        // FLNK -- only process if target is Passive (C `dbScanFwdLink` ->
+        // `dbScanPassive` -> `processTarget` propagates PUTF the same way
+        // OUT links do).
         if let Some(ref flnk) = flnk_name {
-            let is_passive = if let Some(rec) = self.get_record(flnk).await {
-                rec.read().await.common.scan == crate::server::record::ScanType::Passive
-            } else {
-                false
-            };
-            if is_passive {
-                let _ = self
-                    .process_record_with_links(flnk, visited, depth + 1)
-                    .await;
+            if let Some(target_rec) = self.get_record(flnk).await {
+                let (target_scan, should_process) = {
+                    let mut tg = target_rec.write().await;
+                    let pact = tg.is_processing();
+                    let on_chain = visited.contains(flnk);
+                    if !pact {
+                        tg.common.putf = src_putf;
+                    } else if src_putf && !on_chain {
+                        tg.common.rpro = true;
+                        tg.common.putf = false;
+                    }
+                    (tg.common.scan, !pact)
+                };
+                if should_process && target_scan == crate::server::record::ScanType::Passive {
+                    let _ = self
+                        .process_record_with_links(flnk, visited, depth + 1)
+                        .await;
+                }
             }
         }
 

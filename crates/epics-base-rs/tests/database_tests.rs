@@ -430,6 +430,111 @@ async fn test_putf_stays_off_for_cp_chained_targets() {
     );
 }
 
+/// C `dbDbLink.c::processTarget:474` propagates `pdst->putf = psrc->putf`
+/// when writing through a DB OUT link to a non-pact target. Pre-fix
+/// Round 4 the Rust `write_db_link_value` only put the value and called
+/// `process_record_with_links` without touching `target.putf` — so a
+/// CA put on an ao with OUT pointing at a passive ai left the ai's
+/// PUTF=0 during the chained process cycle. dbNotify completion
+/// attribution and device-support `put-driven vs scan-driven`
+/// classifiers downstream of the OUT link silently observed
+/// scan-driven processing instead of put-driven.
+#[tokio::test]
+async fn test_putf_propagates_through_db_out_link_to_passive_target() {
+    let db = PvDatabase::new();
+    db.add_record("PUTF_OUT_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    // Source ao: OUT to TGT, PP semantics so the target processes.
+    db.add_record("PUTF_OUT_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PUTF_OUT_SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("PUTF_OUT_TGT PP".into()))
+            .unwrap();
+    }
+    // Target must be Passive for processTarget to run; AoRecord
+    // defaults to Passive scan so no explicit set needed.
+
+    // Drive a CA put that lands as a put on SRC. SRC.putf becomes 1
+    // before processing; during processing, the OUT-link write runs
+    // and target should inherit putf=1 BEFORE its process cycle.
+    let _ = db
+        .put_record_field_from_ca("PUTF_OUT_SRC", "VAL", EpicsValue::Double(5.0))
+        .await;
+
+    // After both records' synchronous cycles complete, the C path
+    // clears putf on each (each runs its own recGblFwdLink). What
+    // this test pins is the steady-state observability: value
+    // landed (proving OUT-write happened) AND target.rpro stayed
+    // false (no spurious reprocess request — that path only fires
+    // when target was pact at OUT-write time). The mid-cycle PUTF
+    // observability is tested separately via an async target below.
+    let tgt = db.get_record("PUTF_OUT_TGT").await.unwrap();
+    let inst = tgt.read().await;
+    assert!(
+        !inst.common.putf,
+        "after both records' synchronous cycles complete, both clear putf"
+    );
+    assert!(
+        !inst.common.rpro,
+        "target was not pact, so rpro must stay false (normal propagation)"
+    );
+    let val = inst.record.val().and_then(|v| v.to_f64()).unwrap_or(0.0);
+    assert!(
+        (val - 5.0).abs() < 1e-10,
+        "OUT link write propagated value (val={val})"
+    );
+}
+
+/// Mid-cycle PUTF propagation: when the source's OUT-link write
+/// dispatches a target's process(), the target.putf must equal the
+/// source's putf BEFORE the target's own clears fire. Using an async
+/// target lets us observe the bit between write_db_link_value's set
+/// and the eventual complete_async_record clear.
+///
+/// Pre-fix Round 4 `write_db_link_value` only forwarded the value
+/// and dispatched process — never touched `target.putf`. So even
+/// when the source had `putf=1` from a CA put, the async target
+/// stayed at `putf=0` for the duration of the in-flight cycle.
+#[tokio::test]
+async fn test_putf_propagates_mid_cycle_via_async_target_out_link() {
+    let db = PvDatabase::new();
+    // Async target: stays pact between process and complete_async.
+    db.add_record("PROP_TGT", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+    db.add_record("PROP_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PROP_SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("PROP_TGT PP".into()))
+            .unwrap();
+    }
+
+    // Drive CA put. SRC processes synchronously, OUT writes to TGT,
+    // dispatches process; TGT returns AsyncPending so its process
+    // stays in flight — PUTF must be set on TGT before that return
+    // and stay set until completion.
+    let _ = db
+        .put_record_field_from_ca("PROP_SRC", "VAL", EpicsValue::Double(11.0))
+        .await;
+
+    let tgt = db.get_record("PROP_TGT").await.unwrap();
+    let inst = tgt.read().await;
+    assert!(
+        inst.is_processing(),
+        "AsyncPending target stays pact between process and complete"
+    );
+    assert!(
+        inst.common.putf,
+        "target.putf must inherit from src.putf BEFORE complete_async_record clears it \
+         (C dbDbLink.c::processTarget:474). Pre-fix this stayed false."
+    );
+}
+
 /// epics-base 7.0.7 + PR #ac92e3e follow-up: SIMM=RAW input must
 /// route the SIOL value through RVAL and run the record's conversion
 /// chain (LINR/ESLO/EOFF), not overwrite VAL with the raw count.
@@ -1923,6 +2028,93 @@ async fn test_notify_field_respects_mask() {
     }
     assert!(value_rx.try_recv().is_ok());
     assert!(alarm_rx.try_recv().is_err());
+}
+
+/// C `dbAccess.c:575-577` clears `precord->rpro = FALSE; precord->putf =
+/// FALSE` and arms `callNotifyCompletion = TRUE` BEFORE the alarm
+/// check whenever SDIS evaluates to DISV. Pre-fix Round 4 Rust only
+/// reset nsta/nsev and updated the alarm — rpro/putf leaked into the
+/// next cycle and pending dbNotify completion callbacks stalled.
+#[tokio::test]
+async fn test_sdis_disable_clears_rpro_and_putf() {
+    let db = PvDatabase::new();
+    db.add_record("DIS_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("DIS_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("DIS_TGT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("SDIS", EpicsValue::String("DIS_SW".into()))
+            .unwrap();
+        // Pre-set rpro=true, putf=true so the disable path's clear is
+        // observable.
+        inst.common.rpro = true;
+        inst.common.putf = true;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DIS_TGT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("DIS_TGT").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        !inst.common.rpro,
+        "SDIS disable must clear rpro (C dbAccess.c:575). Pre-fix this leaked."
+    );
+    assert!(
+        !inst.common.putf,
+        "SDIS disable must clear putf (C dbAccess.c:576). Pre-fix this leaked."
+    );
+}
+
+/// C `dbAccess.c:622-623` runs `dbNotifyCompletion(precord)` at
+/// `all_done` for the disable bail path because `callNotifyCompletion
+/// = TRUE` was set at line 577. A CA WRITE_NOTIFY landing on a
+/// disabled record must release its caller. Pre-fix Round 4 the
+/// put_notify_tx was never fired, stranding the call until socket
+/// disconnect.
+#[tokio::test]
+async fn test_sdis_disable_fires_put_notify_completion() {
+    let db = PvDatabase::new();
+    db.add_record("DIS_NOT_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("DIS_NOT_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("DIS_NOT_TGT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("SDIS", EpicsValue::String("DIS_NOT_SW".into()))
+            .unwrap();
+    }
+
+    // Arm put_notify_tx on the disabled target. The disable path must
+    // take it (consume tx) and send completion, releasing the rx.
+    let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
+    {
+        let rec = db.get_record("DIS_NOT_TGT").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_notify_tx = Some(tx);
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DIS_NOT_TGT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // rx should be ready — completion was sent via the disable bail.
+    rx.await
+        .expect("disable bail must fire put_notify_tx (C dbAccess.c:622)");
+    // tx must be taken (not left dangling for the next cycle).
+    let rec = db.get_record("DIS_NOT_TGT").await.unwrap();
+    assert!(
+        rec.read().await.put_notify_tx.is_none(),
+        "put_notify_tx must be cleared after firing"
+    );
 }
 
 #[tokio::test]

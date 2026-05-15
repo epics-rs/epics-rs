@@ -188,10 +188,27 @@ impl PvDatabase {
     }
 
     /// Write a value through a DbLink, optionally processing the target if PP and Passive.
+    ///
+    /// `src_putf` carries the source record's `PUTF` bit so the target inherits
+    /// it the same way C `dbDbLink.c::processTarget` propagates it (lines 470-498):
+    ///
+    /// - target not pact: `target.putf = src_putf` (normal propagation),
+    /// - target pact AND `src_putf` AND target not on current process chain:
+    ///   `target.rpro = true`, `target.putf = false` so the in-flight cycle
+    ///   reprocesses on completion attributing the put to the originator,
+    /// - otherwise: no PUTF change (target is either being processed
+    ///   recursively by us, or wasn't triggered by a dbPutField).
+    ///
+    /// Without this, a CA WRITE_NOTIFY landing on an upstream calc/seq/dfanout
+    /// that fanned out via DB OUT links would see `target.putf = 0` on every
+    /// downstream record — breaking dbNotify completion attribution and any
+    /// device-support code that uses PUTF to distinguish operator-driven from
+    /// scan-driven processing.
     pub(crate) async fn write_db_link_value(
         &self,
         link: &crate::server::record::DbLink,
         value: EpicsValue,
+        src_putf: bool,
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
@@ -207,8 +224,21 @@ impl PvDatabase {
             // form. `process_record_with_links` itself also resolves
             // aliases at entry, so passing `link.record` raw is safe.
             if let Some(target_rec) = self.get_record(&link.record).await {
-                let target_scan = target_rec.read().await.common.scan;
-                if target_scan == ScanType::Passive {
+                // Apply C `processTarget` PUTF propagation rules before
+                // dispatching the target's process cycle.
+                let (target_scan, should_process) = {
+                    let mut tg = target_rec.write().await;
+                    let pact = tg.is_processing();
+                    let on_chain = visited.contains(&link.record);
+                    if !pact {
+                        tg.common.putf = src_putf;
+                    } else if src_putf && !on_chain {
+                        tg.common.rpro = true;
+                        tg.common.putf = false;
+                    }
+                    (tg.common.scan, !pact)
+                };
+                if should_process && target_scan == ScanType::Passive {
                     let _ = self
                         .process_record_with_links(&link.record, visited, depth + 1)
                         .await;
@@ -224,6 +254,10 @@ impl PvDatabase {
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
+        // Snapshot the source record's PUTF bit so every write_db_link_value
+        // call below can propagate it to its target — C `dbDbLink.c::
+        // processTarget` invariant (see write_db_link_value doc).
+        let src_putf = rec.read().await.common.putf;
         let (_rtype, dispatch_info) = {
             let instance = rec.read().await;
             let rtype = instance.record.record_type().to_string();
@@ -478,7 +512,7 @@ impl PvDatabase {
                         }
                         let parsed = crate::server::record::parse_link_v2(link_str);
                         if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                            self.write_db_link_value(db, val.clone(), visited, depth)
+                            self.write_db_link_value(db, val.clone(), src_putf, visited, depth)
                                 .await;
                         }
                     }
@@ -505,7 +539,8 @@ impl PvDatabase {
                     if let Some(value) = dol_val {
                         let lnk_parsed = crate::server::record::parse_link_v2(lnk_str);
                         if let crate::server::record::ParsedLink::Db(ref db) = lnk_parsed {
-                            self.write_db_link_value(db, value, visited, depth).await;
+                            self.write_db_link_value(db, value, src_putf, visited, depth)
+                                .await;
                         }
                     }
                 }
@@ -534,7 +569,8 @@ impl PvDatabase {
                     if let Some(value) = value {
                         let lnk_parsed = crate::server::record::parse_link_v2(lnk_str);
                         if let crate::server::record::ParsedLink::Db(ref db) = lnk_parsed {
-                            self.write_db_link_value(db, value, visited, depth).await;
+                            self.write_db_link_value(db, value, src_putf, visited, depth)
+                                .await;
                         }
                     }
                 }

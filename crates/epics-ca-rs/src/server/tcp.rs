@@ -1541,16 +1541,23 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let mut padded = data;
             padded.resize(align8(padded.len()), 0);
 
-            // For deprecated CA_PROTO_READ (cmd=3), the response carries the
-            // SID in cid (not ECA status). Notify clients (cmd=15) get the
-            // ECA_NORMAL status so they can demultiplex by ioid.
+            // For deprecated CA_PROTO_READ (cmd=3), the response carries
+            // the *client-side* CID (`pciu->cid` in C `read_action`
+            // — `camessage.c:622-624` passes `pciu->cid`, NOT
+            // `pciu->sid`, to `cas_copy_in_header`). Modern libca's
+            // `readRespAction` demuxes by ioid (`m_available`) and
+            // ignores `m_cid` for READ responses, but pre-3.14 clients
+            // and stricter wire validators (Wireshark CA dissector,
+            // packet-level fuzzers) cross-check the field. Notify
+            // clients (cmd=15) get ECA_NORMAL since READ_NOTIFY's cid
+            // slot carries status, not the channel CID.
             let mut resp = if is_notify {
                 let mut r = CaHeader::new(CA_PROTO_READ_NOTIFY);
                 r.cid = ECA_NORMAL;
                 r
             } else {
                 let mut r = CaHeader::new(CA_PROTO_READ);
-                r.cid = sid;
+                r.cid = entry.cid;
                 r
             };
             // C client TCP parser requires 8-byte aligned postsize
@@ -2604,10 +2611,7 @@ const CA_PROTO_ERROR_MAX_DIAG_LEN: usize = 480;
 /// bounded across many WRITE_NOTIFYs over a long-lived connection.
 /// Pure transformation extracted so the drain semantics are unit-
 /// testable without standing up a full server + async record.
-fn drain_write_notify_tasks_for_sid(
-    tasks: &mut Vec<(u32, tokio::task::AbortHandle)>,
-    sid: u32,
-) {
+fn drain_write_notify_tasks_for_sid(tasks: &mut Vec<(u32, tokio::task::AbortHandle)>, sid: u32) {
     let mut keep = Vec::with_capacity(tasks.len());
     let mut to_abort = Vec::new();
     for (task_sid, h) in tasks.drain(..) {

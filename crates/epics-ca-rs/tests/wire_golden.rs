@@ -27,7 +27,7 @@
 
 use epics_ca_rs::protocol::{
     CA_DO_REPLY, CA_PROTO_CREATE_CHAN, CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL,
-    CA_PROTO_NOT_FOUND, CA_PROTO_READ_NOTIFY, CA_PROTO_RSRV_IS_UP, CA_PROTO_SEARCH,
+    CA_PROTO_NOT_FOUND, CA_PROTO_READ, CA_PROTO_READ_NOTIFY, CA_PROTO_RSRV_IS_UP, CA_PROTO_SEARCH,
     CA_PROTO_VERSION, CaHeader, ECA_ALLOCMEM, ECA_BADMONID,
 };
 
@@ -389,6 +389,36 @@ fn search_fail_reply_tcp_echoes_request_header_fields() {
         &bytes,
         "000e 0000 000a 000d 12345678 12345678",
         "NOT_FOUND TCP reply echoes request fields",
+    );
+}
+
+#[test]
+fn read_response_header_carries_client_cid_not_sid() {
+    // Deprecated CA_PROTO_READ (cmd=3) response: C `read_action`
+    // (`camessage.c:622-624`) sets `m_cid = pciu->cid` — the
+    // *client-side* CID captured at CREATE_CHAN, NOT the server-side
+    // SID the request addressed the channel with. The Rust server
+    // previously echoed `hdr.cid` (the SID) and diverged from C on the
+    // wire — modern libca demuxes by ioid (`m_available`) so the
+    // mismatch was invisible to it, but the byte-for-byte parity is
+    // what wire-golden tests pin.
+    //
+    // Shape: data_type=DBF_DOUBLE (6), count=1, postsize=8 (one
+    // DBR_DOUBLE), m_cid=clientCid=0xC1, m_available=ioid=0xAB. The
+    // SID under which the client addresses the channel is whatever
+    // was assigned at CREATE_CHAN (here 0x55 in the hypothetical
+    // request); it MUST NOT appear in this response header.
+    let mut h = CaHeader::new(CA_PROTO_READ);
+    h.postsize = 8;
+    h.data_type = 6;
+    h.count = 1;
+    h.cid = 0xC1; // client-side CID (parity: NOT 0x55 sid)
+    h.available = 0xAB;
+    let bytes = h.to_bytes();
+    assert_hex(
+        &bytes,
+        "0003 0008 0006 0001 000000c1 000000ab",
+        "READ response (client cid in m_cid, not sid)",
     );
 }
 

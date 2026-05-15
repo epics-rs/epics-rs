@@ -454,29 +454,168 @@ pub async fn run_tcp_listener(
     >,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
 ) -> CaResult<()> {
-    // C-G11: honor EPICS_CAS_INTF_ADDR_LIST for the TCP listener
-    // (was previously ignored — only the UDP responder respected
-    // it). Bind to the first configured interface; if the list is
-    // empty (the common case) fall back to 0.0.0.0. Multi-interface
-    // multi-listener support is left for a future round — operators
-    // who need it currently bind 0.0.0.0 and apply firewall rules.
-    let bind_ip: std::net::IpAddr = {
+    // C-G11 (R11): honour every interface in `EPICS_CAS_INTF_ADDR_LIST`,
+    // not just the first. C `rsrv_init` (caservertask.c:603-712) iterates
+    // `casIntfAddrList` and spawns one `CAS-TCP` accept thread per
+    // entry, all bound to the same TCP port. Binding to a *specific*
+    // interface IP (vs `INADDR_ANY`) and binding to a *different*
+    // specific IP on the same port is allowed by POSIX; only two
+    // 0.0.0.0 binds collide. Empty list → single `0.0.0.0` listener
+    // (default), preserving the current single-NIC behaviour.
+    //
+    // First successful bind decides `actual_port` (honouring the
+    // existing AddrInUse → ephemeral-fallback path). All subsequent
+    // binds must use that same port; if a per-interface bind fails
+    // it is logged and skipped (matches C `cleanup:` / `continue;` in
+    // `caservertask.c:744-749`, which frees the conf and proceeds).
+    let intf_addrs: Vec<std::net::Ipv4Addr> = {
         let cfg = super::addr_list::from_env();
-        cfg.intf_addrs
-            .first()
-            .map(|a| std::net::IpAddr::V4(*a))
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-    };
-    let listener = match TcpListener::bind((bind_ip, port)).await {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            TcpListener::bind((bind_ip, 0)).await?
+        if cfg.intf_addrs.is_empty() {
+            vec![std::net::Ipv4Addr::UNSPECIFIED]
+        } else {
+            cfg.intf_addrs
         }
-        Err(e) => return Err(e.into()),
     };
-    let actual_port = listener.local_addr()?.port();
+
+    let mut listeners: Vec<(TcpListener, std::net::Ipv4Addr)> = Vec::new();
+    let mut actual_port: Option<u16> = None;
+    for ip in &intf_addrs {
+        let target_port = actual_port.unwrap_or(port);
+        let bind_ip = std::net::IpAddr::V4(*ip);
+        let listener = match TcpListener::bind((bind_ip, target_port)).await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && actual_port.is_none() => {
+                // Only fall back to ephemeral on the FIRST bind. Once
+                // a port has been chosen all subsequent interfaces
+                // MUST share it — otherwise a multi-NIC server would
+                // advertise a different TCP port per interface in its
+                // SEARCH replies (which already carry a single port).
+                TcpListener::bind((bind_ip, 0)).await?
+            }
+            Err(e) => {
+                if actual_port.is_some() {
+                    // Subsequent bind on chosen port failed: log and
+                    // skip (C parity, `cleanup:` path frees + continues).
+                    tracing::warn!(
+                        target: "epics_ca_rs::server::tcp",
+                        intf = %ip,
+                        port = target_port,
+                        error = %e,
+                        "TCP listener bind failed on this interface — skipping"
+                    );
+                    continue;
+                }
+                return Err(e.into());
+            }
+        };
+        let chosen = listener.local_addr()?.port();
+        if actual_port.is_none() {
+            actual_port = Some(chosen);
+        }
+        listeners.push((listener, *ip));
+    }
+
+    let actual_port = match actual_port {
+        Some(p) => p,
+        None => {
+            // C `cantProceed("CAS: No TCP server started\n")` at
+            // `caservertask.c:752`. Every configured interface failed
+            // to bind — there's nothing to serve.
+            return Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "CAS: No TCP server started — all configured interfaces failed to bind",
+            )));
+        }
+    };
     let _ = tcp_port_tx.send(actual_port);
 
+    // One accept-loop task per bound interface. When the parent
+    // `run_tcp_listener` future is dropped (CaServer shutdown via
+    // `tcp_abort.abort()`), this JoinSet is dropped which aborts all
+    // accept loops as a unit. First task to error wins; the rest
+    // are aborted via JoinSet::Drop.
+    let mut accept_tasks: tokio::task::JoinSet<CaResult<()>> = tokio::task::JoinSet::new();
+    for (listener, intf) in listeners {
+        let db_t = db.clone();
+        let acf_t = acf.clone();
+        let acf_reload_tx_t = acf_reload_tx.clone();
+        let beacon_reset_t = beacon_reset.clone();
+        let conn_events_t = conn_events.clone();
+        let audit_t = audit.clone();
+        let drain_t = drain.clone();
+        let stats_t = stats.clone();
+        #[cfg(feature = "experimental-rust-tls")]
+        let tls_t = tls.clone();
+        #[cfg(feature = "cap-tokens")]
+        let cap_token_verifier_t = cap_token_verifier.clone();
+        accept_tasks.spawn(async move {
+            accept_loop(
+                listener,
+                intf,
+                actual_port,
+                db_t,
+                acf_t,
+                acf_reload_tx_t,
+                beacon_reset_t,
+                conn_events_t,
+                audit_t,
+                drain_t,
+                stats_t,
+                #[cfg(feature = "experimental-rust-tls")]
+                tls_t,
+                #[cfg(feature = "cap-tokens")]
+                cap_token_verifier_t,
+            )
+            .await
+        });
+    }
+
+    // Wait for the first error (or for all loops to exit cleanly via
+    // drain). On error, JoinSet::Drop aborts the surviving loops.
+    while let Some(res) = accept_tasks.join_next().await {
+        match res {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => return Err(e),
+            Err(join_err) if join_err.is_cancelled() => continue,
+            Err(join_err) => {
+                return Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    join_err.to_string(),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-interface accept loop. Owned by `run_tcp_listener` via a
+/// `JoinSet` — one task per `EPICS_CAS_INTF_ADDR_LIST` entry. Drains
+/// when the shared `drain` flag is set; otherwise spawns a
+/// `handle_client` task into the local `conn_tasks` `JoinSet` per
+/// accepted connection.
+///
+/// `intf` is the bound interface IP; recorded on accept-error logs so
+/// multi-NIC hosts can tell which listener saw the failure. The
+/// `actual_port` parameter is the TCP port shared across all
+/// listeners (decided in `run_tcp_listener`).
+#[allow(clippy::too_many_arguments)]
+async fn accept_loop(
+    listener: TcpListener,
+    intf: std::net::Ipv4Addr,
+    actual_port: u16,
+    db: Arc<PvDatabase>,
+    acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+    acf_reload_tx: broadcast::Sender<()>,
+    beacon_reset: std::sync::Arc<tokio::sync::Notify>,
+    conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
+    audit: Option<crate::audit::AuditLogger>,
+    drain: Arc<std::sync::atomic::AtomicBool>,
+    stats: Option<Arc<super::ca_server::ServerStats>>,
+    #[cfg(feature = "experimental-rust-tls")] tls: Option<
+        Arc<std::sync::RwLock<Arc<tokio_rustls::rustls::ServerConfig>>>,
+    >,
+    #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
+) -> CaResult<()> {
     // D-G1: track per-connection tasks in a JoinSet so they're
     // aborted as a unit when this accept-loop future is dropped (e.g.
     // CaServer shutdown via tcp_abort.abort()). Without this, every
@@ -492,7 +631,7 @@ pub async fn run_tcp_listener(
         // CaServer::run() loop coordinates the grace period and the
         // ultimate exit.
         if drain.load(std::sync::atomic::Ordering::Acquire) {
-            tracing::info!("TCP listener: drain mode set, exiting accept loop");
+            tracing::info!(intf = %intf, "TCP listener: drain mode set, exiting accept loop");
             return Ok(());
         }
         let (stream, peer) = tokio::select! {
@@ -509,7 +648,7 @@ pub async fn run_tcp_listener(
             drop(stream);
             continue;
         }
-        tracing::info!(peer = %peer, "CA client connected");
+        tracing::info!(peer = %peer, intf = %intf, "CA client connected");
         metrics::counter!("ca_server_accepts_total").increment(1);
         metrics::gauge!("ca_server_clients_active").increment(1.0);
         let db = db.clone();
@@ -2808,5 +2947,161 @@ mod truncate_diag_tests {
         // Standard library guarantees: the returned &str is valid
         // UTF-8 (otherwise this method-call would panic).
         let _ = out.to_owned();
+    }
+}
+
+#[cfg(test)]
+mod multi_nic_listener_tests {
+    //! C-parity regression: `run_tcp_listener` must honour every entry
+    //! in `EPICS_CAS_INTF_ADDR_LIST`, not just the first.
+    //!
+    //! C `rsrv_init` (caservertask.c:603-712) iterates `casIntfAddrList`
+    //! and spawns one accept thread per entry, all on the same TCP
+    //! port. The previous Rust implementation bound only the first
+    //! interface, so a server configured with `INTF_ADDR_LIST="A B"`
+    //! silently dropped TCP accepts on interface B.
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+    use tokio::sync::{Notify, broadcast, oneshot};
+
+    /// Spawn `run_tcp_listener` against a per-test database, return the
+    /// (port, abort-handle). Honours whatever EPICS_CAS_INTF_ADDR_LIST
+    /// is currently set in the process env (caller manages it).
+    async fn start_listener() -> (u16, tokio::task::JoinHandle<()>) {
+        let db = Arc::new(PvDatabase::new());
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (acf_reload_tx, _) = broadcast::channel::<()>(4);
+        let (tcp_tx, tcp_rx) = oneshot::channel::<u16>();
+        let beacon_reset = Arc::new(Notify::new());
+        let drain = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(async move {
+            let _ = run_tcp_listener(
+                db,
+                0, // ephemeral
+                acf,
+                acf_reload_tx,
+                tcp_tx,
+                beacon_reset,
+                None,
+                None,
+                drain,
+                None,
+                #[cfg(feature = "experimental-rust-tls")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await;
+        });
+        let port = tcp_rx.await.expect("listener bound");
+        (port, handle)
+    }
+
+    /// Confirm `INTF_ADDR_LIST=127.0.0.1` results in a listener that
+    /// accepts on 127.0.0.1. This is the "single specific IP" path
+    /// which already worked pre-R11 — the test guards against a
+    /// regression in the refactor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn single_specific_intf_binds_and_accepts() {
+        let saved = std::env::var("EPICS_CAS_INTF_ADDR_LIST").ok();
+        // SAFETY: gated by `serial_test::serial`; restored before return.
+        unsafe { std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1") };
+
+        let (port, listener_task) = start_listener().await;
+        // Connect — TCP handshake completes only if the listener bound
+        // to 127.0.0.1 and is accepting.
+        let stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .expect("connect within timeout")
+        .expect("connect succeeded");
+        drop(stream);
+
+        listener_task.abort();
+        let _ = listener_task.await;
+
+        // SAFETY: same `serial_test::serial` scope.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_INTF_ADDR_LIST"),
+            }
+        }
+    }
+
+    /// Two-entry `INTF_ADDR_LIST`: the first valid interface decides
+    /// the port; the second must bind on the same port. Use
+    /// `127.0.0.1` for both — POSIX rejects two identical
+    /// (addr,port) binds, so the second bind on the same loopback IP
+    /// fails. The R11 contract is that a failed *subsequent* bind is
+    /// logged-and-skipped (matching C `cleanup: continue;`), and the
+    /// listener as a whole still serves the first interface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn duplicate_intf_subsequent_skipped_not_fatal() {
+        let saved = std::env::var("EPICS_CAS_INTF_ADDR_LIST").ok();
+        // SAFETY: gated by `serial_test::serial`.
+        unsafe { std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1 127.0.0.1") };
+
+        let (port, listener_task) = start_listener().await;
+        // First listener still accepts.
+        let stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .expect("connect within timeout")
+        .expect("connect succeeded — first listener serves");
+        drop(stream);
+
+        listener_task.abort();
+        let _ = listener_task.await;
+
+        // SAFETY: same scope.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", v),
+                None => std::env::remove_var("EPICS_CAS_INTF_ADDR_LIST"),
+            }
+        }
+    }
+
+    /// Empty list → falls back to single 0.0.0.0 bind (default).
+    /// Asserts the empty-list path didn't regress.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn empty_intf_list_binds_wildcard() {
+        let saved = std::env::var("EPICS_CAS_INTF_ADDR_LIST").ok();
+        // SAFETY: gated by `serial_test::serial`.
+        unsafe { std::env::remove_var("EPICS_CAS_INTF_ADDR_LIST") };
+
+        let (port, listener_task) = start_listener().await;
+        // 0.0.0.0 binds accept connections on every local IP including
+        // 127.0.0.1.
+        let stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .expect("connect within timeout")
+        .expect("connect succeeded");
+        drop(stream);
+
+        listener_task.abort();
+        let _ = listener_task.await;
+
+        // SAFETY: same scope.
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", v);
+            }
+        }
     }
 }

@@ -307,7 +307,7 @@ async fn run_beacon_monitor_inner(
                     // can otherwise be replayed from anywhere; combined
                     // with the unbounded verified_tuples map below this
                     // is a poison amplifier.
-                    let src_ip = match _src.ip() {
+                    let src_ip = match meta.src.ip() {
                         std::net::IpAddr::V4(v) => v,
                         std::net::IpAddr::V6(_) => {
                             metrics::counter!("ca_client_signed_beacon_failures_total")
@@ -733,7 +733,12 @@ async fn register_with_repeater(socket: &AsyncUdpV4) -> Result<(), ()> {
     let mut hdr = CaHeader::new(CA_PROTO_REPEATER_REGISTER);
     hdr.available = u32::from_be_bytes(local_ip.octets());
 
-    let repeater_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, CA_REPEATER_PORT));
+    // Honour `EPICS_CA_REPEATER_PORT` so the beacon monitor and the
+    // daemon agree when operators override the default — without this
+    // the monitor would silently fail to re-register every 5 min
+    // against a non-default repeater. libca `udpiiu.cpp:168` resolves
+    // the same env var.
+    let repeater_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, repeater_port()));
     socket
         .send_to(&hdr.to_bytes(), repeater_addr)
         .await

@@ -26,9 +26,9 @@
 //! ```
 
 use epics_ca_rs::protocol::{
-    CA_PROTO_CREATE_CHAN, CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL,
-    CA_PROTO_READ_NOTIFY, CA_PROTO_RSRV_IS_UP, CA_PROTO_SEARCH, CA_PROTO_VERSION, CaHeader,
-    ECA_BADMONID,
+    CA_DO_REPLY, CA_PROTO_CREATE_CHAN, CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL,
+    CA_PROTO_NOT_FOUND, CA_PROTO_READ_NOTIFY, CA_PROTO_RSRV_IS_UP, CA_PROTO_SEARCH,
+    CA_PROTO_VERSION, CaHeader, ECA_ALLOCMEM, ECA_BADMONID,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -320,6 +320,75 @@ fn search_reply_tcp_matches_c_zero_postsize_sid_sentinel() {
         &bytes,
         "0006 0000 13c8 0000 ffffffff 12345678",
         "SEARCH TCP reply (postsize=0, sid=~0U)",
+    );
+}
+
+#[test]
+fn create_chan_cap_reached_uses_proto_error_eca_allocmem() {
+    // C `claim_ciu_action` (`rsrv/camessage.c:1229-1239`) reserves
+    // CREATE_CH_FAIL for the "PV does not exist on this server" path
+    // (`dbChannel_create` returning NULL). Resource-exhaustion paths
+    // (`casCreateChannel` returning NULL on alloc failure, no-room
+    // for security table) route through `send_err(mp, ECA_ALLOCMEM,
+    // …)`, which emits a CA_PROTO_ERROR.
+    //
+    // Per `vsend_err`'s command-keyed switch (`camessage.c:155-182`)
+    // CA_PROTO_CREATE_CHAN falls to `default`, so `m_cid` is the
+    // 0xFFFFFFFF "no channel scope" sentinel and `m_available`
+    // carries the ECA status. libca `exceptionRespAction`
+    // (`cac.cpp:1118`) reads `m_available` to surface ECA_ALLOCMEM
+    // to the user callback, distinguishing "server saturated"
+    // from CREATE_CH_FAIL's "no such PV".
+    //
+    // The Rust per-client channel cap used CREATE_CH_FAIL before
+    // this commit; that made transient saturation look like
+    // permanent "PV not found", so a libca client could remove our
+    // address from its resolution cache for the entire connection
+    // lifetime. Pin the corrected ERROR header shape here.
+    let mut resp = CaHeader::new(CA_PROTO_ERROR);
+    resp.cid = 0xFFFF_FFFF;
+    resp.available = ECA_ALLOCMEM;
+    let bytes = resp.to_bytes();
+    let allocmem_hex = format!("{:08x}", ECA_ALLOCMEM);
+    let expected = format!("000b 0000 0000 0000 ffffffff {}", allocmem_hex);
+    assert_hex(
+        &bytes,
+        &expected,
+        "CREATE_CHAN cap-reached ERROR header (ECA_ALLOCMEM, cid=~0U)",
+    );
+}
+
+#[test]
+fn search_fail_reply_tcp_echoes_request_header_fields() {
+    // C `search_fail_reply` (`rsrv/camessage.c:2075-2089`) calls
+    // `cas_copy_in_header(CA_PROTO_NOT_FOUND, 0u, mp->m_dataType,
+    // mp->m_count, mp->m_cid, mp->m_available, NULL)` — every
+    // identifying field of the incoming search request is echoed
+    // verbatim into the NOT_FOUND reply. The earlier Rust path
+    // overwrote `count` with the server's CA_MINOR_VERSION and
+    // `cid` with the request's `m_available` (which happens to
+    // equal `m_cid` for libca search frames, but the parity intent
+    // is "echo m_cid"). This regression-fence the byte-for-byte
+    // shape against the C softIoc.
+    //
+    // Wire shape (16 bytes, no payload):
+    //   m_cmmd      = CA_PROTO_NOT_FOUND (14 = 0x000e)
+    //   m_postsize  = 0
+    //   m_dataType  = CA_DO_REPLY (10 = 0x000a)
+    //   m_count     = client minor version (13 = 0x000d)
+    //   m_cid       = client's request m_cid (0x1234_5678)
+    //   m_available = client's request m_available (0x1234_5678)
+    let mut nf = CaHeader::new(CA_PROTO_NOT_FOUND);
+    nf.data_type = CA_DO_REPLY;
+    nf.count = 13;
+    nf.cid = 0x1234_5678;
+    nf.available = 0x1234_5678;
+    let bytes = nf.to_bytes();
+    assert_eq!(bytes.len(), CaHeader::SIZE);
+    assert_hex(
+        &bytes,
+        "000e 0000 000a 000d 12345678 12345678",
+        "NOT_FOUND TCP reply echoes request fields",
     );
 }
 

@@ -1254,11 +1254,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     "rejecting CREATE_CHAN: per-client channel limit reached"
                 );
                 metrics::counter!("ca_server_channel_limit_rejects_total").increment(1);
-                let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
-                fail.cid = hdr.cid;
-                let mut w = writer.lock().await;
-                w.write_all(&fail.to_bytes()).await?;
-                // flush deferred to handle_client outer loop (batched)
+                // C parity: `claim_ciu_action` (rsrv/camessage.c:1229-1239)
+                // routes channel-allocation failure through
+                // `send_err(mp, ECA_ALLOCMEM, …)`, NOT
+                // CREATE_CH_FAIL. CREATE_CH_FAIL is reserved for the
+                // `dbChannel_create` (PV/field not found) branch
+                // (camessage.c:1212-1219). libca
+                // `exceptionRespAction` surfaces the ECA_ALLOCMEM
+                // status to the user-level callback so the client
+                // knows "server out of resources" vs CREATE_CH_FAIL's
+                // "PV does not exist on this server" — the existing
+                // Rust path conflated the two, leading clients to
+                // remove our address from their resolution cache on
+                // a transient server saturation. Per `vsend_err`'s
+                // switch, CA_PROTO_CREATE_CHAN falls to `default`
+                // and uses `0xffffffff` for `m_cid`.
+                send_ca_error(writer, hdr, ECA_ALLOCMEM, u32::MAX, "channel limit reached").await?;
                 return Ok(());
             }
 
@@ -2315,12 +2326,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 w.write_all(&resp.to_bytes()).await?;
                 // flush deferred to handle_client outer loop (batched)
             } else if hdr.data_type == CA_DO_REPLY {
-                // Explicit negative reply requested — send NOT_FOUND so the
-                // client doesn't have to wait for a search timeout.
+                // Explicit negative reply requested — send NOT_FOUND so
+                // the client doesn't have to wait for a search timeout.
+                //
+                // C parity: `search_fail_reply` (rsrv/camessage.c:2079)
+                // copies the request's `m_dataType`/`m_count`/`m_cid`/
+                // `m_available` verbatim into the response. The previous
+                // Rust path overwrote `count` with the server's
+                // CA_MINOR_VERSION and `cid` with the request's
+                // `m_available` (which happens to equal `m_cid` for
+                // libca search frames, but the parity intent is
+                // "echo m_cid"). With this fix the reply is byte-
+                // equivalent to a C softIoc fail reply.
                 let mut nf = CaHeader::new(CA_PROTO_NOT_FOUND);
-                nf.data_type = CA_DO_REPLY;
-                nf.count = CA_MINOR_VERSION;
-                nf.cid = hdr.available;
+                nf.data_type = hdr.data_type;
+                nf.count = hdr.count;
+                nf.cid = hdr.cid;
                 nf.available = hdr.available;
                 let mut w = writer.lock().await;
                 w.write_all(&nf.to_bytes()).await?;
@@ -2546,6 +2567,31 @@ async fn send_cmd_error<W: AsyncWrite + Unpin + Send + 'static>(
 /// (`cac.cpp:1118`) — which reads the status from `hdr.m_available` —
 /// would surface every server-emitted CA_PROTO_ERROR as ECA_NORMAL
 /// (status 0), silently masking the failure.
+/// C `vsend_err` (rsrv/camessage.c:147,229-242) allocates a fixed
+/// 512-byte buffer for the entire reply (outer header + echoed
+/// request header + diagnostic + NUL), and `epicsVsnprintf` truncates
+/// the formatted diagnostic if it would overflow. Mirror that bound
+/// so a buggy caller (or future translated message catalog) can't
+/// ship a CA_PROTO_ERROR whose payload exceeds the libca per-server
+/// recv buffer or the extended-header threshold. 480 = 512 −
+/// 2*sizeof(caHdr) matches the diagnostic budget C grants
+/// `epicsVsnprintf`.
+const CA_PROTO_ERROR_MAX_DIAG_LEN: usize = 480;
+
+/// Truncate `message` to at most `CA_PROTO_ERROR_MAX_DIAG_LEN` bytes
+/// on a char boundary (so the resulting `&str` slice is always valid
+/// UTF-8). `pad_string` appends the NUL terminator and 8-aligns.
+fn truncate_diag(message: &str) -> &str {
+    if message.len() <= CA_PROTO_ERROR_MAX_DIAG_LEN {
+        return message;
+    }
+    let mut end = CA_PROTO_ERROR_MAX_DIAG_LEN;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
+}
+
 async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     writer: &Arc<Mutex<BufWriter<W>>>,
     original_hdr: &CaHeader,
@@ -2553,7 +2599,7 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     chan_cid: u32,
     message: &str,
 ) -> CaResult<()> {
-    let error_msg_bytes = pad_string(message);
+    let error_msg_bytes = pad_string(truncate_diag(message));
     let payload_size = CaHeader::SIZE + error_msg_bytes.len();
 
     let mut resp = CaHeader::new(CA_PROTO_ERROR);
@@ -2567,4 +2613,49 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     w.write_all(&error_msg_bytes).await?;
     // flush deferred to handle_client outer loop (batched)
     Ok(())
+}
+
+#[cfg(test)]
+mod truncate_diag_tests {
+    use super::{CA_PROTO_ERROR_MAX_DIAG_LEN, truncate_diag};
+
+    #[test]
+    fn passes_through_short_message() {
+        let s = "channel limit reached";
+        assert_eq!(truncate_diag(s), s);
+    }
+
+    #[test]
+    fn truncates_at_exact_limit() {
+        let s = "x".repeat(CA_PROTO_ERROR_MAX_DIAG_LEN);
+        assert_eq!(truncate_diag(&s).len(), CA_PROTO_ERROR_MAX_DIAG_LEN);
+    }
+
+    #[test]
+    fn truncates_oversize_to_limit() {
+        let s = "x".repeat(CA_PROTO_ERROR_MAX_DIAG_LEN + 100);
+        let out = truncate_diag(&s);
+        assert_eq!(out.len(), CA_PROTO_ERROR_MAX_DIAG_LEN);
+        assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn truncation_lands_on_utf8_char_boundary() {
+        // Construct a string that crosses the 480-byte cap inside
+        // a multi-byte UTF-8 sequence: 'é' (U+00E9) is 2 bytes in
+        // UTF-8. Padding with 479 'a's puts the first byte of 'é'
+        // exactly at byte 479 — within the limit — and the second
+        // at byte 480 — past it. Naive byte slicing would split it
+        // and panic. `truncate_diag` must back off to the previous
+        // char boundary (byte 479).
+        let mut s = "a".repeat(479);
+        s.push('é');
+        assert_eq!(s.len(), 481);
+        let out = truncate_diag(&s);
+        assert!(out.is_char_boundary(out.len()));
+        assert!(out.len() <= CA_PROTO_ERROR_MAX_DIAG_LEN);
+        // Standard library guarantees: the returned &str is valid
+        // UTF-8 (otherwise this method-call would panic).
+        let _ = out.to_owned();
+    }
 }

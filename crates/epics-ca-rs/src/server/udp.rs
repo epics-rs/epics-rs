@@ -227,18 +227,16 @@ async fn run_single_responder(
                         reply.extend_from_slice(&search_payload);
 
                         let _ = socket.send_to(&reply, src).await;
-                    } else if hdr.data_type == CA_DO_REPLY {
-                        // Client asked for an explicit negative reply
-                        // (search header data_type == CA_DO_REPLY=10).
-                        // Send CA_PROTO_NOT_FOUND so it doesn't have to
-                        // wait for the search timeout.
-                        let mut nf = CaHeader::new(CA_PROTO_NOT_FOUND);
-                        nf.data_type = CA_DO_REPLY;
-                        nf.count = CA_MINOR_VERSION;
-                        nf.cid = hdr.available;
-                        nf.available = hdr.available;
-                        let _ = socket.send_to(&nf.to_bytes(), src).await;
                     }
+                    // C parity: `search_reply_udp` (rsrv/camessage.c:2167)
+                    // silently returns on `dbChannelTest` failure for ALL
+                    // UDP searches — there is no DO_REPLY branch on the
+                    // UDP path. Only `search_reply_tcp` honours the flag
+                    // and emits CA_PROTO_NOT_FOUND. Emitting NOT_FOUND
+                    // here surprised C libca clients running through a
+                    // name-server-list iteration: a UDP NOT_FOUND from a
+                    // peer would short-circuit the broadcast search,
+                    // missing IOCs that hadn't responded yet.
                 }
             }
 

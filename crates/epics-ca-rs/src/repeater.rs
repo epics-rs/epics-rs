@@ -105,7 +105,12 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
         let _ = sock.set_multicast_all_v4(false);
     }
     sock.set_nonblocking(true)?;
-    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, CA_REPEATER_PORT);
+    // libca `repeater.cpp:511` resolves the bind port through
+    // `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)`. Mirror
+    // that so sites that override the port via env (e.g. to coexist
+    // with a parallel C caRepeater on the default 5065) reach our
+    // daemon. The default remains 5065 when the env var is unset.
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, repeater_port());
     sock.bind(&bind_addr.into())?;
 
     // ca commit 97bf917: join every multicast (224.0.0.0/4) beacon address
@@ -405,7 +410,11 @@ async fn try_register() -> Result<(), ()> {
     let mut hdr = CaHeader::new(CA_PROTO_REPEATER_REGISTER);
     hdr.available = u32::from_be_bytes(local_ip.octets());
 
-    let repeater_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, CA_REPEATER_PORT);
+    // Client REGISTER target: same env override as the daemon bind
+    // above, so a non-default repeater port stays consistent on both
+    // ends. C libca `udpiiu.cpp:168` reads the same env var via
+    // `envGetInetPortConfigParam`.
+    let repeater_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, repeater_port());
     socket
         .send_to(&hdr.to_bytes(), repeater_addr)
         .await

@@ -26,9 +26,9 @@
 //! ```
 
 use epics_ca_rs::protocol::{
-    CA_PROTO_CREATE_CHAN, CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL,
-    CA_PROTO_READ_NOTIFY, CA_PROTO_RSRV_IS_UP, CA_PROTO_SEARCH, CA_PROTO_VERSION, CaHeader,
-    ECA_BADMONID,
+    CA_DO_REPLY, CA_PROTO_CREATE_CHAN, CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL,
+    CA_PROTO_NOT_FOUND, CA_PROTO_READ_NOTIFY, CA_PROTO_RSRV_IS_UP, CA_PROTO_SEARCH,
+    CA_PROTO_VERSION, CaHeader, ECA_BADMONID,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -320,6 +320,40 @@ fn search_reply_tcp_matches_c_zero_postsize_sid_sentinel() {
         &bytes,
         "0006 0000 13c8 0000 ffffffff 12345678",
         "SEARCH TCP reply (postsize=0, sid=~0U)",
+    );
+}
+
+#[test]
+fn search_fail_reply_tcp_echoes_request_header_fields() {
+    // C `search_fail_reply` (`rsrv/camessage.c:2075-2089`) calls
+    // `cas_copy_in_header(CA_PROTO_NOT_FOUND, 0u, mp->m_dataType,
+    // mp->m_count, mp->m_cid, mp->m_available, NULL)` — every
+    // identifying field of the incoming search request is echoed
+    // verbatim into the NOT_FOUND reply. The earlier Rust path
+    // overwrote `count` with the server's CA_MINOR_VERSION and
+    // `cid` with the request's `m_available` (which happens to
+    // equal `m_cid` for libca search frames, but the parity intent
+    // is "echo m_cid"). This regression-fence the byte-for-byte
+    // shape against the C softIoc.
+    //
+    // Wire shape (16 bytes, no payload):
+    //   m_cmmd      = CA_PROTO_NOT_FOUND (14 = 0x000e)
+    //   m_postsize  = 0
+    //   m_dataType  = CA_DO_REPLY (10 = 0x000a)
+    //   m_count     = client minor version (13 = 0x000d)
+    //   m_cid       = client's request m_cid (0x1234_5678)
+    //   m_available = client's request m_available (0x1234_5678)
+    let mut nf = CaHeader::new(CA_PROTO_NOT_FOUND);
+    nf.data_type = CA_DO_REPLY;
+    nf.count = 13;
+    nf.cid = 0x1234_5678;
+    nf.available = 0x1234_5678;
+    let bytes = nf.to_bytes();
+    assert_eq!(bytes.len(), CaHeader::SIZE);
+    assert_hex(
+        &bytes,
+        "000e 0000 000a 000d 12345678 12345678",
+        "NOT_FOUND TCP reply echoes request fields",
     );
 }
 

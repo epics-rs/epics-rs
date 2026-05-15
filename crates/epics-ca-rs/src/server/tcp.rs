@@ -2315,12 +2315,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 w.write_all(&resp.to_bytes()).await?;
                 // flush deferred to handle_client outer loop (batched)
             } else if hdr.data_type == CA_DO_REPLY {
-                // Explicit negative reply requested — send NOT_FOUND so the
-                // client doesn't have to wait for a search timeout.
+                // Explicit negative reply requested — send NOT_FOUND so
+                // the client doesn't have to wait for a search timeout.
+                //
+                // C parity: `search_fail_reply` (rsrv/camessage.c:2079)
+                // copies the request's `m_dataType`/`m_count`/`m_cid`/
+                // `m_available` verbatim into the response. The previous
+                // Rust path overwrote `count` with the server's
+                // CA_MINOR_VERSION and `cid` with the request's
+                // `m_available` (which happens to equal `m_cid` for
+                // libca search frames, but the parity intent is
+                // "echo m_cid"). With this fix the reply is byte-
+                // equivalent to a C softIoc fail reply.
                 let mut nf = CaHeader::new(CA_PROTO_NOT_FOUND);
-                nf.data_type = CA_DO_REPLY;
-                nf.count = CA_MINOR_VERSION;
-                nf.cid = hdr.available;
+                nf.data_type = hdr.data_type;
+                nf.count = hdr.count;
+                nf.cid = hdr.cid;
                 nf.available = hdr.available;
                 let mut w = writer.lock().await;
                 w.write_all(&nf.to_bytes()).await?;

@@ -685,7 +685,13 @@ async fn process_search_datagram(
                         matched_cids.push(*cid);
                     }
                 }
-                if !matched_cids.is_empty() {
+                // pvxs `server.cpp:730-732`: when `nreply==0` AND the
+                // SEARCH header did not set `MustReply`, drop the
+                // SEARCH silently. Honouring `MustReply` even with
+                // `nreply==0` is what lets `pvlist` build its server
+                // list — without this, our server stays invisible to
+                // discovery probes.
+                if !matched_cids.is_empty() || req.must_reply {
                     let resp = build_search_response_proto(
                         guid,
                         req.seq,
@@ -849,7 +855,11 @@ async fn process_v6_search_datagram(
                         matched_cids.push(*cid);
                     }
                 }
-                if !matched_cids.is_empty() {
+                // pvxs `server.cpp:730-732` (also reached for v6
+                // SEARCH via the same handler): honour `MustReply`
+                // with an empty (`found=0`, `nreply=0`) response so
+                // pvlist-style discovery sees the server.
+                if !matched_cids.is_empty() || req.must_reply {
                     let resp = build_search_response_proto(
                         guid,
                         req.seq,
@@ -876,7 +886,14 @@ async fn process_v6_search_datagram(
     }
 }
 
-/// Build a (one-PV) SEARCH_RESPONSE frame with explicit protocol name.
+/// Build a SEARCH_RESPONSE frame with explicit protocol name.
+///
+/// pvxs `server.cpp:743-746`: when `nreply==0`, the `found` byte is set to
+/// `0` (clients see "this server has none of those names" rather than
+/// "this server has empty matches"). When `cids` is empty the response is
+/// still a valid frame — used as an answer to `MustReply`-flagged
+/// SEARCHes (pvlist-style discovery probes) so the requester can build
+/// its server list.
 fn build_search_response_proto(
     guid: [u8; 12],
     seq: u32,
@@ -892,7 +909,7 @@ fn build_search_response_proto(
     payload.extend_from_slice(&addr);
     payload.put_u16(tcp_port, order);
     encode_string_into(protocol, order, &mut payload);
-    payload.put_u8(1); // found
+    payload.put_u8(if cids.is_empty() { 0 } else { 1 }); // found
     payload.put_u16(cids.len() as u16, order);
     for &cid in cids {
         payload.put_u32(cid, order);
@@ -961,6 +978,12 @@ struct SearchRequest {
     /// that the forwarder must clear before relaying via the loopback
     /// ORIGIN_TAG channel (`udp_collector.cpp:391`).
     unicast: bool,
+    /// True when the SEARCH header had the `MustReply` flag (`0x01`,
+    /// `pva_search_flags::MustReply`) set — pvlist-style discovery
+    /// probes set this so every reachable server answers even with
+    /// `nreply==0`. pvxs honours it at `server.cpp:730-732`
+    /// (`if(nreply==0 && !msg.mustReply) return;`).
+    must_reply: bool,
     /// Total bytes consumed from the input slice (header + payload),
     /// used by the multi-message drain loop to advance to the next
     /// chained message in the same datagram.
@@ -1005,6 +1028,10 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     let seq = p.get_u32(order).ok()?;
     let flags = p.get_u8().ok()?;
     let unicast = flags & 0x80 != 0;
+    // `pva_search_flags::MustReply = 0x01`. pvxs `udp_collector.cpp:363`
+    // mirrors the field into `SearchMsg::mustReply`; pvlist relies on
+    // this to enumerate reachable servers regardless of name matches.
+    let must_reply = flags & 0x01 != 0;
     let _ = p.get_bytes(3).ok()?;
     let addr_bytes = p.get_bytes(16).ok()?;
     let mut addr16 = [0u8; 16];
@@ -1041,6 +1068,7 @@ fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
         reply_addr,
         reply_port,
         unicast,
+        must_reply,
         consumed: PvaHeader::SIZE + payload_len,
     })
 }
@@ -1522,5 +1550,56 @@ mod tests {
         );
 
         task.abort();
+    }
+
+    /// pvxs `udp_collector.cpp:363`: `mustReply = flags & pva_search_flags::
+    /// MustReply`. The `MustReply` bit (`0x01`) and the `Unicast` bit
+    /// (`0x80`) live in the same flags byte and are extracted by the
+    /// parser; previously only `Unicast` survived the round trip.
+    #[test]
+    fn parse_search_extracts_must_reply_flag() {
+        let codec = PvaCodec { big_endian: false };
+        // build_discover_search sets flags = 0x01 (MustReply only).
+        let frame = codec.build_discover_search(7, 9999);
+        let req = parse_search_request(&frame).expect("discover SEARCH parses");
+        assert!(
+            req.must_reply,
+            "MustReply flag (0x01) must be extracted into SearchRequest"
+        );
+        assert!(!req.unicast, "Unicast flag (0x80) should be clear");
+
+        // Plain non-must-reply unicast SEARCH (flags = 0x80) keeps both
+        // bits independent.
+        let frame2 = codec.build_search(1, 7, "MY:PV", [0, 0, 0, 0], 5076, true);
+        let req2 = parse_search_request(&frame2).expect("plain SEARCH parses");
+        assert!(req2.unicast);
+        assert!(!req2.must_reply);
+    }
+
+    /// pvxs `server.cpp:743-744`: when `nreply==0` the `found` byte is
+    /// `0`, not `1`. Building a response with an empty CID slice must
+    /// emit `found=0` so a MustReply discovery probe sees the correct
+    /// shape and counts our server as reachable-but-no-match.
+    #[test]
+    fn search_response_empty_cids_emits_found_zero() {
+        let guid = [0x55u8; 12];
+        let bytes = build_search_response_proto(guid, 42, 5075, &[], ByteOrder::Little, "tcp");
+        // Header (8) + GUID (12) + seq (4) + addr16 (16) + port (2) +
+        // size(1)+"tcp"(3) = offset 46 for the `found` byte.
+        let found_off = PvaHeader::SIZE + 12 + 4 + 16 + 2 + 1 + 3;
+        assert_eq!(
+            bytes[found_off], 0,
+            "found byte must be 0 when no CIDs claimed (pvxs nreply==0 path)"
+        );
+        // nreply u16 immediately follows; must also be 0.
+        assert_eq!(
+            u16::from_le_bytes([bytes[found_off + 1], bytes[found_off + 2]]),
+            0,
+            "nreply must be 0 alongside found=0"
+        );
+
+        // Sanity check: non-empty CIDs still emit found=1.
+        let bytes2 = build_search_response_proto(guid, 42, 5075, &[7u32], ByteOrder::Little, "tcp");
+        assert_eq!(bytes2[found_off], 1, "found must be 1 when CIDs present");
     }
 }

@@ -1122,11 +1122,15 @@ async fn handle_unsupported_op(
     let mut cur = frame.cursor();
     let _sid = cur.get_u32(order).unwrap_or(0);
     let ioid = cur.get_u32(order).unwrap_or(0);
-    let _subcmd = cur.get_u8().unwrap_or(0);
+    let subcmd = cur.get_u8().unwrap_or(0);
 
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
-    payload.put_u8(0x00); // subcmd 0 = data response
+    // Echo the request subcmd per pvxs `serverget.cpp:83`. The
+    // unsupported-op error mirrors the regular op error response
+    // shape so pvxs / pvAccessJava clients surface the message
+    // verbatim instead of a protocol-violation diagnostic.
+    payload.put_u8(subcmd);
     let status = Status::error(format!("{label} not supported by this server"));
     status.write_into(order, &mut payload);
 
@@ -1293,6 +1297,33 @@ async fn handle_destroy_channel(
     let cid = cur
         .get_u32(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
+    // pvxs `serverchan.cpp:382-386`: when the SID is unknown the server
+    // logs at debug and silently returns — no DESTROY_CHANNEL reply is
+    // sent. Fabricating "yes I destroyed it" for an SID we never
+    // created (a) lets a malicious peer extract reply frames for any
+    // SID/CID pair (small amplification) and (b) confuses correctness
+    // diagnostics on the client side: a peer that lost track and
+    // re-DESTROYs gets an `OK` echo back instead of the expected
+    // silence, masking the bug. Match pvxs: lookup, return on miss,
+    // remove + reply only on hit.
+    if !channels.contains_key(&sid) {
+        debug!(sid, cid, "DESTROY_CHANNEL on unknown SID: dropping");
+        return Ok(());
+    }
+    // pvxs also warns when `chan->cid != cid` (line 390-393) but proceeds
+    // with the destroy. We don't keep the wire CID alongside the SID
+    // mapping today — log on mismatch for parity with the warn-level
+    // diagnostic, then proceed.
+    if let Some(ch) = channels.get(&sid)
+        && ch.cid != cid
+    {
+        debug!(
+            sid,
+            stored_cid = ch.cid,
+            wire_cid = cid,
+            "DESTROY_CHANNEL CID mismatch"
+        );
+    }
     // Removing the channel drops every OpState in `ops`, which drops
     // each `monitor_abort: Option<Arc<AbortOnDrop>>` and cancels the
     // associated subscriber task — preventing orphaned spawns from
@@ -1562,7 +1593,14 @@ async fn handle_op(
             };
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
-            payload.put_u8(0x00);
+            // pvxs `serverget.cpp:83` echoes the request `subcmd`
+            // verbatim. For GET data phase pvxs client always sends
+            // `subcmd=0x00` (clientget.cpp:303 `state==Exec`) so the
+            // observable byte happens to match the hardcoded 0x00, but
+            // mirroring the request is the parity-correct shape and
+            // future-proofs the response when the client adds new
+            // QoS bits (e.g. `0x04` PROCESS).
+            payload.put_u8(subcmd);
             Status::ok().write_into(order, &mut payload);
             // Emit only the fields the client's pvRequest selected.
             mask.write_into(order, &mut payload);
@@ -1615,7 +1653,16 @@ async fn handle_op(
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
-            payload.put_u8(0x00);
+            // pvxs `serverget.cpp:83` echoes the request `subcmd`. For
+            // a plain PUT EXEC the client sends `0x00`; for PUT_GET
+            // (readback) the client sends `0x40` (clientget.cpp:300,
+            // `state==GetOPut`). Hardcoding `0x00` makes the response
+            // header lie to the client: pvxs `clientget.cpp:362-370`
+            // dispatches the response decode on `subcmd & 0x40`, so a
+            // PUT_GET reply with `subcmd=0x00` was parsed as
+            // status-only and the readback bytes (status+bitset+value)
+            // were silently dropped on the floor.
+            payload.put_u8(subcmd);
             match result {
                 Ok(()) => {
                     // PUT_GET (subcmd bit 0x40 set on the request): client
@@ -2207,7 +2254,12 @@ async fn handle_op(
 
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
-            payload.put_u8(0x00);
+            // pvxs `serverget.cpp:83` echoes the request `subcmd`.
+            // RPC EXEC always sends `0x00`, but mirror the request
+            // for parity-correctness — pvxs validates the response
+            // subcmd against the local op state and treats a mismatch
+            // as a protocol fault.
+            payload.put_u8(subcmd);
             match result {
                 Ok((resp_desc, resp_value)) => {
                     Status::ok().write_into(order, &mut payload);
@@ -2252,6 +2304,16 @@ async fn handle_get_field(
     // Variant descriptor + status=OK, which is worse than a noop —
     // a stale client would build its decode tree against a wrong
     // shape and surface garbage on the next GET. Match pvxs.
+    //
+    // P-C4: pvxs serverintrospect.cpp:159 is ONE composite guard —
+    // `if(!chan || opByIOID.find(ioid)!=opByIOID.end())`. Both arms
+    // log at err level and silently return. We were checking only
+    // the SID half: GET_FIELD reusing an IOID already bound to an
+    // active GET/PUT/MONITOR/RPC in the same channel would (a) fire
+    // back a successful introspection reply that the client logs as
+    // unexpected traffic on a busy IOID, and (b) leave the original
+    // op's state untouched but with the wire conversation polluted.
+    // Match pvxs: reject IOID-reuse via the same silent path.
     let chan = match channels.get(&sid) {
         Some(c) => c,
         None => {
@@ -2259,6 +2321,13 @@ async fn handle_get_field(
             return Ok(());
         }
     };
+    if chan.ops.contains_key(&ioid) {
+        debug!(
+            sid,
+            ioid, "GET_FIELD reuses IOID bound to active op: dropping (pvxs parity)"
+        );
+        return Ok(());
+    }
     let intro = match chan.introspection.clone() {
         Some(d) => d,
         None => source
@@ -2525,6 +2594,442 @@ mod tests {
             }
             other => panic!("expected monitor data, got {other:?}"),
         }
+    }
+
+    /// pvxs `serverchan.cpp:382-386`: when the SID in DESTROY_CHANNEL
+    /// is unknown the server logs at debug and silently returns — no
+    /// reply frame is emitted. Previously we unconditionally fabricated
+    /// `OK` echo back even for SIDs we never created, which both
+    /// amplifies (1:1) and confuses correctness diagnostics in the
+    /// client.
+    #[tokio::test]
+    async fn destroy_channel_on_unknown_sid_emits_no_reply() {
+        let order = ByteOrder::Little;
+        let unknown_sid: u32 = 4242;
+        let cid: u32 = 7;
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        let mut payload = Vec::new();
+        payload.put_u32(unknown_sid, order);
+        payload.put_u32(cid, order);
+        let frame = synth_frame(Command::DestroyChannel, order, payload);
+
+        handle_destroy_channel(&frame, &tx, &mut channels, order)
+            .await
+            .expect("handler returns Ok");
+
+        // Channel was never present; map stays empty.
+        assert!(channels.is_empty(), "no channel inserted");
+        // No reply emitted — pvxs parity.
+        assert!(
+            rx.try_recv().is_err(),
+            "DESTROY_CHANNEL on unknown SID must not emit a reply frame"
+        );
+    }
+
+    /// pvxs DESTROY_CHANNEL for a known SID echoes `sid + cid` back
+    /// (`serverchan.cpp:399-411`). The unknown-SID guard above must
+    /// not regress this path: when the SID exists, the reply still
+    /// fires.
+    #[tokio::test]
+    async fn destroy_channel_on_known_sid_emits_echo() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 11;
+        let cid: u32 = 22;
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid,
+                sid,
+                introspection: None,
+                ops: HashMap::new(),
+            },
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(cid, order);
+        let frame = synth_frame(Command::DestroyChannel, order, payload);
+
+        handle_destroy_channel(&frame, &tx, &mut channels, order)
+            .await
+            .expect("handler returns Ok");
+
+        assert!(!channels.contains_key(&sid), "channel removed on hit");
+        let reply = rx.try_recv().expect("reply emitted for known SID");
+        // Header (8) + ioid placeholder isn't part of DESTROY_CHANNEL;
+        // payload is sid (4) + cid (4) = 8 total, so frame length = 16.
+        assert_eq!(reply.len(), PvaHeader::SIZE + 8);
+    }
+
+    /// pvxs `serverget.cpp:83` echoes the request `subcmd` byte in the
+    /// PUT data response. The PUT_GET (readback) case sets bit 0x40 in
+    /// the client subcmd; pvxs `clientget.cpp:362-370` dispatches the
+    /// reply decode based on that bit. A server response that hardcodes
+    /// 0x00 makes the client decode the wrong shape: the bitset + value
+    /// bytes carried in the frame are misread as trailing garbage and
+    /// the PUT_GET readback is silently lost.
+    #[tokio::test]
+    async fn put_get_response_echoes_request_subcmd() {
+        use crate::pvdata::FieldDesc;
+        use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+        use crate::server_native::tcp::ClientCredentials;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 100;
+
+        // Build a SharedSource with one PV "dut" of type NTScalar<f64>.
+        let pv = SharedPV::new();
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
+        initial
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        pv.open(intro.clone(), PvField::Structure(initial));
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        // Pre-populate a ChannelState as if CREATE_CHANNEL had already
+        // run, so we can drive the PUT INIT + EXEC frames directly.
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // PUT INIT: sid + ioid + subcmd=0x08 + pvRequest(type + value).
+        // Use an empty Structure pvRequest (full mask).
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let req_val = PvField::Structure(PvStructure::new(""));
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08); // INIT
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Put, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT INIT ok");
+        // Drain INIT response — not the focus of this test.
+        let _init_resp = rx.try_recv().expect("INIT response emitted");
+
+        // PUT EXEC with subcmd=0x40 (PUT_GET readback): sid + ioid +
+        // subcmd + bitset + value.
+        let new_val = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.5))));
+            PvField::Structure(s)
+        };
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x40); // PUT_GET readback
+        let bs = BitSet::all_set(intro.total_bits());
+        bs.write_into(order, &mut exec_payload);
+        crate::pvdata::encode::encode_pv_field(&new_val, &intro, order, &mut exec_payload);
+        let exec_frame = synth_frame(Command::Put, order, exec_payload);
+
+        handle_op(
+            &source,
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT EXEC ok");
+
+        let resp = rx.try_recv().expect("PUT EXEC response emitted");
+        // Skip 8-byte header; payload = ioid (4) + subcmd (1) + ...
+        assert!(resp.len() >= PvaHeader::SIZE + 5);
+        let resp_subcmd = resp[PvaHeader::SIZE + 4];
+        assert_eq!(
+            resp_subcmd, 0x40,
+            "PUT_GET reply subcmd must echo the 0x40 readback bit (pvxs serverget.cpp:83)"
+        );
+    }
+
+    /// Companion: a plain PUT EXEC (subcmd=0x00, no readback bit) must
+    /// still emit `subcmd=0x00` in the response. Confirms the echo
+    /// behaviour is symmetric — neither leaking 0x40 when not requested
+    /// nor regressing the common case.
+    #[tokio::test]
+    async fn put_exec_response_echoes_zero_subcmd() {
+        use crate::pvdata::FieldDesc;
+        use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+        use crate::server_native::tcp::ClientCredentials;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 200;
+
+        let pv = SharedPV::new();
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
+        initial
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        pv.open(intro.clone(), PvField::Structure(initial));
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let req_val = PvField::Structure(PvStructure::new(""));
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Put, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT INIT ok");
+        let _ = rx.try_recv().expect("INIT resp");
+
+        // Plain PUT EXEC: subcmd=0x00.
+        let new_val = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+            PvField::Structure(s)
+        };
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x00);
+        let bs = BitSet::all_set(intro.total_bits());
+        bs.write_into(order, &mut exec_payload);
+        crate::pvdata::encode::encode_pv_field(&new_val, &intro, order, &mut exec_payload);
+        let exec_frame = synth_frame(Command::Put, order, exec_payload);
+
+        handle_op(
+            &source,
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT EXEC ok");
+        let resp = rx.try_recv().expect("PUT EXEC response emitted");
+        assert!(resp.len() >= PvaHeader::SIZE + 5);
+        let resp_subcmd = resp[PvaHeader::SIZE + 4];
+        assert_eq!(
+            resp_subcmd, 0x00,
+            "plain PUT EXEC reply subcmd must echo 0x00"
+        );
+    }
+
+    /// pvxs `serverintrospect.cpp:159`: GET_FIELD's guard is the
+    /// composite `if(!chan || opByIOID.find(ioid)!=opByIOID.end())`.
+    /// Both arms log and silently return. Our prior fix (P-G19) only
+    /// covered the !chan branch; an IOID collision with an active
+    /// GET/PUT/MONITOR/RPC in the same channel still fired back a
+    /// fabricated introspection reply, polluting the wire conversation
+    /// on the busy IOID.
+    #[tokio::test]
+    async fn get_field_ioid_collision_with_active_op_drops_reply() {
+        use crate::pvdata::FieldDesc;
+        use crate::server_native::SharedSource;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 1234;
+
+        let shared = SharedSource::new();
+        let source: DynSource = Arc::new(shared);
+
+        // Channel with an active op already bound to `ioid`.
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut ops: HashMap<u32, OpState> = HashMap::new();
+        ops.insert(
+            ioid,
+            OpState {
+                intro: FieldDesc::Variant,
+                kind: OpKind::Get,
+                monitor_started: false,
+                monitor_abort: None,
+                mask: BitSet::new(),
+                monitor_window: None,
+                monitor_window_notify: None,
+                monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                monitor_filters: Arc::new(
+                    epics_base_rs::server::database::filters::FilterChain::new(),
+                ),
+                put_auto_exec: true,
+            },
+        );
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                ops,
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+
+        // GET_FIELD payload: sid + ioid + subfield string.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        crate::proto::encode_string_into("", order, &mut payload);
+        let frame = synth_frame(Command::GetField, order, payload);
+
+        handle_get_field(&source, &frame, &tx, &channels, order)
+            .await
+            .expect("handler returns Ok");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "GET_FIELD with IOID collision must drop silently per pvxs serverintrospect.cpp:159"
+        );
+    }
+
+    /// Companion: GET_FIELD on a CLEAN IOID (not in the channel's ops
+    /// map) still emits the introspection reply. Confirms the
+    /// collision guard doesn't regress the happy path.
+    #[tokio::test]
+    async fn get_field_clean_ioid_emits_reply() {
+        use crate::pvdata::FieldDesc;
+        use crate::server_native::SharedSource;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 5555;
+
+        let shared = SharedSource::new();
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        crate::proto::encode_string_into("", order, &mut payload);
+        let frame = synth_frame(Command::GetField, order, payload);
+
+        handle_get_field(&source, &frame, &tx, &channels, order)
+            .await
+            .expect("handler returns Ok");
+
+        let resp = rx
+            .try_recv()
+            .expect("clean GET_FIELD must emit introspection reply");
+        // ioid (4) + status (1 + ...) + type descriptor
+        assert!(resp.len() > PvaHeader::SIZE + 4);
     }
 }
 

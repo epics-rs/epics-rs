@@ -2435,6 +2435,43 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
 
         CA_PROTO_EVENT_CANCEL => {
             let sub_id = hdr.available;
+            let req_channel_sid = hdr.cid;
+            // C `event_cancel_reply` (camessage.c:2002-2010) walks
+            // the CHANNEL's eventq looking for a matching sub-id.
+            // The cross-check is implicit: a sub-id that exists but
+            // belongs to a different channel is "not found on this
+            // channel" and falls through to the ECA_BADMONID +
+            // RSRV_ERROR path. Rust's `state.subscriptions` is a
+            // flat HashMap by sub-id; we have to add the
+            // cross-check explicitly. If we skipped it, a peer
+            // could send EVENT_CANCEL with wrong cid but valid
+            // sub-id and erase a real subscription bound to a
+            // different channel — bypass of round-21's BAD-MONID
+            // disconnect.
+            let channel_matches = state
+                .subscriptions
+                .get(&sub_id)
+                .is_some_and(|s| s.channel_sid == req_channel_sid);
+            if !channel_matches {
+                // Trigger the round-21 BAD-MONID path: emit
+                // ECA_BADMONID + disconnect. Use the request's
+                // m_cid for the diag PV name when it resolves.
+                let (chan_cid, diag) = match state.channels.get(&req_channel_sid) {
+                    Some(entry) => (entry.cid, entry.pv_name.clone()),
+                    None => (0xFFFF_FFFFu32, "unknown".to_string()),
+                };
+                tracing::debug!(
+                    sub_id,
+                    sid = req_channel_sid,
+                    "EVENT_CANCEL channel-mismatch (sub belongs to different channel); ECA_BADMONID"
+                );
+                send_ca_error(writer, hdr, ECA_BADMONID, chan_cid, &diag).await?;
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "EVENT_CANCEL sub-id {} channel-mismatch (requested sid {}; \
+                     matches C event_cancel_reply 'not on this channel's eventq' RSRV_ERROR)",
+                    sub_id, req_channel_sid
+                )));
+            }
             if let Some(sub) = state.subscriptions.remove(&sub_id) {
                 sub.task.abort();
                 // Resolve pv_name for the SubscriptionClosed event.

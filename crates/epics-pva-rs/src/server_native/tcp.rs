@@ -1293,6 +1293,33 @@ async fn handle_destroy_channel(
     let cid = cur
         .get_u32(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
+    // pvxs `serverchan.cpp:382-386`: when the SID is unknown the server
+    // logs at debug and silently returns — no DESTROY_CHANNEL reply is
+    // sent. Fabricating "yes I destroyed it" for an SID we never
+    // created (a) lets a malicious peer extract reply frames for any
+    // SID/CID pair (small amplification) and (b) confuses correctness
+    // diagnostics on the client side: a peer that lost track and
+    // re-DESTROYs gets an `OK` echo back instead of the expected
+    // silence, masking the bug. Match pvxs: lookup, return on miss,
+    // remove + reply only on hit.
+    if !channels.contains_key(&sid) {
+        debug!(sid, cid, "DESTROY_CHANNEL on unknown SID: dropping");
+        return Ok(());
+    }
+    // pvxs also warns when `chan->cid != cid` (line 390-393) but proceeds
+    // with the destroy. We don't keep the wire CID alongside the SID
+    // mapping today — log on mismatch for parity with the warn-level
+    // diagnostic, then proceed.
+    if let Some(ch) = channels.get(&sid)
+        && ch.cid != cid
+    {
+        debug!(
+            sid,
+            stored_cid = ch.cid,
+            wire_cid = cid,
+            "DESTROY_CHANNEL CID mismatch"
+        );
+    }
     // Removing the channel drops every OpState in `ops`, which drops
     // each `monitor_abort: Option<Arc<AbortOnDrop>>` and cancels the
     // associated subscriber task — preventing orphaned spawns from
@@ -2525,6 +2552,78 @@ mod tests {
             }
             other => panic!("expected monitor data, got {other:?}"),
         }
+    }
+
+    /// pvxs `serverchan.cpp:382-386`: when the SID in DESTROY_CHANNEL
+    /// is unknown the server logs at debug and silently returns — no
+    /// reply frame is emitted. Previously we unconditionally fabricated
+    /// `OK` echo back even for SIDs we never created, which both
+    /// amplifies (1:1) and confuses correctness diagnostics in the
+    /// client.
+    #[tokio::test]
+    async fn destroy_channel_on_unknown_sid_emits_no_reply() {
+        let order = ByteOrder::Little;
+        let unknown_sid: u32 = 4242;
+        let cid: u32 = 7;
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        let mut payload = Vec::new();
+        payload.put_u32(unknown_sid, order);
+        payload.put_u32(cid, order);
+        let frame = synth_frame(Command::DestroyChannel, order, payload);
+
+        handle_destroy_channel(&frame, &tx, &mut channels, order)
+            .await
+            .expect("handler returns Ok");
+
+        // Channel was never present; map stays empty.
+        assert!(channels.is_empty(), "no channel inserted");
+        // No reply emitted — pvxs parity.
+        assert!(
+            rx.try_recv().is_err(),
+            "DESTROY_CHANNEL on unknown SID must not emit a reply frame"
+        );
+    }
+
+    /// pvxs DESTROY_CHANNEL for a known SID echoes `sid + cid` back
+    /// (`serverchan.cpp:399-411`). The unknown-SID guard above must
+    /// not regress this path: when the SID exists, the reply still
+    /// fires.
+    #[tokio::test]
+    async fn destroy_channel_on_known_sid_emits_echo() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 11;
+        let cid: u32 = 22;
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid,
+                sid,
+                introspection: None,
+                ops: HashMap::new(),
+            },
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(cid, order);
+        let frame = synth_frame(Command::DestroyChannel, order, payload);
+
+        handle_destroy_channel(&frame, &tx, &mut channels, order)
+            .await
+            .expect("handler returns Ok");
+
+        assert!(!channels.contains_key(&sid), "channel removed on hit");
+        let reply = rx.try_recv().expect("reply emitted for known SID");
+        // Header (8) + ioid placeholder isn't part of DESTROY_CHANNEL;
+        // payload is sid (4) + cid (4) = 8 total, so frame length = 16.
+        assert_eq!(reply.len(), PvaHeader::SIZE + 8);
     }
 }
 

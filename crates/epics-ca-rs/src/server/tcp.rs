@@ -2303,6 +2303,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             if state.client_minor_version < 4 {
                 return Ok(());
             }
+            // C `search_reply_tcp` (rsrv/camessage.c:2246) rejects
+            // SEARCH whose `m_postsize <= 1` and silently returns
+            // RSRV_OK. Mirror that here so an attacker's empty-name
+            // SEARCH burst on an open TCP connection cannot drive
+            // `db.has_name("")` per frame nor trigger a NOT_FOUND
+            // amplification when CA_DO_REPLY is set.
+            if hdr.postsize <= 1 {
+                return Ok(());
+            }
             let end = payload
                 .iter()
                 .position(|&b| b == 0)

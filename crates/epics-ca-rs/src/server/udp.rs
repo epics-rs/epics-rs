@@ -180,6 +180,22 @@ async fn run_single_responder(
             }
 
             if hdr.cmmd == CA_PROTO_SEARCH {
+                // C `search_reply_udp` (rsrv/camessage.c:2159) rejects
+                // SEARCH whose `m_postsize <= 1` ("empty PV name in UDP
+                // search request") and silently returns RSRV_OK. The
+                // null-terminator alone is 1 byte; a usable PV name
+                // needs at least one non-null byte plus the terminator
+                // (postsize >= 2). Without this guard the Rust path
+                // would parse `pv_name = ""` from an attacker's empty-
+                // postsize SEARCH burst and call `db.has_name("")` on
+                // every datagram — wasted lookups + a non-trivial
+                // amplification vector if a record happened to be
+                // named "" (impossible in practice, but the C side
+                // documents the reject and we match it).
+                if hdr.postsize <= 1 {
+                    offset += msg_len;
+                    continue;
+                }
                 let payload_start = offset + CaHeader::SIZE;
                 let payload_end = payload_start + hdr.postsize as usize;
                 let payload = &buf[payload_start..payload_end];

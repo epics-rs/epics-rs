@@ -1135,13 +1135,46 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     }
                 }
                 CA_PROTO_EVENT_ADD => {
-                    let data = accumulated[data_start..data_start + actual_post].to_vec();
-                    let _ = event_tx.send(TransportEvent::MonitorData {
-                        subid: hdr.available,
-                        data_type: hdr.data_type,
-                        count: hdr.actual_count(),
-                        data,
-                    });
+                    // libca `cac::eventAddRespAction` (`cac.cpp:960`)
+                    // gates the data delivery on `hdr.m_cid ==
+                    // ECA_NORMAL`. The CA server uses non-NORMAL m_cid
+                    // values on monitor frames to deliver out-of-band
+                    // status to the subscriber — specifically
+                    // `rsrv/camessage.c::no_read_access_event` emits
+                    // ECA_NORDACCESS with a zeroed payload of full
+                    // DBR size when read access for an active
+                    // subscription is denied (e.g. after an ACF
+                    // reload that revokes the client's identity).
+                    // Without the gate, Rust would parse the zeroed
+                    // payload as legitimate data and surface
+                    // `value = 0` to the subscriber — silent
+                    // "successful read of zero" instead of an access
+                    // denial.
+                    //
+                    // The Rust SERVER tears down subscriptions on
+                    // NoAccess (round-39), so Rust ↔ Rust never hits
+                    // this path. But Rust client ↔ C IOC does — C IOC
+                    // delivers the no-read-access frame instead of
+                    // tearing down. Gate matches libca.
+                    if hdr.cid != ECA_NORMAL {
+                        tracing::warn!(
+                            server = %server_addr,
+                            subid = hdr.available,
+                            status = hdr.cid,
+                            "MONITOR delivery with non-NORMAL status (likely \
+                             ECA_NORDACCESS from C IOC no_read_access_event); \
+                             dropping bogus zeroed payload"
+                        );
+                        metrics::counter!("ca_client_monitor_status_drops_total").increment(1);
+                    } else {
+                        let data = accumulated[data_start..data_start + actual_post].to_vec();
+                        let _ = event_tx.send(TransportEvent::MonitorData {
+                            subid: hdr.available,
+                            data_type: hdr.data_type,
+                            count: hdr.actual_count(),
+                            data,
+                        });
+                    }
                 }
                 CA_PROTO_ECHO | CA_PROTO_READ_SYNC => {
                     // Echo response from server — liveness already handled

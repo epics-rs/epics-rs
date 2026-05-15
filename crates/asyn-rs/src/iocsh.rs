@@ -255,11 +255,28 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynSetTraceIOMask [portName] [addr] mask",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = arg_str(args, 0).filter(|s| !s.is_empty());
-                let _addr = arg_int(args, 1).unwrap_or(-1) as i32;
+                let addr = arg_int(args, 1).unwrap_or(-1) as i32;
                 let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
                 match TraceIoMask::from_symbolic(&mask_str) {
                     Ok(m) => {
-                        mgr_r.trace_manager().set_trace_io_mask(port.as_deref(), m);
+                        let trace = mgr_r.trace_manager();
+                        // C parity: asynShellCommands.c:734-754 calls
+                        // `connectDevice(pasynUser, portName, addr)`
+                        // before `setTraceIOMask`. When `addr >= 0` the
+                        // pasynUser carries a `pdevice`, so
+                        // `setTraceIOMask` (asynManager.c:2830-2833)
+                        // writes the device-specific dpCommon; only
+                        // when `addr < 0` does it fall to the
+                        // every-device + port fallback.
+                        if let Some(p) = port.as_deref() {
+                            if addr >= 0 {
+                                trace.set_device_trace_io_mask(p, addr, m);
+                            } else {
+                                trace.set_trace_io_mask(Some(p), m);
+                            }
+                        } else {
+                            trace.set_trace_io_mask(None, m);
+                        }
                         Ok(CommandOutcome::Continue)
                     }
                     Err(e) => {
@@ -296,13 +313,26 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynSetTraceInfoMask [portName] [addr] mask",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = arg_str(args, 0).filter(|s| !s.is_empty());
-                let _addr = arg_int(args, 1).unwrap_or(-1) as i32;
+                let addr = arg_int(args, 1).unwrap_or(-1) as i32;
                 let mask_str = arg_str(args, 2).ok_or_else(|| "mask required".to_string())?;
                 match TraceInfoMask::from_symbolic(&mask_str) {
                     Ok(m) => {
-                        mgr_r
-                            .trace_manager()
-                            .set_trace_info_mask(port.as_deref(), m);
+                        let trace = mgr_r.trace_manager();
+                        // C parity: asynShellCommands.c:799-820 routes
+                        // through `connectDevice(pasynUser, portName, addr)`.
+                        // `setTraceInfoMask` (asynManager.c:2872-2875)
+                        // writes the device-specific dpCommon when
+                        // `pdevice != NULL` (addr >= 0); falls to
+                        // every-device + port otherwise.
+                        if let Some(p) = port.as_deref() {
+                            if addr >= 0 {
+                                trace.set_device_trace_info_mask(p, addr, m);
+                            } else {
+                                trace.set_trace_info_mask(Some(p), m);
+                            }
+                        } else {
+                            trace.set_trace_info_mask(None, m);
+                        }
                         Ok(CommandOutcome::Continue)
                     }
                     Err(e) => {
@@ -339,7 +369,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynSetTraceFile [portName] [addr] [filename]",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = arg_str(args, 0).filter(|s| !s.is_empty());
-                let _addr = arg_int(args, 1).unwrap_or(-1) as i32;
+                let addr = arg_int(args, 1).unwrap_or(-1) as i32;
                 let filename = arg_str(args, 2).unwrap_or_default();
                 let target = match filename.as_str() {
                     "" | "stderr" => TraceFile::Stderr,
@@ -352,9 +382,21 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                         }
                     },
                 };
-                mgr_r
-                    .trace_manager()
-                    .set_trace_file(port.as_deref(), target);
+                let trace = mgr_r.trace_manager();
+                // C parity: asynShellCommands.c:855-877 routes through
+                // `connectDevice(pasynUser, portName, addr)`. The
+                // `setTraceFile` resolver (asynManager.c:2898-2926)
+                // walks `findTracePvt(puserPvt)` which picks the
+                // device-specific `dpCommon` when `pdevice != NULL`.
+                if let Some(p) = port.as_deref() {
+                    if addr >= 0 {
+                        trace.set_device_trace_file(p, addr, target);
+                    } else {
+                        trace.set_trace_file(Some(p), target);
+                    }
+                } else {
+                    trace.set_trace_file(None, target);
+                }
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -481,5 +523,100 @@ mod tests {
         handle.report_blocking(0)?;
         handle.report_blocking(2)?;
         Ok(())
+    }
+
+    /// Build a minimal `CommandContext` for exercising registered
+    /// handlers in-process. Mirrors the helper used in
+    /// `epics-base-rs/src/server/iocsh/commands.rs::tests`.
+    fn make_ctx() -> CommandContext {
+        use epics_base_rs::server::database::PvDatabase;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Arc::new(PvDatabase::new());
+        let handle = rt.handle().clone();
+        let ctx = CommandContext::new(db, handle);
+        std::mem::forget(rt);
+        ctx
+    }
+
+    /// Round 5 fix: `asynSetTraceIOMask` / `asynSetTraceInfoMask` /
+    /// `asynSetTraceFile` previously discarded their `addr` arg
+    /// (`let _addr = arg_int(args, 1)`), so an `asynSetTraceIOMask
+    /// MYPORT 3 "ESCAPE"` invocation degraded into a port-wide write
+    /// rather than the device-specific dpCommon write C performs
+    /// (asynManager.c:2830-2833 / 2872-2875 / 2898-2926 via
+    /// `findTracePvt` over `pdevice`). This test invokes all three
+    /// handlers with `addr >= 0` and confirms each fires a per-device
+    /// announce (addr propagated through to the device setter).
+    #[test]
+    fn iocsh_trace_setters_route_addr_to_device_announce() {
+        let mgr = fresh_mgr_with_port("trace_dev_port");
+        let ctx = make_ctx();
+
+        let observed: Arc<Mutex<Vec<(AsynException, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let obs = observed.clone();
+        mgr.exception_manager().add_callback(move |ev| {
+            obs.lock().unwrap().push((ev.exception, ev.addr));
+        });
+
+        let cmds = build_asyn_commands(mgr.clone());
+
+        // asynSetTraceIOMask trace_dev_port 5 "HEX"
+        let io_cmd = cmds
+            .iter()
+            .find(|c| c.name == "asynSetTraceIOMask")
+            .expect("asynSetTraceIOMask must be registered");
+        let _ = io_cmd.handler.call(
+            &[
+                ArgValue::String("trace_dev_port".to_string()),
+                ArgValue::Int(5),
+                ArgValue::String("HEX".to_string()),
+            ],
+            &ctx,
+        );
+
+        // asynSetTraceInfoMask trace_dev_port 7 "SOURCE"
+        let info_cmd = cmds
+            .iter()
+            .find(|c| c.name == "asynSetTraceInfoMask")
+            .expect("asynSetTraceInfoMask must be registered");
+        let _ = info_cmd.handler.call(
+            &[
+                ArgValue::String("trace_dev_port".to_string()),
+                ArgValue::Int(7),
+                ArgValue::String("SOURCE".to_string()),
+            ],
+            &ctx,
+        );
+
+        // asynSetTraceFile trace_dev_port 2 "stderr"
+        let file_cmd = cmds
+            .iter()
+            .find(|c| c.name == "asynSetTraceFile")
+            .expect("asynSetTraceFile must be registered");
+        let _ = file_cmd.handler.call(
+            &[
+                ArgValue::String("trace_dev_port".to_string()),
+                ArgValue::Int(2),
+                ArgValue::String("stderr".to_string()),
+            ],
+            &ctx,
+        );
+
+        let evs = observed.lock().unwrap();
+        assert!(
+            evs.iter()
+                .any(|(e, a)| matches!(e, AsynException::TraceIoMask) && *a == 5),
+            "asynSetTraceIOMask addr=5 must fire a device-scoped announce; observed: {evs:?}"
+        );
+        assert!(
+            evs.iter()
+                .any(|(e, a)| matches!(e, AsynException::TraceInfoMask) && *a == 7),
+            "asynSetTraceInfoMask addr=7 must fire a device-scoped announce; observed: {evs:?}"
+        );
+        assert!(
+            evs.iter()
+                .any(|(e, a)| matches!(e, AsynException::TraceFile) && *a == 2),
+            "asynSetTraceFile addr=2 must fire a device-scoped announce; observed: {evs:?}"
+        );
     }
 }

@@ -81,6 +81,16 @@ pub enum PortCommand {
     DisconnectAddr,
     EnableAddr,
     DisableAddr,
+    /// Port-wide enable / disable (C parity:
+    /// `pasynManager->enable(pasynUser, value)`).
+    SetEnable {
+        yes: bool,
+    },
+    /// Port-wide auto-connect toggle (C parity:
+    /// `pasynManager->autoConnect(pasynUser, value)`).
+    SetAutoConnect {
+        yes: bool,
+    },
     GetBoundsInt32,
     GetBoundsInt64,
     BlockProcess,
@@ -143,6 +153,8 @@ mod tests {
             PortCommand::DisconnectAddr,
             PortCommand::EnableAddr,
             PortCommand::DisableAddr,
+            PortCommand::SetEnable { yes: true },
+            PortCommand::SetAutoConnect { yes: false },
             PortCommand::GetBoundsInt32,
             PortCommand::GetBoundsInt64,
             PortCommand::BlockProcess,

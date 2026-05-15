@@ -88,6 +88,21 @@ pub enum RequestOp {
     EnableAddr,
     /// Disable a specific device address (multi-device ports).
     DisableAddr,
+    /// Enable / disable the entire port. C parity:
+    /// `pasynManager->enable(pasynUser, enable)`
+    /// (`asynManager.c::enable`, fired by asynRecord `ENBL` writes
+    /// at `asynRecord.c:484-486`).
+    SetEnable {
+        yes: bool,
+    },
+    /// Enable / disable auto-connect for the port. C parity:
+    /// `pasynManager->autoConnect(pasynUser, autoConnect)`
+    /// (`asynManager.c::autoConnect`, fired by asynRecord `AUCT`
+    /// writes at `asynRecord.c:481-482`). `asynExceptionAutoConnect`
+    /// is emitted unconditionally on every call.
+    SetAutoConnect {
+        yes: bool,
+    },
     /// Query int32 bounds (low, high).
     GetBoundsInt32,
     /// Query int64 bounds (low, high).
@@ -258,6 +273,20 @@ impl RequestResult {
         Self {
             nbytes,
             data: Some(buf),
+            ..Self::base()
+        }
+    }
+
+    /// Variant of [`Self::octet_read`] that carries the
+    /// end-of-message reason flags returned by
+    /// [`crate::port::PortDriver::io_read_octet_eom`]. The raw `u32`
+    /// is decoded with `EomReason::from_bits_truncate` on the
+    /// consumer side.
+    pub fn octet_read_eom(buf: Vec<u8>, nbytes: usize, eom_reason: u32) -> Self {
+        Self {
+            nbytes,
+            data: Some(buf),
+            eom_reason,
             ..Self::base()
         }
     }

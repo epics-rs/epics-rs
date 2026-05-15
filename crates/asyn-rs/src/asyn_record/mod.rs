@@ -1627,6 +1627,28 @@ impl Record for AsynRecord {
                 self.apply_trace_file();
             }
 
+            // Enable / disable the entire port (C parity:
+            // pasynManager->enable from asynRecord.c:484-486).
+            // Forward the typed flag through the port handle so the
+            // driver sees `enable()` / `disable()` (and the
+            // associated asynExceptionEnable fan-out from
+            // PortDriverBase::set_enabled).
+            "ENBL" => {
+                if let Some(ref entry) = self.port_entry {
+                    let _ = entry.handle.set_enable_blocking(self.enbl != 0);
+                }
+            }
+
+            // Auto-connect (C parity: pasynManager->autoConnect from
+            // asynRecord.c:481-482). C fires
+            // asynExceptionAutoConnect unconditionally, which Rust
+            // mirrors via PortDriverBase::set_auto_connect.
+            "AUCT" => {
+                if let Some(ref entry) = self.port_entry {
+                    let _ = entry.handle.set_auto_connect_blocking(self.auct != 0);
+                }
+            }
+
             // Connection management
             "CNCT" => {
                 if self.cnct != 0 {

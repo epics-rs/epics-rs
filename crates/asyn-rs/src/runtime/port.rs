@@ -85,6 +85,8 @@ pub fn create_port_runtime_boxed(
 ) -> (PortRuntimeHandle, std::thread::JoinHandle<()>) {
     let port_name = driver.base().port_name.clone();
     let can_block = driver.base().flags.can_block;
+    let multi_device = driver.base().flags.multi_device;
+    let max_addr = driver.base().max_addr as i32;
 
     // Event broadcast
     let (event_tx, _) = broadcast::channel(256);
@@ -123,6 +125,7 @@ pub fn create_port_runtime_boxed(
 
     let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts);
     port_handle.set_can_block(can_block);
+    port_handle.set_capabilities(multi_device, max_addr);
     let client = InProcessClient::new(port_handle.clone());
 
     let handle = PortRuntimeHandle {

@@ -218,6 +218,8 @@ impl PortActor {
                 | RequestOp::DisconnectAddr
                 | RequestOp::EnableAddr
                 | RequestOp::DisableAddr
+                | RequestOp::SetEnable { .. }
+                | RequestOp::SetAutoConnect { .. }
                 | RequestOp::BlockProcess
                 | RequestOp::UnblockProcess
                 | RequestOp::ShutdownPort
@@ -370,6 +372,25 @@ impl PortActor {
             }
             RequestOp::DisableAddr => {
                 self.driver.disable_addr(user)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetEnable { yes } => {
+                // C parity: pasynManager->enable(pasynUser, enable) at
+                // asynManager.c — toggles per-port `enabled` state and
+                // emits `asynExceptionEnable`. Routed through the
+                // driver trait so subclasses can override.
+                if *yes {
+                    self.driver.enable(user)?;
+                } else {
+                    self.driver.disable(user)?;
+                }
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetAutoConnect { yes } => {
+                // C parity: pasynManager->autoConnect(pasynUser, value)
+                // at asynManager.c:2310-2324 — fires
+                // `asynExceptionAutoConnect` unconditionally.
+                self.driver.base_mut().set_auto_connect(*yes);
                 Ok(RequestResult::write_ok())
             }
             RequestOp::GetBoundsInt32 => {

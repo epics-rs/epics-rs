@@ -30,6 +30,10 @@ impl PvDatabase {
 
     /// Process a record with full link handling (INP -> process -> alarms -> OUT -> FLNK).
     /// Uses visited set for cycle detection and depth limit.
+    ///
+    /// Foreign-caller entry: FLNK dispatch, scan loop, scan_event, CA put,
+    /// process(PROC=1) etc. Hits the PACT entry guard (mirrors C `dbProcess`
+    /// at `dbAccess.c:537-559`) when the record is mid-async.
     pub fn process_record_with_links<'a>(
         &'a self,
         name: &'a str,
@@ -37,7 +41,27 @@ impl PvDatabase {
         depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth)
+            self.process_record_with_links_inner(name, visited, depth, false)
+                .await
+        })
+    }
+
+    /// Owner-driven continuation re-entry — bypasses the PACT entry guard.
+    ///
+    /// Used by `ProcessAction::ReprocessAfter` timer fires: the spawned
+    /// re-entry task IS the owner of the async cycle, equivalent to C
+    /// `callbackRequestDelayed`'s direct call to the record's `process()`
+    /// (which bypasses `dbProcess`). Foreign callers must still go through
+    /// `process_record_with_links` so FLNK / scan / CA put cannot race
+    /// during the wait window.
+    pub fn process_record_continuation<'a>(
+        &'a self,
+        name: &'a str,
+        visited: &'a mut HashSet<String>,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.process_record_with_links_inner(name, visited, depth, true)
                 .await
         })
     }
@@ -47,6 +71,7 @@ impl PvDatabase {
         name: &str,
         visited: &mut HashSet<String>,
         depth: usize,
+        is_continuation: bool,
     ) -> CaResult<()> {
         const MAX_LINK_DEPTH: usize = 16;
         const MAX_LINK_OPS: usize = 256;
@@ -101,7 +126,7 @@ impl PvDatabase {
         // contract that callers see for `dbProcess`. The pre-existing
         // `dispatch_cp_targets` path already did this check (sets RPRO=true
         // and skips); the main entry was missing it.
-        {
+        if !is_continuation {
             const MAX_LOCK: i16 = 10;
             let mut instance = rec.write().await;
             if instance.is_processing() {
@@ -1218,8 +1243,15 @@ impl PvDatabase {
                         let current = gen_counter.load(std::sync::atomic::Ordering::Relaxed);
                         if current == gen_val {
                             let mut visited = HashSet::new();
+                            // Owner-driven continuation: bypass the PACT
+                            // entry guard so the timer fire reaches the
+                            // record's process() (which advances the
+                            // async state machine — e.g. scaler DLY
+                            // expiry, calc AFTC). Mirrors C
+                            // `callbackRequestDelayed` dispatching to
+                            // `(*prset->process)(prec)` directly.
                             let _ = db
-                                .process_record_with_links(&rec_name, &mut visited, 0)
+                                .process_record_continuation(&rec_name, &mut visited, 0)
                                 .await;
                         }
                     });

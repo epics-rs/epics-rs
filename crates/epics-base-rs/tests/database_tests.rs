@@ -1430,6 +1430,113 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
     assert_eq!(inst.common.lcnt, 0, "lcnt must reset when PACT clears");
 }
 
+// Regression: when a record returns `AsyncPending` paired with a
+// `ReprocessAfter` action (the timer-owned continuation pattern used
+// by scaler DLY / calc AFTC), the spawned timer fire must call
+// `process_record_continuation` and bypass the PACT entry guard so
+// the record's `process()` runs again to advance the state machine.
+// The foreign-caller guard (FLNK / scan / CA put) is still in
+// effect — `test_pact_entry_guard_silent_bail_until_max_lock` above
+// covers that case.
+#[tokio::test]
+async fn test_reprocess_after_continuation_bypasses_pact_guard() {
+    use epics_base_rs::server::record::{ProcessAction, ProcessOutcome, RecordProcessResult};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct ContinuationRecord {
+        process_count: Arc<AtomicU32>,
+    }
+
+    impl Record for ContinuationRecord {
+        fn record_type(&self) -> &'static str {
+            "continuation_test"
+        }
+        fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+            let n = self.process_count.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // First process: arm the timer-driven continuation.
+                Ok(ProcessOutcome {
+                    result: RecordProcessResult::AsyncPending,
+                    actions: vec![ProcessAction::ReprocessAfter(
+                        std::time::Duration::from_millis(20),
+                    )],
+                    device_did_compute: false,
+                })
+            } else {
+                // Continuation reached: complete cleanly, clear PACT.
+                Ok(ProcessOutcome::complete())
+            }
+        }
+        fn get_field(&self, _name: &str) -> Option<EpicsValue> {
+            None
+        }
+        fn put_field(
+            &mut self,
+            _name: &str,
+            _value: EpicsValue,
+        ) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn field_list(&self) -> &'static [FieldDesc] {
+            &[]
+        }
+    }
+
+    let process_count = Arc::new(AtomicU32::new(0));
+    let db = PvDatabase::new();
+    db.add_record(
+        "CONT_REC",
+        Box::new(ContinuationRecord {
+            process_count: process_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // First process: returns AsyncPending + ReprocessAfter(20ms).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CONT_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // PACT should be set immediately after AsyncPending returns.
+    {
+        let rec = db.get_record("CONT_REC").await.unwrap();
+        assert!(
+            rec.read().await.is_processing(),
+            "PACT must be true after AsyncPending"
+        );
+    }
+    assert_eq!(process_count.load(Ordering::SeqCst), 1);
+
+    // A foreign caller during the wait must hit the entry guard (bail
+    // silently) — proves the guard still protects against FLNK/scan
+    // dual-fire while the continuation timer is pending.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CONT_REC", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        process_count.load(Ordering::SeqCst),
+        1,
+        "foreign re-entry during AsyncPending must NOT call process()"
+    );
+
+    // Wait for the ReprocessAfter timer to fire.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    // Continuation fired: process() ran a second time despite
+    // pact=true, and on Complete the AsyncPending tail in
+    // complete_async_record cleared pact.
+    assert_eq!(
+        process_count.load(Ordering::SeqCst),
+        2,
+        "ReprocessAfter timer must call process() again — owner-driven \
+         continuation bypasses the PACT entry guard"
+    );
+}
+
 // --- Monitor Mask tests ---
 
 /// epics-base 3.15.7 — a server-side `dbnd` (deadband) filter

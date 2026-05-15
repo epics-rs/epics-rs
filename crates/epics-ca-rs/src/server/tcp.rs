@@ -1684,6 +1684,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let data = match encode_dbr(requested_type, &snapshot) {
                 Ok(d) => d,
                 Err(_) => {
+                    // C `read_action` (camessage.c:616-620) checks
+                    // `INVALID_DB_REQ(m_dataType)` (type >
+                    // LAST_BUFFER_TYPE = 38) BEFORE any DB lookup and
+                    // returns `RSRV_ERROR` which tears the connection
+                    // down. Other read-path failures (cas_copy_in_header
+                    // budget, access denied, dbChannel_get, caNetConvert
+                    // host-net) all return RSRV_OK and keep the
+                    // connection — those don't apply here.
+                    //
+                    // Rust `encode_dbr` failure with `UnsupportedType`
+                    // is the direct parallel of INVALID_DB_REQ —
+                    // emit the error + drop the connection.
                     if is_notify {
                         send_cmd_error(
                             writer,
@@ -1693,8 +1705,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             ioid,
                         )
                         .await?;
+                    } else {
+                        send_ca_error(writer, hdr, ECA_BADTYPE, hdr.cid, "bad READ data type")
+                            .await?;
                     }
-                    return Ok(());
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "READ with unsupported DBR type {} (matches C read_action RSRV_ERROR)",
+                        requested_type
+                    )));
                 }
             };
             // CA-268: DBR_CLASS_NAME wire payload is always one fixed

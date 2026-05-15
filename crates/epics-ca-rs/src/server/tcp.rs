@@ -262,11 +262,16 @@ struct ClientState {
     /// username.
     #[cfg(feature = "cap-tokens")]
     cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
-    /// Pending WRITE_NOTIFY completion tasks. Each entry is the
-    /// AbortHandle of a task awaiting `put_notify_tx` for an async
-    /// record write. Aborted on connection drop so a stuck async
-    /// device doesn't leak the task forever.
-    write_notify_tasks: Vec<tokio::task::AbortHandle>,
+    /// Pending WRITE_NOTIFY completion tasks. Each entry is the channel
+    /// `sid`-tagged AbortHandle of a task awaiting `put_notify_tx` for
+    /// an async record write. Aborted on connection drop so a stuck
+    /// async device doesn't leak the task forever, and also aborted
+    /// when the owning channel is freed via `CA_PROTO_CLEAR_CHANNEL`
+    /// (C parity: `clear_channel_reply` calls `rsrvFreePutNotify`
+    /// per-channel — `camessage.c:1889`). The sid tag lets us drain
+    /// only the channel-scoped tasks on CLEAR_CHANNEL without
+    /// disturbing other channels' in-flight WRITE_NOTIFYs.
+    write_notify_tasks: Vec<(u32, tokio::task::AbortHandle)>,
 }
 
 impl ClientState {
@@ -1029,7 +1034,7 @@ where
     // stuck async record (motor hung, asyn device unresponsive) would
     // otherwise hold the spawned task and its captured writer Arc
     // forever after the client disconnects.
-    for handle in state.write_notify_tasks.drain(..) {
+    for (_sid, handle) in state.write_notify_tasks.drain(..) {
         handle.abort();
     }
 
@@ -1814,9 +1819,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // captured writer Arc forever after the client drops.
                     // Reap finished handles opportunistically so the Vec
                     // doesn't grow unbounded over a long-lived connection
-                    // that issues many WRITE_NOTIFYs (F1).
-                    state.write_notify_tasks.retain(|h| !h.is_finished());
-                    state.write_notify_tasks.push(join.abort_handle());
+                    // that issues many WRITE_NOTIFYs (F1). The `sid` tag
+                    // also lets `CA_PROTO_CLEAR_CHANNEL` drain only the
+                    // tasks owned by the cleared channel (C parity:
+                    // `rsrvFreePutNotify` per-channel cleanup).
+                    state.write_notify_tasks.retain(|(_, h)| !h.is_finished());
+                    state.write_notify_tasks.push((sid, join.abort_handle()));
                 } else {
                     // Synchronous completion — respond immediately
                     let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
@@ -2365,6 +2373,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     });
                 }
 
+                // C parity: `clear_channel_reply` (`camessage.c:1889`)
+                // calls `rsrvFreePutNotify` to drain pending PUT_NOTIFY
+                // operations for this channel. Without aborting the
+                // matching tasks, a stuck async record could later
+                // emit a stale WRITE_NOTIFY response carrying the
+                // cleared channel's ioid — confusing the client's
+                // ioid demultiplex. Drain finished handles
+                // opportunistically while iterating.
+                drain_write_notify_tasks_for_sid(&mut state.write_notify_tasks, sid);
+
                 // Clean up subscriptions that belong to this channel
                 let sub_ids: Vec<u32> = state
                     .subscriptions
@@ -2578,6 +2596,36 @@ async fn send_cmd_error<W: AsyncWrite + Unpin + Send + 'static>(
 /// `epicsVsnprintf`.
 const CA_PROTO_ERROR_MAX_DIAG_LEN: usize = 480;
 
+/// On `CA_PROTO_CLEAR_CHANNEL`, abort any pending WRITE_NOTIFY
+/// completion task whose owning channel `sid` is being freed (C
+/// parity: `clear_channel_reply` calls `rsrvFreePutNotify` per
+/// channel — `camessage.c:1889`). Finished handles are reaped
+/// opportunistically while iterating so the per-connection Vec stays
+/// bounded across many WRITE_NOTIFYs over a long-lived connection.
+/// Pure transformation extracted so the drain semantics are unit-
+/// testable without standing up a full server + async record.
+fn drain_write_notify_tasks_for_sid(
+    tasks: &mut Vec<(u32, tokio::task::AbortHandle)>,
+    sid: u32,
+) {
+    let mut keep = Vec::with_capacity(tasks.len());
+    let mut to_abort = Vec::new();
+    for (task_sid, h) in tasks.drain(..) {
+        if h.is_finished() {
+            continue;
+        }
+        if task_sid == sid {
+            to_abort.push(h);
+        } else {
+            keep.push((task_sid, h));
+        }
+    }
+    *tasks = keep;
+    for h in to_abort {
+        h.abort();
+    }
+}
+
 /// Truncate `message` to at most `CA_PROTO_ERROR_MAX_DIAG_LEN` bytes
 /// on a char boundary (so the resulting `&str` slice is always valid
 /// UTF-8). `pad_string` appends the NUL terminator and 8-aligns.
@@ -2613,6 +2661,85 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     w.write_all(&error_msg_bytes).await?;
     // flush deferred to handle_client outer loop (batched)
     Ok(())
+}
+
+#[cfg(test)]
+mod write_notify_drain_tests {
+    use super::drain_write_notify_tasks_for_sid;
+
+    /// Spawn a long-running task (sleep-loop) and return its abort
+    /// handle. The handle's `is_finished()` flips to true once `abort()`
+    /// has fired AND the runtime has processed the cancellation. We
+    /// poll for that transition in the test below — drop-flag
+    /// approaches were timing-sensitive on saturated CI runners.
+    fn spawn_pending() -> tokio::task::AbortHandle {
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .abort_handle()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drains_only_matching_sid() {
+        let h_a = spawn_pending();
+        let h_b = spawn_pending();
+        let h_c = spawn_pending();
+        let h_a_probe = h_a.clone();
+        let h_b_probe = h_b.clone();
+        let h_c_probe = h_c.clone();
+        let mut tasks = vec![(10u32, h_a), (20u32, h_b), (10u32, h_c)];
+
+        drain_write_notify_tasks_for_sid(&mut tasks, 10);
+
+        // sid=20 entry survives
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].0, 20);
+
+        // Wait up to 2s (generous for saturated CI) for the aborted
+        // tasks to actually finish. The sid=20 task must still be
+        // running (no abort fired against it).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if h_a_probe.is_finished() && h_c_probe.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(h_a_probe.is_finished(), "sid=10 task #1 must be aborted");
+        assert!(h_c_probe.is_finished(), "sid=10 task #3 must be aborted");
+        assert!(!h_b_probe.is_finished(), "sid=20 task must survive");
+
+        // Cleanup the surviving task so we don't leak.
+        h_b_probe.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reaps_finished_handles_during_drain() {
+        // A handle whose future already completed should be removed
+        // from the Vec regardless of whether its sid matches — this
+        // is the opportunistic-reap behaviour the long-lived
+        // connection relies on.
+        let done = tokio::spawn(async {}).abort_handle();
+        for _ in 0..200 {
+            if done.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(done.is_finished(), "spawned no-op task should complete");
+
+        let live = spawn_pending();
+        let live_probe = live.clone();
+        let mut tasks = vec![(99u32, done), (5u32, live)];
+        drain_write_notify_tasks_for_sid(&mut tasks, 1234);
+        assert_eq!(tasks.len(), 1, "finished handle was not reaped");
+        assert_eq!(tasks[0].0, 5);
+
+        // Cleanup the still-live task.
+        live_probe.abort();
+    }
 }
 
 #[cfg(test)]

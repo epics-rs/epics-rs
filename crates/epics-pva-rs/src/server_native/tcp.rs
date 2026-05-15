@@ -765,7 +765,14 @@ async fn handle_connection_io(
     let _ = tx.send(set_bo).await;
 
     // Step 2: send CONNECTION_VALIDATION request (server → client).
-    let val_req = build_server_connection_validation(order, 87_040, 32_767, &["ca", "anonymous"]);
+    // pvxs `serverconn.cpp:100-115` advertises auth methods in
+    // reverse-priority order ("anonymous" then "ca" pushed onto the
+    // wire); the client should pick `ca` when its libca credentials
+    // resolved. Keep the same set here so the validation check below
+    // accepts both.
+    const ADVERTISED_AUTH_METHODS: &[&str] = &["ca", "anonymous"];
+    let val_req =
+        build_server_connection_validation(order, 87_040, 32_767, ADVERTISED_AUTH_METHODS);
     let _ = tx.send(val_req).await;
 
     // Step 3+: drive the read loop.
@@ -899,14 +906,34 @@ async fn handle_connection_io(
                 // introspection_size (u16), qos (u16); read selected method
                 // (string); when method == "ca", read the type+value of the
                 // auth Value and pull out the `user` / `host` fields. Pure
-                // metadata for audit/logging — we still respond OK either
-                // way (matches pvxs serverconn.cpp:200-234, which also
-                // doesn't gate the ack on auth content).
+                // metadata for audit/logging.
                 cred = parse_client_credentials(&frame, order).unwrap_or(cred);
                 debug!(?peer, method = %cred.method, account = %cred.account,
                     roles = ?cred.roles, "PVA client credentials");
+                // pvxs `serverconn.cpp:238-241` parity: when the client
+                // picks an auth method we never advertised, reply
+                // CONNECTION_VALIDATED with Status::Error so the client
+                // knows its elevated identity claim was rejected. pvxs
+                // keeps the connection open and falls back to whatever
+                // identity is recorded (typically anonymous via the
+                // empty-method path inside parse_client_credentials);
+                // matches "No practical way to handle auth failure. So
+                // we accept all credentials, but may not grant rights."
+                let advertised = ADVERTISED_AUTH_METHODS
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(&cred.method));
+                let validated_status = if advertised {
+                    Status::ok()
+                } else {
+                    debug!(
+                        ?peer,
+                        method = %cred.method,
+                        "PVA client selects unadvertised auth method — replying Status::Error"
+                    );
+                    Status::error("Client selects unadvertised auth".to_string())
+                };
                 let mut payload = Vec::new();
-                Status::ok().write_into(order, &mut payload);
+                validated_status.write_into(order, &mut payload);
                 let h = PvaHeader::application(
                     true,
                     order,

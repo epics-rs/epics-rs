@@ -541,3 +541,171 @@ async fn server_side_filter_pva_dec_wire_through() {
     monitor_handle.abort();
     h.abort();
 }
+
+/// Connect to a freshly started PVA server and drain the server's
+/// SET_BYTE_ORDER + CONNECTION_VALIDATION prologue. Polls for up to
+/// one second so the per-thread spawn race doesn't surface as a
+/// `WouldBlock` on a freshly accepted socket.
+fn read_handshake_prelude(server_addr: std::net::SocketAddr) -> std::net::TcpStream {
+    use std::io::Read;
+    let mut sock = std::net::TcpStream::connect(server_addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    sock.set_nodelay(true).ok();
+    let mut prelude = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // The server emits 8B SetByteOrder control frame + a CONN_VALID
+    // request frame whose total length depends on the advertised
+    // auth method list (~50 B for ["ca","anonymous"]). Keep reading
+    // until we see at least the second frame.
+    while std::time::Instant::now() < deadline {
+        let mut chunk = [0u8; 256];
+        match sock.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                prelude.extend_from_slice(&chunk[..n]);
+                if prelude.len() >= 16 {
+                    break; // we have at least one control frame and part of the next
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("prelude read failed: {e}"),
+        }
+    }
+    assert!(
+        !prelude.is_empty(),
+        "server did not emit prelude within deadline"
+    );
+    sock
+}
+
+/// Loop-read until [`try_parse_frame`] returns a complete frame.
+/// Used by the hand-spoken handshake tests where partial reads on
+/// freshly-accepted sockets are common.
+fn read_one_frame(sock: &mut std::net::TcpStream) -> epics_pva_rs::client_native::decode::Frame {
+    use epics_pva_rs::client_native::decode::try_parse_frame;
+    use std::io::Read;
+
+    let mut buf: Vec<u8> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let mut chunk = [0u8; 512];
+        match sock.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Ok(Some((frame, _))) = try_parse_frame(&buf) {
+                    return frame;
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("frame read failed: {e}"),
+        }
+    }
+    panic!("did not receive a complete frame within deadline");
+}
+
+/// pvxs `serverconn.cpp:238-241` parity: when the client picks an
+/// auth method we never advertised (e.g. "x509" against our
+/// `["ca","anonymous"]` advertisement), the server's
+/// `CONNECTION_VALIDATED` frame must carry `Status::Error` ("Client
+/// selects unadvertised auth"). The connection stays open — pvxs
+/// keeps it alive and just denies elevated rights — so anonymous
+/// access still works downstream.
+///
+/// Multi-thread runtime is required because the test does blocking
+/// `std::net::TcpStream` reads on the same task that drives the
+/// server's spawn; current-thread starves the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_method_unadvertised_returns_status_error() {
+    use std::io::Write;
+
+    use epics_pva_rs::codec::CMD_CONNECTION_VALIDATED;
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("AUTH:UNADV", 0.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    // Hand-speak the handshake so we can dictate the exact `selected`
+    // string. Using `PvaClient` would always pick "anonymous".
+    // Brief poll loop: the server task spawns asynchronously after
+    // `spawn_server` returns, and the SetByteOrder + ConnValidation
+    // request frames can take a few ms to appear on a freshly
+    // accepted socket. Read with a generous timeout and retry until
+    // at least both prologue frames have arrived.
+    let mut sock = read_handshake_prelude(server_addr);
+
+    // Build CONNECTION_VALIDATION reply with method="x509" — never
+    // advertised by the server.
+    let order = ByteOrder::Little;
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(87_040, order); // client buffer hint
+    payload.put_u16(32_767, order); // intro registry size
+    payload.put_u16(0, order); // qos
+    encode_string_into("x509", order, &mut payload);
+    payload.put_u8(0xFF); // null variant — no AuthZ block
+    let h_req = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    h_req.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+
+    // Server's CONNECTION_VALIDATED reply should arrive with
+    // Status::Error (not Status::Ok).
+    let frame = read_one_frame(&mut sock);
+    assert_eq!(
+        frame.header.command, CMD_CONNECTION_VALIDATED,
+        "expected CONNECTION_VALIDATED, got cmd=0x{:02X}",
+        frame.header.command
+    );
+    let mut cur = frame.cursor();
+    let status = Status::decode(&mut cur, order).expect("status");
+    assert!(
+        !status.is_success(),
+        "server accepted unadvertised auth method `x509`: {status:?}"
+    );
+
+    // Companion case: an advertised method (`anonymous`) on a fresh
+    // connection must still return Status::Ok so the existing
+    // anonymous flow doesn't regress.
+    let mut sock2 = read_handshake_prelude(server_addr);
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(87_040, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("anonymous", order, &mut payload);
+    payload.put_u8(0xFF);
+    let h_req = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    h_req.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock2.write_all(&req).unwrap();
+    let frame = read_one_frame(&mut sock2);
+    let mut cur = frame.cursor();
+    let status = Status::decode(&mut cur, order).expect("status");
+    assert!(
+        status.is_success(),
+        "anonymous (advertised) handshake was rejected: {status:?}"
+    );
+
+    h.abort();
+}

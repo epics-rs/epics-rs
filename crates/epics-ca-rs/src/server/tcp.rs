@@ -1710,17 +1710,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
                 None => {
-                    if is_notify {
-                        send_cmd_error(
-                            writer,
-                            CA_PROTO_READ_NOTIFY,
-                            requested_type,
-                            ECA_BADCHID,
-                            ioid,
-                        )
-                        .await?;
-                    }
-                    return Ok(());
+                    // C `read_action` (camessage.c:608-610):
+                    // `if (!pciu) { logBadId; return RSRV_ERROR; }` —
+                    // silent disconnect, no wire reply. Matches the
+                    // EVENT_ADD silent-disconnect pattern (round-16
+                    // 9fdbc37) where C's logBadId path is "log
+                    // server-side, drop the connection". Pre-fix
+                    // Rust sent ECA_BADCHID for READ_NOTIFY and
+                    // silently kept the connection for READ; both
+                    // diverged from C's silent + drop.
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "READ on unknown SID {} (matches C read_action logBadId + RSRV_ERROR)",
+                        sid
+                    )));
                 }
             };
 
@@ -1884,17 +1886,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 let entry = match state.channels.get(&sid) {
                     Some(e) => e,
                     None => {
-                        if is_notify {
-                            send_cmd_error(
-                                writer,
-                                CA_PROTO_WRITE_NOTIFY,
-                                hdr.data_type,
-                                ECA_BADCHID,
-                                ioid,
-                            )
-                            .await?;
-                        }
-                        return Ok(());
+                        // C `write_action` (camessage.c:736-738) +
+                        // `write_notify_action` (camessage.c:1642-1645):
+                        // `if (!pciu) { logBadId; return RSRV_ERROR; }`
+                        // — silent disconnect on missing channel. Same
+                        // family as round-16 EVENT_ADD bad-SID and the
+                        // matching READ branch below.
+                        return Err(epics_base_rs::error::CaError::Protocol(format!(
+                            "WRITE (ACKT/ACKS) on unknown SID {} \
+                             (matches C write_action logBadId + RSRV_ERROR)",
+                            sid
+                        )));
                     }
                 };
                 // R39-G1 / Round 39: alarm-acknowledge PUTs travel
@@ -2000,17 +2002,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
                 None => {
-                    if is_notify {
-                        send_cmd_error(
-                            writer,
-                            CA_PROTO_WRITE_NOTIFY,
-                            hdr.data_type,
-                            ECA_BADCHID,
-                            ioid,
-                        )
-                        .await?;
-                    }
-                    return Ok(());
+                    // Same C logBadId + RSRV_ERROR family as the
+                    // ACKT/ACKS branch above and the READ branch.
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "WRITE on unknown SID {} (matches C write_action logBadId + RSRV_ERROR)",
+                        sid
+                    )));
                 }
             };
 

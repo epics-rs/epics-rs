@@ -257,6 +257,26 @@ async fn recv_loop(
                 break;
             }
 
+            // C UDP dispatcher (camessage.c:2505-2516) allows only
+            // udp_version_action (cmd 0) and search_reply_udp (cmd 6)
+            // to succeed. Every other cmd index in the udpJumpTable
+            // is bound to bad_udp_cmd_action which returns RSRV_ERROR
+            // — the dispatcher loop then `break`s out, dropping the
+            // rest of this datagram. Pre-fix Rust just advanced
+            // `offset` and parsed the next message regardless;
+            // a peer could chain a junk cmd before a SEARCH and the
+            // chained SEARCH would still be processed even though
+            // C IOC would have stopped parsing at the junk cmd.
+            //
+            // VERSION's UDP handler (udp_version_action, camessage.c:
+            // 2094-2110) is a no-op for the stateless Rust responder:
+            // it only stored per-client minor_version_number +
+            // seqNoOfReq in C; Rust doesn't track UDP-per-datagram
+            // state, so we just allow the VERSION header to pass and
+            // continue.
+            if hdr.cmmd != CA_PROTO_VERSION && hdr.cmmd != CA_PROTO_SEARCH {
+                break;
+            }
             if hdr.cmmd == CA_PROTO_SEARCH {
                 // C `search_reply_udp` (rsrv/camessage.c:2151-2154)
                 // rejects unsupported minor versions BEFORE the

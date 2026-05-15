@@ -1167,8 +1167,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .position(|&b| b == 0)
                 .unwrap_or(payload.len());
             if end >= 512 {
-                send_ca_error(writer, hdr, ECA_INTERNAL, "a very long user name was specified")
-                    .await?;
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_INTERNAL,
+                    "a very long user name was specified",
+                )
+                .await?;
                 return Ok(());
             }
             let raw = String::from_utf8_lossy(&payload[..end]).to_string();

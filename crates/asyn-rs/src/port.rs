@@ -1230,7 +1230,10 @@ mod tests {
         drv.base_mut().call_param_callback(0, 0).unwrap();
 
         let iv = rx.try_recv().unwrap();
-        assert!(matches!(iv.aux_status, crate::error::AsynStatus::Disconnected));
+        assert!(matches!(
+            iv.aux_status,
+            crate::error::AsynStatus::Disconnected
+        ));
         assert_eq!(iv.alarm_status, 7);
         assert_eq!(iv.alarm_severity, 3);
     }

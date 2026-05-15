@@ -419,10 +419,7 @@ pub(crate) fn substitute_env_vars(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if i + 1 < chars.len()
-            && chars[i] == '$'
-            && (chars[i + 1] == '(' || chars[i + 1] == '{')
-        {
+        if i + 1 < chars.len() && chars[i] == '$' && (chars[i + 1] == '(' || chars[i + 1] == '{') {
             // Track the bracket pair so the verbatim passthrough on
             // lookup miss reproduces the original syntax.
             let (open, close) = if chars[i + 1] == '(' {
@@ -708,8 +705,7 @@ mod tests {
         unsafe {
             std::env::remove_var("EPICS_PARITY_TEST_BRACE_UNSET");
         }
-        let expanded =
-            substitute_env_vars("${EPICS_PARITY_TEST_BRACE_UNSET=fallback}");
+        let expanded = substitute_env_vars("${EPICS_PARITY_TEST_BRACE_UNSET=fallback}");
         assert_eq!(expanded, "fallback");
 
         // Unset without default — passes through verbatim using the bracket

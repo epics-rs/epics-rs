@@ -705,11 +705,7 @@ mod tests {
                 self.sequence.lock().push("write");
                 Ok(())
             }
-            fn io_read_octet(
-                &mut self,
-                _user: &AsynUser,
-                buf: &mut [u8],
-            ) -> AsynResult<usize> {
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
                 self.sequence.lock().push("read");
                 let resp = b"RSP";
                 let n = resp.len().min(buf.len());

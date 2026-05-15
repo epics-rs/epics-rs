@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 #[cfg(feature = "cap-tokens")]
 use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;

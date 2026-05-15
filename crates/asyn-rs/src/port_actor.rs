@@ -565,6 +565,31 @@ impl PortActor {
                 self.driver.set_option(key, value)?;
                 Ok(RequestResult::write_ok())
             }
+            RequestOp::Report { level } => {
+                // C parity: `asynManager::report` (asynManager.c) walks
+                // every registered port and calls each driver's
+                // `pasynCommon->report` callback. The iocsh wrapper
+                // (`asynReport`) does the per-port loop; here we
+                // dispatch the per-port `report(level)` from the
+                // actor thread so the driver observes its own state
+                // under the actor's serial ownership.
+                self.driver.report(*level);
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetInputEos { eos } => {
+                // C parity: asynRecord IEOS write at asynRecord.c:391
+                // calls `pasynOctet->setInputEos(pasynUser, eos, len)`.
+                // Route through the driver trait so the EOS interpose
+                // layer (interpose/eos.rs) reads from a single source
+                // of truth (`PortDriverBase::input_eos`) rather than
+                // the orphaned options HashMap.
+                self.driver.set_input_eos(eos)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetOutputEos { eos } => {
+                self.driver.set_output_eos(eos)?;
+                Ok(RequestResult::write_ok())
+            }
         };
 
         // Attach alarm/timestamp metadata on successful reads

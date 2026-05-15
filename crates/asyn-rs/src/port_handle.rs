@@ -592,6 +592,52 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Address-aware setOption — iocsh `asynSetOption portName addr key value`.
+    /// The C surface (`asynShellCommands.c:604-606`) carries `addr`
+    /// via `connectDevice`; here we attach it to the AsynUser so the
+    /// driver can disambiguate device-scoped options.
+    pub fn set_option_addr_blocking(&self, addr: i32, key: &str, value: &str) -> AsynResult<()> {
+        let user = AsynUser::default().with_addr(addr);
+        self.submit_blocking(
+            RequestOp::SetOption {
+                key: key.to_string(),
+                value: value.to_string(),
+            },
+            user,
+        )?;
+        Ok(())
+    }
+
+    /// Run the port driver's `report(level)` callback on the actor
+    /// thread. Mirrors C asyn `asynReport` (asynShellCommands.c:586)
+    /// which calls `pasynManager->report` to walk each port's
+    /// `pasynCommon->report` interface. Output is written to stderr
+    /// by the driver itself.
+    pub fn report_blocking(&self, level: i32) -> AsynResult<()> {
+        let user = AsynUser::default();
+        self.submit_blocking(RequestOp::Report { level }, user)?;
+        Ok(())
+    }
+
+    /// Apply input EOS bytes to the port through the actor — C
+    /// `pasynOctet->setInputEos`. asynRecord IEOS writes (and any
+    /// other caller that wants to change the in-driver EOS) MUST
+    /// reach the driver via this path; the previous option-key
+    /// route only wrote to `PortDriverBase::options` which no
+    /// driver consumes.
+    pub fn set_input_eos_blocking(&self, eos: &[u8]) -> AsynResult<()> {
+        let user = AsynUser::default();
+        self.submit_blocking(RequestOp::SetInputEos { eos: eos.to_vec() }, user)?;
+        Ok(())
+    }
+
+    /// Apply output EOS bytes — C `pasynOctet->setOutputEos`.
+    pub fn set_output_eos_blocking(&self, eos: &[u8]) -> AsynResult<()> {
+        let user = AsynUser::default();
+        self.submit_blocking(RequestOp::SetOutputEos { eos: eos.to_vec() }, user)?;
+        Ok(())
+    }
+
     pub async fn get_option(&self, key: &str) -> AsynResult<String> {
         let user = AsynUser::default();
         let result = self

@@ -32,3 +32,5 @@ pub mod user;
 pub mod adapter;
 #[cfg(feature = "epics")]
 pub mod asyn_record;
+#[cfg(feature = "epics")]
+pub mod iocsh;

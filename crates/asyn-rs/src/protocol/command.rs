@@ -108,6 +108,20 @@ pub enum PortCommand {
         key: String,
         value: String,
     },
+    /// Driver `report(level)` invocation — iocsh `asynReport`.
+    Report {
+        level: i32,
+    },
+    /// Set input EOS bytes — C `pasynOctet->setInputEos` /
+    /// asynRecord IEOS.
+    SetInputEos {
+        eos: Vec<u8>,
+    },
+    /// Set output EOS bytes — C `pasynOctet->setOutputEos` /
+    /// asynRecord OEOS.
+    SetOutputEos {
+        eos: Vec<u8>,
+    },
 }
 
 #[cfg(test)]

@@ -88,8 +88,16 @@ impl ADDriverBase {
 
         let pool = Arc::new(NDArrayPool::new(max_memory));
 
-        // Push initial values to RBV records via I/O Intr callbacks
-        port_base.call_param_callbacks(0)?;
+        // Don't fire callbacks here — no record subscribers exist before
+        // dbLoadRecords, so an early `call_param_callbacks(0)` only
+        // consumes the change flags silently. The flags must stay
+        // pending until the first post-iocInit `call_param_callbacks`
+        // (acquire start / poll / write) flushes them to the now-
+        // registered I/O Intr subscribers. The previous behaviour left
+        // MaxSizeX_RBV / MaxSizeY_RBV / SizeX_RBV / SizeY_RBV /
+        // BinX_RBV / BinY_RBV / ImageMode_RBV / etc at zero with
+        // undefined timestamps on a synthetic detector that never
+        // re-sets these statics.
 
         Ok(Self {
             port_base,

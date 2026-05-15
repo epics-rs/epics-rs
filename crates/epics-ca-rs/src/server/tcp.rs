@@ -2512,11 +2512,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         CA_PROTO_READ_SYNC => {
-            // READ_SYNC is a barrier/flush for previously queued responses.
-            // No-op here: handle_client's outer-loop flush always fires
-            // after the inner message-drain at offset > 0, so any
-            // responses buffered before this READ_SYNC will be flushed
-            // at the same point as if we had flushed inline.
+            // C `read_sync_reply` (camessage.c:2053-2067): server
+            // echoes the request header back with cmmd=CA_PROTO_READ_SYNC,
+            // m_postsize=0, and the request's m_dataType / m_count /
+            // m_cid / m_available preserved. libca client treats this
+            // as ECHO (`cac.cpp:72-73`: "legacy READ_SYNC used as
+            // echo with legacy server" — dispatched through
+            // echoRespAction). Without the reply, a client using
+            // READ_SYNC as a keepalive probe (legacy V3 / pre-V4.3
+            // protocol behavior) sees no response and may trigger
+            // its connection-timeout watchdog.
+            //
+            // The outer batched flush still fires, so any prior queued
+            // responses ship along with this echo — preserving the
+            // barrier semantic. Pre-fix Rust silently no-op-ed; this
+            // restores wire parity.
+            let mut resp = CaHeader::new(CA_PROTO_READ_SYNC);
+            resp.data_type = hdr.data_type;
+            resp.count = hdr.count;
+            resp.cid = hdr.cid;
+            resp.available = hdr.available;
+            let mut w = writer.lock().await;
+            w.write_all(&resp.to_bytes()).await?;
+            // flush deferred to handle_client outer loop (batched)
         }
 
         CA_PROTO_ECHO => {

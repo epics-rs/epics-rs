@@ -1395,3 +1395,77 @@ async fn server_read_notify_bad_type_replies_error_and_disconnects() {
          (C read_action RSRV_ERROR parity); got {n} more bytes"
     );
 }
+
+/// C `read_sync_reply` (`rsrv/camessage.c:2053-2067`) echoes the
+/// request header back with cmmd=CA_PROTO_READ_SYNC, m_postsize=0,
+/// and the request's m_dataType / m_count / m_cid / m_available
+/// preserved. libca client treats this as ECHO (`cac.cpp:72-73`).
+/// Pre-fix Rust silently no-op-ed; this regression test ensures the
+/// echo reply now arrives with the expected fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_read_sync_echoes_request_header() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("SYNC:PV", EpicsValue::Double(0.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut hello = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+        .await
+        .expect("VERSION reply timed out")
+        .expect("read VERSION");
+
+    // Send READ_SYNC with distinctive field values to verify echo.
+    let mut sync = CaHeader::new(CA_PROTO_READ_SYNC);
+    sync.data_type = 0xBEEF;
+    sync.count = 0x1234;
+    sync.cid = 0xCAFE_F00D;
+    sync.available = 0xDEAD_BEEF;
+    sock.write_all(&sync.to_bytes()).await.unwrap();
+
+    // Expect CA_PROTO_READ_SYNC reply with the same fields echoed.
+    let mut resp = [0u8; 32];
+    let mut total = 0;
+    while total < 16 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+            .await
+            .expect("READ_SYNC echo timed out")
+            .expect("read echo");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(total >= 16, "expected echo reply, got {total} bytes");
+    let echo = CaHeader::from_bytes(&resp[..16]).expect("parse echo");
+    assert_eq!(echo.cmmd, CA_PROTO_READ_SYNC);
+    assert_eq!(echo.data_type, 0xBEEF, "m_dataType echoed");
+    assert_eq!(echo.count, 0x1234, "m_count echoed");
+    assert_eq!(echo.cid, 0xCAFE_F00D, "m_cid echoed");
+    assert_eq!(echo.available, 0xDEAD_BEEF, "m_available echoed");
+    assert_eq!(echo.postsize, 0, "no payload");
+}

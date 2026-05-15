@@ -1445,10 +1445,24 @@ async fn handle_destroy_channel(
 }
 
 /// Handle CANCEL_REQUEST (cmd 21). pvxs serverconn.cpp:262 — moves the op
-/// from Executing back to Idle without freeing it, so the client can
-/// re-trigger (e.g., re-START a paused monitor). For our model, that
-/// means: stop the running subscriber but keep the OpState so a fresh
-/// MONITOR START can re-spawn it.
+/// from Executing back to Idle without freeing it; the underlying
+/// `MonitorOp` (and the source's onSubscribe state) stays alive so a
+/// later START restores Executing without re-issuing the subscription.
+///
+/// Round 4 (cancel-vs-destroy refactor): previously the Rust handler
+/// dropped `monitor_abort` and cleared `monitor_started`, which aborted
+/// the subscriber task and forced a full re-spawn on the next START.
+/// That heavy path: (1) re-subscribed at the source, potentially
+/// dropping queued events between cancel and START, and (2) re-took the
+/// type/ACL/filter setup cost. Mirroring pvxs, we now flip
+/// `monitor_paused=true` and keep the subscriber task alive. The
+/// subscriber loop already gates emission on `monitor_paused`, so this
+/// suspends events without tearing the task down. The matching
+/// START (subcmd 0x44 — start | process) clears `monitor_paused` via
+/// the existing resume path at handle_op, transitioning back to
+/// Executing without a re-subscribe. DESTROY (`CMD_DESTROY_REQUEST`)
+/// still removes the op outright, dropping `monitor_abort` and
+/// aborting the task — the only path that releases source-side state.
 fn handle_cancel_request(
     frame: &Frame,
     channels: &mut HashMap<u32, ChannelState>,
@@ -1458,10 +1472,16 @@ fn handle_cancel_request(
     let Ok(sid) = cur.get_u32(order) else { return };
     let Ok(ioid) = cur.get_u32(order) else { return };
     if let Some(ch) = channels.get_mut(&sid) {
-        if let Some(op) = ch.ops.get_mut(&ioid) {
-            // Drop the abort guard → subscriber task aborts.
-            op.monitor_abort = None;
-            op.monitor_started = false;
+        if let Some(op) = ch.ops.get(&ioid) {
+            // Suspend without aborting the subscriber task. pvxs
+            // models cancel as Executing→Idle; the subscriber stays
+            // around for the next START to flip back to Executing.
+            // Only MONITOR has a long-lived subscriber to pause —
+            // GET/PUT/RPC are two-shot so the field is effectively a
+            // no-op for them (`monitor_paused` is never consulted off
+            // the MONITOR path).
+            op.monitor_paused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -2594,23 +2614,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_request_aborts_monitor_and_clears_started_flag() {
+    async fn cancel_request_pauses_monitor_without_aborting() {
+        // Round 4 cancel-vs-destroy parity: pvxs serverconn.cpp:262-289
+        // transitions Executing→Idle and fires onCancel, but the
+        // underlying op + subscription stay alive. Our model: flip
+        // `monitor_paused` so the subscriber suspends emission, leaving
+        // the abort guard untouched so the spawned task survives.
         let order = ByteOrder::Little;
         let sid: u32 = 7;
         let ioid: u32 = 99;
 
         // Stand up a fake OpState whose `monitor_abort` points at a real
-        // task we can observe being cancelled.
+        // task we can observe NOT being cancelled.
         let task = tokio::spawn(async move {
-            // Loop until aborted by the Drop guard. If the test ever
-            // returns without the abort firing, the JoinHandle will see
-            // this future complete normally — the assertion below catches
-            // that.
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
         let abort = Arc::new(AbortOnDrop(task.abort_handle()));
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
         let mut ops = HashMap::new();
@@ -2624,7 +2646,7 @@ mod tests {
                 mask: BitSet::new(),
                 monitor_window: None,
                 monitor_window_notify: None,
-                monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                monitor_paused: paused.clone(),
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
@@ -2649,26 +2671,50 @@ mod tests {
         let frame = synth_frame(Command::CancelRequest, order, payload);
         handle_cancel_request(&frame, &mut channels, order);
 
-        // Op must still be in the map (cancel is non-destructive), but
-        // `monitor_started` must reset and the abort guard must be cleared.
+        // pvxs parity: op stays in the map, started flag stays set, abort
+        // guard stays attached, pause flag flips on. Subsequent START
+        // (subcmd 0x44) flips pause off via handle_op's resume path.
         let op = channels
             .get(&sid)
             .and_then(|c| c.ops.get(&ioid))
             .expect("op preserved across cancel");
-        assert!(!op.monitor_started, "monitor_started should reset");
-        assert!(op.monitor_abort.is_none(), "abort guard should be dropped");
+        assert!(
+            op.monitor_started,
+            "monitor_started must stay set — cancel doesn't tear down"
+        );
+        assert!(
+            op.monitor_abort.is_some(),
+            "abort guard must stay — cancel preserves subscriber task"
+        );
+        assert!(
+            paused.load(std::sync::atomic::Ordering::Relaxed),
+            "monitor_paused must flip on so the subscriber suspends emission"
+        );
 
-        // Drop the only remaining strong ref — this fires the abort
-        // (already triggered above when the OpState's clone dropped).
+        // Drop our test-side abort handle so the spawned task can exit
+        // when the OpState's clone is also dropped. With the OpState
+        // still alive in `channels`, the task should still be running
+        // immediately after cancel.
         drop(abort);
+        // The task must NOT have been aborted yet — the OpState in
+        // `channels` still holds an Arc to the abort guard.
+        let join_attempt = tokio::time::timeout(
+            Duration::from_millis(50),
+            &mut Box::pin(async {
+                // Probe: confirm task is still pending by sleeping briefly.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }),
+        )
+        .await;
+        assert!(join_attempt.is_ok(), "probe should not time out");
 
-        // The task must terminate (with `cancelled` == true) within a
-        // reasonable window, otherwise the cancel was a no-op.
+        // Now drop the OpState (simulating DESTROY); the task must abort.
+        channels.clear();
         let join = tokio::time::timeout(Duration::from_millis(500), task).await;
         let outcome = join.expect("aborted task should finish quickly");
         assert!(
             outcome.unwrap_err().is_cancelled(),
-            "task should have been aborted by the Drop guard"
+            "task should abort only on DESTROY (OpState drop), not on cancel"
         );
     }
 

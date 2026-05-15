@@ -2097,15 +2097,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let native_type = match native_type_for_dbr(requested_type) {
                 Ok(t) => t,
                 Err(_) => {
-                    send_cmd_error(
-                        writer,
-                        CA_PROTO_EVENT_ADD,
-                        requested_type,
-                        ECA_BADTYPE,
-                        sub_id,
-                    )
-                    .await?;
-                    return Ok(());
+                    // C `event_add_action` (camessage.c:1769-1771):
+                    // `INVALID_DB_REQ` (data_type > LAST_BUFFER_TYPE = 38)
+                    // returns RSRV_ERROR with NO error reply — the
+                    // connection just drops. Unlike WRITE / READ where
+                    // C emits CA_PROTO_ERROR + drops, EVENT_ADD is
+                    // silent. Match that wire shape: no send, just
+                    // disconnect. Clients see EOF without an ECA hint;
+                    // this matches C IOC behaviour exactly.
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "EVENT_ADD with unsupported DBR type {} (matches C event_add_action silent drop)",
+                        requested_type
+                    )));
                 }
             };
 
@@ -2118,15 +2121,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
                 None => {
-                    send_cmd_error(
-                        writer,
-                        CA_PROTO_EVENT_ADD,
-                        requested_type,
-                        ECA_BADCHID,
-                        sub_id,
-                    )
-                    .await?;
-                    return Ok(());
+                    // C `event_add_action` (camessage.c:1773-1777):
+                    // `logBadId` + RSRV_ERROR on missing channel —
+                    // logs server-side, no wire reply, then drops the
+                    // connection. Same silent-disconnect pattern as
+                    // the INVALID_DB_REQ branch above.
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "EVENT_ADD on unknown SID {} (matches C event_add_action logBadId + RSRV_ERROR)",
+                        sid
+                    )));
                 }
             };
             // Captured up front so the SubscriptionOpened event we

@@ -24,6 +24,21 @@ pub enum AsynError {
     #[error("param not found: {0}")]
     ParamNotFound(String),
 
+    /// C parity: `asynParamAlreadyExists` —
+    /// `paramList::createParam` (`asynPortDriver.cpp:126-138`) returns
+    /// this status when a second `createParam(name, ...)` arrives with
+    /// the same name. The `asynPortDriver::createParam` wrapper
+    /// (`asynPortDriver.cpp:991-1011`) translates it to `asynError`
+    /// with an `asynPrint(ASYN_TRACE_ERROR, ...)` log line. The lax
+    /// Rust [`ParamList::create_param`] silently returns the existing
+    /// index to match the idempotent build pattern used by
+    /// `ad-core-rs`/`ad-plugins-rs` (e.g. `ADDriverParams::create`
+    /// after `NDArrayDriverParams::create`); use
+    /// [`ParamList::create_param_strict`] when you need C parity for
+    /// the duplicate-name error.
+    #[error("param already exists: {0}")]
+    ParamAlreadyExists(String),
+
     #[error("param index out of range: {0}")]
     ParamIndexOutOfRange(usize),
 

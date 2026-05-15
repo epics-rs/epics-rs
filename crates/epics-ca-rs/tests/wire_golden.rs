@@ -261,6 +261,61 @@ fn event_cancel_unknown_sub_id_error_shape() {
 }
 
 #[test]
+fn search_reply_udp_matches_c_sid_sentinel() {
+    // C `search_reply_udp` (`rsrv/camessage.c:2193-2207`) builds:
+    //   m_cmmd      = CA_PROTO_SEARCH (6)
+    //   m_postsize  = 8 (sizeof(minorVersion)=2 → CA_MESSAGE_ALIGN → 8)
+    //   m_dataType  = ca_server_port (carrier for the TCP port)
+    //   m_count     = 0
+    //   m_cid       = ~0U (0xFFFFFFFF) — INADDR_BROADCAST sentinel
+    //                 telling the client to use the UDP source IP.
+    //   m_available = mp->m_available (the client's cid for this PV)
+    // followed by an 8-byte payload whose first 2 bytes carry
+    // CA_MINOR_PROTOCOL_REVISION (13 = 0x000d).
+    let mut resp = CaHeader::new(CA_PROTO_SEARCH);
+    resp.postsize = 8;
+    resp.data_type = 5064; // ca_server_port
+    resp.count = 0;
+    resp.cid = u32::MAX;
+    resp.available = 0x1234_5678;
+    let mut bytes = resp.to_bytes().to_vec();
+    let mut payload = [0u8; 8];
+    payload[0..2].copy_from_slice(&13u16.to_be_bytes());
+    bytes.extend_from_slice(&payload);
+    assert_hex(
+        &bytes,
+        "0006 0008 13c8 0000 ffffffff 12345678 \
+         000d 0000 0000 0000",
+        "SEARCH UDP reply (sid=~0U)",
+    );
+}
+
+#[test]
+fn search_reply_tcp_matches_c_zero_postsize_sid_sentinel() {
+    // C `search_reply_tcp` (`rsrv/camessage.c:2275-2283`):
+    //   m_cmmd      = CA_PROTO_SEARCH (6)
+    //   m_postsize  = 0  (no payload — TCP search reply carries no
+    //                 minor-version trailer, unlike UDP)
+    //   m_dataType  = ca_server_port
+    //   m_count     = 0
+    //   m_cid       = ~0U
+    //   m_available = mp->m_available
+    // Total: 16 bytes, no payload.
+    let mut resp = CaHeader::new(CA_PROTO_SEARCH);
+    resp.set_payload_size(0, 0);
+    resp.data_type = 5064;
+    resp.cid = u32::MAX;
+    resp.available = 0x1234_5678;
+    let bytes = resp.to_bytes();
+    assert_eq!(bytes.len(), CaHeader::SIZE);
+    assert_hex(
+        &bytes,
+        "0006 0000 13c8 0000 ffffffff 12345678",
+        "SEARCH TCP reply (postsize=0, sid=~0U)",
+    );
+}
+
+#[test]
 fn header_round_trip_through_decoder() {
     // Sanity: every test fixture above must round-trip through the
     // decoder. Picks one each from short and extended forms.

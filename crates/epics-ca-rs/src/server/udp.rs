@@ -183,12 +183,29 @@ async fn run_single_responder(
                     .unwrap_or(payload.len());
                 if let Ok(pv_name) = std::str::from_utf8(&payload[..pv_name_end]) {
                     if db.has_name(pv_name).await {
-                        let server_ip = local_ip_for(src);
+                        // C parity: `search_reply_udp`
+                        // (`rsrv/camessage.c:2193-2207`) sets
+                        // `sid = ~0U` (INADDR_BROADCAST), telling
+                        // the client to use the UDP packet's source
+                        // address as the server IP. The previous
+                        // code embedded a probe-derived
+                        // `local_ip_for(src)` which (a) diverged from
+                        // C byte-for-byte and (b) could resolve to
+                        // the wrong interface on multi-homed hosts —
+                        // the probe binds 0.0.0.0:0 and `connect`s
+                        // to the client, but the kernel's outgoing-
+                        // interface choice may not match the
+                        // interface the client used to reach us.
+                        // Using the sentinel delegates the IP
+                        // determination to the receiver, which gets
+                        // it right by construction (the UDP source
+                        // IP is whatever the client sees on the
+                        // reply packet).
                         let mut resp = CaHeader::new(CA_PROTO_SEARCH);
                         resp.postsize = 8;
                         resp.data_type = tcp_port;
                         resp.count = 0;
-                        resp.cid = u32::from_be_bytes(server_ip.octets());
+                        resp.cid = u32::MAX; // ~0U — "use UDP source address"
                         resp.available = hdr.available;
 
                         let mut ver = CaHeader::new(CA_PROTO_VERSION);
@@ -219,22 +236,6 @@ async fn run_single_responder(
 
             offset += msg_len;
         }
-    }
-}
-
-/// Determine the local interface IP that would route to `remote`.
-/// Creates a temporary unconnected UDP socket and "connects" it (no data
-/// is sent — this just lets the OS pick the outgoing interface via routing).
-fn local_ip_for(remote: SocketAddr) -> Ipv4Addr {
-    let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
-        return Ipv4Addr::UNSPECIFIED;
-    };
-    if sock.connect(remote).is_err() {
-        return Ipv4Addr::UNSPECIFIED;
-    }
-    match sock.local_addr() {
-        Ok(SocketAddr::V4(a)) => *a.ip(),
-        _ => Ipv4Addr::UNSPECIFIED,
     }
 }
 

@@ -2194,20 +2194,35 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let pv_name = String::from_utf8_lossy(&payload[..end]).to_string();
 
             if db.has_name(&pv_name).await {
-                // Reply: data_type = tcp_port, cid = 0 (INADDR_ANY), available = client's cid
-                // 8-byte payload containing CA_MINOR_VERSION as u16
+                // C parity: `search_reply_tcp`
+                // (`rsrv/camessage.c:2229-2287`) sends:
+                //   m_postsize  = 0  (no payload — TCP search reply
+                //                 carries no minor-version trailer,
+                //                 unlike UDP)
+                //   m_dataType  = ca_server_port (carries the port)
+                //   m_count     = 0
+                //   m_cid       = ~0U (INADDR_BROADCAST — tells client
+                //                 to use TCP peer addr as server IP;
+                //                 libca `tcpiiu::searchRespNotify`
+                //                 explicitly checks `msg.m_cid !=
+                //                 INADDR_BROADCAST` and falls back to
+                //                 `this->address()` on the sentinel)
+                //   m_available = client's m_available (the cid)
+                //
+                // The previous code wrote `m_cid = 0` (INADDR_ANY) and
+                // an 8-byte minor-version payload. C libca client at
+                // `tcpiiu.cpp:2209` treats anything != INADDR_BROADCAST
+                // as a literal IP, so `m_cid = 0` would surface as a
+                // server at 0.0.0.0:port — unroutable. With this fix
+                // the reply is now byte-equivalent to the C softIoc.
                 let mut resp = CaHeader::new(CA_PROTO_SEARCH);
                 resp.data_type = state.tcp_port;
-                resp.set_payload_size(8, 0);
-                resp.cid = 0; // INADDR_ANY — client uses TCP peer addr
+                resp.set_payload_size(0, 0);
+                resp.cid = u32::MAX; // ~0U — "use TCP peer addr"
                 resp.available = hdr.available;
 
-                let mut search_payload = [0u8; 8];
-                search_payload[0..2].copy_from_slice(&CA_MINOR_VERSION.to_be_bytes());
-
                 let mut w = writer.lock().await;
-                w.write_all(&resp.to_bytes_extended()).await?;
-                w.write_all(&search_payload).await?;
+                w.write_all(&resp.to_bytes()).await?;
                 // flush deferred to handle_client outer loop (batched)
             } else if hdr.data_type == CA_DO_REPLY {
                 // Explicit negative reply requested — send NOT_FOUND so the

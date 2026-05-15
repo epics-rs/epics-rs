@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.17.2 — 2026-05-15
+
+Patch release.
+
+### ad-core-rs — areaDetector static RBV records populate at IOC startup
+
+- **fix(ad-core-rs)** Drop the premature `call_param_callbacks(0)` at
+  the end of `ADDriverBase::new`. Constructor time has no record
+  subscribers (`dbLoadRecords` runs strictly after), so the call
+  silently consumed the change flags of every just-set parameter
+  (`MAX_SIZE_X/Y`, `SIZE_X/Y`, `BIN_X/Y`, `IMAGE_MODE`,
+  `NUM_IMAGES`, `NUM_EXPOSURES`, `ACQUIRE_TIME`, `ACQUIRE_PERIOD`,
+  `STATUS`, `DATA_TYPE`, `COLOR_MODE`, ...) and fired
+  `InterruptManager.notify` into an empty mailbox list before
+  clearing the flags. Records registering during `dbLoadRecords`
+  got fresh mailboxes with no buffered value and — for static
+  parameters never re-set during operation — waited forever.
+  Symptom on synthetic detectors (mini-beamline `MovingDotDetector`):
+  `MaxSizeX_RBV` / `MaxSizeY_RBV` / `SizeX_RBV` / `SizeY_RBV` /
+  `BinX_RBV` / `BinY_RBV` / `NumImages_RBV` at `VAL=0`,
+  `Timestamp=<undefined>` indefinitely. Real cameras masked the
+  gap by refreshing these from device polling on first acquire;
+  synthetic detectors exposed it. Fix removes the call; pending
+  flags now accumulate through construction and flush on the
+  first post-iocInit `call_param_callbacks` (acquire start,
+  write-driven update, dirty-flag handler). (`870acc3`)
+
+  **Anchor**: `call_param_callbacks` inside an `fn new` body.
+  Workspace audit shows ad_driver.rs:92 was the only constructor-time
+  site; all other call sites live in operational methods
+  (`prepare_array`, `write_int32`, `write_float64`, `write_*`) and
+  are correct.
+
+  Verified on a live mini-beamline IOC: after restart, `MaxSizeX_RBV=640`,
+  `MaxSizeY_RBV=480`, `SizeX_RBV=640`, `SizeY_RBV=480`, `BinX_RBV=1`,
+  `BinY_RBV=1`, `NumImages_RBV=100`, all with concrete timestamps. No
+  regression on previously-working RBVs (`Manufacturer_RBV`,
+  `Model_RBV`, `DataType_RBV`).
+
 ## v0.17.1 — 2026-05-15
 
 C-parity hardening release: 126 commits across eleven review rounds.

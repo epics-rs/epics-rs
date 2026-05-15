@@ -1307,13 +1307,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             }
             // C `camessage.c:824-825`: `size = strnlen(pName, m_postsize)
             // + 1; if (size > 512 || size > m_postsize) reject`.
-            // Our `end` here is the string length (null position or
-            // payload end), so `end + 1 > 512` ⇔ `end >= 512`.
-            let end = payload
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(payload.len());
-            if end >= 512 {
+            // The second condition rejects payloads with no null
+            // terminator within m_postsize bytes (strnlen returns
+            // m_postsize, then +1 overflows). Rust's
+            // `position(|&b| b == 0)` returns Some(idx) for
+            // terminated names and `None` (mapped to payload.len())
+            // for unterminated ones — check explicitly so we don't
+            // silently accept unterminated names that C would
+            // reject as "very long".
+            let null_pos = payload.iter().position(|&b| b == 0);
+            let end = null_pos.unwrap_or(payload.len());
+            if null_pos.is_none() || end >= 512 {
                 // C `host_name_action` (camessage.c:825-836): a name
                 // longer than 511 bytes is a protocol violation —
                 // send_err + return RSRV_ERROR (disconnect). The
@@ -1385,12 +1389,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .await?;
                 return Ok(());
             }
-            // C `camessage.c:911-912`: same 512-byte cap as host name.
-            let end = payload
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(payload.len());
-            if end >= 512 {
+            // C `camessage.c:911-912`: same 512-byte cap as host
+            // name, AND same null-termination requirement. C
+            // computes `size = strnlen(pName, m_postsize) + 1`
+            // then rejects on `size > m_postsize`, which catches
+            // names with no null terminator within m_postsize
+            // bytes. Match by treating "no null found" as a
+            // reject.
+            let null_pos = payload.iter().position(|&b| b == 0);
+            let end = null_pos.unwrap_or(payload.len());
+            if null_pos.is_none() || end >= 512 {
                 // C `client_name_action` (camessage.c:912-923): same
                 // 511-byte cap as host_name; send_err + RSRV_ERROR
                 // (disconnect). Post-claim freeze branch returns

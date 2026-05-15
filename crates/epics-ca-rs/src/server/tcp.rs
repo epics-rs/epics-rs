@@ -2221,9 +2221,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         _ => {
-            // Unknown command — send CA_PROTO_ERROR with ECA status and original header
+            // Unknown command — send CA_PROTO_ERROR with ECA status
+            // and original header echoed.  Per C `vsend_err`
+            // (`camessage.c:179-181`), commands that aren't
+            // channel-scoped (i.e. fell through every case label and
+            // can't carry a channel cid we trust) use the
+            // 0xFFFFFFFF sentinel as the outer `m_cid`.
             let error_msg = format!("Unsupported command {}", hdr.cmmd);
-            send_ca_error(writer, hdr, ECA_INTERNAL, &error_msg).await?;
+            send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, &error_msg).await?;
         }
     }
 
@@ -2362,11 +2367,27 @@ async fn send_cmd_error<W: AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
-/// Send a CA_PROTO_ERROR response with the original header and an error message.
+/// Send a CA_PROTO_ERROR response with the original header echoed
+/// into the payload and an error message.
+///
+/// Layout follows C `vsend_err` (`rsrv/camessage.c:139`):
+///   * outer `m_cid` carries the *channel client cid* (i.e. the
+///     client-side identifier of the channel the error relates to),
+///     or `0xFFFFFFFF` for commands that aren't channel-scoped.
+///   * outer `m_available` carries the ECA status code.
+///   * payload is the original request header followed by a
+///     NUL-terminated diagnostic string.
+///
+/// The previous implementation put the ECA status in `m_cid` and left
+/// `m_available` zero, so libca's `exceptionRespAction`
+/// (`cac.cpp:1118`) — which reads the status from `hdr.m_available` —
+/// would surface every server-emitted CA_PROTO_ERROR as ECA_NORMAL
+/// (status 0), silently masking the failure.
 async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     writer: &Arc<Mutex<BufWriter<W>>>,
     original_hdr: &CaHeader,
     eca_status: u32,
+    chan_cid: u32,
     message: &str,
 ) -> CaResult<()> {
     let error_msg_bytes = pad_string(message);
@@ -2374,7 +2395,8 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
 
     let mut resp = CaHeader::new(CA_PROTO_ERROR);
     resp.set_payload_size(payload_size, 0);
-    resp.cid = eca_status;
+    resp.cid = chan_cid;
+    resp.available = eca_status;
 
     let mut w = writer.lock().await;
     w.write_all(&resp.to_bytes_extended()).await?;

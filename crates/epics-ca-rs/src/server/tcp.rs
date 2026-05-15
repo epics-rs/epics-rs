@@ -984,6 +984,49 @@ where
 
         let mut offset = 0;
         while offset + CaHeader::SIZE <= accumulated.len() {
+            // C `camessage` dispatcher (camessage.c:2471-2489): if
+            // msgsize > maxstk (recv buffer ceiling, =
+            // rsrvSizeofLargeBufTCP after expand), emit ECA_TOLARGE
+            // via send_err and drain the rest of the message. Rust
+            // `CaHeader::from_bytes_extended` returns
+            // CaError::Protocol("payload too large") when the
+            // extended postsize exceeds `max_payload_size()`
+            // (default 16 MiB), and the `?` propagation silently
+            // closes the connection. C clients waiting on the
+            // ECA_TOLARGE error callback see only EOF. Pre-check
+            // the extended postsize here and emit the wire reply
+            // before propagating the error.
+            //
+            // Normal-form headers can't overflow `max_payload_size()`
+            // because their postsize is u16 (max 0xfffe < 16 MiB),
+            // so the check only triggers on extended frames.
+            let buf = &accumulated[offset..];
+            if buf.len() >= 24 && buf[2] == 0xFF && buf[3] == 0xFF {
+                let ext_post = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
+                if ext_post > crate::protocol::max_payload_size() {
+                    // Build a stand-in header for the error reply
+                    // (cmmd echoed from the malformed frame; cid
+                    // sentinel 0xFFFFFFFF per `vsend_err`
+                    // non-channel-scoped convention).
+                    let mut probe_hdr = CaHeader::new(u16::from_be_bytes([buf[0], buf[1]]));
+                    probe_hdr.data_type = u16::from_be_bytes([buf[4], buf[5]]);
+                    let _ = send_ca_error(
+                        &writer,
+                        &probe_hdr,
+                        ECA_TOLARGE,
+                        0xFFFF_FFFF,
+                        "CAS: Server unable to load large request message",
+                    )
+                    .await;
+                    let _ = writer.lock().await.flush().await;
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "CA payload too large: ext_post={} > max={} \
+                         (matches C dispatcher ECA_TOLARGE wire reply + drop)",
+                        ext_post,
+                        crate::protocol::max_payload_size()
+                    )));
+                }
+            }
             let (hdr, hdr_size) = CaHeader::from_bytes_extended(&accumulated[offset..])?;
             let actual_post = hdr.actual_postsize();
             // C `rsrv/camessage.c:2452` rejects misaligned payloads

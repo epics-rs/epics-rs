@@ -1204,7 +1204,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     ] {
         let mut h = CaHeader::new(cmd);
         let mut body = name.as_bytes().to_vec();
-        while body.len() % 8 != 0 {
+        while !body.len().is_multiple_of(8) {
             body.push(0);
         }
         h.set_payload_size(body.len(), 0);
@@ -1219,7 +1219,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     create.cid = 0xCAFEBABE;
     let pv_name = b"WRBAD:PV\0";
     let mut create_body = pv_name.to_vec();
-    while create_body.len() % 8 != 0 {
+    while !create_body.len().is_multiple_of(8) {
         create_body.push(0);
     }
     create.set_payload_size(create_body.len(), 0);

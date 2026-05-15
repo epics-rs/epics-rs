@@ -237,6 +237,22 @@ pub(crate) fn substitute_macros(input: &str, macros: &HashMap<String, String>) -
     let mut i = 0;
 
     while i < chars.len() {
+        // C parity: `\<char>` blocks macro-reference detection for the
+        // next char and copies both `\` and `<char>` verbatim. Mirrors
+        // macCore.c::trans:740-749 at level 0 (the level macEnvExpand
+        // / dbLoadRecords runs at by default). Confirmed via
+        // modules/libcom/test/macLib.plt:52:
+        //   $(a)\$(b) with a=foo  ->  foo\$(b)
+        // The `\` is preserved so downstream consumers that DO want
+        // their own escape pass (autosave, host-name expansion) can
+        // discard it; the macLib-level pass merely guarantees the `$`
+        // immediately after `\` is not treated as a macro start.
+        if i + 1 < chars.len() && chars[i] == '\\' {
+            result.push('\\');
+            result.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
         if i + 1 < chars.len() && chars[i] == '$' && (chars[i + 1] == '(' || chars[i + 1] == '{') {
             let close = if chars[i + 1] == '(' { ')' } else { '}' };
             // Find matching close bracket, respecting nested $() / ${}
@@ -1377,6 +1393,40 @@ record(ai, "REC") {
             tags.iter()
                 .any(|(k, v)| k == "autosaveFields" && v == "VAL DESC"),
             "unquoted multi-word value must parse: {tags:?}"
+        );
+    }
+
+    /// C parity (modules/libcom/test/macLib.plt:52):
+    ///   $(a)\$(b)  with a=foo  ->  foo\$(b)
+    /// The `\` MUST block the macro-reference detection of the following
+    /// `$` so `$(b)` survives as literal text. The `\` itself is
+    /// preserved verbatim (macLib level 0 semantic — downstream
+    /// caller-side escape passes may discard it).
+    #[test]
+    fn substitute_macros_backslash_escapes_dollar() {
+        let mut macros = HashMap::new();
+        macros.insert("a".to_string(), "foo".to_string());
+        macros.insert("b".to_string(), "baz".to_string());
+
+        // Anchor test: backslash before $ blocks expansion.
+        assert_eq!(substitute_macros(r"$(a)\$(b)", &macros), r"foo\$(b)");
+
+        // Backslash before brace form too.
+        assert_eq!(substitute_macros(r"\${a}", &macros), r"\${a}");
+
+        // Without backslash, both expand.
+        assert_eq!(substitute_macros("$(a)$(b)", &macros), "foobaz");
+
+        // Backslash escape consumes the IMMEDIATELY next char (one
+        // step at a time, matching C macCore.c:741-744). So `\\$(a)`
+        // emits the first `\` + second `\` literal (escape pair), then
+        // resumes parsing at `$(a)` which expands. Result: `\\foo`.
+        assert_eq!(substitute_macros(r"\\$(a)", &macros), r"\\foo");
+
+        // Backslash NOT before $ / { passes through too (escape any next char).
+        assert_eq!(
+            substitute_macros(r"path\file $(a)", &macros),
+            r"path\file foo"
         );
     }
 }

@@ -2541,9 +2541,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         CA_PROTO_SEARCH => {
-            // TCP search — only supported for clients with minor version >= 4
+            // C `search_reply_tcp` (camessage.c:2238-2241): if
+            // `!CA_VSUPPORTED(m_count)` (minor < 4) the handler
+            // returns RSRV_ERROR which tears the TCP connection
+            // down. Note that the *UDP* SEARCH path returns RSRV_OK
+            // on the same condition (silently skips the reply, no
+            // datagram-level disconnect) — those two paths share
+            // the version-check logic but differ in fatality.
+            //
+            // Pre-fix Rust silently `return Ok(())`-ed, keeping the
+            // connection. A peer could spam unsupported-minor TCP
+            // SEARCH frames indefinitely.
             if state.client_minor_version < 4 {
-                return Ok(());
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "TCP SEARCH from minor {} (< 4) — C search_reply_tcp RSRV_ERROR parity",
+                    state.client_minor_version
+                )));
             }
             // C `search_reply_tcp` (rsrv/camessage.c:2246) rejects
             // SEARCH whose `m_postsize <= 1` and silently returns

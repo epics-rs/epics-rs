@@ -218,9 +218,24 @@ pub const ECA_MESSAGE_TEXT: &[&str] = &[
     "Virtual circuit unresponsive",
 ];
 
-/// Maximum payload size for DoS prevention (16 MB).
 /// Maximum payload size for DoS prevention.
-/// Default 16 MB, configurable via EPICS_CA_MAX_ARRAY_BYTES (matches C EPICS).
+///
+/// **Default divergence from C**: this Rust port defaults to 16 MB
+/// when `EPICS_CA_MAX_ARRAY_BYTES` is unset. The C client/server
+/// (`epics-base/configure/CONFIG_ENV:36`) defaults to **16384 bytes
+/// (16 KB)** — `cac.cpp:197-214` reads the env and rounds it up to
+/// MAX_TCP = `1024 * 16u` (`caProto.h:67` "so waveforms fit").
+///
+/// Rationale for the Rust default: most modern deployments override
+/// this to multi-megabyte values anyway (large waveforms,
+/// area-detector frames), so the C default rejects in practice
+/// before the operator even knows the env exists. Rust ships with
+/// the operator-friendly default but honours the env override
+/// when present.
+///
+/// Strict-C-parity callers who want the 16 KB default can set
+/// `EPICS_CA_MAX_ARRAY_BYTES=16384` explicitly. The env-honour
+/// behaviour is unchanged.
 pub fn max_payload_size() -> usize {
     epics_base_rs::runtime::env::get("EPICS_CA_MAX_ARRAY_BYTES")
         .and_then(|s| s.parse::<usize>().ok())

@@ -2605,6 +2605,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         CA_PROTO_CLEAR_CHANNEL => {
             let sid = hdr.cid;
             let cid = hdr.available;
+            // C `clear_channel_reply` (camessage.c:1883-1887) silently
+            // disconnects on a bad SID via `logBadId` + RSRV_ERROR
+            // (no wire reply). Channels in this Rust state are per-
+            // client by construction, so the "foreign channel"
+            // sub-case of the C check (`pciu->client != client`)
+            // can't happen — the only failure mode is unknown SID.
+            // Pre-fix Rust silently skipped without disconnecting,
+            // so a probing peer could send CLEAR_CHANNEL on random
+            // SIDs indefinitely.
+            if !state.channels.contains_key(&sid) {
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "CLEAR_CHANNEL on unknown SID {} (matches C clear_channel_reply logBadId + RSRV_ERROR)",
+                    sid
+                )));
+            }
             if let Some(entry) = state.channels.remove(&sid) {
                 state.channel_access.remove(&sid);
                 state.release_sid(sid);

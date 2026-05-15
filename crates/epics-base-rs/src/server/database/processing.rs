@@ -1668,6 +1668,20 @@ impl PvDatabase {
         // CP link targets
         self.dispatch_cp_targets(name, visited, depth).await;
 
+        // C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` after
+        // the forward-link dispatch. The same clearing must happen
+        // at the tail of the async-completion path (this is the moral
+        // equivalent of the synchronous completion path in
+        // `put_record_field_from_ca` which clears after
+        // `process_record_with_links` returns). Without this, a
+        // record that completed an async write triggered by a
+        // CA put would keep `putf=1` forever, leaking into every
+        // subsequent scan-driven process cycle.
+        {
+            let mut guard = rec.write().await;
+            guard.common.putf = false;
+        }
+
         Ok(())
     }
 

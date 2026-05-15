@@ -311,6 +311,91 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
     );
 }
 
+/// C `dbAccess.c::dbPutField:1276` sets `precord->putf = TRUE`
+/// IMMEDIATELY before calling `dbProcess`. The flag stays TRUE
+/// throughout the entire process cycle and is cleared in
+/// `recGblFwdLink` (`recGbl.c:302`) after the forward-link
+/// dispatch — i.e. observable for the WHOLE put-driven processing
+/// cycle. Async records keep PUTF=TRUE through the device round
+/// trip; it clears only when the completion path runs FLNK.
+///
+/// Pre-fix the Rust port cleared PUTF in `put_record_field_from_ca`
+/// BEFORE the `process_record_with_links` call (field_io.rs:497),
+/// so any consumer reading PUTF during the process cycle (TPRO
+/// trace, monitor on .PUTF, async-completion path's
+/// "put-driven vs scan-driven" classifier) always saw PUTF=0.
+#[tokio::test]
+async fn test_putf_clears_after_synchronous_put_completion() {
+    // AoRecord is synchronous Soft Channel (process() returns
+    // Complete immediately). The synchronous-completion clear
+    // point in `put_record_field_from_ca` runs after the
+    // `process_record_with_links` call returns — so the
+    // test-observable end state is PUTF=false. The companion
+    // async test below differentiates "stays set through round
+    // trip" vs the pre-fix "always false during process".
+    let db = PvDatabase::new();
+    db.add_record("PUTF_SYNC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let _ = db
+        .put_record_field_from_ca("PUTF_SYNC", "VAL", EpicsValue::Double(42.0))
+        .await;
+
+    let rec = db.get_record("PUTF_SYNC").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        !inst.common.putf,
+        "after synchronous put completion, PUTF must clear (mirrors C recGblFwdLink:302)"
+    );
+}
+
+/// Async-completion path: for a record that returns AsyncPending,
+/// PUTF must remain TRUE across the device round trip and clear
+/// only when `complete_async_record` runs. C parity:
+/// `dbAccess.c::dbPutField:1276` sets putf=TRUE; the async device's
+/// completion eventually calls `dbProcess` again, which runs through
+/// `recGblFwdLink` (clears putf).
+#[tokio::test]
+async fn test_putf_survives_async_round_trip_and_clears_on_completion() {
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_PUTF", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Drive a CA put. AsyncRecord returns AsyncPending, so the
+    // process call returns with PACT=true; PUTF must stay TRUE.
+    let _ = db
+        .put_record_field_from_ca("ASYNC_PUTF", "VAL", EpicsValue::Double(7.0))
+        .await;
+
+    {
+        let rec = db.get_record("ASYNC_PUTF").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "async pending → PACT=true");
+        assert!(
+            inst.common.putf,
+            "PUTF must remain TRUE across the async round trip — \
+             pre-fix the Rust port cleared it before the process call \
+             so async-completion logic could not classify the trigger \
+             as put-driven"
+        );
+    }
+
+    // Now fire the async completion. PUTF must clear (mirrors C
+    // recGblFwdLink:302 after the FLNK dispatch).
+    db.complete_async_record("ASYNC_PUTF").await.unwrap();
+    {
+        let rec = db.get_record("ASYNC_PUTF").await.unwrap();
+        let inst = rec.read().await;
+        assert!(!inst.is_processing(), "completion clears PACT");
+        assert!(
+            !inst.common.putf,
+            "complete_async_record_inner must clear PUTF (recGblFwdLink parity)"
+        );
+    }
+}
+
 /// epics-base PR #3fb10b6 regression: only the record directly
 /// receiving a dbPut should carry PUTF=1 during chain processing.
 /// Pre-fix the CP-target dispatch set PUTF=true on every chained

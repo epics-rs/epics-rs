@@ -494,7 +494,21 @@ impl PvDatabase {
             // field's value actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
 
-            instance.common.putf = false;
+            // C `dbAccess.c::dbPutField:1276` sets `precord->putf = TRUE`
+            // immediately before calling `dbProcess`, and the flag stays
+            // TRUE through the entire process cycle. It is cleared only
+            // in `recGblFwdLink` (recGbl.c:302) after FLNK fires, OR in
+            // the disable-alarm bail (dbAccess.c:576). The Rust port
+            // previously cleared `putf` here — BEFORE the
+            // `process_record_with_links` call below — so any code
+            // path (TPRO trace, async-completion logic, monitor on
+            // .PUTF) observing the bit during the process cycle saw
+            // `putf=0` and could not distinguish put-driven vs
+            // scan-driven processing.
+            //
+            // DO NOT clear `putf` here. The clearing now happens after
+            // the process call returns (synchronous completion) or in
+            // `complete_async_record` (async completion).
 
             instance.cleanup_subscribers();
             // For non-Passive non-VAL fields, notify immediately since
@@ -580,6 +594,25 @@ impl PvDatabase {
                 false
             }
         };
+
+        // C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` after
+        // the forward-link dispatch — the marker only lives for the
+        // duration of the put's processing cycle. For SYNCHRONOUS
+        // completions (PACT was cleared by the time
+        // `process_record_with_links` returns) clear it here. For
+        // async-pending records, the clearing happens later in
+        // `complete_async_record_inner` (which runs FLNK as part of
+        // the completion path) so the PUTF marker survives the
+        // device-write round trip.
+        if !pending {
+            let rec = self.inner.records.read().await;
+            if let Some(rec_arc) = rec.get(record_name) {
+                let mut guard = rec_arc.write().await;
+                if !guard.is_processing() {
+                    guard.common.putf = false;
+                }
+            }
+        }
 
         if pending {
             Ok(Some(completion_rx))

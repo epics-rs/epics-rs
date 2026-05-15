@@ -1448,7 +1448,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // switch, CA_PROTO_CREATE_CHAN falls to `default`
                 // and uses `0xffffffff` for `m_cid`.
                 send_ca_error(writer, hdr, ECA_ALLOCMEM, u32::MAX, "channel limit reached").await?;
-                return Ok(());
+                // C `claim_ciu_action` (camessage.c:1229-1240): when
+                // the server's channel-allocation pool is exhausted,
+                // send_err(ECA_ALLOCMEM) is followed by RSRV_ERROR
+                // which tears the connection down. The Rust per-
+                // client cap is the closest analogue: same root
+                // cause (this client requested more channels than
+                // the server is willing to hold) and the same
+                // ECA_ALLOCMEM wire byte. Match C by dropping the
+                // connection so a misbehaving client doesn't sit
+                // and spam CREATE_CHAN frames against a saturated
+                // cap; the next reconnect re-baselines.
+                return Err(epics_base_rs::error::CaError::Protocol(
+                    "CREATE_CHAN per-client cap reached \
+                     (matches C claim_ciu_action ECA_ALLOCMEM + RSRV_ERROR)"
+                        .into(),
+                ));
             }
 
             let end = payload

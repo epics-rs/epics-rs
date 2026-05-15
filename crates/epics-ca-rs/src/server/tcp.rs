@@ -1251,6 +1251,36 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
     peer: SocketAddr,
     conn_events: Option<&broadcast::Sender<ServerConnectionEvent>>,
 ) -> CaResult<()> {
+    // C dispatcher (camessage.c:2427-2440): any non-VERSION command
+    // from a client whose minor_version_number is below
+    // CA_MINIMUM_SUPPORTED_VERSION (= 4) gets ECA_DEFUNCT via
+    // send_err and the message is drained (status = RSRV_OK,
+    // connection stays open). The intent is "let new clients
+    // identify themselves but tell pre-V4.4 peers they're too old".
+    //
+    // Rust's `state.client_minor_version` defaults to 0 (set only
+    // by the VERSION handler). Pre-fix Rust would dispatch any
+    // non-VERSION command on a fresh connection with minor=0,
+    // bypassing the gate. The CREATE_CHAN / READ / WRITE wire
+    // formats may differ for ancient clients; the C IOC's
+    // ECA_DEFUNCT hint lets the client decide whether to upgrade.
+    //
+    // Note: TCP VERSION with minor<4 already disconnects via
+    // round-12 dbb4b28, so this gate only triggers on clients
+    // that skipped the VERSION handshake entirely OR on a peer
+    // explicitly identifying as pre-V4.4.
+    if hdr.cmmd != CA_PROTO_VERSION && state.client_minor_version < 4 {
+        send_ca_error(
+            writer,
+            hdr,
+            ECA_DEFUNCT,
+            0xFFFF_FFFF,
+            "CAS: Client version too old",
+        )
+        .await?;
+        return Ok(());
+    }
+
     match hdr.cmmd {
         CA_PROTO_VERSION => {
             // C `tcp_version_action` (camessage.c:366-369): rejects

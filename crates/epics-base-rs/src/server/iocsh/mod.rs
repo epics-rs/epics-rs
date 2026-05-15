@@ -88,6 +88,19 @@ impl IocShell {
     /// Execute a command, optionally redirecting output to a file.
     fn execute_command(&self, line: &str, redirect: Option<&Redirect>) -> CommandResult {
         if let Some(redir) = redirect {
+            // C parity: iocsh.cpp supports fd-numbered redirects 1..9
+            // (`2>file` for stderr, etc.). Only fd 1 (stdout) is plumbed
+            // through CommandContext::with_output today; fd 2+ is parsed
+            // for syntax compatibility (so an st.cmd that says
+            // `dbl 2>/dev/null` doesn't error) but the captured output
+            // still routes through the stdout sink. Emit a diagnostic
+            // so operators know the fd-2 capture is approximate.
+            if redir.fd != 1 {
+                eprintln!(
+                    "iocsh: fd {} redirect not fully plumbed — routing to stdout sink",
+                    redir.fd
+                );
+            }
             let file_result = if redir.append {
                 std::fs::OpenOptions::new()
                     .create(true)
@@ -394,49 +407,71 @@ pub(crate) fn join_backslash_continuations(input: &str) -> Vec<(usize, String)> 
 struct Redirect {
     path: String,
     append: bool,
+    /// File descriptor target. C iocsh (iocsh.cpp:287-303) accepts
+    /// `1>` through `9>` (and `1>>` ... `9>>`). The Rust port currently
+    /// only plumbs through stdout (fd 1) — `with_output` captures
+    /// `ctx.println` / `print_fmt` writes. Tracking the fd here lets
+    /// us recognize the C syntax without erroring; non-1 fds emit a
+    /// diagnostic but otherwise route to stdout (best-effort) so an
+    /// st.cmd `2>/dev/null` doesn't fail-fast.
+    fd: u8,
 }
 
-/// Parse `>` / `>>` redirect from end of line.
+/// Parse `>` / `>>` / `N>` / `N>>` redirect from a line.
 /// Returns (command_part, optional redirect).
+///
+/// C parity (iocsh.cpp:287-303): `1>file` through `9>file` and the
+/// double-`>>` (append) variants. Default fd when bare `>` is used is
+/// stdout (fd 1).
 fn parse_redirect(line: &str) -> (&str, Option<Redirect>) {
     let bytes = line.as_bytes();
     let mut in_quote = false;
-    let mut redir_pos = None;
-    let mut is_append = false;
 
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'"' => in_quote = !in_quote,
             b'>' if !in_quote => {
-                redir_pos = Some(i);
-                is_append = i + 1 < bytes.len() && bytes[i + 1] == b'>';
-                break; // use first unquoted > position
+                // C parity: if the char before `>` is a single ASCII
+                // digit 1..9 AND that digit follows a separator (start
+                // of line, space, tab) — interpret as N>.
+                let (op_start, fd) = if i > 0 && bytes[i - 1].is_ascii_digit() {
+                    let d = bytes[i - 1];
+                    // Confirm the digit is at a token boundary: either
+                    // i==1 (digit is first non-empty char in line) or
+                    // the char before the digit is whitespace.
+                    let at_boundary =
+                        i == 1 || matches!(bytes[i - 2], b' ' | b'\t' | b'\r' | b'\n');
+                    if at_boundary && (b'1'..=b'9').contains(&d) {
+                        (i - 1, d - b'0')
+                    } else {
+                        (i, 1u8)
+                    }
+                } else {
+                    (i, 1u8)
+                };
+                let is_append = i + 1 < bytes.len() && bytes[i + 1] == b'>';
+                let cmd = line[..op_start].trim_end();
+                let skip = if is_append { 2 } else { 1 };
+                let path = line[i + skip..].trim();
+                if path.is_empty() {
+                    return (line, None);
+                }
+                return (
+                    cmd,
+                    Some(Redirect {
+                        path: registry::substitute_env_vars(path),
+                        append: is_append,
+                        fd,
+                    }),
+                );
             }
             _ => {}
         }
         i += 1;
     }
 
-    match redir_pos {
-        Some(pos) => {
-            let cmd = line[..pos].trim();
-            let skip = if is_append { 2 } else { 1 };
-            let path = line[pos + skip..].trim();
-            if path.is_empty() {
-                (line, None)
-            } else {
-                (
-                    cmd,
-                    Some(Redirect {
-                        path: registry::substitute_env_vars(path),
-                        append: is_append,
-                    }),
-                )
-            }
-        }
-        None => (line, None),
-    }
+    (line, None)
 }
 
 #[cfg(test)]
@@ -602,14 +637,68 @@ mod tests {
         let r = redir.unwrap();
         assert_eq!(r.path, "/tmp/out.txt");
         assert!(!r.append);
+        assert_eq!(r.fd, 1, "bare > defaults to fd 1");
 
         let (cmd, redir) = parse_redirect("dbl >> /tmp/out.txt");
         assert_eq!(cmd, "dbl");
-        assert!(redir.unwrap().append);
+        let r = redir.unwrap();
+        assert!(r.append);
+        assert_eq!(r.fd, 1);
 
         let (cmd, redir) = parse_redirect("dbl");
         assert_eq!(cmd, "dbl");
         assert!(redir.is_none());
+    }
+
+    /// C parity (iocsh.cpp:287-303): `1>file` and `1>>file` are
+    /// fd-numbered variants of `>` and `>>`, and `2>file` requests
+    /// stderr capture. The parser MUST accept these forms; bare `dbl
+    /// 2>err.log` should not error out the line.
+    #[test]
+    fn test_parse_redirect_fd_numbered() {
+        // 1> equivalent to >
+        let (cmd, redir) = parse_redirect("dbl 1>/tmp/out.txt");
+        assert_eq!(cmd, "dbl");
+        let r = redir.unwrap();
+        assert_eq!(r.path, "/tmp/out.txt");
+        assert!(!r.append);
+        assert_eq!(r.fd, 1);
+
+        // 2> stderr
+        let (cmd, redir) = parse_redirect("dbl 2>/tmp/err.txt");
+        assert_eq!(cmd, "dbl");
+        let r = redir.unwrap();
+        assert_eq!(r.path, "/tmp/err.txt");
+        assert!(!r.append);
+        assert_eq!(r.fd, 2);
+
+        // 2>> stderr append
+        let (cmd, redir) = parse_redirect("dbl 2>>/tmp/err.txt");
+        assert_eq!(cmd, "dbl");
+        let r = redir.unwrap();
+        assert_eq!(r.path, "/tmp/err.txt");
+        assert!(r.append);
+        assert_eq!(r.fd, 2);
+
+        // Digit not at boundary — `cmd5>file` is NOT a fd-redirect;
+        // `5` is part of the previous token. Should parse as bare `>`
+        // with fd=1, path=file. (The cmd portion includes the trailing
+        // `5`; this is a syntax oddity but matches C behavior.)
+        let (cmd, redir) = parse_redirect("cmd5>file");
+        let r = redir.unwrap();
+        assert_eq!(r.fd, 1, "digit not at boundary is part of command");
+        assert_eq!(cmd, "cmd5");
+
+        // 9> high fd parses to fd=9
+        let (_cmd, redir) = parse_redirect("foo 9>x");
+        assert_eq!(redir.unwrap().fd, 9);
+
+        // `0>` does NOT parse as fd-numbered (C only accepts 1..9);
+        // it parses as bare `>` with fd=1 leaving `0` in cmd.
+        let (cmd, redir) = parse_redirect("foo 0>x");
+        let r = redir.unwrap();
+        assert_eq!(r.fd, 1);
+        assert_eq!(cmd, "foo 0");
     }
 
     /// epics-base PR #812 — `dbCreateRecord <type> <name>` creates a

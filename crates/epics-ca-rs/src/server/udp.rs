@@ -258,6 +258,20 @@ async fn recv_loop(
             }
 
             if hdr.cmmd == CA_PROTO_SEARCH {
+                // C `search_reply_udp` (rsrv/camessage.c:2151-2154)
+                // rejects unsupported minor versions BEFORE the
+                // empty-name check. `CA_VSUPPORTED(minor) = minor >= 4`
+                // (CA_MINIMUM_SUPPORTED_VERSION in caProto.h:34). C
+                // returns RSRV_ERROR which skips the reply. Ancient
+                // libca clients (pre-V4.4) parse search replies with a
+                // different layout; emitting our V4.13 reply confuses
+                // them or worse, fabricates a usable channel they
+                // can't actually open.
+                const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
+                if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
+                    offset += msg_len;
+                    continue;
+                }
                 // C `search_reply_udp` (rsrv/camessage.c:2159) rejects
                 // SEARCH whose `m_postsize <= 1` ("empty PV name in UDP
                 // search request") and silently returns RSRV_OK. The

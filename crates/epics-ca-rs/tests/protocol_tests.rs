@@ -1099,3 +1099,55 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
          (C bad_tcp_cmd_action parity); instead read {n} more bytes"
     );
 }
+
+/// C `tcp_version_action` (`rsrv/camessage.c:366-369`) rejects clients
+/// whose minor version is below `CA_MINIMUM_SUPPORTED_VERSION` (= 4 per
+/// `caProto.h:34`) by returning `RSRV_ERROR`, which tears down the TCP
+/// connection. Without this gate an ancient peer could complete
+/// VERSION and proceed to CREATE_CHAN with a wire format the modern
+/// server no longer fully supports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_tcp_version_below_minimum_drops_connection() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("VER:OLD", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // CA V4.0 (minor = 0) is below CA_MINIMUM_SUPPORTED_VERSION = 4.
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = 0;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+
+    // Server must drop the connection — no VERSION reply, just EOF.
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .expect("server did not close TCP after unsupported VERSION")
+        .expect("read");
+    assert_eq!(
+        n, 0,
+        "server must drop the connection on VERSION minor < 4 \
+         (C tcp_version_action parity); instead read {n} bytes"
+    );
+}

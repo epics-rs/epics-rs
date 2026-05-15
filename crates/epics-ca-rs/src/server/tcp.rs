@@ -1210,6 +1210,25 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
 ) -> CaResult<()> {
     match hdr.cmmd {
         CA_PROTO_VERSION => {
+            // C `tcp_version_action` (camessage.c:366-369): rejects
+            // clients whose minor version < CA_MINIMUM_SUPPORTED_VERSION
+            // (=4) with RSRV_ERROR, which tears the connection down.
+            // Without this gate, an ancient client could complete the
+            // VERSION handshake and proceed to CREATE_CHAN with a
+            // wire format we no longer fully support — silently
+            // diverging from C IOC behaviour.
+            const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
+            if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
+                tracing::warn!(
+                    peer = ?peer,
+                    minor = hdr.count,
+                    "CAS: Ignore version from unsupported client (minor < 4); dropping"
+                );
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "unsupported CA minor version {} (matches C tcp_version_action drop)",
+                    hdr.count
+                )));
+            }
             state.client_minor_version = hdr.count;
             // C `rsrv_version_reply` (camessage.c:2115) emits VERSION
             // with all fields zero except `m_count = CA_MINOR_PROTOCOL_REVISION`.

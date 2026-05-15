@@ -2304,6 +2304,16 @@ async fn handle_get_field(
     // Variant descriptor + status=OK, which is worse than a noop —
     // a stale client would build its decode tree against a wrong
     // shape and surface garbage on the next GET. Match pvxs.
+    //
+    // P-C4: pvxs serverintrospect.cpp:159 is ONE composite guard —
+    // `if(!chan || opByIOID.find(ioid)!=opByIOID.end())`. Both arms
+    // log at err level and silently return. We were checking only
+    // the SID half: GET_FIELD reusing an IOID already bound to an
+    // active GET/PUT/MONITOR/RPC in the same channel would (a) fire
+    // back a successful introspection reply that the client logs as
+    // unexpected traffic on a busy IOID, and (b) leave the original
+    // op's state untouched but with the wire conversation polluted.
+    // Match pvxs: reject IOID-reuse via the same silent path.
     let chan = match channels.get(&sid) {
         Some(c) => c,
         None => {
@@ -2311,6 +2321,13 @@ async fn handle_get_field(
             return Ok(());
         }
     };
+    if chan.ops.contains_key(&ioid) {
+        debug!(
+            sid,
+            ioid, "GET_FIELD reuses IOID bound to active op: dropping (pvxs parity)"
+        );
+        return Ok(());
+    }
     let intro = match chan.introspection.clone() {
         Some(d) => d,
         None => source
@@ -2897,6 +2914,122 @@ mod tests {
             resp_subcmd, 0x00,
             "plain PUT EXEC reply subcmd must echo 0x00"
         );
+    }
+
+    /// pvxs `serverintrospect.cpp:159`: GET_FIELD's guard is the
+    /// composite `if(!chan || opByIOID.find(ioid)!=opByIOID.end())`.
+    /// Both arms log and silently return. Our prior fix (P-G19) only
+    /// covered the !chan branch; an IOID collision with an active
+    /// GET/PUT/MONITOR/RPC in the same channel still fired back a
+    /// fabricated introspection reply, polluting the wire conversation
+    /// on the busy IOID.
+    #[tokio::test]
+    async fn get_field_ioid_collision_with_active_op_drops_reply() {
+        use crate::pvdata::FieldDesc;
+        use crate::server_native::SharedSource;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 1234;
+
+        let shared = SharedSource::new();
+        let source: DynSource = Arc::new(shared);
+
+        // Channel with an active op already bound to `ioid`.
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut ops: HashMap<u32, OpState> = HashMap::new();
+        ops.insert(
+            ioid,
+            OpState {
+                intro: FieldDesc::Variant,
+                kind: OpKind::Get,
+                monitor_started: false,
+                monitor_abort: None,
+                mask: BitSet::new(),
+                monitor_window: None,
+                monitor_window_notify: None,
+                monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                monitor_filters: Arc::new(
+                    epics_base_rs::server::database::filters::FilterChain::new(),
+                ),
+                put_auto_exec: true,
+            },
+        );
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                ops,
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+
+        // GET_FIELD payload: sid + ioid + subfield string.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        crate::proto::encode_string_into("", order, &mut payload);
+        let frame = synth_frame(Command::GetField, order, payload);
+
+        handle_get_field(&source, &frame, &tx, &channels, order)
+            .await
+            .expect("handler returns Ok");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "GET_FIELD with IOID collision must drop silently per pvxs serverintrospect.cpp:159"
+        );
+    }
+
+    /// Companion: GET_FIELD on a CLEAN IOID (not in the channel's ops
+    /// map) still emits the introspection reply. Confirms the
+    /// collision guard doesn't regress the happy path.
+    #[tokio::test]
+    async fn get_field_clean_ioid_emits_reply() {
+        use crate::pvdata::FieldDesc;
+        use crate::server_native::SharedSource;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 5555;
+
+        let shared = SharedSource::new();
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        crate::proto::encode_string_into("", order, &mut payload);
+        let frame = synth_frame(Command::GetField, order, payload);
+
+        handle_get_field(&source, &frame, &tx, &channels, order)
+            .await
+            .expect("handler returns Ok");
+
+        let resp = rx
+            .try_recv()
+            .expect("clean GET_FIELD must emit introspection reply");
+        // ioid (4) + status (1 + ...) + type descriptor
+        assert!(resp.len() > PvaHeader::SIZE + 4);
     }
 }
 

@@ -165,6 +165,17 @@ impl PortManager {
     pub fn trace_manager(&self) -> &Arc<TraceManager> {
         &self.trace
     }
+
+    /// Names of every currently-registered port, in arbitrary order.
+    ///
+    /// C parity: `asynManager::report` walks the global port list to
+    /// emit one entry per port — iocsh `asynReport` exposes the same
+    /// view (no port argument = all ports). Used by
+    /// [`crate::iocsh::register_asyn_commands`] for the no-port-arg
+    /// case; also useful for diagnostic tooling.
+    pub fn list_port_names(&self) -> Vec<String> {
+        self.port_handles.lock().keys().cloned().collect()
+    }
 }
 
 impl Default for PortManager {

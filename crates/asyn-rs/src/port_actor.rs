@@ -565,6 +565,17 @@ impl PortActor {
                 self.driver.set_option(key, value)?;
                 Ok(RequestResult::write_ok())
             }
+            RequestOp::Report { level } => {
+                // C parity: `asynManager::report` (asynManager.c) walks
+                // every registered port and calls each driver's
+                // `pasynCommon->report` callback. The iocsh wrapper
+                // (`asynReport`) does the per-port loop; here we
+                // dispatch the per-port `report(level)` from the
+                // actor thread so the driver observes its own state
+                // under the actor's serial ownership.
+                self.driver.report(*level);
+                Ok(RequestResult::write_ok())
+            }
         };
 
         // Attach alarm/timestamp metadata on successful reads

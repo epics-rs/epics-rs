@@ -108,6 +108,10 @@ pub enum PortCommand {
         key: String,
         value: String,
     },
+    /// Driver `report(level)` invocation — iocsh `asynReport`.
+    Report {
+        level: i32,
+    },
 }
 
 #[cfg(test)]

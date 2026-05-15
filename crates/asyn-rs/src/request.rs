@@ -187,6 +187,15 @@ pub enum RequestOp {
         key: String,
         value: String,
     },
+    /// Print a driver report (matches C `asynManager->report` /
+    /// iocsh `asynReport`). The actor calls
+    /// [`crate::port::PortDriver::report`] which writes to stderr
+    /// at the requested verbosity. Carried by the actor so the
+    /// driver is observed from its own thread (consistent with C
+    /// asyn's `pport->lock` invariant for `report`).
+    Report {
+        level: i32,
+    },
 }
 
 /// Result returned by the worker after executing a request.

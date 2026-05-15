@@ -540,6 +540,33 @@ impl TraceManager {
         self.announce(port, AsynException::TraceIoMask);
     }
 
+    /// Per-device variant of [`Self::set_trace_io_mask`].
+    ///
+    /// C parity: `setTraceIOMask` (asynManager.c:2814-2846) writes the
+    /// IO mask into `pdevice->dpc.trace.traceIOMask` when the asynUser
+    /// is connected with `addr >= 0` (`pdevice != NULL`) and announces
+    /// per-device. The IO/InfoMask/File analogues of
+    /// [`Self::set_device_trace_mask`] must mirror that routing so the
+    /// `asynSetTraceIOMask MYPORT N "ESCAPE"` iocsh call (and any
+    /// programmatic device-scoped trace setup) actually overrides the
+    /// `(port, addr)` slot resolved by `with_effective_config`.
+    pub fn set_device_trace_io_mask(&self, port: &str, addr: i32, mask: TraceIoMask) {
+        if let Ok(mut configs) = self.device_configs.lock() {
+            configs
+                .entry((port.to_string(), addr))
+                .or_insert_with(TraceConfig::default)
+                .trace_io_mask = mask;
+        }
+        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            sink.announce(&ExceptionEvent {
+                port_name: port.to_string(),
+                exception: AsynException::TraceIoMask,
+                addr,
+            });
+        }
+    }
+
     /// C parity: asynManager.c:2874/2884 fires `asynExceptionTraceInfoMask`.
     pub fn set_trace_info_mask(&self, port: Option<&str>, mask: TraceInfoMask) {
         match port {
@@ -558,6 +585,28 @@ impl TraceManager {
             }
         }
         self.announce(port, AsynException::TraceInfoMask);
+    }
+
+    /// Per-device variant of [`Self::set_trace_info_mask`].
+    ///
+    /// C parity: `setTraceInfoMask` (asynManager.c:2856-2888) writes
+    /// the info mask into `pdevice->dpc.trace.traceInfoMask` when
+    /// `pdevice != NULL` and announces per-device.
+    pub fn set_device_trace_info_mask(&self, port: &str, addr: i32, mask: TraceInfoMask) {
+        if let Ok(mut configs) = self.device_configs.lock() {
+            configs
+                .entry((port.to_string(), addr))
+                .or_insert_with(TraceConfig::default)
+                .trace_info_mask = mask;
+        }
+        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            sink.announce(&ExceptionEvent {
+                port_name: port.to_string(),
+                exception: AsynException::TraceInfoMask,
+                addr,
+            });
+        }
     }
 
     /// C parity: asynManager.c:2923 fires `asynExceptionTraceFile`
@@ -584,6 +633,29 @@ impl TraceManager {
         // non-null (asynManager.c:2923) — port-scoped only.
         if port.is_some() {
             self.announce(port, AsynException::TraceFile);
+        }
+    }
+
+    /// Per-device variant of [`Self::set_trace_file`].
+    ///
+    /// C parity: `setTraceFile` (asynManager.c:2898-2926) resolves
+    /// `findTracePvt(puserPvt)`, which returns the device-specific
+    /// `dpCommon` when the asynUser carries a `pdevice`; writes the
+    /// new FP there; fires `asynExceptionTraceFile`.
+    pub fn set_device_trace_file(&self, port: &str, addr: i32, file: TraceFile) {
+        if let Ok(mut configs) = self.device_configs.lock() {
+            configs
+                .entry((port.to_string(), addr))
+                .or_insert_with(TraceConfig::default)
+                .file = file;
+        }
+        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            sink.announce(&ExceptionEvent {
+                port_name: port.to_string(),
+                exception: AsynException::TraceFile,
+                addr,
+            });
         }
     }
 
@@ -1417,5 +1489,133 @@ mod tests {
         assert!(contents.contains("device-msg"));
         assert!(contents.contains("p:7"));
         let _ = std::fs::remove_file(&temp);
+    }
+
+    /// C parity: `setTraceIOMask` with `addr >= 0` writes
+    /// `pdevice->dpc.trace.traceIOMask`
+    /// (asynManager.c:2830-2833). The Rust per-device setter must
+    /// place the mask in the `(port, addr)` device slot so the
+    /// effective-config resolver returns the device mask when the
+    /// emit path supplies the matching `addr`.
+    #[test]
+    fn set_device_trace_io_mask_writes_device_slot_and_announces() {
+        let mgr = TraceManager::new();
+        let em = Arc::new(ExceptionManager::new());
+        mgr.set_exception_sink(em.clone());
+        let observed: Arc<Mutex<Vec<(AsynException, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let obs = observed.clone();
+        em.add_callback(move |ev| {
+            obs.lock().unwrap().push((ev.exception, ev.addr));
+        });
+
+        mgr.set_trace_io_mask(Some("p"), TraceIoMask::ASCII);
+        mgr.set_device_trace_io_mask("p", 4, TraceIoMask::HEX);
+
+        // Device slot exists with the new mask.
+        let stored = mgr
+            .device_configs
+            .lock()
+            .unwrap()
+            .get(&("p".to_string(), 4))
+            .map(|c| c.trace_io_mask);
+        assert_eq!(stored, Some(TraceIoMask::HEX));
+
+        // Port mask untouched by the per-device write.
+        let port_mask = mgr
+            .port_configs
+            .lock()
+            .unwrap()
+            .get("p")
+            .map(|c| c.trace_io_mask);
+        assert_eq!(port_mask, Some(TraceIoMask::ASCII));
+
+        // Per-device announce fires with addr=4.
+        let events = observed.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(e, a)| matches!(e, AsynException::TraceIoMask) && *a == 4)
+        );
+    }
+
+    /// C parity: `setTraceInfoMask` with `pdevice != NULL` writes
+    /// `pdevice->dpc.trace.traceInfoMask` and announces per-device
+    /// (asynManager.c:2872-2875).
+    #[test]
+    fn set_device_trace_info_mask_writes_device_slot_and_announces() {
+        let mgr = TraceManager::new();
+        let em = Arc::new(ExceptionManager::new());
+        mgr.set_exception_sink(em.clone());
+        let observed: Arc<Mutex<Vec<(AsynException, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let obs = observed.clone();
+        em.add_callback(move |ev| {
+            obs.lock().unwrap().push((ev.exception, ev.addr));
+        });
+
+        mgr.set_device_trace_info_mask("p", 2, TraceInfoMask::SOURCE | TraceInfoMask::TIME);
+
+        let stored = mgr
+            .device_configs
+            .lock()
+            .unwrap()
+            .get(&("p".to_string(), 2))
+            .map(|c| c.trace_info_mask);
+        assert_eq!(stored, Some(TraceInfoMask::SOURCE | TraceInfoMask::TIME));
+
+        let events = observed.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(e, a)| matches!(e, AsynException::TraceInfoMask) && *a == 2)
+        );
+    }
+
+    /// C parity: `setTraceFile` resolves via `findTracePvt(puserPvt)`
+    /// which picks the device dpCommon when the asynUser carries a
+    /// `pdevice` (asynManager.c:2898-2926). After the per-device
+    /// write, `output_device(port, Some(addr), ...)` must emit into
+    /// the device-specific sink, not the port-level one.
+    #[test]
+    fn set_device_trace_file_routes_emit_to_device_sink() {
+        let mgr = TraceManager::new();
+        let em = Arc::new(ExceptionManager::new());
+        mgr.set_exception_sink(em.clone());
+        let observed: Arc<Mutex<Vec<(AsynException, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let obs = observed.clone();
+        em.add_callback(move |ev| {
+            obs.lock().unwrap().push((ev.exception, ev.addr));
+        });
+
+        mgr.set_trace_mask(Some("p"), TraceMask::ERROR);
+        mgr.set_trace_info_mask(Some("p"), TraceInfoMask::PORT);
+        mgr.set_device_trace_mask("p", 3, TraceMask::ERROR);
+        mgr.set_device_trace_info_mask("p", 3, TraceInfoMask::PORT);
+
+        let port_temp = std::env::temp_dir().join("asyn_trace_dev_file_port.txt");
+        let dev_temp = std::env::temp_dir().join("asyn_trace_dev_file_dev.txt");
+        let port_f = std::fs::File::create(&port_temp).unwrap();
+        let dev_f = std::fs::File::create(&dev_temp).unwrap();
+        mgr.set_trace_file(Some("p"), TraceFile::File(Arc::new(Mutex::new(port_f))));
+        mgr.set_device_trace_file("p", 3, TraceFile::File(Arc::new(Mutex::new(dev_f))));
+
+        mgr.output_device("p", Some(3), TraceMask::ERROR, "device-only-msg");
+
+        let dev_lines = read_lines(&dev_temp);
+        assert!(dev_lines.iter().any(|l| l.contains("device-only-msg")));
+        let port_lines = read_lines(&port_temp);
+        assert!(
+            !port_lines.iter().any(|l| l.contains("device-only-msg")),
+            "addr-targeted emit must not write to port sink"
+        );
+
+        let events = observed.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(e, a)| matches!(e, AsynException::TraceFile) && *a == 3)
+        );
+
+        let _ = std::fs::remove_file(&port_temp);
+        let _ = std::fs::remove_file(&dev_temp);
     }
 }

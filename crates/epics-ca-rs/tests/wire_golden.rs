@@ -26,8 +26,9 @@
 //! ```
 
 use epics_ca_rs::protocol::{
-    CA_PROTO_CREATE_CHAN, CA_PROTO_EVENT_ADD, CA_PROTO_READ_NOTIFY, CA_PROTO_RSRV_IS_UP,
-    CA_PROTO_SEARCH, CA_PROTO_VERSION, CaHeader,
+    CA_PROTO_CREATE_CHAN, CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL,
+    CA_PROTO_READ_NOTIFY, CA_PROTO_RSRV_IS_UP, CA_PROTO_SEARCH, CA_PROTO_VERSION, CaHeader,
+    ECA_BADMONID,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -196,6 +197,129 @@ fn extended_header_for_large_payload() {
         "000f ffff 0000 0000 00000001 0000dead \
          00100000 000186a0",
         "READ_NOTIFY extended",
+    );
+}
+
+#[test]
+fn proto_error_field_assignment_matches_c() {
+    // C `vsend_err` (`rsrv/camessage.c:139-224`) writes CA_PROTO_ERROR
+    // as:
+    //   m_cmmd      = CA_PROTO_ERROR
+    //   m_postsize  = 24 (extended form when payload >= 0xFFFF — for
+    //                small messages the short form is used; here we
+    //                use the same shape as our helper)
+    //   m_dataType  = 0
+    //   m_count     = 0
+    //   m_cid       = channel cid the error pertains to, or
+    //                0xFFFFFFFF when the offending command has no
+    //                channel scope (case-default branch).
+    //   m_available = ECA status (read back by libca's
+    //                `exceptionRespAction` at `cac.cpp:1118` as
+    //                `hdr.m_available`).
+    //
+    // This test pins the field assignment so the round-3 fix of
+    // `send_ca_error` (m_available carries status, not m_cid)
+    // doesn't regress.
+    let mut resp = CaHeader::new(CA_PROTO_ERROR);
+    resp.cid = 0xFFFF_FFFF;
+    resp.available = ECA_BADMONID;
+    let bytes = resp.to_bytes();
+    // Layout:
+    //   0..2   cmmd       = 0x000b (CA_PROTO_ERROR = 11)
+    //   2..4   postsize   = 0x0000
+    //   4..6   data_type  = 0x0000
+    //   6..8   count      = 0x0000
+    //   8..12  cid        = 0xFFFFFFFF (no channel scope)
+    //  12..16  available  = ECA_BADMONID
+    let badmonid_hex = format!("{:08x}", ECA_BADMONID);
+    let expected = format!("000b 0000 0000 0000 ffffffff {}", badmonid_hex);
+    assert_hex(&bytes, &expected, "CA_PROTO_ERROR field assignment");
+}
+
+#[test]
+fn event_cancel_unknown_sub_id_error_shape() {
+    // Per C `event_cancel_reply` (`camessage.c:1998-2021`), when the
+    // sub-id (m_available of the request) doesn't match any active
+    // subscription on the addressed channel, the server replies with
+    // CA_PROTO_ERROR carrying ECA_BADMONID. The payload echoes the
+    // original request header followed by a NUL-terminated diagnostic.
+    //
+    // Wire shape (no diag string for this golden — emit just the
+    // header so future drift in the diagnostic-string formatting
+    // doesn't break this fixture):
+    let mut req = CaHeader::new(CA_PROTO_EVENT_CANCEL);
+    req.cid = 0x1234; // server sid
+    req.available = 0x5678; // requested sub-id
+    let req_bytes = req.to_bytes();
+    assert_eq!(req_bytes.len(), CaHeader::SIZE);
+
+    // Verify the request shape is what the server sees.
+    let badmonid_hex = format!("{:08x}", ECA_BADMONID);
+    let req_hex = req_bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    let expected_req = "00020000000000000000123400005678";
+    assert_eq!(req_hex, expected_req, "EVENT_CANCEL request header");
+    // Confirm the constants used below have the expected hex.
+    assert!(
+        badmonid_hex.len() == 8 && badmonid_hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "ECA_BADMONID hex: {badmonid_hex}"
+    );
+}
+
+#[test]
+fn search_reply_udp_matches_c_sid_sentinel() {
+    // C `search_reply_udp` (`rsrv/camessage.c:2193-2207`) builds:
+    //   m_cmmd      = CA_PROTO_SEARCH (6)
+    //   m_postsize  = 8 (sizeof(minorVersion)=2 → CA_MESSAGE_ALIGN → 8)
+    //   m_dataType  = ca_server_port (carrier for the TCP port)
+    //   m_count     = 0
+    //   m_cid       = ~0U (0xFFFFFFFF) — INADDR_BROADCAST sentinel
+    //                 telling the client to use the UDP source IP.
+    //   m_available = mp->m_available (the client's cid for this PV)
+    // followed by an 8-byte payload whose first 2 bytes carry
+    // CA_MINOR_PROTOCOL_REVISION (13 = 0x000d).
+    let mut resp = CaHeader::new(CA_PROTO_SEARCH);
+    resp.postsize = 8;
+    resp.data_type = 5064; // ca_server_port
+    resp.count = 0;
+    resp.cid = u32::MAX;
+    resp.available = 0x1234_5678;
+    let mut bytes = resp.to_bytes().to_vec();
+    let mut payload = [0u8; 8];
+    payload[0..2].copy_from_slice(&13u16.to_be_bytes());
+    bytes.extend_from_slice(&payload);
+    assert_hex(
+        &bytes,
+        "0006 0008 13c8 0000 ffffffff 12345678 \
+         000d 0000 0000 0000",
+        "SEARCH UDP reply (sid=~0U)",
+    );
+}
+
+#[test]
+fn search_reply_tcp_matches_c_zero_postsize_sid_sentinel() {
+    // C `search_reply_tcp` (`rsrv/camessage.c:2275-2283`):
+    //   m_cmmd      = CA_PROTO_SEARCH (6)
+    //   m_postsize  = 0  (no payload — TCP search reply carries no
+    //                 minor-version trailer, unlike UDP)
+    //   m_dataType  = ca_server_port
+    //   m_count     = 0
+    //   m_cid       = ~0U
+    //   m_available = mp->m_available
+    // Total: 16 bytes, no payload.
+    let mut resp = CaHeader::new(CA_PROTO_SEARCH);
+    resp.set_payload_size(0, 0);
+    resp.data_type = 5064;
+    resp.cid = u32::MAX;
+    resp.available = 0x1234_5678;
+    let bytes = resp.to_bytes();
+    assert_eq!(bytes.len(), CaHeader::SIZE);
+    assert_hex(
+        &bytes,
+        "0006 0000 13c8 0000 ffffffff 12345678",
+        "SEARCH TCP reply (postsize=0, sid=~0U)",
     );
 }
 

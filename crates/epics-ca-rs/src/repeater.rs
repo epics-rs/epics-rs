@@ -163,61 +163,104 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
             continue;
         };
 
-        match hdr.cmmd {
-            CA_PROTO_REPEATER_REGISTER => {
-                register_client_debug(&mut clients, src, debug);
-            }
-            _ => {
-                // Beacon or other message from server — fan out to all
-                // registered clients.  Fill in available=0 with source IP
-                // so clients can identify the server (matches C repeater).
-                let mut data = buf[..len].to_vec();
-                if len >= CaHeader::SIZE {
-                    let avail_offset = 12; // available field at bytes 12..16
-                    let avail = u32::from_be_bytes([
-                        data[avail_offset],
-                        data[avail_offset + 1],
-                        data[avail_offset + 2],
-                        data[avail_offset + 3],
-                    ]);
-                    if avail == 0 {
-                        if let SocketAddr::V4(v4) = src {
-                            data[avail_offset..avail_offset + 4].copy_from_slice(&v4.ip().octets());
-                        }
-                    }
-                }
+        let action = decode_datagram(&buf[..len], &hdr, src);
+        if action.register {
+            register_client_debug(&mut clients, src, debug);
+        }
+        if let Some(data) = action.fanout {
+            fan_out(&mut clients, src, &data, debug);
+        }
+    }
+}
 
-                let src_port = src.port();
-                let mut dead = Vec::new();
-                for (port, client) in &clients {
-                    // Don't reflect back to sender
-                    if *port == src_port {
-                        continue;
-                    }
-                    if !client.send_message(&data) {
-                        if debug >= 1 {
-                            eprintln!("Client on port {port} refused message");
-                        }
-                        if !client.verify() {
-                            dead.push(*port);
-                        } else if debug >= 2 {
-                            eprintln!("Client on port {port} is alive");
-                        }
-                    } else if debug >= 2 {
-                        eprintln!("Sent to port {port}");
-                    }
-                }
-                for p in dead {
-                    if debug >= 1 {
-                        eprintln!("Deleted client on port {p}");
-                    }
-                    clients.remove(&p);
-                }
-                if debug >= 1 {
-                    eprintln!("Verified {} active clients", clients.len());
-                }
+/// Outcome of decoding a single incoming repeater datagram. Mirrors
+/// C `ca_repeater()` (`repeater.cpp:613-637`):
+///   * `register = true` when the leading header is REPEATER_REGISTER,
+///     and the registration is performed before fan-out.
+///   * `fanout = Some(bytes)` when there is anything to broadcast to
+///     other registered clients — i.e. either a non-REGISTER datagram,
+///     or the remainder of a REGISTER + payload datagram after stripping
+///     the 16-byte REGISTER header.
+///
+/// The chained REGISTER + payload case is rare in practice (clients
+/// almost never piggy-back other messages on a registration), but
+/// byte-exact parity matters: a beacon-tunnel datagram that prepends
+/// REGISTER would otherwise be silently dropped by us while C still
+/// fans it out to peers.
+///
+/// Note: after stripping REGISTER, C does NOT re-inspect the remainder
+/// for RSRV_IS_UP — the source-IP rewrite only fires when the *outer*
+/// header is RSRV_IS_UP. So the remainder fan-out path here does not
+/// rewrite `m_available` either, to avoid diverging in the other
+/// direction.
+struct DatagramAction {
+    register: bool,
+    fanout: Option<Vec<u8>>,
+}
+
+fn decode_datagram(buf: &[u8], hdr: &CaHeader, src: SocketAddr) -> DatagramAction {
+    if hdr.cmmd == CA_PROTO_REPEATER_REGISTER {
+        // Remainder after the stripped REGISTER header.
+        if buf.len() <= CaHeader::SIZE {
+            return DatagramAction {
+                register: true,
+                fanout: None,
+            };
+        }
+        // Per C: no source-IP rewrite on the remainder.
+        DatagramAction {
+            register: true,
+            fanout: Some(buf[CaHeader::SIZE..].to_vec()),
+        }
+    } else {
+        let mut data = buf.to_vec();
+        // Per C `repeater.cpp:626-630`: rewrite m_available on
+        // RSRV_IS_UP only when the caller didn't already fill it in.
+        if hdr.cmmd == CA_PROTO_RSRV_IS_UP && hdr.available == 0 {
+            if let SocketAddr::V4(v4) = src {
+                let avail_offset = 12; // available field at bytes 12..16
+                data[avail_offset..avail_offset + 4].copy_from_slice(&v4.ip().octets());
             }
         }
+        DatagramAction {
+            register: false,
+            fanout: Some(data),
+        }
+    }
+}
+
+/// Fan a datagram out to every registered repeater client other than
+/// the sender. Mirrors C `repeater.cpp::fanOut`: per-client `sendMessage`,
+/// and on send failure the client is verified, removed if dead.
+fn fan_out(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, data: &[u8], debug: u8) {
+    let src_port = src.port();
+    let mut dead = Vec::new();
+    for (port, client) in clients.iter() {
+        // Don't reflect back to sender
+        if *port == src_port {
+            continue;
+        }
+        if !client.send_message(data) {
+            if debug >= 1 {
+                eprintln!("Client on port {port} refused message");
+            }
+            if !client.verify() {
+                dead.push(*port);
+            } else if debug >= 2 {
+                eprintln!("Client on port {port} is alive");
+            }
+        } else if debug >= 2 {
+            eprintln!("Sent to port {port}");
+        }
+    }
+    for p in dead {
+        if debug >= 1 {
+            eprintln!("Deleted client on port {p}");
+        }
+        clients.remove(&p);
+    }
+    if debug >= 1 {
+        eprintln!("Verified {} active clients", clients.len());
     }
 }
 
@@ -424,4 +467,100 @@ fn spawn_repeater() {
             .expect("repeater runtime");
         let _ = rt.block_on(run_repeater());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_bytes(cmmd: u16, available: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(cmmd);
+        h.available = available;
+        h.to_bytes().to_vec()
+    }
+
+    fn src_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), port))
+    }
+
+    #[test]
+    fn beacon_rewrites_zero_m_available_with_source_ip() {
+        // RSRV_IS_UP with m_available=0 → repeater fills in the
+        // sender's IP (C `repeater.cpp:626-630`).
+        let buf = header_bytes(CA_PROTO_RSRV_IS_UP, 0);
+        let hdr = CaHeader::from_bytes(&buf).unwrap();
+        let src = src_v4(10, 0, 0, 5, 4321);
+        let act = decode_datagram(&buf, &hdr, src);
+        assert!(!act.register);
+        let data = act.fanout.expect("beacon must be fanned out");
+        // m_available is at bytes 12..16.
+        assert_eq!(&data[12..16], &[10, 0, 0, 5]);
+    }
+
+    #[test]
+    fn beacon_with_nonzero_m_available_is_unchanged() {
+        // RSRV_IS_UP with m_available already set → leave it.
+        let buf = header_bytes(CA_PROTO_RSRV_IS_UP, 0x0a00_0006);
+        let hdr = CaHeader::from_bytes(&buf).unwrap();
+        let src = src_v4(192, 168, 1, 99, 5555);
+        let act = decode_datagram(&buf, &hdr, src);
+        assert!(!act.register);
+        let data = act.fanout.expect("beacon must be fanned out");
+        assert_eq!(&data[12..16], &0x0a00_0006u32.to_be_bytes());
+    }
+
+    #[test]
+    fn non_rsrv_non_register_message_is_not_rewritten() {
+        // Previous code rewrote m_available on ANY non-REGISTER
+        // command — C only rewrites RSRV_IS_UP. Verify a different
+        // command (e.g. VERSION) flows through untouched.
+        let buf = header_bytes(CA_PROTO_VERSION, 0);
+        let hdr = CaHeader::from_bytes(&buf).unwrap();
+        let src = src_v4(10, 0, 0, 5, 4321);
+        let act = decode_datagram(&buf, &hdr, src);
+        assert!(!act.register);
+        let data = act.fanout.expect("fan out");
+        // Bytes 12..16 stay zero.
+        assert_eq!(&data[12..16], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn bare_register_returns_register_only_no_fanout() {
+        let buf = header_bytes(CA_PROTO_REPEATER_REGISTER, 0);
+        let hdr = CaHeader::from_bytes(&buf).unwrap();
+        let src = src_v4(127, 0, 0, 1, 9000);
+        let act = decode_datagram(&buf, &hdr, src);
+        assert!(act.register);
+        assert!(
+            act.fanout.is_none(),
+            "bare REGISTER must not fan out anything"
+        );
+    }
+
+    #[test]
+    fn chained_register_plus_payload_strips_then_fans_out_remainder() {
+        // C parity: REGISTER + RSRV_IS_UP in one datagram. Repeater
+        // registers the sender, strips the 16-byte REGISTER header,
+        // and fans out the remainder to other clients. The remainder's
+        // m_available is NOT rewritten (C `repeater.cpp:613-637` only
+        // checks the outer header for the rewrite — once stripped, the
+        // remainder fan-out path is the literal fanOut call).
+        let mut buf = header_bytes(CA_PROTO_REPEATER_REGISTER, 0);
+        let remainder = header_bytes(CA_PROTO_RSRV_IS_UP, 0);
+        buf.extend_from_slice(&remainder);
+
+        let hdr = CaHeader::from_bytes(&buf).unwrap();
+        let src = src_v4(10, 0, 0, 5, 5060);
+        let act = decode_datagram(&buf, &hdr, src);
+        assert!(act.register, "REGISTER must register the sender");
+        let data = act.fanout.expect("chained payload must fan out");
+        assert_eq!(data.len(), CaHeader::SIZE);
+        // Verify the fanned-out bytes are the literal RSRV_IS_UP
+        // header without source-IP rewrite (parity quirk: the rewrite
+        // only fires when the *outer* command is RSRV_IS_UP).
+        assert_eq!(&data, &remainder);
+        // And the m_available stays zero — C does not rewrite it after
+        // the strip.
+        assert_eq!(&data[12..16], &[0, 0, 0, 0]);
+    }
 }

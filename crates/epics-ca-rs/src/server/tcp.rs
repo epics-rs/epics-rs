@@ -2172,6 +2172,35 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 let mut w = writer.lock().await;
                 w.write_all(&resp.to_bytes()).await?;
                 // flush deferred to handle_client outer loop (batched)
+            } else {
+                // C `event_cancel_reply` (`camessage.c:1998-2021`):
+                // when the sub-id (m_available of the request) does
+                // not match any active subscription on the addressed
+                // channel, send `send_err(ECA_BADMONID,
+                // RECORD_NAME(pciu->dbch))`. The previous Rust
+                // behaviour was a silent ignore, leaving libca-driven
+                // tools that race a CLEAR_CHANNEL against an
+                // EVENT_CANCEL with a stale sub-id waiting for an
+                // exception that never arrives (the stale request
+                // was discarded).
+                //
+                // The diagnostic string uses the resolved PV name
+                // when the m_cid in the request still maps to a
+                // channel; otherwise we fall back to "unknown"
+                // (matches C, which would log via `logBadId` and
+                // return RSRV_ERROR — we degrade to a NORMAL reply
+                // path with a descriptive diag).
+                let req_sid = hdr.cid;
+                let (chan_cid, diag) = match state.channels.get(&req_sid) {
+                    Some(entry) => (entry.cid, entry.pv_name.clone()),
+                    None => (0xFFFF_FFFFu32, "unknown".to_string()),
+                };
+                tracing::debug!(
+                    sub_id,
+                    sid = req_sid,
+                    "EVENT_CANCEL for unknown sub-id; replying ECA_BADMONID"
+                );
+                send_ca_error(writer, hdr, ECA_BADMONID, chan_cid, &diag).await?;
             }
         }
 
@@ -2192,9 +2221,38 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         CA_PROTO_ECHO => {
-            let resp = CaHeader::new(CA_PROTO_ECHO);
+            // C `tcp_echo_action` (`rsrv/camessage.c:403-420`) echoes
+            // the *full* request back to the client — same m_cmmd,
+            // m_postsize, m_dataType, m_count, m_cid, m_available, and
+            // the m_postsize-byte payload. Real clients (libca
+            // `tcpiiu::echoRequest`) issue zero-payload echos with
+            // every field zero, in which case our previous
+            // `CaHeader::new(CA_PROTO_ECHO).to_bytes()` happened to be
+            // byte-identical to C. But a diagnostic / probe client
+            // that sends ECHO with a marker payload (e.g. to measure
+            // RTT or to verify the server isn't a TCP transparent
+            // proxy) gets a stripped, all-zero reply from us — wire
+            // divergence that breaks the documented round-trip
+            // semantics.
+            let mut resp = CaHeader::new(CA_PROTO_ECHO);
+            // Preserve the request fields. set_payload_size handles
+            // both the short and extended encodings transparently.
+            resp.data_type = hdr.data_type;
+            resp.set_payload_size(hdr.actual_postsize(), hdr.actual_count());
+            resp.cid = hdr.cid;
+            resp.available = hdr.available;
             let mut w = writer.lock().await;
-            w.write_all(&resp.to_bytes()).await?;
+            if resp.is_extended() {
+                w.write_all(&resp.to_bytes_extended()).await?;
+            } else {
+                w.write_all(&resp.to_bytes()).await?;
+            }
+            // Echo the payload back verbatim (truncated to the actual
+            // postsize advertised by the request — `payload` here is
+            // already that slice).
+            if !payload.is_empty() {
+                w.write_all(payload).await?;
+            }
             // flush deferred to handle_client outer loop (batched)
         }
 
@@ -2210,20 +2268,35 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let pv_name = String::from_utf8_lossy(&payload[..end]).to_string();
 
             if db.has_name(&pv_name).await {
-                // Reply: data_type = tcp_port, cid = 0 (INADDR_ANY), available = client's cid
-                // 8-byte payload containing CA_MINOR_VERSION as u16
+                // C parity: `search_reply_tcp`
+                // (`rsrv/camessage.c:2229-2287`) sends:
+                //   m_postsize  = 0  (no payload — TCP search reply
+                //                 carries no minor-version trailer,
+                //                 unlike UDP)
+                //   m_dataType  = ca_server_port (carries the port)
+                //   m_count     = 0
+                //   m_cid       = ~0U (INADDR_BROADCAST — tells client
+                //                 to use TCP peer addr as server IP;
+                //                 libca `tcpiiu::searchRespNotify`
+                //                 explicitly checks `msg.m_cid !=
+                //                 INADDR_BROADCAST` and falls back to
+                //                 `this->address()` on the sentinel)
+                //   m_available = client's m_available (the cid)
+                //
+                // The previous code wrote `m_cid = 0` (INADDR_ANY) and
+                // an 8-byte minor-version payload. C libca client at
+                // `tcpiiu.cpp:2209` treats anything != INADDR_BROADCAST
+                // as a literal IP, so `m_cid = 0` would surface as a
+                // server at 0.0.0.0:port — unroutable. With this fix
+                // the reply is now byte-equivalent to the C softIoc.
                 let mut resp = CaHeader::new(CA_PROTO_SEARCH);
                 resp.data_type = state.tcp_port;
-                resp.set_payload_size(8, 0);
-                resp.cid = 0; // INADDR_ANY — client uses TCP peer addr
+                resp.set_payload_size(0, 0);
+                resp.cid = u32::MAX; // ~0U — "use TCP peer addr"
                 resp.available = hdr.available;
 
-                let mut search_payload = [0u8; 8];
-                search_payload[0..2].copy_from_slice(&CA_MINOR_VERSION.to_be_bytes());
-
                 let mut w = writer.lock().await;
-                w.write_all(&resp.to_bytes_extended()).await?;
-                w.write_all(&search_payload).await?;
+                w.write_all(&resp.to_bytes()).await?;
                 // flush deferred to handle_client outer loop (batched)
             } else if hdr.data_type == CA_DO_REPLY {
                 // Explicit negative reply requested — send NOT_FOUND so the
@@ -2295,9 +2368,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         _ => {
-            // Unknown command — send CA_PROTO_ERROR with ECA status and original header
+            // Unknown command — send CA_PROTO_ERROR with ECA status
+            // and original header echoed.  Per C `vsend_err`
+            // (`camessage.c:179-181`), commands that aren't
+            // channel-scoped (i.e. fell through every case label and
+            // can't carry a channel cid we trust) use the
+            // 0xFFFFFFFF sentinel as the outer `m_cid`.
             let error_msg = format!("Unsupported command {}", hdr.cmmd);
-            send_ca_error(writer, hdr, ECA_INTERNAL, &error_msg).await?;
+            send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, &error_msg).await?;
         }
     }
 
@@ -2436,11 +2514,27 @@ async fn send_cmd_error<W: AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
-/// Send a CA_PROTO_ERROR response with the original header and an error message.
+/// Send a CA_PROTO_ERROR response with the original header echoed
+/// into the payload and an error message.
+///
+/// Layout follows C `vsend_err` (`rsrv/camessage.c:139`):
+///   * outer `m_cid` carries the *channel client cid* (i.e. the
+///     client-side identifier of the channel the error relates to),
+///     or `0xFFFFFFFF` for commands that aren't channel-scoped.
+///   * outer `m_available` carries the ECA status code.
+///   * payload is the original request header followed by a
+///     NUL-terminated diagnostic string.
+///
+/// The previous implementation put the ECA status in `m_cid` and left
+/// `m_available` zero, so libca's `exceptionRespAction`
+/// (`cac.cpp:1118`) — which reads the status from `hdr.m_available` —
+/// would surface every server-emitted CA_PROTO_ERROR as ECA_NORMAL
+/// (status 0), silently masking the failure.
 async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     writer: &Arc<Mutex<BufWriter<W>>>,
     original_hdr: &CaHeader,
     eca_status: u32,
+    chan_cid: u32,
     message: &str,
 ) -> CaResult<()> {
     let error_msg_bytes = pad_string(message);
@@ -2448,7 +2542,8 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
 
     let mut resp = CaHeader::new(CA_PROTO_ERROR);
     resp.set_payload_size(payload_size, 0);
-    resp.cid = eca_status;
+    resp.cid = chan_cid;
+    resp.available = eca_status;
 
     let mut w = writer.lock().await;
     w.write_all(&resp.to_bytes_extended()).await?;

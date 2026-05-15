@@ -2147,9 +2147,38 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         CA_PROTO_ECHO => {
-            let resp = CaHeader::new(CA_PROTO_ECHO);
+            // C `tcp_echo_action` (`rsrv/camessage.c:403-420`) echoes
+            // the *full* request back to the client — same m_cmmd,
+            // m_postsize, m_dataType, m_count, m_cid, m_available, and
+            // the m_postsize-byte payload. Real clients (libca
+            // `tcpiiu::echoRequest`) issue zero-payload echos with
+            // every field zero, in which case our previous
+            // `CaHeader::new(CA_PROTO_ECHO).to_bytes()` happened to be
+            // byte-identical to C. But a diagnostic / probe client
+            // that sends ECHO with a marker payload (e.g. to measure
+            // RTT or to verify the server isn't a TCP transparent
+            // proxy) gets a stripped, all-zero reply from us — wire
+            // divergence that breaks the documented round-trip
+            // semantics.
+            let mut resp = CaHeader::new(CA_PROTO_ECHO);
+            // Preserve the request fields. set_payload_size handles
+            // both the short and extended encodings transparently.
+            resp.data_type = hdr.data_type;
+            resp.set_payload_size(hdr.actual_postsize(), hdr.actual_count());
+            resp.cid = hdr.cid;
+            resp.available = hdr.available;
             let mut w = writer.lock().await;
-            w.write_all(&resp.to_bytes()).await?;
+            if resp.is_extended() {
+                w.write_all(&resp.to_bytes_extended()).await?;
+            } else {
+                w.write_all(&resp.to_bytes()).await?;
+            }
+            // Echo the payload back verbatim (truncated to the actual
+            // postsize advertised by the request — `payload` here is
+            // already that slice).
+            if !payload.is_empty() {
+                w.write_all(payload).await?;
+            }
             // flush deferred to handle_client outer loop (batched)
         }
 

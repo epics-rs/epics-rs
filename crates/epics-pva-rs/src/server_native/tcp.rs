@@ -964,36 +964,25 @@ async fn handle_connection_io(
         // Application messages
         match Command::from_code(frame.header.command) {
             Some(Command::CreateChannel) => {
-                if channels.len() >= config.max_channels_per_connection {
-                    warn!(
-                        ?peer,
-                        "rejecting CREATE_CHANNEL: per-connection limit reached"
-                    );
-                    // Reject by sending an error CreateChannel response with cid=u32::MAX.
-                    let mut payload = Vec::new();
-                    payload.put_u32(u32::MAX, order);
-                    payload.put_u32(0u32, order);
-                    Status::error("max channels per connection reached".to_string())
-                        .write_into(order, &mut payload);
-                    let h = PvaHeader::application(
-                        true,
-                        order,
-                        Command::CreateChannel.code(),
-                        payload.len() as u32,
-                    );
-                    let mut buf = Vec::new();
-                    h.write_into(&mut buf);
-                    buf.extend_from_slice(&payload);
-                    let _ = tx.send(buf).await;
-                    continue;
-                }
+                // pvxs `serverchan.cpp:269-358` allows `count > 1`
+                // (cid, name) pairs in one frame; the per-connection
+                // cap check is now per-pair inside the handler.
                 let before = channels.len();
-                handle_create_channel(&source, &frame, &tx, &mut channels, order).await?;
+                handle_create_channel(
+                    &source,
+                    &frame,
+                    &tx,
+                    &mut channels,
+                    order,
+                    config.max_channels_per_connection,
+                    peer,
+                )
+                .await?;
                 // F-G7: track channel-add success via the HashMap
-                // delta. Avoids threading peer_entry into every
-                // handler; the size check is O(1) and the rare
-                // duplicate-cid path naturally evaluates to no-op.
-                if channels.len() > before {
+                // delta — works for both count=1 and count>1 since
+                // we count net inserts.
+                let added = channels.len().saturating_sub(before);
+                for _ in 0..added {
                     peer_entry.channel_added();
                 }
             }
@@ -1267,25 +1256,84 @@ fn build_server_connection_validation(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_create_channel(
     source: &DynSource,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
+    max_channels_per_connection: usize,
+    peer: SocketAddr,
 ) -> PvaResult<()> {
     let mut cur = frame.cursor();
-    let _count = cur
+    // pvxs `serverchan.cpp:269-358`: a single CREATE_CHANNEL frame
+    // can carry `count` (cid, name) pairs and the server must emit
+    // one CREATE_CHANNEL response frame per pair, in arrival order.
+    // The Java pvAccess client batches multiple new channels in one
+    // frame after a SEARCH response; we used to only honour the
+    // first pair and leave the remaining bytes unconsumed.
+    let count = cur
         .get_u16(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let cid = cur
-        .get_u32(order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let name = crate::proto::decode_string(&mut cur, order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?
-        .unwrap_or_default();
+    for _ in 0..count {
+        let cid = match cur.get_u32(order) {
+            Ok(v) => v,
+            Err(_) => break, // truncated → emulate pvxs `M.good()` break
+        };
+        let name = match crate::proto::decode_string(&mut cur, order) {
+            Ok(Some(s)) => s,
+            Ok(None) => String::new(), // pvxs `name.empty()` triggers break
+            Err(_) => break,
+        };
+        if name.is_empty() {
+            break;
+        }
+        // A-G1 per-channel cap check moved inside the per-pair loop
+        // so a multi-name CREATE_CHANNEL can't sneak past the per-
+        // connection limit by amortising the gate against the first
+        // pair only.
+        if channels.len() >= max_channels_per_connection {
+            warn!(
+                ?peer,
+                pv = %name,
+                "rejecting CREATE_CHANNEL: per-connection limit reached"
+            );
+            let mut payload = Vec::new();
+            payload.put_u32(cid, order);
+            payload.put_u32(0u32, order);
+            Status::error("max channels per connection reached".to_string())
+                .write_into(order, &mut payload);
+            let h = PvaHeader::application(
+                true,
+                order,
+                Command::CreateChannel.code(),
+                payload.len() as u32,
+            );
+            let mut buf = Vec::new();
+            h.write_into(&mut buf);
+            buf.extend_from_slice(&payload);
+            let _ = tx.send(buf).await;
+            continue;
+        }
+        emit_create_channel_reply(source, channels, tx, cid, &name, order).await?;
+    }
+    Ok(())
+}
 
-    if !source.has_pv(&name).await {
+/// One iteration of pvxs `handle_CREATE_CHANNEL`'s inner loop:
+/// resolve the PV, allocate a SID (or reject), and emit the
+/// `cid + sid + status` response frame. Factored so the count > 1
+/// loop above is a single straight-line concern.
+async fn emit_create_channel_reply(
+    source: &DynSource,
+    channels: &mut HashMap<u32, ChannelState>,
+    tx: &SrvTx,
+    cid: u32,
+    name: &str,
+    order: ByteOrder,
+) -> PvaResult<()> {
+    if !source.has_pv(name).await {
         let mut payload = Vec::new();
         payload.put_u32(cid, order);
         payload.put_u32(0u32, order); // sid (placeholder)
@@ -1304,11 +1352,11 @@ async fn handle_create_channel(
     }
 
     let sid = alloc_sid();
-    let intro = source.get_introspection(&name).await;
+    let intro = source.get_introspection(name).await;
     channels.insert(
         sid,
         ChannelState {
-            name: name.clone(),
+            name: name.to_string(),
             cid,
             sid,
             introspection: intro,

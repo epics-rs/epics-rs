@@ -85,6 +85,75 @@ impl PvDatabase {
             None => return Err(CaError::ChannelNotFound(name.to_string())),
         };
 
+        // 0a. PACT entry guard — mirrors C `dbProcess` (dbAccess.c:537-559).
+        // If the record is currently mid-async (PACT=true), do NOT re-enter
+        // the body. Instead increment LCNT; after MAX_LOCK=10 consecutive
+        // attempts raise SCAN_ALARM/INVALID with "Async in progress" and
+        // post a monitor on VAL (DBE_VALUE|DBE_LOG). Up to MAX_LOCK we just
+        // bail out silently so transient back-to-back scans don't immediately
+        // alarm the record.
+        //
+        // Without this guard, FLNK / scan-loop / event scans dispatched onto
+        // a record whose first cycle is still pending (async device support,
+        // CA put_notify on PUTF) would re-enter `record.process()` while the
+        // device's first response is still in flight — corrupting the
+        // record's internal state machine and bypassing the C-parity
+        // contract that callers see for `dbProcess`. The pre-existing
+        // `dispatch_cp_targets` path already did this check (sets RPRO=true
+        // and skips); the main entry was missing it.
+        {
+            const MAX_LOCK: i16 = 10;
+            let mut instance = rec.write().await;
+            if instance.is_processing() {
+                let stat = instance.common.stat;
+                let already_invalid =
+                    instance.common.sevr >= crate::server::record::AlarmSeverity::Invalid;
+                let already_scan_alarm = stat == crate::server::recgbl::alarm_status::SCAN_ALARM;
+                let lcnt_before = instance.common.lcnt;
+                instance.common.lcnt = lcnt_before.saturating_add(1);
+                if already_scan_alarm || lcnt_before < MAX_LOCK || already_invalid {
+                    // Bail out without raising alarm yet.
+                    return Ok(());
+                }
+                // Raise SCAN_ALARM/INVALID, reset alarm transition,
+                // and post VAL monitor (DBE_VALUE | DBE_LOG).
+                crate::server::recgbl::rec_gbl_set_sevr_msg(
+                    &mut instance.common,
+                    crate::server::recgbl::alarm_status::SCAN_ALARM,
+                    crate::server::record::AlarmSeverity::Invalid,
+                    "Async in progress",
+                );
+                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
+                // Post VAL event with VALUE | LOG mask (mirrors C
+                // `db_post_events(prec, &VAL, DBE_VALUE|DBE_LOG)`).
+                let mut changed_fields = Vec::new();
+                if let Some(val) = instance.record.val() {
+                    changed_fields.push(("VAL".to_string(), val));
+                }
+                changed_fields.push((
+                    "SEVR".to_string(),
+                    EpicsValue::Short(instance.common.sevr as i16),
+                ));
+                changed_fields.push((
+                    "STAT".to_string(),
+                    EpicsValue::Short(instance.common.stat as i16),
+                ));
+                let snapshot = crate::server::record::ProcessSnapshot {
+                    changed_fields,
+                    event_mask: crate::server::recgbl::EventMask::VALUE
+                        | crate::server::recgbl::EventMask::LOG
+                        | crate::server::recgbl::EventMask::ALARM,
+                };
+                drop(instance);
+                let inst = rec.read().await;
+                inst.notify_from_snapshot(&snapshot);
+                return Ok(());
+            }
+            // Not pact: reset lcnt (mirrors C `else { precord->lcnt = 0; }`
+            // at dbAccess.c:559) so the next async cycle starts clean.
+            instance.common.lcnt = 0;
+        }
+
         // 0. SDIS disable check
         {
             let (sdis_link, disv, diss) = {
@@ -506,6 +575,19 @@ impl PvDatabase {
             let process_actions = outcome.actions;
 
             if process_result == crate::server::record::RecordProcessResult::AsyncPending {
+                // C `dbProcess` contract: when device support / record body
+                // signals "async pending", `pact` MUST be true so subsequent
+                // dbProcess attempts on the same record bail at the entry
+                // guard. Previous Rust port assumed `process_local` had
+                // already set it via the swap-true at function entry, but
+                // this main path bypasses `process_local` and calls
+                // `record.process()` directly — leaving `processing=false`.
+                // Mirrors `aiRecord.c:122` and similar: `prec->pact = TRUE;
+                // return 0;` before async work.
+                instance
+                    .processing
+                    .store(true, std::sync::atomic::Ordering::Release);
+
                 // PACT stays set; skip alarm/timestamp/snapshot/OUT/FLNK.
                 // But still execute any actions (e.g., ReprocessAfter for delayed re-entry).
                 let rec_name = instance.name.clone();

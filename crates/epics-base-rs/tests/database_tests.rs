@@ -1326,6 +1326,110 @@ async fn test_complete_async_record() {
     assert!(!inst.common.udf);
 }
 
+// C parity (dbAccess.c::dbProcess:537-559): a second
+// `process_record_with_links` against a PACT-active record must NOT
+// re-enter `record.process()`. The first attempt must bail silently
+// (lcnt counting up); after MAX_LOCK=10 consecutive bails, SCAN_ALARM /
+// INVALID must be raised with "Async in progress" amsg and VAL must be
+// posted with DBE_VALUE|DBE_LOG|DBE_ALARM.
+#[tokio::test]
+async fn test_pact_entry_guard_silent_bail_until_max_lock() {
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_PACT", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Drive ASYNC_PACT into PACT=true (async pending, lock released).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_PACT", &mut visited, 0)
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("ASYNC_PACT").await.unwrap();
+        let inst = rec.read().await;
+        assert!(
+            inst.is_processing(),
+            "first cycle must leave PACT=true (AsyncPending)"
+        );
+        assert_eq!(inst.common.lcnt, 0, "first cycle must reset lcnt");
+        assert_eq!(inst.common.sevr, AlarmSeverity::NoAlarm);
+    }
+
+    // Up to MAX_LOCK = 10 re-entries while PACT=true must NOT raise alarm.
+    for i in 1..=10 {
+        let mut visited = HashSet::new();
+        db.process_record_with_links("ASYNC_PACT", &mut visited, 0)
+            .await
+            .unwrap();
+        let rec = db.get_record("ASYNC_PACT").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "must remain PACT=true (iter {i})");
+        assert_eq!(inst.common.lcnt, i as i16, "lcnt must increment per bail");
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::NoAlarm,
+            "no SCAN_ALARM yet (iter {i})"
+        );
+    }
+
+    // 11th attempt while pact (lcnt==10 before increment >= MAX_LOCK)
+    // must raise SCAN_ALARM/INVALID and post VAL monitor.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_PACT", &mut visited, 0)
+        .await
+        .unwrap();
+    let rec = db.get_record("ASYNC_PACT").await.unwrap();
+    let inst = rec.read().await;
+    assert!(inst.is_processing(), "PACT still true post-alarm-raise");
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+    assert_eq!(
+        inst.common.stat,
+        epics_base_rs::server::recgbl::alarm_status::SCAN_ALARM
+    );
+    assert_eq!(inst.common.amsg, "Async in progress");
+}
+
+// After PACT clears via complete_async_record, the next process must
+// reset lcnt to 0 (mirrors C `else { precord->lcnt = 0; }`).
+#[tokio::test]
+async fn test_pact_entry_guard_resets_lcnt_after_completion() {
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_RESET", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    // Cycle 1: kick off async, accumulate lcnt via re-entries.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_RESET", &mut visited, 0)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        let mut visited = HashSet::new();
+        db.process_record_with_links("ASYNC_RESET", &mut visited, 0)
+            .await
+            .unwrap();
+    }
+    {
+        let rec = db.get_record("ASYNC_RESET").await.unwrap();
+        assert_eq!(rec.read().await.common.lcnt, 3);
+    }
+
+    // Complete the async; this clears PACT.
+    db.complete_async_record("ASYNC_RESET").await.unwrap();
+
+    // Next process_record_with_links should reset lcnt (path: enters
+    // body since PACT is now false).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_RESET", &mut visited, 0)
+        .await
+        .unwrap();
+    let rec = db.get_record("ASYNC_RESET").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(inst.common.lcnt, 0, "lcnt must reset when PACT clears");
+}
+
 // --- Monitor Mask tests ---
 
 /// epics-base 3.15.7 — a server-side `dbnd` (deadband) filter

@@ -532,13 +532,18 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
     /// Process array and return a `ProcessOutput`. Does NOT send to actor.
     /// Direct interrupts (std_array_data_param) happen here (sync).
     /// The returned output must be published and flushed by the caller in async context.
-    fn process_and_publish(&mut self, array: &NDArray) -> Option<ProcessOutput> {
+    fn process_and_publish(&mut self, array: &Arc<NDArray>) -> Option<ProcessOutput> {
         // B5: a MinCallbackTime-throttled array is dropped — count it.
         if self.should_throttle() {
             self.dropped_arrays
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             return Some(self.dropped_arrays_only_batch());
         }
+        // R2/G5: cache the input array for ProcessPlugin re-injection only
+        // for arrays that actually pass the MinCallbackTime gate and are
+        // processed. C++ sets pPrevInputArray_ in beginProcessCallbacks,
+        // which runs inside processCallbacks — never for throttled frames.
+        self.prev_input_array = Some(Arc::clone(array));
         let t0 = std::time::Instant::now();
         let result = self.processor.process_array(array, &self.pool);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -549,7 +554,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             ready,
             result.param_updates,
             result.scatter_index,
-            Some(array),
+            Some(array.as_ref()),
             elapsed_ms,
         );
         output.batch.merge(self.build_status_params_batch());
@@ -1560,8 +1565,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                         .fetch_add(1, Ordering::AcqRel);
                                     Some(guard.dropped_arrays_only_batch())
                                 } else {
-                                    // G5: cache the input array for ProcessPlugin.
-                                    guard.prev_input_array = Some(msg.array.clone());
+                                    // R2/G5: process_and_publish caches the
+                                    // input array for ProcessPlugin only after
+                                    // the MinCallbackTime gate passes — a
+                                    // throttled frame is never cached.
                                     guard.process_and_publish(&msg.array)
                                 };
                                 let senders = guard.output.lock().senders_clone();
@@ -2557,6 +2564,65 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(50), downstream_rx.recv()).await
         });
         assert!(second.is_err(), "second array throttled out by MinCallbackTime");
+    }
+
+    #[test]
+    fn test_process_plugin_skips_throttled_input() {
+        // R2: a MinCallbackTime-throttled frame must NOT be cached as the
+        // ProcessPlugin input. After array 1 is processed and array 2 is
+        // dropped by the throttle, ProcessPlugin must re-inject array 1
+        // (the last *processed* array), not the dropped array 2.
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            "PROCESS_THROTTLE_TEST",
+            PassthroughProcessor,
+            pool,
+            10,
+            output,
+            "",
+            test_wiring(),
+        );
+        enable_callbacks(&handle);
+
+        // 10s minimum between callbacks — only the first array is processed.
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_float64_blocking(handle.plugin_params.min_callback_time, 0, 10.0)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        send_array(handle.array_sender(), make_test_array(1));
+        send_array(handle.array_sender(), make_test_array(2));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Array 1 was processed and emitted; array 2 was throttled out.
+        assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 1);
+
+        // ProcessPlugin re-injects the cached input. The cache must still hold
+        // array 1, because array 2 never passed the throttle gate. The
+        // re-injected array itself is also subject to the throttle, so reset
+        // MinCallbackTime to 0 first so the re-injected frame is processed.
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_float64_blocking(handle.plugin_params.min_callback_time, 0, 0.0)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(handle.plugin_params.process_plugin, 0, 1)
+            .unwrap();
+        let reprocessed = downstream_rx.blocking_recv().unwrap();
+        assert_eq!(
+            reprocessed.unique_id, 1,
+            "ProcessPlugin must re-inject the last processed array (1), not the throttled array (2)"
+        );
     }
 
     #[test]

@@ -1343,6 +1343,10 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // Shared processor (accessible from data thread)
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let array_output_for_handle = array_output.clone();
+    // B13: register this plugin's output so the WiringRegistry is the single
+    // source of truth for runtime rewiring (PluginManager::add_plugin would
+    // also register it, but direct callers must not bypass the registry).
+    wiring.register_output(port_name, array_output.clone());
     // G1/B1: the DroppedArrays counter is owned by this plugin and shared with
     // every upstream sender so full-queue drops on our input queue are counted.
     let dropped_arrays_counter = array_sender.dropped_arrays_counter().clone();
@@ -1741,6 +1745,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
 }
 
 /// Connect a downstream plugin's sender to a plugin runtime's output.
+///
+/// B13: the upstream's `array_output` is the same `Arc` that every
+/// `create_plugin_runtime*` entry point registers in the `WiringRegistry`, so
+/// adding a sender here mutates the registry-tracked output — the registry
+/// remains the single source of truth for `rewire_by_name`.
 pub fn wire_downstream(upstream: &PluginRuntimeHandle, downstream_sender: NDArraySender) {
     upstream.array_output().lock().add(downstream_sender);
 }
@@ -1790,6 +1799,10 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
 
     let array_output = Arc::new(parking_lot::Mutex::new(output));
     let array_output_for_handle = array_output.clone();
+    // B13: register this plugin's output so the WiringRegistry is the single
+    // source of truth — an output created via this entry point is otherwise
+    // invisible to runtime rewiring.
+    wiring.register_output(port_name, array_output.clone());
     // G1/B1: DroppedArrays counter shared with upstream senders.
     let dropped_arrays_counter = array_sender.dropped_arrays_counter().clone();
     let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {

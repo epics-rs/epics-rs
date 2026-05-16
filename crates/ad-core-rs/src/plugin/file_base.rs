@@ -90,10 +90,28 @@ impl NDPluginFileBase {
             let mut s_count = 0;
             while let Some(c) = chars.next() {
                 if c == '%' {
-                    // Collect format spec
+                    // Collect printf flags and the width/precision spec:
+                    // optional `-` (left-justify) / `0` (zero-pad) flags,
+                    // digits (width), `.digits` (precision). C++ uses real
+                    // epicsSnprintf.
+                    let mut left_justify = false;
+                    let mut zero_pad = false;
+                    loop {
+                        match chars.peek() {
+                            Some('-') => {
+                                left_justify = true;
+                                chars.next();
+                            }
+                            Some('0') => {
+                                zero_pad = true;
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
                     let mut spec = String::new();
                     while let Some(&nc) = chars.peek() {
-                        if nc.is_ascii_digit() || nc == '.' || nc == '-' {
+                        if nc.is_ascii_digit() || nc == '.' {
                             spec.push(nc);
                             chars.next();
                         } else {
@@ -101,45 +119,63 @@ impl NDPluginFileBase {
                         }
                     }
                     match chars.next() {
+                        // `%%` → literal percent.
+                        Some('%') if spec.is_empty() && !left_justify => result.push('%'),
                         Some('s') => {
                             s_count += 1;
                             match s_count {
                                 1 => result.push_str(&self.file_path),
                                 2 => result.push_str(&self.file_name),
-                                _ => result.push_str(""),
+                                _ => {}
                             }
                         }
                         Some('d') => {
-                            // Parse width and precision from spec (e.g. "3.3" → width=3, precision=3)
-                            let width: usize = if spec.contains('.') {
-                                spec.split('.')
-                                    .next()
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0)
-                            } else {
-                                spec.parse().unwrap_or(0)
+                            // `width.precision`: precision = minimum digits
+                            // (zero-pad), width = minimum field width
+                            // (space-pad unless precision provided).
+                            let (width, precision) = match spec.split_once('.') {
+                                Some((w, p)) => (
+                                    w.parse::<usize>().unwrap_or(0),
+                                    p.parse::<usize>().unwrap_or(0),
+                                ),
+                                None => (spec.parse::<usize>().unwrap_or(0), 0),
                             };
-                            let precision: usize = if spec.contains('.') {
-                                spec.split('.')
-                                    .nth(1)
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            let pad = width.max(precision);
-                            if pad > 0 {
+                            // Apply precision first (zero-pad the number).
+                            let digits = format!(
+                                "{:0>prec$}",
+                                self.file_number,
+                                prec = precision
+                            );
+                            // Then pad to the field width. The `0` flag
+                            // zero-pads (ignored when left-justified or when an
+                            // explicit precision is given, per C printf).
+                            if digits.len() >= width {
+                                result.push_str(&digits);
+                            } else if zero_pad && !left_justify && precision == 0 {
                                 result.push_str(&format!(
                                     "{:0>width$}",
                                     self.file_number,
-                                    width = pad
+                                    width = width
                                 ));
                             } else {
-                                result.push_str(&self.file_number.to_string());
+                                let pad = " ".repeat(width - digits.len());
+                                if left_justify {
+                                    result.push_str(&digits);
+                                    result.push_str(&pad);
+                                } else {
+                                    result.push_str(&pad);
+                                    result.push_str(&digits);
+                                }
                             }
                         }
                         Some(other) => {
                             result.push('%');
+                            if left_justify {
+                                result.push('-');
+                            }
+                            if zero_pad {
+                                result.push('0');
+                            }
                             result.push_str(&spec);
                             result.push(other);
                         }
@@ -227,7 +263,8 @@ impl NDPluginFileBase {
             NDFileMode::Capture => {
                 self.capture_buffer.push(array);
                 self.num_captured = self.capture_buffer.len();
-                if self.num_captured >= self.num_capture {
+                // B7: num_capture==0 → buffer forever, never auto-flush.
+                if self.num_capture > 0 && self.num_captured >= self.num_capture {
                     self.flush_capture(writer)?;
                 }
             }
@@ -306,6 +343,36 @@ impl NDPluginFileBase {
 
         self.capture_buffer.clear();
         self.num_captured = 0;
+        Ok(())
+    }
+
+    /// Eagerly open a stream file before the first frame arrives.
+    ///
+    /// C++ `doCapture` opens the file at capture-start for non-lazy stream
+    /// plugins (NDPluginFile.cpp:478-479) so a bad path is reported then,
+    /// not on the first frame (B9). `array` supplies the layout the writer
+    /// needs at open time.
+    pub fn open_stream_eager(
+        &mut self,
+        writer: &mut dyn NDFileWriter,
+        array: &NDArray,
+    ) -> ADResult<()> {
+        if self.is_open {
+            return Ok(());
+        }
+        self.last_written_name = self.create_file_name();
+        let (write_path, _) = self.write_path();
+        writer.open_file(&write_path, NDFileMode::Stream, array)?;
+        self.is_open = true;
+        Ok(())
+    }
+
+    /// Force a file close (used by the FilePluginClose attribute, G9).
+    /// Safe to call when no file is open.
+    pub fn force_close(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
+        if self.is_open {
+            self.close_stream(writer)?;
+        }
         Ok(())
     }
 
@@ -515,6 +582,34 @@ mod tests {
         fb.file_number = 5;
         fb.file_template = "%s%s%d.tif".into();
         assert_eq!(fb.create_file_name(), "/data/img_5.tif");
+    }
+
+    #[test]
+    fn test_create_file_name_printf_specs() {
+        // B10: %-, width-only space pad, %0Nd zero pad, %%.
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = "/d/".into();
+        fb.file_name = "f".into();
+        fb.file_number = 7;
+
+        fb.file_template = "%s%s_%3.3d.dat".into();
+        assert_eq!(fb.create_file_name(), "/d/f_007.dat");
+
+        // Width-only → space pad, right-justified.
+        fb.file_template = "%s%s_%5d".into();
+        assert_eq!(fb.create_file_name(), "/d/f_    7");
+
+        // Left-justify.
+        fb.file_template = "%s%s_%-5d".into();
+        assert_eq!(fb.create_file_name(), "/d/f_7    ");
+
+        // Zero-pad flag.
+        fb.file_template = "%s%s_%05d".into();
+        assert_eq!(fb.create_file_name(), "/d/f_00007");
+
+        // Literal percent.
+        fb.file_template = "%s%s_%d%%".into();
+        assert_eq!(fb.create_file_name(), "/d/f_7%");
     }
 
     #[test]

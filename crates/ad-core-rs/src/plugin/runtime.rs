@@ -1577,22 +1577,26 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             // [1, MaxThreads] and the clamped value written back
                             // rather than spawning a worker pool.
                             if reason == max_threads_reason {
-                                let mut guard = shared.lock();
-                                guard.max_threads = value.as_i32().max(1);
-                                let clamped = guard.num_threads.clamp(1, guard.max_threads);
-                                guard.num_threads = clamped;
-                                let port = guard.port_handle.clone();
-                                let mt = guard.max_threads;
-                                drop(guard);
+                                // Scope the guard so it is released before await.
+                                let (port, clamped, mt) = {
+                                    let mut guard = shared.lock();
+                                    guard.max_threads = value.as_i32().max(1);
+                                    let clamped =
+                                        guard.num_threads.clamp(1, guard.max_threads);
+                                    guard.num_threads = clamped;
+                                    (guard.port_handle.clone(), clamped, guard.max_threads)
+                                };
                                 clamp_writeback(&port, num_threads_reason, clamped).await;
                                 clamp_writeback(&port, max_threads_reason, mt).await;
                             }
                             if reason == num_threads_reason {
-                                let mut guard = shared.lock();
-                                let clamped = value.as_i32().clamp(1, guard.max_threads.max(1));
-                                guard.num_threads = clamped;
-                                let port = guard.port_handle.clone();
-                                drop(guard);
+                                let (port, clamped) = {
+                                    let mut guard = shared.lock();
+                                    let clamped =
+                                        value.as_i32().clamp(1, guard.max_threads.max(1));
+                                    guard.num_threads = clamped;
+                                    (guard.port_handle.clone(), clamped)
+                                };
                                 clamp_writeback(&port, num_threads_reason, clamped).await;
                             }
                             // G6: NDArrayAddr selects a source address of a

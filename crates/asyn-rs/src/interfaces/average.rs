@@ -80,7 +80,10 @@ impl SumAverager {
     pub fn push(&self, sample: f64) {
         let mut s = self.state.lock().unwrap();
         s.sum += sample;
-        s.count += 1;
+        // saturating_add avoids a debug-build overflow panic; C's `int`
+        // counter wraps, and a saturated u64 count is no worse than that
+        // for an averager that is never reset across 2^64 samples.
+        s.count = s.count.saturating_add(1);
     }
 
     /// Return the arithmetic mean and clear sum/count.

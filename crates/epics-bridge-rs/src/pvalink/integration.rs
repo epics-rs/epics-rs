@@ -97,6 +97,17 @@ pub struct PvaLinkResolver {
     /// already running, so [`Self::open_link`] spawns it at most once
     /// per link.
     forwarders: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// B4 `local`: optional handle to the QSRV provider's name
+    /// registry. When the IOC also runs QSRV (the common dual-server
+    /// deployment), a `local=true` link may target a QSRV group
+    /// composite PV — which lives only in the provider's group
+    /// registry, not the `PvDatabase`. Without this handle the
+    /// locality check sees only records / simple PVs and wrongly
+    /// rejects a group-PV link with `NotLocal`. `None` for a
+    /// pvalink-only deployment with no QSRV, where group-PV locality
+    /// is simply unavailable. Wired via [`Self::with_qsrv_provider`].
+    #[cfg(feature = "qsrv")]
+    qsrv: Arc<parking_lot::RwLock<Option<Arc<crate::qsrv::BridgeProvider>>>>,
 }
 
 /// Per-PV scan-on-update fan-out state (B3).
@@ -136,6 +147,8 @@ impl PvaLinkResolver {
             db: Arc::new(parking_lot::RwLock::new(None)),
             scan_targets: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             forwarders: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            #[cfg(feature = "qsrv")]
+            qsrv: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -144,6 +157,32 @@ impl PvaLinkResolver {
     /// [`install_pvalink_resolver`].
     pub fn attach_database(&self, db: PvDatabase) {
         *self.db.write() = Some(db);
+    }
+
+    /// Attach the QSRV provider so a `local=true` link can resolve a
+    /// QSRV group composite PV as IOC-local (B4 `local`).
+    ///
+    /// In a dual-server IOC that runs both pvalink and QSRV, group
+    /// composite PVs live only in the provider's group registry — not
+    /// the `PvDatabase` — so the bare record / simple-PV locality
+    /// check would reject a `local=true` link to a group PV with
+    /// `NotLocal`. Wiring this handle lets the check also accept any
+    /// name the QSRV provider hosts as a group (or single) channel.
+    ///
+    /// Optional: a pvalink-only deployment never calls this, and
+    /// group-PV locality is then simply unavailable (a `local` link
+    /// must target a record or simple PV, as before).
+    #[cfg(feature = "qsrv")]
+    pub fn attach_qsrv_provider(&self, provider: Arc<crate::qsrv::BridgeProvider>) {
+        *self.qsrv.write() = Some(provider);
+    }
+
+    /// Builder form of [`Self::attach_qsrv_provider`] — wires the
+    /// QSRV provider and returns `self` for chaining at IOC assembly.
+    #[cfg(feature = "qsrv")]
+    pub fn with_qsrv_provider(self, provider: Arc<crate::qsrv::BridgeProvider>) -> Self {
+        self.attach_qsrv_provider(provider);
+        self
     }
 
     /// Master enable / disable. When disabled, the resolver closure
@@ -216,24 +255,38 @@ impl PvaLinkResolver {
         let pv_name = cfg.pv_name.clone();
         // B4 `local`: a `local`-flagged link must resolve a PV served
         // by *this* IOC. pvxs requires a local channel; here that
-        // means the target must be served by the attached
-        // `PvDatabase`. A local PV can be a record OR a simple PV
-        // registered via `add_pv` (e.g. a QSRV single-record channel,
-        // an iocsh stats PV, a gateway shadow PV) — gating on
-        // `get_record` alone wrongly rejected those with `NotLocal`.
-        // Both lookups use the no-resolver path so the `local` check
-        // never triggers a remote search. Reject up-front so the
-        // operator gets a clear error instead of a silent remote
-        // resolution. Mirrors pvxs `pvaLinkConfig::local`.
+        // means the target must be hosted by this IOC under one of
+        // three forms:
+        //   * a `PvDatabase` record,
+        //   * a simple PV registered via `add_pv` (e.g. a QSRV
+        //     single-record channel, an iocsh stats PV, a gateway
+        //     shadow PV),
+        //   * a QSRV group composite PV — which lives only in the
+        //     QSRV provider's group registry, not the `PvDatabase`.
+        // Gating on `get_record` alone wrongly rejected simple PVs;
+        // gating on the `PvDatabase` alone wrongly rejected group
+        // PVs. All three are IOC-local; only a genuinely remote PV is
+        // rejected. The DB lookups use the no-resolver path so the
+        // `local` check never triggers a remote search. Reject
+        // up-front so the operator gets a clear error instead of a
+        // silent remote resolution. Mirrors pvxs `pvaLinkConfig::local`.
         if cfg.local {
-            let is_local = match self.db.read().clone() {
-                Some(db) => {
-                    db.get_record_no_resolve(&pv_name).await.is_some()
-                        || db.find_pv(&pv_name).await.is_some()
+            // `mut` is only consumed by the QSRV fallthrough below;
+            // gate it so a `qsrv`-less build does not warn unused_mut.
+            #[cfg(feature = "qsrv")]
+            let mut is_local = self.is_local_in_db(&pv_name).await;
+            #[cfg(not(feature = "qsrv"))]
+            let is_local = self.is_local_in_db(&pv_name).await;
+            // QSRV group / single composite PVs: only checked when a
+            // QSRV provider is wired. `hosts_pv` covers both the group
+            // registry and the provider's single-channel name set.
+            #[cfg(feature = "qsrv")]
+            if !is_local {
+                let provider = self.qsrv.read().clone();
+                if let Some(provider) = provider {
+                    is_local = provider.hosts_pv(&pv_name).await;
                 }
-                // No DB attached — a `local` link cannot be satisfied.
-                None => false,
-            };
+            }
             if !is_local {
                 return Err(PvaLinkError::NotLocal(pv_name));
             }
@@ -287,6 +340,20 @@ impl PvaLinkResolver {
         let field = link.config().field.clone();
         self.handle
             .spawn(run_notify_forwarder(pv_name, field, rx, scan_targets, db));
+    }
+
+    /// Whether `pv_name` is hosted by the attached `PvDatabase` as a
+    /// record or a simple `add_pv` PV. Both lookups use the
+    /// no-resolver path so the `local` check never triggers a remote
+    /// search. Returns `false` when no database is attached.
+    async fn is_local_in_db(&self, pv_name: &str) -> bool {
+        match self.db.read().clone() {
+            Some(db) => {
+                db.get_record_no_resolve(pv_name).await.is_some()
+                    || db.find_pv(pv_name).await.is_some()
+            }
+            None => false,
+        }
     }
 
     /// Build the INP config for `pv_name`, applying any options
@@ -1245,6 +1312,88 @@ mod tests {
         assert!(
             r.is_ok(),
             "local link to a simple add_pv PV must be accepted"
+        );
+    }
+
+    /// #2: a `local=true` pvalink to a QSRV group composite PV must
+    /// be accepted. Group PVs live only in the QSRV provider's group
+    /// registry, never the `PvDatabase`, so the record / simple-PV
+    /// locality check sees nothing and would wrongly return
+    /// `NotLocal`. With the QSRV provider wired via
+    /// `attach_qsrv_provider`, the gate also accepts any name the
+    /// provider hosts. The control case — a `local=true` link to a
+    /// genuinely remote-only PV — must still be rejected.
+    #[cfg(feature = "qsrv")]
+    #[tokio::test]
+    async fn b4_local_link_accepts_qsrv_group_pv() {
+        use crate::qsrv::BridgeProvider;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // Backing records for the group's two members.
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("GRP:level", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_record("GRP:count", Box::new(AiRecord::new(2.0)))
+            .await
+            .unwrap();
+
+        // Register a QSRV group composite PV named `LOCAL:GROUP`.
+        const GROUP_JSON: &str = r#"{
+            "LOCAL:GROUP": {
+                "+id": "epics:nt/NTGroup:1.0",
+                "level": { "+channel": "GRP:level.VAL", "+type": "plain" },
+                "count": { "+channel": "GRP:count.VAL", "+type": "plain" }
+            }
+        }"#;
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load group");
+        provider.process_groups();
+        assert!(
+            provider.has_group_pv("LOCAL:GROUP"),
+            "group PV must be registered in the provider"
+        );
+
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        resolver.attach_qsrv_provider(provider);
+
+        // local=true link to the QSRV group composite PV — accepted.
+        let r = resolver.open_link("pva://LOCAL:GROUP?local=true").await;
+        assert!(
+            r.is_ok(),
+            "local link to a QSRV group composite PV must be accepted, got err {:?}",
+            r.err()
+        );
+
+        // Control: a local=true link to a genuinely remote-only PV
+        // — neither a DB record/simple PV nor a QSRV channel — is
+        // still rejected with NotLocal.
+        let remote = resolver
+            .open_link("pva://OFF:SITE:REMOTE:PV?local=true")
+            .await;
+        assert!(
+            matches!(remote, Err(PvaLinkError::NotLocal(_))),
+            "local link to a remote-only PV must still be rejected, got err {:?}",
+            remote.err()
+        );
+    }
+
+    /// #2: with no QSRV provider wired (pvalink-only deployment), the
+    /// `local` gate keeps its record / simple-PV behaviour — group-PV
+    /// locality is simply unavailable, and a link to a non-local PV
+    /// is still rejected. Guards the optionality of the QSRV handle.
+    #[cfg(feature = "qsrv")]
+    #[tokio::test]
+    async fn b4_local_gate_without_qsrv_still_rejects_remote() {
+        let db = Arc::new(PvDatabase::new());
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        // No attach_qsrv_provider call.
+        let r = resolver
+            .open_link("pva://NO:QSRV:REMOTE:PV?local=true")
+            .await;
+        assert!(
+            matches!(r, Err(PvaLinkError::NotLocal(_))),
+            "without a QSRV handle a non-local link must still be rejected"
         );
     }
 }

@@ -8,16 +8,42 @@ type CurrentTimeFn = Box<dyn Fn() -> Option<SystemTime> + Send + Sync>;
 /// Closure that returns the time for a given event number, or `None`.
 type EventTimeFn = Box<dyn Fn(i32) -> Option<SystemTime> + Send + Sync>;
 
+/// Seconds between the Unix epoch (1970-01-01) and the EPICS epoch
+/// (1990-01-01 00:00:00 UTC).
+const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
+
+/// The EPICS epoch (1990-01-01 00:00:00 UTC) expressed as a Unix
+/// `SystemTime`.
+///
+/// C parity: `epicsGeneralTime.c:66` zero-initialises `lastProvidedTime`
+/// to `epicsTimeStamp {0,0}`, whose semantic value is the EPICS epoch,
+/// not the Unix epoch. EPICS time is "seconds past 1990-01-01"; seeding
+/// the ratchet here keeps the raw `last_provided_time` conceptually
+/// comparable to an EPICS timestamp. (Functionally either far-past
+/// value works — the first real sample always ratchets forward.)
+fn epics_epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(EPICS_EPOCH_UNIX_SECS)
+}
+
 struct CurrentTimeProvider {
     name: String,
     priority: i32,
     get_time: CurrentTimeFn,
+    /// Whether this provider is safe to call from interrupt context.
+    /// C parity: `generalTimeAddIntCurrentTimeProvider` registers an
+    /// interrupt-callable variant queried by `epicsTimeGetCurrentInt`.
+    interrupt_safe: bool,
+    /// `true` for the built-in last-resort OS-clock provider. C tracks
+    /// this via the `osdTimeGetCurrent` function-pointer identity.
+    is_os_default: bool,
 }
 
 struct EventTimeProvider {
     name: String,
     priority: i32,
     get_event: EventTimeFn,
+    /// Interrupt-callable variant — see [`CurrentTimeProvider::interrupt_safe`].
+    interrupt_safe: bool,
 }
 
 struct GeneralTimeInner {
@@ -33,11 +59,16 @@ struct GeneralTimeInner {
     last_current_name: Option<String>,
     /// Name of the provider that last supplied event time.
     last_event_name: Option<String>,
-    /// epics-base 8-D `5cfff383` `osiClockTime` sync hooks: callbacks
-    /// notified when an external time source (PTP, NTP, beacon-driven
-    /// PPS) reports a clock-step or fresh sync. Registered via
-    /// [`register_clock_sync_hook`]; fired by [`notify_clock_sync`]
-    /// when the time-source provider has new sync information.
+    /// C parity: `epicsGeneralTime.c:84` `useOsdGetCurrent`. Starts
+    /// `true`; while only the built-in OS-clock provider is registered,
+    /// `get_current` short-circuits straight to the OS clock and the
+    /// monotonic ratchet is **never consulted** — a real backward
+    /// wall-clock step is returned verbatim, exactly as a C IOC does.
+    /// Cleared by [`register_current_provider`] the moment a
+    /// non-default provider is registered.
+    use_osd_get_current: bool,
+    /// Rust-only notification channel — see [`register_clock_sync_hook`].
+    /// This is **not** a C-base API; it is an additive extension.
     sync_hooks: Vec<Box<dyn Fn(SystemTime) + Send + Sync>>,
 }
 
@@ -46,11 +77,12 @@ impl GeneralTimeInner {
         let mut inner = Self {
             current_providers: Vec::new(),
             event_providers: Vec::new(),
-            last_provided_time: SystemTime::UNIX_EPOCH,
-            event_times: [SystemTime::UNIX_EPOCH; 256],
-            last_best_time: SystemTime::UNIX_EPOCH,
+            last_provided_time: epics_epoch(),
+            event_times: [epics_epoch(); 256],
+            last_best_time: epics_epoch(),
             last_current_name: None,
             last_event_name: None,
+            use_osd_get_current: true,
             sync_hooks: Vec::new(),
         };
         // Register the OS clock as the last-resort current time provider.
@@ -58,6 +90,8 @@ impl GeneralTimeInner {
             name: "OS Clock".to_string(),
             priority: 999,
             get_time: Box::new(|| Some(SystemTime::now())),
+            interrupt_safe: true,
+            is_os_default: true,
         });
         inner
     }
@@ -74,11 +108,36 @@ pub fn register_current_provider(
     priority: i32,
     get_time: impl Fn() -> Option<SystemTime> + Send + Sync + 'static,
 ) {
+    register_current_provider_impl(name.into(), priority, Box::new(get_time), false);
+}
+
+/// Register an **interrupt-callable** current-time provider.
+///
+/// C parity: `epicsGeneralTime.c:445-459` `generalTimeAddIntCurrentTimeProvider`.
+/// The closure MUST be callable from interrupt context — it must not
+/// block, allocate, or take locks. Only providers registered this way
+/// are consulted by [`get_current_int`].
+pub fn register_int_current_provider(
+    name: impl Into<String>,
+    priority: i32,
+    get_time: impl Fn() -> Option<SystemTime> + Send + Sync + 'static,
+) {
+    register_current_provider_impl(name.into(), priority, Box::new(get_time), true);
+}
+
+fn register_current_provider_impl(
+    name: String,
+    priority: i32,
+    get_time: CurrentTimeFn,
+    interrupt_safe: bool,
+) {
     let mut inner = GENERAL_TIME.lock().unwrap();
     let provider = CurrentTimeProvider {
-        name: name.into(),
+        name,
         priority,
-        get_time: Box::new(get_time),
+        get_time,
+        interrupt_safe,
+        is_os_default: false,
     };
     let pos = inner
         .current_providers
@@ -86,6 +145,10 @@ pub fn register_current_provider(
         .position(|p| p.priority > priority)
         .unwrap_or(inner.current_providers.len());
     inner.current_providers.insert(pos, provider);
+    // C `insertProvider`: clear `useOsdGetCurrent` once the provider
+    // list holds more than just the built-in OS default. Any provider
+    // registered through this path is non-default, so clear the flag.
+    inner.use_osd_get_current = false;
 }
 
 /// Register an event-time provider at the given priority (lower = higher priority).
@@ -94,11 +157,34 @@ pub fn register_event_provider(
     priority: i32,
     get_event: impl Fn(i32) -> Option<SystemTime> + Send + Sync + 'static,
 ) {
+    register_event_provider_impl(name.into(), priority, Box::new(get_event), false);
+}
+
+/// Register an **interrupt-callable** event-time provider.
+///
+/// C parity: `epicsGeneralTime.c:488-502` `generalTimeAddIntEventProvider`.
+/// Same interrupt-context constraints as [`register_int_current_provider`].
+/// Only providers registered this way are consulted by [`get_event_int`].
+pub fn register_int_event_provider(
+    name: impl Into<String>,
+    priority: i32,
+    get_event: impl Fn(i32) -> Option<SystemTime> + Send + Sync + 'static,
+) {
+    register_event_provider_impl(name.into(), priority, Box::new(get_event), true);
+}
+
+fn register_event_provider_impl(
+    name: String,
+    priority: i32,
+    get_event: EventTimeFn,
+    interrupt_safe: bool,
+) {
     let mut inner = GENERAL_TIME.lock().unwrap();
     let provider = EventTimeProvider {
-        name: name.into(),
+        name,
         priority,
-        get_event: Box::new(get_event),
+        get_event,
+        interrupt_safe,
     };
     let pos = inner
         .event_providers
@@ -109,14 +195,20 @@ pub fn register_event_provider(
 }
 
 /// Register a callback fired whenever a time provider reports a fresh
-/// external sync (PTP master step, NTP sync window, GPS PPS). Mirrors
-/// epics-base 8-D `5cfff383` `osiClockTime` sync-hook interface.
+/// external sync (PTP master step, NTP sync window, GPS PPS).
+///
+/// **Rust-only extension — not an epics-base API.** EPICS base has no
+/// public registerable clock-sync hook: `osiClockTime.c` keeps its
+/// `ClockTimeSync` logic strictly internal. This is an additive
+/// notification channel for the Rust port's downstream consumers and is
+/// intentionally kept separate from the C-parity `get_current` /
+/// `get_event` paths.
 ///
 /// Hooks are invoked from [`notify_clock_sync`] in registration order
 /// with the new (post-sync) time. They MUST be cheap — they execute
 /// inside the general-time mutex; long work should defer to a spawn.
 /// There is no de-registration API: hooks live for the process
-/// lifetime, mirroring the upstream's atomic-add semantics.
+/// lifetime.
 pub fn register_clock_sync_hook<F>(hook: F)
 where
     F: Fn(SystemTime) + Send + Sync + 'static,
@@ -145,11 +237,37 @@ pub fn notify_clock_sync(t_synced: SystemTime) {
 
 /// Get the current time from the highest-priority provider that succeeds.
 ///
-/// The returned time is monotonically enforced: if a provider returns a time
-/// earlier than the last provided time, the last provided time is returned
-/// and the error counter is incremented.
+/// C parity (`epicsGeneralTime.c:111-112`): while only the built-in
+/// OS-clock provider is registered (`use_osd_get_current`), this
+/// short-circuits straight to the OS clock and the monotonic ratchet is
+/// **not** consulted — a backward wall-clock step (NTP slew, manual
+/// `date` change) is returned verbatim and does **not** count an error.
+///
+/// Once any non-default provider is registered, the returned time is
+/// monotonically enforced: if a provider returns a time earlier than
+/// the last provided time, the last provided time is returned and the
+/// error counter is incremented.
 pub fn get_current() -> SystemTime {
     let mut inner = GENERAL_TIME.lock().unwrap();
+
+    // C `useOsdGetCurrent` short-circuit: no ratchet, no error count.
+    if inner.use_osd_get_current {
+        if let Some(idx) = inner
+            .current_providers
+            .iter()
+            .position(|p| p.is_os_default)
+        {
+            if let Some(t) = (inner.current_providers[idx].get_time)() {
+                let name = inner.current_providers[idx].name.clone();
+                inner.last_provided_time = t;
+                inner.last_current_name = Some(name);
+                return t;
+            }
+        }
+        // OS clock unavailable (should not happen) — fall through to
+        // the ratcheted path below as a last resort.
+    }
+
     for i in 0..inner.current_providers.len() {
         if let Some(t) = (inner.current_providers[i].get_time)() {
             let name = inner.current_providers[i].name.clone();
@@ -167,6 +285,94 @@ pub fn get_current() -> SystemTime {
     // All providers failed — return last known time.
     ERROR_COUNTS.fetch_add(1, Ordering::Relaxed);
     inner.last_provided_time
+}
+
+/// Get the current time, querying only providers **other than** the one
+/// at `ignore_priority`.
+///
+/// C parity: `epicsGeneralTime.c:106-151` `generalTimeGetExceptPriority`.
+/// Used by a time provider (typically an NTP/clock provider) that needs
+/// to read "the best time other than mine" to validate its own sync
+/// without recursing into itself.
+///
+/// Returns `(time, priority_used)` — the priority of the provider that
+/// answered — or `None` when no other provider succeeded. **No ratchet
+/// is applied**: this query may legitimately go backwards, exactly as
+/// the C function documents ("No ratchet, time from this routine may go
+/// backwards").
+///
+/// `ignore_priority` follows the C convention: a positive value skips
+/// the provider *at* that priority; a negative value `-n` skips every
+/// provider *except* the one at priority `n`.
+pub fn get_current_except_priority(ignore_priority: i32) -> Option<(SystemTime, i32)> {
+    let inner = GENERAL_TIME.lock().unwrap();
+    for p in &inner.current_providers {
+        if (ignore_priority > 0 && p.priority == ignore_priority)
+            || (ignore_priority < 0 && p.priority != -ignore_priority)
+        {
+            continue;
+        }
+        if let Some(t) = (p.get_time)() {
+            return Some((t, p.priority));
+        }
+    }
+    None
+}
+
+/// Interrupt-context current-time query.
+///
+/// C parity: `epicsGeneralTime.c:226-238` `epicsTimeGetCurrentInt`.
+/// Consults only providers registered via
+/// [`register_int_current_provider`] (interrupt-callable). Returns
+/// `None` when no interrupt-safe provider answers — the C function
+/// returns `S_time_noProvider` in that case. **No ratchet** — the C
+/// `*Int` path does not touch the shared ratchet state (it must be
+/// interrupt-safe).
+pub fn get_current_int() -> Option<SystemTime> {
+    let inner = GENERAL_TIME.lock().unwrap();
+    for p in &inner.current_providers {
+        if !p.interrupt_safe {
+            continue;
+        }
+        if let Some(t) = (p.get_time)() {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Interrupt-context event-time query.
+///
+/// C parity: `epicsGeneralTime.c:351-367` `epicsTimeGetEventInt`.
+/// Consults only event providers registered via
+/// [`register_int_event_provider`]. Returns `None` when no
+/// interrupt-safe event provider answers. **No ratchet.**
+pub fn get_event_int(event: i32) -> Option<SystemTime> {
+    let inner = GENERAL_TIME.lock().unwrap();
+    for p in &inner.event_providers {
+        if !p.interrupt_safe {
+            continue;
+        }
+        if let Some(t) = (p.get_event)(event) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Name of the highest-priority registered current-time provider.
+///
+/// C parity: `epicsGeneralTime.c` `generalTimeHighestCurrentName` —
+/// the provider at the front of the priority-ordered list. Returns
+/// `None` only when no provider is registered (the Rust port always
+/// has the built-in OS clock, so this is effectively always `Some`).
+pub fn highest_current_name() -> Option<String> {
+    GENERAL_TIME
+        .lock()
+        .unwrap()
+        .current_providers
+        .first()
+        .map(|p| p.name.clone())
 }
 
 /// Get the time for a specific event number.
@@ -253,33 +459,70 @@ pub fn event_provider_name() -> Option<String> {
     GENERAL_TIME.lock().unwrap().last_event_name.clone()
 }
 
+/// Format a `SystemTime` the way C `generalTimeReport` does
+/// (`epicsTimeToStrftime` with `"%Y-%m-%d %H:%M:%S.%06f"`).
+fn format_time_sample(t: SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Utc> = t.into();
+    dt.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
+}
+
 /// Generate a report of registered providers.
+///
+/// C parity: `epicsGeneralTime.c:530-618` `generalTimeReport`.
+/// - First line: `Backwards time errors prevented N times.` followed
+///   by a blank line.
+/// - `Current Time Providers:` / `Event Time Providers:` headers.
+/// - Each provider line is indented with 4 spaces and formatted
+///   `"name", priority = N`.
+/// - At `level > 0`, each *current* provider also prints its current
+///   time sample on the next line (tab-indented), or
+///   `Current Time not available`.
+/// - When a list is empty, prints a tab-indented
+///   `No Providers registered.` line.
 ///
 /// `level`: 0 = brief, 1+ = detailed.
 pub fn report(level: i32) -> String {
     let inner = GENERAL_TIME.lock().unwrap();
     let mut out = String::new();
+
+    // C: printf("Backwards time errors prevented %u times.\n\n", ...)
+    out.push_str(&format!(
+        "Backwards time errors prevented {} times.\n\n",
+        error_counts()
+    ));
+
+    // Current Time Providers.
     out.push_str("Current Time Providers:\n");
-    for p in &inner.current_providers {
-        out.push_str(&format!("  \"{}\" priority {}\n", p.name, p.priority));
+    if inner.current_providers.is_empty() {
+        out.push_str("\tNo Providers registered.\n");
+    } else {
+        for p in &inner.current_providers {
+            out.push_str(&format!("    \"{}\", priority = {}\n", p.name, p.priority));
+            if level != 0 {
+                match (p.get_time)() {
+                    Some(t) => out.push_str(&format!(
+                        "\tCurrent Time is {}.\n",
+                        format_time_sample(t)
+                    )),
+                    None => out.push_str("\tCurrent Time not available\n"),
+                }
+            }
+        }
+        // C `puts(message)` appends one newline after the provider block.
+        out.push('\n');
     }
+
+    // Event Time Providers.
     out.push_str("Event Time Providers:\n");
     if inner.event_providers.is_empty() {
-        out.push_str("  (none)\n");
+        out.push_str("\tNo Providers registered.\n");
     } else {
         for p in &inner.event_providers {
-            out.push_str(&format!("  \"{}\" priority {}\n", p.name, p.priority));
+            out.push_str(&format!("    \"{}\", priority = {}\n", p.name, p.priority));
         }
+        out.push('\n');
     }
-    if level > 0 {
-        out.push_str(&format!("Error count: {}\n", error_counts()));
-        if let Some(ref name) = inner.last_current_name {
-            out.push_str(&format!("Last current provider: \"{}\"\n", name));
-        }
-        if let Some(ref name) = inner.last_event_name {
-            out.push_str(&format!("Last event provider: \"{}\"\n", name));
-        }
-    }
+
     out
 }
 
@@ -467,11 +710,12 @@ mod tests {
         assert_eq!(error_counts(), 0);
     }
 
-    /// epics-base 8-D `5cfff383` regression: a registered sync hook
-    /// fires when `notify_clock_sync` is invoked. Multiple hooks
-    /// fire in registration order. Hooks live for process lifetime
-    /// — the test asserts via Arc<Mutex<Vec<...>>> capture rather
-    /// than de-registering.
+    /// Rust-only sync-hook extension: a registered sync hook fires
+    /// when `notify_clock_sync` is invoked. Multiple hooks fire in
+    /// registration order. Hooks live for process lifetime — the test
+    /// asserts via Arc<Mutex<Vec<...>>> capture rather than
+    /// de-registering. (No C-base counterpart; see
+    /// `register_clock_sync_hook`.)
     #[test]
     fn sync_hooks_fire_in_registration_order() {
         use std::sync::{Arc, Mutex};
@@ -511,5 +755,197 @@ mod tests {
             last1_idx < last2_idx,
             "hook 1 must fire before hook 2 (registration order)"
         );
+    }
+
+    /// M1 C-parity: while only the built-in OS clock is registered,
+    /// `get_current` bypasses the monotonic ratchet — a backward
+    /// wall-clock step is returned verbatim and counts no error.
+    #[test]
+    fn os_clock_only_bypasses_ratchet() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+
+        // Replace the built-in OS clock with a controllable stepping
+        // clock that is still flagged as the OS default, so the
+        // `use_osd_get_current` short-circuit stays active.
+        let t_high = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let t_low = SystemTime::UNIX_EPOCH + Duration::from_secs(1_999_999_000);
+        let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_c = call.clone();
+        {
+            let mut inner = GENERAL_TIME.lock().unwrap();
+            inner.current_providers.clear();
+            inner.current_providers.push(CurrentTimeProvider {
+                name: "OS Clock".to_string(),
+                priority: 999,
+                get_time: Box::new(move || {
+                    let n = call_c.fetch_add(1, Ordering::Relaxed);
+                    Some(if n == 0 { t_high } else { t_low })
+                }),
+                interrupt_safe: true,
+                is_os_default: true,
+            });
+            inner.use_osd_get_current = true;
+        }
+
+        reset_error_counts();
+        let first = get_current();
+        assert_eq!(first, t_high);
+        // Backward step is returned verbatim — NO ratchet, NO error.
+        let second = get_current();
+        assert_eq!(
+            second, t_low,
+            "OS-clock-only path must follow a backward step (C useOsdGetCurrent)"
+        );
+        assert_eq!(
+            error_counts(),
+            0,
+            "OS-clock-only backward step must not count an error"
+        );
+    }
+
+    /// M1 C-parity: registering a non-default provider clears the
+    /// `use_osd_get_current` flag, so the ratchet is back in force.
+    #[test]
+    fn registering_provider_enables_ratchet() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        let t_high = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let t_low = SystemTime::UNIX_EPOCH + Duration::from_secs(1_999_999_000);
+        let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_c = call.clone();
+        register_current_provider("Stepper", 10, move || {
+            let n = call_c.fetch_add(1, Ordering::Relaxed);
+            Some(if n == 0 { t_high } else { t_low })
+        });
+
+        reset_error_counts();
+        assert_eq!(get_current(), t_high);
+        // With a non-default provider present, the ratchet clamps the
+        // backward step and counts an error.
+        assert_eq!(get_current(), t_high);
+        assert_eq!(error_counts(), 1);
+    }
+
+    /// M2 C-parity: `get_current_except_priority` skips the named
+    /// provider and applies no ratchet.
+    #[test]
+    fn except_priority_skips_named_provider() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        let t10 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let t20 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_900_000_000);
+        register_current_provider("P10", 10, move || Some(t10));
+        register_current_provider("P20", 20, move || Some(t20));
+
+        // Ignoring priority 10 -> answered by P20 (priority 20).
+        let (t, prio) = get_current_except_priority(10).expect("P20 answers");
+        assert_eq!(t, t20);
+        assert_eq!(prio, 20);
+
+        // Negative ignore: keep only priority 10.
+        let (t, prio) = get_current_except_priority(-10).expect("P10 answers");
+        assert_eq!(t, t10);
+        assert_eq!(prio, 10);
+    }
+
+    /// M2 C-parity: interrupt-callable providers are consulted only by
+    /// the `*_int` query paths.
+    #[test]
+    fn int_providers_only_seen_by_int_queries() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        let t_int = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        register_int_current_provider("IntClock", 5, move || Some(t_int));
+        assert_eq!(get_current_int(), Some(t_int));
+
+        let t_evt = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_500);
+        register_int_event_provider("IntEvent", 5, move |_| Some(t_evt));
+        assert_eq!(get_event_int(7), Some(t_evt));
+    }
+
+    /// M2 C-parity: `get_event_int` returns `None` when no
+    /// interrupt-safe event provider is registered.
+    #[test]
+    fn int_event_query_none_without_int_provider() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        // A non-int event provider must not satisfy the int query.
+        register_event_provider("Plain", 10, |_| {
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+        });
+        assert_eq!(get_event_int(3), None);
+    }
+
+    /// M2 C-parity: `highest_current_name` returns the front-of-list
+    /// (highest-priority) current provider.
+    #[test]
+    fn highest_current_name_is_top_priority() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        // Only the OS clock (priority 999) -> it is the highest.
+        assert_eq!(highest_current_name().as_deref(), Some("OS Clock"));
+        register_current_provider("Primary", 1, || None);
+        assert_eq!(highest_current_name().as_deref(), Some("Primary"));
+    }
+
+    /// M3 C-parity: `report` output mirrors `generalTimeReport`.
+    #[test]
+    fn report_format_matches_general_time_report() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        let r = report(0);
+        // First line is the backwards-error count.
+        assert!(
+            r.starts_with("Backwards time errors prevented 0 times.\n\n"),
+            "report must lead with the backwards-error line: {r:?}"
+        );
+        assert!(r.contains("Current Time Providers:\n"));
+        // 4-space indent, `, priority = N` form.
+        assert!(
+            r.contains("    \"OS Clock\", priority = 999\n"),
+            "provider line must use C `\"name\", priority = N` form: {r:?}"
+        );
+        // No event providers -> tab-indented "No Providers registered."
+        assert!(
+            r.contains("Event Time Providers:\n\tNo Providers registered.\n"),
+            "empty event list must print the C placeholder: {r:?}"
+        );
+        // The old format strings must be gone.
+        assert!(!r.contains("\" priority "));
+        assert!(!r.contains("(none)"));
+    }
+
+    /// M3 C-parity: at `level > 0`, each current provider prints its
+    /// time sample on a tab-indented line.
+    #[test]
+    fn report_level_one_prints_time_sample() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        let r = report(1);
+        assert!(
+            r.contains("\tCurrent Time is "),
+            "level>0 report must print a per-provider time sample: {r:?}"
+        );
+    }
+
+    /// L2 C-parity: the ratchet seeds at the EPICS epoch (1990-01-01),
+    /// not the Unix epoch (1970-01-01) — `epicsTimeStamp {0,0}`.
+    #[test]
+    fn ratchet_seeds_at_epics_epoch() {
+        // 631_152_000 s past the Unix epoch == 1990-01-01 00:00:00 UTC.
+        let secs = epics_epoch()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(secs, EPICS_EPOCH_UNIX_SECS);
+        assert_eq!(secs, 631_152_000);
+
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        let inner = GENERAL_TIME.lock().unwrap();
+        assert_eq!(inner.last_provided_time, epics_epoch());
+        assert_eq!(inner.last_best_time, epics_epoch());
+        assert!(inner.event_times.iter().all(|t| *t == epics_epoch()));
     }
 }

@@ -252,6 +252,8 @@ impl AsyncUdpV4 {
                 up_first.push(i.clone());
             }
         }
+        let total_nics = up_first.len();
+        let expected_non_loopback = up_first.iter().filter(|i| i.up_non_loopback).count();
         let mut iter = up_first.into_iter();
         let first_info = iter
             .next()
@@ -266,10 +268,12 @@ impl AsyncUdpV4 {
                 io::Error::new(io::ErrorKind::Other, "could not read chosen UDP port")
             })?;
         let mut sockets = vec![first];
+        let mut dropped = 0usize;
         for info in iter {
             match bind_one(&info, chosen_port, broadcast) {
                 Ok(nic) => sockets.push(nic),
                 Err(e) => {
+                    dropped += 1;
                     tracing::debug!(
                         target: "epics_base_rs::net",
                         iface = %info.ip,
@@ -279,6 +283,38 @@ impl AsyncUdpV4 {
                     );
                 }
             }
+        }
+
+        // C-parity intent: a multi-NIC SEARCH bundle that silently
+        // collapses to a single socket misleads the caller into
+        // believing fanout works. When NICs were dropped, surface a
+        // `warn`-level diagnostic rather than only per-NIC `debug`.
+        let bound_non_loopback = sockets.iter().filter(|n| !n.is_loopback).count();
+        if dropped > 0 {
+            tracing::warn!(
+                target: "epics_base_rs::net",
+                port = chosen_port,
+                total_nics,
+                bound = sockets.len(),
+                dropped,
+                bound_non_loopback,
+                "bind_ephemeral_same_port: some NICs failed the same-port bind; \
+                 SEARCH/beacon fanout is degraded"
+            );
+        }
+        // Hard failure: non-loopback NICs were available but none of
+        // them bound — the bundle cannot fan out at all. Mirror
+        // `bind_with_map_filtered`, which errors when no usable socket
+        // is left, instead of returning a silently single-loopback
+        // bundle.
+        if expected_non_loopback > 0 && bound_non_loopback == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!(
+                    "bind_ephemeral_same_port: {expected_non_loopback} non-loopback NIC(s) \
+                     present but none could bind UDP port {chosen_port}"
+                ),
+            ));
         }
         Ok(Self { sockets })
     }
@@ -493,7 +529,16 @@ impl AsyncUdpV4 {
                 return Ok(nic);
             }
         }
-        // (4) First non-loopback NIC.
+        // (4) Default-route NIC — an interface with a `0.0.0.0`
+        // netmask matches every destination. `subnet_contains` rejects
+        // it in pass (1) so it never shadows a specific subnet; here it
+        // is the explicit fallback for an otherwise-unrouted dest.
+        if let Some(nic) =
+            send_eligible().find(|n| !n.is_loopback && is_default_route(n.netmask))
+        {
+            return Ok(nic);
+        }
+        // (5) First non-loopback NIC.
         if let Some(nic) = send_eligible().find(|n| !n.is_loopback) {
             return Ok(nic);
         }
@@ -984,9 +1029,21 @@ fn bind_one_at(
 fn subnet_contains(ip: Ipv4Addr, mask: Ipv4Addr, candidate: Ipv4Addr) -> bool {
     let m = u32::from(mask);
     if m == 0 {
+        // A 0.0.0.0 netmask matches every destination. Returning
+        // `false` here keeps a `/0` interface from shadowing every
+        // more-specific subnet in the priority-1 pass; `/0` interfaces
+        // are instead matched as a fallback via [`is_default_route`].
         return false;
     }
     (u32::from(ip) & m) == (u32::from(candidate) & m)
+}
+
+/// `true` for an interface configured with a `0.0.0.0` netmask — a
+/// default-route NIC. Such an interface matches every destination, so
+/// it is used only as a fallback after specific subnet/broadcast
+/// matches fail, never as a priority-1 match.
+fn is_default_route(mask: Ipv4Addr) -> bool {
+    u32::from(mask) == 0
 }
 
 /// Hand-rolled `select_all` for owned, pinned futures. Avoids pulling
@@ -1122,6 +1179,17 @@ mod tests {
             Ipv4Addr::UNSPECIFIED,
             Ipv4Addr::new(8, 8, 8, 8)
         ));
+    }
+
+    /// L3 C-parity: a `0.0.0.0` netmask identifies a default-route
+    /// interface — `subnet_contains` rejects it (so it never shadows a
+    /// specific subnet) but `is_default_route` flags it for the
+    /// `pick_nic` fallback pass.
+    #[test]
+    fn default_route_iface_is_recognised() {
+        assert!(is_default_route(Ipv4Addr::UNSPECIFIED));
+        assert!(!is_default_route(Ipv4Addr::new(255, 255, 255, 0)));
+        assert!(!is_default_route(Ipv4Addr::new(255, 0, 0, 0)));
     }
 
     /// pvxs `a064677e3625` parity: `enable_so_rxq_ovfl` must be a

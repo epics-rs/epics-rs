@@ -30,7 +30,15 @@ pub struct IfaceInfo {
     /// Subnet broadcast address (when reported by the OS), e.g.
     /// `10.0.0.255`. `None` for point-to-point links.
     pub broadcast: Option<Ipv4Addr>,
-    /// Whether the interface is up and not loopback.
+    /// `true` when the interface carries the OS `IFF_UP` flag **and**
+    /// is not loopback — the eligibility test for SEARCH/beacon
+    /// fanout. C parity: `osiSockDiscoverBroadcastAddresses`
+    /// (`osdNetIfConf.c:170-181`) skips `!(IFF_UP)` and `IFF_LOOPBACK`
+    /// interfaces. On Linux (where the crate links `libc`) this
+    /// consults the live kernel flags via `getifaddrs`; on other
+    /// targets it falls back to `!is_loopback()` because the
+    /// platform's enumerator already excludes operationally-down
+    /// adapters.
     pub up_non_loopback: bool,
 }
 
@@ -147,7 +155,10 @@ impl IfaceMap {
     /// 2. **Broadcast match** — `dest` equals an interface's
     ///    subnet broadcast.
     /// 3. **Loopback** — `127.0.0.0/8` → loopback interface.
-    /// 4. Otherwise `None` — caller treats this as "no per-NIC
+    /// 4. **Default route** — an interface with a `0.0.0.0` netmask
+    ///    matches any destination; used only as a fallback so it never
+    ///    shadows a specific subnet match.
+    /// 5. Otherwise `None` — caller treats this as "no per-NIC
     ///    pinning, let the OS route". For limited broadcast and
     ///    multicast destinations the caller fanouts across all
     ///    interfaces explicitly.
@@ -169,6 +180,17 @@ impl IfaceMap {
         if dest.is_loopback() {
             return g.ifaces.iter().find(|i| i.ip.is_loopback()).cloned();
         }
+        // (4) default-route interface — a `0.0.0.0` netmask matches
+        // every destination. `subnet_contains` rejects it in pass (1)
+        // so it never shadows a specific subnet; here it is the
+        // explicit fallback for an otherwise-unrouted dest.
+        if let Some(i) = g
+            .ifaces
+            .iter()
+            .find(|i| !i.ip.is_loopback() && u32::from(i.netmask) == 0)
+        {
+            return Some(i.clone());
+        }
         None
     }
 }
@@ -185,10 +207,57 @@ fn subnet_contains(ip: Ipv4Addr, mask: Ipv4Addr, candidate: Ipv4Addr) -> bool {
     net == cnet && u32::from(mask) != 0
 }
 
+/// Per-interface-name OS flag snapshot used to compute
+/// `up_non_loopback`. C parity: the `IFF_UP` / `IFF_LOOPBACK` checks in
+/// `osiSockDiscoverBroadcastAddresses` (`osdNetIfConf.c:170-181`).
+#[cfg(target_os = "linux")]
+fn interface_up_flags() -> std::collections::HashMap<String, bool> {
+    use std::collections::HashMap;
+    use std::ffi::CStr;
+
+    let mut map: HashMap<String, bool> = HashMap::new();
+    // SAFETY: standard getifaddrs / freeifaddrs pairing; the pointer is
+    // only dereferenced while non-null and freed exactly once.
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 || head.is_null() {
+            return map;
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_name.is_null() {
+                if let Ok(name) = CStr::from_ptr(ifa.ifa_name).to_str() {
+                    // C: skip interfaces without IFF_UP, skip IFF_LOOPBACK.
+                    let flags = ifa.ifa_flags as libc::c_int;
+                    let up = (flags & libc::IFF_UP) != 0;
+                    let loopback = (flags & libc::IFF_LOOPBACK) != 0;
+                    let eligible = up && !loopback;
+                    // An interface can have several addresses; if any
+                    // entry reports it up+non-loopback, keep that.
+                    map.entry(name.to_string())
+                        .and_modify(|e| *e |= eligible)
+                        .or_insert(eligible);
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    map
+}
+
 fn enumerate_v4() -> Vec<IfaceInfo> {
     let Ok(list) = if_addrs::get_if_addrs() else {
         return Vec::new();
     };
+    // C parity: on Linux consult the live kernel `IFF_UP`/`IFF_LOOPBACK`
+    // flags via `getifaddrs` so an administratively-down interface that
+    // still has an IPv4 address configured is not reported as a fanout
+    // target. (The crate links `libc` only on Linux.)
+    #[cfg(target_os = "linux")]
+    let up_flags = interface_up_flags();
+
     let mut out = Vec::with_capacity(list.len());
     for iface in list {
         let if_addrs::IfAddr::V4(v4) = &iface.addr else {
@@ -200,13 +269,34 @@ fn enumerate_v4() -> Vec<IfaceInfo> {
         // backend keys on the bound IP, not the index, so this is
         // benign).
         let index = iface.index.unwrap_or(0);
+
+        // C `osiSockDiscoverBroadcastAddresses`: an interface is a
+        // fanout target only when it is `IFF_UP` and not loopback.
+        #[cfg(target_os = "linux")]
+        let up_non_loopback = match up_flags.get(&iface.name) {
+            // Kernel flags known — honour them (and never treat
+            // loopback as a fanout target even if a stale flag map
+            // somehow disagrees).
+            Some(&eligible) => eligible && !iface.is_loopback(),
+            // Interface absent from the getifaddrs snapshot (raced a
+            // hot-unplug, or getifaddrs failed) — fall back to the
+            // loopback test rather than dropping the interface.
+            None => !iface.is_loopback(),
+        };
+        // Non-Linux (macOS / Windows / *BSD): the crate does not link
+        // `libc` here, and the platform enumerator already excludes
+        // operationally-down adapters, so the loopback test is the
+        // best portable approximation.
+        #[cfg(not(target_os = "linux"))]
+        let up_non_loopback = !iface.is_loopback();
+
         out.push(IfaceInfo {
             index,
             name: iface.name.clone(),
             ip: v4.ip,
             netmask: v4.netmask,
             broadcast: v4.broadcast,
-            up_non_loopback: !iface.is_loopback(),
+            up_non_loopback,
         });
     }
     out
@@ -243,6 +333,48 @@ mod tests {
         assert!(
             age >= Duration::from_millis(20),
             "refresh_if_stale should report the pre-refresh age (got {age:?})"
+        );
+    }
+
+    /// M5 C-parity: loopback is never reported as a fanout target,
+    /// and every interface flagged `up_non_loopback` is genuinely
+    /// non-loopback (C `osiSockDiscoverBroadcastAddresses` skips
+    /// `IFF_LOOPBACK`).
+    #[test]
+    fn up_non_loopback_excludes_loopback() {
+        let map = IfaceMap::new();
+        for iface in map.all() {
+            if iface.ip.is_loopback() {
+                assert!(
+                    !iface.up_non_loopback,
+                    "loopback {iface:?} must not be a fanout target"
+                );
+            }
+        }
+        // Everything in up_non_loopback() must be non-loopback.
+        for iface in map.up_non_loopback() {
+            assert!(
+                !iface.ip.is_loopback(),
+                "up_non_loopback() must not surface loopback: {iface:?}"
+            );
+        }
+    }
+
+    /// M5 C-parity: on Linux the live `IFF_UP` kernel flag is consulted.
+    /// The loopback interface is `IFF_UP` but `IFF_LOOPBACK`, so the
+    /// flag map reports it as ineligible.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interface_up_flags_marks_loopback_ineligible() {
+        let flags = interface_up_flags();
+        // `lo`/`lo0` is up but loopback -> ineligible. Accept either
+        // name; the machine must have at least one loopback entry.
+        let lo_ineligible = flags
+            .iter()
+            .any(|(name, &eligible)| (name == "lo" || name == "lo0") && !eligible);
+        assert!(
+            lo_ineligible || flags.is_empty(),
+            "loopback must be flagged ineligible in the IFF_UP map: {flags:?}"
         );
     }
 

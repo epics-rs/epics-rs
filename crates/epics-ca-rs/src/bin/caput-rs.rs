@@ -223,22 +223,36 @@ async fn main() {
 
     // Parse the value(s) according to the array/scalar mode.
     let parsed_value = if args.array_mode {
-        let want = match args.values[0].parse::<usize>() {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("caput-rs: -a count must be a non-negative integer ({e})");
-                std::process::exit(1);
+        // C `caput -a` (caput.c:413-418): after the PV name it skips
+        // the count token (`optind++`) and uses ALL remaining values
+        // (`count = argc - optind`) — the count number is informational
+        // only. Match that: ignore it for sizing, keep it solely for a
+        // mismatch warning. `values[0]` is the count token, `[1..]` the
+        // actual values.
+        let tokens = &args.values[1..];
+        if let Ok(want) = args.values[0].parse::<usize>() {
+            if want != tokens.len() {
+                eprintln!(
+                    "caput-rs: warning: -a count {} differs from {} values supplied; \
+                     using all {} (C-parity)",
+                    want,
+                    tokens.len(),
+                    tokens.len()
+                );
             }
-        };
-        if args.values.len() < 1 + want {
+        } else {
+            // C does not parse the count token at all — a non-numeric
+            // token is silently skipped. Mirror that, no hard error.
             eprintln!(
-                "caput-rs: -a count {} but only {} values provided",
-                want,
-                args.values.len() - 1
+                "caput-rs: warning: -a count token '{}' is not a number; \
+                 ignored (C-parity)",
+                args.values[0]
             );
+        }
+        if tokens.is_empty() {
+            eprintln!("caput-rs: -a requires at least one value after the count token");
             std::process::exit(1);
         }
-        let tokens = &args.values[1..1 + want];
         match parse_array(native_type, tokens) {
             Ok(v) => v,
             Err(e) => {

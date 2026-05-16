@@ -55,7 +55,10 @@ fn stat_to_str(stat: u16) -> &'static str {
 /// (NO_ALARM, NO_ALARM) the trailing two fields are emitted empty.
 fn print_long_line(prefix: &str, name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) {
     let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-    let val = format_value(&snap.value, fmt, enum_strings);
+    // caput has no `-#` element-count flag, so req_elems is always false:
+    // an array count prefix is emitted only when the array length itself
+    // exceeds 1 (matches C `caget.c` / `tool_lib.c` PRN_TIME_VAL_STS gating).
+    let val = format_value(&snap.value, fmt, enum_strings, false);
     let ts = format_server_timestamp(snap.timestamp);
     let stat = snap.alarm.status;
     let sevr = snap.alarm.severity;
@@ -339,8 +342,8 @@ async fn main() {
         fmt.field_separator = c;
     }
     let sep = fmt.field_separator;
-    let old_rendered = format_value(&old_value, &fmt, None);
-    let new_rendered = format_value(&new_value, &fmt, None);
+    let old_rendered = format_value(&old_value, &fmt, None, false);
+    let new_rendered = format_value(&new_value, &fmt, None, false);
     let is_scalar = new_value.count() == 1;
     let pad = |name: &str| -> String {
         if is_scalar && sep == ' ' {

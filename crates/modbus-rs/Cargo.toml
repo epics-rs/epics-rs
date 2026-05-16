@@ -1,0 +1,28 @@
+[package]
+name = "modbus-rs"
+version.workspace = true
+edition.workspace = true
+description = "Rust port of EPICS modbus — Modbus TCP/RTU/ASCII driver for epics-rs"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+asyn-rs = { workspace = true }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tracing = "0.1"
+thiserror = "2"
+
+epics-base-rs = { workspace = true, optional = true }
+epics-ca-rs = { workspace = true, optional = true }
+
+[features]
+default = []
+# Opt-in IOC integration: record / device-support binding through asyn-rs.
+# Without this flag modbus-rs builds the protocol + driver layers only,
+# with no EPICS database dependency.
+ioc = ["dep:epics-base-rs", "dep:epics-ca-rs", "asyn-rs/epics"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,0 +1,22 @@
+[package]
+name = "modbus-ioc"
+version.workspace = true
+edition.workspace = true
+description = "Modbus IOC example — demonstrates modbus-rs driver with EPICS records"
+publish = false
+
+[features]
+ioc = ["dep:epics-ca-rs", "dep:epics-bridge-rs", "asyn-rs/epics", "modbus-rs/ioc"]
+
+[dependencies]
+asyn-rs = { workspace = true }
+epics-base-rs = { workspace = true }
+epics-ca-rs = { workspace = true, optional = true }
+epics-bridge-rs = { workspace = true, optional = true }
+modbus-rs = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "modbus_ioc"
+path = "src/bin/modbus_ioc.rs"
+required-features = ["ioc"]

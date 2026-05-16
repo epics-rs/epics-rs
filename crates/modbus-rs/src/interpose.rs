@@ -1,0 +1,426 @@
+//! Link-layer framing for Modbus.
+//!
+//! Port of `modbusInterpose.c`. The Modbus driver builds a bare PDU
+//! (`[slave, fcode, ...]`); this layer wraps it for the physical link before
+//! it reaches the underlying `asyn-rs` octet port, and unwraps the response:
+//!
+//! - **TCP / UDP** — prepend the 6-byte MBAP header; strip MBAP + slave byte
+//!   from the reply, matching the reply's transaction ID against the request.
+//! - **RTU** — append a CRC-16; verify the CRC and strip the slave byte from
+//!   the reply.
+//! - **ASCII** — `:`-prefixed hex with an LRC; the underlying serial port
+//!   adds/strips the CR/LF terminator.
+//!
+//! The CRC-16 and LRC are spec-compliant (`CRC-16/MODBUS`, poly `0xA001`;
+//! 8-bit two's-complement LRC).
+
+use crate::error::{ModbusError, ModbusResult};
+use crate::protocol::{MbapHeader, MAX_MODBUS_FRAME_SIZE, MBAP_HEADER_SIZE};
+
+/// Default response timeout when none is configured (matches the C
+/// `DEFAULT_TIMEOUT` of 2.0 s).
+pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Physical link encoding. Mirrors the C `modbusLinkType` enum, including its
+/// discriminant order so `iocsh`-style integer arguments map identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum LinkType {
+    /// Modbus/TCP — MBAP-framed over a stream socket.
+    Tcp = 0,
+    /// Modbus RTU — CRC-16-framed over a serial line.
+    Rtu = 1,
+    /// Modbus ASCII — `:`-prefixed hex with an LRC over a serial line.
+    Ascii = 2,
+    /// Modbus/TCP carried over UDP datagrams (retransmits on timeout).
+    Udp = 3,
+}
+
+impl LinkType {
+    /// Decode the integer form used by `modbusInterposeConfig`.
+    pub fn from_i32(v: i32) -> Option<Self> {
+        Some(match v {
+            0 => Self::Tcp,
+            1 => Self::Rtu,
+            2 => Self::Ascii,
+            3 => Self::Udp,
+            _ => return None,
+        })
+    }
+
+    /// Whether this link carries Modbus inside an MBAP header.
+    pub fn is_mbap(self) -> bool {
+        matches!(self, Self::Tcp | Self::Udp)
+    }
+}
+
+/// Compute the `CRC-16/MODBUS` checksum (poly `0xA001`, init `0xFFFF`).
+///
+/// Bit-reflected algorithm; produces the same value as the dual-lookup-table
+/// implementation in `modbusInterpose.c`. The result is appended to an RTU
+/// frame low byte first.
+pub fn compute_crc(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in data {
+        crc ^= byte as u16;
+        for _ in 0..8 {
+            if crc & 0x0001 != 0 {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc
+}
+
+/// Compute the Modbus ASCII LRC: the 8-bit two's-complement of the byte sum.
+pub fn compute_lrc(data: &[u8]) -> u8 {
+    let sum = data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    0u8.wrapping_sub(sum)
+}
+
+/// Encode one byte as two uppercase ASCII hex digits.
+fn encode_ascii(value: u8, out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    out.push(HEX[(value >> 4) as usize]);
+    out.push(HEX[(value & 0x0F) as usize]);
+}
+
+/// Decode one ASCII hex digit (`0`-`9`, `A`-`F`; the C decoder is
+/// uppercase-only, so this matches it).
+fn hex_digit(c: u8) -> ModbusResult<u8> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(ModbusError::MissingAsciiMarker),
+    }
+}
+
+/// Modbus link-layer framer. Holds the link type and — for MBAP links — the
+/// rolling transaction-ID counter.
+#[derive(Debug)]
+pub struct ModbusFramer {
+    link_type: LinkType,
+    transaction_id: u16,
+}
+
+/// An unwrapped response: the PDU bytes (function-code first) plus, for MBAP
+/// links, the transaction ID echoed by the slave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwrappedResponse {
+    /// Response PDU starting with the function code.
+    pub pdu: Vec<u8>,
+    /// Transaction ID from the MBAP header (`None` for RTU/ASCII).
+    pub transaction_id: Option<u16>,
+}
+
+impl ModbusFramer {
+    /// Create a framer for the given link type.
+    pub fn new(link_type: LinkType) -> Self {
+        Self {
+            link_type,
+            transaction_id: 0,
+        }
+    }
+
+    /// The configured link type.
+    pub fn link_type(&self) -> LinkType {
+        self.link_type
+    }
+
+    /// Transaction ID of the most recently framed request (MBAP links only).
+    pub fn last_transaction_id(&self) -> u16 {
+        self.transaction_id
+    }
+
+    /// Wrap a bare request PDU (`[slave, fcode, ...]`) into an on-wire frame.
+    ///
+    /// For MBAP links this advances the transaction-ID counter; the value
+    /// used is then available via [`Self::last_transaction_id`]. The CR/LF
+    /// terminator for ASCII frames is added by the underlying serial port's
+    /// output EOS, not here — matching the C driver.
+    pub fn frame_request(&mut self, pdu: &[u8]) -> ModbusResult<Vec<u8>> {
+        match self.link_type {
+            LinkType::Tcp | LinkType::Udp => {
+                self.transaction_id = self.transaction_id.wrapping_add(1);
+                let header = MbapHeader::new(self.transaction_id, pdu.len() as u16);
+                let mut frame = Vec::with_capacity(MBAP_HEADER_SIZE + pdu.len());
+                frame.extend_from_slice(&header.to_bytes());
+                frame.extend_from_slice(pdu);
+                Self::check_size(frame.len())?;
+                Ok(frame)
+            }
+            LinkType::Rtu => {
+                let crc = compute_crc(pdu);
+                let mut frame = Vec::with_capacity(pdu.len() + 2);
+                frame.extend_from_slice(pdu);
+                // CRC is appended low byte first.
+                frame.push((crc & 0xFF) as u8);
+                frame.push((crc >> 8) as u8);
+                Self::check_size(frame.len())?;
+                Ok(frame)
+            }
+            LinkType::Ascii => {
+                let lrc = compute_lrc(pdu);
+                let mut frame = Vec::with_capacity(1 + (pdu.len() + 1) * 2);
+                frame.push(b':');
+                for &b in pdu {
+                    encode_ascii(b, &mut frame);
+                }
+                encode_ascii(lrc, &mut frame);
+                Self::check_size(frame.len())?;
+                Ok(frame)
+            }
+        }
+    }
+
+    /// Unwrap an on-wire response frame, returning the bare response PDU.
+    ///
+    /// - TCP/UDP: strips the 6-byte MBAP header and the 1-byte slave/unit ID.
+    /// - RTU: verifies the CRC-16, then strips the slave byte and CRC.
+    /// - ASCII: checks the `:` marker, decodes hex, verifies the LRC, strips
+    ///   the slave byte. The serial port has already removed the CR/LF.
+    pub fn unwrap_response(&self, frame: &[u8]) -> ModbusResult<UnwrappedResponse> {
+        match self.link_type {
+            LinkType::Tcp | LinkType::Udp => {
+                // MBAP header (6) + slave byte (1) + at least the fcode.
+                if frame.len() < MBAP_HEADER_SIZE + 2 {
+                    return Err(ModbusError::FrameTooShort {
+                        got: frame.len(),
+                        need: MBAP_HEADER_SIZE + 2,
+                    });
+                }
+                let header = MbapHeader::from_bytes(&frame[..MBAP_HEADER_SIZE])?;
+                // Skip MBAP header + the 1-byte slave/unit ID.
+                let pdu = frame[MBAP_HEADER_SIZE + 1..].to_vec();
+                Ok(UnwrappedResponse {
+                    pdu,
+                    transaction_id: Some(header.transaction_id),
+                })
+            }
+            LinkType::Rtu => {
+                // slave (1) + fcode (1) + CRC (2).
+                if frame.len() < 4 {
+                    return Err(ModbusError::FrameTooShort {
+                        got: frame.len(),
+                        need: 4,
+                    });
+                }
+                // CRC over the whole frame, including the CRC bytes, is 0.
+                if compute_crc(frame) != 0 {
+                    return Err(ModbusError::CrcError);
+                }
+                // Strip slave byte (front) and CRC (last 2).
+                let pdu = frame[1..frame.len() - 2].to_vec();
+                Ok(UnwrappedResponse {
+                    pdu,
+                    transaction_id: None,
+                })
+            }
+            LinkType::Ascii => {
+                if frame.first() != Some(&b':') {
+                    return Err(ModbusError::MissingAsciiMarker);
+                }
+                let hex = &frame[1..];
+                if !hex.len().is_multiple_of(2) {
+                    return Err(ModbusError::FrameTooShort {
+                        got: frame.len(),
+                        need: frame.len() + 1,
+                    });
+                }
+                let mut bytes = Vec::with_capacity(hex.len() / 2);
+                for pair in hex.chunks_exact(2) {
+                    let hi = hex_digit(pair[0])?;
+                    let lo = hex_digit(pair[1])?;
+                    bytes.push((hi << 4) | lo);
+                }
+                // Need at least slave (1) + fcode (1) + LRC (1).
+                if bytes.len() < 3 {
+                    return Err(ModbusError::FrameTooShort {
+                        got: bytes.len(),
+                        need: 3,
+                    });
+                }
+                // Last decoded byte is the LRC; it covers everything before.
+                //
+                // NOTE: upstream `modbusInterpose.c` computes the LRC over a
+                // span that includes the received LRC byte and then compares
+                // against `data[i]` one past the decoded region — a latent
+                // off-by-one. This port follows the Modbus ASCII spec: LRC
+                // over slave+data only.
+                let received_lrc = *bytes.last().unwrap();
+                let body = &bytes[..bytes.len() - 1];
+                let computed = compute_lrc(body);
+                if computed != received_lrc {
+                    return Err(ModbusError::LrcError {
+                        received: received_lrc,
+                        computed,
+                    });
+                }
+                // Strip the slave byte.
+                Ok(UnwrappedResponse {
+                    pdu: body[1..].to_vec(),
+                    transaction_id: None,
+                })
+            }
+        }
+    }
+
+    fn check_size(len: usize) -> ModbusResult<()> {
+        if len > MAX_MODBUS_FRAME_SIZE {
+            Err(ModbusError::FrameTooLarge(len))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc_known_vector() {
+        // CRC-16/MODBUS of the ASCII string "123456789" is 0x4B37.
+        assert_eq!(compute_crc(b"123456789"), 0x4B37);
+    }
+
+    #[test]
+    fn crc_over_frame_with_appended_crc_is_zero() {
+        let pdu = [0x01u8, 0x03, 0x00, 0x00, 0x00, 0x0A];
+        let crc = compute_crc(&pdu);
+        let mut frame = pdu.to_vec();
+        frame.push((crc & 0xFF) as u8);
+        frame.push((crc >> 8) as u8);
+        assert_eq!(compute_crc(&frame), 0);
+    }
+
+    #[test]
+    fn lrc_negates_sum() {
+        // sum(0x01,0x03,0x00,0x6B,0x00,0x03) = 0x72; LRC = 0x100 - 0x72 = 0x8E.
+        assert_eq!(compute_lrc(&[0x01, 0x03, 0x00, 0x6B, 0x00, 0x03]), 0x8E);
+    }
+
+    #[test]
+    fn lrc_property_sum_with_lrc_is_zero() {
+        let body = [0x01u8, 0x03, 0x00, 0x6B, 0x00, 0x03];
+        let lrc = compute_lrc(&body);
+        let total: u8 = body.iter().chain(std::iter::once(&lrc)).fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn tcp_frame_roundtrip() {
+        let mut framer = ModbusFramer::new(LinkType::Tcp);
+        let pdu = [0x01u8, 0x03, 0x00, 0x64, 0x00, 0x0A];
+        let frame = framer.frame_request(&pdu).unwrap();
+        // MBAP: txid=1, proto=0, len=6.
+        assert_eq!(&frame[..6], &[0x00, 0x01, 0x00, 0x00, 0x00, 0x06]);
+        assert_eq!(&frame[6..], &pdu);
+
+        // Build a response: MBAP(txid 1) + slave + fcode + byte_count + data.
+        let resp_pdu = [0x01u8, 0x03, 0x02, 0xAB, 0xCD];
+        let header = MbapHeader::new(1, resp_pdu.len() as u16);
+        let mut resp = header.to_bytes().to_vec();
+        resp.extend_from_slice(&resp_pdu);
+        let unwrapped = framer.unwrap_response(&resp).unwrap();
+        assert_eq!(unwrapped.transaction_id, Some(1));
+        assert_eq!(unwrapped.pdu, &[0x03, 0x02, 0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn tcp_transaction_id_increments() {
+        let mut framer = ModbusFramer::new(LinkType::Tcp);
+        framer.frame_request(&[0x01, 0x03]).unwrap();
+        assert_eq!(framer.last_transaction_id(), 1);
+        framer.frame_request(&[0x01, 0x03]).unwrap();
+        assert_eq!(framer.last_transaction_id(), 2);
+    }
+
+    #[test]
+    fn rtu_frame_roundtrip() {
+        let mut framer = ModbusFramer::new(LinkType::Rtu);
+        let pdu = [0x01u8, 0x03, 0x00, 0x00, 0x00, 0x0A];
+        let frame = framer.frame_request(&pdu).unwrap();
+        assert_eq!(&frame[..pdu.len()], &pdu);
+        assert_eq!(frame.len(), pdu.len() + 2);
+
+        // Response: slave + fcode + byte_count + data + CRC.
+        let resp_body = [0x01u8, 0x03, 0x02, 0x12, 0x34];
+        let crc = compute_crc(&resp_body);
+        let mut resp = resp_body.to_vec();
+        resp.push((crc & 0xFF) as u8);
+        resp.push((crc >> 8) as u8);
+        let unwrapped = framer.unwrap_response(&resp).unwrap();
+        assert_eq!(unwrapped.transaction_id, None);
+        assert_eq!(unwrapped.pdu, &[0x03, 0x02, 0x12, 0x34]);
+    }
+
+    #[test]
+    fn rtu_bad_crc_rejected() {
+        let framer = ModbusFramer::new(LinkType::Rtu);
+        // Valid body but a corrupted CRC.
+        let resp = [0x01u8, 0x03, 0x02, 0x12, 0x34, 0x00, 0x00];
+        assert!(matches!(
+            framer.unwrap_response(&resp),
+            Err(ModbusError::CrcError)
+        ));
+    }
+
+    #[test]
+    fn ascii_frame_roundtrip() {
+        let mut framer = ModbusFramer::new(LinkType::Ascii);
+        let pdu = [0x01u8, 0x03, 0x00, 0x6B, 0x00, 0x03];
+        let frame = framer.frame_request(&pdu).unwrap();
+        assert_eq!(frame[0], b':');
+        // ':' + 6 PDU bytes (12 hex) + LRC (2 hex) = 15 chars.
+        assert_eq!(frame.len(), 1 + 12 + 2);
+        assert_eq!(&frame[1..13], b"0103006B0003");
+        // LRC of the PDU is 0x8E.
+        assert_eq!(&frame[13..], b"8E");
+
+        // Response: slave + fcode + byte_count + data, with LRC appended.
+        let resp_body = [0x01u8, 0x03, 0x02, 0xAA, 0xBB];
+        let lrc = compute_lrc(&resp_body);
+        let mut frame = vec![b':'];
+        for &b in &resp_body {
+            encode_ascii(b, &mut frame);
+        }
+        encode_ascii(lrc, &mut frame);
+        let unwrapped = framer.unwrap_response(&frame).unwrap();
+        assert_eq!(unwrapped.pdu, &[0x03, 0x02, 0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn ascii_bad_lrc_rejected() {
+        let framer = ModbusFramer::new(LinkType::Ascii);
+        let mut frame = vec![b':'];
+        for &b in &[0x01u8, 0x03, 0x02, 0xAA, 0xBB] {
+            encode_ascii(b, &mut frame);
+        }
+        encode_ascii(0x00, &mut frame); // wrong LRC
+        assert!(matches!(
+            framer.unwrap_response(&frame),
+            Err(ModbusError::LrcError { .. })
+        ));
+    }
+
+    #[test]
+    fn ascii_missing_marker_rejected() {
+        let framer = ModbusFramer::new(LinkType::Ascii);
+        assert!(matches!(
+            framer.unwrap_response(b"010302AABB"),
+            Err(ModbusError::MissingAsciiMarker)
+        ));
+    }
+
+    #[test]
+    fn link_type_from_i32_matches_c_enum() {
+        assert_eq!(LinkType::from_i32(0), Some(LinkType::Tcp));
+        assert_eq!(LinkType::from_i32(1), Some(LinkType::Rtu));
+        assert_eq!(LinkType::from_i32(2), Some(LinkType::Ascii));
+        assert_eq!(LinkType::from_i32(3), Some(LinkType::Udp));
+        assert_eq!(LinkType::from_i32(4), None);
+    }
+}

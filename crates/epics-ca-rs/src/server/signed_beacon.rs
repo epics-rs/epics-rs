@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use tokio::net::UdpSocket;
 
 /// Custom CA command for the signed beacon companion datagram. Picked
@@ -195,7 +195,10 @@ impl SignedBeaconVerifier {
         signed[4..6].copy_from_slice(&server_port.to_be_bytes());
         signed[6..10].copy_from_slice(&beacon_id.to_be_bytes());
         signed[10..18].copy_from_slice(&ts.to_be_bytes());
-        vk.verify(&signed, &signature)
+        // verify_strict (not verify): rejects low-order / non-canonical
+        // public keys — same Ed25519 signature-malleability hardening
+        // applied to cap_token verification. Honest keys are unaffected.
+        vk.verify_strict(&signed, &signature)
             .map_err(|_| VerifyError::BadSignature)?;
         Ok((server_ip, server_port, beacon_id))
     }

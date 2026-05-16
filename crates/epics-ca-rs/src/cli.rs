@@ -195,7 +195,10 @@ pub fn format_value(
             req_elems_present,
         ),
         EpicsValue::CharArray(arr) => {
-            if fmt.char_array_as_string {
+            // C `caget.c` renders a CHAR array as a long-string only when
+            // `charArrAsStr && (reqElems || nElems > 1)` — a 1-element
+            // CHAR array with `-S` but no `-#` falls through to numeric.
+            if fmt.char_array_as_string && (req_elems_present || arr.len() > 1) {
                 // Long-string convention: bytes up to first NUL.
                 let end = arr.iter().position(|&b| b == 0).unwrap_or(arr.len());
                 String::from_utf8_lossy(&arr[..end]).into_owned()

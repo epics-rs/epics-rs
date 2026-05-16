@@ -10,7 +10,8 @@
 //! Token shape (the payload):
 //!
 //! ```json
-//! {"sub":"alice","groups":["BEAM"],"exp":1714200000,"iss":"ops-1"}
+//! {"sub":"alice","groups":["BEAM"],"exp":1714200000,"iss":"ops-1",
+//!  "aud":"server-a","cnf":"<base64url(sha256(peer-cert-der))>"}
 //! ```
 //!
 //! Encoded form: `cap:<base64url(payload)>.<base64url(signature)>`
@@ -21,6 +22,31 @@
 //! - `exp` is unix seconds; tokens past expiry are rejected
 //! - `groups` are surfaced through ACF UAG matching as
 //!   `cap-token-group:<NAME>` virtual entries
+//! - `aud` is the server identity the token is minted for; a
+//!   verifier configured with a non-empty audience rejects any
+//!   token whose `aud` does not match (defeats cross-server replay)
+//! - `cnf` is the channel-binding confirmation: base64url of the
+//!   SHA-256 of the peer's leaf TLS certificate DER. It binds the
+//!   token to the exact TLS channel it was minted for
+//!
+//! ## Replay protection / mTLS-only requirement
+//!
+//! Cap-tokens are bearer credentials shipped in the *plaintext*
+//! `CA_PROTO_CLIENT_NAME` message. Without binding, any on-path
+//! observer could capture and replay a token verbatim until `exp`.
+//! To defeat this:
+//!
+//! - Every cap-token MUST be channel-bound: [`TokenIssuer::issue`]
+//!   is called with a [`ChannelBinding`] derived from the TLS peer
+//!   certificate, and [`TokenVerifier::verify`] rejects any token
+//!   with no `cnf` claim ([`TokenError::Unbound`]).
+//! - Because a [`ChannelBinding`] can only be derived from a TLS
+//!   peer certificate, a bound token is useless without the matching
+//!   mTLS channel. Cap-tokens therefore MUST NOT be used over a
+//!   plaintext (non-TLS) circuit — `verify()` will reject them.
+//! - A verifier SHOULD be configured with an audience
+//!   ([`TokenVerifier::with_audience`]) so a token minted for one
+//!   server cannot be presented to another.
 //!
 //! The format is intentionally not JWT — JWT carries a lot of
 //! historical baggage we don't need. Custom but compact suits the
@@ -34,6 +60,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Transport channel binding: SHA-256 of the peer's leaf TLS
+/// certificate DER. A cap-token is cryptographically bound to the
+/// TLS channel it was minted for, defeating replay on any other circuit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelBinding([u8; 32]);
+
+impl ChannelBinding {
+    /// Derive from the peer's leaf certificate DER bytes (SHA-256).
+    pub fn from_peer_cert_der(der: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(der);
+        let digest = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        Self(out)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenClaims {
@@ -46,6 +95,13 @@ pub struct TokenClaims {
     pub exp: u64,
     /// Issuer key id — looked up in the verifier's keyring.
     pub iss: String,
+    /// Audience: the server identity the token is minted for.
+    pub aud: String,
+    /// Channel-binding confirmation: base64url (url-safe, no-pad) of
+    /// the 32-byte SHA-256 of the peer's leaf TLS certificate DER.
+    /// `None` = an unbound token (rejected by [`TokenVerifier::verify`]).
+    #[serde(default)]
+    pub cnf: Option<String>,
 }
 
 impl TokenClaims {
@@ -76,6 +132,12 @@ pub enum TokenError {
     Expired,
     #[error("token revoked")]
     Revoked,
+    #[error("token audience does not match verifier audience")]
+    AudienceMismatch,
+    #[error("token channel binding does not match the transport")]
+    BindingMismatch,
+    #[error("token is not channel-bound; cap-tokens require an mTLS circuit")]
+    Unbound,
 }
 
 /// Issues tokens. One signing key per server / role.
@@ -100,16 +162,35 @@ impl TokenIssuer {
         Self::new(iss_id, SigningKey::generate(&mut csprng))
     }
 
-    pub fn issue(&self, sub: &str, groups: &[String], ttl_secs: u64) -> String {
+    /// Mint a token for `sub` with `groups`, valid for `ttl_secs`.
+    ///
+    /// `aud` is the server identity the token is minted for and is
+    /// written into the payload. `binding`, when `Some`, writes the
+    /// `cnf` channel-binding claim — callers MUST supply a binding
+    /// derived from the TLS peer certificate, since the verifier
+    /// rejects unbound tokens.
+    pub fn issue(
+        &self,
+        sub: &str,
+        groups: &[String],
+        ttl_secs: u64,
+        aud: &str,
+        binding: Option<&ChannelBinding>,
+    ) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let cnf = binding.map(|b| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b.as_bytes())
+        });
         let claims = TokenClaims {
             sub: sub.to_string(),
             groups: groups.to_vec(),
             exp: now + ttl_secs,
             iss: self.iss_id.clone(),
+            aud: aud.to_string(),
+            cnf,
         };
         let payload = serde_json::to_vec(&claims).expect("TokenClaims serializes infallibly");
         let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload);
@@ -133,11 +214,23 @@ pub struct TokenVerifier {
     /// can't be "expired early" any other way; we accept the storage
     /// cost (small — typically a handful of entries).
     revoked: std::collections::HashSet<(String, String)>,
+    /// Expected audience. When non-empty, [`TokenVerifier::verify`]
+    /// rejects any token whose `aud` claim does not match. Empty =
+    /// audience checking disabled.
+    audience: String,
 }
 
 impl TokenVerifier {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the expected audience — the identity of this server. A
+    /// token whose `aud` claim does not match is rejected with
+    /// [`TokenError::AudienceMismatch`].
+    pub fn with_audience(mut self, aud: impl Into<String>) -> Self {
+        self.audience = aud.into();
+        self
     }
 
     pub fn trust(&mut self, iss_id: impl Into<String>, key: VerifyingKey) {
@@ -166,7 +259,23 @@ impl TokenVerifier {
             .collect()
     }
 
-    pub fn verify(&self, token: &str) -> Result<TokenClaims, TokenError> {
+    /// Verify a token, returning its claims on success.
+    ///
+    /// `binding` is the channel binding derived from the current TLS
+    /// peer certificate, or `None` if the circuit is plaintext.
+    /// Beyond signature / expiry / revocation, verification enforces:
+    ///
+    /// - **Audience**: if the verifier has a non-empty audience, the
+    ///   token's `aud` must match it, else [`TokenError::AudienceMismatch`].
+    /// - **Channel binding**: a token with a `cnf` claim requires a
+    ///   matching `binding`, else [`TokenError::BindingMismatch`]. A
+    ///   token with no `cnf` claim is rejected with
+    ///   [`TokenError::Unbound`] — cap-tokens MUST be used over mTLS.
+    pub fn verify(
+        &self,
+        token: &str,
+        binding: Option<&ChannelBinding>,
+    ) -> Result<TokenClaims, TokenError> {
         let body = token
             .strip_prefix("cap:")
             .ok_or(TokenError::MissingPrefix)?;
@@ -210,6 +319,28 @@ impl TokenVerifier {
         {
             return Err(TokenError::Revoked);
         }
+        // Audience: a token minted for another server must not be
+        // accepted here.
+        if !self.audience.is_empty() && claims.aud != self.audience {
+            return Err(TokenError::AudienceMismatch);
+        }
+        // Channel binding / mTLS gating: every cap-token must be
+        // bound to the TLS channel it was minted for. An unbound
+        // token (no `cnf`) is rejected outright — since a binding is
+        // only derivable from a TLS peer cert, this enforces that
+        // cap-tokens only work over an mTLS circuit.
+        match &claims.cnf {
+            Some(cnf_b64) => {
+                let cnf_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(cnf_b64)
+                    .map_err(|e| TokenError::Base64(e.to_string()))?;
+                let bound = binding.ok_or(TokenError::BindingMismatch)?;
+                if cnf_bytes.as_slice() != bound.as_bytes() {
+                    return Err(TokenError::BindingMismatch);
+                }
+            }
+            None => return Err(TokenError::Unbound),
+        }
         Ok(claims)
     }
 }
@@ -218,24 +349,39 @@ impl TokenVerifier {
 mod tests {
     use super::*;
 
+    /// Fabricate a deterministic [`ChannelBinding`] for tests by
+    /// hashing fake certificate DER bytes.
+    fn fake_binding(der: &[u8]) -> ChannelBinding {
+        ChannelBinding::from_peer_cert_der(der)
+    }
+
     #[test]
     fn round_trip_valid() {
         let issuer = TokenIssuer::generate("ops-1");
         let mut verifier = TokenVerifier::new();
         verifier.trust("ops-1", issuer.verifying_key());
-        let tok = issuer.issue("alice", &["BEAM".into(), "DIAG".into()], 3600);
-        let claims = verifier.verify(&tok).expect("valid token");
+        let binding = fake_binding(b"fake-cert-der");
+        let tok = issuer.issue(
+            "alice",
+            &["BEAM".into(), "DIAG".into()],
+            3600,
+            "server-a",
+            Some(&binding),
+        );
+        let claims = verifier.verify(&tok, Some(&binding)).expect("valid token");
         assert_eq!(claims.sub, "alice");
         assert_eq!(claims.groups, vec!["BEAM", "DIAG"]);
         assert_eq!(claims.iss, "ops-1");
+        assert_eq!(claims.aud, "server-a");
     }
 
     #[test]
     fn rejects_unknown_issuer() {
         let issuer = TokenIssuer::generate("ops-1");
         let verifier = TokenVerifier::new();
-        let tok = issuer.issue("alice", &[], 3600);
-        let err = verifier.verify(&tok).unwrap_err();
+        let binding = fake_binding(b"fake-cert-der");
+        let tok = issuer.issue("alice", &[], 3600, "server-a", Some(&binding));
+        let err = verifier.verify(&tok, Some(&binding)).unwrap_err();
         matches!(err, TokenError::UnknownIssuer(_))
             .then_some(())
             .expect("expected UnknownIssuer");
@@ -246,14 +392,15 @@ mod tests {
         let issuer = TokenIssuer::generate("ops-1");
         let mut verifier = TokenVerifier::new();
         verifier.trust("ops-1", issuer.verifying_key());
-        let tok = issuer.issue("alice", &[], 3600);
+        let binding = fake_binding(b"fake-cert-der");
+        let tok = issuer.issue("alice", &[], 3600, "server-a", Some(&binding));
         // Flip a byte in the payload portion.
         let body = tok.strip_prefix("cap:").unwrap();
         let (p, s) = body.split_once('.').unwrap();
         let mut p_bytes = p.as_bytes().to_vec();
         p_bytes[0] ^= 0xFF;
         let tampered = format!("cap:{}.{s}", String::from_utf8_lossy(&p_bytes));
-        assert!(verifier.verify(&tampered).is_err());
+        assert!(verifier.verify(&tampered, Some(&binding)).is_err());
     }
 
     #[test]
@@ -261,16 +408,17 @@ mod tests {
         let issuer = TokenIssuer::generate("ops-1");
         let mut verifier = TokenVerifier::new();
         verifier.trust("ops-1", issuer.verifying_key());
-        let tok = issuer.issue("alice", &[], 3600);
-        assert!(verifier.verify(&tok).is_ok());
+        let binding = fake_binding(b"fake-cert-der");
+        let tok = issuer.issue("alice", &[], 3600, "server-a", Some(&binding));
+        assert!(verifier.verify(&tok, Some(&binding)).is_ok());
         verifier.revoke("ops-1", "alice");
-        let err = verifier.verify(&tok).unwrap_err();
+        let err = verifier.verify(&tok, Some(&binding)).unwrap_err();
         matches!(err, TokenError::Revoked)
             .then_some(())
             .expect("expected Revoked");
         // Lifting the revocation re-allows the token.
         verifier.unrevoke("ops-1", "alice");
-        assert!(verifier.verify(&tok).is_ok());
+        assert!(verifier.verify(&tok, Some(&binding)).is_ok());
     }
 
     #[test]
@@ -289,11 +437,93 @@ mod tests {
         let issuer = TokenIssuer::generate("ops-1");
         let mut verifier = TokenVerifier::new();
         verifier.trust("ops-1", issuer.verifying_key());
-        let tok = issuer.issue("alice", &[], 0); // exp = now
+        let binding = fake_binding(b"fake-cert-der");
+        let tok = issuer.issue("alice", &[], 0, "server-a", Some(&binding)); // exp = now
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let err = verifier.verify(&tok).unwrap_err();
+        let err = verifier.verify(&tok, Some(&binding)).unwrap_err();
         matches!(err, TokenError::Expired)
             .then_some(())
             .expect("expected Expired");
+    }
+
+    #[test]
+    fn bound_token_verifies_with_matching_binding() {
+        let issuer = TokenIssuer::generate("ops-1");
+        let mut verifier = TokenVerifier::new();
+        verifier.trust("ops-1", issuer.verifying_key());
+        let binding = fake_binding(b"peer-cert-1");
+        let tok = issuer.issue("alice", &[], 3600, "server-a", Some(&binding));
+        let claims = verifier
+            .verify(&tok, Some(&binding))
+            .expect("matching binding verifies");
+        assert_eq!(claims.sub, "alice");
+        assert!(claims.cnf.is_some());
+    }
+
+    #[test]
+    fn bound_token_rejected_with_different_binding() {
+        let issuer = TokenIssuer::generate("ops-1");
+        let mut verifier = TokenVerifier::new();
+        verifier.trust("ops-1", issuer.verifying_key());
+        let binding = fake_binding(b"peer-cert-1");
+        let other = fake_binding(b"peer-cert-2");
+        let tok = issuer.issue("alice", &[], 3600, "server-a", Some(&binding));
+        let err = verifier.verify(&tok, Some(&other)).unwrap_err();
+        matches!(err, TokenError::BindingMismatch)
+            .then_some(())
+            .expect("expected BindingMismatch for different binding");
+    }
+
+    #[test]
+    fn bound_token_rejected_with_absent_binding() {
+        let issuer = TokenIssuer::generate("ops-1");
+        let mut verifier = TokenVerifier::new();
+        verifier.trust("ops-1", issuer.verifying_key());
+        let binding = fake_binding(b"peer-cert-1");
+        let tok = issuer.issue("alice", &[], 3600, "server-a", Some(&binding));
+        let err = verifier.verify(&tok, None).unwrap_err();
+        matches!(err, TokenError::BindingMismatch)
+            .then_some(())
+            .expect("expected BindingMismatch for absent binding");
+    }
+
+    #[test]
+    fn unbound_token_rejected_even_with_binding() {
+        let issuer = TokenIssuer::generate("ops-1");
+        let mut verifier = TokenVerifier::new();
+        verifier.trust("ops-1", issuer.verifying_key());
+        let binding = fake_binding(b"peer-cert-1");
+        // Token minted with no binding.
+        let tok = issuer.issue("alice", &[], 3600, "server-a", None);
+        let err = verifier.verify(&tok, Some(&binding)).unwrap_err();
+        matches!(err, TokenError::Unbound)
+            .then_some(())
+            .expect("expected Unbound for token minted without a binding");
+    }
+
+    #[test]
+    fn audience_mismatch_rejected() {
+        let issuer = TokenIssuer::generate("ops-1");
+        let mut verifier = TokenVerifier::new().with_audience("server-a");
+        verifier.trust("ops-1", issuer.verifying_key());
+        let binding = fake_binding(b"peer-cert-1");
+        let tok = issuer.issue("alice", &[], 3600, "server-b", Some(&binding));
+        let err = verifier.verify(&tok, Some(&binding)).unwrap_err();
+        matches!(err, TokenError::AudienceMismatch)
+            .then_some(())
+            .expect("expected AudienceMismatch");
+    }
+
+    #[test]
+    fn audience_match_passes() {
+        let issuer = TokenIssuer::generate("ops-1");
+        let mut verifier = TokenVerifier::new().with_audience("server-a");
+        verifier.trust("ops-1", issuer.verifying_key());
+        let binding = fake_binding(b"peer-cert-1");
+        let tok = issuer.issue("alice", &[], 3600, "server-a", Some(&binding));
+        let claims = verifier
+            .verify(&tok, Some(&binding))
+            .expect("matching audience verifies");
+        assert_eq!(claims.aud, "server-a");
     }
 }

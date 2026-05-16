@@ -380,6 +380,9 @@ mod tests {
         assert_eq!(PROC_DESTROY_LINK, 23);
     }
 
+    // Only meaningful in a build without the hardware feature — with
+    // `vxi11` enabled `connect()` reaches the (unimplemented) HW path.
+    #[cfg(not(feature = "vxi11"))]
     #[test]
     fn connect_without_hw_feature_reports_error() {
         let mut drv =

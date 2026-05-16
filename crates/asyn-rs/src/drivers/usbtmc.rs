@@ -367,6 +367,9 @@ mod tests {
         assert!(!drv.base().auto_connect);
     }
 
+    // Only meaningful in a build without the hardware feature — with
+    // `usbtmc` enabled `connect()` reaches the (unimplemented) HW path.
+    #[cfg(not(feature = "usbtmc"))]
     #[test]
     fn connect_without_hw_feature_reports_error() {
         let mut drv = DrvAsynUsbtmcPort::configure("usbtmc0", 0x0957, 0x0407, "", 0, 0).unwrap();

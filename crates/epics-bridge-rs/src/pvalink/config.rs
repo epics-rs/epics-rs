@@ -22,6 +22,51 @@ pub enum LinkDirection {
     Out,
 }
 
+/// Maximize-severity mode for a pvalink (the `sevr` JSON option and the
+/// legacy `MS`/`NMS`/`MSI`/`MSS` bare modifiers).
+///
+/// Mirrors pvxs `pvaLinkConfig::sevr` (`pvalink.h` enum
+/// `NMS`/`MS`/`MSI`/`MSS`). Controls whether a non-`NO_ALARM` severity
+/// observed on the *remote* NT `alarm.severity` field propagates into
+/// the owning record's `LINK_ALARM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SevrMode {
+    /// `NMS` — never maximize. Remote severity is dropped. Default,
+    /// matching pvxs (`sevr` defaults to `NMS`).
+    #[default]
+    Nms,
+    /// `MS` — maximize severity: any non-`NO_ALARM` remote severity
+    /// propagates into the record's `LINK_ALARM`.
+    Ms,
+    /// `MSI` — maximize *invalid* only: propagate solely when the
+    /// remote severity is `INVALID_ALARM`.
+    Msi,
+}
+
+impl SevrMode {
+    /// Decide whether a remote NT `alarm.severity` value should raise
+    /// `LINK_ALARM` on the owning record.
+    ///
+    /// `remote_severity` follows the EPICS alarm severity numbering
+    /// (`0 = NO_ALARM`, `1 = MINOR`, `2 = MAJOR`, `3 = INVALID`),
+    /// which is also the pvData NT `alarm.severity` encoding.
+    ///
+    /// Mirrors pvxs `pvalink_lset.cpp:418`:
+    /// ```text
+    /// (snap_severity != NO_ALARM && sevr == MS) ||
+    /// (snap_severity == INVALID_ALARM && sevr == MSI)
+    /// ```
+    pub fn propagates(self, remote_severity: i32) -> bool {
+        const NO_ALARM: i32 = 0;
+        const INVALID_ALARM: i32 = 3;
+        match self {
+            SevrMode::Nms => false,
+            SevrMode::Ms => remote_severity != NO_ALARM,
+            SevrMode::Msi => remote_severity == INVALID_ALARM,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PvaLinkConfig {
     pub pv_name: String,
@@ -41,6 +86,9 @@ pub struct PvaLinkConfig {
     /// (pvalink_link.cpp:122). Default `false` — record must be
     /// scanned externally.
     pub scan_on_update: bool,
+    /// Maximize-severity mode (`MS`/`NMS`/`MSI`). Mirrors pvxs
+    /// `pvaLinkConfig::sevr`.
+    pub sevr: SevrMode,
     /// Direction inferred from caller, not parsed.
     pub direction: LinkDirection,
 }
@@ -82,12 +130,8 @@ impl PvaLinkConfig {
 
         let mut cfg = PvaLinkConfig {
             pv_name: pv_name.to_string(),
-            field: "value".to_string(),
-            monitor: false,
-            process: false,
-            notify: false,
-            scan_on_update: false,
             direction,
+            ..PvaLinkConfig::defaults_for(pv_name, direction)
         };
 
         if let Some(v) = opts.get("field") {
@@ -97,7 +141,22 @@ impl PvaLinkConfig {
             cfg.monitor = parse_bool(v)?;
         }
         if let Some(v) = opts.get("proc") {
-            cfg.process = matches!(v.as_str(), "TRUE" | "true" | "1" | "PASSIVE" | "passive");
+            // pvxs `proc`: false/true/NPP/PP/CP/CPP. CP / CPP imply
+            // monitor + scan-on-update; PP / true imply put-side
+            // process.
+            match v.as_str() {
+                "TRUE" | "true" | "1" | "PP" | "pp" | "PASSIVE" | "passive" => cfg.process = true,
+                "FALSE" | "false" | "0" | "NPP" | "npp" => cfg.process = false,
+                "CP" | "cp" => {
+                    cfg.monitor = true;
+                    cfg.scan_on_update = true;
+                }
+                "CPP" | "cpp" => {
+                    cfg.monitor = true;
+                    cfg.scan_on_update = true;
+                }
+                other => return Err(PvaLinkParseError::BadOption(other.to_string())),
+            }
         }
         if let Some(v) = opts.get("notify") {
             cfg.notify = parse_bool(v)?;
@@ -105,20 +164,49 @@ impl PvaLinkConfig {
         if let Some(v) = opts.get("scan_on_update") {
             cfg.scan_on_update = parse_bool(v)?;
         }
+        if let Some(v) = opts.get("sevr") {
+            cfg.sevr = parse_sevr(v)?;
+        }
 
         // Apply legacy bare modifiers
         for m in legacy_mods {
             match m.as_str() {
                 "PP" | "pp" => cfg.process = true,
                 "NPP" | "npp" => cfg.process = false,
-                "MS" | "ms" | "NMS" | "nms" => {
-                    // Maximize-severity flags don't affect the PVA path; ignore.
+                "CP" | "cp" => {
+                    cfg.monitor = true;
+                    cfg.scan_on_update = true;
                 }
+                "CPP" | "cpp" => {
+                    cfg.monitor = true;
+                    cfg.scan_on_update = true;
+                }
+                "MS" | "ms" => cfg.sevr = SevrMode::Ms,
+                "MSI" | "msi" => cfg.sevr = SevrMode::Msi,
+                "MSS" | "mss" => cfg.sevr = SevrMode::Ms, // MSS == MS at our granularity
+                "NMS" | "nms" => cfg.sevr = SevrMode::Nms,
                 _ => {}
             }
         }
 
         Ok(cfg)
+    }
+
+    /// Construct a config with pvxs-default option values for the
+    /// given PV name + direction. Used by the parser and by callers
+    /// (the resolver) that build configs programmatically rather than
+    /// parsing a link string.
+    pub fn defaults_for(pv_name: &str, direction: LinkDirection) -> Self {
+        PvaLinkConfig {
+            pv_name: pv_name.to_string(),
+            field: "value".to_string(),
+            monitor: false,
+            process: false,
+            notify: false,
+            scan_on_update: false,
+            sevr: SevrMode::Nms,
+            direction,
+        }
     }
 }
 
@@ -143,6 +231,20 @@ fn parse_query(q: &str) -> Result<HashMap<String, String>, PvaLinkParseError> {
         out.insert(k.to_string(), v.to_string());
     }
     Ok(out)
+}
+
+/// Parse a `sevr` option value. Accepts the pvxs string forms
+/// (`NMS`/`MS`/`MSI`/`MSS`) plus boolean shorthands — pvxs maps
+/// `sevr:true` → `MS` and `sevr:false` → `NMS`.
+fn parse_sevr(v: &str) -> Result<SevrMode, PvaLinkParseError> {
+    match v {
+        "NMS" | "nms" | "false" | "FALSE" | "0" | "no" | "NO" => Ok(SevrMode::Nms),
+        // pvxs treats MSS as a maximize-severity variant; at our
+        // granularity (no separate status propagation) it equals MS.
+        "MS" | "ms" | "MSS" | "mss" | "true" | "TRUE" | "1" | "yes" | "YES" => Ok(SevrMode::Ms),
+        "MSI" | "msi" => Ok(SevrMode::Msi),
+        other => Err(PvaLinkParseError::BadOption(format!("sevr={other}"))),
+    }
 }
 
 fn parse_bool(v: &str) -> Result<bool, PvaLinkParseError> {
@@ -204,6 +306,108 @@ mod tests {
         assert!(matches!(
             PvaLinkConfig::parse("ca://X", LinkDirection::Inp),
             Err(PvaLinkParseError::NotPvaLink(_))
+        ));
+    }
+
+    // ---- B2: MS / NMS / MSI severity flags ----
+
+    #[test]
+    fn sevr_defaults_to_nms() {
+        let c = PvaLinkConfig::parse("pva://X", LinkDirection::Inp).unwrap();
+        assert_eq!(c.sevr, SevrMode::Nms);
+    }
+
+    #[test]
+    fn sevr_legacy_modifiers() {
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X MS", LinkDirection::Inp)
+                .unwrap()
+                .sevr,
+            SevrMode::Ms
+        );
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X MSI", LinkDirection::Inp)
+                .unwrap()
+                .sevr,
+            SevrMode::Msi
+        );
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X NMS", LinkDirection::Inp)
+                .unwrap()
+                .sevr,
+            SevrMode::Nms
+        );
+        // MSS folds to MS at our granularity.
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X MSS", LinkDirection::Inp)
+                .unwrap()
+                .sevr,
+            SevrMode::Ms
+        );
+    }
+
+    #[test]
+    fn sevr_query_option() {
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?sevr=MS", LinkDirection::Inp)
+                .unwrap()
+                .sevr,
+            SevrMode::Ms
+        );
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?sevr=MSI", LinkDirection::Inp)
+                .unwrap()
+                .sevr,
+            SevrMode::Msi
+        );
+        // pvxs boolean shorthand: true→MS, false→NMS.
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?sevr=true", LinkDirection::Inp)
+                .unwrap()
+                .sevr,
+            SevrMode::Ms
+        );
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?sevr=false", LinkDirection::Inp)
+                .unwrap()
+                .sevr,
+            SevrMode::Nms
+        );
+    }
+
+    #[test]
+    fn sevr_propagation_semantics() {
+        // NMS: never propagates.
+        for sev in 0..=3 {
+            assert!(!SevrMode::Nms.propagates(sev));
+        }
+        // MS: any non-NO_ALARM severity propagates.
+        assert!(!SevrMode::Ms.propagates(0)); // NO_ALARM
+        assert!(SevrMode::Ms.propagates(1)); // MINOR
+        assert!(SevrMode::Ms.propagates(2)); // MAJOR
+        assert!(SevrMode::Ms.propagates(3)); // INVALID
+        // MSI: only INVALID propagates.
+        assert!(!SevrMode::Msi.propagates(0));
+        assert!(!SevrMode::Msi.propagates(1));
+        assert!(!SevrMode::Msi.propagates(2));
+        assert!(SevrMode::Msi.propagates(3));
+    }
+
+    #[test]
+    fn proc_cp_implies_monitor_and_scan() {
+        let c = PvaLinkConfig::parse("pva://X?proc=CP", LinkDirection::Inp).unwrap();
+        assert!(c.monitor);
+        assert!(c.scan_on_update);
+        let c2 = PvaLinkConfig::parse("pva://X CPP", LinkDirection::Inp).unwrap();
+        assert!(c2.monitor);
+        assert!(c2.scan_on_update);
+    }
+
+    #[test]
+    fn bad_sevr_value_rejected() {
+        assert!(matches!(
+            PvaLinkConfig::parse("pva://X?sevr=BOGUS", LinkDirection::Inp),
+            Err(PvaLinkParseError::BadOption(_))
         ));
     }
 }

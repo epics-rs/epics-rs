@@ -71,6 +71,19 @@ pub struct PvaLinkResolver {
     /// Mirrors pvxs `pvalink_enable` / `pvalink_disable` iocsh
     /// commands (pvalink.cpp:328).
     enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-PV link-option overrides.
+    ///
+    /// The `epics-base-rs` link parser collapses `@pva://X?sevr=MS`
+    /// (and the legacy `pva://X MS` suffix form) down to a bare PV
+    /// name in `ParsedLink::Pva`, dropping every query option before
+    /// the bridge resolver is consulted. To keep B2 (`MS`/`NMS`)
+    /// effective on the resolver hot path, the bridge stashes the
+    /// parsed [`PvaLinkConfig`] here keyed by PV name when a full
+    /// link string is opened via [`Self::open_link`]; the resolver
+    /// then reuses those options instead of the `NMS` default.
+    /// Mirrors the role of pvxs `pvaLinkConfig` carried on the
+    /// `jlink` for the lifetime of the link.
+    link_options: Arc<parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>>,
 }
 
 impl PvaLinkResolver {
@@ -80,6 +93,7 @@ impl PvaLinkResolver {
             handle,
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            link_options: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -100,17 +114,49 @@ impl PvaLinkResolver {
     /// pvxs `pvalinkOpen` (pvalink_channel.cpp). After this returns,
     /// later calls to [`Self::resolve`] for the same name will read
     /// the cached monitor value (no async block).
+    /// Honors any link options previously registered for `pv_name`
+    /// via [`Self::open_link`] — otherwise pvxs defaults apply.
     pub async fn open(&self, pv_name: &str) -> PvaLinkResult<Arc<PvaLink>> {
+        self.registry.get_or_open(self.inp_cfg_for(pv_name)).await
+    }
+
+    /// Open / cache a link from a full `@pva://...` link string,
+    /// parsing and retaining its options (`sevr`, ...). The parsed
+    /// [`PvaLinkConfig`] is stashed under the bare PV name so the
+    /// steady-state resolver hot path — driven by `epics-base-rs`,
+    /// which only ever hands the bridge a bare PV name — keeps
+    /// applying the same options.
+    ///
+    /// This is the entry point that makes B2 (`MS`/`NMS`) effective
+    /// through the resolver: an INP record whose link string carries
+    /// `sevr=MS` is registered here at IOC init (or via `pvxr`), and
+    /// every later bare-name resolve reuses the `MS` mode.
+    pub async fn open_link(&self, link_string: &str) -> PvaLinkResult<Arc<PvaLink>> {
+        let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Inp)?;
+        // An INP link that is meaningful for the resolver must keep a
+        // monitor open; force it on (pvxs treats `proc=CP/CPP` and the
+        // resolver path as monitored).
         let cfg = PvaLinkConfig {
-            pv_name: pv_name.to_string(),
-            field: "value".into(),
             monitor: true,
-            process: false,
-            notify: false,
-            scan_on_update: false,
-            direction: LinkDirection::Inp,
+            ..cfg
         };
+        self.link_options
+            .write()
+            .insert(cfg.pv_name.clone(), cfg.clone());
         self.registry.get_or_open(cfg).await
+    }
+
+    /// Build the INP config for `pv_name`, applying any options
+    /// registered via [`Self::open_link`]. Falls back to the pvxs
+    /// monitor defaults (`NMS`) when none.
+    fn inp_cfg_for(&self, pv_name: &str) -> PvaLinkConfig {
+        if let Some(cfg) = self.link_options.read().get(pv_name) {
+            return PvaLinkConfig {
+                monitor: true,
+                ..cfg.clone()
+            };
+        }
+        default_inp_cfg(pv_name)
     }
 
     /// Number of successful link reads since startup.
@@ -121,6 +167,21 @@ impl PvaLinkResolver {
     /// Number of cached links.
     pub fn link_count(&self) -> usize {
         self.registry.len()
+    }
+
+    /// Maximize-severity result for the link named `pv_name` (B2).
+    ///
+    /// Returns the remote EPICS severity that should fold into the
+    /// owning record's `LINK_ALARM` — `Some(sev)` only when the
+    /// link's `MS`/`MSI` mode says the remote severity propagates;
+    /// `None` for `NMS` links, sub-threshold severities, links not
+    /// yet open, or links with no cached value. Mirrors pvxs
+    /// `pvaGetAlarmMsg`'s severity output (pvalink_lset.cpp:544).
+    pub fn link_alarm_severity(&self, pv_name: &str) -> Option<i32> {
+        let name = strip_scheme(pv_name)?;
+        self.registry
+            .try_get(name, LinkDirection::Inp)?
+            .link_alarm_severity()
     }
 
     /// Wait until the link for `pv_name` has received at least one
@@ -191,15 +252,7 @@ impl PvaLinkResolver {
 
             // Slow path: link not yet open or first-event not arrived.
             // Open the link (idempotent) then issue an async read.
-            let cfg = PvaLinkConfig {
-                pv_name: name.to_string(),
-                field: "value".into(),
-                monitor: true,
-                process: false,
-                notify: false,
-                scan_on_update: false,
-                direction: LinkDirection::Inp,
-            };
+            let cfg = resolver.inp_cfg_for(name);
             // The Lset external resolver is invoked from inside an
             // async context (PvDatabase::resolve_external_pv runs on a
             // tokio worker). Bare Handle::block_on panics under those
@@ -274,15 +327,7 @@ impl LinkSet for PvaLinkResolver {
         }
 
         // Slow path: open the link / fall back to a fresh GET.
-        let cfg = PvaLinkConfig {
-            pv_name: name.to_string(),
-            field: "value".into(),
-            monitor: true,
-            process: false,
-            notify: false,
-            scan_on_update: false,
-            direction: LinkDirection::Inp,
-        };
+        let cfg = self.inp_cfg_for(name);
         let value = block_in_place_or_warn(|| {
             self.handle.block_on(async {
                 let link = self.registry.get_or_open(cfg).await.ok()?;
@@ -302,13 +347,8 @@ impl LinkSet for PvaLinkResolver {
             format!("pvalink rejects ca:// scheme: {name} (use the CA-link path instead)")
         })?;
         let cfg = PvaLinkConfig {
-            pv_name: name.to_string(),
-            field: "value".into(),
-            monitor: false,
             process: true,
-            notify: false,
-            scan_on_update: false,
-            direction: LinkDirection::Out,
+            ..PvaLinkConfig::defaults_for(name, LinkDirection::Out)
         };
         // P-G16: bypass the Display→string→parse round-trip for
         // ARRAYS (where Display alloc is O(N_elements * digits) and
@@ -393,13 +433,8 @@ fn strip_scheme(name: &str) -> Option<&str> {
 
 fn default_inp_cfg(pv_name: &str) -> PvaLinkConfig {
     PvaLinkConfig {
-        pv_name: pv_name.to_string(),
-        field: "value".into(),
         monitor: true,
-        process: false,
-        notify: false,
-        scan_on_update: false,
-        direction: LinkDirection::Inp,
+        ..PvaLinkConfig::defaults_for(pv_name, LinkDirection::Inp)
     }
 }
 

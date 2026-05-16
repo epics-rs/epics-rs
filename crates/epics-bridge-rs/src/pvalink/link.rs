@@ -23,6 +23,8 @@ pub enum PvaLinkError {
     FieldNotFound(String),
     #[error("field {0:?} is not a scalar")]
     NotScalar(String),
+    #[error("link config parse error: {0}")]
+    Config(#[from] super::config::PvaLinkParseError),
 }
 
 pub type PvaLinkResult<T> = Result<T, PvaLinkError>;
@@ -170,25 +172,75 @@ impl PvaLink {
         self.latest.lock().is_some()
     }
 
-    /// Best-effort alarm message for the linked PV. Returns the
-    /// `alarm.message` field of the latest cached NT structure, or
-    /// `None` when unavailable. Mirrors pvxs `pvaGetAlarmMsg`
-    /// (pvalink_lset.cpp:536) at the message-string level (severity
-    /// / status are reported alongside via the standard NT alarm
-    /// substructure — surface-able via `latest_value()`).
-    pub fn alarm_message(&self) -> Option<String> {
+    /// Raw remote NT `alarm.severity` of the latest cached value, in
+    /// EPICS severity numbering (`0 = NO_ALARM` … `3 = INVALID`).
+    /// `None` when no value is cached or the structure carries no
+    /// alarm sub-field.
+    fn remote_alarm_severity(&self) -> Option<i32> {
         let v = self.latest.lock().clone()?;
         let PvField::Structure(s) = v else {
             return None;
         };
-        let alarm = s.get_field("alarm")?;
-        let PvField::Structure(a) = alarm else {
+        let PvField::Structure(a) = s.get_field("alarm")? else {
             return None;
         };
-        match a.get_field("message")? {
-            PvField::Scalar(ScalarValue::String(m)) => Some(m.clone()),
+        match a.get_field("severity")? {
+            PvField::Scalar(sv) => Some(scalar_value_to_f64(sv) as i32),
             _ => None,
         }
+    }
+
+    /// Severity to fold into the owning record's `LINK_ALARM`, after
+    /// applying the link's `MS`/`NMS`/`MSI` maximize-severity mode
+    /// (B2). Returns `None` when no alarm should propagate — i.e.
+    /// `NMS`, or the remote severity does not meet the mode's
+    /// threshold, or no value is cached yet.
+    ///
+    /// Mirrors pvxs `pvalink_lset.cpp:418` — the `recGblSetSevrMsg`
+    /// gate that propagates `snap_severity` into `LINK_ALARM` only
+    /// when `(sevr==MS && sev!=NO_ALARM) || (sevr==MSI && sev==INVALID)`.
+    pub fn link_alarm_severity(&self) -> Option<i32> {
+        let sev = self.remote_alarm_severity()?;
+        if self.config.sevr.propagates(sev) {
+            Some(sev)
+        } else {
+            None
+        }
+    }
+
+    /// Best-effort alarm message for the linked PV.
+    ///
+    /// B2: the message is gated by the link's maximize-severity mode
+    /// (`MS`/`NMS`/`MSI`). It returns `Some(..)` only when the remote
+    /// severity actually propagates per [`Self::link_alarm_severity`] —
+    /// the database consults this hook to decide whether to raise
+    /// `LINK_ALARM` on the owning record, so an `NMS` link (the
+    /// default) must report no alarm even when the remote PV is in
+    /// alarm. Mirrors pvxs `pvaGetAlarmMsg` (pvalink_lset.cpp:536),
+    /// which reads the same `snap_*` slots that the `MS`/`MSI` gate
+    /// at `pvalink_lset.cpp:418` populates.
+    ///
+    /// When the remote NT structure has no `alarm.message` string but
+    /// the severity does propagate, a synthetic message is returned so
+    /// the alarm is still observable.
+    pub fn alarm_message(&self) -> Option<String> {
+        // Severity gate first — NMS / sub-threshold links report
+        // nothing.
+        let sev = self.link_alarm_severity()?;
+        let v = self.latest.lock().clone()?;
+        let PvField::Structure(s) = v else {
+            return None;
+        };
+        let msg = s.get_field("alarm").and_then(|alarm| {
+            let PvField::Structure(a) = alarm else {
+                return None;
+            };
+            match a.get_field("message") {
+                Some(PvField::Scalar(ScalarValue::String(m))) if !m.is_empty() => Some(m.clone()),
+                _ => None,
+            }
+        });
+        Some(msg.unwrap_or_else(|| format!("remote severity {sev}")))
     }
 
     /// Latest cached NT value, if any. Returned as the raw [`PvField`]
@@ -222,6 +274,23 @@ impl PvaLink {
             _ => return None,
         };
         Some((secs, nsec))
+    }
+
+    /// Test-only constructor: build a [`PvaLink`] with a pre-seeded
+    /// cached value and no live connection. Lets the unit tests
+    /// exercise the cache-reading accessors (`link_alarm_severity`,
+    /// `alarm_message`, `try_read_cached`) without standing up a PVA
+    /// server.
+    #[cfg(test)]
+    pub(crate) fn for_test(config: PvaLinkConfig, cached: Option<PvField>) -> Self {
+        let client = PvaClient::builder().timeout(Duration::from_secs(1)).build();
+        Self {
+            _monitor_abort: None,
+            config,
+            client,
+            latest: Arc::new(Mutex::new(cached)),
+            notify_tx: None,
+        }
     }
 }
 
@@ -310,5 +379,88 @@ mod tests {
         let s = PvStructure::new("epics:nt/NTScalar:1.0");
         let v = extract_field(&PvField::Structure(s), "nope");
         assert!(matches!(v, PvField::Null));
+    }
+
+    use super::super::config::{LinkDirection, PvaLinkConfig, SevrMode};
+
+    /// Build an NTScalar-shaped structure with an `alarm.severity`
+    /// (and optional `alarm.message`).
+    fn nt_with_alarm(severity: i32, message: Option<&str>) -> PvField {
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(severity))));
+        if let Some(m) = message {
+            alarm.fields.push((
+                "message".into(),
+                PvField::Scalar(ScalarValue::String(m.to_string())),
+            ));
+        }
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.0))));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        PvField::Structure(root)
+    }
+
+    fn inp_cfg(sevr: SevrMode) -> PvaLinkConfig {
+        PvaLinkConfig {
+            monitor: true,
+            sevr,
+            ..PvaLinkConfig::defaults_for("X", LinkDirection::Inp)
+        }
+    }
+
+    // ---- B2: MS / NMS / MSI severity propagation on the read path ----
+
+    #[test]
+    fn b2_nms_drops_all_severities() {
+        for sev in 1..=3 {
+            let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), Some(nt_with_alarm(sev, Some("bad"))));
+            assert_eq!(link.link_alarm_severity(), None, "sev={sev}");
+            assert_eq!(link.alarm_message(), None, "sev={sev}");
+        }
+    }
+
+    #[test]
+    fn b2_ms_propagates_any_nonzero_severity() {
+        // NO_ALARM does not propagate.
+        let ok = PvaLink::for_test(inp_cfg(SevrMode::Ms), Some(nt_with_alarm(0, None)));
+        assert_eq!(ok.link_alarm_severity(), None);
+        assert_eq!(ok.alarm_message(), None);
+        // MINOR / MAJOR / INVALID all propagate.
+        for sev in 1..=3 {
+            let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), Some(nt_with_alarm(sev, Some("oops"))));
+            assert_eq!(link.link_alarm_severity(), Some(sev), "sev={sev}");
+            assert_eq!(link.alarm_message(), Some("oops".to_string()), "sev={sev}");
+        }
+    }
+
+    #[test]
+    fn b2_msi_propagates_only_invalid() {
+        let minor = PvaLink::for_test(inp_cfg(SevrMode::Msi), Some(nt_with_alarm(1, Some("m"))));
+        assert_eq!(minor.link_alarm_severity(), None);
+        let major = PvaLink::for_test(inp_cfg(SevrMode::Msi), Some(nt_with_alarm(2, Some("m"))));
+        assert_eq!(major.link_alarm_severity(), None);
+        let invalid = PvaLink::for_test(inp_cfg(SevrMode::Msi), Some(nt_with_alarm(3, Some("dead"))));
+        assert_eq!(invalid.link_alarm_severity(), Some(3));
+        assert_eq!(invalid.alarm_message(), Some("dead".to_string()));
+    }
+
+    #[test]
+    fn b2_synthetic_message_when_no_alarm_message_field() {
+        // MS link, severity propagates, but the NT struct has no
+        // alarm.message — a synthetic message is returned.
+        let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), Some(nt_with_alarm(2, None)));
+        assert_eq!(link.link_alarm_severity(), Some(2));
+        assert_eq!(link.alarm_message(), Some("remote severity 2".to_string()));
+    }
+
+    #[test]
+    fn b2_no_cached_value_means_no_alarm() {
+        let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), None);
+        assert_eq!(link.link_alarm_severity(), None);
+        assert_eq!(link.alarm_message(), None);
     }
 }

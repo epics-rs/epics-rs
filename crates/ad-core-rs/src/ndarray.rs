@@ -611,6 +611,7 @@ mod tests {
             description: "Color Mode".into(),
             source: NDAttrSource::Driver,
             value: NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+            source_impl: None,
         });
         let info = arr.info();
         assert_eq!(info.color_size, 3);

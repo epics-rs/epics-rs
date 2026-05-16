@@ -126,6 +126,7 @@ fn dimension_3d_rgb() {
         description: "Color Mode".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(2), // RGB1
+        source_impl: None,
     });
     let info = arr.info();
     assert_eq!(info.color_size, 3);
@@ -402,6 +403,7 @@ fn attribute_list_add_and_find() {
         description: "Color mode of the image".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(0),
+        source_impl: None,
     });
 
     assert_eq!(list.len(), 1);
@@ -418,12 +420,14 @@ fn attribute_list_replace_existing() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Float64(1.0),
+        source_impl: None,
     });
     list.add(NDAttribute {
         name: "Gain".into(),
         description: "Updated".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Float64(2.5),
+        source_impl: None,
     });
     // Should not duplicate
     assert_eq!(list.len(), 1);
@@ -445,6 +449,7 @@ fn attribute_list_remove() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Float64(25.0),
+        source_impl: None,
     });
     assert!(list.remove("Temp"));
     assert!(list.is_empty());
@@ -460,6 +465,7 @@ fn attribute_list_clear() {
             description: "".into(),
             source: NDAttrSource::Constant,
             value: NDAttrValue::Int32(i),
+            source_impl: None,
         });
     }
     assert_eq!(list.len(), 5);
@@ -475,12 +481,14 @@ fn attribute_list_iter() {
         description: "".into(),
         source: NDAttrSource::Constant,
         value: NDAttrValue::Int32(1),
+        source_impl: None,
     });
     list.add(NDAttribute {
         name: "B".into(),
         description: "".into(),
         source: NDAttrSource::Constant,
         value: NDAttrValue::String("hello".into()),
+        source_impl: None,
     });
     let names: Vec<_> = list.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(names, vec!["A", "B"]);
@@ -506,6 +514,7 @@ fn attribute_source_types() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(1),
+        source_impl: None,
     };
     assert_eq!(driver_attr.source, NDAttrSource::Driver);
 
@@ -517,6 +526,7 @@ fn attribute_source_types() {
             param_name: "TEMPERATURE".into(),
         },
         value: NDAttrValue::Float64(25.0),
+        source_impl: None,
     };
     match &param_attr.source {
         NDAttrSource::Param {
@@ -534,6 +544,7 @@ fn attribute_source_types() {
         description: "".into(),
         source: NDAttrSource::Constant,
         value: NDAttrValue::UInt8(255),
+        source_impl: None,
     };
     assert_eq!(const_attr.source, NDAttrSource::Constant);
 }
@@ -693,6 +704,7 @@ fn pool_reuse_clears_attributes() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(1),
+        source_impl: None,
     });
     assert_eq!(arr.attributes.len(), 1);
 
@@ -746,12 +758,14 @@ fn ndarray_attributes_on_instance() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(0),
+        source_impl: None,
     });
     arr.attributes.add(NDAttribute {
         name: "Gain".into(),
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Float64(1.5),
+        source_impl: None,
     });
 
     assert_eq!(arr.attributes.len(), 2);

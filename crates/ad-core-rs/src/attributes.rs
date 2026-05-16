@@ -113,13 +113,89 @@ impl NDAttrValue {
     }
 }
 
+/// A live source backing an [`NDAttribute`].
+///
+/// C++ models live attributes with `paramAttribute`, `PVAttribute` and
+/// `functAttribute` subclasses, each overriding `updateValue()` to re-read
+/// from a driver parameter, an EPICS PV, or a user function. The Rust port
+/// keeps `NDAttribute` a single concrete type and delegates re-evaluation to
+/// an implementation of this trait. `Constant` / `Driver` attributes have no
+/// source object — their value is static (C++ `NDAttribute::updateValue` is a
+/// no-op for those).
+pub trait NDAttributeSource: Send + Sync {
+    /// Re-evaluate the attribute from its underlying source.
+    fn evaluate(&self) -> NDAttrValue;
+}
+
 /// A named attribute attached to an NDArray.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NDAttribute {
     pub name: String,
     pub description: String,
     pub source: NDAttrSource,
     pub value: NDAttrValue,
+    /// Optional live source. When present, [`NDAttribute::update`] re-reads the
+    /// value from it; when absent the attribute is a static value (Constant /
+    /// Driver), and `update` is a no-op — matching C++ behavior.
+    pub source_impl: Option<std::sync::Arc<dyn NDAttributeSource>>,
+}
+
+impl std::fmt::Debug for NDAttribute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NDAttribute")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("source", &self.source)
+            .field("value", &self.value)
+            .field("has_source_impl", &self.source_impl.is_some())
+            .finish()
+    }
+}
+
+impl NDAttribute {
+    /// Construct a static-valued attribute (no live source).
+    pub fn new_static(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        source: NDAttrSource,
+        value: NDAttrValue,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            source,
+            value,
+            source_impl: None,
+        }
+    }
+
+    /// Construct a source-backed attribute. The value is evaluated immediately.
+    pub fn new_with_source(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        source: NDAttrSource,
+        source_impl: std::sync::Arc<dyn NDAttributeSource>,
+    ) -> Self {
+        let value = source_impl.evaluate();
+        Self {
+            name: name.into(),
+            description: description.into(),
+            source,
+            value,
+            source_impl: Some(source_impl),
+        }
+    }
+
+    /// Re-evaluate this attribute from its live source.
+    ///
+    /// Mirrors C++ `NDAttribute::updateValue()` — a no-op for attributes
+    /// without a live source (Constant / Driver), and a re-read for
+    /// source-backed attributes (Param / EpicsPV / Function).
+    pub fn update(&mut self) {
+        if let Some(src) = &self.source_impl {
+            self.value = src.evaluate();
+        }
+    }
 }
 
 /// Collection of NDAttributes on an NDArray.
@@ -173,6 +249,17 @@ impl NDAttributeList {
             self.add(attr.clone());
         }
     }
+
+    /// Re-evaluate every attribute from its live source.
+    ///
+    /// Mirrors C++ `NDAttributeList::updateValues()`, which is called before
+    /// the list is copied onto an outgoing NDArray so each attribute carries a
+    /// fresh value. Static (Constant / Driver) attributes are unaffected.
+    pub fn update_values(&mut self) {
+        for attr in self.attrs.iter_mut() {
+            attr.update();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +274,7 @@ mod tests {
             description: "Color mode".into(),
             source: NDAttrSource::Driver,
             value: NDAttrValue::Int32(0),
+            source_impl: None,
         });
         let attr = list.get("ColorMode").unwrap();
         assert_eq!(attr.value, NDAttrValue::Int32(0));
@@ -200,12 +288,14 @@ mod tests {
             description: "".into(),
             source: NDAttrSource::Driver,
             value: NDAttrValue::Float64(1.0),
+            source_impl: None,
         });
         list.add(NDAttribute {
             name: "Gain".into(),
             description: "".into(),
             source: NDAttrSource::Driver,
             value: NDAttrValue::Float64(2.5),
+            source_impl: None,
         });
         assert_eq!(list.len(), 1);
         assert_eq!(list.get("Gain").unwrap().value, NDAttrValue::Float64(2.5));
@@ -219,12 +309,14 @@ mod tests {
             description: "".into(),
             source: NDAttrSource::Constant,
             value: NDAttrValue::Int32(1),
+            source_impl: None,
         });
         list.add(NDAttribute {
             name: "B".into(),
             description: "".into(),
             source: NDAttrSource::Constant,
             value: NDAttrValue::String("hello".into()),
+            source_impl: None,
         });
         let names: Vec<_> = list.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["A", "B"]);
@@ -273,6 +365,7 @@ mod tests {
                 param_name: "TEMPERATURE".into(),
             },
             value: NDAttrValue::Float64(25.0),
+            source_impl: None,
         };
         match &attr.source {
             NDAttrSource::Param {
@@ -307,9 +400,71 @@ mod tests {
             description: "".into(),
             source: NDAttrSource::Driver,
             value: NDAttrValue::Int32(1),
+            source_impl: None,
         });
         assert!(list.remove("A"));
         assert!(list.is_empty());
         assert!(!list.remove("A"));
+    }
+
+    /// G10: a source with a live `NDAttributeSource` is re-evaluated by update().
+    struct CountingSource {
+        counter: std::sync::atomic::AtomicI32,
+    }
+    impl NDAttributeSource for CountingSource {
+        fn evaluate(&self) -> NDAttrValue {
+            let n = self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            NDAttrValue::Int32(n)
+        }
+    }
+
+    #[test]
+    fn test_attribute_update_reevaluates_source() {
+        let src = std::sync::Arc::new(CountingSource {
+            counter: std::sync::atomic::AtomicI32::new(0),
+        });
+        let mut attr =
+            NDAttribute::new_with_source("live", "live source", NDAttrSource::Function, src);
+        // Constructed value is the first evaluation.
+        assert_eq!(attr.value, NDAttrValue::Int32(1));
+        attr.update();
+        assert_eq!(attr.value, NDAttrValue::Int32(2));
+        attr.update();
+        assert_eq!(attr.value, NDAttrValue::Int32(3));
+    }
+
+    #[test]
+    fn test_static_attribute_update_is_noop() {
+        // G10: static (Constant / Driver) attributes are not re-evaluated.
+        let mut attr =
+            NDAttribute::new_static("static", "", NDAttrSource::Constant, NDAttrValue::Int32(42));
+        attr.update();
+        assert_eq!(attr.value, NDAttrValue::Int32(42));
+    }
+
+    #[test]
+    fn test_attribute_list_update_values() {
+        // G10: NDAttributeList::update_values re-evaluates every live source.
+        let mut list = NDAttributeList::new();
+        list.add(NDAttribute::new_with_source(
+            "live",
+            "",
+            NDAttrSource::Function,
+            std::sync::Arc::new(CountingSource {
+                counter: std::sync::atomic::AtomicI32::new(0),
+            }),
+        ));
+        list.add(NDAttribute::new_static(
+            "frozen",
+            "",
+            NDAttrSource::Constant,
+            NDAttrValue::Int32(7),
+        ));
+        list.update_values();
+        assert_eq!(list.get("live").unwrap().value, NDAttrValue::Int32(2));
+        assert_eq!(list.get("frozen").unwrap().value, NDAttrValue::Int32(7));
     }
 }

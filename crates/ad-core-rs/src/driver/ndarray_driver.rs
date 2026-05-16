@@ -180,11 +180,7 @@ pub(crate) fn write_array_params(
     match &array.codec {
         Some(codec) => {
             port_base.set_string_param(params.codec, 0, codec.name.as_str().into())?;
-            port_base.set_int32_param(
-                params.compressed_size,
-                0,
-                codec.compressed_size as i32,
-            )?;
+            port_base.set_int32_param(params.compressed_size, 0, codec.compressed_size as i32)?;
         }
         None => {
             port_base.set_string_param(params.codec, 0, String::new())?;
@@ -214,7 +210,11 @@ pub(crate) fn refresh_pool_stats(
         0,
         pool.allocated_bytes() as f64 / MEGABYTE,
     )?;
-    port_base.set_int32_param(params.pool_alloc_buffers, 0, pool.num_alloc_buffers() as i32)?;
+    port_base.set_int32_param(
+        params.pool_alloc_buffers,
+        0,
+        pool.num_alloc_buffers() as i32,
+    )?;
     port_base.set_int32_param(params.pool_free_buffers, 0, pool.num_free_buffers() as i32)?;
     Ok(())
 }
@@ -671,6 +671,7 @@ mod tests {
             description: String::new(),
             source: NDAttrSource::Driver,
             value: NDAttrValue::Int32(crate::color::NDBayerPattern::GRBG as i32),
+            source_impl: None,
         });
         drv.prepare_array(Arc::new(arr)).unwrap();
 

@@ -223,8 +223,10 @@ impl Drop for MdnsAnnouncer {
         // Send the goodbye packet, then stop the daemon. Without
         // `shutdown()` the mdns-sd OS thread (and its sockets) outlives
         // the announcer forever — same leak as `MdnsBackend`. Commands
-        // are processed in order, so the unregister goodbye is queued
-        // ahead of the Exit.
+        // run in FIFO order, so the unregister's first goodbye is sent
+        // before the Exit; the redundant ~120 ms goodbye resend
+        // mdns-sd schedules is dropped when the thread exits — an
+        // acceptable trade for not leaking the thread.
         let _ = self.daemon.unregister(&self.fullname);
         let _ = self.daemon.shutdown();
     }

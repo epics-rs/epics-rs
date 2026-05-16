@@ -202,11 +202,13 @@ fn pool_free_list_reuse() {
         .alloc(vec![NDDimension::new(80)], NDDataType::UInt8)
         .unwrap();
     assert_eq!(pool.num_free_buffers(), 0);
-    // Reusing a 100-byte buffer for an 80-byte request shrinks the tracked
-    // data_size to exactly 80 — matching C++ `dataSize` semantics.
-    assert_eq!(pool.allocated_bytes(), 80);
+    // C parity: NDArrayPool::alloc skips the realloc block when the existing
+    // buffer is already large enough, so `dataSize` and `memorySize_` stay at
+    // the buffer's original size. Reusing a 100-byte buffer for 80 bytes keeps
+    // the tracked data_size at 100; only the live element count is 80.
+    assert_eq!(pool.allocated_bytes(), 100);
     assert_eq!(arr2.data.len(), 80);
-    assert_eq!(arr2.data_size, 80);
+    assert_eq!(arr2.data_size, 100);
     // unique_id keeps incrementing even on reuse
     assert_eq!(arr2.unique_id, 2);
 }

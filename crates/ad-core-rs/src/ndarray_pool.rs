@@ -97,16 +97,18 @@ impl NDArrayPool {
         };
 
         let mut arr = if let Some(mut reused) = reused {
-            // Reuse: the array's tracked data_size changes from its old value to
-            // `needed_bytes`. Adjust `allocated_bytes` by the signed difference,
-            // enforcing `max_memory` when growing.
+            // Reuse: C parity (NDArrayPool.cpp `alloc`) keeps the buffer's
+            // tracked `dataSize` and `memorySize_` unchanged when the existing
+            // buffer is already large enough — only a grow (realloc) adjusts
+            // accounting. Reusing a 1000-byte buffer for an 800-byte request
+            // therefore leaves `allocated_bytes` at 1000.
             let old_size = reused.data_size;
             if reused.data.data_type() != data_type {
                 reused.data = NDDataBuffer::zeros(data_type, num_elements);
             } else {
                 reused.data.resize(num_elements);
             }
-            if needed_bytes > old_size {
+            let effective_size = if needed_bytes > old_size {
                 let diff = (needed_bytes - old_size) as u64;
                 let current = self.allocated_bytes.load(Ordering::Relaxed);
                 if self.max_memory > 0 && current + diff > self.max_memory as u64 {
@@ -117,11 +119,13 @@ impl NDArrayPool {
                     return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
                 }
                 self.allocated_bytes.fetch_add(diff, Ordering::Relaxed);
-            } else if old_size > needed_bytes {
-                self.allocated_bytes
-                    .fetch_sub((old_size - needed_bytes) as u64, Ordering::Relaxed);
-            }
-            reused.data_size = needed_bytes;
+                needed_bytes
+            } else {
+                // Buffer already big enough: keep the larger tracked size so
+                // accounting matches the byte count added when it was created.
+                old_size
+            };
+            reused.data_size = effective_size;
             reused.dims = dims;
             reused.attributes.clear();
             reused.codec = None;
@@ -184,7 +188,8 @@ impl NDArrayPool {
         arr.unique_id = self.next_unique_id.fetch_add(1, Ordering::Relaxed);
         arr.timestamp = EpicsTimestamp::now();
         arr.pool_id = self.id;
-        arr.data_size = needed_bytes;
+        // `data_size` is already correct: a fresh `NDArray::new` sets it to
+        // `needed_bytes`; the reuse branch keeps the buffer's larger size.
         Ok(arr)
     }
 

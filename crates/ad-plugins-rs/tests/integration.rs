@@ -761,7 +761,9 @@ fn test_process_and_publish_writes_array_size_params() {
 
     assert_eq!(size_x, 64, "ArraySizeX should be 64");
     assert_eq!(size_y, 48, "ArraySizeY should be 48");
-    assert_eq!(size_z, 1, "ArraySizeZ should be 1 for 2D mono");
+    // C parity: NDArray::getInfo leaves colorSize at 0 for a 2-D array (no
+    // color dimension), so ArraySizeZ_RBV is 0 for 2D mono.
+    assert_eq!(size_z, 0, "ArraySizeZ should be 0 for 2D mono (no color dim)");
     assert_eq!(array_size, 64 * 48, "ArraySize should be total bytes");
     assert_eq!(counter, 1, "ArrayCounter should be 1");
     assert_eq!(unique_id, 42, "UniqueId should be 42");

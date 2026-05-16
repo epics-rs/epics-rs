@@ -1561,13 +1561,36 @@ fn test_external_move_completion_syncs_and_clears_mip() {
         has_encoder: false,
         vbas_supported: true,
     };
+    // Drive the completion through the live dispatch path: process_motor_info
+    // runs during the Idle-phase readback (determine_event reports no event),
+    // and do_process() must still route MIP_EXTERNAL into check_completion.
     rec.process_motor_info(&done);
-    rec.check_completion();
+    let effects = rec.do_process();
 
     assert!(!rec.stat.mip.contains(MipFlags::EXTERNAL));
     assert!(rec.stat.dmov);
     assert_eq!(rec.pos.val, 7.0);
     assert_eq!(rec.pos.dval, 7.0);
+    let _ = effects;
+}
+
+#[test]
+fn test_external_move_in_progress_keeps_dmov_false_via_do_process() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let mut rec = MotorRecord::new();
+    let moving = MotorStatus {
+        position: 3.0,
+        encoder_position: 3.0,
+        moving: true,
+        done: false,
+        ..Default::default()
+    };
+    rec.process_motor_info(&moving);
+    // Still moving — do_process must not clear EXTERNAL or finalize.
+    rec.process_motor_info(&moving);
+    let _ = rec.do_process();
+    assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
+    assert!(!rec.stat.dmov);
 }
 
 // --- SYNC PV (C: 82c26005, 2010-04) ---

@@ -891,7 +891,18 @@ impl MotorRecord {
                 effects.suppress_forward_link = true;
                 effects
             }
-            None => ProcessEffects::default(),
+            None => {
+                // C: ea063f5f — an externally initiated move is flagged by
+                // process_motor_info() during the Idle-phase readback, which
+                // determine_event() reports as no event. The completion
+                // pipeline still has to run so MIP_EXTERNAL clears and DMOV
+                // returns to 1 once the driver finishes.
+                if self.stat.mip.contains(MipFlags::EXTERNAL) {
+                    self.check_completion()
+                } else {
+                    ProcessEffects::default()
+                }
+            }
         }
     }
 }

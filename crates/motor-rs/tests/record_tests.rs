@@ -1410,6 +1410,47 @@ fn test_home_reverse_proceeds_below_low_soft_limit() {
     );
 }
 
+// --- SPMG=Go resumes a latched jog button (C motorSPMG_Go) ---
+
+#[test]
+fn test_spmg_go_resumes_latched_jog() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    // Jog button latched while paused.
+    rec.ctrl.jogf = true;
+    rec.internal.lspg = SpmgMode::Pause;
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity { direction: true, .. }
+        )),
+        "SPMG=Go must resume the latched forward jog"
+    );
+}
+
+#[test]
+fn test_spmg_go_without_jog_replans_to_dval() {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.pos.drbv = 0.0;
+    rec.internal.lspg = SpmgMode::Pause;
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    // No jog latched → replan toward DVAL.
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }))
+    );
+}
+
 // --- JOGF + JOGR simultaneous: latest-wins (epics-modules/motor #170) ---
 
 #[test]

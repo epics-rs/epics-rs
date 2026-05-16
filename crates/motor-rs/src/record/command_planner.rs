@@ -691,9 +691,15 @@ impl MotorRecord {
                 }
             }
             SpmgMode::Go => {
-                // Resume: if coming from Pause and there's a saved target, replan
                 if matches!(old, SpmgMode::Pause) && self.stat.phase == MotionPhase::Idle {
-                    if (self.pos.dval - self.pos.drbv).abs() > self.retry.rdbd.max(1e-12) {
+                    // C: on Go, a still-latched jog button resumes jogging;
+                    // otherwise replan toward the saved DVAL target.
+                    if self.ctrl.jogf || self.ctrl.jogr {
+                        let forward = self.ctrl.jogf;
+                        self.start_jog(forward, effects);
+                    } else if (self.pos.dval - self.pos.drbv).abs()
+                        > self.retry.rdbd.max(1e-12)
+                    {
                         self.plan_absolute_move(effects);
                     }
                 }

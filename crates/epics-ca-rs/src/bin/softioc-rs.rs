@@ -210,69 +210,74 @@ fn parse_record_def(
         }};
     }
 
-    // Every arm returns directly: the numeric arms parse a typed value
-    // (falling back to a default when the candidate value segment does
-    // not parse), the string arms split off the `:VALUE` segment when
-    // present, and the catch-all returns an error.
-    match rec_type.as_str() {
-        "ai" => {
-            let (n, val) = parse_or_default!(f64, 0.0);
-            Ok((n.to_string(), Box::new(AiRecord::new(val))))
-        }
-        "ao" => {
-            let (n, val) = parse_or_default!(f64, 0.0);
-            Ok((n.to_string(), Box::new(AoRecord::new(val))))
-        }
-        "bi" => {
-            let (n, val) = parse_or_default!(u16, 0);
-            Ok((n.to_string(), Box::new(BiRecord::new(val))))
-        }
-        "bo" => {
-            let (n, val) = parse_or_default!(u16, 0);
-            Ok((n.to_string(), Box::new(BoRecord::new(val))))
-        }
-        "longin" => {
-            let (n, val) = parse_or_default!(i32, 0);
-            Ok((n.to_string(), Box::new(LonginRecord::new(val))))
-        }
-        "longout" => {
-            let (n, val) = parse_or_default!(i32, 0);
-            Ok((n.to_string(), Box::new(LongoutRecord::new(val))))
-        }
-        "mbbi" => {
-            let (n, val) = parse_or_default!(u16, 0);
-            Ok((n.to_string(), Box::new(MbbiRecord::new(val))))
-        }
-        "mbbo" => {
-            let (n, val) = parse_or_default!(u16, 0);
-            Ok((n.to_string(), Box::new(MbboRecord::new(val))))
-        }
-        "stringin" => {
-            // Match the numeric arms: when a `:VALUE` segment is
-            // present, `name` is the record name and `value_str` the
-            // value; with no value segment, `remainder` is the whole
-            // name and the value defaults to empty. (Unlike the
-            // numeric arms there is no parse step — any string is a
-            // valid value.)
-            let (n, val) = if value_str.is_empty() {
-                (remainder, "")
-            } else {
-                (name, value_str)
-            };
-            Ok((n.to_string(), Box::new(StringinRecord::new(val))))
-        }
-        "stringout" => {
-            let (n, val) = if value_str.is_empty() {
-                (remainder, "")
-            } else {
-                (name, value_str)
-            };
-            Ok((n.to_string(), Box::new(StringoutRecord::new(val))))
-        }
-        _ => Err(epics_base_rs::error::CaError::InvalidValue(format!(
-            "unknown record type '{rec_type}'"
-        ))),
+    // Each arm yields a `(record_name, record)` tuple: the numeric arms
+    // parse a typed value (falling back to a default — and keeping the
+    // colon-bearing `remainder` as the name — when the candidate value
+    // segment does not parse), the string arms take `name`/`value_str`
+    // straight from the `rsplit_once` split, and the catch-all errors.
+    let (record_name, record): (String, Box<dyn epics_base_rs::server::record::Record>) =
+        match rec_type.as_str() {
+            "ai" => {
+                let (n, val) = parse_or_default!(f64, 0.0);
+                (n.to_string(), Box::new(AiRecord::new(val)))
+            }
+            "ao" => {
+                let (n, val) = parse_or_default!(f64, 0.0);
+                (n.to_string(), Box::new(AoRecord::new(val)))
+            }
+            "bi" => {
+                let (n, val) = parse_or_default!(u16, 0);
+                (n.to_string(), Box::new(BiRecord::new(val)))
+            }
+            "bo" => {
+                let (n, val) = parse_or_default!(u16, 0);
+                (n.to_string(), Box::new(BoRecord::new(val)))
+            }
+            "longin" => {
+                let (n, val) = parse_or_default!(i32, 0);
+                (n.to_string(), Box::new(LonginRecord::new(val)))
+            }
+            "longout" => {
+                let (n, val) = parse_or_default!(i32, 0);
+                (n.to_string(), Box::new(LongoutRecord::new(val)))
+            }
+            "mbbi" => {
+                let (n, val) = parse_or_default!(u16, 0);
+                (n.to_string(), Box::new(MbbiRecord::new(val)))
+            }
+            "mbbo" => {
+                let (n, val) = parse_or_default!(u16, 0);
+                (n.to_string(), Box::new(MbboRecord::new(val)))
+            }
+            "stringin" | "stringout" => {
+                // No parse step — any string is a valid value — so use
+                // the `rsplit_once` split directly: with a `:VALUE`
+                // segment, `name`/`value_str`; with no colon, `name` is
+                // `remainder` and `value_str` is empty. A trailing colon
+                // (`stringin:PV:`) is an explicit empty value and yields
+                // name `PV`, not `PV:` — which the prior `value_str`-
+                // empty branch got wrong by falling back to `remainder`.
+                if rec_type == "stringin" {
+                    (name.to_string(), Box::new(StringinRecord::new(value_str)))
+                } else {
+                    (name.to_string(), Box::new(StringoutRecord::new(value_str)))
+                }
+            }
+            _ => {
+                return Err(epics_base_rs::error::CaError::InvalidValue(format!(
+                    "unknown record type '{rec_type}'"
+                )));
+            }
+        };
+
+    // A record with an empty PV name (e.g. `ai:` or `stringin::x`) is
+    // never valid and would otherwise register an unaddressable record.
+    if record_name.is_empty() {
+        return Err(epics_base_rs::error::CaError::InvalidValue(format!(
+            "record definition '{def}' has an empty PV name"
+        )));
     }
+    Ok((record_name, record))
 }
 
 fn parse_macros(macro_strs: &[String]) -> HashMap<String, String> {
@@ -443,5 +448,45 @@ async fn main() -> CaResult<()> {
         server.run_with_shell(|_shell| {}).await
     } else {
         server.run().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_record_def;
+
+    fn name_of(def: &str) -> String {
+        parse_record_def(def).expect("valid record def").0
+    }
+
+    #[test]
+    fn numeric_record_splits_value_from_name() {
+        assert_eq!(name_of("ai:TEMP"), "TEMP");
+        assert_eq!(name_of("ai:TEMP:42.5"), "TEMP");
+        // Non-numeric trailing segment: the whole remainder is the name.
+        assert_eq!(name_of("ai:SEQ:counter"), "SEQ:counter");
+    }
+
+    #[test]
+    fn string_record_handles_colons_and_trailing_colon() {
+        // Plain name, no value.
+        assert_eq!(name_of("stringin:MYPV"), "MYPV");
+        // NAME:VALUE.
+        assert_eq!(name_of("stringout:MYPV:hello"), "MYPV");
+        // Trailing colon = explicit empty value; name must NOT keep the
+        // colon (the bug this fix addresses).
+        assert_eq!(name_of("stringin:MYPV:"), "MYPV");
+    }
+
+    #[test]
+    fn empty_pv_name_is_rejected() {
+        assert!(parse_record_def("ai:").is_err());
+        assert!(parse_record_def("stringin::hello").is_err());
+    }
+
+    #[test]
+    fn unknown_record_type_is_rejected() {
+        assert!(parse_record_def("bogus:PV").is_err());
+        assert!(parse_record_def("noseparator").is_err());
     }
 }

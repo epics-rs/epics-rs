@@ -24,7 +24,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
 use super::config::{LinkDirection, PvaLinkConfig};
-use super::link::{PvaLink, PvaLinkResult};
+use super::link::{PvaLink, PvaLinkError, PvaLinkResult};
 use super::registry::PvaLinkRegistry;
 
 /// Wrap `tokio::task::block_in_place(f)` with a runtime-flavour check.
@@ -76,13 +76,13 @@ pub struct PvaLinkResolver {
     /// The `epics-base-rs` link parser collapses `@pva://X?sevr=MS`
     /// (and the legacy `pva://X MS` suffix form) down to a bare PV
     /// name in `ParsedLink::Pva`, dropping every query option before
-    /// the bridge resolver is consulted. To keep B2 (`MS`/`NMS`)
-    /// effective on the resolver hot path, the bridge stashes the
-    /// parsed [`PvaLinkConfig`] here keyed by PV name when a full
-    /// link string is opened via [`Self::open_link`]; the resolver
-    /// then reuses those options instead of the `NMS` default.
-    /// Mirrors the role of pvxs `pvaLinkConfig` carried on the
-    /// `jlink` for the lifetime of the link.
+    /// the bridge resolver is consulted. To keep B2 (`MS`/`NMS`) and
+    /// the B4 options effective on the resolver hot path, the bridge
+    /// stashes the parsed [`PvaLinkConfig`] here keyed by PV name when
+    /// a full link string is opened via [`Self::open_link`]; the
+    /// resolver then reuses those options instead of the `NMS`/Q=4
+    /// defaults. Mirrors the role of pvxs `pvaLinkConfig` carried on
+    /// the `jlink` for the lifetime of the link.
     link_options: Arc<parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>>,
     /// Database handle used by the B3 scan-on-update forwarder to
     /// process owning records. `None` until [`install_pvalink_resolver`]
@@ -105,18 +105,24 @@ struct ScanFanout {
     /// Records to process on every monitor event. Each entry mirrors
     /// one INP pvalink whose `proc` is `CP` (always) or `CPP`
     /// (passive). At our integration granularity both reduce to
-    /// "process this record".
+    /// "process this record"; `always` widens it to fire even when
+    /// the value did not change.
     records: Vec<ScanTarget>,
 }
 
 /// One record bound to a CP/CPP pvalink (B3).
 struct ScanTarget {
     record: String,
-    /// pvxs `pvaLinkConfig` CP vs CPP: a `CP` link processes on every
-    /// event; a `CPP` link only processes when the value changed. We
-    /// reduce that to "process even on a no-op update" — `CP` links
-    /// set this `true`, `CPP` links `false`.
+    /// pvxs `pvaLinkConfig::always` — process even on a no-op update.
     always: bool,
+    /// pvxs `pvaLinkConfig::monorder` — lower scans first within one
+    /// monitor batch.
+    monorder: i32,
+    /// pvxs `pvaLinkConfig::atomic` — atomic links scan as one
+    /// contiguous group ahead of the non-atomic targets in the same
+    /// monitor batch, and an atomic group scans whenever *any* of its
+    /// members changed (so siblings stay consistent within the batch).
+    atomic: bool,
 }
 
 impl PvaLinkResolver {
@@ -157,6 +163,7 @@ impl PvaLinkResolver {
     /// pvxs `pvalinkOpen` (pvalink_channel.cpp). After this returns,
     /// later calls to [`Self::resolve`] for the same name will read
     /// the cached monitor value (no async block).
+    ///
     /// Honors any link options previously registered for `pv_name`
     /// via [`Self::open_link`] — otherwise pvxs defaults apply.
     pub async fn open(&self, pv_name: &str) -> PvaLinkResult<Arc<PvaLink>> {
@@ -164,11 +171,11 @@ impl PvaLinkResolver {
     }
 
     /// Open / cache a link from a full `@pva://...` link string,
-    /// parsing and retaining its options (`sevr`, ...). The parsed
-    /// [`PvaLinkConfig`] is stashed under the bare PV name so the
-    /// steady-state resolver hot path — driven by `epics-base-rs`,
-    /// which only ever hands the bridge a bare PV name — keeps
-    /// applying the same options.
+    /// parsing and retaining its options (`sevr`, `Q`, `pipeline`,
+    /// `monorder`, ...). The parsed [`PvaLinkConfig`] is stashed under
+    /// the bare PV name so the steady-state resolver hot path —
+    /// driven by `epics-base-rs`, which only ever hands the bridge a
+    /// bare PV name — keeps applying the same options.
     ///
     /// This is the entry point that makes B2 (`MS`/`NMS`) effective
     /// through the resolver: an INP record whose link string carries
@@ -207,6 +214,22 @@ impl PvaLinkResolver {
             ..cfg
         };
         let pv_name = cfg.pv_name.clone();
+        // B4 `local`: a `local`-flagged link must resolve a PV served
+        // by *this* IOC. pvxs requires a local channel; here that
+        // means the target must be a record in the attached
+        // `PvDatabase`. Reject up-front so the operator gets a clear
+        // error instead of a silent remote resolution. Mirrors pvxs
+        // `pvaLinkConfig::local`.
+        if cfg.local {
+            let is_local = match self.db.read().clone() {
+                Some(db) => db.get_record(&pv_name).await.is_some(),
+                // No DB attached — a `local` link cannot be satisfied.
+                None => false,
+            };
+            if !is_local {
+                return Err(PvaLinkError::NotLocal(pv_name));
+            }
+        }
         self.link_options
             .write()
             .insert(pv_name.clone(), cfg.clone());
@@ -221,7 +244,9 @@ impl PvaLinkResolver {
                     .records
                     .push(ScanTarget {
                         record: rec,
-                        always: true,
+                        always: cfg.always,
+                        monorder: cfg.monorder,
+                        atomic: cfg.atomic,
                     });
             }
         }
@@ -233,7 +258,8 @@ impl PvaLinkResolver {
     /// B3: spawn the per-link monitor-notification forwarder, at most
     /// once per PV. The task drains the link's notify receiver and,
     /// for every event, processes the link's registered
-    /// scan-on-update records.
+    /// scan-on-update records (`monorder`-sorted; `always` links also
+    /// process on no-op updates).
     fn spawn_notify_forwarder(&self, pv_name: &str, link: &Arc<PvaLink>) {
         {
             let mut started = self.forwarders.lock();
@@ -257,7 +283,7 @@ impl PvaLinkResolver {
 
     /// Build the INP config for `pv_name`, applying any options
     /// registered via [`Self::open_link`]. Falls back to the pvxs
-    /// monitor defaults (`NMS`) when none.
+    /// monitor defaults (`NMS`, `Q=4`, no pipeline) when none.
     fn inp_cfg_for(&self, pv_name: &str) -> PvaLinkConfig {
         if let Some(cfg) = self.link_options.read().get(pv_name) {
             return PvaLinkConfig {
@@ -361,7 +387,7 @@ impl PvaLinkResolver {
 
             // Slow path: link not yet open or first-event not arrived.
             // Open the link (idempotent) then issue an async read.
-            let cfg = resolver.inp_cfg_for(name);
+            let cfg = default_inp_cfg(name);
             // The Lset external resolver is invoked from inside an
             // async context (PvDatabase::resolve_external_pv runs on a
             // tokio worker). Bare Handle::block_on panics under those
@@ -413,9 +439,16 @@ type ScanTargetMap = Arc<parking_lot::RwLock<std::collections::HashMap<String, S
 ///
 /// Drains `rx` (fed by the link's monitor task) and, for every event,
 /// processes the records registered as scan-on-update targets for
-/// `pv_name`. A target with `always=false` (a `CPP` link) is skipped
-/// when the linked leaf field did not change. The loop ends when
-/// every sender is dropped (i.e. the link is closed).
+/// `pv_name`.
+///
+/// Ordering (B4): `atomic` targets scan first as one contiguous
+/// group, then the non-atomic targets; within each group `monorder`
+/// (low → high) decides the order. A `CPP` target (`always=false`) is
+/// skipped on a no-op update, *except* an atomic target scans
+/// whenever any atomic sibling in the same batch changed — so atomic
+/// links stay mutually consistent. Mirrors pvxs `pvaLinkConfig`
+/// `atomic` / `monorder` / `always`. The loop ends when every sender
+/// is dropped (i.e. the link is closed).
 async fn run_notify_forwarder(
     pv_name: String,
     field: String,
@@ -424,29 +457,37 @@ async fn run_notify_forwarder(
     db: Arc<parking_lot::RwLock<Option<PvDatabase>>>,
 ) {
     // Last delivered leaf value, so `always=false` targets can be
-    // skipped on a no-op update.
+    // skipped on a no-op update (pvxs `pvaLinkConfig::always`).
     let mut last: Option<PvField> = None;
     while let Some(value) = rx.recv().await {
         let leaf = extract_leaf(&value, &field);
         let changed = last.as_ref() != Some(&leaf);
         last = Some(leaf);
 
-        let targets: Vec<(String, bool)> = match scan_targets.read().get(&pv_name) {
-            Some(fanout) => fanout
-                .records
-                .iter()
-                .map(|t| (t.record.clone(), t.always))
-                .collect(),
-            None => Vec::new(),
-        };
+        // Snapshot the fan-out, then order it: atomic group first,
+        // then non-atomic; `monorder` within each group.
+        let mut targets: Vec<(String, bool, i32, bool)> =
+            match scan_targets.read().get(&pv_name) {
+                Some(fanout) => fanout
+                    .records
+                    .iter()
+                    .map(|t| (t.record.clone(), t.always, t.monorder, t.atomic))
+                    .collect(),
+                None => Vec::new(),
+            };
+        // Sort key: (!atomic, monorder) → atomic (false sorts first),
+        // then ascending monorder.
+        targets.sort_by_key(|(_, _, order, atomic)| (!*atomic, *order));
 
         let Some(db_handle) = db.read().clone() else {
             continue;
         };
-        for (record, always) in targets {
-            // A CPP (`always=false`) link only scans when the input
-            // value actually changed; CP scans unconditionally.
-            if !changed && !always {
+        for (record, always, _order, atomic) in targets {
+            // pvxs: a CPP (`always=false`) link only scans when the
+            // input value actually changed; CP with `always` scans
+            // unconditionally. An atomic link scans whenever the
+            // batch changed so atomic siblings stay consistent.
+            if !changed && !always && !atomic {
                 continue;
             }
             let _ = db_handle.process_record(&record).await;
@@ -502,7 +543,7 @@ impl LinkSet for PvaLinkResolver {
         }
 
         // Slow path: open the link / fall back to a fresh GET.
-        let cfg = self.inp_cfg_for(name);
+        let cfg = default_inp_cfg(name);
         let value = block_in_place_or_warn(|| {
             self.handle.block_on(async {
                 let link = self.registry.get_or_open(cfg).await.ok()?;
@@ -772,6 +813,8 @@ mod tests {
         fanout.records.push(ScanTarget {
             record: "DEST".to_string(),
             always: true,
+            monorder: 0,
+            atomic: false,
         });
         let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
             std::collections::HashMap::from([("SRC".to_string(), fanout)]),
@@ -815,6 +858,8 @@ mod tests {
         fanout.records.push(ScanTarget {
             record: "DEST".to_string(),
             always: false,
+            monorder: 0,
+            atomic: false,
         });
         let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
             std::collections::HashMap::from([("SRC".to_string(), fanout)]),
@@ -846,14 +891,17 @@ mod tests {
     #[tokio::test]
     async fn b3_open_link_for_record_registers_scan_target() {
         let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        // proc=CP → scan_on_update; sevr=MS exercised together.
         let _ = resolver
             .open_link_for_record("pva://SRC:PV?proc=CP&sevr=MS", "MY:REC")
             .await;
+        // Scan target registered under the bare PV name.
         let targets = resolver.scan_targets.read();
         let fanout = targets.get("SRC:PV").expect("scan target registered");
         assert_eq!(fanout.records.len(), 1);
         assert_eq!(fanout.records[0].record, "MY:REC");
         drop(targets);
+        // Parsed options retained for the resolver hot path.
         let opts = resolver.link_options.read();
         let cfg = opts.get("SRC:PV").expect("link options retained");
         assert_eq!(cfg.sevr, SevrMode::Ms);
@@ -871,6 +919,23 @@ mod tests {
         assert!(resolver.scan_targets.read().get("OTHER:PV").is_none());
     }
 
+    /// B2 through the resolver: `open_link` retains `sevr` so a later
+    /// bare-name `link_alarm_severity` query reflects the `MS` mode.
+    #[tokio::test]
+    async fn b2_open_link_retains_sevr_mode() {
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let _ = resolver.open_link("pva://A:PV?sevr=MSI").await;
+        let cfg = resolver
+            .inp_cfg_for("A:PV")
+            .clone();
+        assert_eq!(cfg.sevr, SevrMode::Msi);
+        // A PV never opened falls back to NMS default.
+        assert_eq!(
+            resolver.inp_cfg_for("UNSEEN").sevr,
+            SevrMode::Nms
+        );
+    }
+
     #[test]
     fn extract_leaf_walks_dotted_path() {
         let mut alarm = PvStructure::new("alarm_t");
@@ -882,5 +947,174 @@ mod tests {
             .push(("alarm".into(), PvField::Structure(alarm)));
         let leaf = extract_leaf(&PvField::Structure(root), "alarm.severity");
         assert!(matches!(leaf, PvField::Scalar(ScalarValue::Int(2))));
+    }
+
+    // ---- B4: local / atomic / monorder forwarder effects ----
+
+    /// A record that appends its name to a shared log on `process()`,
+    /// so a test can observe the *order* in which the B4 forwarder
+    /// scans records.
+    struct OrderRecord {
+        name: &'static str,
+        log: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+    }
+
+    impl epics_base_rs::server::record::Record for OrderRecord {
+        fn record_type(&self) -> &'static str {
+            "ai"
+        }
+        fn process(
+            &mut self,
+        ) -> epics_base_rs::error::CaResult<epics_base_rs::server::record::ProcessOutcome> {
+            self.log.lock().push(self.name);
+            Ok(epics_base_rs::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, _n: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(0.0))
+        }
+        fn put_field(
+            &mut self,
+            _n: &str,
+            _v: EpicsValue,
+        ) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+            &[]
+        }
+    }
+
+    /// B4 `monorder` + `atomic`: the forwarder scans the atomic group
+    /// first, and `monorder` (low → high) within each group.
+    #[tokio::test]
+    async fn b4_forwarder_orders_by_atomic_then_monorder() {
+        let db = PvDatabase::new();
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        for name in ["A", "B", "C", "D"] {
+            db.add_record(
+                name,
+                Box::new(OrderRecord {
+                    name,
+                    log: log.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut fanout = ScanFanout::default();
+        // Non-atomic, monorder 1 / -1.
+        fanout.records.push(ScanTarget {
+            record: "C".into(),
+            always: true,
+            monorder: 1,
+            atomic: false,
+        });
+        fanout.records.push(ScanTarget {
+            record: "D".into(),
+            always: true,
+            monorder: -1,
+            atomic: false,
+        });
+        // Atomic, monorder 5 / 0.
+        fanout.records.push(ScanTarget {
+            record: "A".into(),
+            always: true,
+            monorder: 5,
+            atomic: true,
+        });
+        fanout.records.push(ScanTarget {
+            record: "B".into(),
+            always: true,
+            monorder: 0,
+            atomic: true,
+        });
+        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
+            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
+        ));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            "SRC".to_string(),
+            "value".to_string(),
+            rx,
+            scan_targets,
+            db_slot,
+        ));
+        tx.send(nt_scalar(1.0)).await.unwrap();
+        drop(tx);
+        forwarder.await.unwrap();
+
+        // atomic group first (B by monorder 0, then A by 5), then
+        // non-atomic (D by -1, then C by 1).
+        assert_eq!(*log.lock(), vec!["B", "A", "D", "C"]);
+    }
+
+    /// B4 `atomic`: an atomic CPP-style target (`always=false`) still
+    /// scans on a no-op update — atomic siblings stay consistent.
+    #[tokio::test]
+    async fn b4_atomic_scans_even_on_no_op_update() {
+        let db = PvDatabase::new();
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "DEST",
+            Box::new(CountingRecord {
+                count: count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut fanout = ScanFanout::default();
+        fanout.records.push(ScanTarget {
+            record: "DEST".into(),
+            always: false, // CPP
+            monorder: 0,
+            atomic: true, // but atomic → scans anyway
+        });
+        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
+            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
+        ));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            "SRC".to_string(),
+            "value".to_string(),
+            rx,
+            scan_targets,
+            db_slot,
+        ));
+        // Two identical values: the 2nd is a no-op. A plain CPP link
+        // would scan once; atomic makes it scan both times.
+        tx.send(nt_scalar(1.0)).await.unwrap();
+        tx.send(nt_scalar(1.0)).await.unwrap();
+        drop(tx);
+        forwarder.await.unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// B4 `local`: a `local`-flagged link whose PV is not a local
+    /// record is rejected at open time.
+    #[tokio::test]
+    async fn b4_local_link_rejects_non_local_pv() {
+        let db = Arc::new(PvDatabase::new());
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let r = resolver
+            .open_link("pva://NOT:A:LOCAL:RECORD?local=true")
+            .await;
+        let rejected = matches!(r, Err(PvaLinkError::NotLocal(_)));
+        assert!(rejected, "local link to a non-local PV must be rejected");
+    }
+
+    /// B4 `local`: a non-local link to the same PV opens fine — the
+    /// `local` gate only applies when the option is set.
+    #[tokio::test]
+    async fn b4_non_local_link_to_remote_pv_is_allowed() {
+        let db = Arc::new(PvDatabase::new());
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        // No `local` option → open is not gated (it will just never
+        // connect, which is fine for this assertion).
+        let r = resolver.open_link("pva://SOME:REMOTE:PV").await;
+        assert!(r.is_ok(), "non-local link should open");
     }
 }

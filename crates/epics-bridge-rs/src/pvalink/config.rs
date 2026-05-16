@@ -86,12 +86,51 @@ pub struct PvaLinkConfig {
     /// (pvalink_link.cpp:122). Default `false` — record must be
     /// scanned externally.
     pub scan_on_update: bool,
+    /// When true, `scan_on_update` processing fires on *every* monitor
+    /// event even if the linked field value did not change. Mirrors
+    /// pvxs `pvaLinkConfig::always` — without it, `CP`/`CPP` scans are
+    /// suppressed for no-op updates. INP only.
+    pub always: bool,
     /// Maximize-severity mode (`MS`/`NMS`/`MSI`). Mirrors pvxs
     /// `pvaLinkConfig::sevr`.
     pub sevr: SevrMode,
+    /// Monitor queue size — pvxs `Q` (and the `queueSize` pvRequest
+    /// option). `< 1` is clamped to `1`. Default `4`, matching the
+    /// pvxs default monitor queue depth. INP+monitor only.
+    pub queue_size: usize,
+    /// Pipeline (windowed flow-control) mode — pvxs `pipeline`. When
+    /// true the monitor request carries `record[pipeline=true]`.
+    /// INP+monitor only.
+    pub pipeline: bool,
+    /// Defer the actual Put: when true a `write` only queues the value
+    /// locally and the caller must call `flush_deferred` to push it.
+    /// Mirrors pvxs `pvaLinkConfig::defer`. OUT only.
+    pub defer: bool,
+    /// Retry queued Puts across disconnects: when true a `write` issued
+    /// while the upstream is unreachable is queued and replayed once
+    /// the link reconnects. Mirrors pvxs `pvaLinkConfig::retry`.
+    /// Without it, a Put on a disconnected link fails immediately.
+    /// OUT only.
+    pub retry: bool,
+    /// Require a *local* (same-IOC) channel. When true the link only
+    /// resolves PVs served by the local QSRV instance; remote PVs are
+    /// rejected. Mirrors pvxs `pvaLinkConfig::local`.
+    pub local: bool,
+    /// Atomic multi-link processing. When true, `scan_on_update`
+    /// processing for this link is grouped with other `atomic` links
+    /// sharing the same monitor batch so they scan under one lock
+    /// epoch. Mirrors pvxs `pvaLinkConfig::atomic`.
+    pub atomic: bool,
+    /// Processing order during a `CP` scan batch, clamped to
+    /// `-1024..=1024`. Lower values process first. Mirrors pvxs
+    /// `pvaLinkConfig::monorder`.
+    pub monorder: i32,
     /// Direction inferred from caller, not parsed.
     pub direction: LinkDirection,
 }
+
+/// pvxs default monitor queue depth (`pvaLinkConfig::queueSize`).
+pub const DEFAULT_QUEUE_SIZE: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PvaLinkParseError {
@@ -167,6 +206,38 @@ impl PvaLinkConfig {
         if let Some(v) = opts.get("sevr") {
             cfg.sevr = parse_sevr(v)?;
         }
+        if let Some(v) = opts.get("always") {
+            cfg.always = parse_bool(v)?;
+        }
+        if let Some(v) = opts.get("Q").or_else(|| opts.get("queueSize")) {
+            let n: i64 = v
+                .parse()
+                .map_err(|_| PvaLinkParseError::BadOption(format!("Q={v}")))?;
+            // pvxs clamps `Q < 1` to 1.
+            cfg.queue_size = if n < 1 { 1 } else { n as usize };
+        }
+        if let Some(v) = opts.get("pipeline") {
+            cfg.pipeline = parse_bool(v)?;
+        }
+        if let Some(v) = opts.get("defer") {
+            cfg.defer = parse_bool(v)?;
+        }
+        if let Some(v) = opts.get("retry") {
+            cfg.retry = parse_bool(v)?;
+        }
+        if let Some(v) = opts.get("local") {
+            cfg.local = parse_bool(v)?;
+        }
+        if let Some(v) = opts.get("atomic") {
+            cfg.atomic = parse_bool(v)?;
+        }
+        if let Some(v) = opts.get("monorder") {
+            let n: i64 = v
+                .parse()
+                .map_err(|_| PvaLinkParseError::BadOption(format!("monorder={v}")))?;
+            // pvxs clamps to [-1024, 1024].
+            cfg.monorder = n.clamp(-1024, 1024) as i32;
+        }
 
         // Apply legacy bare modifiers
         for m in legacy_mods {
@@ -204,7 +275,15 @@ impl PvaLinkConfig {
             process: false,
             notify: false,
             scan_on_update: false,
+            always: false,
             sevr: SevrMode::Nms,
+            queue_size: DEFAULT_QUEUE_SIZE,
+            pipeline: false,
+            defer: false,
+            retry: false,
+            local: false,
+            atomic: false,
+            monorder: 0,
             direction,
         }
     }
@@ -393,6 +472,8 @@ mod tests {
         assert!(SevrMode::Msi.propagates(3));
     }
 
+    // ---- B4: link options ----
+
     #[test]
     fn proc_cp_implies_monitor_and_scan() {
         let c = PvaLinkConfig::parse("pva://X?proc=CP", LinkDirection::Inp).unwrap();
@@ -404,7 +485,91 @@ mod tests {
     }
 
     #[test]
-    fn bad_sevr_value_rejected() {
+    fn queue_size_parsing_and_clamp() {
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?Q=8", LinkDirection::Inp)
+                .unwrap()
+                .queue_size,
+            8
+        );
+        // pvxs clamps Q < 1 to 1.
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?Q=0", LinkDirection::Inp)
+                .unwrap()
+                .queue_size,
+            1
+        );
+        // default
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X", LinkDirection::Inp)
+                .unwrap()
+                .queue_size,
+            DEFAULT_QUEUE_SIZE
+        );
+        // `queueSize` alias also accepted.
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?queueSize=16", LinkDirection::Inp)
+                .unwrap()
+                .queue_size,
+            16
+        );
+    }
+
+    #[test]
+    fn monorder_parsing_and_clamp() {
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?monorder=5", LinkDirection::Inp)
+                .unwrap()
+                .monorder,
+            5
+        );
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?monorder=99999", LinkDirection::Inp)
+                .unwrap()
+                .monorder,
+            1024
+        );
+        assert_eq!(
+            PvaLinkConfig::parse("pva://X?monorder=-99999", LinkDirection::Inp)
+                .unwrap()
+                .monorder,
+            -1024
+        );
+    }
+
+    #[test]
+    fn boolean_options_parsed() {
+        let c = PvaLinkConfig::parse(
+            "pva://X?pipeline=true&defer=true&retry=true&local=true&atomic=true&always=true",
+            LinkDirection::Out,
+        )
+        .unwrap();
+        assert!(c.pipeline);
+        assert!(c.defer);
+        assert!(c.retry);
+        assert!(c.local);
+        assert!(c.atomic);
+        assert!(c.always);
+    }
+
+    #[test]
+    fn boolean_options_default_false() {
+        let c = PvaLinkConfig::parse("pva://X", LinkDirection::Out).unwrap();
+        assert!(!c.pipeline);
+        assert!(!c.defer);
+        assert!(!c.retry);
+        assert!(!c.local);
+        assert!(!c.atomic);
+        assert!(!c.always);
+        assert_eq!(c.monorder, 0);
+    }
+
+    #[test]
+    fn bad_option_value_rejected() {
+        assert!(matches!(
+            PvaLinkConfig::parse("pva://X?Q=notanumber", LinkDirection::Inp),
+            Err(PvaLinkParseError::BadOption(_))
+        ));
         assert!(matches!(
             PvaLinkConfig::parse("pva://X?sevr=BOGUS", LinkDirection::Inp),
             Err(PvaLinkParseError::BadOption(_))

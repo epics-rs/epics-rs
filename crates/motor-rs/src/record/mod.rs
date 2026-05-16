@@ -152,13 +152,23 @@ impl Record for MotorRecord {
         let dmov_completed = !dmov_before && self.stat.dmov;
         self.suppress_flnk = effects.suppress_forward_link || !dmov_completed;
 
-        // Write effects to shared mailbox for DeviceSupport.write() to consume
+        // Write effects to shared mailbox for DeviceSupport.write() to consume.
+        // If a previous batch has not been consumed yet (two process() cycles
+        // without an intervening write()), fold the new batch into it rather
+        // than overwriting — otherwise the earlier move command is lost.
         if let Some(state) = self.device_state.clone() {
             let actions = self.effects_to_actions(&effects);
             match state.lock() {
-                Ok(mut ds) => {
-                    ds.pending_actions = Some(actions);
-                }
+                Ok(mut ds) => match ds.pending_actions.take() {
+                    Some(mut prev) => {
+                        tracing::warn!(
+                            "motor: pending_actions not yet consumed — merging batches"
+                        );
+                        prev.merge_newer(actions);
+                        ds.pending_actions = Some(prev);
+                    }
+                    None => ds.pending_actions = Some(actions),
+                },
                 Err(e) => {
                     tracing::error!("device state lock poisoned in process: {e}");
                 }

@@ -17,6 +17,62 @@ use tiff::encoder::TiffEncoder;
 use tiff::encoder::colortype;
 use tiff::tags::Tag;
 
+// Custom TIFF tag numbers — must match C++ NDFileTIFF.cpp:37-41 exactly.
+const TIFFTAG_NDTIMESTAMP: u16 = 65000;
+const TIFFTAG_UNIQUEID: u16 = 65001;
+const TIFFTAG_EPICSTSSEC: u16 = 65002;
+const TIFFTAG_EPICSTSNSEC: u16 = 65003;
+const TIFFTAG_FIRST_ATTRIBUTE: u16 = 65010;
+
+/// Signed-RGB color types. The `tiff` crate only ships unsigned RGB
+/// (`colortype::RGB8/16/32`); C++ libtiff handles signed RGB by setting
+/// `SAMPLEFORMAT_INT` on an otherwise identical RGB layout. These local
+/// `ColorType` impls do exactly that — same bit layout, `SampleFormat::Int`.
+mod signed_rgb {
+    use tiff::encoder::colortype::ColorType;
+    use tiff::tags::{PhotometricInterpretation, SampleFormat};
+
+    macro_rules! signed_rgb {
+        ($name:ident, $inner:ty, $bits:expr) => {
+            pub struct $name;
+            impl ColorType for $name {
+                type Inner = $inner;
+                const TIFF_VALUE: PhotometricInterpretation = PhotometricInterpretation::RGB;
+                const BITS_PER_SAMPLE: &'static [u16] = &[$bits, $bits, $bits];
+                const SAMPLE_FORMAT: &'static [SampleFormat] =
+                    &[SampleFormat::Int, SampleFormat::Int, SampleFormat::Int];
+            }
+        };
+    }
+
+    signed_rgb!(RGBI8, i8, 8);
+    signed_rgb!(RGBI16, i16, 16);
+    signed_rgb!(RGBI32, i32, 32);
+    signed_rgb!(RGBI64, i64, 64);
+}
+
+/// Format an NDAttribute value as the C++ `epicsSnprintf` "name:value" tag
+/// string (NDFileTIFF.cpp:303-327). Numeric values keep their type, not a
+/// generic stringification: signed `%lld`, unsigned `%llu`, float `%f`.
+fn attribute_tag_string(attr: &NDAttribute) -> String {
+    let value = match &attr.value {
+        NDAttrValue::Int8(v) => format!("{}", v),
+        NDAttrValue::Int16(v) => format!("{}", v),
+        NDAttrValue::Int32(v) => format!("{}", v),
+        NDAttrValue::Int64(v) => format!("{}", v),
+        NDAttrValue::UInt8(v) => format!("{}", v),
+        NDAttrValue::UInt16(v) => format!("{}", v),
+        NDAttrValue::UInt32(v) => format!("{}", v),
+        NDAttrValue::UInt64(v) => format!("{}", v),
+        // C++ uses "%f" which is 6 fractional digits.
+        NDAttrValue::Float32(v) => format!("{:.6}", v),
+        NDAttrValue::Float64(v) => format!("{:.6}", v),
+        NDAttrValue::String(s) => s.clone(),
+        NDAttrValue::Undefined => String::new(),
+    };
+    format!("{}:{}", attr.name, value)
+}
+
 /// TIFF file writer using the `tiff` crate for proper encoding/decoding.
 pub struct TiffWriter {
     current_path: Option<PathBuf>,
@@ -111,18 +167,38 @@ impl NDFileWriter for TiffWriter {
             .map_err(|e| ADError::UnsupportedConversion(format!("TIFF encoder error: {}", e)))?;
 
         // Collect attribute tag data before borrowing encoder mutably.
-        // C++ writes NDArray attributes as custom TIFF tags starting at tag 65010.
-        // Each attribute is written as a string tag: "name=value".
+        // C++ writes NDArray attributes as custom TIFF tags starting at tag
+        // 65010 (TIFFTAG_FIRST_ATTRIBUTE), value format "name:value" (colon).
         let attr_tags: Vec<(u16, String)> = array
             .attributes
             .iter()
             .enumerate()
             .map(|(i, attr)| {
-                let tag_num = 65010u16.saturating_add(i as u16);
-                let tag_val = format!("{}={}", attr.name, attr.value.as_string());
-                (tag_num, tag_val)
+                let tag_num = TIFFTAG_FIRST_ATTRIBUTE.saturating_add(i as u16);
+                (tag_num, attribute_tag_string(attr))
             })
             .collect();
+
+        // Standard tags derived from well-known attributes (NDFileTIFF.cpp:243-271).
+        let model = array
+            .attributes
+            .get("Model")
+            .map(|a| a.value.as_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let make = array
+            .attributes
+            .get("Manufacturer")
+            .map(|a| a.value.as_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let image_description = array
+            .attributes
+            .get("TIFFImageDescription")
+            .map(|a| a.value.as_string());
+
+        let unique_id = array.unique_id;
+        let time_stamp = array.time_stamp;
+        let ts_sec = array.timestamp.sec;
+        let ts_nsec = array.timestamp.nsec;
 
         // Macro to reduce repetition: create image encoder, write custom tags, write data.
         macro_rules! write_with_tags {
@@ -131,37 +207,34 @@ impl NDFileWriter for TiffWriter {
                     ADError::UnsupportedConversion(format!("TIFF encoder error: {}", e))
                 })?;
 
-                // Write uniqueId and timestamp as the first custom tags
-                image
-                    .encoder()
-                    .write_tag(
-                        Tag::Unknown(65000),
-                        &*format!("uniqueId={}", array.unique_id),
-                    )
-                    .map_err(|e| {
-                        ADError::UnsupportedConversion(format!("TIFF tag write error: {}", e))
-                    })?;
-                image
-                    .encoder()
-                    .write_tag(
-                        Tag::Unknown(65001),
-                        &*format!("timestamp={}", array.timestamp.as_f64()),
-                    )
-                    .map_err(|e| {
-                        ADError::UnsupportedConversion(format!("TIFF tag write error: {}", e))
-                    })?;
-
-                // Write NDArray attributes as custom tags starting at 65010
-                for (tag_num, tag_val) in &attr_tags {
-                    image
-                        .encoder()
-                        .write_tag(Tag::Unknown(*tag_num), &**tag_val)
-                        .map_err(|e| {
+                macro_rules! tag {
+                    ($tag:expr, $val:expr) => {
+                        image.encoder().write_tag($tag, $val).map_err(|e| {
                             ADError::UnsupportedConversion(format!(
-                                "TIFF attribute tag write error: {}",
+                                "TIFF tag write error: {}",
                                 e
                             ))
                         })?;
+                    };
+                }
+
+                // EPICS metadata tags 65000-65003 — typed values matching C++.
+                tag!(Tag::Unknown(TIFFTAG_NDTIMESTAMP), time_stamp);
+                tag!(Tag::Unknown(TIFFTAG_UNIQUEID), unique_id as u32);
+                tag!(Tag::Unknown(TIFFTAG_EPICSTSSEC), ts_sec);
+                tag!(Tag::Unknown(TIFFTAG_EPICSTSNSEC), ts_nsec);
+
+                // Standard tags (NDFileTIFF.cpp:243-271).
+                tag!(Tag::Software, "EPICS areaDetector");
+                tag!(Tag::Model, &*model);
+                tag!(Tag::Make, &*make);
+                if let Some(desc) = &image_description {
+                    tag!(Tag::ImageDescription, &**desc);
+                }
+
+                // NDArray attributes as custom tags starting at 65010.
+                for (tag_num, tag_val) in &attr_tags {
+                    tag!(Tag::Unknown(*tag_num), &**tag_val);
                 }
 
                 image
@@ -180,11 +253,10 @@ impl NDFileWriter for TiffWriter {
             }
             NDDataBuffer::I8(v) => {
                 if is_rgb {
-                    return Err(ADError::UnsupportedConversion(
-                        "TIFF crate does not support signed RGB8".into(),
-                    ));
+                    write_with_tags!(signed_rgb::RGBI8, v)
+                } else {
+                    write_with_tags!(colortype::GrayI8, v)
                 }
-                write_with_tags!(colortype::GrayI8, v)
             }
             NDDataBuffer::U16(v) => {
                 if is_rgb {
@@ -195,11 +267,10 @@ impl NDFileWriter for TiffWriter {
             }
             NDDataBuffer::I16(v) => {
                 if is_rgb {
-                    return Err(ADError::UnsupportedConversion(
-                        "TIFF crate does not support signed RGB16".into(),
-                    ));
+                    write_with_tags!(signed_rgb::RGBI16, v)
+                } else {
+                    write_with_tags!(colortype::GrayI16, v)
                 }
-                write_with_tags!(colortype::GrayI16, v)
             }
             NDDataBuffer::U32(v) => {
                 if is_rgb {
@@ -210,19 +281,17 @@ impl NDFileWriter for TiffWriter {
             }
             NDDataBuffer::I32(v) => {
                 if is_rgb {
-                    return Err(ADError::UnsupportedConversion(
-                        "TIFF crate does not support signed RGB32".into(),
-                    ));
+                    write_with_tags!(signed_rgb::RGBI32, v)
+                } else {
+                    write_with_tags!(colortype::GrayI32, v)
                 }
-                write_with_tags!(colortype::GrayI32, v)
             }
             NDDataBuffer::I64(v) => {
                 if is_rgb {
-                    return Err(ADError::UnsupportedConversion(
-                        "TIFF crate does not support signed RGB64".into(),
-                    ));
+                    write_with_tags!(signed_rgb::RGBI64, v)
+                } else {
+                    write_with_tags!(colortype::GrayI64, v)
                 }
-                write_with_tags!(colortype::GrayI64, v)
             }
             NDDataBuffer::U64(v) => {
                 if is_rgb {
@@ -610,6 +679,159 @@ mod tests {
             NDDataBuffer::U8(v) => assert_eq!(v.len(), 12),
             other => panic!("unexpected data buffer: {other:?}"),
         }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_metadata_tags_match_cpp_numbers_and_types() {
+        let path = temp_path("tiff_meta_tags");
+        let mut writer = TiffWriter::new();
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        arr.unique_id = 4242;
+        arr.time_stamp = 1234.5;
+        arr.timestamp.sec = 1_000_000;
+        arr.timestamp.nsec = 500;
+
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+        // 65000 = NDTimeStamp (TIFF_DOUBLE).
+        assert_eq!(decoder.get_tag_f64(Tag::Unknown(65000)).unwrap(), 1234.5);
+        // 65001 = NDUniqueId (TIFF_LONG).
+        assert_eq!(decoder.get_tag_u32(Tag::Unknown(65001)).unwrap(), 4242);
+        // 65002 = EPICSTSSec, 65003 = EPICSTSNsec.
+        assert_eq!(decoder.get_tag_u32(Tag::Unknown(65002)).unwrap(), 1_000_000);
+        assert_eq!(decoder.get_tag_u32(Tag::Unknown(65003)).unwrap(), 500);
+        // Standard Software tag.
+        assert_eq!(
+            decoder.get_tag(Tag::Software).unwrap().into_string().unwrap(),
+            "EPICS areaDetector"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_standard_tags_from_attributes() {
+        let path = temp_path("tiff_std_tags");
+        let mut writer = TiffWriter::new();
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "Model",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String("SimDetector".into()),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "Manufacturer",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String("EPICS".into()),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "TIFFImageDescription",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String("test frame".into()),
+        ));
+
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            decoder.get_tag(Tag::Model).unwrap().into_string().unwrap(),
+            "SimDetector"
+        );
+        assert_eq!(
+            decoder.get_tag(Tag::Make).unwrap().into_string().unwrap(),
+            "EPICS"
+        );
+        assert_eq!(
+            decoder
+                .get_tag(Tag::ImageDescription)
+                .unwrap()
+                .into_string()
+                .unwrap(),
+            "test frame"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_attribute_tag_format_uses_colon_and_type() {
+        // C++ uses "name:value" with typed numeric formatting.
+        let mut a = NDArray::new(
+            vec![NDDimension::new(2), NDDimension::new(2)],
+            NDDataType::UInt8,
+        );
+        a.attributes.add(NDAttribute::new_static(
+            "Gain",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(-7),
+        ));
+
+        let path = temp_path("tiff_attr_fmt");
+        let mut writer = TiffWriter::new();
+        writer.open_file(&path, NDFileMode::Single, &a).unwrap();
+        writer.write_file(&a).unwrap();
+        writer.close_file().unwrap();
+
+        let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+        // First attribute tag is 65010.
+        let s = decoder
+            .get_tag(Tag::Unknown(65010))
+            .unwrap()
+            .into_string()
+            .unwrap();
+        assert_eq!(s, "Gain:-7");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_signed_rgb_writes_instead_of_erroring() {
+        let path = temp_path("tiff_signed_rgb");
+        let mut writer = TiffWriter::new();
+
+        let mut arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(2),
+                NDDimension::new(2),
+            ],
+            NDDataType::Int16,
+        );
+        TiffWriter::attach_color_mode(&mut arr, NDColorMode::RGB1);
+        if let NDDataBuffer::I16(v) = &mut arr.data {
+            for (i, item) in v.iter_mut().enumerate() {
+                *item = (i as i16) - 6;
+            }
+        }
+
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        // Previously a hard error; must now succeed.
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let sf = decoder.get_tag_u16_vec(Tag::SampleFormat).unwrap();
+        // SampleFormat 2 = SAMPLEFORMAT_INT.
+        assert!(sf.iter().all(|&s| s == 2), "expected signed sample format");
 
         std::fs::remove_file(&path).ok();
     }

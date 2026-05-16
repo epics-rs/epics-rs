@@ -166,11 +166,11 @@ async fn main() {
     if args.long_string {
         eprintln!("caput-rs: -S (long-string put) is accepted for parity but not yet honoured");
     }
-    if args.force_numeric || args.force_string {
-        // Today the channel's native type drives parse(); -n/-s have
-        // no observable effect until a typed-write API is exposed.
-        // No-op silently to avoid noisy stderr in scripts.
-    }
+    // -n / -s steer ENUM scalar handling below (force_numeric =
+    // interpret as index; force_string = always send DBR_STRING for
+    // server-side menu resolution). For non-ENUM channels they have
+    // no effect — matching C `caput`, where enumAsNr / enumAsString
+    // only gate the DBR_ENUM branch.
 
     let pv_name = args.pv_name.expect("clap enforces required");
 
@@ -254,7 +254,7 @@ async fn main() {
             std::process::exit(1);
         }
         match parse_array(native_type, tokens) {
-            Ok(v) => v,
+            Ok(v) => WriteValue::Typed(v),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -265,19 +265,50 @@ async fn main() {
         // spaces (legacy convention). Modern usage is one value but
         // operators occasionally write `caput PV "alpha beta"`.
         let joined = args.values.join(" ");
-        match epics_ca_rs::EpicsValue::parse(native_type, &joined) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+
+        // ENUM special treatment, mirroring C `caput.c:455-510`:
+        //
+        // * `-n` (force_numeric / enumAsNr): interpret as a number.
+        // * `-s` (force_string / enumAsString): always send the value
+        //   as DBR_STRING and let the SERVER resolve the menu string.
+        // * default: a plain integer index goes through the numeric
+        //   path; anything else is sent as DBR_STRING for server-side
+        //   menu resolution. The client cannot resolve site-custom
+        //   menus, so this is the only way to write them by name.
+        let is_plain_integer = parse_plain_integer(&joined).is_some();
+        if native_type == epics_ca_rs::DbFieldType::Enum
+            && !args.force_numeric
+            && (args.force_string || !is_plain_integer)
+        {
+            WriteValue::EnumString(joined)
+        } else {
+            match epics_ca_rs::EpicsValue::parse(native_type, &joined) {
+                Ok(v) => WriteValue::Typed(v),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
     };
 
-    let result = if args.callback {
-        ch.put_with_timeout(&parsed_value, timeout).await
-    } else {
-        ch.put_nowait(&parsed_value).await
+    let result = match &parsed_value {
+        WriteValue::Typed(v) => {
+            if args.callback {
+                ch.put_with_timeout(v, timeout).await
+            } else {
+                ch.put_nowait(v).await
+            }
+        }
+        WriteValue::EnumString(s) => {
+            // Always write ENUM-by-name through the DBR_STRING put so
+            // the server resolves the menu string.
+            if args.callback {
+                ch.put_string(s).await
+            } else {
+                ch.put_string_nowait(s).await
+            }
+        }
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -285,17 +316,19 @@ async fn main() {
     }
 
     // Re-read for echoing to stdout (matches C caput which always
-    // reads the PV back after the put).
+    // reads the PV back after the put). `echo_fallback` is the value
+    // shown if the post-put read fails — just what was written.
+    let echo_fallback = parsed_value.echo_fallback();
     let (new_value, new_snap) = if args.long_mode {
         match ch.get_with_metadata(DbrClass::Time).await {
             Ok(snap) => (snap.value.clone(), Some(snap)),
-            Err(_) => (parsed_value.clone(), None),
+            Err(_) => (echo_fallback.clone(), None),
         }
     } else {
         (
             match ch.get_with_timeout(timeout).await {
                 Ok((_, val)) => val,
-                Err(_) => parsed_value.clone(),
+                Err(_) => echo_fallback.clone(),
             },
             None,
         )
@@ -346,6 +379,34 @@ async fn main() {
             val = new_rendered
         );
     }
+}
+
+/// What `caput-rs` will write — either a value typed against the
+/// channel's native DBR type, or a string to be sent as `DBR_STRING`
+/// for server-side resolution (the ENUM-by-name path).
+enum WriteValue {
+    Typed(epics_ca_rs::EpicsValue),
+    /// A scalar ENUM value written by name. The server resolves it
+    /// against the record's menu — see `CaChannel::put_string`.
+    EnumString(String),
+}
+
+impl WriteValue {
+    /// Value used to echo `New :` if the post-put read-back fails.
+    fn echo_fallback(&self) -> epics_ca_rs::EpicsValue {
+        match self {
+            WriteValue::Typed(v) => v.clone(),
+            WriteValue::EnumString(s) => epics_ca_rs::EpicsValue::String(s.clone()),
+        }
+    }
+}
+
+/// Parse a plain integer index — decimal, optionally signed, no radix
+/// prefix and no surrounding garbage. C `caput` treats anything that
+/// is not a clean number as an ENUM menu string. Returns `Some` only
+/// for a strict integer literal.
+fn parse_plain_integer(s: &str) -> Option<i64> {
+    s.trim().parse::<i64>().ok()
 }
 
 fn parse_array(

@@ -1289,9 +1289,14 @@ impl CaChannel {
             .map_err(|_| CaError::Shutdown)
     }
 
+    /// Send a `CA_PROTO_WRITE_NOTIFY`. `data_type` is the over-the-wire
+    /// DBR type — usually the channel native type, but the typed
+    /// string-put path passes `DBR_STRING` (0) regardless of native
+    /// type so the server resolves the value (e.g. ENUM menu strings).
     fn send_write_notify_fast(
         &self,
         snap: &ChannelSnapshotPublic,
+        data_type: u16,
         count: u32,
         ioid: u32,
         payload: Vec<u8>,
@@ -1300,7 +1305,7 @@ impl CaChannel {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE_NOTIFY,
                 snap.sid,
-                snap.native_type as u16,
+                data_type,
                 count,
                 Some(ioid),
                 payload,
@@ -1310,7 +1315,7 @@ impl CaChannel {
         self.transport_tx
             .send(TransportCommand::WriteNotify {
                 sid: snap.sid,
-                data_type: snap.native_type as u16,
+                data_type,
                 count,
                 ioid,
                 payload,
@@ -1319,9 +1324,12 @@ impl CaChannel {
             .map_err(|_| CaError::Shutdown)
     }
 
+    /// Send a fire-and-forget `CA_PROTO_WRITE`. See
+    /// [`Self::send_write_notify_fast`] for the `data_type` contract.
     fn send_write_nowait_fast(
         &self,
         snap: &ChannelSnapshotPublic,
+        data_type: u16,
         count: u32,
         payload: Vec<u8>,
     ) -> CaResult<()> {
@@ -1329,7 +1337,7 @@ impl CaChannel {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
                 snap.sid,
-                snap.native_type as u16,
+                data_type,
                 count,
                 None,
                 payload,
@@ -1339,7 +1347,7 @@ impl CaChannel {
         self.transport_tx
             .send(TransportCommand::Write {
                 sid: snap.sid,
-                data_type: snap.native_type as u16,
+                data_type,
                 count,
                 payload,
                 server_addr: snap.server_addr,
@@ -1814,7 +1822,9 @@ impl CaChannel {
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        if let Err(e) = self.send_write_notify_fast(&snap, count, ioid, payload) {
+        if let Err(e) =
+            self.send_write_notify_fast(&snap, snap.native_type as u16, count, ioid, payload)
+        {
             self.in_flight.writes.remove(&ioid);
             return Err(e);
         }
@@ -1841,7 +1851,9 @@ impl CaChannel {
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        if let Err(e) = self.send_write_notify_fast(&snap, count, ioid, payload) {
+        if let Err(e) =
+            self.send_write_notify_fast(&snap, snap.native_type as u16, count, ioid, payload)
+        {
             self.in_flight.writes.remove(&ioid);
             return Err(e);
         }
@@ -1861,7 +1873,52 @@ impl CaChannel {
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        self.send_write_nowait_fast(&snap, count, payload)
+        self.send_write_nowait_fast(&snap, snap.native_type as u16, count, payload)
+    }
+
+    /// Write a string value to the channel as `DBR_STRING` (DBR type 0)
+    /// regardless of the channel's native type, and wait for the
+    /// completion callback.
+    ///
+    /// This mirrors C `caput`'s ENUM handling (`caput.c:485-510`): a
+    /// `DBR_ENUM` channel is written with the value as a `DBR_STRING`
+    /// and the **server** resolves the menu string. That is the only
+    /// way to write a site-custom ENUM by name — the client has no
+    /// access to the IOC's menu definitions. Plain integer ENUM
+    /// indices should still go through [`Self::put`] with
+    /// [`EpicsValue::Enum`].
+    pub async fn put_string(&self, value: &str) -> CaResult<()> {
+        let snap = self.snapshot()?;
+
+        let ioid = alloc_ioid();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
+
+        let payload = EpicsValue::String(value.to_string()).to_bytes();
+        // DBR_STRING = 0; count 1. The server interprets the bytes
+        // against its own field type (e.g. ENUM menu resolution).
+        if let Err(e) = self.send_write_notify_fast(&snap, 0, 1, ioid, payload) {
+            self.in_flight.writes.remove(&ioid);
+            return Err(e);
+        }
+
+        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(30.0);
+        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
+            .map_err(|_| CaError::Timeout)?
+            .map_err(|_| CaError::Shutdown)?
+    }
+
+    /// Fire-and-forget variant of [`Self::put_string`] — sends the
+    /// value as `DBR_STRING` via `CA_PROTO_WRITE` without waiting for
+    /// server acknowledgement.
+    pub async fn put_string_nowait(&self, value: &str) -> CaResult<()> {
+        let snap = self.snapshot()?;
+        let payload = EpicsValue::String(value.to_string()).to_bytes();
+        self.send_write_nowait_fast(&snap, 0, 1, payload)
     }
 
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {
@@ -3891,5 +3948,62 @@ mod event_watcher_tests {
             abort_handle.is_finished(),
             "EventWatcher::abort must stop the watcher task"
         );
+    }
+}
+
+#[cfg(test)]
+mod typed_string_put_tests {
+    use super::*;
+
+    /// The typed string-put path (`CaChannel::put_string` /
+    /// `put_string_nowait`) must put the value on the wire as
+    /// `DBR_STRING` (DBR type code 0) regardless of the channel's
+    /// native type, so the server resolves it (e.g. ENUM menu
+    /// strings). This drives the shared `build_write_frame` builder
+    /// the way `put_string_nowait` does and asserts the header field.
+    #[test]
+    fn put_string_frame_uses_dbr_string_type() {
+        let payload = EpicsValue::String("Running".to_string()).to_bytes();
+        let frame = CaChannel::build_write_frame(
+            CA_PROTO_WRITE,
+            /* sid */ 77,
+            /* data_type — forced DBR_STRING */ 0,
+            /* count */ 1,
+            /* ioid */ None,
+            payload,
+        );
+        let (hdr, _consumed) =
+            CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
+        assert_eq!(hdr.cmmd, CA_PROTO_WRITE, "command must be CA_PROTO_WRITE");
+        assert_eq!(
+            hdr.data_type, 0,
+            "typed string-put must wire DBR_STRING (0), not the native type"
+        );
+        assert_eq!(hdr.cid, 77, "sid echoed in cid field");
+    }
+
+    /// Contrast: a native-typed put of a non-string channel carries
+    /// the native DBR type, NOT 0. Proves the string-put choice of 0
+    /// is a deliberate override, not the default.
+    #[test]
+    fn native_typed_put_frame_keeps_native_type() {
+        let payload = EpicsValue::Double(1.5).to_bytes();
+        let native_double = DbFieldType::Double as u16; // 6
+        let frame = CaChannel::build_write_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            /* sid */ 5,
+            native_double,
+            /* count */ 1,
+            /* ioid */ Some(42),
+            payload,
+        );
+        let (hdr, _consumed) =
+            CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
+        assert_eq!(hdr.data_type, native_double);
+        assert_ne!(
+            hdr.data_type, 0,
+            "native Double put must not collapse to DBR_STRING"
+        );
+        assert_eq!(hdr.available, 42, "ioid echoed in available field");
     }
 }

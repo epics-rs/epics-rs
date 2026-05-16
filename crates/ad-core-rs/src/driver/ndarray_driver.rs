@@ -194,6 +194,77 @@ pub(crate) fn write_array_params(
     Ok(())
 }
 
+/// Refresh the pool-statistics parameters (`POOL_MAX_MEMORY`,
+/// `POOL_USED_MEMORY`, `POOL_ALLOC_BUFFERS`, `POOL_FREE_BUFFERS`) from a pool.
+///
+/// Shared by the `NDPoolPollStats` dispatch and `preAllocateBuffers`.
+pub(crate) fn refresh_pool_stats(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    pool: &NDArrayPool,
+) -> AsynResult<()> {
+    const MEGABYTE: f64 = 1_048_576.0;
+    port_base.set_float64_param(
+        params.pool_max_memory,
+        0,
+        pool.max_memory() as f64 / MEGABYTE,
+    )?;
+    port_base.set_float64_param(
+        params.pool_used_memory,
+        0,
+        pool.allocated_bytes() as f64 / MEGABYTE,
+    )?;
+    port_base.set_int32_param(params.pool_alloc_buffers, 0, pool.num_alloc_buffers() as i32)?;
+    port_base.set_int32_param(params.pool_free_buffers, 0, pool.num_free_buffers() as i32)?;
+    Ok(())
+}
+
+/// Handle a write to a pool-control Int32 parameter, mirroring the pool branch
+/// of C++ `asynNDArrayDriver::writeInt32` (asynNDArrayDriver.cpp:684-694).
+///
+/// `param_index` is the parameter that was just written; `value` is the value
+/// written. Returns `true` when the parameter was a recognized pool-control
+/// parameter and was handled. `template_array` is used by the
+/// `POOL_PRE_ALLOC_BUFFERS` path (C++ uses `pArrays[0]` — the most recent
+/// array); pass the driver's last array, or `None` if none exists yet.
+pub(crate) fn handle_pool_write_int32(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    pool: &NDArrayPool,
+    param_index: usize,
+    template_array: Option<&NDArray>,
+) -> AsynResult<bool> {
+    if param_index == params.pool_empty_free_list {
+        pool.empty_free_list();
+        refresh_pool_stats(port_base, params, pool)?;
+        Ok(true)
+    } else if param_index == params.pool_poll_stats {
+        refresh_pool_stats(port_base, params, pool)?;
+        Ok(true)
+    } else if param_index == params.pool_pre_alloc {
+        if let Some(template) = template_array {
+            let count = port_base
+                .get_int32_param(params.pool_num_pre_alloc_buffers, 0)
+                .unwrap_or(0)
+                .max(0) as usize;
+            // C++ preAllocateBuffers ignores allocation errors per-array; here
+            // we surface them so the caller knows the pool limit was hit.
+            pool.pre_allocate_buffers(template, count).map_err(|e| {
+                asyn_rs::error::AsynError::Status {
+                    status: asyn_rs::error::AsynStatus::Error,
+                    message: e.to_string(),
+                }
+            })?;
+            refresh_pool_stats(port_base, params, pool)?;
+        }
+        // C++ resets NDPoolPreAllocBuffers back to 0 after running.
+        port_base.set_int32_param(params.pool_pre_alloc, 0, 0)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// Base state for asynNDArrayDriver (file handling, attribute mgmt, pool).
 pub struct NDArrayDriverBase {
     pub port_base: PortDriverBase,
@@ -201,6 +272,9 @@ pub struct NDArrayDriverBase {
     pub pool: Arc<NDArrayPool>,
     pub array_output: NDArrayOutput,
     pub queued_counter: Arc<QueuedArrayCounter>,
+    /// Most recently prepared array (C++ `pArrays[0]`), used as the template
+    /// for `preAllocateBuffers`.
+    pub last_array: Option<Arc<NDArray>>,
 }
 
 impl NDArrayDriverBase {
@@ -227,6 +301,7 @@ impl NDArrayDriverBase {
             pool,
             array_output: NDArrayOutput::new(),
             queued_counter: Arc::new(QueuedArrayCounter::new()),
+            last_array: None,
         })
     }
 
@@ -234,6 +309,24 @@ impl NDArrayDriverBase {
     pub fn connect_downstream(&mut self, mut sender: NDArraySender) {
         sender.set_queued_counter(self.queued_counter.clone());
         self.array_output.add(sender);
+    }
+
+    /// Handle a write to a pool-control Int32 parameter (`POOL_EMPTY_FREELIST`,
+    /// `POOL_POLL_STATS`, `POOL_PRE_ALLOC_BUFFERS`), mirroring the pool branch
+    /// of C++ `asynNDArrayDriver::writeInt32`.
+    ///
+    /// Returns `true` when `param_index` was a recognized pool-control
+    /// parameter. Driver layers route their `writeInt32` through this so the
+    /// `POOL_*` parameters act on the pool instead of being dead.
+    pub fn write_int32_pool(&mut self, param_index: usize, _value: i32) -> AsynResult<bool> {
+        let template = self.last_array.clone();
+        handle_pool_write_int32(
+            &mut self.port_base,
+            &self.params,
+            &self.pool,
+            param_index,
+            template.as_deref(),
+        )
     }
 
     /// Number of connected downstream channels.
@@ -259,6 +352,9 @@ impl NDArrayDriverBase {
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
         write_array_params(&mut self.port_base, &self.params, &array)?;
+
+        // Record this as the template array for preAllocateBuffers.
+        self.last_array = Some(array.clone());
 
         // Update pool stats
         self.port_base.set_float64_param(

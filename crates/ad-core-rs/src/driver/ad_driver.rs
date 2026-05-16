@@ -18,6 +18,9 @@ pub struct ADDriverBase {
     pub pool: Arc<NDArrayPool>,
     pub array_output: NDArrayOutput,
     pub queued_counter: Arc<QueuedArrayCounter>,
+    /// Most recently prepared array (C++ `pArrays[0]`), used as the template
+    /// for `preAllocateBuffers`.
+    pub last_array: Option<Arc<NDArray>>,
 }
 
 impl ADDriverBase {
@@ -105,6 +108,7 @@ impl ADDriverBase {
             pool,
             array_output: NDArrayOutput::new(),
             queued_counter: Arc::new(QueuedArrayCounter::new()),
+            last_array: None,
         })
     }
 
@@ -137,6 +141,9 @@ impl ADDriverBase {
             &self.params.base,
             &array,
         )?;
+
+        // Record this as the template array for preAllocateBuffers.
+        self.last_array = Some(array.clone());
 
         // Update pool stats
         self.port_base.set_float64_param(
@@ -220,6 +227,74 @@ impl ADDriverBase {
             }
         }
 
+        Ok(())
+    }
+
+    /// Handle a write to a pool-control Int32 parameter (`POOL_EMPTY_FREELIST`,
+    /// `POOL_POLL_STATS`, `POOL_PRE_ALLOC_BUFFERS`), mirroring the pool branch
+    /// of C++ `asynNDArrayDriver::writeInt32`.
+    ///
+    /// Returns `true` when `param_index` was a recognized pool-control
+    /// parameter.
+    pub fn write_int32_pool(&mut self, param_index: usize, _value: i32) -> AsynResult<bool> {
+        let template = self.last_array.clone();
+        crate::driver::ndarray_driver::handle_pool_write_int32(
+            &mut self.port_base,
+            &self.params.base,
+            &self.pool,
+            param_index,
+            template.as_deref(),
+        )
+    }
+
+    /// Write `ADAcquire` and drive `ADAcquireBusy` accordingly.
+    ///
+    /// Mirrors the `ADAcquire` branch of C++ `asynNDArrayDriver::setIntegerParam`
+    /// (asynNDArrayDriver.cpp:636-663):
+    /// - `value != 0` (start): `ADAcquireBusy = 1`.
+    /// - `value == 0` (stop): `ADAcquireBusy = 0`, but when `ADWaitForPlugins`
+    ///   is set, only once the live queued-array count has reached 0.
+    ///
+    /// `ADAcquire` itself is always written to `value`.
+    pub fn set_acquire(&mut self, value: i32) -> AsynResult<()> {
+        if value == 0 {
+            let wait_for_plugins = self
+                .port_base
+                .get_int32_param(self.params.wait_for_plugins, 0)
+                .unwrap_or(0)
+                != 0;
+            if !wait_for_plugins || self.queued_counter.get() == 0 {
+                self.port_base
+                    .set_int32_param(self.params.acquire_busy, 0, 0)?;
+            }
+        } else {
+            self.port_base
+                .set_int32_param(self.params.acquire_busy, 0, 1)?;
+        }
+        self.port_base
+            .set_int32_param(self.params.acquire, 0, value)?;
+        Ok(())
+    }
+
+    /// Write `NDNumQueuedArrays` and clear `ADAcquireBusy` when the queue
+    /// drains while acquisition has already stopped.
+    ///
+    /// Mirrors the `NDNumQueuedArrays` branch of C++
+    /// `asynNDArrayDriver::setIntegerParam`: when `NDNumQueuedArrays` reaches 0
+    /// and `ADAcquire == 0`, `ADAcquireBusy` is set to 0.
+    pub fn set_num_queued_arrays(&mut self, value: i32) -> AsynResult<()> {
+        if value == 0 {
+            let acquire = self
+                .port_base
+                .get_int32_param(self.params.acquire, 0)
+                .unwrap_or(0);
+            if acquire == 0 {
+                self.port_base
+                    .set_int32_param(self.params.acquire_busy, 0, 0)?;
+            }
+        }
+        self.port_base
+            .set_int32_param(self.params.base.num_queued_arrays, 0, value)?;
         Ok(())
     }
 }
@@ -418,6 +493,122 @@ mod tests {
             elapsed >= std::time::Duration::from_millis(35),
             "expected ~40ms sleep, got {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn test_set_acquire_drives_acquire_busy() {
+        // G8: ADAcquire=1 sets AcquireBusy=1; ADAcquire=0 (no WaitForPlugins)
+        // immediately clears AcquireBusy.
+        let mut ad = ADDriverBase::new("TEST", 8, 8, 1_000_000).unwrap();
+        ad.set_acquire(1).unwrap();
+        assert_eq!(
+            ad.port_base.get_int32_param(ad.params.acquire, 0).unwrap(),
+            1
+        );
+        assert_eq!(
+            ad.port_base
+                .get_int32_param(ad.params.acquire_busy, 0)
+                .unwrap(),
+            1
+        );
+        ad.set_acquire(0).unwrap();
+        assert_eq!(
+            ad.port_base
+                .get_int32_param(ad.params.acquire_busy, 0)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_set_acquire_wait_for_plugins_gating() {
+        // G8: with WaitForPlugins set and queued arrays outstanding, ADAcquire=0
+        // does NOT clear AcquireBusy until NDNumQueuedArrays drains to 0.
+        let mut ad = ADDriverBase::new("TEST", 8, 8, 1_000_000).unwrap();
+        ad.port_base
+            .set_int32_param(ad.params.wait_for_plugins, 0, 1)
+            .unwrap();
+        ad.set_acquire(1).unwrap();
+        ad.queued_counter.increment(); // one array still queued
+
+        ad.set_acquire(0).unwrap();
+        // Still busy — queue not drained.
+        assert_eq!(
+            ad.port_base
+                .get_int32_param(ad.params.acquire_busy, 0)
+                .unwrap(),
+            1
+        );
+
+        // Drain the queue, then NDNumQueuedArrays=0 clears AcquireBusy.
+        ad.queued_counter.decrement();
+        ad.set_num_queued_arrays(0).unwrap();
+        assert_eq!(
+            ad.port_base
+                .get_int32_param(ad.params.acquire_busy, 0)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_write_int32_pool_empty_free_list() {
+        // G3: writing POOL_EMPTY_FREELIST empties the free list.
+        let mut ad = ADDriverBase::new("TEST", 8, 8, 10_000_000).unwrap();
+        let arr = ad
+            .pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(100)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap();
+        ad.pool.release(arr);
+        assert_eq!(ad.pool.num_free_buffers(), 1);
+
+        let handled = ad
+            .write_int32_pool(ad.params.base.pool_empty_free_list, 1)
+            .unwrap();
+        assert!(handled);
+        assert_eq!(ad.pool.num_free_buffers(), 0);
+    }
+
+    #[test]
+    fn test_write_int32_pool_pre_alloc() {
+        // G3: writing POOL_PRE_ALLOC_BUFFERS pre-allocates from the last array.
+        let mut ad = ADDriverBase::new("TEST", 8, 8, 10_000_000).unwrap();
+        let arr = ad
+            .pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(64)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap();
+        ad.prepare_array(Arc::new(arr)).unwrap();
+        ad.port_base
+            .set_int32_param(ad.params.base.pool_num_pre_alloc_buffers, 0, 3)
+            .unwrap();
+
+        let handled = ad
+            .write_int32_pool(ad.params.base.pool_pre_alloc, 1)
+            .unwrap();
+        assert!(handled);
+        // The 3 pre-allocated buffers land on the free list.
+        assert_eq!(ad.pool.num_free_buffers(), 3);
+        // C parity: POOL_PRE_ALLOC_BUFFERS is reset to 0 after running.
+        assert_eq!(
+            ad.port_base
+                .get_int32_param(ad.params.base.pool_pre_alloc, 0)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_write_int32_pool_unrecognized() {
+        // G3: a non-pool parameter is not handled.
+        let mut ad = ADDriverBase::new("TEST", 8, 8, 1_000_000).unwrap();
+        let handled = ad.write_int32_pool(ad.params.gain, 1).unwrap();
+        assert!(!handled);
     }
 
     #[test]

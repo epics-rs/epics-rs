@@ -397,7 +397,12 @@ impl MotorRecord {
     /// Handle STOP command.
     fn handle_stop(&mut self, effects: &mut ProcessEffects) {
         self.ctrl.stop = false; // pulse field
-        if self.stat.phase != MotionPhase::Idle {
+        // C motorRecord.cc — STOP_AXIS is sent whenever motion is in flight.
+        // An externally initiated move keeps phase==Idle but sets
+        // MIP_EXTERNAL, so it must be covered here too.
+        let in_motion = self.stat.phase != MotionPhase::Idle
+            || self.stat.mip.contains(MipFlags::EXTERNAL);
+        if in_motion {
             self.stat.mip.insert(MipFlags::STOP);
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
@@ -625,7 +630,10 @@ impl MotorRecord {
 
         match new {
             SpmgMode::Stop => {
-                if self.stat.phase != MotionPhase::Idle {
+                // Cover externally initiated moves (phase==Idle, MIP_EXTERNAL).
+                let in_motion = self.stat.phase != MotionPhase::Idle
+                    || self.stat.mip.contains(MipFlags::EXTERNAL);
+                if in_motion {
                     self.internal.backlash_pending = false;
                     self.internal.pending_retarget = None;
                     effects.commands.push(MotorCommand::Stop {

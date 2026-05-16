@@ -1684,6 +1684,51 @@ fn test_external_move_in_progress_keeps_dmov_false_via_do_process() {
     assert!(!rec.stat.dmov);
 }
 
+#[test]
+fn test_stop_during_external_move_emits_stop() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let mut rec = MotorRecord::new();
+    // External move flagged (phase stays Idle, MIP_EXTERNAL set).
+    rec.process_motor_info(&MotorStatus {
+        position: 3.0,
+        moving: true,
+        done: false,
+        ..Default::default()
+    });
+    assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
+
+    rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Stop);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "STOP during an external move must emit a Stop command"
+    );
+}
+
+#[test]
+fn test_spmg_stop_during_external_move_emits_stop() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let mut rec = MotorRecord::new();
+    rec.process_motor_info(&MotorStatus {
+        position: 3.0,
+        moving: true,
+        done: false,
+        ..Default::default()
+    });
+    rec.ctrl.spmg = SpmgMode::Stop;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "SPMG=Stop during an external move must emit a Stop command"
+    );
+}
+
 // --- SYNC PV (C: 82c26005, 2010-04) ---
 
 #[test]

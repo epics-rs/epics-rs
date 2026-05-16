@@ -26,6 +26,7 @@ dependencies = [
  "epics-bridge-rs",
  "epics-ca-rs",
  "epics-pva-rs",
+ "flate2",
  "image",
  "jpeg-decoder",
  "jpeg-encoder",

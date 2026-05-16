@@ -35,6 +35,139 @@ use crate::server::iocsh::{self, registry::CommandDef};
 use crate::server::{DeviceSupportFactory, access_security, autosave};
 use autosave::startup::AutosaveStartupConfig;
 
+/// IOC lifecycle init-hook subsystem — Rust port of epics-base
+/// `libcom/src/iocsh/initHooks.{c,h}`.
+///
+/// C code registers a callback via `initHookRegister()` and the IOC
+/// fires `initHookAnnounce(state)` at fixed points during
+/// `iocBuild()` / `iocRun()`. Ported code (autosave pass-0/pass-1
+/// restore, areaDetector plugins, sequencer programs, caPutLog,
+/// devIocStats) all hang behaviour off these announcements.
+///
+/// Both Rust build paths ([`IocApplication::run`] and
+/// [`crate::server::ioc_builder::IocBuilder::build`]) announce the
+/// states they reach in the same order C does.
+pub mod init_hooks {
+    use std::sync::{Arc, Mutex};
+
+    /// Initialization stages, mirroring C's `initHookState` enum
+    /// (`initHooks.h`). Only the states an embedded-style Rust IOC
+    /// can actually reach are modelled; the C `iocPause` /
+    /// `iocShutdown` / unit-test states are omitted because neither
+    /// Rust build path has a pause/shutdown transition that announces
+    /// them. The order of the modelled variants matches C exactly.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum InitHookState {
+        /// Start of iocBuild() / iocInit().
+        AtIocBuild,
+        /// Database sanity checks passed.
+        AtBeginning,
+        /// Callbacks, generalTime & taskwd init.
+        AfterCallbackInit,
+        /// CA links init.
+        AfterCaLinkInit,
+        /// Driver support init.
+        AfterInitDrvSup,
+        /// Record support init.
+        AfterInitRecSup,
+        /// Device support init pass 0 (also autosave pass 0).
+        AfterInitDevSup,
+        /// Records and locksets init (also autosave pass 1).
+        AfterInitDatabase,
+        /// Device support init pass 1.
+        AfterFinishDevSup,
+        /// Scan, AS, ProcessNotify init.
+        AfterScanInit,
+        /// Records with PINI = YES processed.
+        AfterInitialProcess,
+        /// RSRV (CA server) init.
+        AfterCaServerInit,
+        /// End of iocBuild().
+        AfterIocBuilt,
+        /// Start of iocRun().
+        AtIocRun,
+        /// Scan tasks and CA links running.
+        AfterDatabaseRunning,
+        /// RSRV (CA server) running.
+        AfterCaServerRunning,
+        /// End of iocRun() / iocInit().
+        AfterIocRunning,
+    }
+
+    impl InitHookState {
+        /// Printable representation — mirrors C `initHookName()`.
+        pub fn name(&self) -> &'static str {
+            match self {
+                InitHookState::AtIocBuild => "initHookAtIocBuild",
+                InitHookState::AtBeginning => "initHookAtBeginning",
+                InitHookState::AfterCallbackInit => "initHookAfterCallbackInit",
+                InitHookState::AfterCaLinkInit => "initHookAfterCaLinkInit",
+                InitHookState::AfterInitDrvSup => "initHookAfterInitDrvSup",
+                InitHookState::AfterInitRecSup => "initHookAfterInitRecSup",
+                InitHookState::AfterInitDevSup => "initHookAfterInitDevSup",
+                InitHookState::AfterInitDatabase => "initHookAfterInitDatabase",
+                InitHookState::AfterFinishDevSup => "initHookAfterFinishDevSup",
+                InitHookState::AfterScanInit => "initHookAfterScanInit",
+                InitHookState::AfterInitialProcess => "initHookAfterInitialProcess",
+                InitHookState::AfterCaServerInit => "initHookAfterCaServerInit",
+                InitHookState::AfterIocBuilt => "initHookAfterIocBuilt",
+                InitHookState::AtIocRun => "initHookAtIocRun",
+                InitHookState::AfterDatabaseRunning => "initHookAfterDatabaseRunning",
+                InitHookState::AfterCaServerRunning => "initHookAfterCaServerRunning",
+                InitHookState::AfterIocRunning => "initHookAfterIocRunning",
+            }
+        }
+    }
+
+    /// Application callback type — Rust equivalent of C's
+    /// `initHookFunction`. Invoked once per announced state. `Arc`
+    /// so [`init_hook_announce`] can snapshot the list and drop the
+    /// lock before invoking callbacks (C holds its list mutex only
+    /// during traversal, never across the callback).
+    pub type InitHookFunction = Arc<dyn Fn(InitHookState) + Send + Sync>;
+
+    static HOOKS: Mutex<Vec<InitHookFunction>> = Mutex::new(Vec::new());
+
+    /// Register a function for initHook notifications — Rust port of
+    /// C `initHookRegister()`. The callback is invoked for every
+    /// subsequently-announced state. Registration is process-global,
+    /// matching C's single `functionList`.
+    ///
+    /// Unlike C (which dedups by function pointer) closures cannot be
+    /// compared for identity, so every call adds a distinct callback;
+    /// callers must register each hook once.
+    pub fn init_hook_register(func: InitHookFunction) {
+        HOOKS.lock().unwrap().push(func);
+    }
+
+    /// Announce an init-hook state to all registered callbacks —
+    /// Rust port of C `initHookAnnounce()`. Called only by the IOC
+    /// build paths at the fixed lifecycle points.
+    ///
+    /// The callback list is snapshotted (cheap `Arc` clones) and the
+    /// lock released before any callback runs, so a hook that calls
+    /// [`init_hook_register`] from inside the callback cannot
+    /// deadlock. Hooks registered during an announce are not invoked
+    /// for that same state — matching C's snapshot-of-`ellFirst`
+    /// traversal semantics.
+    pub fn init_hook_announce(state: InitHookState) {
+        let snapshot: Vec<InitHookFunction> = HOOKS.lock().unwrap().clone();
+        for cb in snapshot {
+            cb(state);
+        }
+    }
+
+    /// Forget all registered callbacks. Test-only — mirrors C
+    /// `initHookFree()`. Lets unit tests run in isolation without
+    /// leaking process-global hook state into each other.
+    #[cfg(test)]
+    pub fn init_hook_free() {
+        HOOKS.lock().unwrap().clear();
+    }
+}
+
+pub use init_hooks::{InitHookFunction, InitHookState, init_hook_announce, init_hook_register};
+
 /// Context passed to dynamic device support factories during iocInit wiring.
 pub struct DeviceSupportContext<'a> {
     pub dtyp: &'a str,
@@ -64,7 +197,12 @@ pub struct IocRunConfig {
     pub autosave_config: Option<autosave::SaveSetConfig>,
     pub autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     pub shell_commands: Vec<CommandDef>,
-    /// Callbacks to run after PINI processing (e.g., start pollers).
+    /// Retained for API compatibility. [`IocApplication::run`] now
+    /// drains `register_after_init` hooks itself at the
+    /// `initHookAfterIocRunning` point, so this is always handed to
+    /// the protocol runner EMPTY. A runner must not execute it
+    /// (doing so is a no-op on the empty vec, but the hooks have
+    /// already run).
     pub after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
 }
 
@@ -190,6 +328,12 @@ impl IocApplication {
     ///
     /// Use this to start pollers and other periodic tasks that should
     /// not run during st.cmd execution or autosave restore.
+    ///
+    /// [`Self::run`] guarantees these fire — they are drained inside
+    /// `run` at the `initHookAfterIocRunning` point (after PINI
+    /// processing, before handoff to the protocol runner). They are
+    /// NOT delegated to the protocol runner, so a custom runner does
+    /// not need to remember to drain them.
     pub fn register_after_init(mut self, hook: impl FnOnce() + Send + 'static) -> Self {
         self.after_init_hooks.push(Box::new(hook));
         self
@@ -364,22 +508,130 @@ impl IocApplication {
             (Vec::new(), Vec::new(), None)
         };
 
-        // Phase 2a: Pass0 restore (before device support wiring)
-        for sav_path in &pass0_files {
-            match autosave::restore_from_file(&db, sav_path).await {
-                Ok(count) if count > 0 => {
-                    eprintln!("pass0 restore: {count} PVs from {}", sav_path.display());
-                }
-                Err(e) => {
-                    eprintln!("pass0 restore warning: {} - {e}", sav_path.display());
-                }
-                _ => {}
-            }
+        // initHooks subsystem (C `iocInit.c` / `initHooks.c` parity).
+        //
+        // Autosave pass-0 / pass-1 restore are no longer hard-coded
+        // into the build flow: they are registered here as ordinary
+        // init hooks (C autosave registers `initHookAfterInitDevSup`
+        // for pass 0 and `initHookAfterInitDatabase` for pass 1).
+        // Any third-party `init_hook_register` callback also fires at
+        // the matching `init_hook_announce` point below. Because the
+        // restore work is async and the C-parity `InitHookFunction`
+        // is sync, autosave restores live in this local async-hook
+        // table; `announce` below fires *both* tables.
+        type AsyncHook = Box<
+            dyn FnOnce()
+                    -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+                + Send
+                + 'static,
+        >;
+        let mut lifecycle_hooks: Vec<(InitHookState, AsyncHook)> = Vec::new();
+
+        // Register pass-0 restore as an `AfterInitDevSup` hook.
+        {
+            let db_p0 = db.clone();
+            let files = pass0_files.clone();
+            lifecycle_hooks.push((
+                InitHookState::AfterInitDevSup,
+                Box::new(move || {
+                    Box::pin(async move {
+                        for sav_path in &files {
+                            match autosave::restore_from_file(&db_p0, sav_path).await {
+                                Ok(count) if count > 0 => {
+                                    eprintln!(
+                                        "pass0 restore: {count} PVs from {}",
+                                        sav_path.display()
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "pass0 restore warning: {} - {e}",
+                                        sav_path.display()
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    })
+                }),
+            ));
+        }
+        // Register pass-1 restore + SaveSetConfig restore as an
+        // `AfterInitDatabase` hook.
+        {
+            let db_p1 = db.clone();
+            let files = pass1_files.clone();
+            let cfg_path = autosave_config.as_ref().map(|c| c.save_path.clone());
+            lifecycle_hooks.push((
+                InitHookState::AfterInitDatabase,
+                Box::new(move || {
+                    Box::pin(async move {
+                        for sav_path in &files {
+                            match autosave::restore_from_file(&db_p1, sav_path).await {
+                                Ok(count) if count > 0 => {
+                                    eprintln!(
+                                        "pass1 restore: {count} PVs from {}",
+                                        sav_path.display()
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "pass1 restore warning: {} - {e}",
+                                        sav_path.display()
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(path) = cfg_path {
+                            match autosave::restore_from_file(&db_p1, &path).await {
+                                Ok(count) if count > 0 => {
+                                    eprintln!("autosave: restored {count} PVs");
+                                }
+                                Err(e) => {
+                                    eprintln!("autosave restore warning: {} - {e}", path.display());
+                                }
+                                _ => {}
+                            }
+                        }
+                    })
+                }),
+            ));
         }
 
-        // Phase 2b: iocInit — wire device support to all records with DTYP
+        // Fire an init-hook state: the C-parity sync `init_hook_*`
+        // callbacks first, then the local async lifecycle hooks
+        // (autosave restore). Drains every lifecycle hook matching
+        // `state` out of the table so each fires exactly once.
+        macro_rules! announce {
+            ($state:expr) => {{
+                let state = $state;
+                init_hook_announce(state);
+                let mut i = 0;
+                while i < lifecycle_hooks.len() {
+                    if lifecycle_hooks[i].0 == state {
+                        let (_, hook) = lifecycle_hooks.remove(i);
+                        hook().await;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }};
+        }
+
+        // iocBuild begins.
+        announce!(InitHookState::AtIocBuild);
+        announce!(InitHookState::AtBeginning);
+        announce!(InitHookState::AfterCallbackInit);
+        announce!(InitHookState::AfterCaLinkInit);
+        announce!(InitHookState::AfterInitDrvSup);
+        announce!(InitHookState::AfterInitRecSup);
+
+        // Phase 2b: iocInit — wire device support to all records with DTYP.
+        // C: initDevSup() then initHookAfterInitDevSup (autosave pass 0).
         let record_count =
             wire_device_support(&db, &device_factories, &dynamic_device_factory).await?;
+        announce!(InitHookState::AfterInitDevSup);
         wire_subroutines(&db, &subroutine_registry).await;
         let io_intr_count = setup_io_intr(db.clone()).await;
         db.setup_cp_links().await;
@@ -409,26 +661,35 @@ impl IocApplication {
             }
         }
 
-        // Phase 2c: Pass1 restore (after device support wiring)
-        for sav_path in &pass1_files {
-            match autosave::restore_from_file(&db, sav_path).await {
-                Ok(count) if count > 0 => {
-                    eprintln!("pass1 restore: {count} PVs from {}", sav_path.display());
-                }
-                Err(e) => {
-                    eprintln!("pass1 restore warning: {} - {e}", sav_path.display());
-                }
-                _ => {}
-            }
-        }
+        // C: initDatabase() then initHookAfterInitDatabase (autosave
+        // pass 1). The registered hook performs pass-1 + SaveSetConfig
+        // restore.
+        announce!(InitHookState::AfterInitDatabase);
+        announce!(InitHookState::AfterFinishDevSup);
+        announce!(InitHookState::AfterScanInit);
 
-        // Autosave restore from SaveSetConfig
-        if let Some(ref cfg) = autosave_config {
-            let count = autosave::restore_from_file(&db, &cfg.save_path).await?;
-            if count > 0 {
-                eprintln!("autosave: restored {count} PVs");
+        // Phase 2b.6: process PINI=YES records BEFORE the protocol
+        // runner can accept client connections (H2 — match C's
+        // iocBuild ordering: initialProcess() runs inside iocBuild,
+        // before iocRun starts the CA server). Without this, a CA
+        // client connecting in the first moments after IOC start
+        // could `caget` a PINI record's UDF/default value instead of
+        // its processed value. C guarantees this cannot happen.
+        {
+            let pini_records = db.pini_records().await;
+            for name in &pini_records {
+                let mut visited = std::collections::HashSet::new();
+                let _ = db.process_record_with_links(name, &mut visited, 0).await;
             }
+            // Publish completion so any scan scheduler started by the
+            // protocol runner sees PINI as already done and its
+            // non-owner branch does not block. The scheduler's owner
+            // branch still re-runs the PINI burst; that is benign
+            // (PINI records simply recompute) and avoids touching
+            // `scan.rs`, which is outside this change's file scope.
+            db.mark_pini_done();
         }
+        announce!(InitHookState::AfterInitialProcess);
 
         // Phase 2d: Build AutosaveManager from startup config
         let autosave_manager = if let Some(builder) = builder_opt {
@@ -450,6 +711,33 @@ impl IocApplication {
         eprintln!(
             "iocInit: {total_records} records, {record_count} with device support, {io_intr_count} I/O Intr"
         );
+
+        // C: rsrv init / iocBuild end. The Rust CA/PVA listener is
+        // owned by the protocol runner, but PINI is already complete
+        // (Phase 2b.6) so announcing here keeps hook ordering correct
+        // for consumers that key off these states.
+        announce!(InitHookState::AfterCaServerInit);
+        announce!(InitHookState::AfterIocBuilt);
+        // iocRun begins. Scan tasks / CA links are started by the
+        // protocol runner immediately after handoff.
+        announce!(InitHookState::AtIocRun);
+        announce!(InitHookState::AfterDatabaseRunning);
+        announce!(InitHookState::AfterCaServerRunning);
+
+        // H3: drain `after_init_hooks` HERE — a guaranteed drain
+        // point inside `run`. These were previously moved into
+        // `IocRunConfig.after_init_hooks` and silently dropped
+        // unless the external protocol runner remembered to execute
+        // the vector. `register_after_init` promises "run after
+        // iocInit completes"; PINI is done and the database is
+        // built, so this is the correct C `initHookAfterIocRunning`
+        // equivalent point. The `IocRunConfig.after_init_hooks`
+        // field is now always handed over EMPTY (kept for API
+        // compatibility) so a runner cannot double-run them.
+        for hook in after_init_hooks {
+            hook();
+        }
+        announce!(InitHookState::AfterIocRunning);
 
         // Phase 2e: drain `afterIocRunning` queue (epics-base PR #558).
         // Each line is an iocsh command queued by the startup script;
@@ -507,7 +795,10 @@ impl IocApplication {
             autosave_config,
             autosave_manager,
             shell_commands,
-            after_init_hooks,
+            // Already drained above (H3). Handed over empty so a
+            // protocol runner that still inspects the field cannot
+            // double-run the hooks.
+            after_init_hooks: Vec::new(),
         };
 
         // epics-base PR #671 parity: race the protocol runner against
@@ -578,21 +869,13 @@ pub(crate) async fn wire_device_support(
                 } else {
                     None
                 };
-                if let Some(mut dev) = dev_opt {
-                    dev.set_record_info(&name, instance.common.scan);
-                    // Forward info(...) tags to the driver — mirrors
-                    // the IocBuilder build path (round-6 fix). Without
-                    // this, IocApplication startup-script flows that
-                    // load records via iocsh `dbLoadRecords` and rely
-                    // on this batch wiring stage drop tags like
-                    // `asyn:READBACK` on the floor.
-                    dev.apply_record_info(&instance.info);
-                    let init_ok = dev.init(&mut *instance.record).is_ok();
-                    // Clear UDF if init successfully set a value (e.g. initial readback)
-                    if init_ok && instance.record.val().is_some() {
-                        instance.common.udf = false;
-                    }
-                    instance.device = Some(dev);
+                if let Some(dev) = dev_opt {
+                    // Canonical device-support init order (M1/M2):
+                    // set_record_info → apply_record_info → init,
+                    // with init-failure logged and the record flagged
+                    // INVALID. Single owner of the contract, shared
+                    // with the IocBuilder build path.
+                    crate::server::device_support::wire_device_to_record(&mut instance, dev);
                     count += 1;
                 } else {
                     eprintln!(
@@ -680,6 +963,94 @@ async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Serialises the initHooks tests — `HOOKS` is process-global, so
+    /// two tests announcing at once would observe each other's
+    /// callbacks. The state machine here is small; a mutex is enough.
+    static INIT_HOOK_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// H1 regression: a callback registered via `init_hook_register`
+    /// fires for every announced state, and `init_hook_announce`
+    /// delivers states in the order they were announced.
+    #[test]
+    fn init_hook_register_and_announce_in_order() {
+        let _guard = INIT_HOOK_TEST_LOCK.lock().unwrap();
+        init_hooks::init_hook_free();
+
+        let seen: Arc<StdMutex<Vec<InitHookState>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        init_hook_register(Arc::new(move |state| {
+            seen_cb.lock().unwrap().push(state);
+        }));
+
+        // Announce a subset in C order.
+        let order = [
+            InitHookState::AtIocBuild,
+            InitHookState::AfterInitDevSup,
+            InitHookState::AfterInitDatabase,
+            InitHookState::AfterInitialProcess,
+            InitHookState::AfterIocRunning,
+        ];
+        for &s in &order {
+            init_hook_announce(s);
+        }
+
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got, order, "hooks must fire in announce order");
+
+        init_hooks::init_hook_free();
+    }
+
+    /// H1 regression: a hook that registers ANOTHER hook from inside
+    /// its callback must not deadlock, and the newly-registered hook
+    /// is not invoked for the in-progress state (C snapshot
+    /// semantics).
+    #[test]
+    fn init_hook_reentrant_register_does_not_deadlock() {
+        let _guard = INIT_HOOK_TEST_LOCK.lock().unwrap();
+        init_hooks::init_hook_free();
+
+        let inner_calls = Arc::new(AtomicUsize::new(0));
+        let inner_for_outer = inner_calls.clone();
+        init_hook_register(Arc::new(move |_state| {
+            // Register a second hook from inside the callback.
+            let inner = inner_for_outer.clone();
+            init_hook_register(Arc::new(move |_s| {
+                inner.fetch_add(1, Ordering::SeqCst);
+            }));
+        }));
+
+        // First announce: outer hook runs, registers inner. Inner is
+        // NOT called for this state.
+        init_hook_announce(InitHookState::AtIocBuild);
+        assert_eq!(inner_calls.load(Ordering::SeqCst), 0);
+
+        // Second announce: both outer and the inner(s) run.
+        init_hook_announce(InitHookState::AfterIocRunning);
+        assert!(inner_calls.load(Ordering::SeqCst) >= 1);
+
+        init_hooks::init_hook_free();
+    }
+
+    /// H1: state name strings match C `initHookName()`.
+    #[test]
+    fn init_hook_state_names_match_c() {
+        assert_eq!(InitHookState::AtIocBuild.name(), "initHookAtIocBuild");
+        assert_eq!(
+            InitHookState::AfterInitDevSup.name(),
+            "initHookAfterInitDevSup"
+        );
+        assert_eq!(
+            InitHookState::AfterInitDatabase.name(),
+            "initHookAfterInitDatabase"
+        );
+        assert_eq!(
+            InitHookState::AfterIocRunning.name(),
+            "initHookAfterIocRunning"
+        );
+    }
 
     #[tokio::test]
     async fn test_ioc_application_empty() {

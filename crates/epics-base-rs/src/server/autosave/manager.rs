@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::error::{AutosaveError, AutosaveResult};
+use super::format::CompatMode;
 use super::save_file;
 use super::save_set::{
     RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy, TriggerMode,
@@ -17,6 +18,7 @@ pub struct AutosaveBuilder {
     save_sets: Vec<SaveSetConfig>,
     global_macros: HashMap<String, String>,
     status_prefix: Option<String>,
+    compat: CompatMode,
 }
 
 impl AutosaveBuilder {
@@ -25,6 +27,7 @@ impl AutosaveBuilder {
             save_sets: Vec::new(),
             global_macros: HashMap::new(),
             status_prefix: None,
+            compat: CompatMode::Native,
         }
     }
 
@@ -43,6 +46,15 @@ impl AutosaveBuilder {
         self
     }
 
+    /// Select the on-disk save-file format for every save set built
+    /// by this builder. Default [`CompatMode::Native`]; use
+    /// [`CompatMode::CRead`] so a C IOC can read the produced `.sav`
+    /// files.
+    pub fn compat(mut self, mode: CompatMode) -> Self {
+        self.compat = mode;
+        self
+    }
+
     pub async fn build(self) -> AutosaveResult<AutosaveManager> {
         let mut sets = Vec::new();
         for mut cfg in self.save_sets {
@@ -50,7 +62,7 @@ impl AutosaveBuilder {
             for (k, v) in &self.global_macros {
                 cfg.macros.entry(k.clone()).or_insert_with(|| v.clone());
             }
-            let save_set = SaveSet::new(cfg).await?;
+            let save_set = SaveSet::new_with_mode(cfg, self.compat).await?;
             sets.push((Arc::new(save_set), Arc::new(tokio::sync::Mutex::new(()))));
         }
 
@@ -139,6 +151,14 @@ impl AutosaveManager {
 
                                         let should_save = match mode {
                                             TriggerMode::AnyChange => {
+                                                // L5: the first poll only establishes
+                                                // the baseline (`last_value` is `None`),
+                                                // so no save fires until the trigger PV
+                                                // is next seen to change. This is
+                                                // intentional — it avoids a spurious
+                                                // save at IOC startup — and the latency
+                                                // is bounded by `poll_interval` (1s by
+                                                // default for a `create_triggered_set`).
                                                 let changed = last_value.as_ref() != current_str.as_ref()
                                                     && last_value.is_some();
                                                 last_value = current_str;

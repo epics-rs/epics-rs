@@ -282,16 +282,17 @@ impl IocBuilder {
                     } else {
                         None
                     };
-                    if let Some(mut dev) = dev_opt {
-                        let _ = dev.init(&mut *instance.record);
-                        dev.set_record_info(&def.name, instance.common.scan);
-                        // Forward info(...) tags to the driver after
-                        // basic record info — drivers like asyn react
-                        // to `asyn:READBACK`, others to bus-specific
-                        // tags. No-op default keeps legacy device
-                        // support unaffected.
-                        dev.apply_record_info(&instance.info);
-                        instance.device = Some(dev);
+                    if let Some(dev) = dev_opt {
+                        // Canonical device-support init order (M1/M2):
+                        // set_record_info → apply_record_info → init.
+                        // Previously this path ran `init` FIRST and
+                        // discarded its `Result` with `let _ =`; the
+                        // IocApplication path ran info-setup first and
+                        // partially handled the error. Both paths now
+                        // share `wire_device_to_record`, so a driver
+                        // author can write one correct `init()` and an
+                        // init failure is logged + flags the record.
+                        device_support::wire_device_to_record(&mut instance, dev);
                     }
                 }
                 // Subroutine resolution for sub records

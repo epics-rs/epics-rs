@@ -879,6 +879,27 @@ fn test_move_accel_uses_accs_directly_when_accu_is_accs() {
 }
 
 #[test]
+fn test_move_accel_accu_accs_ignores_velo_vbas() {
+    // C accEGUfromVelo: ACCU=Accs returns ACCS unconditionally — VELO/VBAS
+    // do not enter the calculation.
+    let mut rec = MotorRecord::new();
+    rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap(); // ACCU→Accs
+    rec.put_field("VELO", EpicsValue::Double(99.0)).unwrap();
+    rec.put_field("VBAS", EpicsValue::Double(50.0)).unwrap();
+    // re-assert ACCU=Accs (VELO/VBAS puts cascade but must not change accu)
+    rec.put_field("ACCU", EpicsValue::Short(1)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(500.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    let accel = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveAbsolute { acceleration, .. } => Some(*acceleration),
+        MotorCommand::MoveRelative { acceleration, .. } => Some(*acceleration),
+        _ => None,
+    });
+    // ACCS is the master; the (VELO-VBAS)/ACCL path is not taken.
+    assert_eq!(accel, Some(4.0));
+}
+
+#[test]
 fn test_move_accel_velo_equals_vbas_fallback() {
     // VELO==VBAS: span==0 → fall back to VELO/ACCL (C: PR #75)
     let mut rec = MotorRecord::new();

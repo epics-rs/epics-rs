@@ -718,31 +718,35 @@ impl MotorRecord {
     }
 
     /// Acceleration sent to the driver for a normal move, in EGU/sec².
-    /// C: `accEGUfromVelo()` = `(velo - vbas) / accl`; when ACCU=Accs the
-    /// EGU/sec² value ACCS is used directly. When `velo == vbas` the rate
-    /// would be 0, so fall back to `velo / accl` (C: `b201e40e`, PR #75).
-    /// The result is always strictly positive — a zero acceleration would be
-    /// rejected or read as "instant" by drivers.
+    /// Mirrors C `accEGUfromVelo`: `vmax = fabs(velo)`, `vmin = vbas`; when
+    /// ACCU=Accs the EGU/sec² value ACCS is used directly, otherwise
+    /// `(vmax - vmin) / accl`, or `vmax / accl` when `vmax <= vmin`
+    /// (C: `b201e40e`, PR #75).
+    ///
+    /// Deviation from C: the result is floored to a strictly positive value.
+    /// C lets a 0 acceleration through and the driver layer skips SET_ACCEL;
+    /// motor-rs always carries an acceleration in the MotorCommand, so a 0
+    /// (unconfigured axis, or ACCU=Accs with ACCS<=0) is replaced by a
+    /// nominal positive rate.
     pub(crate) fn move_accel_egu(&self) -> f64 {
-        if self.vel.accu == AccsUsed::Accs && self.vel.accs > 0.0 {
-            return self.vel.accs;
-        }
         let accl = if self.vel.accl > 0.0 {
             self.vel.accl
         } else {
             0.1
         };
-        let span = self.vel.velo - self.effective_vbas();
-        let rate = if span > 0.0 {
-            span / accl
+        let vmax = self.vel.velo.abs();
+        let vmin = self.effective_vbas();
+        let rate = if self.vel.accu == AccsUsed::Accs {
+            self.vel.accs
+        } else if vmax > vmin {
+            (vmax - vmin) / accl
         } else {
-            self.vel.velo / accl
+            vmax / accl
         };
-        // Guard against an unconfigured axis (VELO==VBAS==0) yielding 0.
         if rate > 0.0 {
             rate
         } else {
-            self.vel.velo.abs().max(1.0) / accl
+            vmax.max(1.0) / accl
         }
     }
 

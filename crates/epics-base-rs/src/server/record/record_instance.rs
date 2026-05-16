@@ -639,11 +639,14 @@ impl RecordInstance {
             "DTYP" => Some(EpicsValue::String(self.common.dtyp.clone())),
             "TSE" => Some(EpicsValue::Short(self.common.tse)),
             "TSEL" => Some(EpicsValue::String(self.common.tsel.clone())),
+            // C `UTAG` is DBF_UINT64 — modelled as Int64 (no
+            // unsigned-64 scalar in the Rust value model).
+            "UTAG" => Some(EpicsValue::Int64(self.common.utag as i64)),
             "ASG" => Some(EpicsValue::String(self.common.asg.clone())),
             "ASL" => Some(EpicsValue::Char(self.common.asl)),
             "DESC" => Some(EpicsValue::String(self.common.desc.clone())),
             "PHAS" => Some(EpicsValue::Short(self.common.phas)),
-            "EVNT" => Some(EpicsValue::Short(self.common.evnt)),
+            "EVNT" => Some(EpicsValue::String(self.common.evnt.clone())),
             "PRIO" => Some(EpicsValue::Short(self.common.prio)),
             "DISV" => Some(EpicsValue::Short(self.common.disv)),
             "DISA" => Some(EpicsValue::Short(self.common.disa)),
@@ -879,6 +882,18 @@ impl RecordInstance {
                     self.parsed_tsel = parse_link_v2(&self.common.tsel);
                 }
             }
+            "UTAG" => {
+                // C UTAG is DBF_UINT64 — accept any integer-shaped
+                // value and store the unsigned 64-bit tag.
+                match value {
+                    EpicsValue::Int64(v) => self.common.utag = v as u64,
+                    EpicsValue::Long(v) => self.common.utag = v as u64,
+                    EpicsValue::Short(v) => self.common.utag = v as u64,
+                    EpicsValue::Enum(v) => self.common.utag = v as u64,
+                    EpicsValue::Char(v) => self.common.utag = v as u64,
+                    _ => {}
+                }
+            }
             "ASG" => {
                 if let EpicsValue::String(s) = value {
                     self.common.asg = s;
@@ -924,8 +939,21 @@ impl RecordInstance {
                 }
             }
             "EVNT" => {
-                if let EpicsValue::Short(v) = value {
-                    self.common.evnt = v;
+                // C `EVNT` is DBF_STRING (event name). Accept a
+                // string directly; accept a numeric value too for
+                // backward compatibility (numeric events / a calc
+                // record driving EVNT) by formatting it as a string.
+                match value {
+                    EpicsValue::String(s) => self.common.evnt = s,
+                    EpicsValue::Short(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::Long(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::Enum(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::Double(v) => {
+                        // Match C `eventNameToHandle`: a double with
+                        // an integer part is treated as that integer.
+                        self.common.evnt = (v as i64).to_string();
+                    }
+                    _ => {}
                 }
             }
             "PRIO" => {
@@ -1498,6 +1526,25 @@ impl RecordInstance {
         if let Some(ref sub_fn) = self.subroutine {
             sub_fn(&mut *self.record)?;
         }
+        // Soft-Channel input records must skip the RVAL->VAL convert
+        // (C `devAiSoft.c` `read_ai` returns 2 = "don't convert" for
+        // every Soft-Channel input record, incl. one with a constant /
+        // unset INP). Without this, `process_local` on a soft input
+        // with a preset VAL — e.g. NaN — would run `convert()` and
+        // clobber it, after which the UDF check below would see a
+        // defined value and wrongly clear UDF (06-H-2). The
+        // `processing.rs` link path already does this; `process_local`
+        // is the separate foreign-call path (`db.process_record`) and
+        // needs the same skip. "Raw Soft Channel" has a distinct DTYP
+        // so it is excluded by `is_soft` and still runs convert.
+        {
+            let is_soft =
+                self.common.dtyp.is_empty() || self.common.dtyp == "Soft Channel";
+            let is_output = self.record.can_device_write();
+            if is_soft && !is_output {
+                self.record.set_device_did_compute(true);
+            }
+        }
         let outcome = self.record.process()?;
         let process_result = outcome.result;
         // Note: process_local() does not execute ProcessActions — those are
@@ -1556,6 +1603,16 @@ impl RecordInstance {
             });
         }
 
+        // UDF update before alarm evaluation — C parity (see
+        // `processing.rs`). A NaN / undefined value keeps UDF true so
+        // `recGblCheckUDF` raises UDF_ALARM this cycle instead of the
+        // record reporting a stale/garbage value with no alarm.
+        if self.record.clears_udf() {
+            self.common.udf = self.record.value_is_undefined();
+        }
+        // Per-record alarm hook (C `checkAlarms()`).
+        self.record.check_alarms(&mut self.common);
+
         // Evaluate alarms (accumulates into nsta/nsev)
         self.evaluate_alarms();
 
@@ -1563,9 +1620,7 @@ impl RecordInstance {
         let alarm_result = recgbl::rec_gbl_reset_alarms(&mut self.common);
 
         self.common.time = crate::runtime::general_time::get_current();
-        if self.record.clears_udf() {
-            self.common.udf = false;
-        }
+        // UDF already updated above — do not clear unconditionally.
 
         // Compute event mask
         let mut event_mask = EventMask::NONE;
@@ -1589,11 +1644,16 @@ impl RecordInstance {
                 changed_fields.push(("VAL".to_string(), val));
             }
         }
-        if alarm_result.alarm_changed {
+        // C `recGblResetAlarms` posts SEVR ONLY on a sevr change and
+        // STAT only on a stat change — never SEVR on a stat-only
+        // transition. Condition each push on its own field.
+        if self.common.sevr != alarm_result.prev_sevr {
             changed_fields.push((
                 "SEVR".to_string(),
                 EpicsValue::Short(self.common.sevr as i16),
             ));
+        }
+        if self.common.stat != alarm_result.prev_stat {
             changed_fields.push((
                 "STAT".to_string(),
                 EpicsValue::Short(self.common.stat as i16),

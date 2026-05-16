@@ -96,11 +96,22 @@ pub struct AlarmResetResult {
 }
 
 /// Set new alarm severity if it's higher than current nsta/nsev.
-/// Matches EPICS recGblSetSevr: only raises alarm, never lowers.
+/// Matches EPICS `recGblSetSevr` (recGbl.c:258-261): `recGblSetSevr`
+/// delegates to `recGblSetSevrMsg(..., NULL)` → `recGblSetSevrVMsg`
+/// with `msg == NULL`. When the new severity raises the pending
+/// state, the `msg == NULL` branch (recGbl.c:248-250) executes
+/// `prec->namsg[0] = '\0'` — i.e. it **clears** any pending alarm
+/// message. A stale `namsg` written by an earlier MSS link (or
+/// `evaluate_alarms`) must not survive when a later, higher-severity
+/// no-message alarm raises the record severity; otherwise the
+/// record's final `amsg` carries an unrelated upstream record's
+/// alarm text.
 pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverity) {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
+        // C `msg == NULL` branch clears the pending message.
+        common.namsg.clear();
     }
 }
 

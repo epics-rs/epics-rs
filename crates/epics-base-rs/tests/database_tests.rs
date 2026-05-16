@@ -2169,6 +2169,15 @@ async fn test_sdis_disable_fires_put_notify_completion() {
 
 #[tokio::test]
 async fn test_sdis_disable_notifies_alarm() {
+    // C `dbAccess.c:587-592` — the disable branch of `dbProcess` posts:
+    //   db_post_events(&precord->stat, DBE_VALUE);            // STAT
+    //   db_post_events(&precord->sevr, DBE_VALUE);            // SEVR
+    //   db_post_events(&precord->VAL,  DBE_VALUE|DBE_ALARM);  // value field
+    // Only the *value field* carries DBE_ALARM; STAT/SEVR are posted
+    // with DBE_VALUE alone. A DBE_ALARM subscriber must therefore be
+    // attached to the value field (VAL) to observe the disable event —
+    // a DBE_ALARM-only subscription on .STAT/.SEVR would NOT be
+    // notified, matching C semantics.
     let db = PvDatabase::new();
     db.add_record("DISABLE_SW", Box::new(AoRecord::new(1.0)))
         .await
@@ -2185,10 +2194,12 @@ async fn test_sdis_disable_notifies_alarm() {
     let mut alarm_rx = {
         let rec = db.get_record("TARGET").await.unwrap();
         let mut inst = rec.write().await;
+        // DBE_ALARM subscriber on the value field — C posts VAL with
+        // DBE_VALUE|DBE_ALARM in the disable branch (dbAccess.c:590-592).
         inst.add_subscriber(
-            "SEVR",
+            "VAL",
             1,
-            epics_base_rs::types::DbFieldType::Short,
+            epics_base_rs::types::DbFieldType::Double,
             EventMask::ALARM.bits(),
         )
         .expect("subscribe should not be capped at default")
@@ -2461,6 +2472,10 @@ async fn test_fanout_all() {
 
 #[tokio::test]
 async fn test_fanout_specified() {
+    // C parity (fanoutRecord.c:114): SELM=Specified selects the link
+    // at index `SELN + OFFS`, 0-based over LNK0..LNKF. With SELN=1,
+    // OFFS=0 the selected link is LNK1 (NOT LNK2 — the pre-fix port
+    // omitted LNK0 and was off by one).
     use epics_base_rs::server::records::fanout::FanoutRecord;
     let db = PvDatabase::new();
     let mut fanout = FanoutRecord::new();
@@ -2487,8 +2502,9 @@ async fn test_fanout_specified() {
         .await
         .unwrap();
     assert!(visited.contains("FANOUT"));
-    assert!(!visited.contains("T1"));
-    assert!(visited.contains("T2"));
+    // SELN=1 → LNK1 → T1 processed; LNK2/T2 NOT processed.
+    assert!(visited.contains("T1"));
+    assert!(!visited.contains("T2"));
 }
 
 #[tokio::test]

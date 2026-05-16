@@ -51,11 +51,33 @@ pub use ts::TimestampFilter;
 pub struct FilteredMonitorEvent {
     pub event: MonitorEvent,
     pub mask: EventMask,
+    /// `true` when this event originates from a single-read context
+    /// (DB-link / `caget`), not a monitor stream. Mirrors C
+    /// `db_field_log.ctx == dbfl_context_read`: `decimate.c:64` and
+    /// `sync.c:98` both `return pfl` unchanged in that case so a
+    /// one-shot read is never consumed by the decimator counter nor
+    /// gated by the sync state machine.
+    pub read_context: bool,
 }
 
 impl FilteredMonitorEvent {
+    /// Construct a monitor-stream event (`read_context = false`).
     pub fn new(event: MonitorEvent, mask: EventMask) -> Self {
-        Self { event, mask }
+        Self {
+            event,
+            mask,
+            read_context: false,
+        }
+    }
+
+    /// Construct a single-read-context event — `decimate` / `sync`
+    /// pass these through unchanged (C `dbfl_context_read`).
+    pub fn new_read(event: MonitorEvent, mask: EventMask) -> Self {
+        Self {
+            event,
+            mask,
+            read_context: true,
+        }
     }
 }
 
@@ -154,7 +176,9 @@ impl FilterChain {
             snapshot: snap,
             origin: 0,
         };
-        let filtered = self.apply(FilteredMonitorEvent::new(event, EventMask::VALUE))?;
+        // Single-read context — `decimate` / `sync` short-circuit
+        // (C `dbfl_context_read`), `arr` / `ts` / `dbnd` still apply.
+        let filtered = self.apply(FilteredMonitorEvent::new_read(event, EventMask::VALUE))?;
         Some(filtered.event.snapshot.value)
     }
 }

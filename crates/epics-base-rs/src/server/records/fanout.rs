@@ -1,5 +1,13 @@
 use epics_macros_rs::EpicsRecord;
 
+/// `fanout` record — forward-link fan-out.
+///
+/// C parity (`fanoutRecord.c:39` `#define NLINKS 16`,
+/// `fanoutRecord.dbd.pod:139-214`): the record carries 16 forward
+/// links `LNK0..LNKF`. The first slot `LNK0` is a real field — a
+/// `.db` file written for C semantics frequently puts the primary
+/// fan-out target on `LNK0`. Omitting it shifts every link index
+/// by one and silently drops the `LNK0` target on `SELM=All`.
 #[derive(EpicsRecord)]
 #[record(type = "fanout")]
 pub struct FanoutRecord {
@@ -9,6 +17,8 @@ pub struct FanoutRecord {
     pub selm: i16,
     #[field(type = "Short")]
     pub seln: i16,
+    #[field(type = "String")]
+    pub lnk0: String,
     #[field(type = "String")]
     pub lnk1: String,
     #[field(type = "String")]
@@ -53,6 +63,7 @@ impl Default for FanoutRecord {
             val: 0,
             selm: 0,
             seln: 0,
+            lnk0: String::new(),
             lnk1: String::new(),
             lnk2: String::new(),
             lnk3: String::new(),
@@ -80,12 +91,12 @@ impl FanoutRecord {
         Self::default()
     }
 
-    /// Get all non-empty link targets.
+    /// Get all non-empty link targets, in `LNK0..LNKF` order.
     pub fn links(&self) -> Vec<&str> {
         [
-            &self.lnk1, &self.lnk2, &self.lnk3, &self.lnk4, &self.lnk5, &self.lnk6, &self.lnk7,
-            &self.lnk8, &self.lnk9, &self.lnka, &self.lnkb, &self.lnkc, &self.lnkd, &self.lnke,
-            &self.lnkf,
+            &self.lnk0, &self.lnk1, &self.lnk2, &self.lnk3, &self.lnk4, &self.lnk5, &self.lnk6,
+            &self.lnk7, &self.lnk8, &self.lnk9, &self.lnka, &self.lnkb, &self.lnkc, &self.lnkd,
+            &self.lnke, &self.lnkf,
         ]
         .iter()
         .filter(|s| !s.is_empty())

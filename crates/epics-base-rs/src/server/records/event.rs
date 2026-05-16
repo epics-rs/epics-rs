@@ -1,12 +1,24 @@
 use epics_macros_rs::EpicsRecord;
 
-// Event record: triggers monitor posts and FLNK on process.
-// VAL is a short integer (typically unused); the record exists purely as a scan trigger.
+/// `event` record — software-event source.
+///
+/// C parity (`eventRecord.dbd.pod:71` `field(VAL,DBF_STRING)`,
+/// `eventRecord.c:107-132`): `VAL` is the *event name* string. On
+/// every `process()` the record posts that named event via
+/// `postEvent(eventNameToHandle(prec->val))`, waking every
+/// `SCAN="Event"` record whose `EVNT` matches. Posting the event is
+/// the record's entire purpose.
+///
+/// The framework (`processing.rs`) reads `VAL` after `process()` and
+/// routes the event through [`PvDatabase::post_event_named`] — the
+/// record stays a pure state machine with no direct DB access.
 #[derive(EpicsRecord)]
 #[record(type = "event")]
 pub struct EventRecord {
-    #[field(type = "Short")]
-    pub val: i16,
+    /// Event name to post. DBF_STRING in C (was a numeric subscript
+    /// pre-EPICS-7; a numeric string still works for back-compat).
+    #[field(type = "String")]
+    pub val: String,
     #[field(type = "Short")]
     pub simm: i16,
     #[field(type = "String")]
@@ -20,7 +32,7 @@ pub struct EventRecord {
 impl Default for EventRecord {
     fn default() -> Self {
         Self {
-            val: 0,
+            val: String::new(),
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -30,9 +42,10 @@ impl Default for EventRecord {
 }
 
 impl EventRecord {
-    pub fn new(val: i16) -> Self {
+    /// Construct an event record that posts event name `val`.
+    pub fn new(val: impl Into<String>) -> Self {
         Self {
-            val,
+            val: val.into(),
             ..Default::default()
         }
     }

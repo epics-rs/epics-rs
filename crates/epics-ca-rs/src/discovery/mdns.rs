@@ -42,32 +42,68 @@ impl MdnsBackend {
 
         let snap_clone = snapshot.clone();
         tokio::spawn(async move {
+            // Per-instance set of addresses last advertised under that
+            // mDNS fullname. Each `ServiceResolved` carries the instance's
+            // *complete* current address set, so we diff against this to
+            // emit precise per-address `Added`/`Removed` deltas: a
+            // multi-homed IOC keeps every interface, and an instance that
+            // re-binds to a new address has the old one retracted. This is
+            // also how `Removed` gets a real address — the mdns-sd goodbye
+            // packet itself carries none.
+            let mut known: std::collections::HashMap<
+                String,
+                std::collections::HashSet<SocketAddr>,
+            > = std::collections::HashMap::new();
             while let Ok(event) = receiver.recv_async().await {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
-                        for addr in resolve_addresses(&info) {
+                        let fullname = info.get_fullname().to_string();
+                        let resolved: std::collections::HashSet<SocketAddr> =
+                            resolve_addresses(&info).into_iter().collect();
+                        let prev = known.entry(fullname.clone()).or_default();
+                        // Newly-advertised addresses.
+                        for &addr in resolved.difference(prev) {
                             if let Ok(mut snap) = snap_clone.lock() {
                                 if !snap.contains(&addr) {
                                     snap.push(addr);
                                 }
                             }
                             let _ = event_tx.send(DiscoveryEvent::Added {
-                                instance: info.get_fullname().to_string(),
+                                instance: fullname.clone(),
                                 addr,
                             });
-                            tracing::info!(addr = %addr, instance = info.get_fullname(),
+                            tracing::info!(addr = %addr, instance = %fullname,
                                 "mDNS discovered IOC");
                         }
+                        // Addresses this instance no longer advertises
+                        // (interface removed, or a host/port re-bind).
+                        for &addr in prev.difference(&resolved) {
+                            if let Ok(mut snap) = snap_clone.lock() {
+                                snap.retain(|a| *a != addr);
+                            }
+                            let _ = event_tx.send(DiscoveryEvent::Removed {
+                                instance: fullname.clone(),
+                                addr,
+                            });
+                            tracing::info!(addr = %addr, instance = %fullname,
+                                "mDNS IOC address withdrawn");
+                        }
+                        *prev = resolved;
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
-                        // mdns-sd does not carry the resolved address on
-                        // removal, so `addr` is a `0.0.0.0:0` sentinel —
-                        // consumers MUST match `Removed` by the `instance`
-                        // string (the mDNS fullname), never by `addr`.
-                        let _ = event_tx.send(DiscoveryEvent::Removed {
-                            instance: fullname.clone(),
-                            addr: "0.0.0.0:0".parse().unwrap(),
-                        });
+                        // The goodbye packet carries no address; emit a
+                        // `Removed` for every address the instance held.
+                        if let Some(addrs) = known.remove(&fullname) {
+                            for addr in addrs {
+                                if let Ok(mut snap) = snap_clone.lock() {
+                                    snap.retain(|a| *a != addr);
+                                }
+                                let _ = event_tx.send(DiscoveryEvent::Removed {
+                                    instance: fullname.clone(),
+                                    addr,
+                                });
+                            }
+                        }
                         tracing::info!(instance = %fullname, "mDNS IOC went away");
                     }
                     _ => {}

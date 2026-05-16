@@ -550,66 +550,48 @@ impl CaClient {
             if let Some(mut rx) = backend.subscribe() {
                 let fwd_search_tx = search_tx.clone();
                 discovery_forwarders.push(epics_base_rs::runtime::task::spawn(async move {
-                    // `DiscoveryEvent::Removed` is matched BY INSTANCE
-                    // STRING, not by address: mDNS goodbye packets carry
-                    // a usable instance id but not a real socket addr.
-                    // Track the addr each instance was Added under so a
-                    // later Removed can target the correct address.
-                    let mut instance_addrs: std::collections::HashMap<String, SocketAddr> =
+                    // Ref-count each address by how many discovery deltas
+                    // currently back it. A backend emits one `Added` per
+                    // `(instance, address)` pair and a matching `Removed`
+                    // carrying that exact address — so a multi-homed IOC
+                    // contributes one ref per interface, two IOCs sharing
+                    // an address contribute two refs, and an instance
+                    // re-bind is a `Removed` of the old plus an `Added` of
+                    // the new. `AddAddress`/`RemoveAddress` are forwarded
+                    // only on the 0↔1 edge, so a shared address is
+                    // retracted from the search engine only once the last
+                    // backer is gone.
+                    let mut addr_refs: std::collections::HashMap<SocketAddr, usize> =
                         std::collections::HashMap::new();
                     while let Some(evt) = rx.recv().await {
                         match evt {
-                            crate::discovery::DiscoveryEvent::Added { instance, addr } => {
-                                // If this instance was already known under a
-                                // *different* addr (mDNS re-binding — the IOC
-                                // moved host/port), the old addr must be
-                                // retracted, else its AddAddress lingers
-                                // forever. Retract only when no *other*
-                                // instance still backs the old addr — the
-                                // same last-instance rule the Removed arm
-                                // uses. `insert` returns the prior addr; the
-                                // map already holds the new addr by the time
-                                // `values()` runs, so a differing old addr
-                                // is matched only against sibling instances.
-                                if let Some(old_addr) = instance_addrs.insert(instance, addr)
-                                    && old_addr != addr
-                                    && !instance_addrs.values().any(|a| *a == old_addr)
+                            crate::discovery::DiscoveryEvent::Added { addr, .. } => {
+                                let n = addr_refs.entry(addr).or_insert(0);
+                                *n += 1;
+                                if *n == 1
                                     && fwd_search_tx
-                                        .send(SearchRequest::RemoveAddress(old_addr))
+                                        .send(SearchRequest::AddAddress(addr))
                                         .is_err()
-                                {
-                                    break;
-                                }
-                                if fwd_search_tx
-                                    .send(SearchRequest::AddAddress(addr))
-                                    .is_err()
                                 {
                                     break;
                                 }
                             }
-                            crate::discovery::DiscoveryEvent::Removed { instance, .. } => {
-                                if let Some(addr) = instance_addrs.remove(&instance) {
-                                    // Two mDNS instances can resolve to the
-                                    // same SocketAddr (AddAddress dedups by
-                                    // addr). Only retract the address once
-                                    // the *last* instance backing it is gone
-                                    // — otherwise a Removed for one instance
-                                    // drops an address a sibling still needs.
-                                    if instance_addrs.values().any(|a| *a == addr) {
-                                        tracing::debug!(
-                                            %instance, %addr,
-                                            "discovery Removed — address still backed by another instance"
-                                        );
-                                    } else if fwd_search_tx
-                                        .send(SearchRequest::RemoveAddress(addr))
-                                        .is_err()
-                                    {
-                                        break;
+                            crate::discovery::DiscoveryEvent::Removed { addr, .. } => {
+                                if let Some(n) = addr_refs.get_mut(&addr) {
+                                    *n -= 1;
+                                    if *n == 0 {
+                                        addr_refs.remove(&addr);
+                                        if fwd_search_tx
+                                            .send(SearchRequest::RemoveAddress(addr))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 } else {
                                     tracing::debug!(
-                                        %instance,
-                                        "discovery Removed for unknown instance — ignored"
+                                        %addr,
+                                        "discovery Removed for untracked address — ignored"
                                     );
                                 }
                             }

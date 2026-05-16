@@ -66,17 +66,21 @@ pub trait Backend: Send + Sync {
 
 /// Live update from a discovery backend.
 ///
-/// Both variants carry an `instance` string — the service-instance
-/// name (mDNS fullname, or DNS-SD `<instance>._epics-ca._tcp.<zone>`).
-/// Consumers MUST match `Removed` events by `instance`, not by `addr`:
-/// some backends (mDNS) cannot report the resolved address on removal
-/// and emit a `0.0.0.0:0` sentinel in `addr`.
+/// Each event is a precise per-`(instance, addr)` delta: a backend emits
+/// one `Added` per address an instance advertises and a matching
+/// `Removed` carrying that exact address when it goes away. A multi-homed
+/// IOC therefore yields one `Added` per interface, and an instance that
+/// re-binds to a new address yields a `Removed` for the old address plus
+/// an `Added` for the new one. `Removed.addr` is the real resolved
+/// address — consumers may key on it directly (e.g. ref-count shared
+/// addresses). The `instance` string (mDNS fullname, or DNS-SD
+/// `<instance>._epics-ca._tcp.<zone>`) is carried for diagnostics.
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
-    /// A new IOC just came online.
+    /// An IOC address just became reachable.
     Added { instance: String, addr: SocketAddr },
-    /// An IOC is no longer reachable. `addr` may be a `0.0.0.0:0`
-    /// sentinel — match on `instance`.
+    /// An IOC address is no longer reachable. `addr` is the real
+    /// resolved address that was previously `Added`.
     Removed { instance: String, addr: SocketAddr },
 }
 

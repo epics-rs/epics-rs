@@ -1203,7 +1203,7 @@ pub(crate) fn motor_put_field(
                     rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
                     rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
                 }
-                detect_inverted_limits(&mut rec.limits);
+                detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1223,7 +1223,7 @@ pub(crate) fn motor_put_field(
                     rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
                     rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
                 }
-                detect_inverted_limits(&mut rec.limits);
+                detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1243,7 +1243,7 @@ pub(crate) fn motor_put_field(
                 );
                 rec.limits.hlm = hlm;
                 rec.limits.llm = llm;
-                detect_inverted_limits(&mut rec.limits);
+                detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1262,7 +1262,7 @@ pub(crate) fn motor_put_field(
                 );
                 rec.limits.hlm = hlm;
                 rec.limits.llm = llm;
-                detect_inverted_limits(&mut rec.limits);
+                detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1602,13 +1602,17 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
     rec.limits.llm = llm;
 }
 
-/// Detect inverted soft-limit configurations and mark LVIO immediately.
-/// C: `270347df` (PR #108) — if the user/dial high/low pair is inverted
-/// (LLM > HLM or DLLM > DHLM), set LVIO without waiting for the next poll
-/// so clients see the error state on the same put cycle.
-fn detect_inverted_limits(limits: &mut LimitFields) {
+/// Re-evaluate LVIO after a soft-limit put.
+/// C: `270347df` (PR #108) — an inverted high/low pair (LLM > HLM or
+/// DLLM > DHLM) sets LVIO immediately, without waiting for the next poll.
+/// When the pair is valid again, LVIO is recomputed from the current DVAL
+/// so a corrected limit clears the latched violation even on an idle axis
+/// that is not being polled.
+fn detect_inverted_limits(limits: &mut LimitFields, dval: f64) {
     if limits.dllm > limits.dhlm || limits.llm > limits.hlm {
         limits.lvio = true;
+    } else {
+        limits.lvio = coordinate::check_soft_limits(dval, limits.dhlm, limits.dllm);
     }
 }
 

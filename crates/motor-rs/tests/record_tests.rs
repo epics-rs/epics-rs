@@ -1303,6 +1303,22 @@ fn test_reverse_jog_at_low_limit_is_rejected_and_clears_button() {
 }
 
 #[test]
+fn test_jog_soft_limit_uses_user_frame_with_dir_neg() {
+    // C: d52fe5ee — jog soft-limit check is in user coordinates. With
+    // DIR=Neg the user frame still has JOGF = user-positive, so a forward
+    // jog at the user high limit is rejected regardless of DIR.
+    let mut rec = MotorRecord::new();
+    rec.conv.dir = MotorDir::Neg;
+    rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.pos.val = 10.0; // at user high limit
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert!(!rec.ctrl.jogf, "forward jog at user HLM rejected under DIR=Neg");
+    assert!(rec.limits.lvio);
+}
+
+#[test]
 fn test_reverse_jog_at_high_limit_is_allowed() {
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
@@ -1488,6 +1504,36 @@ fn test_llm_greater_than_hlm_sets_lvio_immediately() {
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(100.0)).unwrap();
     assert!(rec.limits.llm > rec.limits.hlm);
+    assert!(rec.limits.lvio);
+}
+
+#[test]
+fn test_correcting_inverted_limits_clears_lvio_without_poll() {
+    // C: 270347df — LVIO must clear when the limit pair becomes valid again,
+    // even on an idle axis that is not being polled.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.pos.dval = 0.0; // inside any sane window
+    // Create the inverted state.
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(100.0)).unwrap();
+    assert!(rec.limits.lvio);
+    // Correct it: DLLM back below DHLM.
+    rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+    assert!(
+        !rec.limits.lvio,
+        "LVIO must clear once the limit pair is valid and DVAL is in range"
+    );
+}
+
+#[test]
+fn test_correcting_limits_keeps_lvio_when_position_still_outside() {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.pos.dval = 500.0; // far outside the corrected window
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    // Pair is valid now, but DVAL 500 is outside [-10, 10] → LVIO stays.
     assert!(rec.limits.lvio);
 }
 

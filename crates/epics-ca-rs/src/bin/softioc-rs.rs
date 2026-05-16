@@ -196,12 +196,20 @@ fn parse_record_def(
         (remainder, "")
     };
 
-    // Helper: attempt to parse the candidate value; if it fails, treat the whole
-    // remainder as the name and use the default value.
+    // Helper: attempt to parse the candidate value segment.
+    //   - empty candidate (no `:VALUE`, or a trailing `:`)  -> `name` + default;
+    //     `name` is the colon-stripped prefix, and with no colon at all
+    //     `rsplit_once` failed so `name == remainder` anyway. Using `name`
+    //     here (not `remainder`) keeps a trailing `:` out of the PV name,
+    //     matching the stringin/stringout arms.
+    //   - candidate parses                                  -> `name` + value.
+    //   - candidate present but unparsable (a colon-bearing PV name whose
+    //     last segment is not a number) -> `remainder` + default, so the
+    //     name keeps its embedded colons.
     macro_rules! parse_or_default {
         ($type:ty, $default:expr) => {{
             if value_str.is_empty() {
-                (remainder, $default)
+                (name, $default)
             } else if let Ok(v) = value_str.parse::<$type>() {
                 (name, v)
             } else {
@@ -270,9 +278,10 @@ fn parse_record_def(
             }
         };
 
-    // A record with an empty PV name (e.g. `ai:` or `stringin::x`) is
-    // never valid and would otherwise register an unaddressable record.
-    if record_name.is_empty() {
+    // A record with an empty or whitespace-only PV name (e.g. `ai:`,
+    // `stringin::x`, `ai: `) is never valid and would otherwise register
+    // an unaddressable record.
+    if record_name.trim().is_empty() {
         return Err(epics_base_rs::error::CaError::InvalidValue(format!(
             "record definition '{def}' has an empty PV name"
         )));
@@ -465,6 +474,16 @@ mod tests {
         assert_eq!(name_of("ai:TEMP:42.5"), "TEMP");
         // Non-numeric trailing segment: the whole remainder is the name.
         assert_eq!(name_of("ai:SEQ:counter"), "SEQ:counter");
+        // Trailing colon = explicit empty/default value; the numeric arms
+        // must strip it from the name, same as the string arms.
+        assert_eq!(name_of("ai:TEMP:"), "TEMP");
+        assert_eq!(name_of("longout:SEQ:counter:"), "SEQ:counter");
+    }
+
+    #[test]
+    fn whitespace_only_pv_name_is_rejected() {
+        assert!(parse_record_def("ai: ").is_err());
+        assert!(parse_record_def("stringin:  ").is_err());
     }
 
     #[test]

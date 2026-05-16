@@ -420,7 +420,26 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // the same way `GroupChannel::put` reads members via
             // `get_nested_field`. One `put` call so atomic groups stay
             // atomic.
+            //
+            // B1: a single-record channel's put extracts only the
+            // `value` field (`pv_structure_to_epics`). A query field
+            // named anything else would be placed at a dead path and
+            // silently dropped — reject it with a clear error so the
+            // caller learns the contract instead of seeing a no-op.
+            // Group channels accept arbitrary member paths, so the
+            // check is scoped to `AnyChannel::Single`.
             if !query.is_empty() {
+                if let AnyChannel::Single(_) = channel.as_ref() {
+                    for (field, _) in &query {
+                        let top = field.split('.').next().unwrap_or(field);
+                        if top != "value" {
+                            return Err(format!(
+                                "qsrv RPC on {name_owned:?}: single-record channel \
+                                 accepts only the `value` query field, got {field:?}"
+                            ));
+                        }
+                    }
+                }
                 let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
                 for (field, field_value) in &query {
                     super::group::set_nested_field(&mut put, field, field_value.clone());
@@ -827,6 +846,114 @@ mod tests {
             err.contains("PV not found"),
             "error must name the missing PV: {err}"
         );
+    }
+
+    /// B1: an RPC query field named anything other than `value` on a
+    /// single-record channel must be rejected — `pv_structure_to_epics`
+    /// only extracts `value`, so a stray field name would otherwise be
+    /// silently dropped (a no-op put). The caller deserves a clear
+    /// error naming the offending field.
+    #[tokio::test]
+    async fn rpc_single_record_rejects_non_value_query_field() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ao::AoRecord;
+        use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("RPC:AO2", Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = QsrvPvStore::new(provider);
+
+        // NTURI with query.freq=1.0 — `freq` is not a record field.
+        let mut query = PvStructure::new("");
+        query
+            .fields
+            .push(("freq".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        let mut nturi = PvStructure::new("epics:nt/NTURI:1.0");
+        nturi
+            .fields
+            .push(("query".into(), PvField::Structure(query)));
+        let request = PvField::Structure(nturi);
+
+        let err = store
+            .rpc("RPC:AO2", request.descriptor(), request)
+            .await
+            .expect_err("non-`value` query field must be rejected");
+        assert!(
+            err.contains("freq") && err.contains("value"),
+            "error must name the bad field and the accepted one: {err}"
+        );
+    }
+
+    /// B1: an RPC against a group PV accepts member field names as
+    /// query arguments (the `Single`-only `value` restriction must not
+    /// fire for `AnyChannel::Group`). `pvcall GRP level=.. count=..`
+    /// writes both members and reads the group back.
+    #[tokio::test]
+    async fn rpc_on_group_pv_writes_members() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+
+        const GROUP_JSON: &str = r#"{
+            "RPC:GRP": {
+                "+id": "epics:nt/NTGroup:1.0",
+                "+atomic": true,
+                "level": { "+channel": "RPC:GRP:level.VAL", "+type": "plain" },
+                "count": { "+channel": "RPC:GRP:count.VAL", "+type": "plain" }
+            }
+        }"#;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("RPC:GRP:level", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_record("RPC:GRP:count", Box::new(LonginRecord::new(2)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db));
+        provider.load_group_config(GROUP_JSON).expect("load group");
+        provider.process_groups();
+        let store = QsrvPvStore::new(provider);
+
+        // NTURI: query.level=9.0, query.count=8 — both are member paths.
+        let mut query = PvStructure::new("");
+        query
+            .fields
+            .push(("level".into(), PvField::Scalar(ScalarValue::Double(9.0))));
+        query
+            .fields
+            .push(("count".into(), PvField::Scalar(ScalarValue::Long(8))));
+        let mut nturi = PvStructure::new("epics:nt/NTURI:1.0");
+        nturi
+            .fields
+            .push(("query".into(), PvField::Structure(query)));
+        let request = PvField::Structure(nturi);
+
+        let (_desc, value) = store
+            .rpc("RPC:GRP", request.descriptor(), request)
+            .await
+            .expect("RPC on a group PV must accept member query fields");
+
+        let s = match value {
+            PvField::Structure(s) => s,
+            other => panic!("group RPC response must be a structure, got {other}"),
+        };
+        assert_eq!(
+            s.get_field("level"),
+            Some(&PvField::Scalar(ScalarValue::Double(9.0))),
+            "group member `level` must reflect the RPC write"
+        );
+        match s.get_field("count") {
+            Some(PvField::Scalar(ScalarValue::Long(v))) => assert_eq!(*v, 8),
+            Some(PvField::Scalar(ScalarValue::Int(v))) => assert_eq!(*v as i64, 8),
+            other => panic!("group member `count` mismatch: {other:?}"),
+        }
     }
 
     /// End-to-end wire test: a top-level `UnionArray` PV registered

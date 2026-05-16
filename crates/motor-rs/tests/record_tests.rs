@@ -704,6 +704,27 @@ fn test_rdbd_forced_to_at_least_abs_mres() {
 }
 
 #[test]
+fn test_mres_change_enforces_min_retry_deadband() {
+    // C: special() calls enforceMinRetryDeadband on MRES change.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.retry.rdbd = 0.0005; // below |mres| after the change below
+    rec.put_field("MRES", EpicsValue::Double(0.002)).unwrap();
+    assert!(rec.retry.rdbd >= 0.002, "RDBD must be raised to |MRES|");
+}
+
+#[test]
+fn test_do_process_enforces_min_retry_deadband() {
+    // C: do_work calls enforceMinRetryDeadband every pass. A default RDBD of
+    // 0.0 would disable retry entirely; do_process must floor it to |MRES|.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.retry.rdbd = 0.0;
+    rec.do_process();
+    assert_eq!(rec.retry.rdbd, 1.0);
+}
+
+#[test]
 fn test_no_retry_when_diff_equals_rdbd() {
     // C: 70063c0a — retry only when diff strictly exceeds RDBD.
     let mut rec = MotorRecord::new();

@@ -1158,9 +1158,9 @@ pub(crate) fn motor_put_field(
         },
         "RDBD" => match value {
             EpicsValue::Double(v) => {
-                // C: enforceMinRetryDeadband - RDBD must be >= |MRES|
-                let min_rdbd = rec.conv.mres.abs();
-                rec.retry.rdbd = if v < min_rdbd { min_rdbd } else { v };
+                rec.retry.rdbd = v;
+                // C: enforceMinRetryDeadband — RDBD must be >= |MRES|.
+                rec.enforce_min_retry_deadband();
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1600,6 +1600,8 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
     );
     rec.limits.hlm = hlm;
     rec.limits.llm = llm;
+    // C: special() calls enforceMinRetryDeadband on MRES change.
+    rec.enforce_min_retry_deadband();
 }
 
 /// Re-evaluate LVIO after a soft-limit put.

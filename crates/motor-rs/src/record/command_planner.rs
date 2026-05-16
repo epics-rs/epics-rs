@@ -832,6 +832,17 @@ impl MotorRecord {
         }
     }
 
+    /// C `enforceMinRetryDeadband` (motorRecord.cc:557): RDBD must be at
+    /// least |MRES|. C calls this at init, every do_work pass, and on RDBD/
+    /// MRES change. Without it RDBD stays at its 0.0 default and retry never
+    /// fires (and MISS never latches), since retry is gated on RDBD > 0.
+    pub(crate) fn enforce_min_retry_deadband(&mut self) {
+        let min_rdbd = self.conv.mres.abs();
+        if self.retry.rdbd < min_rdbd {
+            self.retry.rdbd = min_rdbd;
+        }
+    }
+
     /// Check if a new command can be accepted.
     pub fn can_accept_command(&self) -> bool {
         matches!(self.ctrl.spmg, SpmgMode::Go | SpmgMode::Move)
@@ -861,6 +872,9 @@ impl MotorRecord {
 
     /// Process the motor record (called by EPICS record support).
     pub fn do_process(&mut self) -> ProcessEffects {
+        // C: do_work calls enforceMinRetryDeadband every pass.
+        self.enforce_min_retry_deadband();
+
         // STUP: one-shot status refresh
         if self.stat.stup > 0 {
             self.stat.stup = 0;

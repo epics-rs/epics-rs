@@ -496,6 +496,32 @@ fn test_stup_triggers_status_refresh() {
 }
 
 #[test]
+fn test_stup_does_not_drop_concurrent_user_write() {
+    // C handles STUP at the top of do_work and continues the pass. A user
+    // write (last_write) arriving in the same cycle must still be planned —
+    // the STUP must not early-return and discard it.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.stat.stup = 1;
+    // VAL write in the same process cycle as the STUP request.
+    rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
+    let effects = rec.do_process();
+    // STUP honoured…
+    assert!(effects.status_refresh);
+    assert_eq!(rec.stat.stup, 0);
+    // …and the move command is still planned, not dropped.
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "concurrent VAL write must still produce a move"
+    );
+}
+
+#[test]
 fn test_hls_blocks_positive_move() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;

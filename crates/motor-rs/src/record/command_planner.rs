@@ -912,14 +912,23 @@ impl MotorRecord {
         // C: do_work calls enforceMinRetryDeadband every pass.
         self.enforce_min_retry_deadband();
 
-        // STUP: one-shot status refresh
-        if self.stat.stup > 0 {
+        // STUP: one-shot status refresh request. C handles STUP at the top of
+        // do_work and then *continues* the pass — it does not early-return.
+        // Consume the flag here, run the normal process pipeline, and OR the
+        // status_refresh into whatever effects result so a user write or
+        // device update arriving in the same cycle is not dropped.
+        let stup_requested = self.stat.stup > 0;
+        if stup_requested {
             self.stat.stup = 0;
-            let mut effects = ProcessEffects::default();
-            effects.status_refresh = true;
-            return effects;
         }
+        let mut effects = self.do_process_inner();
+        if stup_requested {
+            effects.status_refresh = true;
+        }
+        effects
+    }
 
+    fn do_process_inner(&mut self) -> ProcessEffects {
         // Sub-step pulse recovery: if DMOV is false but phase is Idle
         // (no real motion started), finalize to restore DMOV=1.
         if !self.stat.dmov && self.stat.phase == MotionPhase::Idle && self.stat.mip.is_empty() {

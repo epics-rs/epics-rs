@@ -65,11 +65,18 @@ pub trait Backend: Send + Sync {
 }
 
 /// Live update from a discovery backend.
+///
+/// Both variants carry an `instance` string — the service-instance
+/// name (mDNS fullname, or DNS-SD `<instance>._epics-ca._tcp.<zone>`).
+/// Consumers MUST match `Removed` events by `instance`, not by `addr`:
+/// some backends (mDNS) cannot report the resolved address on removal
+/// and emit a `0.0.0.0:0` sentinel in `addr`.
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
     /// A new IOC just came online.
     Added { instance: String, addr: SocketAddr },
-    /// An IOC is no longer reachable.
+    /// An IOC is no longer reachable. `addr` may be a `0.0.0.0:0`
+    /// sentinel — match on `instance`.
     Removed { instance: String, addr: SocketAddr },
 }
 

@@ -60,9 +60,10 @@ impl MdnsBackend {
                         }
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
-                        // mdns-sd doesn't carry the resolved address on
-                        // removal; we just emit a marker event with a
-                        // null-ish addr so listeners can re-query.
+                        // mdns-sd does not carry the resolved address on
+                        // removal, so `addr` is a `0.0.0.0:0` sentinel —
+                        // consumers MUST match `Removed` by the `instance`
+                        // string (the mDNS fullname), never by `addr`.
                         let _ = event_tx.send(DiscoveryEvent::Removed {
                             instance: fullname.clone(),
                             addr: "0.0.0.0:0".parse().unwrap(),

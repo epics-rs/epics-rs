@@ -432,6 +432,84 @@ fn load_pkcs12_keychain(
     Err(TlsConfigError::Pkcs12Disabled(path.to_path_buf()))
 }
 
+// ─── X.509 identity → authorization credentials ─────────────────────────
+
+/// Authorization identity derived from a verified TLS peer certificate
+/// chain. Mirrors pvxs `PeerCredentials` for the `x509` auth method
+/// (`SSLContext::fill_credentials`, `src/ossl.cpp`):
+///
+/// - `account` = the **leaf** (peer) certificate's subject CommonName.
+/// - `authority` = the **root CA**'s subject CommonName, but only when
+///   that last cert in the chain is a self-signed CA (pvxs checks
+///   `X509_check_ca(root) && EXFLAG_SS`).
+///
+/// The `method` is always `"x509"`. Server-side ACF rules of the form
+/// `RULE(1, WRITE) { ... METHOD("x509") AUTHORITY("Root CA") }` match
+/// against these fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X509Credentials {
+    /// Peer leaf certificate subject CommonName → ACF account.
+    pub account: String,
+    /// Root CA subject CommonName → ACF authority. Empty when the
+    /// chain has no self-signed CA at its end.
+    pub authority: String,
+}
+
+/// Extract the subject CommonName from a DER-encoded X.509 certificate.
+/// Returns `None` when the cert fails to parse or carries no CN RDN.
+fn subject_common_name(der: &[u8]) -> Option<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    cert.subject()
+        .iter_common_name()
+        .next()
+        .and_then(|attr| attr.as_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// True iff the DER-encoded cert is a self-signed CA (root). Mirrors
+/// pvxs `X509_check_ca(root) && (X509_get_extension_flags(root) & EXFLAG_SS)`:
+/// a root CA must (a) have `basicConstraints` CA:TRUE and (b) be
+/// self-signed (subject == issuer).
+fn is_self_signed_ca(der: &[u8]) -> bool {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
+        return false;
+    };
+    let is_ca = cert
+        .basic_constraints()
+        .ok()
+        .flatten()
+        .map(|bc| bc.value.ca)
+        .unwrap_or(false);
+    is_ca && cert.subject() == cert.issuer()
+}
+
+/// Map a verified TLS peer certificate chain to authorization
+/// credentials, mirroring pvxs `SSLContext::fill_credentials`.
+///
+/// `chain` is the peer's certificate chain in leaf-first order — the
+/// exact ordering rustls exposes via `CommonState::peer_certificates()`
+/// and `tokio_rustls`'s `TlsStream` connection info. The leaf
+/// (`chain[0]`) supplies the `account`; the last entry, when it is a
+/// self-signed CA, supplies the `authority`.
+///
+/// Returns `None` when the chain is empty or the leaf has no subject
+/// CommonName — matching pvxs, which only sets `method="x509"` once a
+/// peer CN is in hand.
+pub fn x509_credentials_from_chain(chain: &[CertificateDer<'_>]) -> Option<X509Credentials> {
+    let leaf = chain.first()?;
+    let account = subject_common_name(leaf)?;
+
+    // Root CA = last cert in the chain, but only honoured as the
+    // `authority` when it is a self-signed CA (pvxs ossl.cpp:410).
+    let authority = chain
+        .last()
+        .filter(|root| is_self_signed_ca(root))
+        .and_then(|root| subject_common_name(root))
+        .unwrap_or_default();
+
+    Some(X509Credentials { account, authority })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +834,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─── X.509 credential extraction ────────────────────────────────
+
+    /// Build a self-signed root CA cert with the given CommonName.
+    fn make_ca(cn: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).expect("ca params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().expect("ca key");
+        let cert = params.self_signed(&key).expect("ca self-signed");
+        (cert, key)
+    }
+
+    /// Build a leaf (end-entity) cert with the given CN, signed by `ca`.
+    fn make_leaf(
+        cn: &str,
+        ca: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+    ) -> CertificateDer<'static> {
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .expect("leaf params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        let key = rcgen::KeyPair::generate().expect("leaf key");
+        let cert = params.signed_by(&key, ca, ca_key).expect("leaf signed");
+        CertificateDer::from(cert.der().to_vec())
+    }
+
+    #[test]
+    fn x509_credentials_account_is_leaf_cn_and_authority_is_root_cn() {
+        // Chain: leaf "operator-alice" signed by root CA "EPICS Root CA".
+        let (ca_cert, ca_key) = make_ca("EPICS Root CA");
+        let leaf = make_leaf("operator-alice", &ca_cert, &ca_key);
+        let root = CertificateDer::from(ca_cert.der().to_vec());
+
+        let chain = vec![leaf, root];
+        let creds = x509_credentials_from_chain(&chain).expect("credentials");
+        assert_eq!(creds.account, "operator-alice");
+        assert_eq!(creds.authority, "EPICS Root CA");
+    }
+
+    #[test]
+    fn x509_credentials_leaf_only_chain_has_no_authority() {
+        // A leaf-only chain (no root appended) still yields the
+        // account, but the authority stays empty because the last
+        // entry is the leaf itself — not a self-signed CA.
+        let (ca_cert, ca_key) = make_ca("Some CA");
+        let leaf = make_leaf("svc-readonly", &ca_cert, &ca_key);
+
+        let chain = vec![leaf];
+        let creds = x509_credentials_from_chain(&chain).expect("credentials");
+        assert_eq!(creds.account, "svc-readonly");
+        assert_eq!(creds.authority, "");
+    }
+
+    #[test]
+    fn x509_credentials_empty_chain_is_none() {
+        assert!(x509_credentials_from_chain(&[]).is_none());
+    }
+
+    #[test]
+    fn is_self_signed_ca_distinguishes_root_from_leaf() {
+        let (ca_cert, ca_key) = make_ca("Root");
+        let root = CertificateDer::from(ca_cert.der().to_vec());
+        let leaf = make_leaf("leaf", &ca_cert, &ca_key);
+        assert!(is_self_signed_ca(&root), "root CA must be detected");
+        assert!(
+            !is_self_signed_ca(&leaf),
+            "CA-signed leaf must not be treated as root"
+        );
+    }
+
+    #[test]
+    fn subject_common_name_extracts_cn() {
+        let (ca_cert, ca_key) = make_ca("CA");
+        let leaf = make_leaf("my-account", &ca_cert, &ca_key);
+        assert_eq!(subject_common_name(&leaf).as_deref(), Some("my-account"));
     }
 }

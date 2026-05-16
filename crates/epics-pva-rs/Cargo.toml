@@ -36,6 +36,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 # Pure-Rust; opt-in via the `pkcs12` feature so PEM-only deployments
 # can drop the extra dependency. Enabled by default.
 p12 = { version = "0.6", optional = true }
+# X.509 identity extraction from the verified TLS peer chain — pvxs
+# `SSLContext::fill_credentials` parity (CN → ACF account, root CA CN →
+# authority). Same crate/version `epics-ca-rs` already depends on.
+x509-parser = "0.16"
 
 [features]
 default = ["pkcs12"]

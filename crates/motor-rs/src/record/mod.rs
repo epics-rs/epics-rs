@@ -223,6 +223,13 @@ impl Record for MotorRecord {
     fn primary_field(&self) -> &'static str {
         "VAL"
     }
+
+    /// MDEL/ADEL monitor deadband applies to the readback (RBV), not the
+    /// VAL setpoint. C `monitor()` gates RBV value/archive monitors on
+    /// MDEL/ADEL; VAL is a setpoint that only changes on a move command.
+    fn monitor_deadband_value(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::Double(self.pos.rbv))
+    }
 }
 
 #[cfg(test)]

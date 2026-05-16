@@ -2379,3 +2379,18 @@ fn test_accs_roundtrip_via_pv() {
     assert_eq!(rec.get_field("ACCS"), Some(EpicsValue::Double(4.0)));
     assert_eq!(rec.get_field("ACCU"), Some(EpicsValue::Short(1)));
 }
+
+// --- MDEL/ADEL deadband target (C: monitor() gates on RBV) ---
+
+#[test]
+fn test_monitor_deadband_value_is_rbv_not_val() {
+    // The harness applies MDEL/ADEL to monitor_deadband_value(). For a motor
+    // record that must be the readback (RBV), not the VAL setpoint.
+    let mut rec = MotorRecord::new();
+    rec.pos.rbv = 42.0;
+    rec.pos.val = 10.0; // setpoint differs from readback
+    assert_eq!(
+        rec.monitor_deadband_value(),
+        Some(EpicsValue::Double(42.0))
+    );
+}

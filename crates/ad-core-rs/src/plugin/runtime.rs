@@ -232,6 +232,15 @@ pub trait NDPluginProcess: Send + 'static {
     /// Plugin type name for PLUGIN_TYPE param.
     fn plugin_type(&self) -> &str;
 
+    /// Whether this plugin can process compressed (`codec != None`) arrays
+    /// (C++ `compressionAware_`, G3). Defaults to `false`: a plugin that
+    /// operates on raw pixels must not be handed compressed bytes — the
+    /// runtime drops compressed input and counts it into DroppedArrays.
+    /// A codec/file plugin that understands compressed data overrides this.
+    fn compression_aware(&self) -> bool {
+        false
+    }
+
     /// Register plugin-specific params on the base. Called once during construction.
     fn register_params(
         &mut self,
@@ -1308,6 +1317,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
 
     // Capture plugin type and array data handle before mutable borrow
     let plugin_type_name = processor.plugin_type().to_string();
+    let compression_aware = processor.compression_aware();
     let array_data = processor.array_data_handle();
 
     // Create the port driver for control plane
@@ -1366,7 +1376,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         sort_size: 10,
         sort_buffer: SortBuffer::new(),
         dropped_arrays: dropped_arrays_counter,
-        compression_aware: false,
+        compression_aware,
         max_byte_rate: 0.0,
         throttler: super::throttler::Throttler::new(0.0),
         prev_input_array: None,
@@ -1800,6 +1810,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         tokio::sync::mpsc::unbounded_channel::<(usize, i32, ParamChangeValue)>();
 
     let plugin_type_name = processor.plugin_type().to_string();
+    let compression_aware = processor.compression_aware();
     let array_data = processor.array_data_handle();
     let driver = PluginPortDriver::new(
         port_name,
@@ -1850,7 +1861,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         sort_size: 10,
         sort_buffer: SortBuffer::new(),
         dropped_arrays: dropped_arrays_counter,
-        compression_aware: false,
+        compression_aware,
         max_byte_rate: 0.0,
         throttler: super::throttler::Throttler::new(0.0),
         prev_input_array: None,
@@ -2523,6 +2534,47 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(50), downstream_rx.recv()).await
         });
         assert!(second.is_err(), "second array throttled out by MinCallbackTime");
+    }
+
+    #[test]
+    fn test_g3_compressed_array_dropped_on_non_aware_plugin() {
+        // G3: a non-compression-aware plugin drops a compressed array.
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            "G3_TEST",
+            PassthroughProcessor, // compression_aware() defaults to false
+            pool,
+            10,
+            output,
+            "",
+            test_wiring(),
+        );
+        enable_callbacks(&handle);
+
+        // A compressed array must be dropped, not forwarded.
+        let mut compressed = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        compressed.unique_id = 1;
+        compressed.codec = Some(crate::codec::Codec {
+            name: crate::codec::CodecName::JPEG,
+            compressed_size: 16,
+            level: 0,
+            shuffle: 0,
+            compressor: 0,
+        });
+        send_array(handle.array_sender(), Arc::new(compressed));
+
+        // An uncompressed array passes through normally.
+        send_array(handle.array_sender(), make_test_array(2));
+
+        let r = downstream_rx.blocking_recv().unwrap();
+        assert_eq!(
+            r.unique_id, 2,
+            "compressed array dropped; only the raw array reaches downstream"
+        );
     }
 
     #[test]

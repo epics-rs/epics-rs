@@ -4,10 +4,93 @@ use std::sync::Arc;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 
+use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 use crate::params::ndarray_driver::NDArrayDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
+
+/// `ND_ATTRIBUTES_STATUS` code: attributes loaded successfully
+/// (C++ `NDAttributesOK`).
+pub const ATTR_STATUS_OK: i32 = 0;
+/// `ND_ATTRIBUTES_STATUS` code: the attributes file could not be opened
+/// (C++ `NDAttributesFileNotFound`).
+pub const ATTR_STATUS_FILE_NOT_FOUND: i32 = 1;
+/// `ND_ATTRIBUTES_STATUS` code: the attributes XML failed to parse
+/// (C++ `NDAttributesXMLSyntaxError`).
+pub const ATTR_STATUS_XML_SYNTAX_ERROR: i32 = 2;
+/// `ND_ATTRIBUTES_STATUS` code: macro expansion failed
+/// (C++ `NDAttributesMacroError`). Reserved — macro substitution is not
+/// implemented in the Rust port.
+pub const ATTR_STATUS_MACRO_ERROR: i32 = 3;
+
+/// Extract the value of an XML attribute `key="..."` from a single tag body.
+fn xml_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("{key}=\"");
+    let start = tag.find(&pat)? + pat.len();
+    let end = tag[start..].find('"')? + start;
+    Some(&tag[start..end])
+}
+
+/// Parse the areaDetector `NDAttributesFile` XML schema.
+///
+/// Recognizes a root `<Attributes>` element containing
+/// `<Attribute name="..." source="..." type="..." description="..." .../>`
+/// children. The `type` attribute selects the [`NDAttrSource`]; `EPICS_PV`,
+/// `param`, `Function` and `const` map to `EpicsPV`, `Param`, `Function` and
+/// `Constant` respectively (C++ `NDAttribute::attrSourceString`). Live values
+/// are not fetched here — Param/EpicsPV/Function attributes are stored with an
+/// `Undefined` value until a source backend evaluates them; `const`
+/// attributes carry their literal `source` string as the value.
+fn parse_attributes_xml(xml: &str) -> Result<Vec<NDAttribute>, String> {
+    if !xml.contains("<Attributes>") {
+        return Err("missing <Attributes> root element".into());
+    }
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find("<Attribute ") {
+        let after = &rest[open + 1..];
+        let close = after
+            .find("/>")
+            .or_else(|| after.find('>'))
+            .ok_or_else(|| "unterminated <Attribute> tag".to_string())?;
+        let tag = &after[..close];
+
+        let name = xml_attr(tag, "name")
+            .ok_or_else(|| "Attribute missing name".to_string())?
+            .to_string();
+        let description = xml_attr(tag, "description").unwrap_or("").to_string();
+        let source_str =
+            xml_attr(tag, "source").ok_or_else(|| format!("Attribute {name} missing source"))?;
+        // C++ default attribute type is EPICS_PV.
+        let attr_type = xml_attr(tag, "type").unwrap_or("EPICS_PV");
+
+        let (source, value) = match attr_type {
+            "EPICS_PV" => (NDAttrSource::EpicsPV, NDAttrValue::Undefined),
+            "param" => (
+                NDAttrSource::Param {
+                    port_name: String::new(),
+                    param_name: source_str.to_string(),
+                },
+                NDAttrValue::Undefined,
+            ),
+            "Function" => (NDAttrSource::Function, NDAttrValue::Undefined),
+            "const" => (
+                NDAttrSource::Constant,
+                NDAttrValue::String(source_str.to_string()),
+            ),
+            other => {
+                return Err(format!(
+                    "unknown attribute type '{other}' for attribute {name}"
+                ));
+            }
+        };
+
+        out.push(NDAttribute::new_static(name, description, source, value));
+        rest = &after[close..];
+    }
+    Ok(out)
+}
 
 /// Parse a C printf-style template with two `%s` and one `%d`-like specifier.
 ///
@@ -275,6 +358,9 @@ pub struct NDArrayDriverBase {
     /// Most recently prepared array (C++ `pArrays[0]`), used as the template
     /// for `preAllocateBuffers`.
     pub last_array: Option<Arc<NDArray>>,
+    /// NDArray attribute definitions loaded from `ND_ATTRIBUTES_FILE`
+    /// (C++ `asynNDArrayDriver::pAttributeList`).
+    pub attributes: crate::attributes::NDAttributeList,
 }
 
 impl NDArrayDriverBase {
@@ -302,6 +388,7 @@ impl NDArrayDriverBase {
             array_output: NDArrayOutput::new(),
             queued_counter: Arc::new(QueuedArrayCounter::new()),
             last_array: None,
+            attributes: crate::attributes::NDAttributeList::new(),
         })
     }
 
@@ -443,6 +530,164 @@ impl NDArrayDriverBase {
         self.port_base
             .set_int32_param(self.params.file_path_exists, 0, exists as i32)?;
         Ok(exists)
+    }
+
+    /// Recursively create the directory components of `path`.
+    ///
+    /// Mirrors C++ `asynNDArrayDriver::createFilePath`: directory parts at
+    /// index `>= path_depth` are created (parts before that depth are assumed
+    /// to already exist). A `path_depth` of 0 is a no-op; a negative
+    /// `path_depth` counts from the end (`num_parts + path_depth`, clamped to a
+    /// minimum of 1). `EEXIST` is not an error.
+    pub fn create_file_path(path: &str, path_depth: i32) -> AsynResult<()> {
+        if path_depth == 0 {
+            return Ok(());
+        }
+
+        // Leading prefix to preserve verbatim: an optional Windows drive
+        // designator ("C:") plus any leading path separators.
+        let bytes: Vec<char> = path.chars().collect();
+        let mut i = 0usize;
+        let mut prefix = String::new();
+        if bytes.len() >= 2 && bytes[1] == ':' {
+            prefix.push(bytes[0]);
+            prefix.push(':');
+            i = 2;
+        }
+        while i < bytes.len() && (bytes[i] == '/' || bytes[i] == '\\') {
+            prefix.push(bytes[i]);
+            i += 1;
+        }
+
+        let rest: String = bytes[i..].iter().collect();
+        let parts: Vec<&str> = rest.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+        let num_parts = parts.len() as i32;
+
+        let mut depth = path_depth;
+        if depth < 0 {
+            depth = num_parts + depth;
+            if depth < 1 {
+                depth = 1;
+            }
+        }
+
+        let mut next_dir = prefix;
+        for (idx, part) in parts.iter().enumerate() {
+            next_dir.push_str(part);
+            if idx as i32 >= depth {
+                match std::fs::create_dir(&next_dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            next_dir.push('/');
+        }
+        Ok(())
+    }
+
+    /// Handle a write to an Octet parameter, mirroring the relevant branches of
+    /// C++ `asynNDArrayDriver::writeOctet`.
+    ///
+    /// - `ND_ATTRIBUTES_FILE` / `ND_ATTRIBUTES_MACROS`: reload the attribute
+    ///   definitions via [`Self::read_nd_attributes_file`].
+    /// - `FILE_PATH`: run `checkPath`; if the directory does not exist, attempt
+    ///   `createFilePath` bounded by `CREATE_DIR`, then re-check.
+    ///
+    /// The caller is expected to have already stored `value` into the parameter
+    /// library. Returns `true` when `param_index` was a recognized parameter.
+    pub fn write_octet(&mut self, param_index: usize, value: &str) -> AsynResult<bool> {
+        if param_index == self.params.attributes_file
+            || param_index == self.params.attributes_macros
+        {
+            let _ = self.read_nd_attributes_file();
+            Ok(true)
+        } else if param_index == self.params.file_path {
+            if !self.check_path()? {
+                let depth = self
+                    .port_base
+                    .get_int32_param(self.params.create_dir, 0)
+                    .unwrap_or(0);
+                let _ = Self::create_file_path(value, depth);
+                self.check_path()?;
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Load NDArray attribute definitions from the `ND_ATTRIBUTES_FILE`
+    /// parameter, mirroring C++ `asynNDArrayDriver::readNDAttributesFile`.
+    ///
+    /// The parameter value is either a path to an XML file or inline XML
+    /// (recognized by containing `<Attributes>`). The XML schema is the
+    /// areaDetector `NDAttributesFile` schema: a root `<Attributes>` element
+    /// with `<Attribute name="..." source="..." type="..." .../>` children.
+    /// Macro substitution (C++ `ND_ATTRIBUTES_MACROS`) is not supported and is
+    /// ignored. Attributes are stored on `self.attributes`; `ND_ATTRIBUTES_STATUS`
+    /// is set to the resulting status code.
+    pub fn read_nd_attributes_file(&mut self) -> AsynResult<()> {
+        let file_param = self
+            .port_base
+            .get_string_param(self.params.attributes_file, 0)?
+            .to_string();
+
+        // Clear any existing attributes (C++ clears unconditionally first).
+        self.attributes.clear();
+        if file_param.is_empty() {
+            self.port_base
+                .set_int32_param(self.params.attributes_status, 0, ATTR_STATUS_OK)?;
+            return Ok(());
+        }
+
+        // The parameter is inline XML if it contains the root element.
+        let xml = if file_param.contains("<Attributes>") {
+            file_param
+        } else {
+            match std::fs::read_to_string(&file_param) {
+                Ok(s) => s,
+                Err(_) => {
+                    self.port_base.set_int32_param(
+                        self.params.attributes_status,
+                        0,
+                        ATTR_STATUS_FILE_NOT_FOUND,
+                    )?;
+                    return Err(asyn_rs::error::AsynError::Status {
+                        status: asyn_rs::error::AsynStatus::Error,
+                        message: format!("readNDAttributesFile: cannot open {file_param}"),
+                    });
+                }
+            }
+        };
+
+        match parse_attributes_xml(&xml) {
+            Ok(attrs) => {
+                for attr in attrs {
+                    self.attributes.add(attr);
+                }
+                self.port_base
+                    .set_int32_param(self.params.attributes_status, 0, ATTR_STATUS_OK)?;
+                Ok(())
+            }
+            Err(msg) => {
+                self.port_base.set_int32_param(
+                    self.params.attributes_status,
+                    0,
+                    ATTR_STATUS_XML_SYNTAX_ERROR,
+                )?;
+                Err(asyn_rs::error::AsynError::Status {
+                    status: asyn_rs::error::AsynStatus::Error,
+                    message: format!("readNDAttributesFile: {msg}"),
+                })
+            }
+        }
+    }
+
+    /// Access the driver's NDArray attribute list (populated by
+    /// `read_nd_attributes_file`).
+    pub fn attributes(&self) -> &crate::attributes::NDAttributeList {
+        &self.attributes
     }
 }
 
@@ -718,5 +963,124 @@ mod tests {
 
         let received = receiver.blocking_recv().unwrap();
         assert_eq!(received.unique_id, id);
+    }
+
+    #[test]
+    fn test_create_file_path_recursive() {
+        // G9: createFilePath creates directory components at depth >= path_depth.
+        let base = std::env::temp_dir().join(format!(
+            "ad_core_rs_cfp_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = base.join("a").join("b").join("c");
+        let path = format!("{}/", nested.to_string_lossy());
+        // path_depth 0 = no-op.
+        NDArrayDriverBase::create_file_path(&path, 0).unwrap();
+        assert!(!nested.exists());
+        // path_depth 1 creates everything from index 1 onward.
+        NDArrayDriverBase::create_file_path(&path, 1).unwrap();
+        assert!(nested.is_dir());
+        // Idempotent — EEXIST is not an error.
+        NDArrayDriverBase::create_file_path(&path, 1).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_read_nd_attributes_file_inline_xml() {
+        // G9: readNDAttributesFile parses inline XML (NDAttributesFile schema).
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let xml = r#"<Attributes>
+            <Attribute name="Gain" type="param" source="GAIN" description="detector gain"/>
+            <Attribute name="Comment" type="const" source="hello"/>
+            <Attribute name="Temp" type="EPICS_PV" source="$(P)Temp"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+
+        assert_eq!(drv.attributes().len(), 3);
+        let gain = drv.attributes().get("Gain").unwrap();
+        assert!(matches!(gain.source, NDAttrSource::Param { .. }));
+        let comment = drv.attributes().get("Comment").unwrap();
+        assert_eq!(comment.value, NDAttrValue::String("hello".into()));
+        assert!(matches!(
+            drv.attributes().get("Temp").unwrap().source,
+            NDAttrSource::EpicsPV
+        ));
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
+            ATTR_STATUS_OK
+        );
+    }
+
+    #[test]
+    fn test_read_nd_attributes_file_empty_is_ok() {
+        // G9: an empty ND_ATTRIBUTES_FILE clears attributes and reports OK.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        assert_eq!(drv.attributes().len(), 0);
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
+            ATTR_STATUS_OK
+        );
+    }
+
+    #[test]
+    fn test_read_nd_attributes_file_missing_file() {
+        // G9: a non-existent file path yields FILE_NOT_FOUND status.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.port_base
+            .set_string_param(
+                drv.params.attributes_file,
+                0,
+                "/nonexistent_attrs_xyz.xml".into(),
+            )
+            .unwrap();
+        assert!(drv.read_nd_attributes_file().is_err());
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
+            ATTR_STATUS_FILE_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn test_write_octet_file_path_creates_dir() {
+        // G9: writeOctet on FILE_PATH runs checkPath then createFilePath.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "ad_core_rs_wo_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = base.join("sub");
+        let path = format!("{}/", target.to_string_lossy());
+        drv.port_base
+            .set_int32_param(drv.params.create_dir, 0, 1)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_path, 0, path.clone())
+            .unwrap();
+        let handled = drv.write_octet(drv.params.file_path, &path).unwrap();
+        assert!(handled);
+        assert!(target.is_dir());
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.file_path_exists, 0)
+                .unwrap(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1860,18 +1860,50 @@ fn test_rstm_near_zero_no_restore_when_driver_already_positioned() {
     rec.conv.rstm = RestoreMode::NearZero;
     rec.conv.mres = 1.0;
     rec.retry.rdbd = 0.05;
-    rec.pos.dval = 5.0; // autosaved
+    // Autosaved DVAL and driver position are deliberately different (5 vs 8)
+    // so restore (dval stays 5) and sync (dval becomes 8) are distinguishable.
+    rec.pos.dval = 5.0;
     let status = MotorStatus {
-        position: 5.0, // driver already at 5.0 — not near zero
-        encoder_position: 5.0,
+        position: 8.0, // driver at 8.0 — far from zero
+        encoder_position: 8.0,
         done: true,
         ..Default::default()
     };
     let effects = rec.initial_readback(&status);
-    // Driver position is meaningful → adopt it, no restore
-    assert_eq!(rec.pos.dval, 5.0);
+    // Driver position is meaningful → no restore → adopt driver readback (8.0).
+    assert_eq!(rec.pos.dval, 8.0, "should sync to driver position, not restore");
     assert!(
         !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+    );
+}
+
+#[test]
+fn test_rstm_near_zero_uses_motor_position_not_encoder() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // C compares the *motor* dial (status.position * MRES), not the encoder
+    // dial. With UEIP=Yes and ERES != MRES, the encoder readback differs from
+    // the motor position; the near-zero decision must follow the motor.
+    let mut rec = MotorRecord::new();
+    rec.conv.rstm = RestoreMode::NearZero;
+    rec.conv.mres = 1.0;
+    rec.conv.eres = 10.0; // encoder scale differs
+    rec.conv.ueip = true;
+    rec.retry.rdbd = 0.05;
+    rec.pos.dval = 5.0; // autosaved, meaningful
+    let status = MotorStatus {
+        position: 0.0,         // motor at zero → restore expected
+        encoder_position: 5.0, // encoder reads non-zero
+        done: true,
+        ..Default::default()
+    };
+    let effects = rec.initial_readback(&status);
+    // Motor position is near zero → restore the autosaved DVAL.
+    assert_eq!(rec.pos.dval, 5.0);
+    assert!(
+        effects
             .commands
             .iter()
             .any(|c| matches!(c, MotorCommand::SetPosition { .. }))

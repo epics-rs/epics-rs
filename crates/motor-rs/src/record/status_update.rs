@@ -274,10 +274,15 @@ impl MotorRecord {
         // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when
         // the autosaved DVAL is meaningful but the driver currently sits near
         // zero (i.e. the controller lost its position across the IOC restart).
+        //
+        // C compares `fabs(status.position * mres)` — the *motor* position
+        // dial value, always via MRES. Use the motor raw position (RMP), not
+        // DRBV, since DRBV follows the encoder (ERES) when UEIP=Yes.
         let rdbd = self.retry.rdbd.abs().max(self.conv.mres.abs());
+        let motor_dial = coordinate::raw_to_dial(self.pos.rmp, self.conv.mres);
         let dval_non_zero_pos_near_zero = autosaved_dval.abs() > rdbd
             && self.conv.mres != 0.0
-            && self.pos.drbv.abs() < rdbd;
+            && motor_dial.abs() < rdbd;
         let mut restore = self
             .conv
             .rstm

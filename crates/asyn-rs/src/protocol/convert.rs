@@ -72,6 +72,8 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::SetAutoConnect { yes } => Self::SetAutoConnect { yes: *yes },
             RequestOp::GetBoundsInt32 => Self::GetBoundsInt32,
             RequestOp::GetBoundsInt64 => Self::GetBoundsInt64,
+            RequestOp::GetEnable => Self::GetEnable,
+            RequestOp::GetAutoConnect => Self::GetAutoConnect,
             RequestOp::BlockProcess => Self::BlockProcess,
             RequestOp::UnblockProcess => Self::UnblockProcess,
             RequestOp::DrvUserCreate { drv_info } => Self::DrvUserCreate {
@@ -160,6 +162,8 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::SetAutoConnect { yes } => Self::SetAutoConnect { yes: *yes },
             PortCommand::GetBoundsInt32 => Self::GetBoundsInt32,
             PortCommand::GetBoundsInt64 => Self::GetBoundsInt64,
+            PortCommand::GetEnable => Self::GetEnable,
+            PortCommand::GetAutoConnect => Self::GetAutoConnect,
             PortCommand::BlockProcess => Self::BlockProcess,
             PortCommand::UnblockProcess => Self::UnblockProcess,
             PortCommand::DrvUserCreate { drv_info } => Self::DrvUserCreate {

@@ -211,6 +211,8 @@ impl PortActor {
                 | RequestOp::DisableAddr
                 | RequestOp::SetEnable { .. }
                 | RequestOp::SetAutoConnect { .. }
+                | RequestOp::GetEnable
+                | RequestOp::GetAutoConnect
                 | RequestOp::BlockProcess
                 | RequestOp::UnblockProcess
                 | RequestOp::ShutdownPort
@@ -395,6 +397,14 @@ impl PortActor {
                 // `asynExceptionAutoConnect` unconditionally.
                 self.driver.base_mut().set_auto_connect(*yes);
                 Ok(RequestResult::write_ok())
+            }
+            RequestOp::GetEnable => {
+                let enabled = self.driver.base().enabled;
+                Ok(RequestResult::int32_read(i32::from(enabled)))
+            }
+            RequestOp::GetAutoConnect => {
+                let auto = self.driver.base().auto_connect;
+                Ok(RequestResult::int32_read(i32::from(auto)))
             }
             RequestOp::GetBoundsInt32 => {
                 let (low, high) = self.driver.get_bounds_int32(user)?;
@@ -939,6 +949,25 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn actor_get_enable_and_auto_connect() {
+        // GetEnable/GetAutoConnect report the driver's actual state and
+        // answer even when the port is disabled (they are lifecycle ops
+        // that bypass the enabled/connected check).
+        let mut drv = TestDriver::new();
+        drv.base.enabled = false;
+        drv.base.auto_connect = true;
+        let tx = spawn_actor(drv);
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let r = send_and_wait(&tx, RequestOp::GetEnable, user).unwrap();
+        assert_eq!(r.int_val, Some(0));
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let r = send_and_wait(&tx, RequestOp::GetAutoConnect, user).unwrap();
+        assert_eq!(r.int_val, Some(1));
     }
 
     #[test]

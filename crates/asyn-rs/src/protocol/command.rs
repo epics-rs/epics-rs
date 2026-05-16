@@ -93,6 +93,10 @@ pub enum PortCommand {
     },
     GetBoundsInt32,
     GetBoundsInt64,
+    /// Query whether the port is currently enabled.
+    GetEnable,
+    /// Query whether auto-connect is enabled for the port.
+    GetAutoConnect,
     BlockProcess,
     UnblockProcess,
     DrvUserCreate {
@@ -171,6 +175,8 @@ mod tests {
             PortCommand::SetAutoConnect { yes: false },
             PortCommand::GetBoundsInt32,
             PortCommand::GetBoundsInt64,
+            PortCommand::GetEnable,
+            PortCommand::GetAutoConnect,
             PortCommand::BlockProcess,
             PortCommand::UnblockProcess,
             PortCommand::DrvUserCreate {

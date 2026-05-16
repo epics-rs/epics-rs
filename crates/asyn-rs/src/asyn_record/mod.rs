@@ -1106,8 +1106,17 @@ impl AsynRecord {
                 // Mark connected
                 self.pcnct = 1;
                 self.cnct = 1;
-                self.enbl = 1;
-                self.auct = 1;
+                // C asynRecord.c connectDevice queries the port's actual
+                // enable / auto-connect state into ENBL / AUCT — it must
+                // not force them to 1, which would discard a user who
+                // configured ENBL=0 or a port registered noAutoConnect.
+                // Keep the current field value if the query fails.
+                if let Ok(enabled) = entry.handle.is_enabled_blocking() {
+                    self.enbl = i32::from(enabled);
+                }
+                if let Ok(auto) = entry.handle.is_auto_connect_blocking() {
+                    self.auct = i32::from(auto);
+                }
                 // Only clear errors if drv_user_create succeeded (don't mask the error)
                 if self.errs.is_empty() || self.resolved_reason != 0 || self.drvinfo.is_empty() {
                     self.errs.clear();

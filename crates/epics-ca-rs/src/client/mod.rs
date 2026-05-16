@@ -560,7 +560,26 @@ impl CaClient {
                     while let Some(evt) = rx.recv().await {
                         match evt {
                             crate::discovery::DiscoveryEvent::Added { instance, addr } => {
-                                instance_addrs.insert(instance, addr);
+                                // If this instance was already known under a
+                                // *different* addr (mDNS re-binding — the IOC
+                                // moved host/port), the old addr must be
+                                // retracted, else its AddAddress lingers
+                                // forever. Retract only when no *other*
+                                // instance still backs the old addr — the
+                                // same last-instance rule the Removed arm
+                                // uses. `insert` returns the prior addr; the
+                                // map already holds the new addr by the time
+                                // `values()` runs, so a differing old addr
+                                // is matched only against sibling instances.
+                                if let Some(old_addr) = instance_addrs.insert(instance, addr)
+                                    && old_addr != addr
+                                    && !instance_addrs.values().any(|a| *a == old_addr)
+                                    && fwd_search_tx
+                                        .send(SearchRequest::RemoveAddress(old_addr))
+                                        .is_err()
+                                {
+                                    break;
+                                }
                                 if fwd_search_tx
                                     .send(SearchRequest::AddAddress(addr))
                                     .is_err()

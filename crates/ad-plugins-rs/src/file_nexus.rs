@@ -25,6 +25,32 @@ use ad_core_rs::plugin::runtime::{
 
 use rust_hdf5::{H5Dataset, H5File};
 
+/// Name of the HDF5 attribute recording the NDArray data type ordinal
+/// (matches C `NDDataType_t`). `read_file` uses it to recover the exact type
+/// — without it `read_raw::<u8>` / `<u16>` cannot distinguish signed vs
+/// unsigned or i32 vs u32 vs f32 (all 4-byte) datasets.
+const DTYPE_ATTR: &str = "NDArrayDataType";
+
+/// Serialize an NDArray data buffer to **little-endian** bytes. `rust-hdf5`
+/// 0.2.0 records every numeric datatype message as little-endian and copies
+/// the `&[u8]` passed to `write_chunk` verbatim, so a typed dataset fed
+/// host-endian `as_u8_slice()` bytes is only correct on a little-endian host.
+/// This makes the on-disk bytes match the declared LE datatype on every host.
+fn nd_buffer_to_le_bytes(buf: &NDDataBuffer) -> Vec<u8> {
+    match buf {
+        NDDataBuffer::I8(v) => v.iter().map(|&x| x as u8).collect(),
+        NDDataBuffer::U8(v) => v.clone(),
+        NDDataBuffer::I16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::U16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::I32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::U32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::I64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::U64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::F32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::F64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+    }
+}
+
 // ===========================================================================
 // NeXus XML template parser
 // ===========================================================================
@@ -297,12 +323,24 @@ pub struct NexusWriter {
     uid_dataset: Option<H5Dataset>,
     /// Per-frame `timeStamp` dataset.
     ts_dataset: Option<H5Dataset>,
+    /// `entry/data/data` dataset — the NXdata-group copy of the image data
+    /// (built-in hierarchy only). NeXus readers locate the signal through
+    /// the `NXdata` group, so the data must appear there. `rust-hdf5` 0.2.0
+    /// exposes no hard-link API, so a real HDF5 hard link to the detector
+    /// dataset is impossible; the equivalent here is a second dataset in the
+    /// NXdata group written from the same frame bytes. `None` in template
+    /// mode (the template owns the tree) and after `close_file`.
+    nxdata_dataset: Option<H5Dataset>,
     /// Parsed NeXus XML template tree, if a valid template was loaded.
     template: Option<XmlElement>,
     /// HDF5 path of the group that contains the main array dataset (template
     /// mode); the dataset itself is named by the template's `pArray` node.
     data_group_path: String,
     data_node_name: String,
+    /// HDF5 path of the NXdata group that receives the image-data copy
+    /// (built-in hierarchy only — `Some("entry/data")`). `None` in template
+    /// mode, where the template controls all dataset placement.
+    nxdata_group_path: Option<String>,
 }
 
 impl NexusWriter {
@@ -314,9 +352,11 @@ impl NexusWriter {
             dataset: None,
             uid_dataset: None,
             ts_dataset: None,
+            nxdata_dataset: None,
             template: None,
             data_group_path: "entry/instrument/detector".to_string(),
             data_node_name: "data".to_string(),
+            nxdata_group_path: None,
         }
     }
 
@@ -631,6 +671,12 @@ impl NDFileWriter for NexusWriter {
         // rust-hdf5 0.2.12 supports attributes on).
         Self::apply_root_nx_class(&h5file, "NXroot");
 
+        self.dataset = None;
+        self.uid_dataset = None;
+        self.ts_dataset = None;
+        self.nxdata_dataset = None;
+        self.nxdata_group_path = None;
+
         if let Some(template) = self.template.clone() {
             // Template mode: build the group/dataset tree from the user's
             // NeXus XML template (C++ NDFileNexus::loadTemplateFile).
@@ -659,6 +705,11 @@ impl NDFileWriter for NexusWriter {
             Self::write_nx_class(&data_group, "NXdata")?;
             self.data_group_path = "entry/instrument/detector".to_string();
             self.data_node_name = "data".to_string();
+            // The image data must appear inside the NXdata group so NeXus
+            // readers locate the signal. rust-hdf5 0.2.0 has no hard-link
+            // API, so write_file places a second `data` dataset here from
+            // the same frame bytes (documented equivalent of a hard link).
+            self.nxdata_group_path = Some("entry/data".to_string());
         }
 
         self.file = Some(h5file);
@@ -673,11 +724,12 @@ impl NDFileWriter for NexusWriter {
 
         let frame_shape = array.dims.iter().rev().map(|d| d.size).collect::<Vec<_>>();
         let data_node_name = self.data_node_name.clone();
+        let nxdata_group_path = self.nxdata_group_path.clone();
 
-        // Resolve the data group from its HDF5 path.
-        let data_group = {
+        // Resolve a group from its slash-separated HDF5 path.
+        let resolve_group = |path: &str| -> ADResult<rust_hdf5::H5Group> {
             let mut group = h5file.root_group();
-            for component in self.data_group_path.split('/') {
+            for component in path.split('/') {
                 if component.is_empty() {
                     continue;
                 }
@@ -685,79 +737,101 @@ impl NDFileWriter for NexusWriter {
                     .group(component)
                     .map_err(|e| ADError::UnsupportedConversion(e.to_string()))?;
             }
-            group
+            Ok(group)
         };
+        let data_group = resolve_group(&self.data_group_path)?;
+
+        // Element type recorded on the data dataset for lossless read-back,
+        // and the frame bytes serialized explicitly little-endian (rust-hdf5
+        // 0.2.0 records LE datatypes and copies write_chunk bytes verbatim).
+        let dtype_ordinal = array.data.data_type() as i32;
+        let frame_bytes = nd_buffer_to_le_bytes(&array.data);
 
         if self.frame_count == 0 {
-            // First frame: create a chunked dataset with leading frame dimension.
+            // First frame: create a chunked dataset with leading frame dim.
             // Shape: [1, dim0, dim1, ...], chunk: [1, dim0, dim1, ...]
             let mut ds_shape = vec![1usize];
             ds_shape.extend_from_slice(&frame_shape);
             let chunk_dims = ds_shape.clone();
 
-            macro_rules! create_chunked {
-                ($t:ty, $v:expr) => {{
-                    let ds = data_group
+            // Create the image dataset typed per the NDArray data type; all
+            // ten NDArray types are covered so read_file can recover them.
+            macro_rules! create_image_ds {
+                ($group:expr, $t:ty, $name:expr) => {{
+                    $group
                         .new_dataset::<$t>()
                         .shape(&ds_shape[..])
                         .chunk(&chunk_dims[..])
                         .resizable()
-                        .create(&data_node_name)
+                        .create($name)
                         .map_err(|e| {
-                            ADError::UnsupportedConversion(format!("NeXus dataset error: {}", e))
-                        })?;
-                    let raw = unsafe {
-                        std::slice::from_raw_parts(
-                            $v.as_ptr() as *const u8,
-                            $v.len() * std::mem::size_of::<$t>(),
-                        )
-                    };
-                    ds.write_chunk(0, raw).map_err(|e| {
-                        ADError::UnsupportedConversion(format!("NeXus write error: {}", e))
-                    })?;
-                    // Write NDArray attributes on the first frame
-                    for attr in array.attributes.iter() {
-                        let val_str = attr.value.as_string();
-                        let _ = ds
-                            .new_attr::<rust_hdf5::types::VarLenUnicode>()
-                            .shape(())
-                            .create(attr.name.as_str())
-                            .and_then(|a| {
-                                let s: rust_hdf5::types::VarLenUnicode =
-                                    val_str.parse().unwrap_or_default();
-                                a.write_scalar(&s)
-                            });
+                            ADError::UnsupportedConversion(format!(
+                                "NeXus dataset error: {}",
+                                e
+                            ))
+                        })?
+                }};
+            }
+            macro_rules! create_typed {
+                ($group:expr, $name:expr) => {{
+                    match array.data.data_type() {
+                        NDDataType::Int8 => create_image_ds!($group, i8, $name),
+                        NDDataType::UInt8 => create_image_ds!($group, u8, $name),
+                        NDDataType::Int16 => create_image_ds!($group, i16, $name),
+                        NDDataType::UInt16 => create_image_ds!($group, u16, $name),
+                        NDDataType::Int32 => create_image_ds!($group, i32, $name),
+                        NDDataType::UInt32 => create_image_ds!($group, u32, $name),
+                        NDDataType::Int64 => create_image_ds!($group, i64, $name),
+                        NDDataType::UInt64 => create_image_ds!($group, u64, $name),
+                        NDDataType::Float32 => create_image_ds!($group, f32, $name),
+                        NDDataType::Float64 => create_image_ds!($group, f64, $name),
                     }
-                    ds
                 }};
             }
 
-            let ds = match &array.data {
-                NDDataBuffer::U8(v) => create_chunked!(u8, v),
-                NDDataBuffer::U16(v) => create_chunked!(u16, v),
-                NDDataBuffer::I16(v) => create_chunked!(i16, v),
-                NDDataBuffer::I32(v) => create_chunked!(i32, v),
-                NDDataBuffer::U32(v) => create_chunked!(u32, v),
-                NDDataBuffer::F32(v) => create_chunked!(f32, v),
-                NDDataBuffer::F64(v) => create_chunked!(f64, v),
-                _ => {
-                    let raw = array.data.as_u8_slice();
-                    let ds = data_group
-                        .new_dataset::<u8>()
-                        .shape(&ds_shape[..])
-                        .chunk(&chunk_dims[..])
-                        .resizable()
-                        .create(&data_node_name)
-                        .map_err(|e| {
-                            ADError::UnsupportedConversion(format!("NeXus dataset error: {}", e))
-                        })?;
-                    ds.write_chunk(0, raw).map_err(|e| {
-                        ADError::UnsupportedConversion(format!("NeXus write error: {}", e))
-                    })?;
-                    ds
-                }
-            };
+            let ds = create_typed!(data_group, &data_node_name);
+            ds.write_chunk(0, &frame_bytes).map_err(|e| {
+                ADError::UnsupportedConversion(format!("NeXus write error: {}", e))
+            })?;
+            // Record the exact data type for lossless read-back.
+            let _ = ds
+                .new_attr::<i32>()
+                .shape(())
+                .create(DTYPE_ATTR)
+                .and_then(|a| a.write_numeric(&dtype_ordinal));
+            // Write NDArray attributes on the first frame.
+            for attr in array.attributes.iter() {
+                let val_str = attr.value.as_string();
+                let _ = ds
+                    .new_attr::<rust_hdf5::types::VarLenUnicode>()
+                    .shape(())
+                    .create(attr.name.as_str())
+                    .and_then(|a| {
+                        let s: rust_hdf5::types::VarLenUnicode =
+                            val_str.parse().unwrap_or_default();
+                        a.write_scalar(&s)
+                    });
+            }
             self.dataset = Some(ds);
+
+            // Built-in hierarchy: also place the image data inside the
+            // NXdata group so a NeXus reader can locate the signal there.
+            if let Some(ref nxpath) = nxdata_group_path {
+                let nxdata_group = resolve_group(nxpath)?;
+                let nx_ds = create_typed!(nxdata_group, "data");
+                nx_ds.write_chunk(0, &frame_bytes).map_err(|e| {
+                    ADError::UnsupportedConversion(format!(
+                        "NeXus NXdata write error: {}",
+                        e
+                    ))
+                })?;
+                let _ = nx_ds
+                    .new_attr::<i32>()
+                    .shape(())
+                    .create(DTYPE_ATTR)
+                    .and_then(|a| a.write_numeric(&dtype_ordinal));
+                self.nxdata_dataset = Some(nx_ds);
+            }
 
             // Per-frame uniqueId / timeStamp are proper resizable 1-D
             // datasets (C++ writes them as datasets, not as N numbered
@@ -771,7 +845,7 @@ impl NDFileWriter for NexusWriter {
                 .map_err(|e| {
                     ADError::UnsupportedConversion(format!("NeXus uniqueId dataset: {}", e))
                 })?;
-            uid.write_chunk(0, &array.unique_id.to_ne_bytes())
+            uid.write_chunk(0, &array.unique_id.to_le_bytes())
                 .map_err(|e| {
                     ADError::UnsupportedConversion(format!("NeXus uniqueId write: {}", e))
                 })?;
@@ -786,7 +860,7 @@ impl NDFileWriter for NexusWriter {
                 .map_err(|e| {
                     ADError::UnsupportedConversion(format!("NeXus timeStamp dataset: {}", e))
                 })?;
-            ts.write_chunk(0, &array.time_stamp.to_ne_bytes())
+            ts.write_chunk(0, &array.time_stamp.to_le_bytes())
                 .map_err(|e| {
                     ADError::UnsupportedConversion(format!("NeXus timeStamp write: {}", e))
                 })?;
@@ -803,17 +877,25 @@ impl NDFileWriter for NexusWriter {
             ds.extend(&new_shape).map_err(|e| {
                 ADError::UnsupportedConversion(format!("NeXus extend error: {}", e))
             })?;
-
-            let raw = array.data.as_u8_slice();
-            ds.write_chunk(self.frame_count, raw)
+            ds.write_chunk(self.frame_count, &frame_bytes)
                 .map_err(|e| ADError::UnsupportedConversion(format!("NeXus write error: {}", e)))?;
+
+            // Extend and append the NXdata-group copy in lockstep.
+            if let Some(nx_ds) = self.nxdata_dataset.as_ref() {
+                nx_ds.extend(&new_shape).map_err(|e| {
+                    ADError::UnsupportedConversion(format!("NeXus NXdata extend: {}", e))
+                })?;
+                nx_ds.write_chunk(self.frame_count, &frame_bytes).map_err(|e| {
+                    ADError::UnsupportedConversion(format!("NeXus NXdata write: {}", e))
+                })?;
+            }
 
             // Extend the per-frame metadata datasets and append this frame.
             if let Some(uid) = self.uid_dataset.as_ref() {
                 uid.extend(&[new_frame_count]).map_err(|e| {
                     ADError::UnsupportedConversion(format!("NeXus uniqueId extend: {}", e))
                 })?;
-                uid.write_chunk(self.frame_count, &array.unique_id.to_ne_bytes())
+                uid.write_chunk(self.frame_count, &array.unique_id.to_le_bytes())
                     .map_err(|e| {
                         ADError::UnsupportedConversion(format!("NeXus uniqueId write: {}", e))
                     })?;
@@ -822,7 +904,7 @@ impl NDFileWriter for NexusWriter {
                 ts.extend(&[new_frame_count]).map_err(|e| {
                     ADError::UnsupportedConversion(format!("NeXus timeStamp extend: {}", e))
                 })?;
-                ts.write_chunk(self.frame_count, &array.time_stamp.to_ne_bytes())
+                ts.write_chunk(self.frame_count, &array.time_stamp.to_le_bytes())
                     .map_err(|e| {
                         ADError::UnsupportedConversion(format!("NeXus timeStamp write: {}", e))
                     })?;
@@ -851,32 +933,60 @@ impl NDFileWriter for NexusWriter {
 
         let shape = ds.shape();
         let dims: Vec<NDDimension> = shape.iter().rev().map(|&s| NDDimension::new(s)).collect();
+        let element_size = ds.element_size();
 
-        if let Ok(data) = ds.read_raw::<u8>() {
-            let mut arr = NDArray::new(dims, NDDataType::UInt8);
-            arr.data = NDDataBuffer::U8(data);
-            return Ok(arr);
-        }
-        if let Ok(data) = ds.read_raw::<u16>() {
-            let mut arr = NDArray::new(dims, NDDataType::UInt16);
-            arr.data = NDDataBuffer::U16(data);
-            return Ok(arr);
-        }
-        if let Ok(data) = ds.read_raw::<f64>() {
-            let mut arr = NDArray::new(dims, NDDataType::Float64);
-            arr.data = NDDataBuffer::F64(data);
-            return Ok(arr);
+        // Recover the exact NDArray data type from the recorded attribute.
+        // Untyped read_raw cannot distinguish signed/unsigned or i32/u32/f32
+        // (all same element size), so the recorded type is authoritative.
+        let recorded: Option<NDDataType> = ds
+            .attr(DTYPE_ATTR)
+            .ok()
+            .and_then(|a| a.read_numeric::<i32>().ok())
+            .and_then(|v| NDDataType::from_ordinal(v as u8));
+
+        let data_type = recorded.unwrap_or(match element_size {
+            1 => NDDataType::UInt8,
+            2 => NDDataType::UInt16,
+            4 => NDDataType::Float32,
+            8 => NDDataType::Float64,
+            other => {
+                return Err(ADError::UnsupportedConversion(format!(
+                    "unsupported NeXus element size {}",
+                    other
+                )))
+            }
+        });
+
+        macro_rules! read_typed {
+            ($t:ty, $variant:ident) => {{
+                let data = ds.read_raw::<$t>().map_err(|e| {
+                    ADError::UnsupportedConversion(format!("NeXus read error: {}", e))
+                })?;
+                let mut arr = NDArray::new(dims, data_type);
+                arr.data = NDDataBuffer::$variant(data);
+                return Ok(arr);
+            }};
         }
 
-        Err(ADError::UnsupportedConversion(
-            "unsupported data type in NeXus file".into(),
-        ))
+        match data_type {
+            NDDataType::Int8 => read_typed!(i8, I8),
+            NDDataType::UInt8 => read_typed!(u8, U8),
+            NDDataType::Int16 => read_typed!(i16, I16),
+            NDDataType::UInt16 => read_typed!(u16, U16),
+            NDDataType::Int32 => read_typed!(i32, I32),
+            NDDataType::UInt32 => read_typed!(u32, U32),
+            NDDataType::Int64 => read_typed!(i64, I64),
+            NDDataType::UInt64 => read_typed!(u64, U64),
+            NDDataType::Float32 => read_typed!(f32, F32),
+            NDDataType::Float64 => read_typed!(f64, F64),
+        }
     }
 
     fn close_file(&mut self) -> ADResult<()> {
         self.dataset = None;
         self.uid_dataset = None;
         self.ts_dataset = None;
+        self.nxdata_dataset = None;
         self.file = None;
         self.current_path = None;
         Ok(())
@@ -1260,5 +1370,114 @@ mod tests {
         assert!(proc.ctrl.writer.has_template());
 
         std::fs::remove_file(&tmpl_path).ok();
+    }
+
+    #[test]
+    fn test_nxdata_group_contains_image_data() {
+        // N2: the built-in NXdata group `/entry/data` must actually contain
+        // the image dataset, not be an empty group.
+        let path = temp_path("nexus_nxdata");
+        let mut writer = NexusWriter::new();
+
+        let mk = |base: u8| {
+            let mut arr = NDArray::new(
+                vec![NDDimension::new(3), NDDimension::new(2)],
+                NDDataType::UInt8,
+            );
+            if let NDDataBuffer::U8(ref mut v) = arr.data {
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = base + i as u8;
+                }
+            }
+            arr
+        };
+
+        let a0 = mk(0);
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk(100)).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        // The NXdata group dataset exists and carries the data.
+        let nx = h5
+            .dataset("entry/data/data")
+            .expect("NXdata group must contain the `data` dataset");
+        assert_eq!(nx.shape(), vec![2, 2, 3]);
+        let nx_vals: Vec<u8> = nx.read_raw().unwrap();
+        assert_eq!(nx_vals.len(), 2 * 6);
+        assert_eq!(nx_vals[0], 0);
+        assert_eq!(nx_vals[6], 100);
+        // It mirrors the detector dataset content.
+        let det: Vec<u8> = h5
+            .dataset("entry/instrument/detector/data")
+            .unwrap()
+            .read_raw()
+            .unwrap();
+        assert_eq!(nx_vals, det);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_read_file_roundtrips_all_data_types() {
+        // N4: every NDArray data type must round-trip through read_file,
+        // not just u8/u16/f64.
+        use ad_core_rs::ndarray::NDDataType::*;
+        for dt in [
+            Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float32,
+            Float64,
+        ] {
+            let path = temp_path(&format!("nexus_type_{:?}", dt));
+            let mut writer = NexusWriter::new();
+            let mut arr =
+                NDArray::new(vec![NDDimension::new(2), NDDimension::new(2)], dt);
+            // Distinct, type-revealing values: negatives for signed types.
+            match arr.data {
+                NDDataBuffer::I8(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataBuffer::U8(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataBuffer::I16(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataBuffer::U16(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataBuffer::I32(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataBuffer::U32(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataBuffer::I64(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataBuffer::U64(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataBuffer::F32(ref mut v) => {
+                    v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5])
+                }
+                NDDataBuffer::F64(ref mut v) => {
+                    v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5])
+                }
+            }
+
+            writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+            writer.write_file(&arr).unwrap();
+            writer.close_file().unwrap();
+
+            let mut reader = NexusWriter::new();
+            reader.current_path = Some(path.clone());
+            let read = reader
+                .read_file()
+                .unwrap_or_else(|e| panic!("{:?} read failed: {}", dt, e));
+            assert_eq!(
+                read.data.data_type(),
+                dt,
+                "{:?}: type must round-trip",
+                dt
+            );
+            // Leading frame dim [1] + 2x2 => 3 dims, 4 elements.
+            assert_eq!(read.data.len(), 4, "{:?}: element count", dt);
+            for i in 0..4 {
+                assert_eq!(
+                    arr.data.get_as_f64(i),
+                    read.data.get_as_f64(i),
+                    "{:?}: element {} must round-trip",
+                    dt,
+                    i
+                );
+            }
+
+            std::fs::remove_file(&path).ok();
+        }
     }
 }

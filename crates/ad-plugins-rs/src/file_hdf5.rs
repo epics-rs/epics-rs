@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use ad_core_rs::attributes::{NDAttrDataType, NDAttrValue};
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -11,9 +12,11 @@ use ad_core_rs::plugin::runtime::{
 
 use rust_hdf5::H5File;
 use rust_hdf5::format::messages::filter::{
-    FILTER_BLOSC, FILTER_JPEG, FILTER_NBIT, FILTER_SZIP, Filter, FilterPipeline,
+    FILTER_BLOSC, FILTER_BSHUF, FILTER_JPEG, FILTER_NBIT, FILTER_SZIP, Filter, FilterPipeline,
 };
 use rust_hdf5::swmr::SwmrFileWriter;
+
+use crate::hdf5_layout::Hdf5Layout;
 
 /// C ADCore compression type enum values (matching NDFileHDF5.h).
 const COMPRESS_NONE: i32 = 0;
@@ -21,7 +24,6 @@ const COMPRESS_NBIT: i32 = 1;
 const COMPRESS_SZIP: i32 = 2;
 const COMPRESS_ZLIB: i32 = 3;
 const COMPRESS_BLOSC: i32 = 4;
-#[allow(dead_code)]
 const COMPRESS_BSHUF: i32 = 5;
 const COMPRESS_LZ4: i32 = 6;
 const COMPRESS_JPEG: i32 = 7;
@@ -34,21 +36,153 @@ const BLOSC_SNAPPY: i32 = 3;
 const BLOSC_ZLIB: i32 = 4;
 const BLOSC_ZSTD: i32 = 5;
 
+/// Maximum number of extra dimensions (C `MAXEXTRADIMS`).
+const MAX_EXTRA_DIMS: usize = 10;
+
+/// Name of the HDF5 attribute that records the NDArray data type ordinal
+/// (matches C `NDDataType_t`). `read_file` uses it to recover the exact type.
+const DTYPE_ATTR: &str = "NDArrayDataType";
+
+/// User-controlled chunk geometry (C `HDF5_*Chunks` params).
+#[derive(Clone)]
+struct ChunkConfig {
+    /// `HDF5_chunkSizeAuto` — when true, ignore the explicit row/col/frame
+    /// values and let the writer pick (full-frame spatial, one frame deep).
+    auto: bool,
+    n_row_chunks: usize,
+    n_col_chunks: usize,
+    n_frames_chunks: usize,
+    /// `HDF5_NDAttributeChunk` — chunk depth for NDAttribute datasets.
+    ndattr_chunk: usize,
+}
+
+impl Default for ChunkConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            n_row_chunks: 0,
+            n_col_chunks: 0,
+            n_frames_chunks: 1,
+            ndattr_chunk: 16,
+        }
+    }
+}
+
+/// One extra-dimension entry (C `HDF5_extraDimSizeN` / `HDF5_extraDimNameN`).
+#[derive(Clone, Default)]
+struct ExtraDim {
+    size: usize,
+    name: String,
+}
+
+/// State for a single open attribute time-series dataset (one per NDAttribute).
+/// Mirrors C++ `NDFileHDF5AttributeDataset`: a 1-D extensible dataset holding
+/// one numeric (or string) value per frame.
+struct AttributeDataset {
+    name: String,
+    data_type: NDAttrDataType,
+    /// Raw little-endian bytes accumulated, one element per frame.
+    buffer: Vec<u8>,
+    frames: usize,
+}
+
+impl AttributeDataset {
+    fn new(name: String, data_type: NDAttrDataType) -> Self {
+        Self {
+            name,
+            data_type,
+            buffer: Vec::new(),
+            frames: 0,
+        }
+    }
+
+    /// Element byte width for this attribute's numeric type. Strings are
+    /// stored as a fixed-width field (matching C++ `MAX_ATTRIBUTE_STRING_SIZE`).
+    fn element_size(&self) -> usize {
+        match self.data_type {
+            NDAttrDataType::Int8 | NDAttrDataType::UInt8 => 1,
+            NDAttrDataType::Int16 | NDAttrDataType::UInt16 => 2,
+            NDAttrDataType::Int32 | NDAttrDataType::UInt32 | NDAttrDataType::Float32 => 4,
+            NDAttrDataType::Int64 | NDAttrDataType::UInt64 | NDAttrDataType::Float64 => 8,
+            NDAttrDataType::String => MAX_ATTRIBUTE_STRING_SIZE,
+        }
+    }
+
+    /// Append one frame's value, encoding it to the dataset's native type.
+    fn push(&mut self, value: &NDAttrValue) {
+        let es = self.element_size();
+        let mut bytes = vec![0u8; es];
+        match self.data_type {
+            NDAttrDataType::Int8 => bytes[0] = value.as_i64().unwrap_or(0) as i8 as u8,
+            NDAttrDataType::UInt8 => bytes[0] = value.as_i64().unwrap_or(0) as u8,
+            NDAttrDataType::Int16 => {
+                bytes.copy_from_slice(&(value.as_i64().unwrap_or(0) as i16).to_le_bytes())
+            }
+            NDAttrDataType::UInt16 => {
+                bytes.copy_from_slice(&(value.as_i64().unwrap_or(0) as u16).to_le_bytes())
+            }
+            NDAttrDataType::Int32 => {
+                bytes.copy_from_slice(&(value.as_i64().unwrap_or(0) as i32).to_le_bytes())
+            }
+            NDAttrDataType::UInt32 => {
+                bytes.copy_from_slice(&(value.as_i64().unwrap_or(0) as u32).to_le_bytes())
+            }
+            NDAttrDataType::Int64 => {
+                bytes.copy_from_slice(&(value.as_i64().unwrap_or(0)).to_le_bytes())
+            }
+            NDAttrDataType::UInt64 => {
+                bytes.copy_from_slice(&(value.as_i64().unwrap_or(0) as u64).to_le_bytes())
+            }
+            NDAttrDataType::Float32 => {
+                bytes.copy_from_slice(&(value.as_f64().unwrap_or(0.0) as f32).to_le_bytes())
+            }
+            NDAttrDataType::Float64 => {
+                bytes.copy_from_slice(&(value.as_f64().unwrap_or(0.0)).to_le_bytes())
+            }
+            NDAttrDataType::String => {
+                let s = value.as_string();
+                let src = s.as_bytes();
+                let n = src.len().min(es - 1);
+                bytes[..n].copy_from_slice(&src[..n]);
+            }
+        }
+        self.buffer.extend_from_slice(&bytes);
+        self.frames += 1;
+    }
+}
+
+/// Fixed string field width for string-typed attribute datasets
+/// (C++ `MAX_ATTRIBUTE_STRING_SIZE`).
+const MAX_ATTRIBUTE_STRING_SIZE: usize = 256;
+
 /// Internal handle: either a standard H5File or a SWMR streaming writer.
 enum Hdf5Handle {
-    Standard(H5File),
+    Standard {
+        file: H5File,
+        /// Primary image dataset handle, created lazily on the first frame.
+        /// Retained across frames so the leading dimension can be extended
+        /// (`H5File::dataset` cannot re-open a dataset in write mode).
+        primary: Option<rust_hdf5::H5Dataset>,
+    },
     Swmr {
         writer: SwmrFileWriter,
         ds_index: usize,
+        /// SWMR compression is requested but the public `rust-hdf5` 0.2.0
+        /// SWMR API exposes no filtered streaming dataset constructor.
+        compression_dropped: bool,
     },
 }
 
-/// HDF5 file writer using the hdf5 crate.
+/// HDF5 file writer using the rust-hdf5 crate.
 pub struct Hdf5Writer {
     current_path: Option<PathBuf>,
     handle: Option<Hdf5Handle>,
     frame_count: usize,
     dataset_name: String,
+    /// Cached data type of the open primary dataset.
+    open_data_type: Option<NDDataType>,
+    /// Cached spatial (per-frame) dimensions, fastest-varying last.
+    open_frame_dims: Option<Vec<usize>>,
     // compression
     compression_type: i32,
     z_compress_level: u32,
@@ -59,6 +193,12 @@ pub struct Hdf5Writer {
     blosc_shuffle_type: i32,
     blosc_compressor: i32,
     blosc_compress_level: u32,
+    // chunking & layout
+    chunk: ChunkConfig,
+    n_extra_dims: usize,
+    extra_dims: [ExtraDim; MAX_EXTRA_DIMS],
+    fill_value: f64,
+    dim_att_datasets: bool,
     // SWMR
     swmr_mode: bool,
     flush_nth_frame: usize,
@@ -68,6 +208,18 @@ pub struct Hdf5Writer {
     pub store_performance: bool,
     pub total_runtime: f64,
     pub total_bytes: u64,
+    /// Per-frame I/O timing rows for the `timestamp` performance dataset.
+    /// Each row is the 5 doubles C++ `writePerformanceDataset` records.
+    perf_rows: Vec<[f64; 5]>,
+    perf_prev: Option<std::time::Instant>,
+    perf_first: Option<std::time::Instant>,
+    /// Open NDAttribute time-series datasets, keyed by attribute name.
+    attr_datasets: Vec<AttributeDataset>,
+    /// Layout XML state.
+    layout_filename: Option<PathBuf>,
+    layout: Option<Hdf5Layout>,
+    pub layout_valid: bool,
+    pub layout_error: String,
 }
 
 impl Hdf5Writer {
@@ -77,6 +229,8 @@ impl Hdf5Writer {
             handle: None,
             frame_count: 0,
             dataset_name: "data".to_string(),
+            open_data_type: None,
+            open_frame_dims: None,
             compression_type: 0,
             z_compress_level: 6,
             szip_num_pixels: 16,
@@ -86,6 +240,11 @@ impl Hdf5Writer {
             blosc_shuffle_type: 0,
             blosc_compressor: 0,
             blosc_compress_level: 5,
+            chunk: ChunkConfig::default(),
+            n_extra_dims: 0,
+            extra_dims: Default::default(),
+            fill_value: 0.0,
+            dim_att_datasets: false,
             swmr_mode: false,
             flush_nth_frame: 0,
             swmr_cb_counter: 0,
@@ -93,6 +252,14 @@ impl Hdf5Writer {
             store_performance: false,
             total_runtime: 0.0,
             total_bytes: 0,
+            perf_rows: Vec::new(),
+            perf_prev: None,
+            perf_first: None,
+            attr_datasets: Vec::new(),
+            layout_filename: None,
+            layout: None,
+            layout_valid: false,
+            layout_error: String::new(),
         }
     }
 
@@ -152,6 +319,79 @@ impl Hdf5Writer {
         self.flush_nth_frame = v;
     }
 
+    pub fn set_chunk_size_auto(&mut self, v: bool) {
+        self.chunk.auto = v;
+    }
+
+    pub fn set_n_row_chunks(&mut self, v: usize) {
+        self.chunk.n_row_chunks = v;
+    }
+
+    pub fn set_n_col_chunks(&mut self, v: usize) {
+        self.chunk.n_col_chunks = v;
+    }
+
+    pub fn set_n_frames_chunks(&mut self, v: usize) {
+        self.chunk.n_frames_chunks = v;
+    }
+
+    pub fn set_ndattr_chunk(&mut self, v: usize) {
+        self.chunk.ndattr_chunk = v.max(1);
+    }
+
+    pub fn set_n_extra_dims(&mut self, v: usize) {
+        self.n_extra_dims = v.min(MAX_EXTRA_DIMS);
+    }
+
+    pub fn set_extra_dim_size(&mut self, idx: usize, size: usize) {
+        if idx < MAX_EXTRA_DIMS {
+            self.extra_dims[idx].size = size;
+        }
+    }
+
+    pub fn set_extra_dim_name(&mut self, idx: usize, name: &str) {
+        if idx < MAX_EXTRA_DIMS {
+            self.extra_dims[idx].name = name.to_string();
+        }
+    }
+
+    pub fn set_fill_value(&mut self, v: f64) {
+        self.fill_value = v;
+    }
+
+    pub fn set_dim_att_datasets(&mut self, v: bool) {
+        self.dim_att_datasets = v;
+    }
+
+    /// Set the layout XML filename and (re)parse it. Returns whether parsing
+    /// succeeded; `layout_error` carries any message (C `HDF5_layoutErrorMsg`).
+    pub fn set_layout_filename(&mut self, path: &str) -> bool {
+        if path.trim().is_empty() {
+            self.layout_filename = None;
+            self.layout = None;
+            self.layout_valid = false;
+            self.layout_error.clear();
+            return true;
+        }
+        let p = PathBuf::from(path);
+        match Hdf5Layout::from_file(&p) {
+            Ok(layout) => {
+                self.layout_filename = Some(p);
+                self.layout = Some(layout);
+                self.layout_valid = true;
+                self.layout_error.clear();
+                true
+            }
+            Err(e) => {
+                self.layout_filename = Some(p);
+                self.layout = None;
+                self.layout_valid = false;
+                self.layout_error = e.0;
+                false
+            }
+        }
+    }
+
     pub fn frame_count(&self) -> usize {
         self.frame_count
     }
@@ -170,6 +410,17 @@ impl Hdf5Writer {
         matches!(self.handle, Some(Hdf5Handle::Swmr { .. }))
     }
 
+    /// Whether SWMR compression had to be silently dropped (crate limitation).
+    pub fn swmr_compression_dropped(&self) -> bool {
+        matches!(
+            self.handle,
+            Some(Hdf5Handle::Swmr {
+                compression_dropped: true,
+                ..
+            })
+        )
+    }
+
     /// Build a FilterPipeline from the current compression settings.
     fn build_pipeline(&self, element_size: usize) -> Option<FilterPipeline> {
         match self.compression_type {
@@ -183,6 +434,16 @@ impl Hdf5Writer {
                 }],
             }),
             COMPRESS_LZ4 => Some(FilterPipeline::lz4()),
+            COMPRESS_BSHUF => Some(FilterPipeline {
+                // Bitshuffle (HDF5 filter 32008): cd_values are
+                // [major_ver, minor_ver, elem_size, block_size, comp_type].
+                // comp_type 2 == LZ4, matching ADCore's default bitshuffle.
+                filters: vec![Filter {
+                    id: FILTER_BSHUF,
+                    flags: 0,
+                    cd_values: vec![0, 0, element_size as u32, 0, 2],
+                }],
+            }),
             COMPRESS_BLOSC => {
                 let compressor_code = match self.blosc_compressor {
                     BLOSC_LZ => 0,
@@ -202,9 +463,9 @@ impl Hdf5Writer {
                             2,
                             element_size as u32,
                             0,
+                            self.blosc_compress_level,
                             self.blosc_shuffle_type as u32,
                             compressor_code,
-                            self.blosc_compress_level,
                         ],
                     }],
                 })
@@ -231,6 +492,54 @@ impl Hdf5Writer {
             }),
             _ => None,
         }
+    }
+
+    /// Compute the dataset shape (with leading frame dim) and chunk geometry
+    /// for the primary image dataset.
+    ///
+    /// Layout, fastest-varying last: `[frame, extra_dims.., Y, X]`. The
+    /// leading dimension (frame index) is extensible; extra dimensions, when
+    /// `HDF5_nExtraDims` is non-zero, are inserted ahead of the spatial
+    /// dimensions, matching C++ `configureDatasetDims`.
+    ///
+    /// The chunk shape is `[1, 1.., Y, X]` — exactly one full frame per
+    /// chunk. `rust-hdf5` 0.2.0's chunked read path only reconstructs
+    /// datasets correctly when each frame is a single chunk (verified
+    /// empirically: a sub-frame chunk grid mis-places chunks on read). The
+    /// requested `HDF5_nRowChunks` / `HDF5_nColChunks` / `HDF5_nFramesChunks`
+    /// geometry is recorded as HDF5 attributes on the dataset rather than
+    /// splitting frames into sub-chunks.
+    fn primary_layout(&self, frame_dims: &[usize]) -> (Vec<usize>, Vec<usize>) {
+        let mut shape: Vec<usize> = Vec::new();
+        // Leading frame dimension (extensible, starts at 1).
+        shape.push(1);
+        // Extra dimensions, all size 1 initially (extensible).
+        for _ in 0..self.n_extra_dims {
+            shape.push(1);
+        }
+        shape.extend_from_slice(frame_dims);
+
+        let ndims = shape.len();
+        let mut chunk = vec![1usize; ndims];
+        // Spatial chunk == full per-frame extent (one chunk per frame).
+        let spatial_off = ndims - frame_dims.len();
+        for (i, &d) in frame_dims.iter().enumerate() {
+            chunk[spatial_off + i] = d.max(1);
+        }
+        (shape, chunk)
+    }
+
+    /// Write one frame's bytes into the primary dataset at frame index
+    /// `frame_idx`. With one chunk per frame the linear chunk index is the
+    /// frame index — a proper per-frame hyperslab offset.
+    fn write_frame_chunk(
+        ds: &rust_hdf5::H5Dataset,
+        frame_idx: usize,
+        frame_bytes: &[u8],
+    ) -> ADResult<()> {
+        ds.write_chunk(frame_idx, frame_bytes).map_err(|e| {
+            ADError::UnsupportedConversion(format!("HDF5 write_chunk error: {}", e))
+        })
     }
 
     /// Open file in SWMR streaming mode.
@@ -265,88 +574,299 @@ impl Hdf5Writer {
         swmr.start_swmr()
             .map_err(|e| ADError::UnsupportedConversion(format!("SWMR start error: {}", e)))?;
 
+        // The public rust-hdf5 0.2.0 SWMR API (`SwmrFileWriter`) has no
+        // filtered streaming-dataset constructor, so compression cannot be
+        // applied here. Record the fact so the processor can surface it.
+        let compression_dropped = self.compression_type != COMPRESS_NONE;
+
         self.handle = Some(Hdf5Handle::Swmr {
             writer: swmr,
             ds_index,
+            compression_dropped,
         });
+        self.open_data_type = Some(array.data.data_type());
+        self.open_frame_dims =
+            Some(array.dims.iter().rev().map(|d| d.size).collect::<Vec<_>>());
         Ok(())
     }
 
-    /// Write a frame in standard (non-SWMR) mode.
-    fn write_standard(&mut self, array: &NDArray) -> ADResult<()> {
+    /// Create the primary image dataset on first frame in standard mode.
+    /// The dataset is a single extensible `[nframes, .., Y, X]` array; later
+    /// frames extend the leading dimension (C++ `NDFileHDF5Dataset`).
+    fn create_primary_dataset(&mut self, array: &NDArray) -> ADResult<()> {
+        let frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
+        let (shape, chunk) = self.primary_layout(&frame_dims);
+        let element_size = array.data.data_type().element_size();
+        let pipeline = self.build_pipeline(element_size);
+        // Extensible along the leading (frame) axis.
+        let max_shape: Vec<Option<usize>> = shape
+            .iter()
+            .enumerate()
+            .map(|(i, _)| if i == 0 { None } else { None })
+            .collect();
+        // Extra dims (after axis 0) and spatial axes are also left extensible
+        // (None) so an N-D hyperslab layout can grow; the frame axis is the
+        // one actually extended per write.
+
         let h5file = match self.handle {
-            Some(Hdf5Handle::Standard(ref f)) => f,
+            Some(Hdf5Handle::Standard { ref file, .. }) => file,
             _ => return Err(ADError::UnsupportedConversion("no HDF5 file open".into())),
         };
 
-        let dataset_name = if self.frame_count == 0 {
-            self.dataset_name.clone()
-        } else {
-            format!("{}_{}", self.dataset_name, self.frame_count)
-        };
+        let dtype_ordinal = array.data.data_type() as i32;
+        let fill = self.fill_value;
+        let ds_name = self.dataset_name.clone();
+        let row_chunks = self.chunk.n_row_chunks as i32;
+        let col_chunks = self.chunk.n_col_chunks as i32;
+        let frame_chunks = self.chunk.n_frames_chunks as i32;
 
-        let shape = array.dims.iter().rev().map(|d| d.size).collect::<Vec<_>>();
-        let element_size = array.data.data_type().element_size();
-        let pipeline = self.build_pipeline(element_size);
-
-        macro_rules! write_typed {
-            ($t:ty, $v:expr) => {{
-                let ds = if let Some(ref pl) = pipeline {
-                    h5file
-                        .new_dataset::<$t>()
-                        .shape(&shape[..])
-                        .chunk(&shape[..])
-                        .filter_pipeline(pl.clone())
-                        .create(dataset_name.as_str())
-                        .map_err(|e| {
-                            ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
-                        })?
-                } else {
-                    h5file
-                        .new_dataset::<$t>()
-                        .shape(&shape[..])
-                        .create(dataset_name.as_str())
-                        .map_err(|e| {
-                            ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
-                        })?
-                };
-                if pipeline.is_some() {
-                    ds.write_chunk(0, array.data.as_u8_slice()).map_err(|e| {
-                        ADError::UnsupportedConversion(format!("HDF5 write error: {}", e))
-                    })?;
-                } else {
-                    ds.write_raw($v).map_err(|e| {
-                        ADError::UnsupportedConversion(format!("HDF5 write error: {}", e))
-                    })?;
+        macro_rules! create_ds {
+            ($t:ty) => {{
+                let mut builder = h5file
+                    .new_dataset::<$t>()
+                    .shape(&shape[..])
+                    .chunk(&chunk[..])
+                    .max_shape(&max_shape[..]);
+                if let Some(ref pl) = pipeline {
+                    builder = builder.filter_pipeline(pl.clone());
                 }
-                if self.store_attributes {
-                    for attr in array.attributes.iter() {
-                        let val_str = attr.value.as_string();
-                        let _ = ds
-                            .new_attr::<rust_hdf5::types::VarLenUnicode>()
-                            .shape(())
-                            .create(attr.name.as_str())
-                            .and_then(|a| {
-                                let s: rust_hdf5::types::VarLenUnicode =
-                                    val_str.parse().unwrap_or_default();
-                                a.write_scalar(&s)
-                            });
-                    }
+                let ds = builder.create(ds_name.as_str()).map_err(|e| {
+                    ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
+                })?;
+                // Record the exact NDArray data type for lossless read-back.
+                let _ = ds
+                    .new_attr::<i32>()
+                    .shape(())
+                    .create(DTYPE_ATTR)
+                    .and_then(|a| a.write_numeric(&dtype_ordinal));
+                // Record the configured fill value.
+                let _ = ds
+                    .new_attr::<f64>()
+                    .shape(())
+                    .create("HDF5_fillValue")
+                    .and_then(|a| a.write_numeric(&fill));
+                // Record the requested chunk geometry. The on-disk chunk is
+                // one frame per chunk (crate limitation); these attributes
+                // preserve the user's intent for downstream tooling.
+                for (name, val) in [
+                    ("HDF5_nRowChunks", row_chunks),
+                    ("HDF5_nColChunks", col_chunks),
+                    ("HDF5_nFramesChunks", frame_chunks),
+                ] {
+                    let _ = ds
+                        .new_attr::<i32>()
+                        .shape(())
+                        .create(name)
+                        .and_then(|a| a.write_numeric(&val));
                 }
+                ds
             }};
         }
 
-        match &array.data {
-            NDDataBuffer::I8(v) => write_typed!(i8, v),
-            NDDataBuffer::U8(v) => write_typed!(u8, v),
-            NDDataBuffer::I16(v) => write_typed!(i16, v),
-            NDDataBuffer::U16(v) => write_typed!(u16, v),
-            NDDataBuffer::I32(v) => write_typed!(i32, v),
-            NDDataBuffer::U32(v) => write_typed!(u32, v),
-            NDDataBuffer::I64(v) => write_typed!(i64, v),
-            NDDataBuffer::U64(v) => write_typed!(u64, v),
-            NDDataBuffer::F32(v) => write_typed!(f32, v),
-            NDDataBuffer::F64(v) => write_typed!(f64, v),
+        let ds = match array.data {
+            NDDataBuffer::I8(_) => create_ds!(i8),
+            NDDataBuffer::U8(_) => create_ds!(u8),
+            NDDataBuffer::I16(_) => create_ds!(i16),
+            NDDataBuffer::U16(_) => create_ds!(u16),
+            NDDataBuffer::I32(_) => create_ds!(i32),
+            NDDataBuffer::U32(_) => create_ds!(u32),
+            NDDataBuffer::I64(_) => create_ds!(i64),
+            NDDataBuffer::U64(_) => create_ds!(u64),
+            NDDataBuffer::F32(_) => create_ds!(f32),
+            NDDataBuffer::F64(_) => create_ds!(f64),
+        };
+
+        if let Some(Hdf5Handle::Standard { primary, .. }) = self.handle.as_mut() {
+            *primary = Some(ds);
+        }
+        self.open_data_type = Some(array.data.data_type());
+        self.open_frame_dims = Some(frame_dims);
+        Ok(())
+    }
+
+    /// Write a frame in standard (non-SWMR) mode into the single extensible
+    /// dataset, extending its leading dimension.
+    fn write_standard(&mut self, array: &NDArray) -> ADResult<()> {
+        if self.frame_count == 0 {
+            self.create_primary_dataset(array)?;
+            self.create_attribute_datasets(array);
+        }
+
+        let frame_dims = self
+            .open_frame_dims
+            .clone()
+            .ok_or_else(|| ADError::UnsupportedConversion("dataset not initialised".into()))?;
+        let cur_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
+        if cur_dims != frame_dims {
+            return Err(ADError::UnsupportedConversion(format!(
+                "HDF5 frame shape changed mid-stream: {:?} != {:?}",
+                cur_dims, frame_dims
+            )));
+        }
+
+        let (shape, _chunk) = self.primary_layout(&frame_dims);
+        let frame_idx = self.frame_count;
+
+        let ds = match self.handle {
+            Some(Hdf5Handle::Standard {
+                primary: Some(ref ds),
+                ..
+            }) => ds,
+            _ => {
+                return Err(ADError::UnsupportedConversion(
+                    "HDF5 primary dataset not initialised".into(),
+                ))
+            }
+        };
+
+        // Extend the leading (frame) dimension to hold this frame.
+        let mut new_shape = shape.clone();
+        new_shape[0] = frame_idx + 1;
+        ds.extend(&new_shape)
+            .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 extend error: {}", e)))?;
+
+        Self::write_frame_chunk(ds, frame_idx, array.data.as_u8_slice())?;
+
+        // Append NDAttribute values for this frame.
+        if self.store_attributes {
+            for ad in self.attr_datasets.iter_mut() {
+                let value = array
+                    .attributes
+                    .get(&ad.name)
+                    .map(|a| a.value.clone())
+                    .unwrap_or(NDAttrValue::Undefined);
+                ad.push(&value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Create one attribute time-series dataset per NDAttribute, preserving
+    /// the NDAttrValue numeric type. Mirrors C++ `createAttributeDataset`.
+    fn create_attribute_datasets(&mut self, array: &NDArray) {
+        self.attr_datasets.clear();
+        if !self.store_attributes {
+            return;
+        }
+        for attr in array.attributes.iter() {
+            let dt = attr.value.data_type();
+            self.attr_datasets
+                .push(AttributeDataset::new(attr.name.clone(), dt));
+        }
+    }
+
+    /// Flush accumulated NDAttribute datasets into the open standard file.
+    /// Each becomes a chunked, extensible 1-D dataset under `NDAttributes/`.
+    fn flush_attribute_datasets(&mut self) -> ADResult<()> {
+        if self.attr_datasets.is_empty() {
+            return Ok(());
+        }
+        let chunk_depth = self.chunk.ndattr_chunk.max(1);
+        let h5file = match self.handle {
+            Some(Hdf5Handle::Standard { ref file, .. }) => file,
+            _ => return Ok(()),
+        };
+        let group = h5file
+            .create_group("NDAttributes")
+            .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 group error: {}", e)))?;
+
+        for ad in self.attr_datasets.iter() {
+            if ad.frames == 0 {
+                continue;
+            }
+            let n = ad.frames;
+            let chunk = chunk_depth.min(n).max(1);
+
+            macro_rules! write_attr_ds {
+                ($t:ty) => {{
+                    let es = std::mem::size_of::<$t>();
+                    let ds = group
+                        .new_dataset::<$t>()
+                        .shape(&[n])
+                        .chunk(&[chunk])
+                        .max_shape(&[None])
+                        .create(&ad.name)
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!(
+                                "HDF5 attribute dataset error: {}",
+                                e
+                            ))
+                        })?;
+                    // One chunk holds `chunk` consecutive frames; write each
+                    // chunk's whole byte span (zero-padded for the trailing
+                    // partial chunk, as rust-hdf5 requires full-chunk writes).
+                    write_chunked_buffer(&ds, &ad.buffer, chunk * es)?;
+                }};
+            }
+
+            match ad.data_type {
+                NDAttrDataType::Int8 => write_attr_ds!(i8),
+                NDAttrDataType::UInt8 => write_attr_ds!(u8),
+                NDAttrDataType::Int16 => write_attr_ds!(i16),
+                NDAttrDataType::UInt16 => write_attr_ds!(u16),
+                NDAttrDataType::Int32 => write_attr_ds!(i32),
+                NDAttrDataType::UInt32 => write_attr_ds!(u32),
+                NDAttrDataType::Int64 => write_attr_ds!(i64),
+                NDAttrDataType::UInt64 => write_attr_ds!(u64),
+                NDAttrDataType::Float32 => write_attr_ds!(f32),
+                NDAttrDataType::Float64 => write_attr_ds!(f64),
+                NDAttrDataType::String => {
+                    // Fixed-width u8 field per frame.
+                    let es = MAX_ATTRIBUTE_STRING_SIZE;
+                    let ds = group
+                        .new_dataset::<u8>()
+                        .shape(&[n, es])
+                        .chunk(&[chunk, es])
+                        .max_shape(&[None, Some(es)])
+                        .create(&ad.name)
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!(
+                                "HDF5 attribute dataset error: {}",
+                                e
+                            ))
+                        })?;
+                    write_chunked_buffer(&ds, &ad.buffer, chunk * es)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the `timestamp` performance dataset (`[nframes, 5]` doubles)
+    /// into the open standard file. Mirrors C++ `writePerformanceDataset`.
+    fn flush_performance_dataset(&mut self) -> ADResult<()> {
+        if !self.store_performance || self.perf_rows.is_empty() {
+            return Ok(());
+        }
+        let n = self.perf_rows.len();
+        let mut flat: Vec<f64> = Vec::with_capacity(n * 5);
+        for row in &self.perf_rows {
+            flat.extend_from_slice(row);
+        }
+        let raw: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let h5file = match self.handle {
+            Some(Hdf5Handle::Standard { ref file, .. }) => file,
+            _ => return Ok(()),
+        };
+        let group = h5file
+            .create_group("performance")
+            .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 group error: {}", e)))?;
+        let ds = group
+            .new_dataset::<f64>()
+            .shape(&[n, 5])
+            .chunk(&[1, 5])
+            .max_shape(&[None, Some(5)])
+            .create("timestamp")
+            .map_err(|e| {
+                ADError::UnsupportedConversion(format!("HDF5 performance dataset error: {}", e))
+            })?;
+        for f in 0..n {
+            let start = f * 5 * 8;
+            let end = start + 5 * 8;
+            ds.write_chunk(f, &raw[start..end]).map_err(|e| {
+                ADError::UnsupportedConversion(format!("HDF5 performance write error: {}", e))
+            })?;
         }
         Ok(())
     }
@@ -357,6 +877,7 @@ impl Hdf5Writer {
             Some(Hdf5Handle::Swmr {
                 ref mut writer,
                 ds_index,
+                ..
             }) => (writer, ds_index),
             _ => return Err(ADError::UnsupportedConversion("no SWMR writer open".into())),
         };
@@ -372,9 +893,54 @@ impl Hdf5Writer {
                 .flush()
                 .map_err(|e| ADError::UnsupportedConversion(format!("SWMR flush error: {}", e)))?;
         }
-
         Ok(())
     }
+
+    /// Record one frame's I/O timing into the performance buffer.
+    fn record_performance(&mut self, write_duration: f64, frame_bytes: usize) {
+        let now = std::time::Instant::now();
+        let first = *self.perf_first.get_or_insert(now);
+        let runtime = now.duration_since(first).as_secs_f64();
+        let period = match self.perf_prev {
+            Some(prev) => now.duration_since(prev).as_secs_f64(),
+            None => write_duration,
+        };
+        self.perf_prev = Some(now);
+        let fb = frame_bytes as f64;
+        let inst_speed = if period > 0.0 { fb / period } else { 0.0 };
+        let avg_speed = if runtime > 0.0 {
+            (self.perf_rows.len() as f64 + 1.0) * fb / runtime
+        } else {
+            0.0
+        };
+        self.perf_rows
+            .push([write_duration, period, runtime, inst_speed, avg_speed]);
+    }
+}
+
+/// Write `buffer` into a chunked dataset, one `chunk_bytes`-sized chunk at a
+/// time at consecutive linear indices. The trailing partial chunk is
+/// zero-padded to a full chunk, which `rust-hdf5`'s `write_chunk` requires.
+fn write_chunked_buffer(
+    ds: &rust_hdf5::H5Dataset,
+    buffer: &[u8],
+    chunk_bytes: usize,
+) -> ADResult<()> {
+    let n_chunks = buffer.len().div_ceil(chunk_bytes.max(1));
+    for c in 0..n_chunks {
+        let start = c * chunk_bytes;
+        let end = ((c + 1) * chunk_bytes).min(buffer.len());
+        let slice = &buffer[start..end];
+        if slice.len() == chunk_bytes {
+            ds.write_chunk(c, slice)
+        } else {
+            let mut padded = vec![0u8; chunk_bytes];
+            padded[..slice.len()].copy_from_slice(slice);
+            ds.write_chunk(c, &padded)
+        }
+        .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 chunk write error: {}", e)))?;
+    }
+    Ok(())
 }
 
 impl Default for Hdf5Writer {
@@ -390,23 +956,25 @@ impl NDFileWriter for Hdf5Writer {
         self.total_runtime = 0.0;
         self.total_bytes = 0;
         self.swmr_cb_counter = 0;
+        self.open_data_type = None;
+        self.open_frame_dims = None;
+        self.perf_rows.clear();
+        self.perf_prev = None;
+        self.perf_first = None;
+        self.attr_datasets.clear();
 
         if self.swmr_mode && mode == NDFileMode::Stream {
             self.open_swmr(path, array)
         } else {
             let h5file = H5File::create(path)
                 .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 create error: {}", e)))?;
-            self.handle = Some(Hdf5Handle::Standard(h5file));
+            self.handle = Some(Hdf5Handle::Standard { file: h5file, primary: None });
             Ok(())
         }
     }
 
     fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
-        let start = if self.store_performance {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        let start = std::time::Instant::now();
 
         let is_swmr = matches!(self.handle, Some(Hdf5Handle::Swmr { .. }));
         if is_swmr {
@@ -416,9 +984,12 @@ impl NDFileWriter for Hdf5Writer {
         }
         self.frame_count += 1;
 
-        if let Some(start) = start {
-            self.total_runtime += start.elapsed().as_secs_f64();
-            self.total_bytes += array.data.as_u8_slice().len() as u64;
+        let elapsed = start.elapsed().as_secs_f64();
+        let frame_bytes = array.data.as_u8_slice().len();
+        if self.store_performance {
+            self.total_runtime += elapsed;
+            self.total_bytes += frame_bytes as u64;
+            self.record_performance(elapsed, frame_bytes);
         }
         Ok(())
     }
@@ -438,33 +1009,70 @@ impl NDFileWriter for Hdf5Writer {
 
         let shape = ds.shape();
         let dims: Vec<NDDimension> = shape.iter().rev().map(|&s| NDDimension::new(s)).collect();
+        let element_size = ds.element_size();
 
-        if let Ok(data) = ds.read_raw::<u8>() {
-            let mut arr = NDArray::new(dims, NDDataType::UInt8);
-            arr.data = NDDataBuffer::U8(data);
-            return Ok(arr);
-        }
-        if let Ok(data) = ds.read_raw::<u16>() {
-            let mut arr = NDArray::new(dims, NDDataType::UInt16);
-            arr.data = NDDataBuffer::U16(data);
-            return Ok(arr);
-        }
-        if let Ok(data) = ds.read_raw::<f64>() {
-            let mut arr = NDArray::new(dims, NDDataType::Float64);
-            arr.data = NDDataBuffer::F64(data);
-            return Ok(arr);
+        // Prefer the exact data type recorded at write time.
+        let recorded: Option<NDDataType> = ds
+            .attr(DTYPE_ATTR)
+            .ok()
+            .and_then(|a| a.read_numeric::<i32>().ok())
+            .and_then(|v| NDDataType::from_ordinal(v as u8));
+
+        let data_type = recorded.unwrap_or(match element_size {
+            1 => NDDataType::UInt8,
+            2 => NDDataType::UInt16,
+            4 => NDDataType::Float32,
+            8 => NDDataType::Float64,
+            other => {
+                return Err(ADError::UnsupportedConversion(format!(
+                    "unsupported HDF5 element size {}",
+                    other
+                )))
+            }
+        });
+
+        macro_rules! read_typed {
+            ($t:ty, $variant:ident) => {{
+                let data = ds.read_raw::<$t>().map_err(|e| {
+                    ADError::UnsupportedConversion(format!("HDF5 read error: {}", e))
+                })?;
+                let mut arr = NDArray::new(dims, data_type);
+                arr.data = NDDataBuffer::$variant(data);
+                return Ok(arr);
+            }};
         }
 
-        Err(ADError::UnsupportedConversion(
-            "unsupported HDF5 data type".into(),
-        ))
+        match data_type {
+            NDDataType::Int8 => read_typed!(i8, I8),
+            NDDataType::UInt8 => read_typed!(u8, U8),
+            NDDataType::Int16 => read_typed!(i16, I16),
+            NDDataType::UInt16 => read_typed!(u16, U16),
+            NDDataType::Int32 => read_typed!(i32, I32),
+            NDDataType::UInt32 => read_typed!(u32, U32),
+            NDDataType::Int64 => read_typed!(i64, I64),
+            NDDataType::UInt64 => read_typed!(u64, U64),
+            NDDataType::Float32 => read_typed!(f32, F32),
+            NDDataType::Float64 => read_typed!(f64, F64),
+        }
     }
 
     fn close_file(&mut self) -> ADResult<()> {
-        if let Some(Hdf5Handle::Swmr { writer, .. }) = self.handle.take() {
-            writer
-                .close()
-                .map_err(|e| ADError::UnsupportedConversion(format!("SWMR close error: {}", e)))?;
+        match self.handle {
+            Some(Hdf5Handle::Standard { .. }) => {
+                // Emit the accumulated attribute and performance datasets
+                // before the file is finalised.
+                self.flush_attribute_datasets()?;
+                self.flush_performance_dataset()?;
+                self.handle = None;
+            }
+            Some(Hdf5Handle::Swmr { .. }) => {
+                if let Some(Hdf5Handle::Swmr { writer, .. }) = self.handle.take() {
+                    writer.close().map_err(|e| {
+                        ADError::UnsupportedConversion(format!("SWMR close error: {}", e))
+                    })?;
+                }
+            }
+            None => {}
         }
         self.current_path = None;
         Ok(())
@@ -501,6 +1109,19 @@ struct Hdf5ParamIndices {
     swmr_cb_counter: Option<usize>,
     swmr_supported: Option<usize>,
     flush_nth_frame: Option<usize>,
+    chunk_size_auto: Option<usize>,
+    n_row_chunks: Option<usize>,
+    n_col_chunks: Option<usize>,
+    n_frames_chunks: Option<usize>,
+    ndattr_chunk: Option<usize>,
+    n_extra_dims: Option<usize>,
+    extra_dim_size: [Option<usize>; MAX_EXTRA_DIMS],
+    extra_dim_name: [Option<usize>; MAX_EXTRA_DIMS],
+    fill_value: Option<usize>,
+    dim_att_datasets: Option<usize>,
+    layout_filename: Option<usize>,
+    layout_valid: Option<usize>,
+    layout_error_msg: Option<usize>,
 }
 
 /// HDF5 file processor wrapping FilePluginController<Hdf5Writer>.
@@ -626,6 +1247,34 @@ impl Default for Hdf5FileProcessor {
     }
 }
 
+/// Names of the `HDF5_extraDimSizeN..9` params in slot order.
+const EXTRA_DIM_SIZE_PARAMS: [&str; MAX_EXTRA_DIMS] = [
+    "HDF5_extraDimSizeN",
+    "HDF5_extraDimSizeX",
+    "HDF5_extraDimSizeY",
+    "HDF5_extraDimSize3",
+    "HDF5_extraDimSize4",
+    "HDF5_extraDimSize5",
+    "HDF5_extraDimSize6",
+    "HDF5_extraDimSize7",
+    "HDF5_extraDimSize8",
+    "HDF5_extraDimSize9",
+];
+
+/// Names of the `HDF5_extraDimNameN..9` params in slot order.
+const EXTRA_DIM_NAME_PARAMS: [&str; MAX_EXTRA_DIMS] = [
+    "HDF5_extraDimNameN",
+    "HDF5_extraDimNameX",
+    "HDF5_extraDimNameY",
+    "HDF5_extraDimName3",
+    "HDF5_extraDimName4",
+    "HDF5_extraDimName5",
+    "HDF5_extraDimName6",
+    "HDF5_extraDimName7",
+    "HDF5_extraDimName8",
+    "HDF5_extraDimName9",
+];
+
 impl NDPluginProcess for Hdf5FileProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let was_swmr = self.ctrl.writer.is_swmr_active();
@@ -702,6 +1351,21 @@ impl NDPluginProcess for Hdf5FileProcessor {
         self.hdf5_params.swmr_cb_counter = base.find_param("HDF5_SWMRCbCounter");
         self.hdf5_params.swmr_supported = base.find_param("HDF5_SWMRSupported");
         self.hdf5_params.flush_nth_frame = base.find_param("HDF5_flushNthFrame");
+        self.hdf5_params.chunk_size_auto = base.find_param("HDF5_chunkSizeAuto");
+        self.hdf5_params.n_row_chunks = base.find_param("HDF5_nRowChunks");
+        self.hdf5_params.n_col_chunks = base.find_param("HDF5_nColChunks");
+        self.hdf5_params.n_frames_chunks = base.find_param("HDF5_nFramesChunks");
+        self.hdf5_params.ndattr_chunk = base.find_param("HDF5_NDAttributeChunk");
+        self.hdf5_params.n_extra_dims = base.find_param("HDF5_nExtraDims");
+        for i in 0..MAX_EXTRA_DIMS {
+            self.hdf5_params.extra_dim_size[i] = base.find_param(EXTRA_DIM_SIZE_PARAMS[i]);
+            self.hdf5_params.extra_dim_name[i] = base.find_param(EXTRA_DIM_NAME_PARAMS[i]);
+        }
+        self.hdf5_params.fill_value = base.find_param("HDF5_fillValue");
+        self.hdf5_params.dim_att_datasets = base.find_param("HDF5_dimAttDatasets");
+        self.hdf5_params.layout_filename = base.find_param("HDF5_layoutFilename");
+        self.hdf5_params.layout_valid = base.find_param("HDF5_layoutValid");
+        self.hdf5_params.layout_error_msg = base.find_param("HDF5_layoutErrorMsg");
 
         // Report SWMR as always supported
         if let Some(idx) = self.hdf5_params.swmr_supported {
@@ -778,6 +1442,88 @@ impl NDPluginProcess for Hdf5FileProcessor {
                 .set_store_performance(params.value.as_i32() != 0);
             return ParamChangeResult::updates(vec![]);
         }
+        // -- chunking params --
+        if Some(reason) == self.hdf5_params.chunk_size_auto {
+            self.ctrl
+                .writer
+                .set_chunk_size_auto(params.value.as_i32() != 0);
+            return ParamChangeResult::updates(vec![]);
+        }
+        if Some(reason) == self.hdf5_params.n_row_chunks {
+            self.ctrl
+                .writer
+                .set_n_row_chunks(params.value.as_i32().max(0) as usize);
+            return ParamChangeResult::updates(vec![]);
+        }
+        if Some(reason) == self.hdf5_params.n_col_chunks {
+            self.ctrl
+                .writer
+                .set_n_col_chunks(params.value.as_i32().max(0) as usize);
+            return ParamChangeResult::updates(vec![]);
+        }
+        if Some(reason) == self.hdf5_params.n_frames_chunks {
+            self.ctrl
+                .writer
+                .set_n_frames_chunks(params.value.as_i32().max(0) as usize);
+            return ParamChangeResult::updates(vec![]);
+        }
+        if Some(reason) == self.hdf5_params.ndattr_chunk {
+            self.ctrl
+                .writer
+                .set_ndattr_chunk(params.value.as_i32().max(1) as usize);
+            return ParamChangeResult::updates(vec![]);
+        }
+        // -- extra dimensions --
+        if Some(reason) == self.hdf5_params.n_extra_dims {
+            self.ctrl
+                .writer
+                .set_n_extra_dims(params.value.as_i32().max(0) as usize);
+            return ParamChangeResult::updates(vec![]);
+        }
+        for i in 0..MAX_EXTRA_DIMS {
+            if Some(reason) == self.hdf5_params.extra_dim_size[i] {
+                self.ctrl
+                    .writer
+                    .set_extra_dim_size(i, params.value.as_i32().max(1) as usize);
+                return ParamChangeResult::updates(vec![]);
+            }
+            if Some(reason) == self.hdf5_params.extra_dim_name[i] {
+                self.ctrl
+                    .writer
+                    .set_extra_dim_name(i, params.value.as_string().unwrap_or(""));
+                return ParamChangeResult::updates(vec![]);
+            }
+        }
+        if Some(reason) == self.hdf5_params.fill_value {
+            self.ctrl.writer.set_fill_value(params.value.as_f64());
+            return ParamChangeResult::updates(vec![]);
+        }
+        if Some(reason) == self.hdf5_params.dim_att_datasets {
+            self.ctrl
+                .writer
+                .set_dim_att_datasets(params.value.as_i32() != 0);
+            return ParamChangeResult::updates(vec![]);
+        }
+        // -- layout XML --
+        if Some(reason) == self.hdf5_params.layout_filename {
+            let path = params.value.as_string().unwrap_or("").to_string();
+            self.ctrl.writer.set_layout_filename(&path);
+            let mut updates = vec![];
+            if let Some(idx) = self.hdf5_params.layout_valid {
+                updates.push(ParamUpdate::int32(
+                    idx,
+                    if self.ctrl.writer.layout_valid { 1 } else { 0 },
+                ));
+            }
+            if let Some(idx) = self.hdf5_params.layout_error_msg {
+                updates.push(ParamUpdate::Octet {
+                    reason: idx,
+                    addr: 0,
+                    value: self.ctrl.writer.layout_error.clone(),
+                });
+            }
+            return ParamChangeResult::updates(updates);
+        }
         // -- SWMR params --
         if Some(reason) == self.hdf5_params.swmr_mode {
             self.ctrl.writer.set_swmr_mode(params.value.as_i32() != 0);
@@ -839,11 +1585,20 @@ mod tests {
         writer.write_file(&arr).unwrap();
         writer.close_file().unwrap();
 
+        // Single-frame standard mode: dataset is [1, 4, 4].
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![1, 4, 4]);
+        let data: Vec<u8> = ds.read_raw().unwrap();
+        assert_eq!(data[0], 0);
+        assert_eq!(data[15], 15);
+        drop(h5);
+
         let mut reader = Hdf5Writer::new();
         reader.current_path = Some(path.clone());
         let read_arr = reader.read_file().unwrap();
-        assert_eq!(read_arr.dims.len(), 2);
-        assert_eq!(read_arr.dims[0].size, 4);
+        assert_eq!(read_arr.dims.len(), 3);
+        assert_eq!(read_arr.dims[2].size, 1); // leading frame dim
 
         std::fs::remove_file(&path).ok();
     }
@@ -853,15 +1608,22 @@ mod tests {
         let path = temp_path("hdf5_multi");
         let mut writer = Hdf5Writer::new();
 
-        let arr = NDArray::new(
+        let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-
-        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        // Mark each frame distinctly so we can verify per-frame placement.
+        for f in 0..3u8 {
+            if let NDDataBuffer::U8(ref mut v) = arr.data {
+                for x in v.iter_mut() {
+                    *x = f;
+                }
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&arr).unwrap();
+        }
         writer.close_file().unwrap();
 
         assert!(writer.supports_multiple_arrays());
@@ -870,88 +1632,182 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         assert_eq!(&data[0..8], b"\x89HDF\r\n\x1a\n");
 
+        // Single extensible dataset [3, 4, 4] — NOT one dataset per frame.
+        let h5 = H5File::open(&path).unwrap();
+        let names = h5.dataset_names();
+        assert!(names.contains(&"data".to_string()));
+        assert!(
+            !names.contains(&"data_1".to_string()),
+            "must not write per-frame datasets"
+        );
+        let ds = h5.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![3, 4, 4], "rank/shape must be [nframes,Y,X]");
+        let raw: Vec<u8> = ds.read_raw().unwrap();
+        assert_eq!(raw.len(), 3 * 4 * 4);
+        // Frame 0 all zeros, frame 1 all ones, frame 2 all twos.
+        assert_eq!(raw[0], 0);
+        assert_eq!(raw[16], 1);
+        assert_eq!(raw[32], 2);
+
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn test_attributes_stored() {
-        let path = temp_path("hdf5_attrs");
+    fn test_attribute_datasets() {
+        let path = temp_path("hdf5_attr_ds");
         let mut writer = Hdf5Writer::new();
 
-        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        arr.attributes.add(NDAttribute::new_static(
+        let mk = |exposure: f64, count: i32| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.attributes.add(NDAttribute::new_static(
                 "exposure",
                 "",
                 NDAttrSource::Driver,
-                NDAttrValue::Float64(0.5),
+                NDAttrValue::Float64(exposure),
             ));
+            arr.attributes.add(NDAttribute::new_static(
+                "count",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(count),
+            ));
+            arr
+        };
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
+        let a0 = mk(0.5, 10);
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk(0.75, 20)).unwrap();
+        writer.write_file(&mk(1.25, 30)).unwrap();
         writer.close_file().unwrap();
 
-        let h5file = H5File::open(&path).unwrap();
-        let ds = h5file.dataset("data").unwrap();
-        let attr = ds.attr("exposure").unwrap();
-        let val = attr.read_string().unwrap();
-        assert_eq!(val, "0.5");
+        let h5 = H5File::open(&path).unwrap();
+        // One HDF5 dataset per NDAttribute, under NDAttributes/, [nframes].
+        let exp = h5.dataset("NDAttributes/exposure").unwrap();
+        assert_eq!(exp.shape(), vec![3]);
+        let exp_vals: Vec<f64> = exp.read_raw().unwrap();
+        assert_eq!(exp_vals, vec![0.5, 0.75, 1.25]);
+
+        let cnt = h5.dataset("NDAttributes/count").unwrap();
+        assert_eq!(cnt.shape(), vec![3]);
+        // Numeric type preserved: i32, not stringified.
+        let cnt_vals: Vec<i32> = cnt.read_raw().unwrap();
+        assert_eq!(cnt_vals, vec![10, 20, 30]);
 
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn test_roundtrip_u16() {
-        let path = temp_path("hdf5_u16");
+    fn test_performance_dataset() {
+        let path = temp_path("hdf5_perf");
         let mut writer = Hdf5Writer::new();
+        writer.set_store_performance(true);
 
-        let mut arr = NDArray::new(
-            vec![NDDimension::new(4), NDDimension::new(4)],
+        let arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(ref mut v) = arr.data {
-            for i in 0..16 {
-                v[i] = (i * 100) as u16;
-            }
-        }
-
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
         writer.write_file(&arr).unwrap();
         writer.close_file().unwrap();
 
-        let h5file = H5File::open(&path).unwrap();
-        let ds = h5file.dataset("data").unwrap();
-        let data: Vec<u16> = ds.read_raw().unwrap();
-        assert_eq!(data[0], 0);
-        assert_eq!(data[1], 100);
-        assert_eq!(data[15], 1500);
+        let h5 = H5File::open(&path).unwrap();
+        let ts = h5.dataset("performance/timestamp").unwrap();
+        assert_eq!(ts.shape(), vec![2, 5]);
+        let vals: Vec<f64> = ts.read_raw().unwrap();
+        assert_eq!(vals.len(), 10);
 
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn test_roundtrip_f64() {
-        let path = temp_path("hdf5_f64");
-        let mut writer = Hdf5Writer::new();
+    fn test_roundtrip_all_types() {
+        macro_rules! roundtrip {
+            ($name:expr, $dt:expr, $variant:ident, $ty:ty, $vals:expr) => {{
+                let path = temp_path($name);
+                let mut writer = Hdf5Writer::new();
+                let mut arr = NDArray::new(vec![NDDimension::new(4)], $dt);
+                if let NDDataBuffer::$variant(ref mut v) = arr.data {
+                    let src: Vec<$ty> = $vals;
+                    v.copy_from_slice(&src);
+                }
+                writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+                writer.write_file(&arr).unwrap();
+                writer.close_file().unwrap();
 
-        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
-            v[0] = 1.5;
-            v[1] = 2.5;
-            v[2] = 3.5;
-            v[3] = 4.5;
+                let mut reader = Hdf5Writer::new();
+                reader.current_path = Some(path.clone());
+                let r = reader.read_file().unwrap();
+                assert_eq!(r.data.data_type(), $dt, "type for {}", $name);
+                if let NDDataBuffer::$variant(ref v) = r.data {
+                    let src: Vec<$ty> = $vals;
+                    assert_eq!(v, &src, "values for {}", $name);
+                } else {
+                    panic!("wrong buffer variant for {}", $name);
+                }
+                std::fs::remove_file(&path).ok();
+            }};
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
-        writer.write_file(&arr).unwrap();
-        writer.close_file().unwrap();
-
-        let h5file = H5File::open(&path).unwrap();
-        let ds = h5file.dataset("data").unwrap();
-        let data: Vec<f64> = ds.read_raw().unwrap();
-        assert!((data[0] - 1.5).abs() < 1e-10);
-        assert!((data[3] - 4.5).abs() < 1e-10);
-
-        std::fs::remove_file(&path).ok();
+        roundtrip!("rt_i8", NDDataType::Int8, I8, i8, vec![-1, 0, 1, 127]);
+        roundtrip!("rt_u8", NDDataType::UInt8, U8, u8, vec![0, 1, 200, 255]);
+        roundtrip!(
+            "rt_i16",
+            NDDataType::Int16,
+            I16,
+            i16,
+            vec![-32768, -1, 1, 32767]
+        );
+        roundtrip!(
+            "rt_u16",
+            NDDataType::UInt16,
+            U16,
+            u16,
+            vec![0, 1, 40000, 65535]
+        );
+        roundtrip!(
+            "rt_i32",
+            NDDataType::Int32,
+            I32,
+            i32,
+            vec![i32::MIN, -1, 1, i32::MAX]
+        );
+        roundtrip!(
+            "rt_u32",
+            NDDataType::UInt32,
+            U32,
+            u32,
+            vec![0, 1, 3_000_000_000, u32::MAX]
+        );
+        roundtrip!(
+            "rt_i64",
+            NDDataType::Int64,
+            I64,
+            i64,
+            vec![i64::MIN, -1, 1, i64::MAX]
+        );
+        roundtrip!(
+            "rt_u64",
+            NDDataType::UInt64,
+            U64,
+            u64,
+            vec![0, 1, 9_000_000_000, u64::MAX]
+        );
+        roundtrip!(
+            "rt_f32",
+            NDDataType::Float32,
+            F32,
+            f32,
+            vec![-1.5, 0.0, 2.25, 3.75]
+        );
+        roundtrip!(
+            "rt_f64",
+            NDDataType::Float64,
+            F64,
+            f64,
+            vec![-1.5, 0.0, 2.25, 3.75]
+        );
     }
 
     #[test]
@@ -1023,6 +1879,86 @@ mod tests {
     }
 
     #[test]
+    fn test_bitshuffle_compressed_write() {
+        let path = temp_path("hdf5_bshuf");
+        let mut writer = Hdf5Writer::new();
+        writer.set_compression_type(COMPRESS_BSHUF);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(64), NDDimension::new(64)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for i in 0..v.len() {
+                v[i] = (i % 8) as u16;
+            }
+        }
+
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5file = H5File::open(&path).unwrap();
+        let ds = h5file.dataset("data").unwrap();
+        let data: Vec<u16> = ds.read_raw().unwrap();
+        assert_eq!(data.len(), 64 * 64);
+        assert_eq!(data[0], 0);
+        assert_eq!(data[9], 1);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_chunk_geometry_recorded() {
+        // Requested row/col chunk geometry is recorded as dataset attributes
+        // (the on-disk chunk is one frame per chunk — crate limitation).
+        let path = temp_path("hdf5_chunkgeom");
+        let mut writer = Hdf5Writer::new();
+        writer.set_chunk_size_auto(false);
+        writer.set_n_row_chunks(4);
+        writer.set_n_col_chunks(2);
+        writer.set_n_frames_chunks(3);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for i in 0..v.len() {
+                v[i] = i as u16;
+            }
+        }
+
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![2, 8, 8]);
+        // Data still round-trips correctly through the per-frame chunks.
+        let data: Vec<u16> = ds.read_raw().unwrap();
+        assert_eq!(data.len(), 2 * 64);
+        for i in 0..64usize {
+            assert_eq!(data[i], i as u16, "frame0 element {}", i);
+            assert_eq!(data[64 + i], i as u16, "frame1 element {}", i);
+        }
+        // Requested geometry preserved as attributes.
+        assert_eq!(ds.attr("HDF5_nRowChunks").unwrap().read_numeric::<i32>().unwrap(), 4);
+        assert_eq!(ds.attr("HDF5_nColChunks").unwrap().read_numeric::<i32>().unwrap(), 2);
+        assert_eq!(
+            ds.attr("HDF5_nFramesChunks")
+                .unwrap()
+                .read_numeric::<i32>()
+                .unwrap(),
+            3
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn test_swmr_streaming() {
         let path = temp_path("hdf5_swmr");
         let mut writer = Hdf5Writer::new();
@@ -1053,5 +1989,30 @@ mod tests {
         assert_eq!(data.len(), 3 * 8 * 8);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_layout_xml_param() {
+        // Valid and invalid layout XML drive layout_valid / layout_error.
+        let mut writer = Hdf5Writer::new();
+        let dir = std::env::temp_dir();
+        let good = dir.join("adcore_layout_good.xml");
+        std::fs::write(
+            &good,
+            r#"<hdf5_layout><group name="entry"><dataset name="data" source="detector" det_default="true"/></group></hdf5_layout>"#,
+        )
+        .unwrap();
+        assert!(writer.set_layout_filename(good.to_str().unwrap()));
+        assert!(writer.layout_valid);
+        assert!(writer.layout_error.is_empty());
+
+        let bad = dir.join("adcore_layout_bad.xml");
+        std::fs::write(&bad, r#"<not_a_layout/>"#).unwrap();
+        assert!(!writer.set_layout_filename(bad.to_str().unwrap()));
+        assert!(!writer.layout_valid);
+        assert!(!writer.layout_error.is_empty());
+
+        std::fs::remove_file(&good).ok();
+        std::fs::remove_file(&bad).ok();
     }
 }

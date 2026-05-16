@@ -289,6 +289,7 @@ impl NDArrayPool {
     /// - `copy_dimensions`: copy `dims` from source.
     /// - `copy_data_type`: the output buffer takes the source data type.
     /// - `copy_data`: copy the pixel/codec bytes.
+    ///
     /// Attributes are always cleared on the output then copied from the source.
     pub fn copy(
         &self,

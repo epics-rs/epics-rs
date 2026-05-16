@@ -565,7 +565,7 @@ impl NDArrayDriverBase {
 
         let mut depth = path_depth;
         if depth < 0 {
-            depth = num_parts + depth;
+            depth += num_parts;
             if depth < 1 {
                 depth = 1;
             }

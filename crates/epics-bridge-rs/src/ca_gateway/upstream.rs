@@ -434,12 +434,25 @@ impl UpstreamManager {
                     }
 
                     // Push to shadow PvDatabase to fan out to downstream clients
-                    let _ = db_clone
+                    let post_result = db_clone
                         .put_pv_and_post(&name, snapshot.value.clone())
                         .await;
                     // B5 RATE_STATS: count the monitor post fanned
                     // out downstream (C++ gateServer::postEventCount).
-                    stats_for_task.record_post_event();
+                    // Count only on a SUCCESSFUL fan-out so
+                    // `postEventCount` stays consistent with
+                    // `clientEventCount`, which counts successes — a
+                    // failed `put_pv_and_post` (e.g. shadow PV missing)
+                    // forwarded nothing downstream.
+                    match post_result {
+                        Ok(()) => stats_for_task.record_post_event(),
+                        Err(e) => tracing::debug!(
+                            pv = %name,
+                            error = %e,
+                            "ca-gateway-rs: shadow put_pv_and_post failed; \
+                             postEventCount not incremented"
+                        ),
+                    }
 
                     // Re-arm the backoff after a successful event.
                     backoff = Duration::from_millis(250);

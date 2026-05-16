@@ -286,11 +286,7 @@ impl ParamList {
     }
 
     fn append_param(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
-        let index = if self.params[0].is_empty() {
-            0
-        } else {
-            self.params[0].len()
-        };
+        let index = self.params[0].len();
         for addr_params in &mut self.params {
             addr_params.push(ParamEntry::new(name.to_string(), param_type));
         }
@@ -892,7 +888,10 @@ impl ParamList {
                     message: format!("enum index {value} out of range (0..{})", choices.len()),
                 });
             }
-            if *idx != value {
+            // C parity: enum index is stored through paramVal::setInteger,
+            // which gates on `!isDefined() || data != value` — a first set
+            // to index 0 (the default) must still flip `defined`.
+            if !entry.defined || *idx != value {
                 *idx = value;
                 entry.value_changed = true;
                 entry.defined = true;
@@ -1827,5 +1826,21 @@ mod tests {
         pl.set_string(idx, 0, String::new()).unwrap();
         assert!(pl.is_param_defined(idx, 0).unwrap());
         assert_eq!(pl.get_string_strict(idx, 0).unwrap(), "");
+    }
+
+    #[test]
+    fn set_enum_index_first_write_to_default_index_flips_defined() {
+        // C parity: enum index is stored through paramVal::setInteger,
+        // which gates on `!isDefined() || data != value` — a first set
+        // to index 0 (the type default) must still flip defined and
+        // value_changed so the initial selection fires its I/O Intr.
+        // A freshly created Enum param carries one sentinel choice and
+        // is undefined; set_enum_index(.., 0) must define it.
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param("MODE", ParamType::Enum).unwrap();
+        assert!(!pl.is_param_defined(idx, 0).unwrap());
+        pl.set_enum_index(idx, 0, 0).unwrap();
+        assert!(pl.is_param_defined(idx, 0).unwrap());
+        assert!(pl.take_changed_single(idx, 0).unwrap());
     }
 }

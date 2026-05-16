@@ -201,15 +201,6 @@ impl PortActor {
             return;
         }
 
-        // Deadline check
-        if Instant::now() > deadline {
-            let _ = reply.send(Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "request deadline expired before execution".into(),
-            }));
-            return;
-        }
-
         let is_connect_op = matches!(
             op,
             RequestOp::Connect
@@ -224,6 +215,18 @@ impl PortActor {
                 | RequestOp::UnblockProcess
                 | RequestOp::ShutdownPort
         );
+
+        // Deadline check — I/O ops only. Lifecycle / queue-management ops
+        // (connect, block, unblock, shutdown) are not subject to the queue
+        // deadline: an UnblockProcess that waited out its deadline must
+        // still run, or the port stays wedged for every non-owner caller.
+        if !is_connect_op && Instant::now() > deadline {
+            let _ = reply.send(Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "request deadline expired before execution".into(),
+            }));
+            return;
+        }
         let is_connect_priority = user.priority == QueuePriority::Connect;
 
         // Connect ops and Connect-priority requests bypass enabled/connected checks
@@ -415,6 +418,22 @@ impl PortActor {
                     }
                 } else {
                     self.blocked_by = Some((token, 1));
+                    // Messages already drained into the heap before this
+                    // BlockProcess executed would otherwise still be
+                    // dispatched to the driver, breaking block-port
+                    // exclusivity. enqueue_message only diverts messages
+                    // that arrive *after* the block, so sweep the heap now
+                    // and divert every non-owner, non-unblock message.
+                    let drained: Vec<ActorMessage> = self.heap.drain().collect();
+                    for msg in drained {
+                        let is_owner = msg.block_token == Some(token);
+                        let is_unblock = matches!(msg.op, RequestOp::UnblockProcess);
+                        if is_owner || is_unblock {
+                            self.heap.push(msg);
+                        } else {
+                            self.pending_while_blocked.push(msg);
+                        }
+                    }
                 }
                 Ok(RequestResult::write_ok())
             }
@@ -965,6 +984,30 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap();
         assert_eq!(result.int_val, Some(99));
+    }
+
+    #[test]
+    fn actor_unblock_with_expired_deadline_still_runs() {
+        // An UnblockProcess that waited out its queue deadline must still
+        // execute — otherwise the port stays wedged for every non-owner
+        // caller forever. Lifecycle ops bypass the deadline short-circuit.
+        let tx = spawn_actor(TestDriver::new());
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        user.block_token = Some(7);
+        send_and_wait(&tx, RequestOp::BlockProcess, user).unwrap();
+
+        // Submit the unblock with an already-expired deadline.
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_nanos(1));
+        user.block_token = Some(7);
+        std::thread::sleep(Duration::from_millis(1));
+        send_and_wait(&tx, RequestOp::UnblockProcess, user)
+            .expect("expired-deadline UnblockProcess must still run");
+
+        // Port must be unblocked: a non-owner request now succeeds.
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        send_and_wait(&tx, RequestOp::Int32Read, user)
+            .expect("port should be unblocked after UnblockProcess");
     }
 
     #[test]

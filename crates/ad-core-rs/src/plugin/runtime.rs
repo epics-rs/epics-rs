@@ -32,7 +32,7 @@ use crate::params::ndarray_driver::NDArrayDriverParams;
 
 use super::channel::{NDArrayOutput, NDArrayReceiver, NDArraySender, ndarray_channel};
 use super::params::PluginBaseParams;
-use super::wiring::WiringRegistry;
+use super::wiring::{upstream_key, WiringRegistry};
 
 /// Value sent through the param change channel from control plane to data plane.
 #[derive(Debug, Clone)]
@@ -1374,10 +1374,12 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // Shared processor (accessible from data thread)
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let array_output_for_handle = array_output.clone();
-    // B13: register this plugin's output so the WiringRegistry is the single
-    // source of truth for runtime rewiring (PluginManager::add_plugin would
-    // also register it, but direct callers must not bypass the registry).
-    wiring.register_output(port_name, array_output.clone());
+    // B13/G6: register this plugin's output so the WiringRegistry is the
+    // single source of truth for runtime rewiring (PluginManager::add_plugin
+    // would also register it, but direct callers must not bypass the
+    // registry). Registered under every address in 0..max_addr so a
+    // downstream plugin can select a non-zero NDArrayAddr.
+    wiring.register_output_addrs(port_name, max_addr, array_output.clone());
     // G1/B1: the DroppedArrays counter is owned by this plugin and shared with
     // every upstream sender so full-queue drops on our input queue are counted.
     let dropped_arrays_counter = array_sender.dropped_arrays_counter().clone();
@@ -1483,19 +1485,6 @@ async fn clamp_writeback(port: &PortHandle, reason: usize, value: i32) {
     let _ = port
         .set_params_and_notify(0, vec![ParamSetValue::Int32 { reason, addr: 0, value }])
         .await;
-}
-
-/// Resolve a `(port, addr)` pair to a WiringRegistry key (G6).
-///
-/// Address 0 keys on the bare port name (the common single-address case);
-/// a non-zero address appends `:<addr>` so a multi-address driver can
-/// register a distinct output per source address.
-fn upstream_key(port: &str, addr: i32) -> String {
-    if port.is_empty() || addr == 0 {
-        port.to_string()
-    } else {
-        format!("{port}:{addr}")
-    }
 }
 
 fn plugin_data_loop<P: NDPluginProcess>(
@@ -2101,6 +2090,53 @@ mod tests {
         // Data thread should terminate
         let result = data_jh.join();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_wire_to_nonzero_ndarray_addr() {
+        // G6: a multi-address upstream plugin registers its output under every
+        // address in 0..max_addr. A downstream consumer must be able to select
+        // NDArrayAddr=1 and actually receive arrays — previously the output was
+        // registered under the bare port name only, so the "PORT:1" key was
+        // missing and rewire failed with "not found".
+        use crate::plugin::wiring::upstream_key;
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let wiring = test_wiring();
+
+        // Upstream plugin advertises 2 addresses.
+        let (up_handle, _up_jh) = create_plugin_runtime_multi_addr(
+            "UP_MULTI",
+            PassthroughProcessor,
+            pool,
+            10,
+            "",
+            wiring.clone(),
+            2,
+        );
+        enable_callbacks(&up_handle);
+
+        // The "PORT:1" key must resolve to the same output as the bare port.
+        let addr0 = wiring.lookup_output("UP_MULTI");
+        let addr1 = wiring.lookup_output(&upstream_key("UP_MULTI", 1));
+        assert!(addr0.is_some(), "addr 0 output must be registered");
+        assert!(
+            addr1.is_some(),
+            "addr 1 output must be registered for a max_addr=2 port"
+        );
+
+        // Wire a downstream consumer to UP_MULTI address 1.
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWN_ADDR1", 10);
+        wiring
+            .rewire(&downstream_sender, "", &upstream_key("UP_MULTI", 1))
+            .expect("wiring a consumer to NDArrayAddr=1 must succeed");
+
+        // An array sent through the upstream must reach the addr-1 consumer.
+        send_array(up_handle.array_sender(), make_test_array(99));
+        let received = downstream_rx.blocking_recv().unwrap();
+        assert_eq!(
+            received.unique_id, 99,
+            "consumer wired to NDArrayAddr=1 must receive upstream arrays"
+        );
     }
 
     #[test]

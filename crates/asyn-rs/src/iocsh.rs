@@ -11,29 +11,36 @@
 //!
 //! Available only with the `epics` feature.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use epics_base_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
 
+use crate::drivers::ip_port::DrvAsynIPPort;
 use crate::manager::PortManager;
-use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceMask};
+use crate::port::PortDriver;
+use crate::runtime::config::RuntimeConfig;
+use crate::runtime::port::{create_port_runtime, PortRuntimeHandle};
+use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
 
-/// Register the six standard asyn iocsh commands on the supplied
+/// Register the standard asyn iocsh commands on the supplied
 /// [`IocApplication`]. The shared [`PortManager`] is captured in each
 /// command closure so the trace mutators reach the same
 /// [`crate::trace::TraceManager`] the drivers were registered with.
 ///
-/// C parity: `asynShellCommands.c::asynReport / asynSetOption /
-/// asynSetTraceMask / asynSetTraceIOMask / asynSetTraceInfoMask /
-/// asynSetTraceFile`.
+/// C parity: the six `asynShellCommands.c` commands (`asynReport /
+/// asynSetOption / asynSetTraceMask / asynSetTraceIOMask /
+/// asynSetTraceInfoMask / asynSetTraceFile`) plus the port-creation
+/// command `drvAsynIPPort.c::drvAsynIPPortConfigure`, registered as a
+/// startup command so it runs before `iocInit`.
 pub fn register_asyn_commands(mut app: IocApplication, mgr: Arc<PortManager>) -> IocApplication {
+    let trace = mgr.trace_manager().clone();
     for def in build_asyn_commands(mgr) {
         app = app.register_shell_command(def);
     }
-    app
+    app.register_startup_command(drv_asyn_ip_port_configure_command(trace))
 }
 
 fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
@@ -90,9 +97,11 @@ pub fn register_asyn_commands_on_shell(
     shell: &epics_base_rs::server::iocsh::IocShell,
     mgr: Arc<PortManager>,
 ) {
+    let trace = mgr.trace_manager().clone();
     for def in build_asyn_commands(mgr) {
         shell.register(def);
     }
+    shell.register(drv_asyn_ip_port_configure_command(trace));
 }
 
 /// Build the six iocsh `CommandDef`s without binding them to a
@@ -405,6 +414,98 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     out
 }
 
+/// Keeps the [`PortRuntimeHandle`]s created by `drvAsynIPPortConfigure`
+/// alive for the process lifetime. Dropping a handle shuts the port's
+/// actor thread down, so a startup-script-created port must be parked
+/// somewhere with a 'static lifetime.
+static IP_PORT_RUNTIMES: OnceLock<Mutex<Vec<PortRuntimeHandle>>> = OnceLock::new();
+
+fn keep_ip_port_runtime(handle: PortRuntimeHandle) {
+    IP_PORT_RUNTIMES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(handle);
+}
+
+/// Build the `drvAsynIPPortConfigure` iocsh command.
+///
+/// C parity: `drvAsynIPPort.c::drvAsynIPPortConfigure(portName,
+/// hostInfo, priority, noAutoConnect, noProcessEos)`. `hostInfo` is
+/// `host:port[:localPort] [protocol]` (see [`DrvAsynIPPort::new`]).
+///
+/// The created port is registered in the [`crate::asyn_record`] port
+/// registry so `asynRecord` device support resolves it by name. The
+/// runtime handle is parked in a process-lifetime static.
+///
+/// `priority` and `noProcessEos` are accepted for startup-script
+/// compatibility but have no effect: the Rust runtime schedules every
+/// port actor uniformly (priority is advisory in C too), and the IP
+/// driver never auto-installs an EOS interpose, so `noProcessEos` is
+/// already the default. `noAutoConnect` is honored.
+pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDef {
+    CommandDef::new(
+        "drvAsynIPPortConfigure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "hostInfo",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "priority",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "noAutoConnect",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "noProcessEos",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "drvAsynIPPortConfigure portName hostInfo [priority] [noAutoConnect] [noProcessEos] \
+         - create an IP octet port",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port = arg_str(args, 0)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "portName required".to_string())?;
+            let host = arg_str(args, 1)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "hostInfo required".to_string())?;
+            let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
+
+            let mut driver = match DrvAsynIPPort::new(&port, &host) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if no_auto_connect {
+                driver.base_mut().auto_connect = false;
+            }
+
+            let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            keep_ip_port_runtime(handle);
+            ctx.println(&format!(
+                "drvAsynIPPortConfigure: octet port '{port}' -> {host}"
+            ));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,5 +719,43 @@ mod tests {
                 .any(|(e, a)| matches!(e, AsynException::TraceFile) && *a == 2),
             "asynSetTraceFile addr=2 must fire a device-scoped announce; observed: {evs:?}"
         );
+    }
+
+    /// `drvAsynIPPortConfigure` creates an IP octet port and registers
+    /// it in the asyn_record port registry so asynRecord device support
+    /// can resolve it by name. `DrvAsynIPPort::new` only parses the
+    /// host info (no connect), so no live server is needed.
+    #[test]
+    fn drv_asyn_ip_port_configure_registers_port() {
+        let cmd = drv_asyn_ip_port_configure_command(Arc::new(TraceManager::new()));
+        assert_eq!(cmd.name, "drvAsynIPPortConfigure");
+        assert_eq!(cmd.args.len(), 5);
+
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[
+                ArgValue::String("iocsh_ip_cfg_test".into()),
+                ArgValue::String("127.0.0.1:9001".into()),
+            ],
+            &ctx,
+        );
+        assert!(result.is_ok(), "command failed: {:?}", result.err());
+        assert!(
+            crate::asyn_record::get_port("iocsh_ip_cfg_test").is_some(),
+            "port must be resolvable via the asyn_record registry"
+        );
+    }
+
+    /// A missing required argument is rejected without creating a port.
+    #[test]
+    fn drv_asyn_ip_port_configure_rejects_missing_host() {
+        let cmd = drv_asyn_ip_port_configure_command(Arc::new(TraceManager::new()));
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[ArgValue::String("iocsh_ip_cfg_nohost".into())],
+            &ctx,
+        );
+        assert!(result.is_err());
+        assert!(crate::asyn_record::get_port("iocsh_ip_cfg_nohost").is_none());
     }
 }

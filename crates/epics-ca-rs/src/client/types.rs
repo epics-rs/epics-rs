@@ -327,6 +327,13 @@ pub(crate) enum SearchRequest {
     /// new address — call [`super::CaClient::hurry_up`] (or wait
     /// for the natural retry) for that.
     AddAddress(SocketAddr),
+    /// Remove a unicast address from the search engine's working
+    /// address list. Used when a discovery backend reports an IOC
+    /// went away (`DiscoveryEvent::Removed`). No-op if the address
+    /// isn't present. Already-pending searches against the removed
+    /// address run to their natural retry; only future search rounds
+    /// stop targeting it.
+    RemoveAddress(SocketAddr),
     /// Replace the entire working address list. Mirrors libca
     /// `configureChannelAccessAddressList` (iocinf.cpp:166). Use
     /// when the application has authoritative knowledge of the

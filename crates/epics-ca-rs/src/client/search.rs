@@ -686,6 +686,14 @@ fn handle_request_or_addr(
             }
             None
         }
+        SearchRequest::RemoveAddress(addr) => {
+            let before = addr_list.len();
+            addr_list.retain(|e| e.sock != addr);
+            if addr_list.len() != before {
+                tracing::info!(?addr, "ca-rs: addr_list -= (discovery removal)");
+            }
+            None
+        }
         SearchRequest::SetAddressList(list) => {
             tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
             *addr_list = list
@@ -821,7 +829,9 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
         // `handle_request_or_addr` before they reach this match.
         // Defensive no-op so adding new variants doesn't crash if
         // future code paths plumb them straight to handle_request.
-        SearchRequest::AddAddress(_) | SearchRequest::SetAddressList(_) => None,
+        SearchRequest::AddAddress(_)
+        | SearchRequest::RemoveAddress(_)
+        | SearchRequest::SetAddressList(_) => None,
     }
 }
 
@@ -1313,6 +1323,30 @@ mod tests {
         handle_request(&mut state, SearchRequest::Cancel { cid: 1 });
         assert!(state.pending.is_empty());
         assert!(state.buckets[bucket].is_empty());
+    }
+
+    /// `SearchRequest::RemoveAddress` must drop an entry that
+    /// `AddAddress` previously appended — this is the path a discovery
+    /// backend's `DiscoveryEvent::Removed` feeds. A removal for an
+    /// address not in the list is a silent no-op.
+    #[test]
+    fn add_then_remove_address_round_trip() {
+        let mut state = SearchEngineState::new();
+        let mut addr_list: Vec<super::super::AddrEntry> = Vec::new();
+        let a: SocketAddr = "10.0.0.7:5064".parse().unwrap();
+        let b: SocketAddr = "10.0.0.8:5064".parse().unwrap();
+
+        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::AddAddress(a));
+        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::AddAddress(b));
+        assert_eq!(addr_list.len(), 2);
+
+        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::RemoveAddress(a));
+        assert_eq!(addr_list.len(), 1);
+        assert!(addr_list.iter().all(|e| e.sock == b));
+
+        // Removing an address not present is a no-op, not a panic.
+        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::RemoveAddress(a));
+        assert_eq!(addr_list.len(), 1);
     }
 
     #[test]

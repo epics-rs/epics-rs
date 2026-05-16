@@ -273,6 +273,16 @@ pub struct CaClient {
     _search_task: tokio::task::JoinHandle<()>,
     _transport_task: tokio::task::JoinHandle<()>,
     _beacon_task: tokio::task::JoinHandle<()>,
+    /// Discovery backends retained for their lifetime. mDNS's
+    /// `MdnsBackend` owns an `mdns-sd` `ServiceDaemon` whose browse
+    /// runs only while the backend is alive — dropping it kills live
+    /// discovery. Held here so post-startup IOCs keep being found.
+    _discovery_backends: Vec<Box<dyn crate::discovery::Backend>>,
+    /// Per-backend forwarder tasks: drain each backend's
+    /// `subscribe()` stream and feed `DiscoveryEvent`s into the
+    /// search engine as `AddAddress` / `RemoveAddress`. Aborted on
+    /// drop so they don't outlive the client.
+    _discovery_forwarders: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Internal coordinator requests from CaChannel / public API
@@ -528,6 +538,57 @@ impl CaClient {
             search_attempts.clone(),
         ));
 
+        // Wire each discovery backend's live-update stream into the
+        // search engine. `discover()` above was a one-shot scan;
+        // `subscribe()` (mDNS, watch-style DNS) pushes IOCs that come
+        // and go *after* startup. Without this, post-startup IOCs are
+        // never discovered. The `backends` Vec — and the `ServiceDaemon`
+        // an `MdnsBackend` owns — is retained on `CaClient` so the
+        // browse keeps running for the client's lifetime.
+        let mut discovery_forwarders: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for backend in &backends {
+            if let Some(mut rx) = backend.subscribe() {
+                let fwd_search_tx = search_tx.clone();
+                discovery_forwarders.push(epics_base_rs::runtime::task::spawn(async move {
+                    // `DiscoveryEvent::Removed` is matched BY INSTANCE
+                    // STRING, not by address: mDNS goodbye packets carry
+                    // a usable instance id but not a real socket addr.
+                    // Track the addr each instance was Added under so a
+                    // later Removed can target the correct address.
+                    let mut instance_addrs: std::collections::HashMap<String, SocketAddr> =
+                        std::collections::HashMap::new();
+                    while let Some(evt) = rx.recv().await {
+                        match evt {
+                            crate::discovery::DiscoveryEvent::Added { instance, addr } => {
+                                instance_addrs.insert(instance, addr);
+                                if fwd_search_tx
+                                    .send(SearchRequest::AddAddress(addr))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            crate::discovery::DiscoveryEvent::Removed { instance, .. } => {
+                                if let Some(addr) = instance_addrs.remove(&instance) {
+                                    if fwd_search_tx
+                                        .send(SearchRequest::RemoveAddress(addr))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        %instance,
+                                        "discovery Removed for unknown instance — ignored"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }));
+            }
+        }
+
         #[cfg(feature = "experimental-rust-tls")]
         let tls_arc = config.tls.as_ref().and_then(|t| match t {
             crate::tls::TlsConfig::Client(arc) => Some(arc.clone()),
@@ -609,6 +670,8 @@ impl CaClient {
             _search_task: search_task,
             _transport_task: transport_task,
             _beacon_task: beacon_task,
+            _discovery_backends: backends,
+            _discovery_forwarders: discovery_forwarders,
         })
     }
 
@@ -971,6 +1034,13 @@ impl Drop for CaClient {
         let search_abort = self._search_task.abort_handle();
         let transport_abort = self._transport_task.abort_handle();
         let beacon_abort = self._beacon_task.abort_handle();
+
+        // Discovery forwarders hold a `search_tx` clone — abort them
+        // so they don't outlive the client. The `_discovery_backends`
+        // Vec drops with `self`, tearing down any `ServiceDaemon`.
+        for fwd in &self._discovery_forwarders {
+            fwd.abort();
+        }
 
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {

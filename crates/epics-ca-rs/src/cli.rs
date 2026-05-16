@@ -126,7 +126,18 @@ impl Default for ValueFormat {
 /// the integer index is used (matches `-n` flag default when no enum
 /// metadata is available). `format_value` does not emit a trailing
 /// newline.
-pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[String]>) -> String {
+///
+/// `req_elems_present` mirrors C `caget.c:286` / the `PRN_TIME_VAL_STS`
+/// macro (`tool_lib.c:486`): the array element-count prefix is emitted
+/// only when `reqElems || pv->nElems > 1`. Pass `true` when the user
+/// supplied `-#` on the command line; a genuine 1-element waveform read
+/// without `-#` then prints just the value with no count prefix.
+pub fn format_value(
+    v: &EpicsValue,
+    fmt: &ValueFormat,
+    enum_strings: Option<&[String]>,
+    req_elems_present: bool,
+) -> String {
     let sep = fmt.field_separator;
     match v {
         EpicsValue::String(s) => s.clone(),
@@ -137,16 +148,32 @@ pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[St
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         EpicsValue::Float(x) => format_float(*x as f64, fmt),
         EpicsValue::Double(x) => format_float(*x, fmt),
-        EpicsValue::ShortArray(arr) => {
-            render_array_int(arr.iter().map(|&n| n as i64), arr.len(), fmt, sep)
-        }
-        EpicsValue::LongArray(arr) => {
-            render_array_int(arr.iter().map(|&n| n as i64), arr.len(), fmt, sep)
-        }
-        EpicsValue::Int64Array(arr) => render_array_int(arr.iter().copied(), arr.len(), fmt, sep),
+        EpicsValue::ShortArray(arr) => render_array_int(
+            arr.iter().map(|&n| n as i64),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
+        EpicsValue::LongArray(arr) => render_array_int(
+            arr.iter().map(|&n| n as i64),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
+        EpicsValue::Int64Array(arr) => render_array_int(
+            arr.iter().copied(),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
         EpicsValue::EnumArray(arr) => {
             let mut parts = Vec::with_capacity(arr.len() + 1);
-            parts.push(arr.len().to_string());
+            if req_elems_present || arr.len() > 1 {
+                parts.push(arr.len().to_string());
+            }
             let take = fmt.max_elements.unwrap_or(arr.len()).min(arr.len());
             for &idx in &arr[..take] {
                 parts.push(format_enum(idx as i64, fmt, enum_strings));
@@ -158,12 +185,14 @@ pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[St
             arr.len(),
             fmt,
             sep,
+            req_elems_present,
         ),
         EpicsValue::DoubleArray(arr) => render_array_iter(
             arr.iter().map(|&x| format_float(x, fmt)),
             arr.len(),
             fmt,
             sep,
+            req_elems_present,
         ),
         EpicsValue::CharArray(arr) => {
             if fmt.char_array_as_string {
@@ -171,12 +200,20 @@ pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[St
                 let end = arr.iter().position(|&b| b == 0).unwrap_or(arr.len());
                 String::from_utf8_lossy(&arr[..end]).into_owned()
             } else {
-                render_array_int(arr.iter().map(|&b| (b as i8) as i64), arr.len(), fmt, sep)
+                render_array_int(
+                    arr.iter().map(|&b| (b as i8) as i64),
+                    arr.len(),
+                    fmt,
+                    sep,
+                    req_elems_present,
+                )
             }
         }
         EpicsValue::StringArray(arr) => {
             let mut parts = Vec::with_capacity(arr.len() + 1);
-            parts.push(arr.len().to_string());
+            if req_elems_present || arr.len() > 1 {
+                parts.push(arr.len().to_string());
+            }
             let take = fmt.max_elements.unwrap_or(arr.len()).min(arr.len());
             parts.extend(arr[..take].iter().cloned());
             parts.join(&sep.to_string())
@@ -189,10 +226,13 @@ fn render_array_int<I: Iterator<Item = i64>>(
     total: usize,
     fmt: &ValueFormat,
     sep: char,
+    req_elems_present: bool,
 ) -> String {
     let take = fmt.max_elements.unwrap_or(total).min(total);
     let mut parts = Vec::with_capacity(take + 1);
-    parts.push(total.to_string());
+    if req_elems_present || total > 1 {
+        parts.push(total.to_string());
+    }
     for n in iter.take(take) {
         parts.push(format_int_i64(n, fmt.int_style));
     }
@@ -204,10 +244,13 @@ fn render_array_iter<I: Iterator<Item = String>>(
     total: usize,
     fmt: &ValueFormat,
     sep: char,
+    req_elems_present: bool,
 ) -> String {
     let take = fmt.max_elements.unwrap_or(total).min(total);
     let mut parts = Vec::with_capacity(take + 1);
-    parts.push(total.to_string());
+    if req_elems_present || total > 1 {
+        parts.push(total.to_string());
+    }
     parts.extend(iter.take(take));
     parts.join(&sep.to_string())
 }
@@ -369,16 +412,31 @@ mod tests {
     #[test]
     fn array_renders_count_then_values() {
         let v = EpicsValue::DoubleArray(vec![1.0, 2.5, 3.0]);
-        let s = format_value(&v, &fmt_default(), None);
+        let s = format_value(&v, &fmt_default(), None, false);
         // C: `3 1 2.5 3` (count + space-separated %g values)
         assert_eq!(s, "3 1 2.5 3");
+    }
+
+    /// C `caget.c:286` gates the count prefix on `reqElems || nElems > 1`.
+    /// A genuine 1-element waveform read WITHOUT `-#` prints just the
+    /// value, no `1 ` prefix.
+    #[test]
+    fn single_element_array_omits_count_without_req_elems() {
+        let v = EpicsValue::DoubleArray(vec![2.5]);
+        // No `-#` on the command line → no count prefix.
+        assert_eq!(format_value(&v, &fmt_default(), None, false), "2.5");
+        // `-#` supplied → count prefix returns even for 1 element.
+        assert_eq!(format_value(&v, &fmt_default(), None, true), "1 2.5");
+        // Multi-element always carries the count prefix.
+        let v2 = EpicsValue::DoubleArray(vec![1.0, 2.5]);
+        assert_eq!(format_value(&v2, &fmt_default(), None, false), "2 1 2.5");
     }
 
     #[test]
     fn enum_with_strings_renders_string() {
         let strs = vec!["off".to_string(), "on".to_string()];
         let v = EpicsValue::Enum(1);
-        let s = format_value(&v, &fmt_default(), Some(&strs));
+        let s = format_value(&v, &fmt_default(), Some(&strs), false);
         assert_eq!(s, "on");
     }
 
@@ -388,7 +446,7 @@ mod tests {
         let v = EpicsValue::Enum(1);
         let mut fmt = fmt_default();
         fmt.enum_as_number = true;
-        let s = format_value(&v, &fmt, Some(&strs));
+        let s = format_value(&v, &fmt, Some(&strs), false);
         assert_eq!(s, "1");
     }
 
@@ -397,7 +455,7 @@ mod tests {
         let v = EpicsValue::CharArray(b"hello\0xxxx".to_vec());
         let mut fmt = fmt_default();
         fmt.char_array_as_string = true;
-        assert_eq!(format_value(&v, &fmt, None), "hello");
+        assert_eq!(format_value(&v, &fmt, None, false), "hello");
     }
 
     #[test]
@@ -407,7 +465,7 @@ mod tests {
         fmt.float_as_int = true;
         fmt.int_style = IntStyle::Hex;
         // 1235 = 0x4d3
-        assert_eq!(format_value(&v, &fmt, None), "0x4d3");
+        assert_eq!(format_value(&v, &fmt, None, false), "0x4d3");
     }
 
     #[test]
@@ -465,7 +523,8 @@ mod tests {
         let v = EpicsValue::LongArray((0..10).collect());
         let mut fmt = fmt_default();
         fmt.max_elements = Some(3);
-        let s = format_value(&v, &fmt, None);
+        // `-#` implies `req_elems_present` so the count prefix is present.
+        let s = format_value(&v, &fmt, None, true);
         // Total count is full (10) per C `caget -# 3` behaviour:
         //   "10 0 1 2"
         assert_eq!(s, "10 0 1 2");

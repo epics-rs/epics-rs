@@ -28,6 +28,7 @@ pub mod file_tiff;
 pub mod gather;
 pub mod hdf5_layout;
 pub mod overlay;
+pub mod overlay_font;
 pub mod par_util;
 pub mod passthrough;
 pub mod pos_plugin;

@@ -412,29 +412,58 @@ impl DrvAsynIPPort {
         let addr_str = format!("{}:{}", self.config.host, self.config.port);
 
         if let Some(local_port) = self.config.local_port {
-            let socket = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )?;
-            socket.set_reuse_address(true)?;
-            let local_addr: std::net::SocketAddr = format!("0.0.0.0:{local_port}")
-                .parse()
-                .map_err(|_| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("invalid local address: 0.0.0.0:{local_port}"),
-                })?;
-            socket.bind(&local_addr.into())?;
-
-            let remote_addr: std::net::SocketAddr =
+            use std::net::ToSocketAddrs;
+            // Resolve the remote like the no-local-port branch — the old
+            // code used `SocketAddr::parse`, which only accepts literal
+            // IPs, so a hostname target (valid per the config parser)
+            // failed, as did any IPv6 target (domain was forced to IPV4).
+            let addrs: Vec<std::net::SocketAddr> =
                 addr_str
-                    .parse()
-                    .map_err(|e: std::net::AddrParseError| AsynError::Status {
+                    .to_socket_addrs()
+                    .map_err(|e| AsynError::Status {
                         status: AsynStatus::Error,
-                        message: format!("invalid remote address '{addr_str}': {e}"),
+                        message: format!("failed to resolve '{addr_str}': {e}"),
+                    })?
+                    .collect();
+
+            let mut last_err: Option<AsynError> = None;
+            for remote_addr in &addrs {
+                let (domain, local_str) = if remote_addr.is_ipv6() {
+                    (socket2::Domain::IPV6, format!("[::]:{local_port}"))
+                } else {
+                    (socket2::Domain::IPV4, format!("0.0.0.0:{local_port}"))
+                };
+                let socket = match socket2::Socket::new(
+                    domain,
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        last_err = Some(AsynError::Io(e));
+                        continue;
+                    }
+                };
+                socket.set_reuse_address(true)?;
+                let local_addr: std::net::SocketAddr =
+                    local_str.parse().map_err(|_| AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("invalid local address: {local_str}"),
                     })?;
-            socket.connect_timeout(&remote_addr.into(), self.config.connect_timeout)?;
-            Ok(TcpStream::from(socket))
+                if let Err(e) = socket.bind(&local_addr.into()) {
+                    last_err = Some(AsynError::Io(e));
+                    continue;
+                }
+                match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout)
+                {
+                    Ok(()) => return Ok(TcpStream::from(socket)),
+                    Err(e) => last_err = Some(AsynError::Io(e)),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("no addresses found for '{addr_str}'"),
+            }))
         } else {
             use std::net::ToSocketAddrs;
             let addrs: Vec<std::net::SocketAddr> = addr_str
@@ -619,9 +648,12 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        // HTTP connect-per-transaction: reconnect if disconnected
+        // HTTP connect-per-transaction: reconnect if disconnected.
+        // Surface the connect failure cause (DNS, refused, TLS reset)
+        // rather than letting check_ready() mask it as a generic
+        // "port disconnected".
         if self.config.protocol == IpProtocol::Http && !self.base.connected {
-            let _ = self.connect(&AsynUser::default());
+            self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
         let result = self
@@ -681,9 +713,10 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
-        // HTTP connect-per-transaction: reconnect if disconnected
+        // HTTP connect-per-transaction: reconnect if disconnected.
+        // Surface the connect failure cause rather than masking it.
         if self.config.protocol == IpProtocol::Http && !self.base.connected {
-            let _ = self.connect(&AsynUser::default());
+            self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
         asyn_trace_io!(

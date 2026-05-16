@@ -757,7 +757,10 @@ impl DrvAsynIPServerPort {
             }
             Ok(n) => Ok(OctetReadResult {
                 nbytes_transferred: n,
-                eom_reason: EomReason::empty(),
+                // Match the client-side `ip_port` driver and the EOS
+                // interpose layer, which report CNT on a count-limited
+                // read; an empty reason stalls EOS/record processing.
+                eom_reason: EomReason::CNT,
             }),
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock

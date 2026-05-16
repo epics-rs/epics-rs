@@ -249,6 +249,29 @@ impl CircuitBreakerRegistry {
             .unwrap_or(false)
     }
 
+    /// Read-only check: is this server *hard-blocked right now*, i.e.
+    /// OPEN with a cooldown that has not yet elapsed?
+    ///
+    /// Distinct from [`is_open`](Self::is_open): an OPEN breaker whose
+    /// cooldown has already elapsed is *probe-ready*, not blocking — it
+    /// returns `false` here so a caller gating on this can fall through
+    /// to [`allow`](Self::allow), which performs the OPEN→HALF_OPEN
+    /// transition and consumes the probe slot. HALF_OPEN and CLOSED
+    /// breakers also return `false`. Using `is_open` instead of this for
+    /// an early reject would strand probe-ready breakers forever, since
+    /// `allow` (the only code that leaves OPEN) would never be reached.
+    pub fn is_blocking(&self, server: SocketAddr) -> bool {
+        self.breakers
+            .get(&server)
+            .map(|b| {
+                matches!(b.state, BreakerState::Open)
+                    && b.cooldown_until
+                        .map(|until| Instant::now() < until)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     /// Drop entries that are Closed AND have no recent failures and
     /// no probe in flight — they hold no information that subsequent
     /// `allow()` calls would need. Called on insert when the map
@@ -333,6 +356,39 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         // Doubled cooldown is now 100ms; original 50ms wouldn't have helped.
         assert!(!reg.allow(addr()));
+    }
+
+    #[test]
+    fn is_blocking_distinguishes_probe_ready_from_hard_blocked() {
+        let mut reg = CircuitBreakerRegistry::with_config(fast_config());
+        for _ in 0..3 {
+            reg.record_failure(addr());
+        }
+        // Just tripped OPEN: hard-blocked, cooldown not elapsed.
+        assert!(reg.is_open(addr()));
+        assert!(reg.is_blocking(addr()));
+        std::thread::sleep(Duration::from_millis(60));
+        // Cooldown elapsed: still OPEN, but now probe-ready, not blocking.
+        assert!(reg.is_open(addr()));
+        assert!(!reg.is_blocking(addr()));
+    }
+
+    #[test]
+    fn open_breaker_recovers_via_is_blocking_then_allow() {
+        // Regression: the search.rs reply path gates on `is_blocking()`
+        // then calls `allow()`. A probe-ready OPEN breaker must pass the
+        // gate so `allow()` can perform the OPEN→HALF_OPEN transition;
+        // otherwise the breaker is stranded OPEN forever.
+        let mut reg = CircuitBreakerRegistry::with_config(fast_config());
+        for _ in 0..3 {
+            reg.record_failure(addr());
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!reg.is_blocking(addr()), "probe-ready breaker must not block");
+        assert!(reg.allow(addr()), "allow() must admit the probe");
+        reg.record_success(addr());
+        assert!(reg.allow(addr()), "breaker recovered to CLOSED");
+        assert!(!reg.is_open(addr()));
     }
 
     #[test]

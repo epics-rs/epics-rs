@@ -29,6 +29,9 @@ pub enum OverlayShape {
         y: usize,
         text: String,
         font_size: usize,
+        /// Optional strftime format. When non-empty, the formatted NDArray
+        /// timestamp is appended to `text` (C++ `TimeStampFormat`).
+        timestamp_format: String,
     },
 }
 
@@ -142,28 +145,80 @@ fn get_char_bitmap(ch: char) -> [[bool; FONT_WIDTH]; FONT_HEIGHT] {
     bitmap
 }
 
+/// Format an EPICS timestamp with a strftime-style format string.
+///
+/// Mirrors C++ `epicsTimeToStrftime` for the conversion specifiers commonly
+/// used in AreaDetector overlay configs: `%Y %m %d %H %M %S %f %%`. `%f` is
+/// the fractional seconds in microseconds (6 digits). Unknown specifiers are
+/// passed through verbatim.
+fn format_epics_time(ts: ad_core_rs::timestamp::EpicsTimestamp, fmt: &str) -> String {
+    // Decompose the UTC time-of-day from the EPICS timestamp.
+    let secs = ts.sec as u64 + 631_152_000; // EPICS epoch -> Unix epoch
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    let (hour, minute, second) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    // Civil date from days since Unix epoch (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    let mut out = String::with_capacity(fmt.len() + 16);
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&format!("{year:04}")),
+            Some('m') => out.push_str(&format!("{month:02}")),
+            Some('d') => out.push_str(&format!("{day:02}")),
+            Some('H') => out.push_str(&format!("{hour:02}")),
+            Some('M') => out.push_str(&format!("{minute:02}")),
+            Some('S') => out.push_str(&format!("{second:02}")),
+            Some('f') => out.push_str(&format!("{:06}", ts.nsec / 1000)),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Per-type drawing via macro
 // ---------------------------------------------------------------------------
 
 macro_rules! draw_on_typed_buffer {
-    ($data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, xor) => {{
-        draw_on_typed_buffer!(@inner $data, $T, $overlays, $w, $h, |data: &mut [$T], idx: usize, mode: DrawMode, value: $T| {
+    ($data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr, xor) => {{
+        draw_on_typed_buffer!(@inner $data, $T, $overlays, $w, $h, $ts, |data: &mut [$T], idx: usize, mode: DrawMode, value: $T| {
             match mode {
                 DrawMode::Set => data[idx] = value,
                 DrawMode::XOR => data[idx] ^= value,
             }
         });
     }};
-    ($data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, set_only) => {{
-        draw_on_typed_buffer!(@inner $data, $T, $overlays, $w, $h, |data: &mut [$T], idx: usize, _mode: DrawMode, value: $T| {
+    ($data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr, set_only) => {{
+        draw_on_typed_buffer!(@inner $data, $T, $overlays, $w, $h, $ts, |data: &mut [$T], idx: usize, _mode: DrawMode, value: $T| {
             data[idx] = value;
         });
     }};
-    (@inner $data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $set_fn:expr) => {{
+    (@inner $data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr, $set_fn:expr) => {{
         let data: &mut [$T] = $data;
         let w: usize = $w;
         let h: usize = $h;
+        let array_ts: ad_core_rs::timestamp::EpicsTimestamp = $ts;
         let set_fn = $set_fn;
 
         for overlay in $overlays.iter() {
@@ -182,25 +237,33 @@ macro_rules! draw_on_typed_buffer {
 
             match &overlay.shape {
                 OverlayShape::Cross { center_x, center_y, size } => {
-                    let cx = *center_x;
-                    let cy = *center_y;
-                    let half = *size / 2;
-                    // Horizontal arm: WidthY thickness (centered vertically)
-                    let wy_half = wy / 2;
-                    for dx in 0..=half.min(w) {
-                        for t in 0..wy {
-                            let ty = (cy + t).wrapping_sub(wy_half);
-                            if cx + dx < w { set_pixel(cx + dx, ty); }
-                            if dx <= cx { set_pixel(cx - dx, ty); }
+                    // C++ doOverlayT Cross: xwide/ywide are WidthX/2, WidthY/2
+                    // (half-widths). Rows inside the horizontal band
+                    // [ycent-ywide, ycent+ywide] draw the full arm; other rows
+                    // draw only the vertical strip [xcent-xwide, xcent+xwide].
+                    // This structure visits every pixel exactly once, so the
+                    // center pixel is not double-XOR'd.
+                    let cx = *center_x as i64;
+                    let cy = *center_y as i64;
+                    let half = (*size / 2) as i64;
+                    let xwide = (wx / 2) as i64;
+                    let ywide = (wy / 2) as i64;
+                    let mut put = |x: i64, y: i64| {
+                        if x >= 0 && y >= 0 {
+                            set_pixel(x as usize, y as usize);
                         }
-                    }
-                    // Vertical arm: WidthX thickness (centered horizontally)
-                    let wx_half = wx / 2;
-                    for dy in 0..=half.min(h) {
-                        for t in 0..wx {
-                            let tx = (cx + t).wrapping_sub(wx_half);
-                            if cy + dy < h { set_pixel(tx, cy + dy); }
-                            if dy <= cy { set_pixel(tx, cy - dy); }
+                    };
+                    for iy in (cy - half)..=(cy + half) {
+                        if iy >= cy - ywide && iy <= cy + ywide {
+                            // Inside the horizontal band: full row.
+                            for ix in (cx - half)..=(cx + half) {
+                                put(ix, iy);
+                            }
+                        } else {
+                            // Outside the band: vertical strip only.
+                            for ix in (cx - xwide)..=(cx + xwide) {
+                                put(ix, iy);
+                            }
                         }
                     }
                 }
@@ -240,34 +303,54 @@ macro_rules! draw_on_typed_buffer {
                     }
                 }
                 OverlayShape::Ellipse { center_x, center_y, rx, ry } => {
-                    let cx = *center_x as f64;
-                    let cy = *center_y as f64;
-                    let rxf = *rx as f64;
-                    let ryf = *ry as f64;
-                    // Draw concentric ellipses from outer radius to inner radius
-                    let wx_thickness = (wx as f64).min(rxf);
-                    let wy_thickness = (wy as f64).min(ryf);
-                    let steps = ((rxf + ryf) * 4.0).max(64.0) as usize;
-                    for layer in 0..wx.max(wy) {
-                        let frac = layer as f64;
-                        let rx_cur = (rxf - frac * wx_thickness / wx.max(1) as f64).max(0.0);
-                        let ry_cur = (ryf - frac * wy_thickness / wy.max(1) as f64).max(0.0);
-                        if rx_cur <= 0.0 && ry_cur <= 0.0 {
-                            break;
+                    // C++ doOverlayT Ellipse: parametric over the first
+                    // quadrant, mirrored to the other three; for each of
+                    // `xwide` thickness layers shrink the radii by jj. C++
+                    // sorts+uniques the resulting pixel list before drawing
+                    // "or the XOR draw mode won't work because the pixel will
+                    // be set and then unset". We dedup pixels here for the
+                    // same reason.
+                    let cx = *center_x as i64;
+                    let cy = *center_y as i64;
+                    let xsize = *rx as i64;
+                    let ysize = *ry as i64;
+                    // C++: xwide = MIN(WidthX, SizeX-1); SizeX = 2*rx.
+                    let xwide = (wx as i64).min((2 * xsize - 1).max(0));
+                    let n_steps = (2 * (xsize + ysize)).max(1);
+                    let theta_step = std::f64::consts::FRAC_PI_2 / n_steps as f64;
+                    let mut pixels: Vec<(i64, i64)> = Vec::new();
+                    for ii in 0..=n_steps {
+                        let theta = ii as f64 * theta_step;
+                        for jj in 0..xwide.max(1) {
+                            let ix = (((xsize - jj) as f64) * theta.cos() + 0.5) as i64;
+                            let iy = (((ysize - jj) as f64) * theta.sin() + 0.5) as i64;
+                            pixels.push((cx + ix, cy + iy));
+                            pixels.push((cx + ix, cy - iy));
+                            pixels.push((cx - ix, cy + iy));
+                            pixels.push((cx - ix, cy - iy));
                         }
-                        for i in 0..steps {
-                            let angle = 2.0 * std::f64::consts::PI * i as f64 / steps as f64;
-                            let px = (cx + rx_cur * angle.cos()).round() as usize;
-                            let py = (cy + ry_cur * angle.sin()).round() as usize;
-                            set_pixel(px, py);
+                    }
+                    // Remove duplicates so XOR mode does not self-cancel.
+                    pixels.sort_unstable();
+                    pixels.dedup();
+                    for (px, py) in pixels {
+                        if px >= 0 && py >= 0 {
+                            set_pixel(px as usize, py as usize);
                         }
                     }
                 }
-                OverlayShape::Text { x, y, text, font_size } => {
+                OverlayShape::Text { x, y, text, font_size, timestamp_format } => {
                     let scale = (*font_size).max(1) / FONT_HEIGHT.max(1);
                     let scale = scale.max(1);
+                    // Append the formatted timestamp when a format is set
+                    // (C++ epicsTimeToStrftime + DisplayText concatenation).
+                    let rendered = if timestamp_format.is_empty() {
+                        text.clone()
+                    } else {
+                        format!("{}{}", text, format_epics_time(array_ts, timestamp_format))
+                    };
                     let mut cursor_x = *x;
-                    for ch in text.chars() {
+                    for ch in rendered.chars() {
                         let bitmap = get_char_bitmap(ch);
                         for row in 0..FONT_HEIGHT {
                             for col in 0..FONT_WIDTH {
@@ -302,34 +385,34 @@ pub fn draw_overlays(src: &NDArray, overlays: &[OverlayDef]) -> NDArray {
 
     match &mut arr.data {
         NDDataBuffer::U8(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u8, overlays, w, h, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u8, overlays, w, h, arr.timestamp, xor);
         }
         NDDataBuffer::U16(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u16, overlays, w, h, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u16, overlays, w, h, arr.timestamp, xor);
         }
         NDDataBuffer::I16(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i16, overlays, w, h, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i16, overlays, w, h, arr.timestamp, xor);
         }
         NDDataBuffer::I32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i32, overlays, w, h, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i32, overlays, w, h, arr.timestamp, xor);
         }
         NDDataBuffer::U32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u32, overlays, w, h, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u32, overlays, w, h, arr.timestamp, xor);
         }
         NDDataBuffer::F32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), f32, overlays, w, h, set_only);
+            draw_on_typed_buffer!(data.as_mut_slice(), f32, overlays, w, h, arr.timestamp, set_only);
         }
         NDDataBuffer::F64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), f64, overlays, w, h, set_only);
+            draw_on_typed_buffer!(data.as_mut_slice(), f64, overlays, w, h, arr.timestamp, set_only);
         }
         NDDataBuffer::I8(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i8, overlays, w, h, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i8, overlays, w, h, arr.timestamp, xor);
         }
         NDDataBuffer::I64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i64, overlays, w, h, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i64, overlays, w, h, arr.timestamp, xor);
         }
         NDDataBuffer::U64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u64, overlays, w, h, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u64, overlays, w, h, arr.timestamp, xor);
         }
     }
 
@@ -355,6 +438,7 @@ struct OverlaySlot {
     green: u8,
     blue: u8,
     display_text: String,
+    timestamp_format: String,
     font: usize,
 }
 
@@ -374,6 +458,7 @@ impl Default for OverlaySlot {
             green: 0,
             blue: 0,
             display_text: String::new(),
+            timestamp_format: String::new(),
             font: 0,
         }
     }
@@ -413,6 +498,7 @@ impl OverlaySlot {
                 y: self.position_y,
                 text: self.display_text.clone(),
                 font_size: (self.font + 1) * FONT_HEIGHT,
+                timestamp_format: self.timestamp_format.clone(),
             },
             _ => OverlayShape::Rectangle {
                 x: self.position_x,
@@ -449,6 +535,7 @@ struct OverlayParamIndices {
     green: Option<usize>,
     blue: Option<usize>,
     display_text: Option<usize>,
+    timestamp_format: Option<usize>,
     font: Option<usize>,
 }
 
@@ -511,11 +598,13 @@ impl OverlayProcessor {
                     y,
                     text,
                     font_size,
+                    timestamp_format,
                 } => {
                     slot.shape = 3;
                     slot.position_x = x;
                     slot.position_y = y;
                     slot.display_text = text;
+                    slot.timestamp_format = timestamp_format;
                     slot.font = font_size / FONT_HEIGHT.max(1);
                 }
             }
@@ -586,6 +675,7 @@ impl NDPluginProcess for OverlayProcessor {
         self.params.green = base.find_param("OVERLAY_GREEN");
         self.params.blue = base.find_param("OVERLAY_BLUE");
         self.params.display_text = base.find_param("OVERLAY_DISPLAY_TEXT");
+        self.params.timestamp_format = base.find_param("OVERLAY_TIMESTAMP_FORMAT");
         self.params.font = base.find_param("OVERLAY_FONT");
         Ok(())
     }
@@ -680,6 +770,10 @@ impl NDPluginProcess for OverlayProcessor {
             if let ParamChangeValue::Octet(s) = &params.value {
                 slot.display_text = s.clone();
             }
+        } else if Some(reason) == self.params.timestamp_format {
+            if let ParamChangeValue::Octet(s) = &params.value {
+                slot.timestamp_format = s.clone();
+            }
         } else if Some(reason) == self.params.font {
             slot.font = params.value.as_i32().max(0) as usize;
         }
@@ -749,9 +843,9 @@ mod tests {
 
         let out = draw_overlays(&arr, &overlays);
         if let NDDataBuffer::U8(ref v) = out.data {
-            // Center pixel (0,0) is drawn twice (horiz + vert arms):
-            // 0xFF ^ 0xFF ^ 0xFF = 0xFF
-            assert_eq!(v[0], 0xFF);
+            // C++ Cross visits each pixel exactly once, so the center is
+            // XOR'd a single time: 0xFF ^ 0xFF = 0x00 (not double-toggled).
+            assert_eq!(v[0], 0x00);
             // Neighbor (1,0) drawn once: 0x00 ^ 0xFF = 0xFF
             assert_eq!(v[1], 0xFF);
             // Pixel (0,1) drawn once: 0x00 ^ 0xFF = 0xFF
@@ -795,6 +889,7 @@ mod tests {
                 y: 0,
                 text: "Hi".to_string(),
                 font_size: 7,
+                timestamp_format: String::new(),
             },
             draw_mode: DrawMode::Set,
             color: [0, 255, 0],
@@ -874,5 +969,128 @@ mod tests {
             // Center pixel should be set (XOR falls back to Set for floats)
             assert_eq!(v[4 * 8 + 4], 100.0);
         }
+    }
+
+    #[test]
+    fn test_cross_thickness_half_width() {
+        // C++ Cross uses xwide = WidthX/2: WidthY=4 => horizontal band of
+        // 2*2+1 = 5 rows centered on the cross.
+        let arr = NDArray::new(
+            vec![NDDimension::new(20), NDDimension::new(20)],
+            NDDataType::UInt8,
+        );
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Cross {
+                center_x: 10,
+                center_y: 10,
+                size: 8,
+            },
+            draw_mode: DrawMode::Set,
+            color: [0, 255, 0],
+            width_x: 1,
+            width_y: 4,
+        }];
+        let out = draw_overlays(&arr, &overlays);
+        if let NDDataBuffer::U8(ref v) = out.data {
+            let w = 20;
+            // The horizontal band spans rows [cy-2, cy+2] = [8, 12]. A column
+            // away from the vertical strip (e.g. x=7) is set inside the band
+            // and clear outside.
+            for y in 8..=12 {
+                assert_eq!(v[y * w + 7], 255, "row {y} should be in the band");
+            }
+            assert_eq!(v[7 * w + 7], 0, "row 7 is outside the band");
+            assert_eq!(v[13 * w + 7], 0, "row 13 is outside the band");
+        }
+    }
+
+    #[test]
+    fn test_xor_ellipse_no_double_toggle() {
+        // Regression: an XOR ellipse must not leave holes from double-toggled
+        // pixels. Every drawn pixel ends up XOR'd exactly once: 0 -> 0xFF.
+        let arr = NDArray::new(
+            vec![NDDimension::new(40), NDDimension::new(40)],
+            NDDataType::UInt8,
+        );
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Ellipse {
+                center_x: 20,
+                center_y: 20,
+                rx: 12,
+                ry: 8,
+            },
+            draw_mode: DrawMode::XOR,
+            color: [0, 0xFF, 0],
+            width_x: 3,
+            width_y: 3,
+        }];
+        let out = draw_overlays(&arr, &overlays);
+        if let NDDataBuffer::U8(ref v) = out.data {
+            // Any non-zero pixel must be exactly 0xFF — a double-toggled pixel
+            // would have wrapped back to 0x00, so the ellipse would have a
+            // hole. Count drawn pixels to confirm the ellipse is non-empty.
+            let mut drawn = 0;
+            for &px in v.iter() {
+                assert!(px == 0 || px == 0xFF, "double-toggled pixel: {px}");
+                if px == 0xFF {
+                    drawn += 1;
+                }
+            }
+            assert!(drawn > 0, "ellipse drew no pixels");
+        }
+    }
+
+    #[test]
+    fn test_text_timestamp_format_appends() {
+        // A non-empty timestamp_format appends a formatted timestamp; an empty
+        // one renders the bare text. Compare rendered pixel counts.
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(120), NDDimension::new(12)],
+            NDDataType::UInt8,
+        );
+        // EPICS timestamp: sec since 1990; pick a value with a known date.
+        arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp {
+            sec: 0, // 1990-01-01 00:00:00
+            nsec: 0,
+        };
+        let count_set = |arr: &NDArray, fmt: &str| -> usize {
+            let ov = vec![OverlayDef {
+                shape: OverlayShape::Text {
+                    x: 0,
+                    y: 0,
+                    text: "T".to_string(),
+                    font_size: 7,
+                    timestamp_format: fmt.to_string(),
+                },
+                draw_mode: DrawMode::Set,
+                color: [0, 255, 0],
+                width_x: 1,
+                width_y: 1,
+            }];
+            let out = draw_overlays(arr, &ov);
+            if let NDDataBuffer::U8(v) = &out.data {
+                v.iter().filter(|&&p| p != 0).count()
+            } else {
+                0
+            }
+        };
+        let bare = count_set(&arr, "");
+        let with_ts = count_set(&arr, "%Y-%m-%d");
+        // The appended "1990-01-01" adds glyphs => strictly more set pixels.
+        assert!(with_ts > bare, "timestamp text should add pixels");
+    }
+
+    #[test]
+    fn test_format_epics_time_known_date() {
+        // EPICS sec 0 == 1990-01-01 00:00:00 UTC.
+        let ts = ad_core_rs::timestamp::EpicsTimestamp {
+            sec: 0,
+            nsec: 123_456_000,
+        };
+        assert_eq!(
+            format_epics_time(ts, "%Y-%m-%d %H:%M:%S.%f"),
+            "1990-01-01 00:00:00.123456"
+        );
+        assert_eq!(format_epics_time(ts, "100%%"), "100%");
     }
 }

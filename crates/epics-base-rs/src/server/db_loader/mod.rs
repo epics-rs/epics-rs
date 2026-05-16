@@ -1242,9 +1242,13 @@ mod tests {
         let mut rec = HistogramRecord::new(10, 0.0, 10.0);
         rec.add_sample(2.5); // bucket 2
         rec.add_sample(2.7); // bucket 2
-        rec.add_sample(7.0); // bucket 7
+        // C `histogramRecord.c:340-345` selects the bucket with a
+        // closed upper edge (`temp <= i*wdth`): a value exactly on a
+        // boundary lands in the LOWER bucket. sgnl=7.0, wdth=1.0 ->
+        // i=7 is the first `7.0 <= i*1.0`, dest = i-1 = bucket 6.
+        rec.add_sample(7.0); // boundary value -> bucket 6 (C parity)
         assert_eq!(rec.val[2], 2);
-        assert_eq!(rec.val[7], 1);
+        assert_eq!(rec.val[6], 1);
     }
 
     #[test]

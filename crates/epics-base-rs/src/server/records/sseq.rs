@@ -69,15 +69,12 @@ impl SseqRecord {
         match self.selm {
             0 => true, // All
             1 => {
-                // Specified — SELN selects which step (1-based)
+                // Specified — SELN is the 1-based step number. The 10
+                // steps are numbered 1..=10 (synApps sseq DLY1..DLYA),
+                // so step number `seln` selects index `seln - 1`.
+                // `seln == 0` or `seln > 10` selects no step.
                 let sel = self.seln as usize;
-                if sel >= 1 && sel <= 9 {
-                    step_idx == sel - 1
-                } else if sel == 10 {
-                    step_idx == 9
-                } else {
-                    false
-                }
+                (1..=NUM_STEPS).contains(&sel) && step_idx == sel - 1
             }
             2 => {
                 // Mask — SELN is a bitmask

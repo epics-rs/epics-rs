@@ -58,13 +58,20 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Transport channel binding: SHA-256 of the peer's leaf TLS
 /// certificate DER. A cap-token is cryptographically bound to the
-/// TLS channel it was minted for, defeating replay on any other circuit.
+/// peer-certificate identity it was minted for, defeating replay over
+/// any circuit presenting a different certificate.
+///
+/// This is a peer-*certificate* binding (RFC 5929 `tls-server-end-point`
+/// style), not a per-TLS-session binding: two sessions that present the
+/// same client certificate produce the same binding. That is sufficient
+/// here — possession of the cert+key already grants mTLS access — but it
+/// does not distinguish two connections from the same cert holder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelBinding([u8; 32]);
 
@@ -187,7 +194,9 @@ impl TokenIssuer {
         let claims = TokenClaims {
             sub: sub.to_string(),
             groups: groups.to_vec(),
-            exp: now + ttl_secs,
+            // saturating: a near-u64::MAX ttl must not wrap to a past
+            // exp (which would still fail-closed, but confusingly).
+            exp: now.saturating_add(ttl_secs),
             iss: self.iss_id.clone(),
             aud: aud.to_string(),
             cnf,
@@ -308,7 +317,11 @@ impl TokenVerifier {
             .keys
             .get(&claims.iss)
             .ok_or_else(|| TokenError::UnknownIssuer(claims.iss.clone()))?;
-        key.verify(payload_b64.as_bytes(), &signature)
+        // verify_strict (not verify): additionally rejects low-order /
+        // non-canonical public keys, closing the signature-malleability
+        // hole for a malicious issuer keyring entry. Behavior for honest
+        // keys and signatures is unchanged.
+        key.verify_strict(payload_b64.as_bytes(), &signature)
             .map_err(|_| TokenError::BadSignature)?;
         if claims.is_expired() {
             return Err(TokenError::Expired);

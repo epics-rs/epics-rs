@@ -71,12 +71,21 @@ pub struct ConnEventReplay {
     /// Recent events, oldest first. Bounded — the oldest entry is
     /// dropped once `REPLAY_LOG_CAPACITY` is exceeded.
     log: parking_lot::Mutex<VecDeque<SeqConnEvent>>,
+    /// B11: highest sequence number the forwarder has processed so
+    /// far (incl. raw-lag skips). A receiver that subscribes *after*
+    /// the forwarder has already processed N events seeds its
+    /// `last_seq` from this so a later `Lagged` only replays events
+    /// the receiver could actually have missed — not the whole 1..N
+    /// backlog it was never meant to see (which would double-count
+    /// per-PV refcounts).
+    high_water: std::sync::atomic::AtomicU64,
 }
 
 impl ConnEventReplay {
     fn new() -> Self {
         Self {
             log: parking_lot::Mutex::new(VecDeque::with_capacity(REPLAY_LOG_CAPACITY)),
+            high_water: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -84,11 +93,29 @@ impl ConnEventReplay {
     /// at capacity. Called only by the single forwarder task, so the
     /// `seq` values are strictly increasing.
     fn record(&self, ev: SeqConnEvent) {
+        let seq = ev.0;
         let mut log = self.log.lock();
         if log.len() == REPLAY_LOG_CAPACITY {
             log.pop_front();
         }
         log.push_back(ev);
+        drop(log);
+        self.advance_high_water(seq);
+    }
+
+    /// Advance the high-water mark to `seq` (monotonic — never moves
+    /// backwards). Called by the forwarder after recording an event
+    /// and after a raw-broadcast lag skips a span of sequence numbers.
+    fn advance_high_water(&self, seq: u64) {
+        self.high_water
+            .fetch_max(seq, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Current high-water sequence number — the `last_seq` a freshly
+    /// subscribed [`ReplayingReceiver`] starts from so it never
+    /// replays events that predate its subscription.
+    pub fn high_water(&self) -> u64 {
+        self.high_water.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Return every logged event whose sequence number is strictly
@@ -331,10 +358,16 @@ impl DownstreamServer {
             });
         }
         let state = replay_guard.as_ref().expect("just initialised");
+        // B11: seed `last_seq` with the forwarder's current high-water
+        // mark, NOT 0. A receiver subscribing after the forwarder has
+        // already processed N events must, on a later `Lagged`, replay
+        // only events > N — the ones it could actually have missed.
+        // Starting from 0 would replay the entire 1..N backlog it was
+        // never meant to receive, double-counting per-PV refcounts.
         Some(ReplayingReceiver {
             rx: state.tx.subscribe(),
             replay: state.replay.clone(),
-            last_seq: 0,
+            last_seq: state.replay.high_water(),
             pending: VecDeque::new(),
         })
     }
@@ -437,6 +470,10 @@ fn spawn_conn_event_forwarder(
                     // can detect it as an unrecoverable truncation
                     // rather than silently renumbering.
                     seq += n;
+                    // Keep the high-water mark in step with the skip
+                    // so a receiver subscribing now does not later
+                    // replay the gap span.
+                    replay.advance_high_water(seq);
                     tracing::warn!(
                         missed = n,
                         "ca-gateway-rs: raw connection-event broadcast lagged at \
@@ -592,6 +629,114 @@ mod tests {
         assert_eq!(seen, (1..=N).collect::<Vec<_>>(), "lagged events not fully replayed");
         drop(tx);
         assert!(matches!(recv.recv().await, ConnEventRecv::Closed));
+    }
+
+    /// B11 late-subscriber regression: a `ReplayingReceiver` created
+    /// after the forwarder has already processed events N>0 must, on a
+    /// later `Lagged`, replay ONLY events that arrived after it
+    /// subscribed — never the 1..N backlog it was never meant to see.
+    ///
+    /// Pre-fix every receiver started with `last_seq = 0`, so a late
+    /// subscriber's first lag recovered the entire log from seq 1,
+    /// double-counting per-PV refcounts for connections that opened
+    /// and closed before it ever existed.
+    #[tokio::test]
+    async fn late_subscriber_does_not_replay_pre_subscription_backlog() {
+        let replay = Arc::new(ConnEventReplay::new());
+        let (tx, _keepalive) = broadcast::channel::<SeqConnEvent>(4);
+
+        // The forwarder has already processed 10 events before this
+        // receiver exists. They are in the log; high-water is now 10.
+        const PRE: u32 = 10;
+        for i in 1..=PRE {
+            replay.record((i as u64, ev("OLD", i)));
+        }
+        assert_eq!(replay.high_water(), PRE as u64);
+
+        // A late subscriber: `connection_events()` seeds `last_seq`
+        // from the current high-water mark, NOT 0.
+        let mut recv = ReplayingReceiver {
+            rx: tx.subscribe(),
+            replay: replay.clone(),
+            last_seq: replay.high_water(),
+            pending: VecDeque::new(),
+        };
+
+        // Now 20 NEW events arrive. The cap-4 channel drops the older
+        // ones for this un-drained receiver, forcing a `Lagged`.
+        const NEW: u32 = 20;
+        for i in (PRE + 1)..=(PRE + NEW) {
+            let sequenced = (i as u64, ev("NEW", i));
+            replay.record(sequenced.clone());
+            let _ = tx.send(sequenced);
+        }
+
+        // recv must yield exactly the NEW events (cids 11..=30), in
+        // order — none of the pre-subscription 1..=10 backlog.
+        let mut seen = Vec::new();
+        for _ in 0..NEW {
+            match recv.recv().await {
+                ConnEventRecv::Event(ServerConnectionEvent::ChannelCreated {
+                    cid,
+                    pv_name,
+                    ..
+                }) => {
+                    assert_eq!(pv_name, "NEW", "must not replay pre-subscription `OLD` events");
+                    seen.push(cid);
+                }
+                ConnEventRecv::GapTruncated { missed } => {
+                    panic!("unexpected truncation, missed={missed}")
+                }
+                other => panic!("unexpected recv outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            seen,
+            ((PRE + 1)..=(PRE + NEW)).collect::<Vec<_>>(),
+            "late subscriber must replay only post-subscription events"
+        );
+        drop(tx);
+        assert!(matches!(recv.recv().await, ConnEventRecv::Closed));
+    }
+
+    /// B11: `connection_events()` itself seeds a late receiver's
+    /// `last_seq` from the forwarder's high-water mark. Verified by
+    /// driving events through the real `DownstreamServer` forwarder
+    /// then checking a fresh receiver does not start from 0.
+    #[tokio::test]
+    async fn connection_events_seeds_late_subscriber_from_high_water() {
+        let db = Arc::new(PvDatabase::new());
+        let downstream = DownstreamServer::new(db, 0);
+
+        // First subscriber installs the forwarder + replay state.
+        let _first = downstream
+            .connection_events()
+            .await
+            .expect("first receiver");
+
+        // Reach into the replay state and simulate the forwarder
+        // having processed events (the real forwarder is driven by a
+        // live CaServer broadcast, not available in a unit test).
+        {
+            let guard = downstream.replay_state.lock().await;
+            let state = guard.as_ref().expect("replay state installed");
+            for i in 1..=7u64 {
+                state.replay.record((i, ev("PV", i as u32)));
+            }
+        }
+
+        // A receiver created now must start at the high-water mark (7),
+        // not 0 — otherwise a later lag replays the 1..7 backlog.
+        let late = downstream
+            .connection_events()
+            .await
+            .expect("late receiver");
+        assert_eq!(
+            late.last_seq, 7,
+            "late subscriber must be seeded from the forwarder high-water mark"
+        );
+
+        downstream.stop_connection_events().await;
     }
 
     /// End-to-end through the forwarder: events published to the raw

@@ -84,6 +84,39 @@ pub struct PvaLinkResolver {
     /// Mirrors the role of pvxs `pvaLinkConfig` carried on the
     /// `jlink` for the lifetime of the link.
     link_options: Arc<parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>>,
+    /// Database handle used by the B3 scan-on-update forwarder to
+    /// process owning records. `None` until [`install_pvalink_resolver`]
+    /// wires it — without it, monitor events still update the cached
+    /// value but cannot drive `CP`/`CPP` record processing.
+    db: Arc<parking_lot::RwLock<Option<PvDatabase>>>,
+    /// B3: per-PV set of record names to process when a monitor event
+    /// arrives (the `scan_on_update` / CP fan-out targets). Populated
+    /// by [`Self::open_link_for_record`].
+    scan_targets: Arc<parking_lot::RwLock<std::collections::HashMap<String, ScanFanout>>>,
+    /// B3: PV names whose monitor-notification forwarder task is
+    /// already running, so [`Self::open_link`] spawns it at most once
+    /// per link.
+    forwarders: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// Per-PV scan-on-update fan-out state (B3).
+#[derive(Default)]
+struct ScanFanout {
+    /// Records to process on every monitor event. Each entry mirrors
+    /// one INP pvalink whose `proc` is `CP` (always) or `CPP`
+    /// (passive). At our integration granularity both reduce to
+    /// "process this record".
+    records: Vec<ScanTarget>,
+}
+
+/// One record bound to a CP/CPP pvalink (B3).
+struct ScanTarget {
+    record: String,
+    /// pvxs `pvaLinkConfig` CP vs CPP: a `CP` link processes on every
+    /// event; a `CPP` link only processes when the value changed. We
+    /// reduce that to "process even on a no-op update" — `CP` links
+    /// set this `true`, `CPP` links `false`.
+    always: bool,
 }
 
 impl PvaLinkResolver {
@@ -94,7 +127,17 @@ impl PvaLinkResolver {
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             link_options: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            db: Arc::new(parking_lot::RwLock::new(None)),
+            scan_targets: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            forwarders: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Attach the database handle the B3 scan-on-update forwarder
+    /// uses to process owning records. Called by
+    /// [`install_pvalink_resolver`].
+    pub fn attach_database(&self, db: PvDatabase) {
+        *self.db.write() = Some(db);
     }
 
     /// Master enable / disable. When disabled, the resolver closure
@@ -132,6 +175,29 @@ impl PvaLinkResolver {
     /// `sevr=MS` is registered here at IOC init (or via `pvxr`), and
     /// every later bare-name resolve reuses the `MS` mode.
     pub async fn open_link(&self, link_string: &str) -> PvaLinkResult<Arc<PvaLink>> {
+        self.open_link_inner(link_string, None).await
+    }
+
+    /// Like [`Self::open_link`] but also binds `record` as a
+    /// scan-on-update target (B3). When the parsed link has
+    /// `scan_on_update` (i.e. `proc=CP` / `CPP`), every monitor event
+    /// on the remote PV processes `record` through the database —
+    /// the INP-monitor record-notification path that pvxs
+    /// `pvaLinkChannel::run` drives via `scanOnUpdate`.
+    pub async fn open_link_for_record(
+        &self,
+        link_string: &str,
+        record: &str,
+    ) -> PvaLinkResult<Arc<PvaLink>> {
+        self.open_link_inner(link_string, Some(record.to_string()))
+            .await
+    }
+
+    async fn open_link_inner(
+        &self,
+        link_string: &str,
+        record: Option<String>,
+    ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Inp)?;
         // An INP link that is meaningful for the resolver must keep a
         // monitor open; force it on (pvxs treats `proc=CP/CPP` and the
@@ -140,10 +206,53 @@ impl PvaLinkResolver {
             monitor: true,
             ..cfg
         };
+        let pv_name = cfg.pv_name.clone();
         self.link_options
             .write()
-            .insert(cfg.pv_name.clone(), cfg.clone());
-        self.registry.get_or_open(cfg).await
+            .insert(pv_name.clone(), cfg.clone());
+        // B3: register the scan-on-update target before opening so the
+        // forwarder spawned below already sees it.
+        if let Some(rec) = record {
+            if cfg.scan_on_update {
+                self.scan_targets
+                    .write()
+                    .entry(pv_name.clone())
+                    .or_default()
+                    .records
+                    .push(ScanTarget {
+                        record: rec,
+                        always: true,
+                    });
+            }
+        }
+        let link = self.registry.get_or_open(cfg).await?;
+        self.spawn_notify_forwarder(&pv_name, &link);
+        Ok(link)
+    }
+
+    /// B3: spawn the per-link monitor-notification forwarder, at most
+    /// once per PV. The task drains the link's notify receiver and,
+    /// for every event, processes the link's registered
+    /// scan-on-update records.
+    fn spawn_notify_forwarder(&self, pv_name: &str, link: &Arc<PvaLink>) {
+        {
+            let mut started = self.forwarders.lock();
+            if started.contains(pv_name) {
+                return;
+            }
+            started.insert(pv_name.to_string());
+        }
+        let Some(rx) = link.take_notify_rx() else {
+            // OUT / non-monitor links never created a channel.
+            self.forwarders.lock().remove(pv_name);
+            return;
+        };
+        let pv_name = pv_name.to_string();
+        let scan_targets = self.scan_targets.clone();
+        let db = self.db.clone();
+        let field = link.config().field.clone();
+        self.handle
+            .spawn(run_notify_forwarder(pv_name, field, rx, scan_targets, db));
     }
 
     /// Build the INP config for `pv_name`, applying any options
@@ -288,11 +397,77 @@ pub async fn install_pvalink_resolver(
     handle: tokio::runtime::Handle,
 ) -> PvaLinkResolver {
     let resolver = PvaLinkResolver::new(handle);
+    // B3: give the resolver the DB handle so the scan-on-update
+    // forwarder can process owning records.
+    resolver.attach_database((**db).clone());
     db.set_external_resolver(resolver.clone().build_resolver())
         .await;
     db.register_link_set("pva", Arc::new(resolver.clone()))
         .await;
     resolver
+}
+
+type ScanTargetMap = Arc<parking_lot::RwLock<std::collections::HashMap<String, ScanFanout>>>;
+
+/// B3 monitor-notification forwarder loop.
+///
+/// Drains `rx` (fed by the link's monitor task) and, for every event,
+/// processes the records registered as scan-on-update targets for
+/// `pv_name`. A target with `always=false` (a `CPP` link) is skipped
+/// when the linked leaf field did not change. The loop ends when
+/// every sender is dropped (i.e. the link is closed).
+async fn run_notify_forwarder(
+    pv_name: String,
+    field: String,
+    mut rx: tokio::sync::mpsc::Receiver<PvField>,
+    scan_targets: ScanTargetMap,
+    db: Arc<parking_lot::RwLock<Option<PvDatabase>>>,
+) {
+    // Last delivered leaf value, so `always=false` targets can be
+    // skipped on a no-op update.
+    let mut last: Option<PvField> = None;
+    while let Some(value) = rx.recv().await {
+        let leaf = extract_leaf(&value, &field);
+        let changed = last.as_ref() != Some(&leaf);
+        last = Some(leaf);
+
+        let targets: Vec<(String, bool)> = match scan_targets.read().get(&pv_name) {
+            Some(fanout) => fanout
+                .records
+                .iter()
+                .map(|t| (t.record.clone(), t.always))
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let Some(db_handle) = db.read().clone() else {
+            continue;
+        };
+        for (record, always) in targets {
+            // A CPP (`always=false`) link only scans when the input
+            // value actually changed; CP scans unconditionally.
+            if !changed && !always {
+                continue;
+            }
+            let _ = db_handle.process_record(&record).await;
+        }
+    }
+}
+
+/// Walk a dotted field path and return the leaf [`PvField`]. Mirror
+/// of `link::extract_field` for the B3 forwarder's change detection.
+fn extract_leaf(root: &PvField, path: &str) -> PvField {
+    if path.is_empty() {
+        return root.clone();
+    }
+    let mut cursor = root.clone();
+    for segment in path.split('.') {
+        cursor = match cursor {
+            PvField::Structure(s) => s.get_field(segment).cloned().unwrap_or(PvField::Null),
+            other => return other,
+        };
+    }
+    cursor
 }
 
 impl LinkSet for PvaLinkResolver {
@@ -530,5 +705,182 @@ mod tests {
             .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
         let f = PvField::Structure(s);
         assert_eq!(pvfield_to_epics_value(&f), Some(EpicsValue::Long(42)));
+    }
+
+    // ---- B3: monitor-notification forwarder wiring ----
+
+    use crate::pvalink::config::SevrMode;
+    use epics_pva_rs::pvdata::PvStructure;
+
+    fn nt_scalar(v: f64) -> PvField {
+        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+        s.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(v))));
+        PvField::Structure(s)
+    }
+
+    /// A minimal record whose `process()` bumps a shared counter, so
+    /// a test can observe how many times the B3 forwarder processed
+    /// it.
+    struct CountingRecord {
+        count: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl epics_base_rs::server::record::Record for CountingRecord {
+        fn record_type(&self) -> &'static str {
+            "ai"
+        }
+        fn process(
+            &mut self,
+        ) -> epics_base_rs::error::CaResult<epics_base_rs::server::record::ProcessOutcome> {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(epics_base_rs::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, _name: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(0.0))
+        }
+        fn put_field(
+            &mut self,
+            _name: &str,
+            _value: EpicsValue,
+        ) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+            &[]
+        }
+    }
+
+    /// B3: a monitor event delivered on the forwarder channel
+    /// processes the registered owning record.
+    #[tokio::test]
+    async fn b3_forwarder_processes_owning_record_on_update() {
+        let db = PvDatabase::new();
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "DEST",
+            Box::new(CountingRecord {
+                count: count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // CP-style target: always=true so every event scans.
+        let mut fanout = ScanFanout::default();
+        fanout.records.push(ScanTarget {
+            record: "DEST".to_string(),
+            always: true,
+        });
+        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
+            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
+        ));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            "SRC".to_string(),
+            "value".to_string(),
+            rx,
+            scan_targets,
+            db_slot,
+        ));
+
+        // Two distinct values → two scans.
+        tx.send(nt_scalar(1.0)).await.unwrap();
+        tx.send(nt_scalar(2.0)).await.unwrap();
+        drop(tx); // close channel so the forwarder loop ends
+        forwarder.await.unwrap();
+
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// B3: with `always=false` (a `CPP` link) a no-op update — same
+    /// leaf value — does NOT re-process the record.
+    #[tokio::test]
+    async fn b3_forwarder_skips_unchanged_value_when_not_always() {
+        let db = PvDatabase::new();
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "DEST",
+            Box::new(CountingRecord {
+                count: count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut fanout = ScanFanout::default();
+        fanout.records.push(ScanTarget {
+            record: "DEST".to_string(),
+            always: false,
+        });
+        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
+            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
+        ));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            "SRC".to_string(),
+            "value".to_string(),
+            rx,
+            scan_targets,
+            db_slot,
+        ));
+
+        // 1.0 (change), 1.0 (no-op → skipped), 3.0 (change).
+        tx.send(nt_scalar(1.0)).await.unwrap();
+        tx.send(nt_scalar(1.0)).await.unwrap();
+        tx.send(nt_scalar(3.0)).await.unwrap();
+        drop(tx);
+        forwarder.await.unwrap();
+
+        // Only the two changed events scanned.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// B3: `open_link_for_record` registers a `proc=CP` link's scan
+    /// target and retains its parsed options (B2 `sevr` included).
+    #[tokio::test]
+    async fn b3_open_link_for_record_registers_scan_target() {
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let _ = resolver
+            .open_link_for_record("pva://SRC:PV?proc=CP&sevr=MS", "MY:REC")
+            .await;
+        let targets = resolver.scan_targets.read();
+        let fanout = targets.get("SRC:PV").expect("scan target registered");
+        assert_eq!(fanout.records.len(), 1);
+        assert_eq!(fanout.records[0].record, "MY:REC");
+        drop(targets);
+        let opts = resolver.link_options.read();
+        let cfg = opts.get("SRC:PV").expect("link options retained");
+        assert_eq!(cfg.sevr, SevrMode::Ms);
+        assert!(cfg.scan_on_update);
+    }
+
+    /// B3: a non-CP link (`proc=NPP`) opened with a record does NOT
+    /// register a scan target — only CP/CPP fan out.
+    #[tokio::test]
+    async fn b3_non_cp_link_registers_no_scan_target() {
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let _ = resolver
+            .open_link_for_record("pva://OTHER:PV?proc=NPP", "REC2")
+            .await;
+        assert!(resolver.scan_targets.read().get("OTHER:PV").is_none());
+    }
+
+    #[test]
+    fn extract_leaf_walks_dotted_path() {
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(2))));
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        let leaf = extract_leaf(&PvField::Structure(root), "alarm.severity");
+        assert!(matches!(leaf, PvField::Scalar(ScalarValue::Int(2))));
     }
 }

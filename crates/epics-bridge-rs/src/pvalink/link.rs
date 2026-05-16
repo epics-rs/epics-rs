@@ -47,9 +47,16 @@ pub struct PvaLink {
     client: PvaClient,
     /// Latest received value (INP only — None until first event).
     latest: Arc<Mutex<Option<PvField>>>,
-    /// Subscriber channel for record-side notification (INP monitor mode).
-    #[allow(dead_code)]
-    notify_tx: Option<mpsc::Sender<PvField>>,
+    /// Receiver half of the INP-monitor record-notification channel.
+    ///
+    /// B3: every monitor event for an INP+monitor link pushes the new
+    /// [`PvField`] onto this channel (the sender lives inside the
+    /// spawned monitor task). [`Self::take_notify_rx`] hands the
+    /// receiver to the resolver, which forwards events into
+    /// `scan_on_update` / CP processing of the owning record. Wrapped
+    /// in a `Mutex<Option<..>>` because the receiver is single-consumer
+    /// and is moved out exactly once.
+    notify_rx: Mutex<Option<mpsc::Receiver<PvField>>>,
 }
 
 struct MonitorAbort(tokio::task::AbortHandle);
@@ -68,12 +75,18 @@ impl PvaLink {
         let client = PvaClient::builder().timeout(Duration::from_secs(5)).build();
 
         let latest = Arc::new(Mutex::new(None));
-        let mut notify_tx = None;
+        let mut notify_rx = None;
         let mut monitor_abort = None;
 
         if matches!(config.direction, LinkDirection::Inp) && config.monitor {
-            let (tx, _rx) = mpsc::channel::<PvField>(64);
-            notify_tx = Some(tx.clone());
+            // B3: the receiver half is handed to the resolver, which
+            // forwards every monitor event into scan-on-update / CP
+            // processing of the owning record. `try_send` below
+            // tolerates a full channel — the `latest` cache is
+            // authoritative for the value itself; the channel only
+            // drives record processing.
+            let (tx, rx) = mpsc::channel::<PvField>(64);
+            notify_rx = Some(rx);
 
             let pv_name = config.pv_name.clone();
             let latest_clone = latest.clone();
@@ -93,9 +106,19 @@ impl PvaLink {
             config,
             client,
             latest,
-            notify_tx,
+            notify_rx: Mutex::new(notify_rx),
             _monitor_abort: monitor_abort,
         })
+    }
+
+    /// Take the INP-monitor notification receiver (B3). Returns the
+    /// channel exactly once; subsequent calls return `None`. The
+    /// resolver calls this right after `open` to spawn the
+    /// scan-on-update forwarder. `None` for OUT / non-monitor links
+    /// (they never created a channel) or after the receiver has
+    /// already been claimed.
+    pub fn take_notify_rx(&self) -> Option<mpsc::Receiver<PvField>> {
+        self.notify_rx.lock().take()
     }
 
     pub fn config(&self) -> &PvaLinkConfig {
@@ -289,7 +312,7 @@ impl PvaLink {
             config,
             client,
             latest: Arc::new(Mutex::new(cached)),
-            notify_tx: None,
+            notify_rx: Mutex::new(None),
         }
     }
 }
@@ -462,5 +485,16 @@ mod tests {
         let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), None);
         assert_eq!(link.link_alarm_severity(), None);
         assert_eq!(link.alarm_message(), None);
+    }
+
+    // ---- B3: notify receiver ----
+
+    #[test]
+    fn b3_take_notify_rx_only_once() {
+        // A link built via for_test has no live monitor, so
+        // take_notify_rx is None — the live-channel path is covered
+        // by the integration-side forwarder test.
+        let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), None);
+        assert!(link.take_notify_rx().is_none());
     }
 }

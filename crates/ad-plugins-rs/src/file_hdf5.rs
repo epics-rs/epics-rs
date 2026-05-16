@@ -681,6 +681,17 @@ impl Hdf5Writer {
                     .create(DTYPE_ATTR)
                     .and_then(|a| a.write_numeric(&dtype_ordinal));
                 // Record the configured fill value.
+                //
+                // CRATE LIMITATION: C++ NDFileHDF5 sets HDF5_fillValue on the
+                // dataset creation property list (H5Pset_fill_value). rust-hdf5
+                // 0.2.12 hard-codes the HDF5 Fill Value message to zeros for
+                // chunked datasets (writer.rs `fill_value: None`) and exposes
+                // no DatasetBuilder / create_dataset API to override it, so the
+                // value cannot reach the DCPL. The closest correct alternative
+                // is to record it as a dataset attribute named HDF5_fillValue;
+                // downstream tooling can read it, but unwritten chunks still
+                // read back as zero, not `fill`. A true fix needs a rust-hdf5
+                // release with a fill-value API.
                 let _ = ds
                     .new_attr::<f64>()
                     .shape(())
@@ -1771,6 +1782,30 @@ mod tests {
         // Numeric type preserved: i32, not stringified.
         let cnt_vals: Vec<i32> = cnt.read_raw().unwrap();
         assert_eq!(cnt_vals, vec![10, 20, 30]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_fill_value_recorded_on_dataset() {
+        // rust-hdf5 0.2.12 cannot set the DCPL fill value, so the configured
+        // HDF5_fillValue is recorded as a dataset attribute. Verify it round-trips.
+        let path = temp_path("hdf5_fill");
+        let mut writer = Hdf5Writer::new();
+        writer.set_fill_value(7.5);
+
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        let fv: f64 = ds.attr("HDF5_fillValue").unwrap().read_numeric().unwrap();
+        assert_eq!(fv, 7.5);
 
         std::fs::remove_file(&path).ok();
     }

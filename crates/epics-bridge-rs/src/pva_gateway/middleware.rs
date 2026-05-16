@@ -232,13 +232,28 @@ impl AclConfig {
     }
 }
 
+/// B7: per-pattern compiled-program size limit for operator-supplied
+/// ACL regexes. 256 KiB is far more than any realistic PV-name
+/// pattern needs (a generous allow/deny list compiles to a few KiB)
+/// while still rejecting a pathological pattern up front instead of
+/// letting it consume unbounded memory at compile time.
+const ACL_REGEX_SIZE_LIMIT: usize = 256 * 1024;
+
 /// B7: compile `pattern` as a both-ends-anchored regex so a regex
 /// ACL entry matches whole PV names, mirroring glob semantics
 /// (`BL10C:*` ≡ `BL10C:.*`, bare token ≡ exact match). Wrapping in a
 /// non-capturing group keeps top-level alternation (`a|b`) anchored
 /// as `^(?:a|b)$` rather than `^a|b$`.
+///
+/// Compiled via [`regex::RegexBuilder`] with explicit `size_limit`
+/// and `dfa_size_limit` so an operator-supplied pathological pattern
+/// fails fast with a bounded `regex::Error` rather than compiling
+/// with the crate defaults (which allow far larger programs).
 fn compile_anchored(pattern: &str) -> Result<regex::Regex, regex::Error> {
-    regex::Regex::new(&format!("^(?:{pattern})$"))
+    regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
+        .size_limit(ACL_REGEX_SIZE_LIMIT)
+        .dfa_size_limit(ACL_REGEX_SIZE_LIMIT)
+        .build()
 }
 
 fn matches_pattern(pattern: &str, name: &str) -> bool {
@@ -970,6 +985,41 @@ mod tests {
     fn acl_invalid_regex_rejected_at_build() {
         assert!(AclConfig::default().deny_regex(r"BL10C:[").is_err());
         assert!(AclConfig::default().allow_regex(r"(unclosed").is_err());
+    }
+
+    /// B7: a pathological operator-supplied ACL regex whose compiled
+    /// program exceeds `ACL_REGEX_SIZE_LIMIT` must fail fast at build
+    /// time with a bounded `regex::Error` rather than compiling with
+    /// the crate's larger defaults. A bounded counted repetition of a
+    /// large bounded inner repetition blows the program size well
+    /// past 256 KiB while staying a syntactically valid pattern.
+    #[test]
+    fn acl_oversized_regex_rejected_by_size_limit() {
+        // `(?:a{1000}){1000}` — syntactically valid, but the compiled
+        // program is far larger than the 256 KiB ACL limit.
+        let pathological = r"(?:a{1000}){1000}";
+
+        // `compile_anchored` is the single funnel both `deny_regex`
+        // and `allow_regex` route through — test it directly so the
+        // failing error variant is observable (`AclConfig` is not
+        // `Debug`, so `expect_err` on the builder is unavailable).
+        match compile_anchored(pathological) {
+            Err(regex::Error::CompiledTooBig(_)) => {}
+            other => panic!("expected CompiledTooBig, got {other:?}"),
+        }
+        // Both ACL builder entry points reject it.
+        assert!(
+            AclConfig::default().deny_regex(pathological).is_err(),
+            "oversized deny regex must be rejected"
+        );
+        assert!(
+            AclConfig::default().allow_regex(pathological).is_err(),
+            "oversized allow regex must be rejected"
+        );
+
+        // A realistic ACL pattern still compiles fine under the limit.
+        assert!(compile_anchored(r"BL\d+C:.*:HV").is_ok());
+        assert!(AclConfig::default().deny_regex(r"BL\d+C:.*:HV").is_ok());
     }
 
     /// The regex ACL still gates through the `AclLayer` wrapper on a

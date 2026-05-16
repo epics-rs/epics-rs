@@ -357,11 +357,22 @@ async fn main() {
                 }
             }
             Err(e) if e.contains("not connected") || e.contains("isconnect") => {
-                println!(
-                    "{}{}*** Not connected (PV not found)",
-                    pad_name(true, pv_name),
-                    sep
-                );
+                // C prints two different strings: plain/terse mode
+                // (caget.c:265) prints lowercase `*** not connected`;
+                // only `-a`/wide mode (print_time_val_sts,
+                // tool_lib.c:521) prints `*** Not connected (PV not
+                // found)`.
+                if args.wide {
+                    println!(
+                        "{}{}*** Not connected (PV not found)",
+                        pad_name(true, pv_name),
+                        sep
+                    );
+                } else if args.terse {
+                    println!("*** not connected");
+                } else {
+                    println!("{}{}*** not connected", pad_name(true, pv_name), sep);
+                }
                 failed = true;
             }
             Err(e) if e.contains("timeout") => {

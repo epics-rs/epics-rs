@@ -171,7 +171,6 @@ impl MotorRecord {
         self.stat.mip = MipFlags::empty();
         self.stat.dmov = true;
         self.stat.movn = false;
-        self.suppress_flnk = false;
         self.retry.rcnt = 0;
         self.internal.backlash_pending = false;
         self.internal.pending_retarget = None;

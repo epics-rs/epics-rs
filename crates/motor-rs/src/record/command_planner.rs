@@ -266,7 +266,6 @@ impl MotorRecord {
                 // (with no pending event) will finalize with DMOV=1.
                 self.stat.dmov = false;
                 self.stat.movn = true;
-                self.suppress_flnk = true;
                 // Request a poll so the next I/O Intr cycle completes
                 effects.request_poll = true;
                 effects.suppress_forward_link = true;
@@ -302,7 +301,6 @@ impl MotorRecord {
 
         // DMOV pulse: set false before starting
         self.stat.dmov = false;
-        self.suppress_flnk = true;
         self.retry.rcnt = 0;
         self.retry.miss = false;
 
@@ -459,7 +457,6 @@ impl MotorRecord {
         }
 
         self.stat.dmov = false;
-        self.suppress_flnk = true;
 
         if forward {
             self.stat.mip = MipFlags::JOGF;
@@ -543,7 +540,6 @@ impl MotorRecord {
         }
 
         self.stat.dmov = false;
-        self.suppress_flnk = true;
 
         if forward {
             self.stat.mip = MipFlags::HOMF;

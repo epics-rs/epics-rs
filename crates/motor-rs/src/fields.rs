@@ -332,7 +332,6 @@ pub struct InternalFields {
     pub ldvl: f64,
     pub lrvl: i64,
     pub lspg: SpmgMode,
-    pub pp: bool,
     pub sync: bool,
     /// Backlash final move pending after MainMove completes
     pub backlash_pending: bool,

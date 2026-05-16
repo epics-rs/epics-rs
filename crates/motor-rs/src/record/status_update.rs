@@ -152,8 +152,8 @@ impl MotorRecord {
         // C: ea063f5f (2008) — when the driver is moving but the record had no
         // pending motion, this is an externally initiated move (someone called
         // the controller directly, or another record drove the same axis).
-        // Mark MIP_EXTERNAL, clear DMOV, and queue a post-process so the next
-        // process() resynchronizes once movement completes.
+        // Mark MIP_EXTERNAL and clear DMOV; do_process() routes the next
+        // process() into check_completion via the MIP_EXTERNAL bit.
         if self.stat.movn
             && self.stat.dmov
             && self.stat.phase == MotionPhase::Idle
@@ -161,7 +161,6 @@ impl MotorRecord {
         {
             self.stat.dmov = false;
             self.stat.mip |= MipFlags::EXTERNAL;
-            self.internal.pp = true;
         }
 
         // Limit switches: map raw -> user based on DIR and MRES sign

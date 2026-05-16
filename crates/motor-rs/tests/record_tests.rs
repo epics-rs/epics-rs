@@ -1657,7 +1657,6 @@ fn test_external_move_detected_when_driver_moves_while_idle() {
 
     assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
     assert!(!rec.stat.dmov);
-    assert!(rec.internal.pp);
 }
 
 #[test]
@@ -1684,11 +1683,11 @@ fn test_external_move_idempotent_on_repeat_poll() {
         vbas_supported: true,
     };
     rec.process_motor_info(&status);
-    rec.internal.pp = false; // simulate that process consumed pp
-    // Second poll while still moving should not re-trigger external flagging
+    assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
+    // Second poll while still moving must not re-trigger external flagging
+    // (the !mip.contains(EXTERNAL) guard makes it idempotent).
     rec.process_motor_info(&status);
     assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
-    assert!(!rec.internal.pp); // not re-set
 }
 
 #[test]

@@ -928,6 +928,22 @@ impl PvaClient {
         op_rpc(&ch, request_desc, request_value, self.inner.timeout).await
     }
 
+    /// Same as [`Self::pvrpc`] but pins the operation to a specific
+    /// server, bypassing UDP search. Mirrors pvxs
+    /// `ctxt.rpc(name).server(addr)` (`tools/list.cpp`). Required for
+    /// querying server-internal PVs (e.g. the special `server` PV used
+    /// by `pvlist <ip>`) which are not announced via search.
+    pub async fn pvrpc_from(
+        &self,
+        pv_name: &str,
+        server: SocketAddr,
+        request_desc: &FieldDesc,
+        request_value: &PvField,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel_with_forced(pv_name, Some(server)).await?;
+        op_rpc(&ch, request_desc, request_value, self.inner.timeout).await
+    }
+
     /// Snapshot of the client's current state — channel cache size,
     /// connection-pool peers, name-server count, etc. Mirrors pvxs
     /// `Context::report` (client.h:599) at the "summary counters"

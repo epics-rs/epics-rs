@@ -18,9 +18,9 @@
 //!  "result":"ok"}
 //! ```
 //!
-//! Event types: `connect`, `disconnect`, `create_chan`, `caput`,
-//! `acf_deny`, `subscribe`, `unsubscribe`. Keep additions strictly
-//! additive — downstream log shippers parse the JSON.
+//! Event types: `connect`, `disconnect`, `create_chan`, `caget`,
+//! `caput`, `acf_deny`, `subscribe`, `unsubscribe`. Keep additions
+//! strictly additive — downstream log shippers parse the JSON.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -116,10 +116,11 @@ impl AuditEvent<'_> {
     ///
     /// `MM/DD/YYYY HH:MM:SS ASUSER <op> <user>@<host> <verb>: <pv>[=<value>] <result>`
     ///
-    /// `<op>` is `R` (read) for `subscribe`, `W` (write) for `caput`,
-    /// `C` (connect) / `D` (disconnect) for connection lifecycle, or
-    /// `?` for any other event type. `<verb>` is the full event name
-    /// so downstream parsers can disambiguate.
+    /// `<op>` is `R` (read) for `subscribe` / `unsubscribe` / `caget`,
+    /// `W` (write) for `caput`, `C` (connect) / `D` (disconnect) for
+    /// connection lifecycle, `O` (open) for `create_chan`, `X` for
+    /// `acf_deny`, or `?` for any other event type. `<verb>` is the
+    /// full event name so downstream parsers can disambiguate.
     fn to_aslog_line(&self) -> String {
         let now = chrono::Utc::now();
         let ts = now.format("%m/%d/%Y %H:%M:%S");

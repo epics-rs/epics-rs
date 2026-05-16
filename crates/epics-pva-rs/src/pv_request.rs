@@ -491,6 +491,8 @@ enum Token {
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Equal,
     Field,
     Record,
@@ -552,6 +554,14 @@ impl<'a> Parser<'a> {
                 self.advance(1);
                 Ok(Token::RBracket)
             }
+            '{' => {
+                self.advance(1);
+                Ok(Token::LBrace)
+            }
+            '}' => {
+                self.advance(1);
+                Ok(Token::RBrace)
+            }
             '=' => {
                 self.advance(1);
                 Ok(Token::Equal)
@@ -594,7 +604,10 @@ impl<'a> Parser<'a> {
                     self.parse_options(out)?;
                 }
                 Token::Name(s) => {
-                    out.fields.push(s);
+                    // Bare-name short-hand for `field(name)`. pvDataCPP also
+                    // allows a brace group to follow a bare name here, e.g.
+                    // `value{a,b}` — treat it as `field(value{a,b})`.
+                    self.parse_field_entry(s, "", out)?;
                 }
                 other => {
                     return Err(PvRequestParseError::UnexpectedChar {
@@ -607,14 +620,103 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Parse the comma-separated entry list of a top-level `field(...)`,
+    /// terminated by `RParen`.
+    ///
+    /// Each entry is a dotted/brace path. Every leaf path pushed into
+    /// `out.fields` is the entry's fully-joined dotted form, so the brace
+    /// dialect `field(v{a,b})` and the dotted dialect `field(v.a,v.b)`
+    /// both yield the identical flat path list `["v.a", "v.b"]`.
+    /// An immediately-closing `field()` is the valid select-all form.
     fn parse_field_list(&mut self, out: &mut PvRequestExpr) -> Result<(), PvRequestParseError> {
         loop {
             let tok = self.lex()?;
             match tok {
                 Token::RParen => return Ok(()),
+                Token::Comma => {
+                    // A leading or doubled comma is tolerated (matches the
+                    // lenient pvxs `parse_fields` loop).
+                    continue;
+                }
+                Token::Name(s) => {
+                    self.parse_field_entry(s, "", out)?;
+                }
+                Token::Eof => {
+                    return Err(PvRequestParseError::Unterminated { pos: self.pos });
+                }
+                other => {
+                    return Err(PvRequestParseError::UnexpectedChar {
+                        pos: self.pos,
+                        chr: format!("{other:?}"),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Parse a single field entry whose leading name has already been
+    /// lexed as `name`. `prefix` is the dotted ancestry above it.
+    ///
+    /// An entry is `name` optionally followed by a brace member group
+    /// `{ sub-entry-list }`. The name itself may be a dotted path
+    /// (`alarm.severity`) since the lexer treats `.` as part of a name;
+    /// such a dotted name simply becomes part of the joined prefix.
+    ///
+    /// - Bare `name` (no brace)         → push `prefix + name`.
+    /// - `name{a,b}`                    → recurse with prefix `name`.
+    /// - `name{a{c},b}`                 → fully nested recursion.
+    ///
+    /// After the entry (and its optional brace group) is consumed, the
+    /// caller's list loop resumes at the following `,` / terminator.
+    fn parse_field_entry(
+        &mut self,
+        name: String,
+        prefix: &str,
+        out: &mut PvRequestExpr,
+    ) -> Result<(), PvRequestParseError> {
+        let joined = join_path(prefix, &name);
+        // Look ahead: a `{` immediately after the name opens a member
+        // group; anything else means this entry is a leaf path.
+        let save = self.pos;
+        let tok = self.lex()?;
+        if tok == Token::LBrace {
+            // Nested member group. Recurse, parsing the sub-list with the
+            // current joined path as the new prefix.
+            self.parse_brace_group(&joined, out)?;
+        } else {
+            // Not a brace group — this entry is a complete leaf path.
+            // Rewind so the caller's list loop sees the terminator/comma.
+            self.pos = save;
+            out.fields.push(joined);
+        }
+        Ok(())
+    }
+
+    /// Parse the body of a `{ ... }` member group whose opening `{` has
+    /// already been consumed. `prefix` is the dotted ancestry that every
+    /// sub-entry hangs off of.
+    fn parse_brace_group(
+        &mut self,
+        prefix: &str,
+        out: &mut PvRequestExpr,
+    ) -> Result<(), PvRequestParseError> {
+        let mut first = true;
+        loop {
+            let tok = self.lex()?;
+            match tok {
+                Token::RBrace => {
+                    if first {
+                        return Err(PvRequestParseError::UnexpectedChar {
+                            pos: self.pos,
+                            chr: "empty {}".to_string(),
+                        });
+                    }
+                    return Ok(());
+                }
                 Token::Comma => continue,
                 Token::Name(s) => {
-                    out.fields.push(s);
+                    first = false;
+                    self.parse_field_entry(s, prefix, out)?;
                 }
                 Token::Eof => {
                     return Err(PvRequestParseError::Unterminated { pos: self.pos });
@@ -678,6 +780,20 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Join a dotted `prefix` with a `segment`, both of which may themselves
+/// be dotted paths. An empty prefix yields the segment unchanged so the
+/// brace and dotted dialects produce identical flat paths:
+/// `field(v{a,b})` → `v.a`,`v.b` ; `field(v.a,v.b)` → `v.a`,`v.b`.
+fn join_path(prefix: &str, segment: &str) -> String {
+    if prefix.is_empty() {
+        segment.to_string()
+    } else if segment.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}.{segment}")
+    }
+}
+
 fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_' || c.is_ascii_digit()
 }
@@ -701,5 +817,159 @@ mod tests {
         let full = build_pv_request(false);
         let value_only = build_pv_request_value_only(false);
         assert!(value_only.len() < full.len());
+    }
+
+    // ── pvRequest expression parser ──────────────────────────────────
+
+    fn fields(expr: &str) -> Vec<String> {
+        PvRequestExpr::parse(expr).expect("parse ok").fields
+    }
+
+    #[test]
+    fn parses_dotted_dialect() {
+        assert_eq!(fields("field(value,alarm.severity)"), ["value", "alarm.severity"]);
+    }
+
+    #[test]
+    fn parses_brace_member_group() {
+        // pvDataCPP dialect: `value{a,b}` == `value.a, value.b`.
+        assert_eq!(
+            fields("field(value{LMT_l,LTM_h})"),
+            ["value.LMT_l", "value.LTM_h"]
+        );
+    }
+
+    #[test]
+    fn brace_and_dotted_dialects_are_equivalent() {
+        // The pvxs issue #156 core requirement: the two dialects must
+        // produce the same field selection.
+        let dotted = PvRequestExpr::parse("field(value.LMT_l,value.LTM_h)").unwrap();
+        let brace = PvRequestExpr::parse("field(value{LMT_l,LTM_h})").unwrap();
+        assert_eq!(dotted, brace);
+        assert_eq!(dotted.to_field_desc(), brace.to_field_desc());
+    }
+
+    #[test]
+    fn nested_brace_groups() {
+        // `a{b{c,d},e}` == `a.b.c, a.b.d, a.e`.
+        assert_eq!(
+            fields("field(a{b{c,d},e})"),
+            ["a.b.c", "a.b.d", "a.e"]
+        );
+    }
+
+    #[test]
+    fn nested_brace_equivalent_to_dotted() {
+        let brace = PvRequestExpr::parse("field(a{b{c,d},e})").unwrap();
+        let dotted = PvRequestExpr::parse("field(a.b.c,a.b.d,a.e)").unwrap();
+        assert_eq!(brace, dotted);
+        assert_eq!(brace.to_field_desc(), dotted.to_field_desc());
+    }
+
+    #[test]
+    fn dotted_name_with_trailing_brace_group() {
+        // A dotted prefix segment may itself carry a brace group.
+        assert_eq!(
+            fields("field(a.b{c,d})"),
+            ["a.b.c", "a.b.d"]
+        );
+        // …and that equals the fully-dotted spelling.
+        assert_eq!(
+            PvRequestExpr::parse("field(a.b{c,d})").unwrap(),
+            PvRequestExpr::parse("field(a.b.c,a.b.d)").unwrap()
+        );
+    }
+
+    #[test]
+    fn brace_group_inside_dotted_prefix_then_more() {
+        // Mixed dialect: a brace group followed by a sibling at the
+        // top level.
+        assert_eq!(
+            fields("field(value{a,b},timeStamp)"),
+            ["value.a", "value.b", "timeStamp"]
+        );
+    }
+
+    #[test]
+    fn deeply_nested_braces() {
+        assert_eq!(
+            fields("field(a{b{c{d,e},f},g})"),
+            ["a.b.c.d", "a.b.c.e", "a.b.f", "a.g"]
+        );
+    }
+
+    #[test]
+    fn brace_group_on_bare_name_shorthand() {
+        // pvDataCPP allows the brace group without a `field(...)` wrapper.
+        assert_eq!(fields("value{a,b}"), ["value.a", "value.b"]);
+        assert_eq!(
+            PvRequestExpr::parse("value{a,b}").unwrap(),
+            PvRequestExpr::parse("field(value.a,value.b)").unwrap()
+        );
+    }
+
+    #[test]
+    fn brace_groups_coexist_with_record_options() {
+        let expr =
+            PvRequestExpr::parse("field(value{a,b})record[pipeline=true]").unwrap();
+        assert_eq!(expr.fields, ["value.a", "value.b"]);
+        assert_eq!(
+            expr.record_options,
+            [("pipeline".to_string(), "true".to_string())]
+        );
+    }
+
+    #[test]
+    fn whitespace_inside_brace_group() {
+        assert_eq!(
+            fields("field( value { a , b } )"),
+            ["value.a", "value.b"]
+        );
+    }
+
+    #[test]
+    fn empty_brace_group_is_rejected() {
+        // pvDataCPP rejects `{}` ("empty {}").
+        assert!(PvRequestExpr::parse("field(value{})").is_err());
+    }
+
+    #[test]
+    fn empty_nested_brace_group_is_rejected() {
+        assert!(PvRequestExpr::parse("field(a{b{}})").is_err());
+    }
+
+    #[test]
+    fn unterminated_brace_group_is_error() {
+        assert!(PvRequestExpr::parse("field(value{a,b").is_err());
+    }
+
+    #[test]
+    fn brace_dialect_encodes_same_field_desc_as_dotted() {
+        // End-to-end: the wire FieldDesc tree must be byte-identical for
+        // equivalent dotted and brace expressions.
+        let dotted = PvRequestExpr::parse("field(a.b,a.c,d)").unwrap();
+        let brace = PvRequestExpr::parse("field(a{b,c},d)").unwrap();
+        assert_eq!(dotted.to_field_desc(), brace.to_field_desc());
+        assert_eq!(dotted.encode(false), brace.encode(false));
+        assert_eq!(dotted.encode(true), brace.encode(true));
+    }
+
+    #[test]
+    fn brace_group_repeated_subfield_dedups_in_nested_tree() {
+        // `a{b,b.c}` → paths a.b and a.b.c; build_nested must merge them
+        // under a single `a` → `b` node, same as the dotted spelling.
+        let brace = PvRequestExpr::parse("field(a{b,b.c})").unwrap();
+        let dotted = PvRequestExpr::parse("field(a.b,a.b.c)").unwrap();
+        assert_eq!(brace.fields, ["a.b", "a.b.c"]);
+        assert_eq!(brace.to_field_desc(), dotted.to_field_desc());
+    }
+
+    #[test]
+    fn builder_pv_request_accepts_brace_dialect() {
+        let built = PvRequestBuilder::new()
+            .pv_request("field(value{LMT_l,LTM_h})")
+            .expect("parse ok")
+            .build();
+        assert_eq!(built.fields, ["value.LMT_l", "value.LTM_h"]);
     }
 }

@@ -213,6 +213,27 @@ struct ForwardTarget {
     iface_v4: Option<Ipv4Addr>,
 }
 
+/// The `IP_MULTICAST_TTL` / `IP_MULTICAST_IF` values to assert on the
+/// shared send socket before forwarding to `tgt`.
+///
+/// `None` for a unicast destination — no multicast setsockopt is
+/// needed. For a multicast destination it is always `Some`: the
+/// override when present, otherwise the platform defaults (TTL 1,
+/// interface `INADDR_ANY`). Returning the defaults rather than `None`
+/// is the F3 fix — a multicast target WITHOUT overrides must still
+/// reset the shared socket so a prior destination's state cannot
+/// bleed through. Mirrors pvxs `mcast_prep_sendto`, which runs for
+/// every multicast destination.
+fn multicast_opts_for(tgt: &ForwardTarget) -> Option<(u32, Ipv4Addr)> {
+    if !tgt.addr.ip().is_multicast() {
+        return None;
+    }
+    Some((
+        tgt.ttl.unwrap_or(1),
+        tgt.iface_v4.unwrap_or(Ipv4Addr::UNSPECIFIED),
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -295,13 +316,11 @@ async fn main() {
     if let Err(e) = send_socket.set_broadcast(true) {
         eprintln!("mshim-rs: set_broadcast: {e}");
     }
-    // Apply `@iface` / `,ttl#` to the send socket. mshim uses a
-    // single send socket; when several multicast destinations request
-    // different overrides we apply each before its send (see the
-    // per-target apply in the recv loop). The values set here are the
-    // socket's defaults — the last forward target's settings — and
-    // are re-asserted per datagram so concurrent destinations with
-    // distinct overrides each get their own.
+    // mshim uses a single shared send socket. `IP_MULTICAST_TTL` /
+    // `IP_MULTICAST_IF` are setsockopt state on that socket, so the
+    // recv loop re-asserts both for every multicast destination before
+    // its send — overrides when present, platform defaults otherwise —
+    // so one destination's settings never bleed into another's.
     let send_sock_std: StdUdpSocket = send_socket.into();
     let send_sock = match UdpSocket::from_std(send_sock_std) {
         Ok(s) => s,
@@ -373,32 +392,27 @@ async fn main() {
                                 continue;
                             }
                             // Apply per-destination multicast options
-                            // before the send. `set_multicast_*`
-                            // operate on the underlying socket; we
-                            // re-assert them each datagram so two
-                            // destinations with distinct overrides on
-                            // the shared send socket don't bleed into
-                            // each other.
-                            if tgt.addr.ip().is_multicast()
-                                && (tgt.ttl.is_some() || tgt.iface_v4.is_some())
-                            {
+                            // before the send — for EVERY multicast
+                            // target, override or not (see
+                            // `multicast_opts_for`). `set_multicast_*`
+                            // operate on the shared send socket, so a
+                            // destination without overrides must still
+                            // reset to the defaults or it inherits the
+                            // previous destination's settings.
+                            if let Some((ttl, iface)) = multicast_opts_for(tgt) {
                                 // `SockRef` borrows the tokio socket's
                                 // fd so we can reach the setsockopt-
                                 // backed multicast options tokio's
                                 // `UdpSocket` doesn't expose directly
                                 // (notably `IP_MULTICAST_IF`).
                                 let sref = SockRef::from(send_sock.as_ref());
-                                if let Some(ttl) = tgt.ttl
-                                    && let Err(e) = sref.set_multicast_ttl_v4(ttl)
-                                {
+                                if let Err(e) = sref.set_multicast_ttl_v4(ttl) {
                                     eprintln!(
                                         "mshim-rs: set multicast ttl for {}: {e}",
                                         tgt.addr
                                     );
                                 }
-                                if let Some(iface) = tgt.iface_v4
-                                    && let Err(e) = sref.set_multicast_if_v4(&iface)
-                                {
+                                if let Err(e) = sref.set_multicast_if_v4(&iface) {
                                     eprintln!(
                                         "mshim-rs: set multicast iface for {}: {e}",
                                         tgt.addr
@@ -542,5 +556,68 @@ mod tests {
         if let Ok(v4) = lo {
             assert!(v4.is_loopback(), "loopback iface should map to a loopback addr");
         }
+    }
+
+    fn fwd(ip: &str, ttl: Option<u32>, iface: Option<Ipv4Addr>) -> ForwardTarget {
+        ForwardTarget {
+            addr: SocketAddr::new(ip.parse().unwrap(), 5076),
+            ttl,
+            iface_v4: iface,
+        }
+    }
+
+    /// F3: a unicast destination needs no multicast setsockopt.
+    #[test]
+    fn multicast_opts_none_for_unicast() {
+        assert_eq!(multicast_opts_for(&fwd("192.168.1.10", None, None)), None);
+        // An override on a unicast target is still irrelevant.
+        assert_eq!(
+            multicast_opts_for(&fwd("192.168.1.10", Some(64), None)),
+            None
+        );
+    }
+
+    /// F3: a multicast destination WITH overrides reports them verbatim.
+    #[test]
+    fn multicast_opts_uses_override() {
+        let iface = Ipv4Addr::new(192, 168, 1, 5);
+        assert_eq!(
+            multicast_opts_for(&fwd("224.1.1.1", Some(32), Some(iface))),
+            Some((32, iface))
+        );
+    }
+
+    /// F3 regression: a multicast destination WITHOUT overrides must
+    /// still report the platform defaults (TTL 1, INADDR_ANY) so the
+    /// shared send socket is reset — it must NOT report `None`, which
+    /// would let a prior destination's TTL/IF bleed through.
+    #[test]
+    fn multicast_opts_resets_to_defaults_without_override() {
+        assert_eq!(
+            multicast_opts_for(&fwd("224.1.1.1", None, None)),
+            Some((1, Ipv4Addr::UNSPECIFIED))
+        );
+    }
+
+    /// F3: mixed targets — an override target followed by a bare
+    /// multicast target — each resolve to independent option sets, so
+    /// forwarding to the bare target after the override target resets
+    /// the socket instead of inheriting TTL 32 / the override iface.
+    #[test]
+    fn multicast_opts_mixed_targets_do_not_bleed() {
+        let iface = Ipv4Addr::new(10, 0, 0, 1);
+        let with_override = fwd("239.0.0.1", Some(32), Some(iface));
+        let bare = fwd("239.0.0.2", None, None);
+
+        assert_eq!(
+            multicast_opts_for(&with_override),
+            Some((32, iface)),
+            "override target keeps its settings"
+        );
+        assert_eq!(
+            multicast_opts_for(&bare),
+            Some((1, Ipv4Addr::UNSPECIFIED)),
+            "bare target resets to defaults, not the prior target's 32/{iface}"
+        );
     }
 }

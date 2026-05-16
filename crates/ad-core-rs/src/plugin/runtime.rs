@@ -140,6 +140,22 @@ impl ParamUpdate {
             value,
         }
     }
+    /// Create an Octet (string) update at addr 0.
+    pub fn octet(reason: usize, value: String) -> Self {
+        Self::Octet {
+            reason,
+            addr: 0,
+            value,
+        }
+    }
+    /// Create an Octet (string) update at a specific addr.
+    pub fn octet_addr(reason: usize, addr: i32, value: String) -> Self {
+        Self::Octet {
+            reason,
+            addr,
+            value,
+        }
+    }
 }
 
 /// Result of processing one array: output arrays + param updates to write back.

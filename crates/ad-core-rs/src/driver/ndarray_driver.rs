@@ -65,16 +65,29 @@ fn sprintf_template(template: &str, path: &str, name: &str, number: i32) -> Stri
 }
 
 /// Format an integer with a printf-style width/precision spec.
-/// Handles specs like "", "3.3", "04", "06", "3", ".3", etc.
+///
+/// Emulates C `printf` integer conversion:
+/// - **precision** (`.N`) is the minimum number of digits — the value is
+///   zero-padded on the left to at least that many digits.
+/// - **width** (`N`) is the minimum field width — the (already
+///   precision-padded) string is then padded with spaces on the left
+///   (right-justified) to at least that width.
+/// - the `0` flag, when present and there is no precision, makes the width
+///   pad with zeros instead of spaces (C ignores `0` when a precision is
+///   given for integer conversions).
+///
+/// Examples: `%3.3d` of 7 → `"007"`; `%5.3d` of 42 → `"  042"`;
+/// `%04d` of 7 → `"0007"`; `%5d` of 7 → `"    7"`.
 fn format_int_spec(spec: &str, value: i32) -> String {
     if spec.is_empty() {
         return value.to_string();
     }
 
-    let zero_pad = spec.starts_with('0');
-    let spec_clean = spec.trim_start_matches('0');
+    let zero_flag = spec.starts_with('0');
+    // Strip only the leading flag '0' before parsing width digits.
+    let spec_clean = if zero_flag { &spec[1..] } else { spec };
 
-    // Split on '.' for width.precision
+    // Split on '.' into width.precision.
     let (width_str, prec_str) = if let Some(dot_pos) = spec_clean.find('.') {
         (&spec_clean[..dot_pos], Some(&spec_clean[dot_pos + 1..]))
     } else {
@@ -82,17 +95,37 @@ fn format_int_spec(spec: &str, value: i32) -> String {
     };
 
     let width: usize = width_str.parse().unwrap_or(0);
+    let has_precision = prec_str.is_some();
     let precision: usize = prec_str.and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    let min_digits = width.max(precision);
-    if min_digits == 0 {
-        return value.to_string();
-    }
-
-    if zero_pad || precision > 0 {
-        format!("{:0>width$}", value, width = min_digits)
+    // Step 1: render the integer, zero-padded to `precision` digits.
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let digits = if digits.len() < precision {
+        format!("{}{}", "0".repeat(precision - digits.len()), digits)
     } else {
-        format!("{:>width$}", value, width = min_digits)
+        digits
+    };
+    let body = if negative {
+        format!("-{digits}")
+    } else {
+        digits
+    };
+
+    // Step 2: pad to the field width. C uses zero-padding for the width only
+    // when the `0` flag is set AND no precision was specified.
+    if body.len() >= width {
+        body
+    } else if zero_flag && !has_precision {
+        let pad = width - body.len();
+        if negative {
+            // Keep the sign at the front of zero-padding (C behavior).
+            format!("-{}{}", "0".repeat(pad), &body[1..])
+        } else {
+            format!("{}{}", "0".repeat(pad), body)
+        }
+    } else {
+        format!("{}{}", " ".repeat(width - body.len()), body)
     }
 }
 
@@ -225,12 +258,10 @@ impl NDArrayDriverBase {
             .get_int32_param(self.params.auto_increment, 0)
             .unwrap_or(0);
 
-        let full = if template.is_empty() {
-            format!("{}{}{:04}", path, name, number)
-        } else {
-            // Parse C printf-style template: two %s args (path, name) and one %d-like arg (number)
-            sprintf_template(template, path, name, number)
-        };
+        // C parity: an empty FILE_TEMPLATE is passed straight to epicsSnprintf,
+        // which yields an empty string. Do NOT fabricate a default template.
+        // sprintf_template handles the empty case correctly (no specifiers).
+        let full = sprintf_template(template, path, name, number);
 
         self.port_base
             .set_string_param(self.params.full_file_name, 0, full.clone())?;
@@ -329,7 +360,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_file_name_default() {
+    fn test_create_file_name_empty_template_yields_empty() {
+        // C parity (B9): an empty FILE_TEMPLATE is passed through epicsSnprintf
+        // verbatim, producing an empty string — no fabricated default.
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
         drv.port_base
             .set_string_param(drv.params.file_path, 0, "/tmp/".into())
@@ -345,7 +378,41 @@ mod tests {
             .unwrap();
 
         let name = drv.create_file_name().unwrap();
-        assert_eq!(name, "/tmp/test_0042");
+        assert_eq!(name, "");
+    }
+
+    #[test]
+    fn test_create_file_name_standard_template() {
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_path, 0, "/tmp/".into())
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_name, 0, "test".into())
+            .unwrap();
+        drv.port_base
+            .set_int32_param(drv.params.file_number, 0, 42)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.file_template, 0, "%s%s_%3.3d.dat".into())
+            .unwrap();
+
+        let name = drv.create_file_name().unwrap();
+        assert_eq!(name, "/tmp/test_042.dat");
+    }
+
+    #[test]
+    fn test_format_int_spec_width_vs_precision() {
+        // B10: precision = min digits (zero-pad); width = field (space-pad).
+        assert_eq!(format_int_spec("3.3", 7), "007");
+        assert_eq!(format_int_spec("5.3", 42), "  042");
+        assert_eq!(format_int_spec("04", 7), "0007");
+        assert_eq!(format_int_spec("5", 7), "    7");
+        assert_eq!(format_int_spec("", 7), "7");
+        assert_eq!(format_int_spec("2.5", 12345), "12345");
+        // Negative values keep the sign in front.
+        assert_eq!(format_int_spec("6.3", -4), "  -004");
+        assert_eq!(format_int_spec("05", -4), "-0004");
     }
 
     #[test]

@@ -189,9 +189,13 @@ async fn main() {
 
     // Print "*** Not connected" for PVs that didn't connect within
     // the wait window. Mirrors `tool_lib.c::print_time_val_sts` line
-    // 521 — "*** Not connected (PV not found)". Honor `-F`: C pads the
-    // name to 30 only with the default space separator, and emits the
-    // field separator between the name and the message.
+    // 521 — "*** Not connected (PV not found)". Honor `-F`: emit the
+    // field separator between the name and the message, and pad the
+    // name to 30 only with the default space separator. C's full rule
+    // also suppresses padding for an array PV (`nElems > 1`); a
+    // not-connected PV carries no element count here, so we gate on
+    // the separator alone — identical to C for the common scalar /
+    // no-`-#` case.
     let sep = args.field_separator.unwrap_or(' ');
     for (i, pv_name) in args.pv_names.iter().enumerate() {
         if !connected_flags[i].load(Ordering::Acquire) {
@@ -279,6 +283,10 @@ async fn monitor_pv(
                     // C `tool_lib.c::print_time_val_sts` ECA_DISCONN
                     // branch: `name <sep> ts *** disconnected`. Pad the
                     // name to 30 only with the default space separator.
+                    // C also suppresses padding for an array PV; the
+                    // disconnect event carries no element count, so we
+                    // gate on the separator alone — identical to C for
+                    // the common scalar case.
                     let name_col = if sep == ' ' {
                         format!("{pv:<width$}", width = PV_NAME_WIDTH)
                     } else {

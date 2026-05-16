@@ -502,6 +502,7 @@ mod tests {
             account: account.into(),
             method: method.into(),
             host: "localhost".into(),
+            authority: String::new(),
         }
     }
 

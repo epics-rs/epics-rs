@@ -32,6 +32,40 @@ fn generate_self_signed() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     (cert_der, key_der)
 }
 
+// Build a self-signed root CA with the given CommonName.
+fn make_ca(cn: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
+    let mut params = rcgen::CertificateParams::new(Vec::new()).expect("ca params");
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let key = rcgen::KeyPair::generate().expect("ca key");
+    let cert = params.self_signed(&key).expect("ca self-signed");
+    (cert, key)
+}
+
+// Build a leaf cert (CN + 127.0.0.1 SAN) signed by `ca`.
+fn make_leaf(
+    cn: &str,
+    ca: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let mut params =
+        rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("leaf params");
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.is_ca = rcgen::IsCa::ExplicitNoCa;
+    let key = rcgen::KeyPair::generate().expect("leaf key");
+    let cert = params.signed_by(&key, ca, ca_key).expect("leaf signed");
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let key_der: PrivateKeyDer<'static> =
+        PrivatePkcs8KeyDer::from(key.serialize_der()).into();
+    (cert_der, key_der)
+}
+
 #[derive(Clone)]
 struct StaticSource {
     inner: Arc<Mutex<std::collections::HashMap<String, PvField>>>,
@@ -185,6 +219,129 @@ async fn tls_client_to_tls_server_full_handshake() {
         }
         other => panic!("expected NTScalar structure, got {other:?}"),
     }
+
+    server_handle.abort();
+}
+
+/// F8: a client presenting an X.509 client certificate over mTLS must
+/// have its connection credentials populated with `method = "x509"`,
+/// `account` = the client leaf cert's subject CommonName, and
+/// `authority` = the root CA's CommonName. Mirrors pvxs
+/// `SSLContext::fill_credentials`.
+#[tokio::test]
+async fn mtls_client_cert_populates_x509_credentials() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // One root CA signs both the server and the client leaf certs.
+    let (ca_cert, ca_key) = make_ca("EPICS Test Root CA");
+    let ca_der = CertificateDer::from(ca_cert.der().to_vec());
+    let (server_cert, server_key) = make_leaf("pva-test-server", &ca_cert, &ca_key);
+    let (client_cert, client_key) = make_leaf("operator-bob", &ca_cert, &ca_key);
+
+    // Server: present the server leaf chain (leaf + root) and require a
+    // client cert verified against the CA.
+    let mut client_ca_roots = RootCertStore::empty();
+    client_ca_roots.add(ca_der.clone()).unwrap();
+    let client_verifier =
+        rustls::server::WebPkiClientVerifier::builder(Arc::new(client_ca_roots))
+            .build()
+            .expect("client verifier");
+    let server_cfg = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![server_cert.clone(), ca_der.clone()], server_key)
+        .expect("server tls config");
+    let server_tls = Arc::new(TlsServerConfig {
+        config: Arc::new(server_cfg),
+        require_client_cert: true,
+    });
+
+    // Client: trust the CA, present its own leaf chain (leaf + root).
+    let mut server_ca_roots = RootCertStore::empty();
+    server_ca_roots.add(ca_der.clone()).unwrap();
+    let client_cfg = ClientConfig::builder()
+        .with_root_certificates(server_ca_roots)
+        .with_client_auth_cert(vec![client_cert, ca_der.clone()], client_key)
+        .expect("client tls config");
+    let client_tls = Arc::new(TlsClientConfig {
+        config: Arc::new(client_cfg),
+    });
+
+    let source = Arc::new(StaticSource::new());
+    source.put("MTLS:PV", 7.0).await;
+
+    // `auth_complete` hook captures the credentials the server derived
+    // for the connecting peer.
+    let captured: Arc<Mutex<Option<(String, String, String)>>> = Arc::new(Mutex::new(None));
+    let captured_hook = captured.clone();
+    let auth_complete: Arc<
+        dyn Fn(std::net::SocketAddr, &epics_pva_rs::server_native::tcp::ClientCredentials)
+            + Send
+            + Sync,
+    > = Arc::new(move |_peer, cred| {
+        if let Ok(mut g) = captured_hook.try_lock() {
+            *g = Some((
+                cred.method.clone(),
+                cred.account.clone(),
+                cred.authority.clone(),
+            ));
+        }
+    });
+
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        tls: Some(server_tls),
+        auth_complete: Some(auth_complete),
+        ..Default::default()
+    };
+    let server_handle = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let client = PvaClient::builder()
+        .timeout(Duration::from_secs(3))
+        .server_addr(server_addr)
+        .with_tls(client_tls)
+        .build();
+
+    let v = tokio::time::timeout(Duration::from_secs(5), client.pvget("MTLS:PV"))
+        .await
+        .expect("pvget timed out")
+        .expect("pvget failed");
+    match v {
+        PvField::Structure(s) => {
+            assert_eq!(s.struct_id, "epics:nt/NTScalar:1.0");
+            assert!(matches!(
+                s.get_value(),
+                Some(ScalarValue::Double(d)) if (d - 7.0).abs() < 1e-9
+            ));
+        }
+        other => panic!("expected NTScalar structure, got {other:?}"),
+    }
+
+    // The server must have mapped the client cert to x509 credentials.
+    let creds = captured
+        .lock()
+        .await
+        .clone()
+        .expect("auth_complete hook should have fired");
+    assert_eq!(creds.0, "x509", "method must be x509 for mTLS peer");
+    assert_eq!(
+        creds.1, "operator-bob",
+        "account must be the client leaf cert CommonName"
+    );
+    assert_eq!(
+        creds.2, "EPICS Test Root CA",
+        "authority must be the root CA CommonName"
+    );
 
     server_handle.abort();
 }

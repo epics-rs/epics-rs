@@ -499,6 +499,20 @@ pub async fn run_tcp_server_on_listener(
                                 .await
                             {
                                 Ok(Ok(tls_stream)) => {
+                                    // F8: derive the peer's x509 identity from
+                                    // the *verified* certificate chain before
+                                    // splitting the stream. rustls only
+                                    // exposes `peer_certificates()` on the
+                                    // whole `TlsStream`, and the chain has
+                                    // already passed `WebPkiClientVerifier`,
+                                    // so this is the cryptographically-checked
+                                    // identity (pvxs `fill_credentials`).
+                                    let x509_id = {
+                                        let (_, conn) = tls_stream.get_ref();
+                                        conn.peer_certificates().and_then(|chain| {
+                                            crate::auth::x509_credentials_from_chain(chain)
+                                        })
+                                    };
                                     let (r, w) = tokio::io::split(tls_stream);
                                     handle_connection_io(
                                         src,
@@ -507,6 +521,7 @@ pub async fn run_tcp_server_on_listener(
                                         peer,
                                         cfg,
                                         peer_entry.clone(),
+                                        x509_id,
                                     )
                                     .await
                                 }
@@ -533,6 +548,7 @@ pub async fn run_tcp_server_on_listener(
                                 peer,
                                 cfg,
                                 peer_entry.clone(),
+                                None,
                             )
                             .await
                         }
@@ -554,22 +570,38 @@ pub async fn run_tcp_server_on_listener(
     }
 }
 
-/// Identity extracted from the client's CONNECTION_VALIDATION reply.
-/// Mirrors pvxs `server::ClientCredentials` (serverconn.cpp:73-234) at
-/// the wire-parse level — we don't currently feed it into ACF, but the
-/// structured form is ready for future per-op authorisation hooks and
-/// already lands in `tracing` for audit.
+/// Identity used for per-connection authorisation.
+///
+/// Mirrors pvxs `server::ClientCredentials` (serverconn.cpp:73-234).
+/// Two population paths feed it:
+///
+/// - **`ca` / `anonymous`** — parsed off the CONNECTION_VALIDATION reply
+///   (`parse_client_credentials`).
+/// - **`x509`** — derived from the *verified* TLS peer certificate chain
+///   after the handshake (pvxs `SSLContext::fill_credentials`). The TLS
+///   identity is authoritative: it overrides whatever the client claims
+///   in CONNECTION_VALIDATION, because the chain was cryptographically
+///   verified against the configured root CA.
+///
+/// The structured form is consumed by the server's ACF access gate
+/// (`AccessGate::check`) and lands in `tracing` for audit.
 #[derive(Debug, Clone)]
 pub struct ClientCredentials {
     /// Selected auth method ("anonymous" / "ca" / "x509" / ...).
     pub method: String,
-    /// Account name (e.g., the `ca` auth's `user` field). Empty when
-    /// the auth method does not carry one.
+    /// Account name (e.g., the `ca` auth's `user` field, or the x509
+    /// leaf cert subject CommonName). Empty when the auth method does
+    /// not carry one.
     pub account: String,
     /// Host name claim from the `ca` auth, when present. Informational
     /// only — never trust it for access decisions over the network
     /// hostname / mTLS-verified peer.
     pub host: String,
+    /// Certificate authority for the `x509` method: the root CA's
+    /// subject CommonName (pvxs `PeerCredentials::authority`). Empty for
+    /// non-TLS methods. ACF `RULE(... ){ AUTHORITY("...") }` scopes
+    /// match against this.
+    pub authority: String,
     /// Group / role claims advertised by the auth method. Populated
     /// by the `ca` method via [`crate::auth::posix_groups`] on the
     /// client side; on the server side the same list is parsed off
@@ -584,6 +616,21 @@ impl ClientCredentials {
             method: "anonymous".into(),
             account: "anonymous".into(),
             host: String::new(),
+            authority: String::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// Build `x509` credentials from a verified TLS peer chain.
+    /// Mirrors pvxs `SSLContext::fill_credentials`: the leaf cert's
+    /// subject CommonName becomes the `account` and the root CA's
+    /// subject CommonName becomes the `authority`.
+    fn x509(creds: crate::auth::X509Credentials) -> Self {
+        Self {
+            method: "x509".into(),
+            account: creds.account,
+            host: String::new(),
+            authority: creds.authority,
             roles: Vec::new(),
         }
     }
@@ -624,6 +671,7 @@ fn parse_client_credentials(frame: &Frame, order: ByteOrder) -> Option<ClientCre
         method: method.clone(),
         account: String::new(),
         host: String::new(),
+        authority: String::new(),
         roles: Vec::new(),
     };
     if let Ok(desc) = decode_type_desc(&mut cur, order) {
@@ -687,6 +735,12 @@ async fn handle_connection_io(
     peer: SocketAddr,
     config: PvaServerConfig,
     peer_entry: Arc<crate::server_native::peers::PeerEntry>,
+    // F8: x509 identity from the verified TLS peer chain, when this
+    // connection arrived over mutually-authenticated TLS. `None` for
+    // plain TCP or TLS without a client cert. When present it is the
+    // authoritative identity and overrides the CONNECTION_VALIDATION
+    // claim — mirrors pvxs `SSLContext::fill_credentials`.
+    x509_identity: Option<crate::auth::X509Credentials>,
 ) -> PvaResult<()> {
     let op_timeout = config.op_timeout;
     let idle_timeout = config.idle_timeout;
@@ -798,11 +852,22 @@ async fn handle_connection_io(
     let mut channels: HashMap<u32, ChannelState> = HashMap::new();
     let mut handshake_complete = false;
     // Client identity carried for the rest of the connection lifetime.
-    // Extracted from the CONNECTION_VALIDATION reply; falls back to
-    // anonymous when the client either skips the exchange (some legacy
-    // clients) or sends an unparseable payload. Available for future
-    // per-op authorisation hooks; today only logged at handshake time.
-    let mut cred = ClientCredentials::anonymous();
+    //
+    // F8 precedence (mirrors pvxs):
+    //  - mTLS with a verified client cert → `x509` credentials derived
+    //    from the cert chain. This is cryptographically verified and is
+    //    the authoritative identity — the CONNECTION_VALIDATION reply
+    //    cannot override it.
+    //  - otherwise → parsed from the CONNECTION_VALIDATION reply
+    //    (`ca`/`anonymous`), falling back to anonymous when the client
+    //    skips the exchange or sends an unparseable payload.
+    //
+    // Fed into the server's ACF `AccessGate::check` for every op.
+    let x509_locked = x509_identity.is_some();
+    let mut cred = match x509_identity {
+        Some(id) => ClientCredentials::x509(id),
+        None => ClientCredentials::anonymous(),
+    };
     // Per-connection emit-side TypeStore. Only consulted when
     // `config.emit_type_cache` is true (off by default for pvAccessCPP
     // compatibility — that client does not parse 0xFD/0xFE markers).
@@ -925,9 +990,27 @@ async fn handle_connection_io(
                 // (string); when method == "ca", read the type+value of the
                 // auth Value and pull out the `user` / `host` fields. Pure
                 // metadata for audit/logging.
-                cred = parse_client_credentials(&frame, order).unwrap_or(cred);
+                // F8: when the connection is mTLS-authenticated, the
+                // x509 identity from the verified cert chain wins — the
+                // client's CONNECTION_VALIDATION claim is parsed only
+                // for diagnostics and never replaces it.
+                if x509_locked {
+                    if let Some(claimed) = parse_client_credentials(&frame, order) {
+                        debug!(
+                            ?peer,
+                            x509_account = %cred.account,
+                            x509_authority = %cred.authority,
+                            claimed_method = %claimed.method,
+                            claimed_account = %claimed.account,
+                            "PVA client over mTLS — x509 identity overrides CONNECTION_VALIDATION claim"
+                        );
+                    }
+                } else {
+                    cred = parse_client_credentials(&frame, order).unwrap_or(cred);
+                }
                 debug!(?peer, method = %cred.method, account = %cred.account,
-                    roles = ?cred.roles, "PVA client credentials");
+                    authority = %cred.authority, roles = ?cred.roles,
+                    "PVA client credentials");
                 // pvxs `serverconn.cpp:238-241` parity: when the client
                 // picks an auth method we never advertised, reply
                 // CONNECTION_VALIDATED with Status::Error so the client
@@ -937,9 +1020,17 @@ async fn handle_connection_io(
                 // empty-method path inside parse_client_credentials);
                 // matches "No practical way to handle auth failure. So
                 // we accept all credentials, but may not grant rights."
-                let advertised = ADVERTISED_AUTH_METHODS
-                    .iter()
-                    .any(|m| m.eq_ignore_ascii_case(&cred.method));
+                // F8: an mTLS connection is authenticated by its
+                // verified certificate chain — `cred.method` is
+                // `"x509"` regardless of the CONNECTION_VALIDATION
+                // claim, and that is always a valid method when TLS is
+                // in use (pvxs advertises `x509` for TLS transports).
+                // So the unadvertised-method rejection only applies to
+                // the plain-TCP `ca`/`anonymous` negotiation.
+                let advertised = x509_locked
+                    || ADVERTISED_AUTH_METHODS
+                        .iter()
+                        .any(|m| m.eq_ignore_ascii_case(&cred.method));
                 let validated_status = if advertised {
                     Status::ok()
                 } else {
@@ -1317,6 +1408,7 @@ async fn handle_put_get(
         account: cred.account.clone(),
         method: cred.method.clone(),
         host: cred.host.clone(),
+        authority: cred.authority.clone(),
     };
 
     let mut payload = Vec::new();
@@ -1474,6 +1566,7 @@ async fn handle_process(
         account: cred.account.clone(),
         method: cred.method.clone(),
         host: cred.host.clone(),
+        authority: cred.authority.clone(),
     };
     // Processing mutates record state — WRITE-gated, like PUT.
     let result = {
@@ -2028,10 +2121,17 @@ async fn handle_op(
                 account: cred.account.clone(),
                 method: cred.method.clone(),
                 host: cred.host.clone(),
+                authority: cred.authority.clone(),
             };
             let checked = source
                 .access_gate()
-                .check(&ch.name, &ctx.host, &ctx.account, &ctx.method, "")
+                .check(
+                    &ch.name,
+                    &ctx.host,
+                    &ctx.account,
+                    &ctx.method,
+                    &ctx.authority,
+                )
                 .await;
             let value = match source.get_value_checked(checked, ctx).await {
                 Some(v) => v,
@@ -2090,12 +2190,19 @@ async fn handle_op(
                 account: cred.account.clone(),
                 method: cred.method.clone(),
                 host: cred.host.clone(),
+                authority: cred.authority.clone(),
             };
 
             let result = {
                 let checked = source
                     .access_gate()
-                    .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+                    .check(
+                        &pv_name,
+                        &ctx.host,
+                        &ctx.account,
+                        &ctx.method,
+                        &ctx.authority,
+                    )
                     .await;
                 source.put_value_checked(checked, value, ctx.clone()).await
             };
@@ -2141,7 +2248,13 @@ async fn handle_op(
                         // fresh one against the SAME `(pv, ctx)`.
                         let read_checked = source
                             .access_gate()
-                            .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+                            .check(
+                                &pv_name,
+                                &ctx.host,
+                                &ctx.account,
+                                &ctx.method,
+                                &ctx.authority,
+                            )
                             .await;
                         match source.get_value_checked(read_checked, ctx).await {
                             Some(v) => {
@@ -2245,6 +2358,7 @@ async fn handle_op(
                     account: cred.account.clone(),
                     method: cred.method.clone(),
                     host: cred.host.clone(),
+                    authority: cred.authority.clone(),
                 };
                 // Round 42 + R49-G1: type-state MONITOR gate.
                 //
@@ -2276,7 +2390,7 @@ async fn handle_op(
                         &mon_ctx.host,
                         &mon_ctx.account,
                         &mon_ctx.method,
-                        "",
+                        &mon_ctx.authority,
                     )
                     .await;
                 // Snapshot the window + notify so the spawned task can
@@ -2686,6 +2800,7 @@ async fn handle_op(
                 account: cred.account.clone(),
                 method: cred.method.clone(),
                 host: cred.host.clone(),
+                authority: cred.authority.clone(),
             };
             let rpc_checked = source
                 .access_gate()
@@ -2694,7 +2809,7 @@ async fn handle_op(
                     &rpc_ctx_val.host,
                     &rpc_ctx_val.account,
                     &rpc_ctx_val.method,
-                    "",
+                    &rpc_ctx_val.authority,
                 )
                 .await;
             let result = source

@@ -23,13 +23,18 @@ pub use epics_base_rs::server::access_security::{AccessChecked, AccessGate};
 pub struct ChannelContext {
     /// Downstream client TCP socket address.
     pub peer: SocketAddr,
-    /// Account name from CONNECTION_VALIDATION (`anonymous` when the
-    /// client didn't authenticate).
+    /// Account name. For `ca`/`anonymous` this comes from
+    /// CONNECTION_VALIDATION; for `x509` it is the verified peer
+    /// leaf-certificate subject CommonName.
     pub account: String,
     /// Auth method (`"anonymous"`, `"ca"`, `"x509"`).
     pub method: String,
     /// Reverse-resolved host name. Empty when DNS lookup failed.
     pub host: String,
+    /// Certificate authority for the `x509` method: the root CA's
+    /// subject CommonName. Empty for non-TLS methods. ACF
+    /// `AUTHORITY(...)` rule scopes match against this.
+    pub authority: String,
 }
 
 /// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
@@ -94,9 +99,12 @@ pub trait ChannelSource: Send + Sync + 'static {
         let host = ctx.host.clone();
         let account = ctx.account.clone();
         let method = ctx.method.clone();
+        let authority = ctx.authority.clone();
         let name = pv_name.to_string();
         async move {
-            let checked = gate.check(&name, &host, &account, &method, "").await;
+            let checked = gate
+                .check(&name, &host, &account, &method, &authority)
+                .await;
             if checked.allows_read() {
                 Some(checked)
             } else {

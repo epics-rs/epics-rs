@@ -86,6 +86,25 @@ impl MotorPollLoop {
         let _ = self.io_intr_tx.send(()).await;
     }
 
+    /// Spawn a settle-delay timer as an independent task so the `select!`
+    /// loop keeps servicing commands (Shutdown/Stop/Start) while the delay
+    /// runs. On expiry it records `expired_delay_id` and pulses io_intr.
+    fn spawn_delay(&self, delay_id: u64, dur: Duration) {
+        let device_state = self.device_state.clone();
+        let io_intr_tx = self.io_intr_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(dur).await;
+            match device_state.lock() {
+                Ok(mut ds) => ds.expired_delay_id = Some(delay_id),
+                Err(e) => {
+                    tracing::error!("device state lock poisoned in delay expiry: {e}");
+                    return;
+                }
+            }
+            let _ = io_intr_tx.send(()).await;
+        });
+    }
+
     fn effective_poll_interval(&mut self) -> Duration {
         if self.forced_fast_polls_remaining > 0 {
             self.forced_fast_polls_remaining -= 1;
@@ -120,15 +139,7 @@ impl MotorPollLoop {
                             }
                             Some(PollCommand::ScheduleDelay(delay_id, dur)) => {
                                 active = false;
-                                tokio::time::sleep(dur).await;
-                                match self.device_state.lock() {
-                                    Ok(mut ds) => { ds.expired_delay_id = Some(delay_id); }
-                                    Err(e) => {
-                                        tracing::error!("device state lock poisoned in delay expiry: {e}");
-                                        continue;
-                                    }
-                                }
-                                let _ = self.io_intr_tx.send(()).await;
+                                self.spawn_delay(delay_id, dur);
                             }
                             Some(PollCommand::Shutdown) => {
                                 return;
@@ -154,17 +165,7 @@ impl MotorPollLoop {
                         active = false;
                     }
                     Some(PollCommand::ScheduleDelay(delay_id, dur)) => {
-                        tokio::time::sleep(dur).await;
-                        match self.device_state.lock() {
-                            Ok(mut ds) => {
-                                ds.expired_delay_id = Some(delay_id);
-                            }
-                            Err(e) => {
-                                tracing::error!("device state lock poisoned in delay expiry: {e}");
-                                continue;
-                            }
-                        }
-                        let _ = self.io_intr_tx.send(()).await;
+                        self.spawn_delay(delay_id, dur);
                     }
                     Some(PollCommand::Shutdown) | None => {
                         return;

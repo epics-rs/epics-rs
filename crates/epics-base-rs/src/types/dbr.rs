@@ -166,8 +166,22 @@ impl DbFieldType {
 pub fn dbr_buffer_size(dbr_type: u16, native_type: DbFieldType, count: usize) -> usize {
     let value_size = native_type.element_size() * count;
     let meta_size = match dbr_type / 7 {
-        0 => 0,  // Plain
-        1 => 4,  // STS: status(2) + severity(2)
+        0 => 0, // Plain
+        1 => {
+            // STS: status(2) + severity(2), plus the per-type RISC
+            // alignment pad that sits before `value` in the C
+            // `dbr_sts_*` structs (db_access.h:192-240):
+            //   sts_char:   +RISC_pad(1)  → meta 5
+            //   sts_double: +RISC_pad(4)  → meta 8 (dbr_long_t)
+            //   others:     no pad        → meta 4
+            // Int64 is served over CA as DBR_DOUBLE so it shares the
+            // double pad.
+            match native_type {
+                DbFieldType::Char => 5,
+                DbFieldType::Double | DbFieldType::Int64 => 8,
+                _ => 4,
+            }
+        }
         2 => 12, // TIME: status(2) + severity(2) + stamp(8)
         3 => {
             // GR: varies by type
@@ -220,5 +234,55 @@ pub fn native_type_for_dbr(dbr_type: u16) -> CaResult<DbFieldType> {
     match dbr_native_index(dbr_type) {
         Some(idx) => DbFieldType::from_u16(idx),
         None => Err(CaError::UnsupportedType(dbr_type)),
+    }
+}
+
+#[cfg(test)]
+mod buffer_size_tests {
+    use super::*;
+
+    /// H-1: STS meta size is per-type. `dbr_sts_double` carries a
+    /// 4-byte `dbr_long_t` RISC_pad (db_access.h:233-238) → meta 8.
+    #[test]
+    fn sts_double_meta_is_8() {
+        // scalar: 8 (meta) + 8 (value) = 16
+        assert_eq!(
+            dbr_buffer_size(DBR_STS_DOUBLE, DbFieldType::Double, 1),
+            16
+        );
+        // n elements: 8 + 8*n
+        assert_eq!(
+            dbr_buffer_size(DBR_STS_DOUBLE, DbFieldType::Double, 5),
+            8 + 8 * 5
+        );
+    }
+
+    /// H-1: `dbr_sts_char` carries a 1-byte RISC_pad
+    /// (db_access.h:218-223) → meta 5.
+    #[test]
+    fn sts_char_meta_is_5() {
+        assert_eq!(dbr_buffer_size(DBR_STS_CHAR, DbFieldType::Char, 1), 6);
+        assert_eq!(
+            dbr_buffer_size(DBR_STS_CHAR, DbFieldType::Char, 10),
+            5 + 10
+        );
+    }
+
+    /// H-1: types with no STS RISC pad keep the flat 4-byte meta.
+    #[test]
+    fn sts_short_meta_is_4() {
+        assert_eq!(dbr_buffer_size(DBR_STS_SHORT, DbFieldType::Short, 1), 6);
+        assert_eq!(dbr_buffer_size(DBR_STS_LONG, DbFieldType::Long, 1), 8);
+        assert_eq!(dbr_buffer_size(DBR_STS_FLOAT, DbFieldType::Float, 1), 8);
+    }
+
+    /// Plain and TIME layers are unaffected by the STS pad fix.
+    #[test]
+    fn plain_and_time_unchanged() {
+        assert_eq!(dbr_buffer_size(DBR_DOUBLE, DbFieldType::Double, 3), 24);
+        assert_eq!(
+            dbr_buffer_size(DBR_TIME_DOUBLE, DbFieldType::Double, 1),
+            12 + 8
+        );
     }
 }

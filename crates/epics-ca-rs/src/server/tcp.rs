@@ -645,6 +645,14 @@ async fn accept_loop(
             // starve incoming accepts.
             Some(_) = conn_tasks.join_next() => continue,
         };
+        // Reap finished connection tasks promptly. The select! arm on
+        // `conn_tasks.join_next()` only fires when `listener.accept()`
+        // is Pending, but `biased` makes the accept arm strictly
+        // preferred — so under a sustained connect storm completed
+        // `JoinHandle`s would accumulate in the set unbounded. A
+        // non-blocking `try_join_next` drain after every accept caps
+        // the set at the count of genuinely in-flight connections.
+        while conn_tasks.try_join_next().is_some() {}
         if drain.load(std::sync::atomic::Ordering::Acquire) {
             tracing::info!(peer = %peer, "drain mode: rejecting new connection");
             drop(stream);

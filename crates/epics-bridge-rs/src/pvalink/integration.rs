@@ -490,7 +490,17 @@ async fn run_notify_forwarder(
             if !changed && !always && !atomic {
                 continue;
             }
-            let _ = db_handle.process_record(&record).await;
+            // B3: process WITH links so the CP/CPP-driven scan fans
+            // out via INP/OUT/FLNK — a pvalink feeding a calc record
+            // must propagate to the calc's FLNK chain. Bare
+            // `process_record` runs only `process_local` and would
+            // drop the chain. Fresh `visited` set + depth 0: this is
+            // the foreign-caller entry, like the scan loop and FLNK
+            // dispatch.
+            let mut visited = std::collections::HashSet::new();
+            let _ = db_handle
+                .process_record_with_links(&record, &mut visited, 0)
+                .await;
         }
     }
 }
@@ -884,6 +894,75 @@ mod tests {
 
         // Only the two changed events scanned.
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// B3: a pvalink-driven update fans out through the owning
+    /// record's FLNK chain. The forwarder must call
+    /// `process_record_with_links` (not the bare `process_record`),
+    /// otherwise a CP pvalink feeding a calc record never propagates
+    /// to the calc's FLNK target.
+    #[tokio::test]
+    async fn b3_forwarder_propagates_flnk_chain() {
+        let db = PvDatabase::new();
+        // DEST is the pvalink target; DOWNSTREAM is DEST's FLNK.
+        let dest_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let down_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "DEST",
+            Box::new(CountingRecord {
+                count: dest_count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        db.add_record(
+            "DOWNSTREAM",
+            Box::new(CountingRecord {
+                count: down_count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        // Wire DEST.FLNK -> DOWNSTREAM.
+        {
+            let rec = db.get_record("DEST").await.expect("DEST exists");
+            let mut inst = rec.write().await;
+            inst.put_common_field("FLNK", EpicsValue::String("DOWNSTREAM".into()))
+                .expect("set FLNK");
+        }
+
+        let mut fanout = ScanFanout::default();
+        fanout.records.push(ScanTarget {
+            record: "DEST".to_string(),
+            always: true,
+            monorder: 0,
+            atomic: false,
+        });
+        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
+            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
+        ));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            "SRC".to_string(),
+            "value".to_string(),
+            rx,
+            scan_targets,
+            db_slot,
+        ));
+
+        tx.send(nt_scalar(5.0)).await.unwrap();
+        drop(tx);
+        forwarder.await.unwrap();
+
+        // DEST processed once, and its FLNK fanned out to DOWNSTREAM.
+        assert_eq!(dest_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            down_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "FLNK target must process via process_record_with_links"
+        );
     }
 
     /// B3: `open_link_for_record` registers a `proc=CP` link's scan

@@ -987,21 +987,21 @@ impl NDPluginProcess for StatsProcessor {
             ParamUpdate::int32(p.profile_size_y, info.y_size as i32),
         ];
 
-        // Histogram waveforms: the counts (HIST_ARRAY) and the bin-center X
-        // axis (HIST_X_ARRAY). C++ computeHistX fills the X axis with bin
-        // centers spanning [HistMin, HistMax].
+        // Histogram waveforms: the counts (HIST_ARRAY) and the bin X axis
+        // (HIST_X_ARRAY). C++ NDPluginStats::computeHistX fills the X axis
+        // with bin left edges: `scale = (histMax - histMin) / histSize` and
+        // `histX[i] = histMin + i*scale` for i in 0..histSize. The divisor is
+        // the bin count (histSize), not histSize-1, so the last bin's X is
+        // histMin + (histSize-1)*scale, strictly below histMax.
         if self.do_compute_histogram && !result.histogram.is_empty() {
             updates.push(ParamUpdate::float64_array(
                 p.hist_array,
                 result.histogram.clone(),
             ));
             let n = result.histogram.len();
-            let hist_x: Vec<f64> = if n > 1 {
-                let step = (self.hist_max - self.hist_min) / (n - 1) as f64;
-                (0..n).map(|i| self.hist_min + i as f64 * step).collect()
-            } else {
-                vec![self.hist_min]
-            };
+            let step = (self.hist_max - self.hist_min) / n as f64;
+            let hist_x: Vec<f64> =
+                (0..n).map(|i| self.hist_min + i as f64 * step).collect();
             updates.push(ParamUpdate::float64_array(p.hist_x_array, hist_x));
         }
 
@@ -1584,7 +1584,7 @@ mod tests {
         }
 
         let result = proc.process_array(&arr, &pool);
-        let p = proc.params.clone();
+        let p = proc.params;
         // HIST_ARRAY, HIST_X_ARRAY and the 8 PROFILE_* waveforms must be
         // pushed as float64 array updates.
         let array_reasons: Vec<usize> = result
@@ -1615,6 +1615,76 @@ mod tests {
                 "missing array update for reason {reason}"
             );
         }
+    }
+
+    #[test]
+    fn test_hist_x_array_uses_bin_count_divisor() {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        // C++ NDPluginStats::computeHistX: scale = (histMax-histMin)/histSize,
+        // histX[i] = histMin + i*scale. For histSize=256, min=0, max=255 the
+        // last bin X must be ~254.0 (= 255*255/256), NOT 255.0.
+        let mut proc = StatsProcessor::new();
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "_stats_histx_",
+            1,
+            asyn_rs::port::PortFlags::default(),
+        );
+        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        proc.register_params(&mut base).unwrap();
+
+        proc.do_compute_histogram = true;
+        proc.hist_size = 256;
+        proc.hist_min = 0.0;
+        proc.hist_max = 255.0;
+        let pool = NDArrayPool::new(1_000_000);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, val) in v.iter_mut().enumerate() {
+                *val = (i * 16) as u8;
+            }
+        }
+
+        let result = proc.process_array(&arr, &pool);
+        let hist_x = result
+            .param_updates
+            .iter()
+            .find_map(|u| match u {
+                ParamUpdate::Float64Array { reason, value, .. }
+                    if *reason == proc.params.hist_x_array =>
+                {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .expect("HIST_X_ARRAY must be emitted");
+
+        assert_eq!(hist_x.len(), 256, "256 bins");
+        let scale = 255.0 / 256.0;
+        assert!(
+            (hist_x[0] - 0.0).abs() < 1e-9,
+            "bin 0 X must be histMin (0.0), got {}",
+            hist_x[0]
+        );
+        assert!(
+            (hist_x[1] - scale).abs() < 1e-9,
+            "bin 1 X must be {scale}, got {}",
+            hist_x[1]
+        );
+        assert!(
+            (hist_x[255] - 255.0 * scale).abs() < 1e-9,
+            "last bin X must be ~254.004 (255*255/256), got {}",
+            hist_x[255]
+        );
+        assert!(
+            hist_x[255] < 255.0,
+            "last bin X must be strictly below histMax, got {}",
+            hist_x[255]
+        );
     }
 
     #[test]

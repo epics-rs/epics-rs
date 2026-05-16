@@ -156,9 +156,16 @@ impl AsynMotor for SimMotor {
         _user: &AsynUser,
         distance: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
-        self.target = self.position + distance;
+        let target = self.position + distance;
+        if self.deferred {
+            // Honour deferred mode like move_absolute — queue the resolved
+            // absolute target instead of moving immediately.
+            self.deferred_moves.push((target, velocity, acceleration));
+            return Ok(());
+        }
+        self.target = target;
         self.velocity = velocity.abs().max(0.001);
         self.start_position = self.position;
         self.moving = true;

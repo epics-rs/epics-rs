@@ -18,6 +18,10 @@ pub enum LayoutSource {
     Constant,
     /// Value taken from an NDAttribute.
     NdAttribute,
+    /// No `source` attribute given (C++ `DataSource` default `notset`). Used
+    /// by the built-in `<dataset name="timestamp">` performance dataset in
+    /// the C ADCore `DEFAULT_LAYOUT`, whose data the writer fills directly.
+    Unset,
 }
 
 /// Scalar datatype for constant/attribute layout nodes (schema `attrSourceTypeEnum`).
@@ -194,6 +198,19 @@ impl Hdf5Layout {
                 }
             });
         }
+        found
+    }
+
+    /// Find the group path of the first dataset named `name`, returning the
+    /// owning group's full path (the C `NDFileHDF5` performance dataset is a
+    /// `<dataset name="timestamp">` in the layout tree).
+    pub fn dataset_group_path(&self, name: &str) -> Option<String> {
+        let mut found = None;
+        self.for_each_dataset(|path, d| {
+            if d.name == name && found.is_none() {
+                found = Some(path.to_string());
+            }
+        });
         found
     }
 
@@ -645,8 +662,13 @@ fn parse_attribute(attrs: &[(String, String)]) -> Result<LayoutAttribute, Layout
 }
 
 fn parse_source(attrs: &[(String, String)], name: &str) -> Result<LayoutSource, LayoutError> {
-    let s = attr_get(attrs, "source")
-        .ok_or_else(|| LayoutError(format!("<dataset name=\"{}\"> missing 'source'", name)))?;
+    // C++ `process_dset_xml_attribute` leaves the DataSource at its default
+    // (`notset`) when no `source` attribute is present, so a sourceless
+    // `<dataset>` (the built-in performance `timestamp` dataset) is valid.
+    let s = match attr_get(attrs, "source") {
+        Some(s) => s,
+        None => return Ok(LayoutSource::Unset),
+    };
     match s.as_str() {
         "detector" => Ok(LayoutSource::Detector),
         "constant" => Ok(LayoutSource::Constant),

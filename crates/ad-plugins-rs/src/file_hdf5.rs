@@ -224,6 +224,16 @@ pub struct Hdf5Writer {
     layout: Option<Hdf5Layout>,
     pub layout_valid: bool,
     pub layout_error: String,
+    /// Full path of the primary image dataset for the currently-open file.
+    /// `"data"` (flat root) when no valid layout is loaded; the layout's
+    /// `det_default` dataset path (e.g. `entry/instrument/detector/data`)
+    /// otherwise. Leading slash stripped — keyed as `rust-hdf5` keys datasets.
+    resolved_dataset_path: String,
+    /// Group prefix (no leading/trailing slash) for NDAttribute datasets.
+    /// Empty when flat; the layout `ndattr_default` group otherwise.
+    resolved_ndattr_group: String,
+    /// Group prefix for the performance dataset. Empty when flat.
+    resolved_perf_group: String,
 }
 
 impl Hdf5Writer {
@@ -265,6 +275,9 @@ impl Hdf5Writer {
             layout: None,
             layout_valid: false,
             layout_error: String::new(),
+            resolved_dataset_path: "data".to_string(),
+            resolved_ndattr_group: String::new(),
+            resolved_perf_group: String::new(),
         }
     }
 
@@ -616,6 +629,129 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Resolve the on-disk dataset/group paths from the loaded layout XML.
+    ///
+    /// With a valid layout this places the image dataset at the layout's
+    /// `det_default` dataset path, NDAttribute datasets under the
+    /// `ndattr_default` group, and the performance dataset under the group
+    /// holding the `timestamp` dataset — matching C `NDFileHDF5`'s
+    /// `/entry/instrument/detector/data` tree. Without a layout the flat
+    /// root defaults (`data`, `NDAttributes`, `performance`) are kept.
+    ///
+    /// All returned paths have the leading `/` stripped, since `rust-hdf5`
+    /// keys datasets/groups without a leading slash.
+    fn resolve_layout_paths(&mut self) {
+        let strip = |s: String| s.trim_start_matches('/').to_string();
+        match self.layout.as_ref() {
+            Some(layout) => {
+                self.resolved_dataset_path = layout
+                    .detector_dataset_path()
+                    .map(strip)
+                    .unwrap_or_else(|| self.dataset_name.clone());
+                self.resolved_ndattr_group = layout
+                    .ndattr_default_group()
+                    .map(strip)
+                    .unwrap_or_default();
+                self.resolved_perf_group = layout
+                    .dataset_group_path("timestamp")
+                    .map(strip)
+                    .unwrap_or_default();
+            }
+            None => {
+                self.resolved_dataset_path = self.dataset_name.clone();
+                self.resolved_ndattr_group.clear();
+                self.resolved_perf_group.clear();
+            }
+        }
+    }
+
+    /// Build every group node declared in the loaded layout XML so that empty
+    /// NeXus-style groups (e.g. an `NXdata` placeholder) also exist on disk,
+    /// not just the groups implied by the dataset placement. No-op when no
+    /// layout is loaded.
+    ///
+    /// `rust-hdf5` 0.2.0's `create_group` errors on a duplicate path, so each
+    /// distinct group path is created exactly once via a created-set; paths
+    /// are processed shortest-first so a parent always exists before a child.
+    fn build_layout_groups(&self) -> ADResult<()> {
+        let layout = match self.layout.as_ref() {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let file = match self.handle {
+            Some(Hdf5Handle::Standard { ref file, .. }) => file,
+            _ => return Ok(()),
+        };
+        fn collect(g: &crate::hdf5_layout::LayoutGroup, prefix: &str, out: &mut Vec<String>) {
+            let here = if prefix.is_empty() {
+                g.name.clone()
+            } else {
+                format!("{}/{}", prefix, g.name)
+            };
+            out.push(here.clone());
+            for sub in &g.groups {
+                collect(sub, &here, out);
+            }
+        }
+        let mut paths = Vec::new();
+        for g in &layout.groups {
+            collect(g, "", &mut paths);
+        }
+        paths.sort_by_key(|p| p.matches('/').count());
+        paths.dedup();
+        let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for path in &paths {
+            if created.contains(path) {
+                continue;
+            }
+            let (parent, leaf) = match path.rsplit_once('/') {
+                Some((p, l)) => (p, l),
+                None => ("", path.as_str()),
+            };
+            // The parent path was created earlier (shorter, sorted first).
+            let parent_group = if parent.is_empty() {
+                None
+            } else {
+                Some(Self::open_write_group(file, parent)?)
+            };
+            match parent_group.as_ref() {
+                Some(g) => g.create_group(leaf),
+                None => file.create_group(leaf),
+            }
+            .map_err(|e| {
+                ADError::UnsupportedConversion(format!(
+                    "HDF5 layout group '{}': {}",
+                    path, e
+                ))
+            })?;
+            created.insert(path.clone());
+        }
+        Ok(())
+    }
+
+    /// Re-open an already-created group by full path in write mode. In write
+    /// mode `H5Group::group` returns a handle without verification, so this is
+    /// a pure handle constructor walking each path segment.
+    fn open_write_group(file: &H5File, path: &str) -> ADResult<rust_hdf5::H5Group> {
+        let mut current: Option<rust_hdf5::H5Group> = None;
+        for seg in path.split('/').filter(|s| !s.is_empty()) {
+            let next = match current.as_ref() {
+                Some(g) => g.group(seg),
+                None => file.root_group().group(seg),
+            }
+            .map_err(|e| {
+                ADError::UnsupportedConversion(format!(
+                    "HDF5 group reopen '{}': {}",
+                    seg, e
+                ))
+            })?;
+            current = Some(next);
+        }
+        current.ok_or_else(|| {
+            ADError::UnsupportedConversion("empty group path".into())
+        })
+    }
+
     /// Create the primary image dataset on first frame in standard mode.
     /// The dataset is a single extensible `[nframes, .., Y, X]` array; later
     /// frames extend the leading dimension (C++ `NDFileHDF5Dataset`).
@@ -639,14 +775,55 @@ impl Hdf5Writer {
             })
             .collect();
 
+        // Build the layout group hierarchy (if a layout XML is loaded) before
+        // placing the dataset. With no layout this is a no-op and the dataset
+        // lands flat at the file root.
+        self.build_layout_groups()?;
+
+        // Collect the `constant` HDF5 attributes the layout XML attaches to the
+        // primary image dataset (the one at `resolved_dataset_path`, e.g. the
+        // NeXus `signal=1` marker). Only constant attributes are materialised
+        // here; `ndattribute`-sourced attribute nodes carry per-frame values
+        // and are out of scope for the static dataset-creation path.
+        let resolved_ds = self.resolved_dataset_path.clone();
+        let layout_ds_attrs: Vec<(String, crate::hdf5_layout::LayoutDataType, String)> = self
+            .layout
+            .as_ref()
+            .map(|l| {
+                use crate::hdf5_layout::LayoutSource;
+                let mut out = Vec::new();
+                l.for_each_dataset(|path, d| {
+                    let full = format!("{}/{}", path, d.name);
+                    if full.trim_start_matches('/') == resolved_ds {
+                        for a in &d.attributes {
+                            if a.source == LayoutSource::Constant {
+                                out.push((a.name.clone(), a.data_type, a.value.clone()));
+                            }
+                        }
+                    }
+                });
+                out
+            })
+            .unwrap_or_default();
+
         let h5file = match self.handle {
             Some(Hdf5Handle::Standard { ref file, .. }) => file,
             _ => return Err(ADError::UnsupportedConversion("no HDF5 file open".into())),
         };
 
+        // Resolve the dataset's parent group and leaf name. `resolved_dataset_path`
+        // is e.g. `entry/instrument/detector/data` with a layout, or `data` flat.
+        let (ds_group, ds_name): (Option<rust_hdf5::H5Group>, String) =
+            match self.resolved_dataset_path.rsplit_once('/') {
+                Some((group_path, leaf)) => (
+                    Some(Self::open_write_group(h5file, group_path)?),
+                    leaf.to_string(),
+                ),
+                None => (None, self.resolved_dataset_path.clone()),
+            };
+
         let dtype_ordinal = array.data.data_type() as i32;
         let fill = self.fill_value;
-        let ds_name = self.dataset_name.clone();
         let row_chunks = self.chunk.n_row_chunks as i32;
         let col_chunks = self.chunk.n_col_chunks as i32;
         let frame_chunks = self.chunk.n_frames_chunks as i32;
@@ -663,11 +840,13 @@ impl Hdf5Writer {
 
         macro_rules! create_ds {
             ($t:ty) => {{
-                let mut builder = h5file
-                    .new_dataset::<$t>()
-                    .shape(&shape[..])
-                    .chunk(&chunk[..])
-                    .max_shape(&max_shape[..]);
+                let mut builder = match ds_group.as_ref() {
+                    Some(g) => g.new_dataset::<$t>(),
+                    None => h5file.new_dataset::<$t>(),
+                }
+                .shape(&shape[..])
+                .chunk(&chunk[..])
+                .max_shape(&max_shape[..]);
                 if let Some(ref pl) = pipeline {
                     builder = builder.filter_pipeline(pl.clone());
                 }
@@ -727,6 +906,37 @@ impl Hdf5Writer {
                             .shape(())
                             .create(&format!("HDF5_extraDimName{}", i))
                             .and_then(|a| a.write_scalar(&s));
+                    }
+                }
+                // Materialise the layout XML's constant dataset attributes
+                // (e.g. NeXus `signal=1`), typed per the XML `type` attribute.
+                for (aname, atype, avalue) in &layout_ds_attrs {
+                    use crate::hdf5_layout::LayoutDataType;
+                    match atype {
+                        LayoutDataType::Int => {
+                            let v: i64 = avalue.trim().parse().unwrap_or(0);
+                            let _ = ds
+                                .new_attr::<i64>()
+                                .shape(())
+                                .create(aname)
+                                .and_then(|a| a.write_numeric(&v));
+                        }
+                        LayoutDataType::Float => {
+                            let v: f64 = avalue.trim().parse().unwrap_or(0.0);
+                            let _ = ds
+                                .new_attr::<f64>()
+                                .shape(())
+                                .create(aname)
+                                .and_then(|a| a.write_numeric(&v));
+                        }
+                        LayoutDataType::String => {
+                            let s = rust_hdf5::types::VarLenUnicode(avalue.clone());
+                            let _ = ds
+                                .new_attr::<rust_hdf5::types::VarLenUnicode>()
+                                .shape(())
+                                .create(aname)
+                                .and_then(|a| a.write_scalar(&s));
+                        }
                     }
                 }
                 ds
@@ -813,7 +1023,12 @@ impl Hdf5Writer {
         // maps row-major onto the extra-dim grid, so the linear chunk index is
         // the frame counter itself.
 
-        Self::write_frame_chunk(ds, frame_idx, array.data.as_u8_slice())?;
+        // The dataset declares a little-endian element type; serialize the
+        // frame to LE explicitly rather than passing host-endian bytes
+        // (see `nd_buffer_to_le_bytes`). `write_chunk` is the only chunked
+        // write path the crate exposes, so a typed write is not possible.
+        let frame_bytes = nd_buffer_to_le_bytes(&array.data);
+        Self::write_frame_chunk(ds, frame_idx, &frame_bytes)?;
 
         // Append NDAttribute values for this frame.
         if self.store_attributes {
@@ -850,13 +1065,21 @@ impl Hdf5Writer {
             return Ok(());
         }
         let chunk_depth = self.chunk.ndattr_chunk.max(1);
+        let ndattr_group = self.resolved_ndattr_group.clone();
         let h5file = match self.handle {
             Some(Hdf5Handle::Standard { ref file, .. }) => file,
             _ => return Ok(()),
         };
-        let group = h5file
-            .create_group("NDAttributes")
-            .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 group error: {}", e)))?;
+        // With a valid layout the `ndattr_default` group was already created
+        // by `build_layout_groups`; re-open it. Without a layout, fall back
+        // to a flat `NDAttributes` group at the file root.
+        let group = if ndattr_group.is_empty() {
+            h5file
+                .create_group("NDAttributes")
+                .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 group error: {}", e)))?
+        } else {
+            Self::open_write_group(h5file, &ndattr_group)?
+        };
 
         for ad in self.attr_datasets.iter() {
             if ad.frames == 0 {
@@ -931,15 +1154,26 @@ impl Hdf5Writer {
         for row in &self.perf_rows {
             flat.extend_from_slice(row);
         }
+        // f64 doubles serialized explicitly little-endian to match the LE
+        // datatype `rust-hdf5` records (write_chunk copies bytes verbatim).
         let raw: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
 
+        let perf_group = self.resolved_perf_group.clone();
         let h5file = match self.handle {
             Some(Hdf5Handle::Standard { ref file, .. }) => file,
             _ => return Ok(()),
         };
-        let group = h5file
-            .create_group("performance")
-            .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 group error: {}", e)))?;
+        // With a valid layout the performance group (the group holding the
+        // `timestamp` dataset) was already created by `build_layout_groups`;
+        // re-open it. Without a layout, fall back to a flat `performance`
+        // group at the file root.
+        let group = if perf_group.is_empty() {
+            h5file
+                .create_group("performance")
+                .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 group error: {}", e)))?
+        } else {
+            Self::open_write_group(h5file, &perf_group)?
+        };
         let ds = group
             .new_dataset::<f64>()
             .shape([n, 5])
@@ -970,8 +1204,12 @@ impl Hdf5Writer {
             _ => return Err(ADError::UnsupportedConversion("no SWMR writer open".into())),
         };
 
+        // The SWMR streaming dataset declares a little-endian element type and
+        // `append_frame` copies the supplied `&[u8]` verbatim; serialize to LE
+        // explicitly (see `nd_buffer_to_le_bytes`) so the file is portable.
+        let frame_bytes = nd_buffer_to_le_bytes(&array.data);
         writer
-            .append_frame(ds_index, array.data.as_u8_slice())
+            .append_frame(ds_index, &frame_bytes)
             .map_err(|e| ADError::UnsupportedConversion(format!("SWMR append error: {}", e)))?;
 
         // Periodic flush
@@ -1003,6 +1241,32 @@ impl Hdf5Writer {
         };
         self.perf_rows
             .push([write_duration, period, runtime, inst_speed, avg_speed]);
+    }
+}
+
+/// Serialize an NDArray data buffer to **little-endian** bytes.
+///
+/// `rust-hdf5` 0.2.0 records every numeric datatype message as little-endian
+/// (`Endianness::LittleEndian`) and its only chunked-write API, `write_chunk`,
+/// copies the supplied `&[u8]` verbatim into the chunk with no byte-swap.
+/// `NDDataBuffer::as_u8_slice()` returns the buffer in *host* byte order, so
+/// feeding it directly into a typed chunked dataset is correct only on a
+/// little-endian host. This helper makes the on-disk bytes match the declared
+/// LE datatype on every host: on LE it is a verbatim copy, on BE it swaps each
+/// element. Used for every typed-dataset chunk write where no typed
+/// chunked-write path exists in the crate.
+fn nd_buffer_to_le_bytes(buf: &NDDataBuffer) -> Vec<u8> {
+    match buf {
+        NDDataBuffer::I8(v) => v.iter().map(|&x| x as u8).collect(),
+        NDDataBuffer::U8(v) => v.clone(),
+        NDDataBuffer::I16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::U16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::I32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::U32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::I64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::U64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::F32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataBuffer::F64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
     }
 }
 
@@ -1051,6 +1315,9 @@ impl NDFileWriter for Hdf5Writer {
         self.perf_prev = None;
         self.perf_first = None;
         self.attr_datasets.clear();
+        // Resolve where image/attribute/performance datasets land for this
+        // file: the loaded layout XML tree, or the flat root default.
+        self.resolve_layout_paths();
 
         if self.swmr_mode && mode == NDFileMode::Stream {
             self.open_swmr(path, array)
@@ -1084,6 +1351,11 @@ impl NDFileWriter for Hdf5Writer {
     }
 
     fn read_file(&mut self) -> ADResult<NDArray> {
+        // The image dataset lives at the layout-resolved path (flat `data`
+        // by default, or the nested layout path). Resolve it so read-back
+        // tracks the same placement as the write path.
+        self.resolve_layout_paths();
+        let dataset_path = self.resolved_dataset_path.clone();
         let path = self
             .current_path
             .as_ref()
@@ -1093,7 +1365,7 @@ impl NDFileWriter for Hdf5Writer {
             .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 open error: {}", e)))?;
 
         let ds = h5file
-            .dataset(&self.dataset_name)
+            .dataset(&dataset_path)
             .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e)))?;
 
         let shape = ds.shape();
@@ -2223,5 +2495,125 @@ mod tests {
 
         std::fs::remove_file(&good).ok();
         std::fs::remove_file(&bad).ok();
+    }
+
+    #[test]
+    fn test_layout_xml_places_dataset_in_nested_tree() {
+        // A valid layout XML must place the image dataset at the layout's
+        // det_default path (C ADCore /entry/instrument/detector/data),
+        // NDAttributes under the ndattr_default group, and the performance
+        // dataset under the group holding the `timestamp` dataset — NOT flat
+        // at the file root.
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_layout_nested.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <group name="entry">
+                <group name="instrument">
+                  <group name="detector">
+                    <dataset name="data" source="detector" det_default="true">
+                      <attribute name="signal" source="constant" value="1" type="int"/>
+                    </dataset>
+                  </group>
+                  <group name="NDAttributes" ndattr_default="true"/>
+                  <group name="performance">
+                    <dataset name="timestamp"/>
+                  </group>
+                </group>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_layout_nested");
+        let mut writer = Hdf5Writer::new();
+        writer.set_store_performance(true);
+        assert!(
+            writer.set_layout_filename(layout.to_str().unwrap()),
+            "layout XML must parse: {}",
+            writer.layout_error
+        );
+
+        let mk = |fill: f64| {
+            let mut arr = NDArray::new(
+                vec![NDDimension::new(4), NDDimension::new(4)],
+                NDDataType::UInt16,
+            );
+            arr.attributes.add(NDAttribute::new_static(
+                "exposure",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Float64(fill),
+            ));
+            arr
+        };
+
+        let a0 = mk(0.5);
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk(0.75)).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let names = h5.dataset_names();
+        // Image dataset at the nested layout path, NOT flat `data`.
+        assert!(
+            names.contains(&"entry/instrument/detector/data".to_string()),
+            "image dataset must be at the nested layout path; got {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"data".to_string()),
+            "must not also write a flat-root `data` dataset"
+        );
+        let img = h5.dataset("entry/instrument/detector/data").unwrap();
+        assert_eq!(img.shape(), vec![2, 4, 4]);
+        // Layout constant attribute materialised.
+        assert_eq!(
+            img.attr("signal").unwrap().read_numeric::<i64>().unwrap(),
+            1
+        );
+        // NDAttribute dataset under the ndattr_default group.
+        assert!(
+            names.contains(&"entry/instrument/NDAttributes/exposure".to_string()),
+            "NDAttribute dataset must be under the layout ndattr group; got {:?}",
+            names
+        );
+        // Performance dataset under the layout's performance group.
+        assert!(
+            names.contains(&"entry/instrument/performance/timestamp".to_string()),
+            "performance dataset must be under the layout group; got {:?}",
+            names
+        );
+
+        // Read-back resolves the nested dataset path.
+        drop(h5);
+        let mut reader = Hdf5Writer::new();
+        assert!(reader.set_layout_filename(layout.to_str().unwrap()));
+        reader.current_path = Some(path.clone());
+        let read_arr = reader.read_file().unwrap();
+        assert_eq!(read_arr.dims.len(), 3);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
+    }
+
+    #[test]
+    fn test_no_layout_keeps_flat_root_default() {
+        // Without a layout file the writer keeps the flat-root `data` default.
+        let path = temp_path("hdf5_flat_default");
+        let mut writer = Hdf5Writer::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        assert!(h5.dataset_names().contains(&"data".to_string()));
+        std::fs::remove_file(&path).ok();
     }
 }

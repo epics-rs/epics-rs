@@ -795,9 +795,26 @@ fn cmd_post_event_alias() -> CommandDef {
     )
 }
 
-fn post_event_handler(_args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
-    ctx.block_on(ctx.db().post_event());
-    ctx.println("Event scan processed");
+fn post_event_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
+    // C `dbIocRegister.c` `postEvent <event>` routes through
+    // `post_event(int)` -> `postEvent(pevent_list[event])`, posting
+    // ONLY the records whose `EVNT` matches that event. Route to
+    // `post_event_named` when an event argument is given; with no
+    // argument fall back to the (non-C) "process every Event record".
+    match args.first() {
+        Some(ArgValue::Int(event)) => {
+            ctx.block_on(ctx.db().post_event_named(&event.to_string()));
+            ctx.println(&format!("Posted event {event}"));
+        }
+        Some(ArgValue::String(name)) if !name.is_empty() => {
+            ctx.block_on(ctx.db().post_event_named(name));
+            ctx.println(&format!("Posted event {name}"));
+        }
+        _ => {
+            ctx.block_on(ctx.db().post_event());
+            ctx.println("Event scan processed (all SCAN=Event records)");
+        }
+    }
     Ok(CommandOutcome::Continue)
 }
 

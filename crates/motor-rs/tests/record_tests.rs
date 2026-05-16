@@ -913,9 +913,9 @@ fn test_move_accel_never_zero_for_unconfigured_axis() {
     rec.vel.accl = 0.5;
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
-    if let Some(a) = emitted_accel(&effects) {
-        assert!(a > 0.0, "acceleration must stay positive, got {a}");
-    }
+    let a = emitted_accel(&effects)
+        .expect("a move command must be emitted for a 50-unit move");
+    assert!(a > 0.0, "acceleration must stay positive, got {a}");
 }
 
 #[test]
@@ -994,11 +994,11 @@ fn test_move_to_home_defaults_to_move_absolute() {
     use asyn_rs::user::AsynUser;
     let mut sim = motor_rs::sim_motor::SimMotor::new();
     let user = AsynUser::new(0);
+    // move_to_home's default impl delegates to move_absolute(position=3.0).
     sim.move_to_home(&user, 3.0, 1.0, 0.5).unwrap();
     let status = sim.poll(&user).unwrap();
-    // SimMotor's move_absolute starts a move toward target=3.0
-    // (sim drives position over time; here we just check the command was accepted)
-    let _ = status;
+    // The sim must now be moving toward 3.0 from its start at 0.0.
+    assert!(status.moving, "move_to_home should start a move");
 }
 
 // --- PCO record PV exposure (C: 05b25c1d PR #248) ---

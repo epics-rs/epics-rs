@@ -235,7 +235,7 @@ impl AxisRuntime {
                             | MotorCommand::Home { .. }
                     )
                 });
-                self.execute_actions(&actions);
+                self.execute_actions(&actions).await;
                 self.apply_poll_directive(&actions);
                 if has_move {
                     self.forced_fast_polls_remaining = self.forced_fast_polls_config;
@@ -289,7 +289,7 @@ impl AxisRuntime {
         }
     }
 
-    fn execute_actions(&mut self, actions: &DeviceActions) {
+    async fn execute_actions(&mut self, actions: &DeviceActions) {
         let user = AsynUser::new(0);
 
         // Auto power on: enable closed loop before move commands
@@ -306,7 +306,9 @@ impl AxisRuntime {
             if has_move {
                 let _ = self.motor.set_closed_loop(&user, true);
                 if !self.power_on_delay.is_zero() {
-                    std::thread::sleep(self.power_on_delay);
+                    // Async sleep — a blocking sleep here would stall every
+                    // other axis/task sharing this tokio worker thread.
+                    tokio::time::sleep(self.power_on_delay).await;
                 }
             }
         }

@@ -340,6 +340,111 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
+    /// PVA RPC against a QSRV-served record or group PV.
+    ///
+    /// pvxs QSRV2 supports RPC on records and group PVs; the prior
+    /// `QsrvPvStore` left `ChannelSource::rpc` at its default
+    /// ("RPC not supported"). This override gives QSRV records and
+    /// group PVs the standard NTURI-shaped RPC contract:
+    ///
+    /// * The request is parsed as `epics:nt/NTURI:1.0` — RPC arguments
+    ///   live in the `query` substructure (`pvcall PV field=value`).
+    ///   A non-NTURI top-level structure is also accepted: its own
+    ///   fields are treated as the query set.
+    /// * Every query field is PUT into the target PV before the
+    ///   response is assembled. A query field named `value` (the
+    ///   common `pvcall PV value=...` case) maps onto the record's
+    ///   canonical `value` subfield; a field whose name is a known
+    ///   group member is routed to that member. This makes RPC a
+    ///   process-and-read primitive — pvxs `pvxcall`-style.
+    /// * The response is the PV's current value after the writes
+    ///   (`(FieldDesc, PvField::Structure)`), so a parameterless RPC
+    ///   degenerates to a plain GET. Native PVA plugin PVs
+    ///   (NTNDArray etc.) are read-only: their RPC is GET-only and a
+    ///   non-empty query is rejected.
+    fn rpc(
+        &self,
+        name: &str,
+        request_desc: FieldDesc,
+        request_value: PvField,
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+        let name_owned = name.to_string();
+        let pva_pvs = self.pva_pvs.clone();
+        async move {
+            let _ = request_desc;
+            // Pull RPC arguments: NTURI puts them under `query`,
+            // a bare structure exposes them at top level.
+            let query: Vec<(String, PvField)> = match &request_value {
+                PvField::Structure(s) => match s.get_field("query") {
+                    Some(PvField::Structure(q)) => q.fields.clone(),
+                    _ => s.fields.clone(),
+                },
+                PvField::Null => Vec::new(),
+                other => {
+                    return Err(format!(
+                        "qsrv RPC on {name_owned:?}: expected an NTURI or structure \
+                         request, got {other}"
+                    ));
+                }
+            };
+
+            // Native PVA plugin PVs (NTNDArray from NDPluginPva) are
+            // produced server-side and have no record to write into.
+            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
+                if !query.is_empty() {
+                    return Err(format!(
+                        "qsrv RPC on {name_owned:?}: native PVA PV is read-only, \
+                         RPC query arguments are not accepted"
+                    ));
+                }
+                let value = handle.latest.lock().clone().ok_or_else(|| {
+                    format!("qsrv RPC on {name_owned:?}: native PVA PV has no value yet")
+                })?;
+                let desc = handle
+                    .descriptor
+                    .clone()
+                    .unwrap_or_else(|| value.descriptor());
+                return Ok((desc, value));
+            }
+
+            let channel = self
+                .channel(&name_owned)
+                .await
+                .ok_or_else(|| format!("qsrv RPC: PV not found: {name_owned}"))?;
+
+            // Apply the query as a single PUT before the read-back.
+            // Each query field is placed at its own path in the put
+            // structure: for a single-record channel the only writable
+            // path is `value` (`pvcall PV value=...`); for a group PV
+            // every query field name is a member field path, resolved
+            // the same way `GroupChannel::put` reads members via
+            // `get_nested_field`. One `put` call so atomic groups stay
+            // atomic.
+            if !query.is_empty() {
+                let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+                for (field, field_value) in &query {
+                    super::group::set_nested_field(&mut put, field, field_value.clone());
+                }
+                channel
+                    .put(&put)
+                    .await
+                    .map_err(|e| format!("qsrv RPC put on {name_owned} failed: {e}"))?;
+            }
+
+            // Read back the post-write value as the RPC response.
+            let empty_request = PvStructure::new("");
+            let value = channel
+                .get(&empty_request)
+                .await
+                .map_err(|e| format!("qsrv RPC get-back on {name_owned} failed: {e}"))?;
+            let desc = channel
+                .get_field()
+                .await
+                .map_err(|e| format!("qsrv RPC introspection on {name_owned} failed: {e}"))?;
+            Ok((desc, PvField::Structure(value)))
+        }
+    }
+
     fn subscribe(
         &self,
         name: &str,
@@ -613,6 +718,115 @@ mod tests {
         store
             .register_pva_pv("TEST:BOGUS", latest, subscribers, Some(bogus_desc))
             .await;
+    }
+
+    /// B1: PVA RPC against a QSRV-served record. A parameterless RPC
+    /// degenerates to a GET — the response is the record's current
+    /// NTScalar value. Closes the doc gap "QsrvPvStore missing rpc".
+    #[tokio::test]
+    async fn rpc_on_qsrv_record_without_args_returns_current_value() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::pvdata::{PvField, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("RPC:AI", Box::new(AiRecord::new(2.5)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = QsrvPvStore::new(provider);
+
+        let (desc, value) = store
+            .rpc("RPC:AI", FieldDesc::Variant, PvField::Null)
+            .await
+            .expect("RPC on a QSRV record must succeed");
+
+        assert!(
+            matches!(desc, FieldDesc::Structure { .. }),
+            "RPC response descriptor must be the record's NT structure"
+        );
+        let s = match value {
+            PvField::Structure(s) => s,
+            other => panic!("RPC response must be a structure, got {other}"),
+        };
+        match s.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::Double(v))) => {
+                assert_eq!(*v, 2.5, "RPC must read back the record's current value")
+            }
+            other => panic!("expected scalar value field, got {other:?}"),
+        }
+    }
+
+    /// B1: an RPC carrying NTURI query arguments writes them into the
+    /// record before reading back — process-and-read, pvxs `pvxcall`
+    /// style. `pvcall RPC:AO value=7.0` must leave the record at 7.0.
+    #[tokio::test]
+    async fn rpc_on_qsrv_record_with_query_args_writes_then_reads() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ao::AoRecord;
+        use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("RPC:AO", Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = QsrvPvStore::new(provider);
+
+        // Build an NTURI request: query.value = 7.0.
+        let mut query = PvStructure::new("");
+        query
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.0))));
+        let mut nturi = PvStructure::new("epics:nt/NTURI:1.0");
+        nturi
+            .fields
+            .push(("scheme".into(), PvField::Scalar(ScalarValue::String("pva".into()))));
+        nturi
+            .fields
+            .push(("path".into(), PvField::Scalar(ScalarValue::String("RPC:AO".into()))));
+        nturi
+            .fields
+            .push(("query".into(), PvField::Structure(query)));
+
+        let request = PvField::Structure(nturi);
+        let (_desc, value) = store
+            .rpc("RPC:AO", request.descriptor(), request)
+            .await
+            .expect("RPC with query args must succeed");
+
+        let s = match value {
+            PvField::Structure(s) => s,
+            other => panic!("RPC response must be a structure, got {other}"),
+        };
+        match s.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::Double(v))) => {
+                assert_eq!(*v, 7.0, "RPC query arg must have been written to the record")
+            }
+            other => panic!("expected scalar value field, got {other:?}"),
+        }
+    }
+
+    /// B1: RPC against an unknown PV is a clean error, not a panic.
+    #[tokio::test]
+    async fn rpc_on_unknown_pv_errors() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = QsrvPvStore::new(provider);
+
+        let err = store
+            .rpc("NOPE:NOPV", FieldDesc::Variant, PvField::Null)
+            .await
+            .expect_err("RPC on a missing PV must error");
+        assert!(
+            err.contains("PV not found"),
+            "error must name the missing PV: {err}"
+        );
     }
 
     /// End-to-end wire test: a top-level `UnionArray` PV registered

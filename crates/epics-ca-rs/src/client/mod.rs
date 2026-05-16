@@ -570,7 +570,18 @@ impl CaClient {
                             }
                             crate::discovery::DiscoveryEvent::Removed { instance, .. } => {
                                 if let Some(addr) = instance_addrs.remove(&instance) {
-                                    if fwd_search_tx
+                                    // Two mDNS instances can resolve to the
+                                    // same SocketAddr (AddAddress dedups by
+                                    // addr). Only retract the address once
+                                    // the *last* instance backing it is gone
+                                    // — otherwise a Removed for one instance
+                                    // drops an address a sibling still needs.
+                                    if instance_addrs.values().any(|a| *a == addr) {
+                                        tracing::debug!(
+                                            %instance, %addr,
+                                            "discovery Removed — address still backed by another instance"
+                                        );
+                                    } else if fwd_search_tx
                                         .send(SearchRequest::RemoveAddress(addr))
                                         .is_err()
                                     {
@@ -1887,6 +1898,11 @@ impl CaChannel {
     /// access to the IOC's menu definitions. Plain integer ENUM
     /// indices should still go through [`Self::put`] with
     /// [`EpicsValue::Enum`].
+    ///
+    /// Note: a CA `DBR_STRING` is a fixed 40-byte field, so `value` is
+    /// truncated to 39 bytes + NUL on the wire (same fixed-buffer limit
+    /// as C `caput`). ENUM menu names are well within this; callers
+    /// writing longer strings should expect silent truncation.
     pub async fn put_string(&self, value: &str) -> CaResult<()> {
         let snap = self.snapshot()?;
 

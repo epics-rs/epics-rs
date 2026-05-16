@@ -1941,6 +1941,49 @@ impl CaChannel {
         self.send_write_nowait_fast(&snap, 0, 1, payload)
     }
 
+    /// Array variant of [`Self::put_string`] — writes `values` as a
+    /// `DBR_STRING` array (`count = values.len()`) regardless of the
+    /// channel's native type, and waits for the completion callback.
+    ///
+    /// This is the ENUM-waveform-by-name path: C `caput -a` on a
+    /// `DBR_ENUM` waveform writes each element as a `DBR_STRING` and the
+    /// **server** resolves each menu string. Each element is subject to
+    /// the same fixed 40-byte field truncation (39 bytes + NUL) as
+    /// [`Self::put_string`].
+    pub async fn put_string_array(&self, values: &[String]) -> CaResult<()> {
+        let snap = self.snapshot()?;
+
+        let ioid = alloc_ioid();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
+
+        let payload = EpicsValue::StringArray(values.to_vec()).to_bytes();
+        let count = values.len() as u32;
+        // DBR_STRING = 0. The server interprets each 40-byte element
+        // against its own field type (e.g. ENUM menu resolution).
+        if let Err(e) = self.send_write_notify_fast(&snap, 0, count, ioid, payload) {
+            self.in_flight.writes.remove(&ioid);
+            return Err(e);
+        }
+
+        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(30.0);
+        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
+            .map_err(|_| CaError::Timeout)?
+            .map_err(|_| CaError::Shutdown)?
+    }
+
+    /// Fire-and-forget variant of [`Self::put_string_array`].
+    pub async fn put_string_array_nowait(&self, values: &[String]) -> CaResult<()> {
+        let snap = self.snapshot()?;
+        let payload = EpicsValue::StringArray(values.to_vec()).to_bytes();
+        let count = values.len() as u32;
+        self.send_write_nowait_fast(&snap, 0, count, payload)
+    }
+
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {
         self.subscribe_with_deadband(0.0).await
     }
@@ -4027,5 +4070,36 @@ mod typed_string_put_tests {
             "native Double put must not collapse to DBR_STRING"
         );
         assert_eq!(hdr.available, 42, "ioid echoed in available field");
+    }
+
+    /// The ENUM-waveform-by-name path (`put_string_array`) must wire a
+    /// `DBR_STRING` array: data_type 0, count = element count, and a
+    /// 40-byte-per-element payload, so the server resolves each menu
+    /// string. Drives the same `build_write_frame` builder.
+    #[test]
+    fn put_string_array_frame_uses_dbr_string_type_and_count() {
+        let values = vec![
+            "Running".to_string(),
+            "Stopped".to_string(),
+            "Paused".to_string(),
+        ];
+        let payload = EpicsValue::StringArray(values.clone()).to_bytes();
+        assert_eq!(
+            payload.len(),
+            values.len() * 40,
+            "DBR_STRING array is 40 bytes per element"
+        );
+        let frame = CaChannel::build_write_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            /* sid */ 9,
+            /* data_type — forced DBR_STRING */ 0,
+            /* count */ values.len() as u32,
+            /* ioid */ Some(7),
+            payload,
+        );
+        let (hdr, _consumed) =
+            CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
+        assert_eq!(hdr.data_type, 0, "string-array put must wire DBR_STRING (0)");
+        assert_eq!(hdr.count, 3, "count must be the element count");
     }
 }

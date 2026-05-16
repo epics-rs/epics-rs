@@ -256,11 +256,27 @@ async fn main() {
             eprintln!("caput-rs: -a requires at least one value after the count token");
             std::process::exit(1);
         }
-        match parse_array(native_type, tokens) {
-            Ok(v) => WriteValue::Typed(v),
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+        // ENUM waveform special-casing, parallel to the scalar path:
+        // unless `-n` forces numeric, route to a DBR_STRING array for
+        // server-side menu resolution when `-s` is set or any element
+        // is not a plain integer index. C `caput -a` resolves each ENUM
+        // element string-or-numeric; sending the whole waveform as
+        // DBR_STRING achieves the same — the server parses an
+        // integer-looking element with no matching menu name as an
+        // index (the same documented divergence as the scalar path).
+        let enum_by_name = native_type == epics_ca_rs::DbFieldType::Enum
+            && !args.force_numeric
+            && (args.force_string
+                || tokens.iter().any(|t| parse_plain_integer(t).is_none()));
+        if enum_by_name {
+            WriteValue::EnumStringArray(tokens.to_vec())
+        } else {
+            match parse_array(native_type, tokens) {
+                Ok(v) => WriteValue::Typed(v),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
     } else {
@@ -317,6 +333,15 @@ async fn main() {
                 ch.put_string(s).await
             } else {
                 ch.put_string_nowait(s).await
+            }
+        }
+        WriteValue::EnumStringArray(v) => {
+            // ENUM waveform by name — DBR_STRING array, server resolves
+            // each element.
+            if args.callback {
+                ch.put_string_array(v).await
+            } else {
+                ch.put_string_array_nowait(v).await
             }
         }
     };
@@ -399,6 +424,10 @@ enum WriteValue {
     /// A scalar ENUM value written by name. The server resolves it
     /// against the record's menu — see `CaChannel::put_string`.
     EnumString(String),
+    /// An ENUM waveform written by name — each element a `DBR_STRING`
+    /// the server resolves against the record's menu. See
+    /// `CaChannel::put_string_array`.
+    EnumStringArray(Vec<String>),
 }
 
 impl WriteValue {
@@ -407,6 +436,9 @@ impl WriteValue {
         match self {
             WriteValue::Typed(v) => v.clone(),
             WriteValue::EnumString(s) => epics_ca_rs::EpicsValue::String(s.clone()),
+            WriteValue::EnumStringArray(v) => {
+                epics_ca_rs::EpicsValue::StringArray(v.clone())
+            }
         }
     }
 }

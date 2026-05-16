@@ -284,7 +284,11 @@ impl ControlSource {
                      configured on this gateway)"
                         .to_string()
                 })?;
-            let content = std::fs::read_to_string(&path)
+            // Async file read — `std::fs` would block the tokio
+            // worker thread for the duration of the disk read inside
+            // this RPC handler.
+            let content = tokio::fs::read_to_string(&path)
+                .await
                 .map_err(|e| format!("reload: cannot read ACF file '{path}': {e}"))?;
             let cfg = epics_base_rs::server::access_security::parse_acf(&content)
                 .map_err(|e| format!("reload: cannot parse ACF file '{path}': {e}"))?;

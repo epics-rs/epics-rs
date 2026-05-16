@@ -180,7 +180,17 @@ impl ADDriverBase {
         Ok(to_publish)
     }
 
-    /// Set shutter state (open/close). In C++ this dispatches based on shutter mode.
+    /// Set shutter state (open/close).
+    ///
+    /// Mirrors C++ `ADDriver::setShutter` (ADDriver.cpp:29-52):
+    /// - `ADShutterModeNone`: no-op.
+    /// - `ADShutterModeEPICS`: write `ADShutterControlEPICS`, fire callbacks,
+    ///   then sleep `shutterOpenDelay - shutterCloseDelay`.
+    /// - `ADShutterModeDetector`: empty break — detector drivers override
+    ///   `setShutter` themselves.
+    ///
+    /// C++ never writes `ADShutterStatus` here — the actual shutter status is
+    /// driven by the shutter hardware / EPICS records, not assumed.
     pub fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
         let mode = ShutterMode::from_i32(
             self.port_base
@@ -190,23 +200,29 @@ impl ADDriverBase {
         match mode {
             Some(ShutterMode::None) | None => {}
             Some(ShutterMode::DetectorOnly) => {
-                self.port_base.set_int32_param(
-                    self.params.shutter_control,
-                    0,
-                    if open { 1 } else { 0 },
-                )?;
+                // C++ ADShutterModeDetector is an empty break; detector drivers
+                // override setShutter. Nothing to do in the base implementation.
             }
             Some(ShutterMode::EpicsOnly) => {
+                let open_delay = self
+                    .port_base
+                    .get_float64_param(self.params.shutter_open_delay, 0)?;
+                let close_delay = self
+                    .port_base
+                    .get_float64_param(self.params.shutter_close_delay, 0)?;
                 self.port_base.set_int32_param(
                     self.params.shutter_control_epics,
                     0,
                     if open { 1 } else { 0 },
                 )?;
+                self.port_base.call_param_callbacks(0)?;
+                // C++: epicsThreadSleep(shutterOpenDelay - shutterCloseDelay).
+                let delay = open_delay - close_delay;
+                if delay > 0.0 {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(delay));
+                }
             }
         }
-
-        self.port_base
-            .set_int32_param(self.params.shutter_status, 0, if open { 1 } else { 0 })?;
 
         Ok(())
     }
@@ -338,38 +354,25 @@ mod tests {
     }
 
     #[test]
-    fn test_shutter_control_detector_mode() {
+    fn test_shutter_detector_mode_is_noop_in_base() {
+        // C parity: ADShutterModeDetector is an empty break in the base driver;
+        // detector drivers override setShutter themselves. The base must NOT
+        // touch SHUTTER_CONTROL or SHUTTER_STATUS.
         let mut ad = ADDriverBase::new("TEST", 8, 8, 1_000_000).unwrap();
         ad.port_base
             .set_int32_param(ad.params.shutter_mode, 0, ShutterMode::DetectorOnly as i32)
             .unwrap();
+        ad.port_base
+            .set_int32_param(ad.params.shutter_control, 0, 7)
+            .unwrap();
 
         ad.set_shutter(true).unwrap();
+        // Unchanged — base setShutter does nothing for detector mode.
         assert_eq!(
             ad.port_base
                 .get_int32_param(ad.params.shutter_control, 0)
                 .unwrap(),
-            1
-        );
-        assert_eq!(
-            ad.port_base
-                .get_int32_param(ad.params.shutter_status, 0)
-                .unwrap(),
-            1
-        );
-
-        ad.set_shutter(false).unwrap();
-        assert_eq!(
-            ad.port_base
-                .get_int32_param(ad.params.shutter_control, 0)
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            ad.port_base
-                .get_int32_param(ad.params.shutter_status, 0)
-                .unwrap(),
-            0
+            7
         );
     }
 
@@ -386,6 +389,38 @@ mod tests {
                 .get_int32_param(ad.params.shutter_control_epics, 0)
                 .unwrap(),
             1
+        );
+        // C parity: setShutter never writes SHUTTER_STATUS.
+        assert_eq!(
+            ad.port_base
+                .get_int32_param_strict(ad.params.shutter_status, 0)
+                .ok(),
+            None,
+            "SHUTTER_STATUS must remain unset by setShutter"
+        );
+    }
+
+    #[test]
+    fn test_shutter_epics_mode_sleeps_open_minus_close() {
+        // C parity: EPICS mode sleeps (shutterOpenDelay - shutterCloseDelay).
+        let mut ad = ADDriverBase::new("TEST", 8, 8, 1_000_000).unwrap();
+        ad.port_base
+            .set_int32_param(ad.params.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        ad.port_base
+            .set_float64_param(ad.params.shutter_open_delay, 0, 0.05)
+            .unwrap();
+        ad.port_base
+            .set_float64_param(ad.params.shutter_close_delay, 0, 0.01)
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        ad.set_shutter(true).unwrap();
+        let elapsed = start.elapsed();
+        // delay = 0.05 - 0.01 = 0.04 s.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(35),
+            "expected ~40ms sleep, got {elapsed:?}"
         );
     }
 

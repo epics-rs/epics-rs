@@ -39,11 +39,12 @@
 //!   by the pure-Rust `p12` crate.
 //! - **PBES2** — PBKDF2 + AES-CBC, the OpenSSL 3.x default (no
 //!   `-legacy` flag). The `p12` crate cannot decrypt these, so the
-//!   loader parses the PKCS#12 ASN.1 with the RustCrypto `pkcs12` /
-//!   `der` / `cms` stack and decrypts the PBES2-protected
-//!   `SafeContents` and `pkcs8ShroudedKeyBag`s with `pkcs5`. The
-//!   OpenSSL-3 keychain MAC (PKCS#12 KDF with SHA-256, HMAC-SHA256) is
-//!   verified before any bag is decrypted.
+//!   loader parses the PKCS#12 PFX / `AuthenticatedSafe` /
+//!   `ContentInfo` / `EncryptedData` / `SafeBag` ASN.1 directly with
+//!   the stable `der` crate and decrypts the PBES2-protected
+//!   `SafeContents` and `pkcs8ShroudedKeyBag`s with the stable `pkcs5`
+//!   crate. The OpenSSL-3 keychain MAC (PKCS#12 KDF with SHA-256,
+//!   HMAC-SHA256) is verified before any bag is decrypted.
 //!
 //! The loader tries the classic `p12` path first; when `p12` reports a
 //! bag-decryption failure (the symptom of PBES2 content) it retries
@@ -572,12 +573,11 @@ mod load_pkcs12_pbes2 {
     use super::{Keychain, TlsConfigError, select_leaf_index};
     use std::path::Path;
 
-    use cms::content_info::ContentInfo;
-    use cms::encrypted_data::EncryptedData;
-    use const_oid::ObjectIdentifier;
-    use der::asn1::OctetString;
-    use der::{Decode, Encode};
-    use rc_pkcs12::{BagType, CertBag, Pfx, SafeBag};
+    use der::asn1::{Any, ObjectIdentifier, OctetString, SetOfVec};
+    use der::{Decode, Encode, Sequence};
+    // `digest` traits, re-exported by `sha2` — the PKCS#12 MAC KDF
+    // (RFC 7292 Appendix B) is generic over the hash via these.
+    use rc_sha2::digest;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     /// `id-data` — an unencrypted content blob (RFC 5652).
@@ -595,6 +595,108 @@ mod load_pkcs12_pbes2 {
     const OID_SHA256: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 
+    /// `keyBag` — an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 7292 §4.2.1).
+    const OID_KEY_BAG: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.12.10.1.1");
+    /// `pkcs8ShroudedKeyBag` — a PBES2/PBE-encrypted private key (RFC 7292 §4.2.2).
+    const OID_PKCS8_SHROUDED_KEY_BAG: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.12.10.1.2");
+    /// `certBag` — an X.509 (or SDSI) certificate (RFC 7292 §4.2.3).
+    const OID_CERT_BAG: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.12.10.1.3");
+
+    // ─── PKCS#12 / RFC 5652 ASN.1 structures ────────────────────────
+    //
+    // RFC 7292 (PKCS#12) and RFC 5652 (CMS) define these as plain DER
+    // `SEQUENCE`s. We decode them with the stable `der` crate's
+    // `Sequence` derive — no pre-release `cms` / `pkcs12` crate needed.
+
+    /// `ContentInfo` (RFC 5652 §3): a content type OID plus an optional
+    /// `[0] EXPLICIT` content body. Used both as the PFX `authSafe` and
+    /// as each `AuthenticatedSafe` element.
+    #[derive(Sequence)]
+    struct ContentInfo {
+        content_type: ObjectIdentifier,
+        #[asn1(context_specific = "0", tag_mode = "EXPLICIT", optional = "true")]
+        content: Option<Any>,
+    }
+
+    /// `DigestInfo` (RFC 7292 §4): the MAC's digest algorithm and value.
+    #[derive(Sequence)]
+    struct DigestInfo {
+        digest_algorithm: spki::AlgorithmIdentifierOwned,
+        digest: OctetString,
+    }
+
+    /// `MacData` (RFC 7292 §4): the keychain integrity MAC. `iterations`
+    /// carries an ASN.1 `DEFAULT 1`, so DER omits it when it equals 1 —
+    /// modelled `Option` and defaulted on read.
+    #[derive(Sequence)]
+    struct MacData {
+        mac: DigestInfo,
+        mac_salt: OctetString,
+        #[asn1(optional = "true")]
+        iterations: Option<u32>,
+    }
+
+    /// `PFX` (RFC 7292 §4): the PKCS#12 top-level structure.
+    #[derive(Sequence)]
+    struct Pfx {
+        version: u8,
+        auth_safe: ContentInfo,
+        #[asn1(optional = "true")]
+        mac_data: Option<MacData>,
+    }
+
+    /// `EncryptedContentInfo` (RFC 5652 §6.1): the encrypted payload of
+    /// an `EncryptedData`. `encrypted_content` is `[0] IMPLICIT OCTET
+    /// STRING OPTIONAL`.
+    #[derive(Sequence)]
+    struct EncryptedContentInfo {
+        content_type: ObjectIdentifier,
+        content_enc_alg: spki::AlgorithmIdentifierOwned,
+        #[asn1(context_specific = "0", tag_mode = "IMPLICIT", optional = "true")]
+        encrypted_content: Option<OctetString>,
+    }
+
+    /// `EncryptedData` (RFC 5652 §8): a password-encrypted `SafeContents`
+    /// carried as an `id-encryptedData` `AuthenticatedSafe` element.
+    #[derive(Sequence)]
+    struct EncryptedData {
+        version: u8,
+        enc_content_info: EncryptedContentInfo,
+    }
+
+    /// `Attribute` (RFC 5652 §5.3): a `SafeBag`'s attribute — used to
+    /// read `localKeyID`. `ValueOrd` is derived so a `SetOfVec` of
+    /// these can be DER-decoded (a SET OF must be value-orderable).
+    #[derive(Sequence, der::ValueOrd)]
+    struct Attribute {
+        oid: ObjectIdentifier,
+        values: SetOfVec<Any>,
+    }
+
+    /// `SafeBag` (RFC 7292 §4.2): one bag inside a `SafeContents`. The
+    /// `bag_value` is `[0] EXPLICIT ANY` — its concrete type depends on
+    /// `bag_id` (CertBag / EncryptedPrivateKeyInfo / PrivateKeyInfo).
+    #[derive(Sequence)]
+    struct SafeBag {
+        bag_id: ObjectIdentifier,
+        #[asn1(context_specific = "0", tag_mode = "EXPLICIT")]
+        bag_value: Any,
+        #[asn1(optional = "true")]
+        bag_attributes: Option<SetOfVec<Attribute>>,
+    }
+
+    /// `CertBag` (RFC 7292 §4.2.3): a certificate bag. For X.509 the
+    /// `cert_value` is `[0] EXPLICIT OCTET STRING` holding the cert DER.
+    #[derive(Sequence)]
+    struct CertBag {
+        cert_id: ObjectIdentifier,
+        #[asn1(context_specific = "0", tag_mode = "EXPLICIT")]
+        cert_value: OctetString,
+    }
+
     fn err(path: &Path, reason: impl Into<String>) -> TlsConfigError {
         TlsConfigError::Pkcs12 {
             path: path.to_path_buf(),
@@ -605,14 +707,14 @@ mod load_pkcs12_pbes2 {
     /// True iff the keychain carries a classic SHA-1 PKCS#12 MAC — the
     /// only MAC the `p12` crate can handle (it panics on any other).
     /// A MAC-less keychain or any non-SHA-1 MAC returns `false`, which
-    /// routes the load through the RustCrypto path. A structurally
-    /// invalid keychain also returns `false`; the RustCrypto loader
-    /// then surfaces the precise parse error.
+    /// routes the load through the stable-`der` PBES2 path. A
+    /// structurally invalid keychain also returns `false`; the PBES2
+    /// loader then surfaces the precise parse error.
     pub(super) fn has_classic_sha1_mac(bytes: &[u8]) -> bool {
         match Pfx::from_der(bytes) {
             Ok(pfx) => pfx
                 .mac_data
-                .map(|m| m.mac.algorithm.oid == OID_SHA1)
+                .map(|m| m.mac.digest_algorithm.oid == OID_SHA1)
                 .unwrap_or(false),
             Err(_) => false,
         }
@@ -652,6 +754,88 @@ mod load_pkcs12_pbes2 {
         })
     }
 
+    /// PKCS#12 password-based key derivation (RFC 7292 Appendix B.2),
+    /// generic over the digest. `id` is the RFC's purpose byte: 1 =
+    /// key material, 2 = IV, 3 = MAC key. `password` is the BMPString
+    /// form (UTF-16BE + a trailing `00 00`). `block_len` is the hash's
+    /// block size in bytes (64 for both SHA-1 and SHA-256). Returns
+    /// `n` derived bytes.
+    ///
+    /// This is the algorithm OpenSSL's `PKCS12_key_gen` implements; we
+    /// reproduce it directly so the keychain MAC can be checked with
+    /// only the stable `digest`-based hash crates — no `pkcs12` crate.
+    fn pkcs12_kdf<D>(
+        id: u8,
+        password_bmp: &[u8],
+        salt: &[u8],
+        iterations: u32,
+        block_len: usize,
+        n: usize,
+    ) -> Vec<u8>
+    where
+        D: digest::Digest + digest::FixedOutputReset,
+    {
+        let u = <D as digest::OutputSizeUser>::output_size(); // digest length
+        let v = block_len; // hash block length (bytes)
+
+        // D = v bytes all equal to `id`.
+        let diversifier = vec![id; v];
+
+        // S = salt expanded to a multiple of v; P = password likewise.
+        let expand = |src: &[u8]| -> Vec<u8> {
+            if src.is_empty() {
+                return Vec::new();
+            }
+            let len = v * src.len().div_ceil(v);
+            let mut out = Vec::with_capacity(len);
+            while out.len() < len {
+                out.push(src[out.len() % src.len()]);
+            }
+            out
+        };
+        let s = expand(salt);
+        let p = expand(password_bmp);
+
+        // I = S || P.
+        let mut i_buf = Vec::with_capacity(s.len() + p.len());
+        i_buf.extend_from_slice(&s);
+        i_buf.extend_from_slice(&p);
+
+        let mut hasher = D::new();
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            // A = H^iterations( D || I ).
+            digest::Digest::update(&mut hasher, &diversifier);
+            digest::Digest::update(&mut hasher, &i_buf);
+            let mut a = hasher.finalize_reset();
+            for _ in 1..iterations {
+                digest::Digest::update(&mut hasher, &a);
+                a = hasher.finalize_reset();
+            }
+            out.extend_from_slice(&a[..u.min(n - out.len())]);
+            if out.len() >= n {
+                break;
+            }
+
+            // B = v-byte block formed by repeating A.
+            let mut b = vec![0u8; v];
+            for (k, byte) in b.iter_mut().enumerate() {
+                *byte = a[k % u];
+            }
+            // I_j = (I_j + B + 1) mod 2^v, for each v-byte block of I.
+            for chunk in i_buf.chunks_mut(v) {
+                let mut carry = 1u16;
+                for k in (0..chunk.len()).rev() {
+                    let sum = chunk[k] as u16 + b[k] as u16 + carry;
+                    chunk[k] = sum as u8;
+                    carry = sum >> 8;
+                }
+            }
+        }
+        out.truncate(n);
+        out
+    }
+
     /// Verify the PKCS#12 keychain MAC. Reproduces OpenSSL's
     /// `PKCS12_verify_mac`: derive an HMAC key with the PKCS#12 KDF
     /// (RFC 7292 Appendix B) over the MAC salt, then HMAC the
@@ -671,34 +855,26 @@ mod load_pkcs12_pbes2 {
             // verify. OpenSSL accepts these too.
             return Ok(());
         };
-        let digest_oid = mac_data.mac.algorithm.oid;
+        let digest_oid = mac_data.mac.digest_algorithm.oid;
         let salt = mac_data.mac_salt.as_bytes();
-        let rounds = mac_data.iterations;
+        // ASN.1 `iterations` is `DEFAULT 1`; an absent field means 1.
+        let rounds = mac_data.iterations.unwrap_or(1);
         let expected = mac_data.mac.digest.as_bytes();
+        let password_bmp = super::bmp_password(password);
 
         // SHA-1 and SHA-256 cover every MAC OpenSSL emits for a `.p12`.
+        // RFC 7292 MAC purpose byte is 3 (MAC key material).
         let ok = if digest_oid == OID_SHA256 {
-            let key = rc_pkcs12::kdf::derive_key_utf8::<rc_sha2::Sha256>(
-                password,
-                salt,
-                rc_pkcs12::kdf::Pkcs12KeyType::Mac,
-                rounds,
-                32,
-            )
-            .map_err(|e| err(path, format!("PKCS#12 MAC key derivation failed: {e}")))?;
+            // SHA-256: 32-byte output, 64-byte block.
+            let key =
+                pkcs12_kdf::<rc_sha2::Sha256>(3, &password_bmp, salt, rounds, 64, 32);
             let mut mac = <rc_hmac::Hmac<rc_sha2::Sha256>>::new_from_slice(&key)
                 .map_err(|e| err(path, format!("HMAC init failed: {e}")))?;
             mac.update(auth_safe_content);
             mac.verify_slice(expected).is_ok()
         } else if digest_oid == OID_SHA1 {
-            let key = rc_pkcs12::kdf::derive_key_utf8::<rc_sha1::Sha1>(
-                password,
-                salt,
-                rc_pkcs12::kdf::Pkcs12KeyType::Mac,
-                rounds,
-                20,
-            )
-            .map_err(|e| err(path, format!("PKCS#12 MAC key derivation failed: {e}")))?;
+            // SHA-1: 20-byte output, 64-byte block.
+            let key = pkcs12_kdf::<rc_sha1::Sha1>(3, &password_bmp, salt, rounds, 64, 20);
             let mut mac = <rc_hmac::Hmac<rc_sha1::Sha1>>::new_from_slice(&key)
                 .map_err(|e| err(path, format!("HMAC init failed: {e}")))?;
             mac.update(auth_safe_content);
@@ -726,34 +902,6 @@ mod load_pkcs12_pbes2 {
             .map_err(|e| err(path, format!("SafeContents decode failed: {e}")))
     }
 
-    /// Strip the `[0] EXPLICIT` context-specific wrapper RFC 7292 puts
-    /// around a `SafeBag`'s `bagValue`, returning the inner element's
-    /// DER. `SafeBag::decode_value` keeps the wrapper in `bag_value`,
-    /// so every bag payload must pass through this before its inner
-    /// type (CertBag / EncryptedPrivateKeyInfo / PrivateKeyInfo) can
-    /// be decoded.
-    fn unwrap_explicit_0(
-        path: &Path,
-        bag_value: &[u8],
-        what: &str,
-    ) -> Result<Vec<u8>, TlsConfigError> {
-        use der::asn1::AnyRef;
-        use der::{SliceReader, TagNumber};
-
-        let mut reader = SliceReader::new(bag_value)
-            .map_err(|e| err(path, format!("{what} reader init failed: {e}")))?;
-        let inner = der::asn1::ContextSpecific::<AnyRef<'_>>::decode_explicit(
-            &mut reader,
-            TagNumber(0),
-        )
-        .map_err(|e| err(path, format!("{what} [0] EXPLICIT decode failed: {e}")))?
-        .ok_or_else(|| err(path, format!("{what} missing [0] EXPLICIT bagValue")))?;
-        inner
-            .value
-            .to_der()
-            .map_err(|e| err(path, format!("{what} inner re-encode failed: {e}")))
-    }
-
     /// Extract a `SafeBag`'s `localKeyID` attribute value, if present.
     /// The attribute value is an `OCTET STRING`; on any decode mishap
     /// we treat the id as absent rather than failing the whole load —
@@ -763,8 +911,7 @@ mod load_pkcs12_pbes2 {
         for attr in attrs.iter() {
             if attr.oid == OID_LOCAL_KEY_ID {
                 if let Some(v) = attr.values.iter().next() {
-                    let der = v.to_der().ok()?;
-                    if let Ok(os) = OctetString::from_der(&der) {
+                    if let Ok(os) = v.decode_as::<OctetString>() {
                         return Some(os.as_bytes().to_vec());
                     }
                 }
@@ -774,7 +921,10 @@ mod load_pkcs12_pbes2 {
     }
 
     /// Process one `SafeBag`, appending any X.509 cert / private key it
-    /// carries to the running keychain accumulators.
+    /// carries to the running keychain accumulators. The `der`-derived
+    /// `SafeBag` already strips the `[0] EXPLICIT` wrapper RFC 7292 puts
+    /// around `bagValue`, so `bag.bag_value` is the inner CertBag /
+    /// EncryptedPrivateKeyInfo / PrivateKeyInfo element directly.
     fn process_bag(
         path: &Path,
         bag: &SafeBag,
@@ -783,49 +933,48 @@ mod load_pkcs12_pbes2 {
         key: &mut Option<PrivateKeyDer<'static>>,
         key_local_id: &mut Option<Vec<u8>>,
     ) -> Result<(), TlsConfigError> {
-        // `SafeBag::bag_value` retains the `[0] EXPLICIT` wrapper that
-        // RFC 7292 puts around `bagValue`. Strip it to reach the inner
-        // CertBag / EncryptedPrivateKeyInfo / PrivateKeyInfo SEQUENCE.
-        match BagType::try_from(bag.bag_id) {
-            Ok(BagType::Cert) => {
-                let inner = unwrap_explicit_0(path, &bag.bag_value, "certBag")?;
-                let cert_bag = CertBag::from_der(&inner)
-                    .map_err(|e| err(path, format!("certBag decode failed: {e}")))?;
-                cert_bags.push((
-                    cert_bag.cert_value.as_bytes().to_vec(),
-                    bag_local_key_id(bag),
-                ));
+        if bag.bag_id == OID_CERT_BAG {
+            let cert_bag = bag
+                .bag_value
+                .decode_as::<CertBag>()
+                .map_err(|e| err(path, format!("certBag decode failed: {e}")))?;
+            cert_bags.push((
+                cert_bag.cert_value.as_bytes().to_vec(),
+                bag_local_key_id(bag),
+            ));
+        } else if bag.bag_id == OID_PKCS8_SHROUDED_KEY_BAG {
+            // pkcs8ShroudedKeyBag = EncryptedPrivateKeyInfo:
+            // SEQUENCE { encryptionAlgorithm AlgorithmIdentifier,
+            //            encryptedData       OCTET STRING }.
+            let epki = bag
+                .bag_value
+                .decode_as::<EncryptedPrivateKeyInfo>()
+                .map_err(|e| {
+                    err(path, format!("EncryptedPrivateKeyInfo decode failed: {e}"))
+                })?;
+            let pkcs8 = pbes2_decrypt(
+                path,
+                &epki.encryption_algorithm,
+                epki.encrypted_data.as_bytes(),
+                password,
+            )?;
+            if key.is_none() {
+                *key = Some(PrivateKeyDer::Pkcs8(pkcs8.into()));
+                *key_local_id = bag_local_key_id(bag);
             }
-            Ok(BagType::Pkcs8) => {
-                // pkcs8ShroudedKeyBag = EncryptedPrivateKeyInfo:
-                // SEQUENCE { encryptionAlgorithm AlgorithmIdentifier,
-                //            encryptedData       OCTET STRING }.
-                let inner = unwrap_explicit_0(path, &bag.bag_value, "pkcs8ShroudedKeyBag")?;
-                let epki = EncryptedPrivateKeyInfo::from_der(&inner)
-                    .map_err(|e| err(path, format!("EncryptedPrivateKeyInfo decode failed: {e}")))?;
-                let pkcs8 = pbes2_decrypt(
-                    path,
-                    &epki.encryption_algorithm,
-                    epki.encrypted_data.as_bytes(),
-                    password,
-                )?;
-                if key.is_none() {
-                    *key = Some(PrivateKeyDer::Pkcs8(pkcs8.into()));
-                    *key_local_id = bag_local_key_id(bag);
-                }
+        } else if bag.bag_id == OID_KEY_BAG {
+            // keyBag = an unencrypted PKCS#8 PrivateKeyInfo.
+            if key.is_none() {
+                let inner = bag
+                    .bag_value
+                    .to_der()
+                    .map_err(|e| err(path, format!("keyBag re-encode failed: {e}")))?;
+                *key = Some(PrivateKeyDer::Pkcs8(inner.into()));
+                *key_local_id = bag_local_key_id(bag);
             }
-            Ok(BagType::Key) => {
-                // keyBag = an unencrypted PKCS#8 PrivateKeyInfo.
-                if key.is_none() {
-                    let inner = unwrap_explicit_0(path, &bag.bag_value, "keyBag")?;
-                    *key = Some(PrivateKeyDer::Pkcs8(inner.into()));
-                    *key_local_id = bag_local_key_id(bag);
-                }
-            }
-            // CRL / secret / nested safeContents bags carry no TLS
-            // material for our purposes — skip them.
-            _ => {}
         }
+        // CRL / secret / nested safeContents bags carry no TLS material
+        // for our purposes — skip them.
         Ok(())
     }
 
@@ -833,7 +982,7 @@ mod load_pkcs12_pbes2 {
     /// `pkcs8ShroudedKeyBag`. Decoded with `der` directly to avoid a
     /// `pkcs8`-crate dependency: the algorithm id feeds straight into
     /// `pkcs5::EncryptionScheme`.
-    #[derive(der::Sequence)]
+    #[derive(Sequence)]
     struct EncryptedPrivateKeyInfo {
         encryption_algorithm: spki::AlgorithmIdentifierOwned,
         encrypted_data: OctetString,
@@ -864,6 +1013,8 @@ mod load_pkcs12_pbes2 {
         let auth_safe_octets = pfx
             .auth_safe
             .content
+            .as_ref()
+            .ok_or_else(|| err(path, "PKCS#12 authSafe has no content"))?
             .decode_as::<OctetString>()
             .map_err(|e| err(path, format!("authSafe content decode failed: {e}")))?;
         let auth_safe_der = auth_safe_octets.as_bytes();
@@ -879,17 +1030,20 @@ mod load_pkcs12_pbes2 {
         let mut key_local_id: Option<Vec<u8>> = None;
 
         for ci in &safes {
+            let Some(content) = ci.content.as_ref() else {
+                // A `ContentInfo` with no content carries no bags.
+                continue;
+            };
             let safe_contents_der: Vec<u8> = if ci.content_type == ID_DATA {
                 // Plain SafeContents — content is an OCTET STRING.
-                ci.content
+                content
                     .decode_as::<OctetString>()
                     .map_err(|e| err(path, format!("data SafeContents decode failed: {e}")))?
                     .as_bytes()
                     .to_vec()
             } else if ci.content_type == ID_ENCRYPTED_DATA {
                 // PBES2-encrypted SafeContents.
-                let enc = ci
-                    .content
+                let enc = content
                     .decode_as::<EncryptedData>()
                     .map_err(|e| err(path, format!("EncryptedData decode failed: {e}")))?;
                 let eci = &enc.enc_content_info;

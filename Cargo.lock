@@ -610,18 +610,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
 
 [[package]]
-name = "cms"
-version = "0.3.0-pre.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758d5272932ff167e96ec9641a04d96ab1901cccc5ea9f47c15b4cbaa6f9ea53"
-dependencies = [
- "const-oid 0.10.2",
- "der 0.8.0",
- "spki 0.8.0",
- "x509-cert",
-]
-
-[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -856,7 +844,6 @@ checksum = "71fd89660b2dc699704064e59e9dba0147b903e85319429e131620d022be411b"
 dependencies = [
  "const-oid 0.10.2",
  "der_derive",
- "flagset",
  "zeroize",
 ]
 
@@ -1107,8 +1094,6 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
- "cms",
- "const-oid 0.10.2",
  "dashmap",
  "der 0.8.0",
  "epics-base-rs",
@@ -1119,7 +1104,6 @@ dependencies = [
  "libc",
  "p12",
  "parking_lot",
- "pkcs12",
  "pkcs5",
  "rcgen",
  "rustls 0.23.39",
@@ -1254,12 +1238,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "flagset"
-version = "0.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 
 [[package]]
 name = "flate2"
@@ -2711,21 +2689,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pkcs12"
-version = "0.2.0-pre.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8059bd79345d1d1c125656025814704bab5cdd204b1cefd5fab59b0fdd7476d2"
-dependencies = [
- "cms",
- "const-oid 0.10.2",
- "der 0.8.0",
- "digest 0.11.3",
- "spki 0.8.0",
- "x509-cert",
- "zeroize",
-]
 
 [[package]]
 name = "pkcs5"
@@ -4891,17 +4854,6 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
-
-[[package]]
-name = "x509-cert"
-version = "0.3.0-rc.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e21aad3a769f25f3d2d0cbf30ea8b50a1d602354bd6ab687fad112821608ba6"
-dependencies = [
- "const-oid 0.10.2",
- "der 0.8.0",
- "spki 0.8.0",
-]
 
 [[package]]
 name = "x509-parser"

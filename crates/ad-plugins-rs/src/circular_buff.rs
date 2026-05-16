@@ -74,6 +74,16 @@ pub enum BufferStatus {
     AcquisitionCompleted,
 }
 
+/// Result of pushing a frame: which frames to forward downstream now, and
+/// whether a capture sequence completed on this push.
+#[derive(Debug, Default)]
+pub struct PushResult {
+    /// Frames to forward downstream immediately, in order.
+    pub forward: Vec<Arc<NDArray>>,
+    /// True if the post-trigger count was reached on this push.
+    pub sequence_done: bool,
+}
+
 /// Circular buffer state for pre/post-trigger capture.
 pub struct CircularBuffer {
     pub(crate) pre_count: usize,
@@ -81,7 +91,12 @@ pub struct CircularBuffer {
     buffer: VecDeque<Arc<NDArray>>,
     pub(crate) trigger_condition: TriggerCondition,
     triggered: bool,
-    post_remaining: usize,
+    /// Number of post-trigger frames forwarded so far for the current trigger.
+    post_done: usize,
+    /// True once the pre-buffer has been flushed for the current trigger.
+    pre_flushed: bool,
+    /// Frames captured for the current sequence (pre + post), for callers
+    /// that want the batch via [`CircularBuffer::take_captured`].
     captured: Vec<Arc<NDArray>>,
     /// Maximum number of triggers before stopping (0 = unlimited).
     preset_trigger_count: usize,
@@ -101,7 +116,8 @@ impl CircularBuffer {
             buffer: VecDeque::with_capacity(pre_count + 1),
             trigger_condition: condition,
             triggered: false,
-            post_remaining: 0,
+            post_done: 0,
+            pre_flushed: false,
             captured: Vec::new(),
             preset_trigger_count: 0,
             trigger_count: 0,
@@ -131,11 +147,18 @@ impl CircularBuffer {
     }
 
     /// Push an array into the circular buffer.
-    /// Returns true if a complete capture sequence is ready.
-    pub fn push(&mut self, array: Arc<NDArray>) -> bool {
+    ///
+    /// Mirrors C++ `NDPluginCircularBuff::processCallbacks`: on the frame that
+    /// triggers, the pre-buffer is flushed immediately and the triggering
+    /// frame is forwarded as the first post-trigger frame; each subsequent
+    /// post-trigger frame is forwarded individually. The returned
+    /// [`PushResult::forward`] holds the frames to send downstream this call.
+    pub fn push(&mut self, array: Arc<NDArray>) -> PushResult {
+        let mut result = PushResult::default();
+
         // If acquisition is completed, ignore new frames
         if self.status == BufferStatus::AcquisitionCompleted {
-            return false;
+            return result;
         }
 
         // Transition from Idle to BufferFilling on first push
@@ -144,21 +167,23 @@ impl CircularBuffer {
         }
 
         if self.triggered {
-            // Post-trigger capture (Flushing state)
-            self.captured.push(array);
-            self.post_remaining -= 1;
-            if self.post_remaining == 0 {
-                self.triggered = false;
-                // Check if we've reached the preset trigger count
-                if self.preset_trigger_count > 0 && self.trigger_count >= self.preset_trigger_count
-                {
-                    self.status = BufferStatus::AcquisitionCompleted;
-                } else {
-                    self.status = BufferStatus::BufferFilling;
-                }
-                return true;
+            // Post-trigger capture (Flushing state).
+            // Flush the pre-buffer once, before the first post-trigger frame.
+            if !self.pre_flushed {
+                self.pre_flushed = true;
+                let pre: Vec<_> = self.buffer.drain(..).collect();
+                self.captured.extend(pre.iter().cloned());
+                result.forward.extend(pre);
             }
-            return false;
+            // C++ increments currentPostCount, forwards the frame, then tests
+            // `currentPostCount >= postCount`.
+            self.captured.push(Arc::clone(&array));
+            result.forward.push(array);
+            self.post_done += 1;
+            if self.post_done >= self.post_count {
+                self.complete_sequence(&mut result);
+            }
+            return result;
         }
 
         // Check trigger condition BEFORE adding to pre-buffer,
@@ -203,20 +228,20 @@ impl CircularBuffer {
             // Trigger fires before adding this frame to the pre-buffer,
             // so the triggering frame will be the first post-trigger frame.
             self.trigger();
-            // The triggering frame is the first post-trigger capture.
-            self.captured.push(array);
-            self.post_remaining -= 1;
-            if self.post_remaining == 0 {
-                self.triggered = false;
-                if self.preset_trigger_count > 0 && self.trigger_count >= self.preset_trigger_count
-                {
-                    self.status = BufferStatus::AcquisitionCompleted;
-                } else {
-                    self.status = BufferStatus::BufferFilling;
-                }
-                return true;
+            // Flush the pre-buffer immediately, then forward the triggering
+            // frame as the first post-trigger frame (C++ flushPreBuffer +
+            // doCallbacksGenericPointer of the trigger frame).
+            self.pre_flushed = true;
+            let pre: Vec<_> = self.buffer.drain(..).collect();
+            self.captured.extend(pre.iter().cloned());
+            result.forward.extend(pre);
+            self.captured.push(Arc::clone(&array));
+            result.forward.push(array);
+            self.post_done += 1;
+            if self.post_done >= self.post_count {
+                self.complete_sequence(&mut result);
             }
-            return false;
+            return result;
         }
 
         // Maintain pre-trigger ring buffer
@@ -225,7 +250,22 @@ impl CircularBuffer {
             self.buffer.pop_front();
         }
 
-        false
+        result
+    }
+
+    /// Finalize a completed post-trigger sequence (C++
+    /// `currentPostCount >= postCount` branch): advance status / trigger
+    /// bookkeeping and signal completion.
+    fn complete_sequence(&mut self, result: &mut PushResult) {
+        self.triggered = false;
+        self.pre_flushed = false;
+        self.post_done = 0;
+        if self.preset_trigger_count > 0 && self.trigger_count >= self.preset_trigger_count {
+            self.status = BufferStatus::AcquisitionCompleted;
+        } else {
+            self.status = BufferStatus::BufferFilling;
+        }
+        result.sequence_done = true;
     }
 
     /// External trigger.
@@ -236,12 +276,13 @@ impl CircularBuffer {
         }
 
         self.triggered = true;
-        self.post_remaining = self.post_count;
+        self.post_done = 0;
+        self.pre_flushed = false;
         self.trigger_count += 1;
         self.status = BufferStatus::Flushing;
-        // Flush pre-trigger buffer to captured
+        // The pre-buffer is flushed lazily on the first post-trigger push so
+        // the frames stream out in order with the post-trigger frames.
         self.captured.clear();
-        self.captured.extend(self.buffer.drain(..));
     }
 
     /// Take the captured arrays (pre + post trigger).
@@ -261,7 +302,8 @@ impl CircularBuffer {
         self.buffer.clear();
         self.captured.clear();
         self.triggered = false;
-        self.post_remaining = 0;
+        self.post_done = 0;
+        self.pre_flushed = false;
         self.trigger_count = 0;
         self.status = BufferStatus::Idle;
     }
@@ -346,7 +388,7 @@ impl NDPluginProcess for CircularBuffProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
-        let done = self.buffer.push(Arc::new(array.clone()));
+        let push_result = self.buffer.push(Arc::new(array.clone()));
 
         let mut updates = Vec::new();
         if let Some(idx) = self.params.status {
@@ -371,12 +413,15 @@ impl NDPluginProcess for CircularBuffProcessor {
             updates.push(ParamUpdate::int32(idx, self.buffer.trigger_count() as i32));
         }
 
-        if done {
-            let mut result = ProcessResult::arrays(self.buffer.take_captured());
+        // Stream frames downstream as the C++ plugin does: pre-buffer frames
+        // are flushed at the trigger and each post-trigger frame is forwarded
+        // immediately, rather than being withheld until the sequence ends.
+        if push_result.forward.is_empty() {
+            ProcessResult::sink(updates)
+        } else {
+            let mut result = ProcessResult::arrays(push_result.forward);
             result.param_updates = updates;
             result
-        } else {
-            ProcessResult::sink(updates)
         }
     }
 
@@ -544,9 +589,17 @@ mod tests {
         cb.trigger();
         assert!(cb.is_triggered());
 
-        cb.push(make_array(4));
-        let done = cb.push(make_array(5));
-        assert!(done);
+        // First post-trigger push flushes the pre-buffer and forwards frame 4.
+        let r1 = cb.push(make_array(4));
+        assert!(!r1.sequence_done);
+        let ids1: Vec<_> = r1.forward.iter().map(|a| a.unique_id).collect();
+        assert_eq!(ids1, vec![2, 3, 4]); // 2 pre + frame 4
+
+        // Second post-trigger push forwards frame 5 and completes.
+        let r2 = cb.push(make_array(5));
+        assert!(r2.sequence_done);
+        let ids2: Vec<_> = r2.forward.iter().map(|a| a.unique_id).collect();
+        assert_eq!(ids2, vec![5]);
 
         let captured = cb.take_captured();
         assert_eq!(captured.len(), 4); // 2 pre + 2 post
@@ -554,6 +607,51 @@ mod tests {
         assert_eq!(captured[1].unique_id, 3);
         assert_eq!(captured[2].unique_id, 4);
         assert_eq!(captured[3].unique_id, 5);
+    }
+
+    #[test]
+    fn test_post_count_zero_no_underflow() {
+        // Regression: post_count == 0 must complete the sequence on the first
+        // post-trigger frame instead of underflowing the post counter.
+        let mut cb = CircularBuffer::new(2, 0, TriggerCondition::External);
+        cb.push(make_array(1));
+        cb.push(make_array(2));
+        cb.trigger();
+        assert!(cb.is_triggered());
+
+        // First frame after the trigger: pre-buffer flushed + this frame,
+        // and the sequence completes immediately (postCount == 0).
+        let r = cb.push(make_array(3));
+        assert!(r.sequence_done);
+        let ids: Vec<_> = r.forward.iter().map(|a| a.unique_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert!(!cb.is_triggered());
+        assert_eq!(cb.status(), BufferStatus::BufferFilling);
+
+        // No panic / no 2^64 capture; further frames just fill the pre-buffer.
+        let r2 = cb.push(make_array(4));
+        assert!(!r2.sequence_done);
+        assert!(r2.forward.is_empty());
+    }
+
+    #[test]
+    fn test_attribute_trigger_post_count_zero() {
+        // post_count == 0 with an attribute trigger: the triggering frame is
+        // forwarded and the sequence completes on the same push.
+        let mut cb = CircularBuffer::new(
+            1,
+            0,
+            TriggerCondition::AttributeThreshold {
+                name: "trigger".into(),
+                threshold: 5.0,
+            },
+        );
+        cb.push(make_array_with_attr(1, 1.0));
+        let r = cb.push(make_array_with_attr(2, 9.0));
+        assert!(r.sequence_done);
+        let ids: Vec<_> = r.forward.iter().map(|a| a.unique_id).collect();
+        assert_eq!(ids, vec![1, 2]); // 1 pre + triggering frame
+        assert!(!cb.is_triggered());
     }
 
     #[test]
@@ -572,11 +670,14 @@ mod tests {
         assert!(!cb.is_triggered());
 
         // This should trigger (attr >= 5.0); triggering frame is first post-trigger
-        cb.push(make_array_with_attr(3, 5.0));
+        let r3 = cb.push(make_array_with_attr(3, 5.0));
         assert!(cb.is_triggered());
+        // Pre-buffer (id=2) flushed + triggering frame (id=3) forwarded now.
+        let ids3: Vec<_> = r3.forward.iter().map(|a| a.unique_id).collect();
+        assert_eq!(ids3, vec![2, 3]);
 
-        let done = cb.push(make_array(4));
-        assert!(done);
+        let r4 = cb.push(make_array(4));
+        assert!(r4.sequence_done);
 
         let captured = cb.take_captured();
         // 1 pre (id=2) + 2 post (id=3 triggering frame + id=4)
@@ -611,7 +712,7 @@ mod tests {
         assert!(cb.is_triggered());
 
         let done = cb.push(make_array(3));
-        assert!(done);
+        assert!(done.sequence_done);
 
         let captured = cb.take_captured();
         // 1 pre (id=1) + 2 post (id=2 triggering frame + id=3)
@@ -720,7 +821,7 @@ mod tests {
         assert_eq!(cb.status(), BufferStatus::Flushing);
 
         let done = cb.push(make_array(2));
-        assert!(done);
+        assert!(done.sequence_done);
         assert_eq!(cb.status(), BufferStatus::BufferFilling); // back to filling after first capture
 
         cb.take_captured();
@@ -734,14 +835,14 @@ mod tests {
         assert_eq!(cb.status(), BufferStatus::Flushing);
 
         let done = cb.push(make_array(4));
-        assert!(done);
+        assert!(done.sequence_done);
         assert_eq!(cb.status(), BufferStatus::AcquisitionCompleted);
 
         cb.take_captured();
 
         // Further frames should be ignored
         let done = cb.push(make_array(5));
-        assert!(!done);
+        assert!(!done.sequence_done);
         assert_eq!(cb.status(), BufferStatus::AcquisitionCompleted);
 
         // Further triggers should be ignored
@@ -769,7 +870,7 @@ mod tests {
 
         // Post-trigger capture completes -> back to BufferFilling
         let done = cb.push(make_array(3));
-        assert!(done);
+        assert!(done.sequence_done);
         assert_eq!(cb.status(), BufferStatus::BufferFilling);
 
         // Reset -> Idle

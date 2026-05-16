@@ -4,7 +4,10 @@ use std::sync::Arc;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 
-use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+use crate::attributes::{
+    EpicsPvAttributeSource, FunctionAttributeSource, NDAttrSource, NDAttrValue, NDAttribute,
+    NDAttributeFunctionRegistry, ParamAttributeSource,
+};
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 use crate::params::ndarray_driver::NDArrayDriverParams;
@@ -36,13 +39,23 @@ fn xml_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
 ///
 /// Recognizes a root `<Attributes>` element containing
 /// `<Attribute name="..." source="..." type="..." description="..." .../>`
-/// children. The `type` attribute selects the [`NDAttrSource`]; `EPICS_PV`,
-/// `param`, `Function` and `const` map to `EpicsPV`, `Param`, `Function` and
-/// `Constant` respectively (C++ `NDAttribute::attrSourceString`). Live values
-/// are not fetched here — Param/EpicsPV/Function attributes are stored with an
-/// `Undefined` value until a source backend evaluates them; `const`
-/// attributes carry their literal `source` string as the value.
-fn parse_attributes_xml(xml: &str) -> Result<Vec<NDAttribute>, String> {
+/// children. The `type` attribute selects the [`NDAttrSource`]; C++
+/// `NDAttribute::attrSourceString` defines the canonical uppercase names
+/// `PARAM`, `EPICS_PV`, `FUNCTION`, `CONST` — the match is case-insensitive so
+/// historic lowercase forms still parse.
+///
+/// G10: live attributes are built with concrete [`NDAttributeSource`]
+/// backends:
+/// - `PARAM` → [`ParamAttributeSource`], fed by the driver from the asyn
+///   parameter library (optional `addr` attribute, default 0).
+/// - `FUNCTION` → [`FunctionAttributeSource`], calling a function registered
+///   in `registry` (optional `param` attribute passed to the function).
+/// - `EPICS_PV` → [`EpicsPvAttributeSource`], fed by a CA-monitor task.
+/// - `CONST` → static value carrying the literal `source` string.
+fn parse_attributes_xml(
+    xml: &str,
+    registry: &std::sync::Arc<NDAttributeFunctionRegistry>,
+) -> Result<Vec<NDAttribute>, String> {
     if !xml.contains("<Attributes>") {
         return Err("missing <Attributes> root element".into());
     }
@@ -65,17 +78,38 @@ fn parse_attributes_xml(xml: &str) -> Result<Vec<NDAttribute>, String> {
         // C++ default attribute type is EPICS_PV.
         let attr_type = xml_attr(tag, "type").unwrap_or("EPICS_PV");
 
-        let (source, value) = match attr_type {
-            "EPICS_PV" => (NDAttrSource::EpicsPV, NDAttrValue::Undefined),
-            "param" => (
-                NDAttrSource::Param {
-                    port_name: String::new(),
-                    param_name: source_str.to_string(),
-                },
-                NDAttrValue::Undefined,
-            ),
-            "Function" => (NDAttrSource::Function, NDAttrValue::Undefined),
-            "const" => (
+        let attr = match attr_type.to_ascii_uppercase().as_str() {
+            "EPICS_PV" => {
+                // G10: a CA-monitor task feeds the cell; backend is pluggable.
+                let src = EpicsPvAttributeSource::new(source_str);
+                NDAttribute::new_with_source(name, description, NDAttrSource::EpicsPV, src)
+            }
+            "PARAM" => {
+                // C++ paramAttribute: optional `addr` (default 0).
+                let addr = xml_attr(tag, "addr")
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
+                let src = ParamAttributeSource::new(source_str, addr);
+                NDAttribute::new_with_source(
+                    name,
+                    description,
+                    NDAttrSource::Param {
+                        port_name: String::new(),
+                        param_name: source_str.to_string(),
+                    },
+                    src,
+                )
+            }
+            "FUNCTION" => {
+                // C++ functAttribute: `source` is the function name, optional
+                // `param` is the string passed to the function.
+                let func_param = xml_attr(tag, "param").unwrap_or("");
+                let src = FunctionAttributeSource::new(registry.clone(), source_str, func_param);
+                NDAttribute::new_with_source(name, description, NDAttrSource::Function, src)
+            }
+            "CONST" => NDAttribute::new_static(
+                name,
+                description,
                 NDAttrSource::Constant,
                 NDAttrValue::String(source_str.to_string()),
             ),
@@ -86,7 +120,7 @@ fn parse_attributes_xml(xml: &str) -> Result<Vec<NDAttribute>, String> {
             }
         };
 
-        out.push(NDAttribute::new_static(name, description, source, value));
+        out.push(attr);
         rest = &after[close..];
     }
     Ok(out)
@@ -361,6 +395,9 @@ pub struct NDArrayDriverBase {
     /// NDArray attribute definitions loaded from `ND_ATTRIBUTES_FILE`
     /// (C++ `asynNDArrayDriver::pAttributeList`).
     pub attributes: crate::attributes::NDAttributeList,
+    /// Registry of named attribute functions for `FUNCTION`-type attributes
+    /// (C++ `registryFunctionFind` / `registerNDAttributeFunction`).
+    pub attr_functions: std::sync::Arc<NDAttributeFunctionRegistry>,
 }
 
 impl NDArrayDriverBase {
@@ -389,6 +426,7 @@ impl NDArrayDriverBase {
             queued_counter: Arc::new(QueuedArrayCounter::new()),
             last_array: None,
             attributes: crate::attributes::NDAttributeList::new(),
+            attr_functions: NDAttributeFunctionRegistry::new(),
         })
     }
 
@@ -428,13 +466,25 @@ impl NDArrayDriverBase {
     ///
     /// This function does NOT publish the array — the caller is responsible
     /// for that in an async context. Returns `None` when callbacks are disabled.
-    pub fn prepare_array(&mut self, array: Arc<NDArray>) -> AsynResult<Option<Arc<NDArray>>> {
+    pub fn prepare_array(&mut self, mut array: Arc<NDArray>) -> AsynResult<Option<Arc<NDArray>>> {
         let counter = self
             .port_base
             .get_int32_param(self.params.array_counter, 0)?
             + 1;
         self.port_base
             .set_int32_param(self.params.array_counter, 0, counter)?;
+
+        // G10: re-evaluate every live attribute (PARAM from the parameter
+        // library, FUNCTION from the registry, EPICS_PV from its CA cell) and
+        // merge the fresh values onto the outgoing array. Port of C++
+        // `asynNDArrayDriver::doCallbacksGenericPointer` calling
+        // `getAttributes(pArray->pAttributeList)` before the callback. Skipped
+        // when the driver has no attribute definitions, so a plain array is
+        // never needlessly deep-copied via `Arc::make_mut`.
+        if !self.attributes.is_empty() {
+            let fresh = self.update_attributes();
+            Arc::make_mut(&mut array).attributes.copy_from(&fresh);
+        }
 
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
@@ -661,7 +711,7 @@ impl NDArrayDriverBase {
             }
         };
 
-        match parse_attributes_xml(&xml) {
+        match parse_attributes_xml(&xml, &self.attr_functions) {
             Ok(attrs) => {
                 for attr in attrs {
                     self.attributes.add(attr);
@@ -688,6 +738,69 @@ impl NDArrayDriverBase {
     /// `read_nd_attributes_file`).
     pub fn attributes(&self) -> &crate::attributes::NDAttributeList {
         &self.attributes
+    }
+
+    /// Re-evaluate every live attribute, then return a snapshot of the list to
+    /// attach to an outgoing NDArray.
+    ///
+    /// Port of C++ `asynNDArrayDriver::getAttributes` →
+    /// `NDAttributeList::updateValues()`. `PARAM` attributes are refreshed from
+    /// this driver's asyn parameter library (mirroring
+    /// `paramAttribute::updateValue`, which reads `pDriver->getXxxParam`);
+    /// `FUNCTION` attributes call their registered function; `EPICS_PV`
+    /// attributes read whatever value a CA-monitor task last fed into their
+    /// cell. `CONST` / `DRIVER` attributes are static.
+    pub fn update_attributes(&mut self) -> crate::attributes::NDAttributeList {
+        // 1. Feed each PARAM attribute's cell from the parameter library.
+        //    Done first (immutable borrow of attributes + port_base), so the
+        //    subsequent update_values() re-read picks up the fresh value.
+        for attr in self.attributes.iter() {
+            if let Some(param_src) = attr.param_source() {
+                if let Some(value) = self.read_param_value(&param_src.param_name, param_src.addr) {
+                    param_src.cell().set(value);
+                }
+            }
+        }
+        // 2. Re-evaluate every attribute from its (now-fresh) source.
+        self.attributes.update_values();
+        // 3. Return a snapshot for the outgoing array.
+        self.attributes.clone()
+    }
+
+    /// Read a parameter's current value from the asyn parameter library,
+    /// converting it to an [`NDAttrValue`]. Returns `None` when the parameter
+    /// name is unknown or its value is undefined.
+    fn read_param_value(&self, param_name: &str, addr: i32) -> Option<NDAttrValue> {
+        use asyn_rs::param::ParamType;
+        let index = self.port_base.params.find_param(param_name)?;
+        match self.port_base.params.param_type(index)? {
+            ParamType::Int32 | ParamType::Enum | ParamType::UInt32Digital => self
+                .port_base
+                .params
+                .get_int32(index, addr)
+                .ok()
+                .map(NDAttrValue::Int32),
+            ParamType::Int64 => self
+                .port_base
+                .params
+                .get_int64(index, addr)
+                .ok()
+                .map(NDAttrValue::Int64),
+            ParamType::Float64 => self
+                .port_base
+                .params
+                .get_float64(index, addr)
+                .ok()
+                .map(NDAttrValue::Float64),
+            ParamType::Octet => self
+                .port_base
+                .params
+                .get_string(index, addr)
+                .ok()
+                .map(|s| NDAttrValue::String(s.to_string())),
+            // Array / pointer parameters have no scalar attribute mapping.
+            _ => None,
+        }
     }
 }
 
@@ -1017,6 +1130,98 @@ mod tests {
                 .unwrap(),
             ATTR_STATUS_OK
         );
+    }
+
+    #[test]
+    fn test_param_attribute_reevaluates_from_param_library() {
+        // G10: a PARAM attribute loaded from NDAttributesFile XML must
+        // re-evaluate from the driver's asyn parameter library on
+        // update_attributes(), not stay frozen at its Undefined load value.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let xml = r#"<Attributes>
+            <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+            <Attribute name="Maker" type="PARAM" source="MANUFACTURER" datatype="STRING"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+
+        // Drive the parameter library, then re-evaluate the attributes.
+        drv.port_base
+            .set_int32_param(drv.params.array_counter, 0, 17)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.manufacturer, 0, "ACME".into())
+            .unwrap();
+        let snap = drv.update_attributes();
+        assert_eq!(snap.get("Counter").unwrap().value, NDAttrValue::Int32(17));
+        assert_eq!(
+            snap.get("Maker").unwrap().value,
+            NDAttrValue::String("ACME".into())
+        );
+
+        // A later parameter change is picked up on the next update.
+        drv.port_base
+            .set_int32_param(drv.params.array_counter, 0, 99)
+            .unwrap();
+        let snap2 = drv.update_attributes();
+        assert_eq!(snap2.get("Counter").unwrap().value, NDAttrValue::Int32(99));
+    }
+
+    #[test]
+    fn test_function_attribute_reevaluates_from_registry() {
+        // G10: a FUNCTION attribute loaded from XML must call its registered
+        // function on update_attributes().
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        // Register a function whose return value changes on each call.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let c = counter.clone();
+        drv.attr_functions.register("tick", move |param: &str| {
+            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            // The XML `param` string is passed through to the function.
+            NDAttrValue::String(format!("{param}={n}"))
+        });
+
+        let xml = r#"<Attributes>
+            <Attribute name="Live" type="FUNCTION" source="tick" param="seq"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        // Construction evaluated the function once (value = "seq=1").
+        assert_eq!(
+            drv.attributes().get("Live").unwrap().value,
+            NDAttrValue::String("seq=1".into())
+        );
+
+        let snap = drv.update_attributes();
+        assert_eq!(
+            snap.get("Live").unwrap().value,
+            NDAttrValue::String("seq=2".into())
+        );
+        let snap2 = drv.update_attributes();
+        assert_eq!(
+            snap2.get("Live").unwrap().value,
+            NDAttrValue::String("seq=3".into())
+        );
+    }
+
+    #[test]
+    fn test_function_attribute_missing_function_is_undefined() {
+        // G10: a FUNCTION attribute naming an unregistered function evaluates
+        // to Undefined (C++ functAttribute::updateValue returns asynError).
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let xml = r#"<Attributes>
+            <Attribute name="Missing" type="FUNCTION" source="no_such_fn"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        let snap = drv.update_attributes();
+        assert_eq!(snap.get("Missing").unwrap().value, NDAttrValue::Undefined);
     }
 
     #[test]

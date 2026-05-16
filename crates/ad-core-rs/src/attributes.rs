@@ -125,6 +125,266 @@ impl NDAttrValue {
 pub trait NDAttributeSource: Send + Sync {
     /// Re-evaluate the attribute from its underlying source.
     fn evaluate(&self) -> NDAttrValue;
+
+    /// Downcast hook so the driver can recognize a `ParamAttributeSource` (or
+    /// `EpicsPvAttributeSource`) and feed its [`LiveValueCell`].
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// A thread-safe value cell shared between an attribute source and the agent
+/// that feeds it fresh values (the driver for `Param`, a CA-monitor task for
+/// `EpicsPV`). The feeder calls [`LiveValueCell::set`]; the attribute source
+/// reads via [`LiveValueCell::get`].
+#[derive(Debug)]
+pub struct LiveValueCell {
+    value: std::sync::RwLock<NDAttrValue>,
+}
+
+impl LiveValueCell {
+    /// Create a cell with an initial (typically `Undefined`) value.
+    pub fn new(initial: NDAttrValue) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            value: std::sync::RwLock::new(initial),
+        })
+    }
+
+    /// Store a fresh value (called by the feeder — driver / CA-monitor task).
+    pub fn set(&self, value: NDAttrValue) {
+        if let Ok(mut guard) = self.value.write() {
+            *guard = value;
+        }
+    }
+
+    /// Read the current value.
+    pub fn get(&self) -> NDAttrValue {
+        self.value
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or(NDAttrValue::Undefined)
+    }
+}
+
+impl NDAttributeSource for LiveValueCell {
+    fn evaluate(&self) -> NDAttrValue {
+        self.get()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Live source for a `Param`-type attribute (C++ `paramAttribute`).
+///
+/// The driver owns the asyn parameter library; on each
+/// `NDAttributeList::update_values()` cycle the driver refreshes this source's
+/// [`LiveValueCell`] with the current value of the parameter named
+/// `param_name`. `evaluate()` then returns that fresh value — mirroring C++
+/// `paramAttribute::updateValue()`, which reads `pDriver->getXxxParam()`.
+#[derive(Debug)]
+pub struct ParamAttributeSource {
+    /// The asyn parameter name this attribute reads (the XML `source`).
+    pub param_name: String,
+    /// The address (asyn `paramAddr`) to read from.
+    pub addr: i32,
+    cell: std::sync::Arc<LiveValueCell>,
+}
+
+impl ParamAttributeSource {
+    pub fn new(param_name: impl Into<String>, addr: i32) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            param_name: param_name.into(),
+            addr,
+            cell: LiveValueCell::new(NDAttrValue::Undefined),
+        })
+    }
+
+    /// The shared cell the driver writes fresh parameter values into.
+    pub fn cell(&self) -> &std::sync::Arc<LiveValueCell> {
+        &self.cell
+    }
+}
+
+impl NDAttributeSource for ParamAttributeSource {
+    fn evaluate(&self) -> NDAttrValue {
+        self.cell.get()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A user attribute function: receives the `functParam` string and returns the
+/// attribute's current value. Port of C++ `NDAttributeFunction`
+/// (`functAttribute` calls `pFunction(functParam, &functionPvt, this)`).
+pub type NDAttributeFunction = std::sync::Arc<dyn Fn(&str) -> NDAttrValue + Send + Sync>;
+
+/// Registry of named attribute functions (C++ `registryFunctionFind` /
+/// `registerNDAttributeFunction`).
+///
+/// A `Function`-type attribute names a function here; `FunctionAttributeSource`
+/// looks it up and calls it on every `evaluate()`.
+#[derive(Default)]
+pub struct NDAttributeFunctionRegistry {
+    funcs: std::sync::RwLock<std::collections::HashMap<String, NDAttributeFunction>>,
+}
+
+impl NDAttributeFunctionRegistry {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// Register an attribute function under `name` (C++
+    /// `registerNDAttributeFunction`).
+    pub fn register(
+        &self,
+        name: impl Into<String>,
+        func: impl Fn(&str) -> NDAttrValue + Send + Sync + 'static,
+    ) {
+        if let Ok(mut g) = self.funcs.write() {
+            g.insert(name.into(), std::sync::Arc::new(func));
+        }
+    }
+
+    /// Look up a registered function by name (C++ `registryFunctionFind`).
+    pub fn find(&self, name: &str) -> Option<NDAttributeFunction> {
+        self.funcs.read().ok()?.get(name).cloned()
+    }
+}
+
+/// Live source for a `Function`-type attribute (C++ `functAttribute`).
+///
+/// Holds a reference to the function registry, the function name (XML
+/// `source`) and the function parameter string (XML `param`). `evaluate()`
+/// looks the function up and calls it — matching `functAttribute::updateValue`.
+/// If the function is not registered, `evaluate()` returns `Undefined`
+/// (C++ `updateValue` returns `asynError` and leaves the value unchanged).
+pub struct FunctionAttributeSource {
+    registry: std::sync::Arc<NDAttributeFunctionRegistry>,
+    function_name: String,
+    function_param: String,
+}
+
+impl FunctionAttributeSource {
+    pub fn new(
+        registry: std::sync::Arc<NDAttributeFunctionRegistry>,
+        function_name: impl Into<String>,
+        function_param: impl Into<String>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            registry,
+            function_name: function_name.into(),
+            function_param: function_param.into(),
+        })
+    }
+}
+
+impl NDAttributeSource for FunctionAttributeSource {
+    fn evaluate(&self) -> NDAttrValue {
+        match self.registry.find(&self.function_name) {
+            Some(f) => f(&self.function_param),
+            None => NDAttrValue::Undefined,
+        }
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Live source for an `EPICS_PV`-type attribute (C++ `PVAttribute`).
+///
+/// A CA-monitor task feeds fresh values into the shared [`LiveValueCell`];
+/// `evaluate()` returns the latest monitored value. This struct is the
+/// pluggable backend — the CA-monitor feeder task that drives the cell is
+/// provided separately (it requires a live `epics-ca-rs` CA client).
+#[derive(Debug)]
+pub struct EpicsPvAttributeSource {
+    /// The PV name this attribute monitors (the XML `source`).
+    pub pv_name: String,
+    cell: std::sync::Arc<LiveValueCell>,
+}
+
+impl EpicsPvAttributeSource {
+    pub fn new(pv_name: impl Into<String>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            pv_name: pv_name.into(),
+            cell: LiveValueCell::new(NDAttrValue::Undefined),
+        })
+    }
+
+    /// The shared cell a CA-monitor task writes fresh PV values into.
+    pub fn cell(&self) -> &std::sync::Arc<LiveValueCell> {
+        &self.cell
+    }
+}
+
+impl NDAttributeSource for EpicsPvAttributeSource {
+    fn evaluate(&self) -> NDAttrValue {
+        self.cell.get()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// CA-monitor feeder for `EPICS_PV`-type attributes (C++ `PVAttribute`'s
+/// channel-access monitor callback).
+///
+/// Requires the `ioc` feature (the `epics-ca-rs` CA client). Spawns a tokio
+/// task that subscribes to the attribute's PV via [`epics_ca_rs::client::CaClient::camonitor`]
+/// and writes every monitored value into the source's [`LiveValueCell`], so
+/// `evaluate()` returns the latest value. The task exits when the monitor
+/// stream ends; the returned [`tokio::task::JoinHandle`] lets the caller abort
+/// it on shutdown.
+#[cfg(feature = "ioc")]
+pub fn spawn_ca_monitor(
+    client: std::sync::Arc<epics_ca_rs::client::CaClient>,
+    source: std::sync::Arc<EpicsPvAttributeSource>,
+) -> tokio::task::JoinHandle<()> {
+    let pv_name = source.pv_name.clone();
+    let cell = source.cell().clone();
+    tokio::spawn(async move {
+        let _ = client
+            .camonitor(&pv_name, |value| {
+                cell.set(epics_value_to_nd_attr(&value));
+            })
+            .await;
+    })
+}
+
+/// Convert an `epics-ca-rs` [`epics_ca_rs::EpicsValue`] scalar to an
+/// [`NDAttrValue`]. Array values collapse to their first element (an NDArray
+/// attribute is scalar); empty arrays yield `Undefined`.
+#[cfg(feature = "ioc")]
+fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
+    use epics_ca_rs::EpicsValue as E;
+    match value {
+        E::String(s) => NDAttrValue::String(s.clone()),
+        E::Short(v) => NDAttrValue::Int16(*v),
+        E::Float(v) => NDAttrValue::Float32(*v),
+        E::Enum(v) => NDAttrValue::UInt16(*v),
+        E::Char(v) => NDAttrValue::UInt8(*v),
+        E::Long(v) => NDAttrValue::Int32(*v),
+        E::Double(v) => NDAttrValue::Float64(*v),
+        E::Int64(v) => NDAttrValue::Int64(*v),
+        E::ShortArray(a) => a.first().map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int16(*v)),
+        E::FloatArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Float32(*v)),
+        E::EnumArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt16(*v)),
+        E::DoubleArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Float64(*v)),
+        E::LongArray(a) => a.first().map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int32(*v)),
+        E::CharArray(a) => a.first().map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt8(*v)),
+        E::Int64Array(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int64(*v)),
+        E::StringArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::String(v.clone())),
+    }
 }
 
 /// A named attribute attached to an NDArray.
@@ -195,6 +455,22 @@ impl NDAttribute {
         if let Some(src) = &self.source_impl {
             self.value = src.evaluate();
         }
+    }
+
+    /// If this attribute is backed by a [`ParamAttributeSource`], return it so
+    /// the driver can feed its [`LiveValueCell`] from the parameter library.
+    pub fn param_source(&self) -> Option<&ParamAttributeSource> {
+        self.source_impl
+            .as_ref()
+            .and_then(|s| s.as_any().downcast_ref::<ParamAttributeSource>())
+    }
+
+    /// If this attribute is backed by an [`EpicsPvAttributeSource`], return it
+    /// so a CA-monitor task can feed its [`LiveValueCell`].
+    pub fn epics_pv_source(&self) -> Option<&EpicsPvAttributeSource> {
+        self.source_impl
+            .as_ref()
+            .and_then(|s| s.as_any().downcast_ref::<EpicsPvAttributeSource>())
     }
 }
 
@@ -419,6 +695,9 @@ mod tests {
                 + 1;
             NDAttrValue::Int32(n)
         }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[test]
@@ -443,6 +722,57 @@ mod tests {
             NDAttribute::new_static("static", "", NDAttrSource::Constant, NDAttrValue::Int32(42));
         attr.update();
         assert_eq!(attr.value, NDAttrValue::Int32(42));
+    }
+
+    #[test]
+    fn test_param_source_cell_reevaluates() {
+        // G10: a ParamAttributeSource returns whatever the driver last fed
+        // into its cell — update() re-reads the fresh value.
+        let src = ParamAttributeSource::new("GAIN", 0);
+        let mut attr = NDAttribute::new_with_source(
+            "Gain",
+            "",
+            NDAttrSource::Param {
+                port_name: String::new(),
+                param_name: "GAIN".into(),
+            },
+            src.clone(),
+        );
+        assert_eq!(attr.value, NDAttrValue::Undefined);
+        src.cell().set(NDAttrValue::Float64(3.5));
+        attr.update();
+        assert_eq!(attr.value, NDAttrValue::Float64(3.5));
+        // param_source() downcast exposes the backend to the driver.
+        assert_eq!(attr.param_source().unwrap().param_name, "GAIN");
+    }
+
+    #[test]
+    fn test_function_source_via_registry() {
+        // G10: a FunctionAttributeSource calls the named registered function.
+        let registry = NDAttributeFunctionRegistry::new();
+        registry.register("double", |p: &str| {
+            NDAttrValue::Int32(p.parse::<i32>().unwrap_or(0) * 2)
+        });
+        let src = FunctionAttributeSource::new(registry.clone(), "double", "21");
+        let mut attr =
+            NDAttribute::new_with_source("Doubled", "", NDAttrSource::Function, src);
+        assert_eq!(attr.value, NDAttrValue::Int32(42));
+        attr.update();
+        assert_eq!(attr.value, NDAttrValue::Int32(42));
+
+        // An unregistered function evaluates to Undefined.
+        let missing = FunctionAttributeSource::new(registry, "no_such", "");
+        assert_eq!(missing.evaluate(), NDAttrValue::Undefined);
+    }
+
+    #[test]
+    fn test_epics_pv_source_cell_feeding() {
+        // G10: an EpicsPvAttributeSource returns whatever a CA-monitor task
+        // last fed into its cell.
+        let src = EpicsPvAttributeSource::new("TST:Temp");
+        assert_eq!(src.evaluate(), NDAttrValue::Undefined);
+        src.cell().set(NDAttrValue::Float64(22.4));
+        assert_eq!(src.evaluate(), NDAttrValue::Float64(22.4));
     }
 
     #[test]

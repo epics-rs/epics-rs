@@ -12,6 +12,11 @@ use crate::timestamp::EpicsTimestamp;
 /// it and allocate fresh to avoid wasting memory.
 const THRESHOLD_SIZE_RATIO: f64 = 1.5;
 
+/// Process-wide source of pool identities. Each `NDArrayPool` gets a unique
+/// non-zero id so `release` can verify an array belongs to it (C++
+/// NDArrayPool.cpp:352 checks `pArray->pNDArrayPool == this`).
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
 /// NDArray factory with free-list reuse and memory tracking.
 ///
 /// Mimics C++ ADCore's NDArrayPool: on alloc, checks the free list for a
@@ -19,6 +24,8 @@ const THRESHOLD_SIZE_RATIO: f64 = 1.5;
 /// free list for future reuse. The free list is sorted by capacity (descending)
 /// and excess entries are dropped when max_memory is exceeded.
 pub struct NDArrayPool {
+    /// Unique identity of this pool, stamped onto every array it allocates.
+    id: u64,
     max_memory: usize,
     allocated_bytes: AtomicU64,
     next_unique_id: AtomicI32,
@@ -30,6 +37,7 @@ pub struct NDArrayPool {
 impl NDArrayPool {
     pub fn new(max_memory: usize) -> Self {
         Self {
+            id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
             max_memory,
             allocated_bytes: AtomicU64::new(0),
             next_unique_id: AtomicI32::new(1),
@@ -39,15 +47,27 @@ impl NDArrayPool {
         }
     }
 
+    /// Identity of this pool (the value stamped onto `NDArray::pool_id`).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Allocate an NDArray. Tries to reuse a free-list entry with sufficient capacity.
+    ///
+    /// Memory accounting tracks the exact requested byte count (`data_size`,
+    /// equivalent to C++ `dataSize`), NOT the allocator-rounded `Vec::capacity`.
+    /// `allocated_bytes` is the sum of the `data_size` of every live + free array,
+    /// so it matches what C++ `getMemorySize()` reports and the `max_memory`
+    /// limit is enforced exactly.
     pub fn alloc(&self, dims: Vec<NDDimension>, data_type: NDDataType) -> ADResult<NDArray> {
         let num_elements: usize = dims.iter().map(|d| d.size).product();
         let needed_bytes = num_elements * data_type.element_size();
 
-        // Try to find a reusable buffer in the free list
+        // Try to find a reusable buffer in the free list. Selection is by Vec
+        // capacity (a buffer big enough to hold the data without reallocating),
+        // but accounting always uses the exact `data_size`.
         let reused = {
             let mut free = self.free_list.lock();
-            // Find smallest buffer that is large enough (free list sorted descending by capacity)
             let mut best_idx = None;
             let mut best_cap = usize::MAX;
             for (i, arr) in free.iter().enumerate() {
@@ -59,11 +79,11 @@ impl NDArrayPool {
             }
             if let Some(idx) = best_idx {
                 if best_cap as f64 > needed_bytes as f64 * THRESHOLD_SIZE_RATIO {
+                    // Oversized: discard it, subtract its tracked data_size.
                     let dropped = free.swap_remove(idx);
-                    let dropped_cap = dropped.data.capacity_bytes();
                     self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
                     self.allocated_bytes
-                        .fetch_sub(dropped_cap as u64, Ordering::Relaxed);
+                        .fetch_sub(dropped.data_size as u64, Ordering::Relaxed);
                     self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
                     None
                 } else {
@@ -77,35 +97,38 @@ impl NDArrayPool {
         };
 
         let mut arr = if let Some(mut reused) = reused {
-            // Reuse: retype the buffer if needed, resize to match
+            // Reuse: the array's tracked data_size changes from its old value to
+            // `needed_bytes`. Adjust `allocated_bytes` by the signed difference,
+            // enforcing `max_memory` when growing.
+            let old_size = reused.data_size;
             if reused.data.data_type() != data_type {
-                // Must reallocate with new type, but we keep the allocation tracked
-                let old_cap = reused.data.capacity_bytes();
                 reused.data = NDDataBuffer::zeros(data_type, num_elements);
-                let new_cap = reused.data.capacity_bytes();
-                // Adjust allocated_bytes for the difference
-                if new_cap > old_cap {
-                    let diff = new_cap - old_cap;
-                    let current = self.allocated_bytes.load(Ordering::Relaxed);
-                    if self.max_memory > 0 && current + diff as u64 > self.max_memory as u64 {
-                        return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
-                    }
-                    self.allocated_bytes
-                        .fetch_add(diff as u64, Ordering::Relaxed);
-                } else {
-                    let diff = old_cap - new_cap;
-                    self.allocated_bytes
-                        .fetch_sub(diff as u64, Ordering::Relaxed);
-                }
             } else {
                 reused.data.resize(num_elements);
             }
+            if needed_bytes > old_size {
+                let diff = (needed_bytes - old_size) as u64;
+                let current = self.allocated_bytes.load(Ordering::Relaxed);
+                if self.max_memory > 0 && current + diff > self.max_memory as u64 {
+                    // Put the array back; the reuse path does not consume a slot.
+                    let mut free = self.free_list.lock();
+                    free.push(reused);
+                    self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
+                    return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
+                }
+                self.allocated_bytes.fetch_add(diff, Ordering::Relaxed);
+            } else if old_size > needed_bytes {
+                self.allocated_bytes
+                    .fetch_sub((old_size - needed_bytes) as u64, Ordering::Relaxed);
+            }
+            reused.data_size = needed_bytes;
             reused.dims = dims;
             reused.attributes.clear();
             reused.codec = None;
             reused
         } else {
-            // Fresh allocation with CAS loop to avoid TOCTOU race
+            // Fresh allocation with CAS loop to avoid TOCTOU race. The reserved
+            // amount is exactly `needed_bytes`; no capacity slack is ever added.
             if self.max_memory > 0 {
                 loop {
                     let current = self.allocated_bytes.load(Ordering::Relaxed);
@@ -121,12 +144,12 @@ impl NDArrayPool {
                                 .saturating_sub(self.max_memory as u64);
                             while !free.is_empty() && reclaimed < over {
                                 let dropped = free.remove(0);
-                                let dropped_cap = dropped.data.capacity_bytes();
+                                let dropped_size = dropped.data_size as u64;
                                 self.allocated_bytes
-                                    .fetch_sub(dropped_cap as u64, Ordering::Relaxed);
+                                    .fetch_sub(dropped_size, Ordering::Relaxed);
                                 self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
                                 self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
-                                reclaimed += dropped_cap as u64;
+                                reclaimed += dropped_size;
                             }
                             if reclaimed >= over {
                                 freed_enough = true;
@@ -155,17 +178,13 @@ impl NDArrayPool {
                     .fetch_add(needed_bytes as u64, Ordering::Relaxed);
             }
             self.num_alloc_buffers.fetch_add(1, Ordering::Relaxed);
-            let new_arr = NDArray::new(dims, data_type);
-            let actual_cap = new_arr.data.capacity_bytes();
-            if actual_cap > needed_bytes {
-                self.allocated_bytes
-                    .fetch_add((actual_cap - needed_bytes) as u64, Ordering::Relaxed);
-            }
-            new_arr
+            NDArray::new(dims, data_type)
         };
 
         arr.unique_id = self.next_unique_id.fetch_add(1, Ordering::Relaxed);
         arr.timestamp = EpicsTimestamp::now();
+        arr.pool_id = self.id;
+        arr.data_size = needed_bytes;
         Ok(arr)
     }
 
@@ -183,33 +202,43 @@ impl NDArrayPool {
     }
 
     /// Return an array to the free list for future reuse.
+    ///
+    /// The array must have been allocated from this pool. C++
+    /// (NDArrayPool.cpp:352) verifies `pArray->pNDArrayPool == this` and refuses
+    /// otherwise; the Rust port checks `pool_id` and drops a foreign array
+    /// without touching this pool's free list or accounting.
     pub fn release(&self, array: NDArray) {
-        let cap = array.data.capacity_bytes();
+        if array.pool_id != self.id {
+            // Foreign (or non-pool) array — never touch this pool's accounting.
+            // Dropping `array` here frees its memory; it was never part of
+            // `allocated_bytes`, so no adjustment is made.
+            return;
+        }
+
         let mut free = self.free_list.lock();
         free.push(array);
         self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
 
-        // If total allocated exceeds max_memory, drop largest free entries
-        // (max_memory == 0 means unlimited, skip trimming)
+        // If total allocated exceeds max_memory, drop largest free entries.
+        // Accounting and the loop counter both use the exact `data_size` so the
+        // `usize` `excess` can never underflow (max_memory == 0 means unlimited).
         let total = self.allocated_bytes.load(Ordering::Relaxed) as usize;
         if self.max_memory > 0 && total > self.max_memory && !free.is_empty() {
-            // Sort descending by capacity so we drop largest first
-            free.sort_by(|a, b| b.data.capacity_bytes().cmp(&a.data.capacity_bytes()));
-            let mut excess = total.saturating_sub(self.max_memory);
+            free.sort_by(|a, b| b.data_size.cmp(&a.data_size));
+            let mut excess = total - self.max_memory;
             while excess > 0 && !free.is_empty() {
                 let dropped = free.remove(0);
-                let dropped_cap = dropped.data.capacity_bytes();
+                let dropped_size = dropped.data_size;
                 self.allocated_bytes
-                    .fetch_sub(dropped_cap.min(total) as u64, Ordering::Relaxed);
+                    .fetch_sub(dropped_size as u64, Ordering::Relaxed);
                 self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
                 self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
-                if dropped_cap >= excess {
+                if dropped_size >= excess {
                     break;
                 }
-                excess -= dropped_cap;
+                excess -= dropped_size;
             }
         }
-        let _ = cap;
     }
 
     /// Clear all entries from the free list.
@@ -217,9 +246,8 @@ impl NDArrayPool {
         let mut free = self.free_list.lock();
         let count = free.len() as u32;
         for arr in free.drain(..) {
-            let cap = arr.data.capacity_bytes();
             self.allocated_bytes
-                .fetch_sub(cap as u64, Ordering::Relaxed);
+                .fetch_sub(arr.data_size as u64, Ordering::Relaxed);
             self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
         }
         self.num_free_buffers.fetch_sub(count, Ordering::Relaxed);
@@ -252,16 +280,92 @@ impl NDArrayPool {
         Ok(pooled_array(array, pool))
     }
 
+    /// Copy `src` into a (possibly existing) output array.
+    ///
+    /// Mirrors C++ `NDArrayPool::copy(pIn, pOut, copyData, copyDimensions,
+    /// copyDataType)`:
+    /// - `out` is `None`: a fresh array is allocated through this pool with the
+    ///   source dimensions/type.
+    /// - `copy_dimensions`: copy `dims` from source.
+    /// - `copy_data_type`: the output buffer takes the source data type.
+    /// - `copy_data`: copy the pixel/codec bytes.
+    /// Attributes are always cleared on the output then copied from the source.
+    pub fn copy(
+        &self,
+        src: &NDArray,
+        out: Option<NDArray>,
+        copy_data: bool,
+        copy_dimensions: bool,
+        copy_data_type: bool,
+    ) -> ADResult<NDArray> {
+        let mut out = match out {
+            Some(o) => o,
+            None => self.alloc(src.dims.clone(), src.data.data_type())?,
+        };
+
+        out.unique_id = src.unique_id;
+        out.time_stamp = src.time_stamp;
+        out.timestamp = src.timestamp;
+        if copy_dimensions {
+            out.dims = src.dims.clone();
+        }
+        out.codec = src.codec.clone();
+
+        if copy_data {
+            if copy_data_type && out.data.data_type() != src.data.data_type() {
+                // Output adopts the source type: clone the buffer wholesale.
+                out.data = src.data.clone();
+            } else if out.data.data_type() == src.data.data_type() {
+                out.data = src.data.clone();
+            } else {
+                // Output keeps its own type: convert pixel values.
+                out.data = crate::color::convert_data_type(src, out.data.data_type())?.data;
+            }
+        } else if copy_data_type && out.data.data_type() != src.data.data_type() {
+            out.data = NDDataBuffer::zeros(src.data.data_type(), out.data.len());
+        }
+
+        out.attributes.clear();
+        out.attributes.copy_from(&src.attributes);
+        Ok(out)
+    }
+
+    /// Allocate `count` copies of `template_array`, then immediately release
+    /// them back to the free list (C++ `asynNDArrayDriver::preAllocateBuffers`).
+    ///
+    /// The net effect is that the pool's free list is warmed with `count`
+    /// reusable buffers sized for the template array.
+    pub fn pre_allocate_buffers(&self, template_array: &NDArray, count: usize) -> ADResult<()> {
+        let mut buffers = Vec::with_capacity(count);
+        for _ in 0..count {
+            buffers.push(self.copy(template_array, None, true, true, true)?);
+        }
+        for arr in buffers {
+            self.release(arr);
+        }
+        Ok(())
+    }
+
     /// Convert data type only (no dimension changes).
-    /// Allocates from pool, converts data, copies metadata.
+    /// Allocates the output through the pool, converts data, copies metadata.
     pub fn convert_type(&self, src: &NDArray, target_type: NDDataType) -> ADResult<NDArray> {
+        // C parity (NDArrayPool.cpp:620-625): cannot convert compressed data.
+        if src.codec.is_some() {
+            return Err(ADError::UnsupportedConversion(
+                "convert_type: cannot convert compressed (codec) data".into(),
+            ));
+        }
         if src.data.data_type() == target_type {
             return self.alloc_copy(src);
         }
-        let mut out = crate::color::convert_data_type(src, target_type)?;
-        out.unique_id = self
-            .next_unique_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Allocate the output through the pool so it counts against
+        // allocated_bytes / num_alloc_buffers.
+        let mut out = self.alloc(src.dims.clone(), target_type)?;
+        let converted = crate::color::convert_data_type(src, target_type)?;
+        out.data = converted.data;
+        out.time_stamp = src.time_stamp;
+        out.timestamp = src.timestamp;
+        out.attributes.copy_from(&src.attributes);
         Ok(out)
     }
 
@@ -281,6 +385,13 @@ impl NDArrayPool {
         dims_out: &[NDDimension],
         target_type: NDDataType,
     ) -> ADResult<NDArray> {
+        // C parity (NDArrayPool.cpp:620-625): cannot convert compressed data.
+        if src.codec.is_some() {
+            return Err(ADError::UnsupportedConversion(
+                "convert: cannot convert compressed (codec) data".into(),
+            ));
+        }
+
         let ndims = src.dims.len();
         if dims_out.len() != ndims {
             return Err(ADError::InvalidDimensions(format!(
@@ -319,7 +430,10 @@ impl NDArrayPool {
 
         let src_type = src.data.data_type();
 
-        // Build output dimension metadata
+        // Build output dimension metadata.
+        // C++ NDArrayPool.cpp:719-724 makes `reverse` cumulative:
+        //   if (pIn->dims[i].reverse) pOut->dims[i].reverse = !pOut->dims[i].reverse;
+        // i.e. out.reverse = dims_out[i].reverse XOR src.dims[i].reverse.
         let mut out_dims = Vec::with_capacity(ndims);
         for i in 0..ndims {
             let bin = dims_out[i].binning.max(1);
@@ -327,7 +441,7 @@ impl NDArrayPool {
                 size: out_sizes[i],
                 offset: src.dims[i].offset + dims_out[i].offset,
                 binning: src.dims[i].binning * bin,
-                reverse: dims_out[i].reverse,
+                reverse: dims_out[i].reverse ^ src.dims[i].reverse,
             });
         }
 
@@ -418,26 +532,64 @@ impl NDArrayPool {
             NDDataBuffer::F64(v) => convert_buf!(v, f64, 0.0f64, F64),
         };
 
-        // Build intermediate array in source type with binned data
-        let mut arr = NDArray {
-            unique_id: self
-                .next_unique_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            timestamp: src.timestamp,
-            time_stamp: src.time_stamp,
-            dims: out_dims,
-            data: out_data,
-            attributes: src.attributes.clone(),
-            codec: src.codec.clone(),
-        };
+        // Allocate the output array THROUGH the pool so it counts against
+        // allocated_bytes / num_alloc_buffers and can be reused via the free
+        // list (C parity: C++ convert calls alloc() for its output).
+        let mut arr = self.alloc(out_dims, target_type)?;
+        arr.timestamp = src.timestamp;
+        arr.time_stamp = src.time_stamp;
+        arr.attributes.copy_from(&src.attributes);
 
-        // Convert data type if needed
+        // `out_data` holds the binned result in the SOURCE type. If the target
+        // type differs, convert; otherwise install it directly.
         if target_type != src_type {
-            let converted = crate::color::convert_data_type(&arr, target_type)?;
+            let staging = NDArray::new(arr.dims.clone(), src_type);
+            let mut staging = staging;
+            staging.data = out_data;
+            let converted = crate::color::convert_data_type(&staging, target_type)?;
             arr.data = converted.data;
+        } else {
+            arr.data = out_data;
         }
 
         Ok(arr)
+    }
+
+    /// Produce a diagnostic text dump (matching C++ `NDArrayPool::report`).
+    ///
+    /// `details > 5` additionally lists the free-list entries.
+    pub fn report(&self, details: i32) -> String {
+        let mut out = String::new();
+        out.push('\n');
+        out.push_str("NDArrayPool:\n");
+        out.push_str(&format!(
+            "  numBuffers={}, numFree={}\n",
+            self.num_alloc_buffers(),
+            self.num_free_buffers()
+        ));
+        out.push_str(&format!(
+            "  memorySize={}, maxMemory={}\n",
+            self.allocated_bytes(),
+            self.max_memory
+        ));
+        if details > 5 {
+            let free = self.free_list.lock();
+            out.push_str("  freeList: (index, dataSize, capacity)\n");
+            for (i, arr) in free.iter().enumerate() {
+                out.push_str(&format!(
+                    "    {} {} {}\n",
+                    i,
+                    arr.data_size,
+                    arr.data.capacity_bytes()
+                ));
+            }
+            if details > 10 {
+                for arr in free.iter() {
+                    out.push_str(&arr.report(details));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1165,5 +1317,193 @@ mod tests {
         } else {
             panic!("wrong type");
         }
+    }
+
+    // --- Regression tests for review fixes ---
+
+    /// B1: output `reverse` must be cumulative — `dims_out.reverse XOR src.reverse`.
+    #[test]
+    fn test_convert_reverse_flag_cumulative() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        src.dims[0].reverse = true; // source already reversed
+
+        // dims_out also requests reverse: true XOR true = false.
+        let dims_out = vec![NDDimension {
+            size: 4,
+            offset: 0,
+            binning: 1,
+            reverse: true,
+        }];
+        let out = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
+        assert!(!out.dims[0].reverse, "true XOR true must be false");
+
+        // dims_out reverse false: false XOR true = true.
+        let dims_out2 = vec![NDDimension {
+            size: 4,
+            offset: 0,
+            binning: 1,
+            reverse: false,
+        }];
+        let out2 = pool.convert(&src, &dims_out2, NDDataType::UInt8).unwrap();
+        assert!(out2.dims[0].reverse, "false XOR true must be true");
+    }
+
+    /// B3: pool accounting tracks the EXACT requested byte count, not Vec capacity.
+    #[test]
+    fn test_alloc_tracks_exact_data_size() {
+        let pool = NDArrayPool::new(0); // unlimited
+        let a = pool
+            .alloc(vec![NDDimension::new(333)], NDDataType::UInt16)
+            .unwrap();
+        // 333 * 2 = 666 — exact, no allocator capacity slack.
+        assert_eq!(a.data_size, 666);
+        assert_eq!(pool.allocated_bytes(), 666);
+    }
+
+    /// B3: a single allocation cannot push `allocated_bytes` past `max_memory`.
+    #[test]
+    fn test_alloc_strict_max_memory_enforcement() {
+        let pool = NDArrayPool::new(1000);
+        // 600 bytes — fits.
+        let _a = pool
+            .alloc(vec![NDDimension::new(600)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(pool.allocated_bytes(), 600);
+        // 500 more would total 1100 > 1000 — must be rejected.
+        let r = pool.alloc(vec![NDDimension::new(500)], NDDataType::UInt8);
+        assert!(r.is_err());
+        assert!(pool.allocated_bytes() <= 1000);
+    }
+
+    /// B6/B7: `convert` output is pool-tracked; releasing it accounts consistently.
+    #[test]
+    fn test_convert_output_is_pool_tracked() {
+        let pool = NDArrayPool::new(1_000_000);
+        let src = make_4x4_u8();
+        let before_alloc = pool.num_alloc_buffers();
+        let dims_out = vec![
+            NDDimension {
+                size: 4,
+                offset: 0,
+                binning: 1,
+                reverse: false,
+            },
+            NDDimension {
+                size: 4,
+                offset: 0,
+                binning: 1,
+                reverse: false,
+            },
+        ];
+        let out = pool.convert(&src, &dims_out, NDDataType::UInt8).unwrap();
+        assert_eq!(out.pool_id, pool.id());
+        assert_eq!(out.data_size, 16);
+        // convert allocated a fresh buffer through the pool.
+        assert_eq!(pool.num_alloc_buffers(), before_alloc + 1);
+        let bytes_with_out = pool.allocated_bytes();
+        assert_eq!(bytes_with_out, 16);
+        // Releasing it returns the exact data_size to the free list — no drift.
+        pool.release(out);
+        assert_eq!(pool.num_free_buffers(), 1);
+        assert_eq!(pool.allocated_bytes(), 16);
+    }
+
+    /// B8: `convert` / `convert_type` reject compressed input.
+    #[test]
+    fn test_convert_rejects_compressed_input() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = make_4x4_u8();
+        src.codec = Some(crate::codec::Codec {
+            name: crate::codec::CodecName::LZ4,
+            compressed_size: 4,
+            level: 0,
+            shuffle: 0,
+            compressor: 0,
+        });
+        let dims_out = vec![
+            NDDimension {
+                size: 4,
+                offset: 0,
+                binning: 1,
+                reverse: false,
+            },
+            NDDimension {
+                size: 4,
+                offset: 0,
+                binning: 1,
+                reverse: false,
+            },
+        ];
+        assert!(pool.convert(&src, &dims_out, NDDataType::UInt8).is_err());
+        assert!(pool.convert_type(&src, NDDataType::UInt16).is_err());
+    }
+
+    /// G1: `release` of a foreign array must not corrupt this pool's accounting.
+    #[test]
+    fn test_release_foreign_array_rejected() {
+        let pool_a = NDArrayPool::new(1_000_000);
+        let pool_b = NDArrayPool::new(1_000_000);
+        let arr = pool_a
+            .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+            .unwrap();
+        let bytes_b_before = pool_b.allocated_bytes();
+        let free_b_before = pool_b.num_free_buffers();
+        // Release pool A's array into pool B — must be rejected.
+        pool_b.release(arr);
+        assert_eq!(pool_b.allocated_bytes(), bytes_b_before);
+        assert_eq!(pool_b.num_free_buffers(), free_b_before);
+    }
+
+    /// G1: a non-pool array (pool_id == 0) is also rejected by `release`.
+    #[test]
+    fn test_release_non_pool_array_rejected() {
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = NDArray::new(vec![NDDimension::new(10)], NDDataType::UInt8);
+        assert_eq!(arr.pool_id, 0);
+        pool.release(arr);
+        assert_eq!(pool.num_free_buffers(), 0);
+        assert_eq!(pool.allocated_bytes(), 0);
+    }
+
+    /// G2: `copy` into a fresh array copies data, dims, type.
+    #[test]
+    fn test_copy_allocates_and_copies() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        if let NDDataBuffer::U8(ref mut v) = src.data {
+            v.copy_from_slice(&[9, 8, 7, 6]);
+        }
+        let out = pool.copy(&src, None, true, true, true).unwrap();
+        assert_eq!(out.pool_id, pool.id());
+        assert_eq!(out.dims.len(), 1);
+        if let NDDataBuffer::U8(ref v) = out.data {
+            assert_eq!(v, &[9, 8, 7, 6]);
+        } else {
+            panic!("wrong type");
+        }
+    }
+
+    /// G2: `pre_allocate_buffers` warms the free list with reusable buffers.
+    #[test]
+    fn test_pre_allocate_buffers_warms_free_list() {
+        let pool = NDArrayPool::new(10_000_000);
+        let template = pool
+            .alloc(vec![NDDimension::new(256)], NDDataType::UInt16)
+            .unwrap();
+        pool.pre_allocate_buffers(&template, 3).unwrap();
+        assert_eq!(pool.num_free_buffers(), 3);
+    }
+
+    /// G11: `report` produces a non-empty diagnostic dump.
+    #[test]
+    fn test_pool_report_nonempty() {
+        let pool = NDArrayPool::new(1_000_000);
+        let _ = pool
+            .alloc(vec![NDDimension::new(10)], NDDataType::UInt8)
+            .unwrap();
+        let r = pool.report(10);
+        assert!(r.contains("NDArrayPool"));
+        assert!(r.contains("numBuffers"));
     }
 }

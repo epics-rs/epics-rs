@@ -89,8 +89,9 @@ fn dimension_1d() {
     let arr = NDArray::new(dims, NDDataType::UInt8);
     let info = arr.info();
     assert_eq!(info.x_size, 1024);
-    assert_eq!(info.y_size, 1);
-    assert_eq!(info.color_size, 1);
+    // C parity: 1-D arrays leave ySize / colorSize at 0.
+    assert_eq!(info.y_size, 0);
+    assert_eq!(info.color_size, 0);
     assert_eq!(info.num_elements, 1024);
     assert_eq!(info.bytes_per_element, 1);
 }
@@ -102,7 +103,8 @@ fn dimension_2d_mono() {
     let info = arr.info();
     assert_eq!(info.x_size, 640);
     assert_eq!(info.y_size, 480);
-    assert_eq!(info.color_size, 1);
+    // C parity: 2-D arrays leave colorSize at 0 (no color dimension).
+    assert_eq!(info.color_size, 0);
     assert_eq!(info.num_elements, 640 * 480);
     assert_eq!(info.bytes_per_element, 2);
     assert_eq!(info.total_bytes, 640 * 480 * 2);
@@ -189,17 +191,21 @@ fn pool_free_list_reuse() {
     let arr = pool
         .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
         .unwrap();
-    let alloc_after_first = pool.allocated_bytes();
+    // Accounting tracks the exact requested data_size (C parity), not Vec capacity.
+    assert_eq!(pool.allocated_bytes(), 100);
     pool.release(arr);
     assert_eq!(pool.num_free_buffers(), 1);
 
-    // Allocate again — use size within THRESHOLD_SIZE_RATIO (1.5x) for reuse
+    // Allocate again — use size within THRESHOLD_SIZE_RATIO (1.5x) for reuse.
     let arr2 = pool
         .alloc(vec![NDDimension::new(80)], NDDataType::UInt8)
         .unwrap();
     assert_eq!(pool.num_free_buffers(), 0);
-    assert_eq!(pool.allocated_bytes(), alloc_after_first);
+    // Reusing a 100-byte buffer for an 80-byte request shrinks the tracked
+    // data_size to exactly 80 — matching C++ `dataSize` semantics.
+    assert_eq!(pool.allocated_bytes(), 80);
     assert_eq!(arr2.data.len(), 80);
+    assert_eq!(arr2.data_size, 80);
     // unique_id keeps incrementing even on reuse
     assert_eq!(arr2.unique_id, 2);
 }

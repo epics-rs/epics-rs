@@ -309,6 +309,14 @@ pub struct NDArray {
     pub data: NDDataBuffer,
     pub attributes: NDAttributeList,
     pub codec: Option<Codec>,
+    /// Identity of the pool that allocated this array (C++ `pNDArrayPool`).
+    /// `0` means the array was not allocated through any pool. `NDArrayPool::release`
+    /// verifies this matches its own id before returning the buffer to the free list.
+    pub pool_id: u64,
+    /// Requested byte count at allocation time (C++ `dataSize`). This is the exact
+    /// `num_elements * element_size` requested, NOT the allocator-rounded Vec capacity.
+    /// Pool memory accounting adds/subtracts this exact value.
+    pub data_size: usize,
 }
 
 impl NDArray {
@@ -327,6 +335,8 @@ impl NDArray {
             data: NDDataBuffer::zeros(data_type, num_elements),
             attributes: NDAttributeList::new(),
             codec: None,
+            pool_id: 0,
+            data_size: num_elements * data_type.element_size(),
         }
     }
 
@@ -353,12 +363,16 @@ impl NDArray {
 
         let (x_size, y_size, color_size, x_dim, y_dim, color_dim, x_stride, y_stride, color_stride) =
             match ndims {
+                // C++ getInfo: ySize/colorSize/strides stay 0-initialized for <2-D.
+                // The `colorSize == 0` idiom signals "no color dimension"; keeping it
+                // at 0 (not 1) preserves C parity for that check.
                 0 => (0, 0, 0, 0, 0, 0, 0, 0, 0),
-                1 => (self.dims[0].size, 1, 1, 0, 0, 0, 1, self.dims[0].size, 0),
+                1 => (self.dims[0].size, 0, 0, 0, 0, 0, 1, 0, 0),
                 2 => {
                     let xs = self.dims[0].size;
                     let ys = self.dims[1].size;
-                    (xs, ys, 1, 0, 1, 0, 1, xs, 0)
+                    // C++ getInfo for 2-D: yStride = xSize, colorSize/colorStride = 0.
+                    (xs, ys, 0, 0, 1, 0, 1, xs, 0)
                 }
                 _ => {
                     // 3D: layout depends on ColorMode
@@ -410,6 +424,54 @@ impl NDArray {
             color_stride,
             color_mode,
         }
+    }
+
+    /// Produce a diagnostic text dump (matching C++ `NDArray::report`).
+    ///
+    /// `details > 5` additionally lists attributes.
+    pub fn report(&self, details: i32) -> String {
+        let mut out = String::new();
+        out.push('\n');
+        out.push_str("NDArray:\n");
+        let dim_sizes: Vec<String> = self.dims.iter().map(|d| d.size.to_string()).collect();
+        out.push_str(&format!(
+            "  ndims={} dims=[{}]\n",
+            self.dims.len(),
+            dim_sizes.join(" ")
+        ));
+        out.push_str(&format!(
+            "  dataType={:?}, dataSize={}, numElements={}\n",
+            self.data.data_type(),
+            self.data_size,
+            self.data.len()
+        ));
+        out.push_str(&format!(
+            "  uniqueId={}, timeStamp={}, epicsTS.secPastEpoch={}, epicsTS.nsec={}\n",
+            self.unique_id, self.time_stamp, self.timestamp.sec, self.timestamp.nsec
+        ));
+        out.push_str(&format!("  poolId={}\n", self.pool_id));
+        match &self.codec {
+            Some(c) => out.push_str(&format!(
+                "  codec={:?}, compressedSize={}\n",
+                c.name, c.compressed_size
+            )),
+            None => out.push_str("  codec=none\n"),
+        }
+        out.push_str(&format!(
+            "  number of attributes={}\n",
+            self.attributes.len()
+        ));
+        if details > 5 {
+            for attr in self.attributes.iter() {
+                out.push_str(&format!(
+                    "    attribute name={}, value={}, source={:?}\n",
+                    attr.name,
+                    attr.value.as_string(),
+                    attr.source
+                ));
+            }
+        }
+        out
     }
 
     /// Validate that buffer length matches dimension product.
@@ -513,7 +575,8 @@ mod tests {
         let info = arr.info();
         assert_eq!(info.x_size, 640);
         assert_eq!(info.y_size, 480);
-        assert_eq!(info.color_size, 1);
+        // C parity: 2-D arrays have colorSize == 0 (no color dimension).
+        assert_eq!(info.color_size, 0);
         assert_eq!(info.num_elements, 640 * 480);
         assert_eq!(info.bytes_per_element, 2);
         assert_eq!(info.total_bytes, 640 * 480 * 2);
@@ -565,8 +628,9 @@ mod tests {
         let arr = NDArray::new(dims, NDDataType::Float64);
         let info = arr.info();
         assert_eq!(info.x_size, 1024);
-        assert_eq!(info.y_size, 1);
-        assert_eq!(info.color_size, 1);
+        // C parity: 1-D arrays leave ySize / colorSize at 0.
+        assert_eq!(info.y_size, 0);
+        assert_eq!(info.color_size, 0);
     }
 
     #[test]

@@ -130,17 +130,13 @@ impl ADDriverBase {
         self.port_base
             .set_int32_param(self.params.base.array_counter, 0, counter)?;
 
-        let info = array.info();
-        self.port_base
-            .set_int32_param(self.params.base.array_size_x, 0, info.x_size as i32)?;
-        self.port_base
-            .set_int32_param(self.params.base.array_size_y, 0, info.y_size as i32)?;
-        self.port_base
-            .set_int32_param(self.params.base.array_size_z, 0, info.color_size as i32)?;
-        self.port_base
-            .set_int32_param(self.params.base.array_size, 0, info.total_bytes as i32)?;
-        self.port_base
-            .set_int32_param(self.params.base.unique_id, 0, array.unique_id)?;
+        // G5/G6/G7: write all per-array parameters (size, dims, type, color,
+        // Bayer, timestamps, codec).
+        crate::driver::ndarray_driver::write_array_params(
+            &mut self.port_base,
+            &self.params.base,
+            &array,
+        )?;
 
         // Update pool stats
         self.port_base.set_float64_param(

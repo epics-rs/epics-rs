@@ -548,16 +548,20 @@ impl GatewayServer {
         // into one refcount slot — `Active` would flip back to
         // `Inactive` on the first CLEAR even with channels still open.
         //
-        // `Lagged` does NOT just `continue`: with bounded broadcast
-        // buffer, lagged events would silently desync the per-PV
-        // refcount. On lag we conservatively emit a warning so the
-        // operator notices; structural fix (replay on lag) is
-        // tracked as future work.
+        // `Lagged` is handled by replay (B11): `connection_events`
+        // returns a `ReplayingReceiver` that, on a broadcast lag,
+        // recovers the exact missed events from a bounded ring buffer
+        // before resuming the live stream. The consumer below never
+        // sees a silent gap, so the per-PV refcounts stay correct.
+        // The only residual lossy case — a lag that overflows the
+        // replay log — surfaces as `ConnEventRecv::GapTruncated` and
+        // is logged.
         let conn_rx = downstream.connection_events().await;
         let conn_handle = if let Some(mut rx) = conn_rx {
             let stats_for_conn = stats.clone();
             let cache_for_conn = self.cache.clone();
             Some(tokio::spawn(async move {
+                use super::downstream::ConnEventRecv;
                 use epics_ca_rs::server::ServerConnectionEvent;
                 use std::collections::HashMap;
                 use std::collections::hash_map::DefaultHasher;
@@ -579,11 +583,29 @@ impl GatewayServer {
                 let mut peer_channels: HashMap<std::net::SocketAddr, Vec<(String, u32)>> =
                     HashMap::new();
                 loop {
-                    match rx.recv().await {
-                        Ok(ServerConnectionEvent::Connected(addr)) => {
+                    let event = match rx.recv().await {
+                        ConnEventRecv::Event(ev) => ev,
+                        ConnEventRecv::GapTruncated { missed } => {
+                            // A lag overflowed the replay ring buffer
+                            // — the only case where events are
+                            // genuinely unrecoverable. Far rarer than
+                            // the channel-depth lag that replay
+                            // covers; warn so the operator notices.
+                            tracing::warn!(
+                                missed,
+                                "ca-gateway-rs: connection-event lag exceeded the \
+                                 replay log — per-PV refcount may be transiently \
+                                 off until the next CREATE/CLEAR cycle"
+                            );
+                            continue;
+                        }
+                        ConnEventRecv::Closed => break,
+                    };
+                    match event {
+                        ServerConnectionEvent::Connected(addr) => {
                             stats_for_conn.record_host(&addr.ip().to_string()).await;
                         }
-                        Ok(ServerConnectionEvent::Disconnected(addr)) => {
+                        ServerConnectionEvent::Disconnected(addr) => {
                             stats_for_conn.forget_host(&addr.ip().to_string()).await;
                             if let Some(channels) = peer_channels.remove(&addr) {
                                 let cache = cache_for_conn.read().await;
@@ -594,14 +616,14 @@ impl GatewayServer {
                                 }
                             }
                         }
-                        Ok(ServerConnectionEvent::ChannelCreated { peer, pv_name, cid }) => {
+                        ServerConnectionEvent::ChannelCreated { peer, pv_name, cid } => {
                             let sid = synthetic_sid(peer, &pv_name, cid);
                             if let Some(entry) = cache_for_conn.read().await.get(&pv_name) {
                                 entry.write().await.add_subscriber(sid);
                             }
                             peer_channels.entry(peer).or_default().push((pv_name, sid));
                         }
-                        Ok(ServerConnectionEvent::ChannelCleared { peer, pv_name, cid }) => {
+                        ServerConnectionEvent::ChannelCleared { peer, pv_name, cid } => {
                             let sid = synthetic_sid(peer, &pv_name, cid);
                             if let Some(entry) = cache_for_conn.read().await.get(&pv_name) {
                                 entry.write().await.remove_subscriber(sid);
@@ -613,17 +635,7 @@ impl GatewayServer {
                                 }
                             }
                         }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                missed = n,
-                                "ca-gateway-rs: connection events lagged — \
-                                 per-PV refcount may be transiently off until \
-                                 the next CREATE/CLEAR cycle"
-                            );
-                            continue;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        _ => {}
                     }
                 }
             }))
@@ -663,6 +675,9 @@ impl GatewayServer {
         if let Some(h) = conn_handle {
             h.abort();
         }
+        // B11: stop the connection-event forwarder task spawned by
+        // `connection_events()` so it does not outlive the server.
+        downstream.stop_connection_events().await;
 
         downstream_result
     }

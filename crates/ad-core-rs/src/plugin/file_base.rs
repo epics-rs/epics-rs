@@ -232,6 +232,21 @@ impl NDPluginFileBase {
         Ok(())
     }
 
+    /// Delete the driver's original file for `array` when `delete_driver_file`
+    /// is set. C++ NDPluginFile deletes the driver file in every write mode
+    /// (Single, Stream, and Capture), keyed off the `DriverFileName` attribute.
+    fn maybe_delete_driver_file(&self, array: &NDArray) {
+        if !self.delete_driver_file {
+            return;
+        }
+        if let Some(attr) = array.attributes.get("DriverFileName") {
+            let driver_file = attr.value.as_string();
+            if !driver_file.is_empty() {
+                let _ = std::fs::remove_file(&driver_file);
+            }
+        }
+    }
+
     /// Process an incoming array according to the current file mode.
     pub fn process_array(
         &mut self,
@@ -248,14 +263,7 @@ impl NDPluginFileBase {
                 if let Some(final_path) = final_path {
                     Self::rename_temp(&write_path, &final_path)?;
                 }
-                if self.delete_driver_file {
-                    if let Some(attr) = array.attributes.get("DriverFileName") {
-                        let driver_file = attr.value.as_string();
-                        if !driver_file.is_empty() {
-                            let _ = std::fs::remove_file(&driver_file);
-                        }
-                    }
-                }
+                self.maybe_delete_driver_file(&array);
                 if self.auto_increment {
                     self.file_number += 1;
                 }
@@ -282,14 +290,7 @@ impl NDPluginFileBase {
                     self.is_open = true;
                 }
                 writer.write_file(&array)?;
-                if self.delete_driver_file {
-                    if let Some(attr) = array.attributes.get("DriverFileName") {
-                        let driver_file = attr.value.as_string();
-                        if !driver_file.is_empty() {
-                            let _ = std::fs::remove_file(&driver_file);
-                        }
-                    }
-                }
+                self.maybe_delete_driver_file(&array);
                 self.num_captured += 1;
             }
         }
@@ -319,6 +320,12 @@ impl NDPluginFileBase {
             if let Some(final_path) = final_path {
                 Self::rename_temp(&write_path, &final_path)?;
             }
+            // C++ deletes the driver file per frame in Capture mode too.
+            let buffer = std::mem::take(&mut self.capture_buffer);
+            for arr in &buffer {
+                self.maybe_delete_driver_file(arr);
+            }
+            self.capture_buffer = buffer;
             if self.auto_increment {
                 self.file_number += 1;
             }
@@ -334,6 +341,7 @@ impl NDPluginFileBase {
                 if let Some(final_path) = final_path {
                     Self::rename_temp(&write_path, &final_path)?;
                 }
+                self.maybe_delete_driver_file(arr);
                 if self.auto_increment {
                     self.file_number += 1;
                 }
@@ -638,6 +646,76 @@ mod tests {
 
         let temp = fb.temp_file_path().unwrap();
         assert_eq!(temp.to_str().unwrap(), "/data/img_0001.tmp");
+    }
+
+    fn make_array_with_driver_file(id: i32, driver_file: &str) -> Arc<NDArray> {
+        use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.unique_id = id;
+        arr.attributes.add(NDAttribute::new_static(
+            "DriverFileName",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String(driver_file.to_string()),
+        ));
+        Arc::new(arr)
+    }
+
+    #[test]
+    fn test_delete_driver_file_in_capture_mode() {
+        // C++ NDPluginFile deletes the driver file per frame in Capture mode
+        // too, not only Single/Stream.
+        let dir = std::env::temp_dir();
+        let f1 = dir.join("adcore_capture_driver_1.raw");
+        let f2 = dir.join("adcore_capture_driver_2.raw");
+        std::fs::write(&f1, b"x").unwrap();
+        std::fs::write(&f2, b"y").unwrap();
+
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = format!("{}/", dir.display());
+        fb.file_name = "capdel_".into();
+        fb.delete_driver_file = true;
+        fb.set_mode(NDFileMode::Capture);
+        fb.set_num_capture(2);
+
+        let mut writer = MockWriter::new(true);
+        fb.process_array(
+            make_array_with_driver_file(1, f1.to_str().unwrap()),
+            &mut writer,
+        )
+        .unwrap();
+        fb.process_array(
+            make_array_with_driver_file(2, f2.to_str().unwrap()),
+            &mut writer,
+        )
+        .unwrap();
+
+        // Capture buffer flushed at num_capture=2; both driver files deleted.
+        assert!(!f1.exists(), "driver file 1 should be deleted in capture mode");
+        assert!(!f2.exists(), "driver file 2 should be deleted in capture mode");
+    }
+
+    #[test]
+    fn test_delete_driver_file_capture_single_image_format() {
+        let dir = std::env::temp_dir();
+        let f1 = dir.join("adcore_capture_si_driver_1.raw");
+        std::fs::write(&f1, b"x").unwrap();
+
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = format!("{}/", dir.display());
+        fb.file_name = "capdelsi_".into();
+        fb.delete_driver_file = true;
+        fb.set_mode(NDFileMode::Capture);
+        fb.set_num_capture(1);
+
+        let mut writer = MockWriter::new(false); // single-image format
+        fb.process_array(
+            make_array_with_driver_file(1, f1.to_str().unwrap()),
+            &mut writer,
+        )
+        .unwrap();
+
+        assert!(!f1.exists(), "driver file should be deleted in capture mode");
     }
 
     #[test]

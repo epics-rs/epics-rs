@@ -212,6 +212,23 @@ impl<W: NDFileWriter> FilePluginController<W> {
         }
     }
 
+    /// Re-evaluate whether the current `FilePath` directory exists and push a
+    /// `FilePathExists` param update. C++ `NDPluginFile::checkPath()` runs this
+    /// before each write, not only when FilePath changes.
+    fn refresh_file_path_exists(&self, updates: &mut Vec<ParamUpdate>) {
+        let idx = match self.params.file_path_exists {
+            Some(idx) => idx,
+            None => return,
+        };
+        let path = self.file_base.file_path.trim_end_matches(std::path::MAIN_SEPARATOR);
+        let exists = !path.is_empty() && std::path::Path::new(path).is_dir();
+        updates.push(ParamUpdate::Int32 {
+            reason: idx,
+            addr: 0,
+            value: if exists { 1 } else { 0 },
+        });
+    }
+
     /// G9: apply the `FilePluginFileName` / `FilePluginFileNumber` attributes
     /// to the file base, returning param updates for the changed PVs and
     /// whether a mid-stream file reopen is required (C++ `attrFileNameSet` /
@@ -256,6 +273,12 @@ impl<W: NDFileWriter> FilePluginController<W> {
         if !self.destination_matches(&array) {
             return proc_result;
         }
+
+        // Re-check file-path existence before every write. C++ NDPluginFile
+        // calls checkPath() before each write so a directory deleted after
+        // FilePath was set is reflected; the Rust port previously updated
+        // FilePathExists only on the FilePath param change.
+        self.refresh_file_path_exists(&mut proc_result.param_updates);
 
         // G9: FilePluginClose attribute forces an immediate file close.
         let force_close = array

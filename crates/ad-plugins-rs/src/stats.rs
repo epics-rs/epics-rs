@@ -905,7 +905,7 @@ impl NDPluginProcess for StatsProcessor {
         // Centroid computation
         let mut centroid = CentroidResult::default();
         if self.do_compute_centroid {
-            if info.color_size == 1 && array.dims.len() >= 2 {
+            if info.color_size <= 1 && array.dims.len() >= 2 {
                 centroid = compute_centroid(
                     &array.data,
                     info.x_size,
@@ -926,7 +926,7 @@ impl NDPluginProcess for StatsProcessor {
         }
 
         // Profile computation
-        if self.do_compute_profiles && info.color_size == 1 && array.dims.len() >= 2 {
+        if self.do_compute_profiles && info.color_size <= 1 && array.dims.len() >= 2 {
             let profiles = compute_profiles(
                 &array.data,
                 info.x_size,
@@ -948,7 +948,7 @@ impl NDPluginProcess for StatsProcessor {
         }
 
         // Compute cursor value: pixel at (cursor_x, cursor_y)
-        if info.color_size == 1 && array.dims.len() >= 2 {
+        if info.color_size <= 1 && array.dims.len() >= 2 {
             let cx = self.cursor_x;
             let cy = self.cursor_y;
             if cx < info.x_size && cy < info.y_size {
@@ -956,7 +956,7 @@ impl NDPluginProcess for StatsProcessor {
             }
         }
 
-        let updates = vec![
+        let mut updates = vec![
             ParamUpdate::float64(p.min_value, result.min),
             ParamUpdate::float64(p.max_value, result.max),
             ParamUpdate::float64(p.mean_value, result.mean),
@@ -986,6 +986,61 @@ impl NDPluginProcess for StatsProcessor {
             ParamUpdate::int32(p.profile_size_x, info.x_size as i32),
             ParamUpdate::int32(p.profile_size_y, info.y_size as i32),
         ];
+
+        // Histogram waveforms: the counts (HIST_ARRAY) and the bin-center X
+        // axis (HIST_X_ARRAY). C++ computeHistX fills the X axis with bin
+        // centers spanning [HistMin, HistMax].
+        if self.do_compute_histogram && !result.histogram.is_empty() {
+            updates.push(ParamUpdate::float64_array(
+                p.hist_array,
+                result.histogram.clone(),
+            ));
+            let n = result.histogram.len();
+            let hist_x: Vec<f64> = if n > 1 {
+                let step = (self.hist_max - self.hist_min) / (n - 1) as f64;
+                (0..n).map(|i| self.hist_min + i as f64 * step).collect()
+            } else {
+                vec![self.hist_min]
+            };
+            updates.push(ParamUpdate::float64_array(p.hist_x_array, hist_x));
+        }
+
+        // Profile waveforms: emit the computed X/Y projections to asyn
+        // clients (C++ doCallbacksFloat64Array for each PROFILE_* waveform).
+        if self.do_compute_profiles && !result.profile_avg_x.is_empty() {
+            updates.push(ParamUpdate::float64_array(
+                p.profile_average_x,
+                result.profile_avg_x.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_average_y,
+                result.profile_avg_y.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_threshold_x,
+                result.profile_threshold_x.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_threshold_y,
+                result.profile_threshold_y.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_centroid_x,
+                result.profile_centroid_x.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_centroid_y,
+                result.profile_centroid_y.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_cursor_x,
+                result.profile_cursor_x.clone(),
+            ));
+            updates.push(ParamUpdate::float64_array(
+                p.profile_cursor_y,
+                result.profile_cursor_y.clone(),
+            ));
+        }
 
         // Send time series data to TS port driver (if configured)
         if let Some(ref sender) = self.ts_sender {
@@ -1495,6 +1550,71 @@ mod tests {
         assert_eq!(stats.min, 10.0);
         assert_eq!(stats.max, 50.0);
         assert_eq!(stats.mean, 30.0);
+    }
+
+    #[test]
+    fn test_stats_emits_histogram_and_profile_arrays() {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        let mut proc = StatsProcessor::new();
+        // Register params so the array reasons are distinct, non-zero indices.
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "_stats_scratch_",
+            1,
+            asyn_rs::port::PortFlags::default(),
+        );
+        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        proc.register_params(&mut base).unwrap();
+
+        proc.do_compute_histogram = true;
+        proc.do_compute_profiles = true;
+        proc.hist_size = 8;
+        proc.hist_min = 0.0;
+        proc.hist_max = 7.0;
+        let pool = NDArrayPool::new(1_000_000);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, val) in v.iter_mut().enumerate() {
+                *val = (i % 8) as u8;
+            }
+        }
+
+        let result = proc.process_array(&arr, &pool);
+        let p = proc.params.clone();
+        // HIST_ARRAY, HIST_X_ARRAY and the 8 PROFILE_* waveforms must be
+        // pushed as float64 array updates.
+        let array_reasons: Vec<usize> = result
+            .param_updates
+            .iter()
+            .filter_map(|u| match u {
+                ParamUpdate::Float64Array { reason, value, .. } => {
+                    assert!(!value.is_empty(), "array waveform must not be empty");
+                    Some(*reason)
+                }
+                _ => None,
+            })
+            .collect();
+        for reason in [
+            p.hist_array,
+            p.hist_x_array,
+            p.profile_average_x,
+            p.profile_average_y,
+            p.profile_threshold_x,
+            p.profile_threshold_y,
+            p.profile_centroid_x,
+            p.profile_centroid_y,
+            p.profile_cursor_x,
+            p.profile_cursor_y,
+        ] {
+            assert!(
+                array_reasons.contains(&reason),
+                "missing array update for reason {reason}"
+            );
+        }
     }
 
     #[test]

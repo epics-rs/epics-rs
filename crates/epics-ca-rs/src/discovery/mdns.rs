@@ -20,17 +20,39 @@ use super::{Backend, CA_SERVICE_TYPE, DiscoveryEvent};
 /// `mdns-sd` requires the trailing `.local.` for link-local domain.
 const MDNS_TYPE: &str = "_epics-ca._tcp.local.";
 
+/// Cap on tracked mDNS service instances. mDNS is unauthenticated, so
+/// without a cap a hostile LAN responder could flood unique instance
+/// names and grow the browser's `known` map — and the downstream
+/// `addr_refs` / search-engine `addr_list` — without bound. Mirrors
+/// the DNS-SD `MAX_INSTANCES`.
+const MAX_MDNS_INSTANCES: usize = 256;
+
 /// Client-side mDNS discovery backend.
 ///
-/// Spawns a `ServiceDaemon` on construction and runs a background
-/// browser. Discovered IOCs are pushed into both an internal
-/// snapshot (for `discover()`) and a subscriber channel (for
-/// `subscribe()`).
+/// Spawns an `mdns-sd` `ServiceDaemon` (which runs its own OS thread)
+/// and a background browser task. Discovered IOCs are pushed into both
+/// an internal snapshot (for `discover()`) and a subscriber channel
+/// (for `subscribe()`). Dropping the backend runs [`Drop`], which
+/// calls `ServiceDaemon::shutdown()` and aborts the browser task —
+/// dropping the `ServiceDaemon` handle alone does NOT stop its thread.
 pub struct MdnsBackend {
-    #[allow(dead_code)]
     daemon: ServiceDaemon,
+    browser: tokio::task::JoinHandle<()>,
     snapshot: Arc<Mutex<Vec<SocketAddr>>>,
     event_rx: Mutex<Option<mpsc::UnboundedReceiver<DiscoveryEvent>>>,
+}
+
+impl Drop for MdnsBackend {
+    fn drop(&mut self) {
+        // The mdns-sd daemon runs on its own OS thread that exits ONLY
+        // on an explicit Exit command — dropping the `ServiceDaemon`
+        // (just a Sender clone) leaves the thread, its sockets, and the
+        // browser task running forever. `shutdown()` sends Exit, which
+        // also closes the `ServiceEvent` channel so the browser task
+        // falls out of its recv loop; `abort()` is belt-and-suspenders.
+        let _ = self.daemon.shutdown();
+        self.browser.abort();
+    }
 }
 
 impl MdnsBackend {
@@ -41,7 +63,7 @@ impl MdnsBackend {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let snap_clone = snapshot.clone();
-        tokio::spawn(async move {
+        let browser = tokio::spawn(async move {
             // Per-instance set of addresses last advertised under that
             // mDNS fullname. Each `ServiceResolved` carries the instance's
             // *complete* current address set, so we diff against this to
@@ -58,6 +80,18 @@ impl MdnsBackend {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
                         let fullname = info.get_fullname().to_string();
+                        // Cap distinct instances against an mDNS flood.
+                        // An update to an already-tracked instance is
+                        // always allowed; only brand-new names past the
+                        // cap are dropped.
+                        if !known.contains_key(&fullname)
+                            && known.len() >= MAX_MDNS_INSTANCES
+                        {
+                            tracing::warn!(instance = %fullname,
+                                cap = MAX_MDNS_INSTANCES,
+                                "mDNS: instance cap reached; ignoring new instance");
+                            continue;
+                        }
                         let resolved: std::collections::HashSet<SocketAddr> =
                             resolve_addresses(&info).into_iter().collect();
                         let prev = known.entry(fullname.clone()).or_default();
@@ -113,6 +147,7 @@ impl MdnsBackend {
 
         Ok(Self {
             daemon,
+            browser,
             snapshot,
             event_rx: Mutex::new(Some(event_rx)),
         })
@@ -185,7 +220,13 @@ impl MdnsAnnouncer {
 
 impl Drop for MdnsAnnouncer {
     fn drop(&mut self) {
+        // Send the goodbye packet, then stop the daemon. Without
+        // `shutdown()` the mdns-sd OS thread (and its sockets) outlives
+        // the announcer forever — same leak as `MdnsBackend`. Commands
+        // are processed in order, so the unregister goodbye is queued
+        // ahead of the Exit.
         let _ = self.daemon.unregister(&self.fullname);
+        let _ = self.daemon.shutdown();
     }
 }
 
@@ -207,13 +248,6 @@ fn resolve_addresses(info: &ServiceInfo) -> Vec<SocketAddr> {
         .iter()
         .map(|ip| SocketAddr::new(IpAddr::V4(**ip), port))
         .collect()
-}
-
-// Suppress "field is never read" lint — `daemon` keeps the background
-// task alive via Drop; the field exists only to extend the lifetime.
-#[allow(dead_code)]
-fn _suppress_unused() {
-    let _ = std::mem::size_of::<MdnsBackend>();
 }
 
 #[allow(dead_code)]

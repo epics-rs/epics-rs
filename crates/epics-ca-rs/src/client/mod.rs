@@ -1843,35 +1843,38 @@ impl CaChannel {
     }
 
     /// Convenience wrapper around [`Self::connection_events`] that
-    /// invokes `cb` on every `AccessRightsChanged`. Returns a
-    /// [`tokio::task::JoinHandle`] you can drop to stop watching.
-    /// Mirrors libca `ca_replace_access_rights_event` at the
-    /// callback-registration shape.
-    pub fn on_access_rights_change<F>(&self, mut cb: F) -> tokio::task::JoinHandle<()>
+    /// invokes `cb` on every `AccessRightsChanged`. Returns an
+    /// [`EventWatcher`] guard — drop it (or call `.abort()`) to stop
+    /// watching; the watcher task is aborted on drop. Mirrors libca
+    /// `ca_replace_access_rights_event` at the callback-registration
+    /// shape.
+    pub fn on_access_rights_change<F>(&self, mut cb: F) -> EventWatcher
     where
         F: FnMut(AccessRights) + Send + 'static,
     {
         let mut rx = self.conn_tx.subscribe();
-        epics_base_rs::runtime::task::spawn(async move {
+        let handle = epics_base_rs::runtime::task::spawn(async move {
             while let Ok(evt) = rx.recv().await {
                 if let ConnectionEvent::AccessRightsChanged { read, write } = evt {
                     cb(AccessRights { read, write });
                 }
             }
-        })
+        });
+        EventWatcher { handle }
     }
 
     /// Convenience wrapper around [`Self::connection_events`] that
     /// invokes `cb(true)` on `Connected` and `cb(false)` on
     /// `Disconnected`. Mirrors libca
-    /// `ca_change_connection_event(chid, callback)` (oldChannelNotify.cpp:229) —
-    /// drop the returned handle to stop watching.
-    pub fn on_connection_change<F>(&self, mut cb: F) -> tokio::task::JoinHandle<()>
+    /// `ca_change_connection_event(chid, callback)` (oldChannelNotify.cpp:229).
+    /// Returns an [`EventWatcher`] guard — drop it (or call `.abort()`)
+    /// to stop watching; the watcher task is aborted on drop.
+    pub fn on_connection_change<F>(&self, mut cb: F) -> EventWatcher
     where
         F: FnMut(bool) + Send + 'static,
     {
         let mut rx = self.conn_tx.subscribe();
-        epics_base_rs::runtime::task::spawn(async move {
+        let handle = epics_base_rs::runtime::task::spawn(async move {
             while let Ok(evt) = rx.recv().await {
                 match evt {
                     ConnectionEvent::Connected => cb(true),
@@ -1879,7 +1882,8 @@ impl CaChannel {
                     _ => {}
                 }
             }
-        })
+        });
+        EventWatcher { handle }
     }
 
     /// Server's IP address as a string (e.g. `"10.0.0.5:5064"`).
@@ -1949,6 +1953,34 @@ impl Drop for MonitorHandle {
         let _ = self
             .coord_tx
             .send(CoordRequest::Unsubscribe { subid: self.subid });
+    }
+}
+
+/// Abort-on-drop guard for a connection / access-rights watcher task.
+///
+/// A bare `tokio::task::JoinHandle` *detaches* on drop — it does not
+/// abort the spawned task. Returning one from
+/// [`CaChannel::on_connection_change`] / [`CaChannel::on_access_rights_change`]
+/// while documenting "drop to stop" would leak a running task. This
+/// guard mirrors the `ServerConnection` abort-on-drop pattern: dropping
+/// it aborts the inner watcher task.
+#[must_use = "dropping the EventWatcher immediately stops the watcher task; \
+              bind it to a variable to keep watching"]
+pub struct EventWatcher {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl EventWatcher {
+    /// Stop watching now. Equivalent to dropping the guard; provided
+    /// for callers that want an explicit, named teardown.
+    pub fn abort(self) {
+        // Drop runs `handle.abort()`.
+    }
+}
+
+impl Drop for EventWatcher {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 
@@ -3722,5 +3754,68 @@ mod waiter_drain_tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod event_watcher_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Dropping an `EventWatcher` must abort the spawned watcher task
+    /// (a bare `JoinHandle` would only detach, leaking the task). The
+    /// task here loops forever; after the guard drops, `is_finished()`
+    /// must become true.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_aborts_watcher_task() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = ran.clone();
+        let handle = epics_base_rs::runtime::task::spawn(async move {
+            ran_in_task.store(true, Ordering::SeqCst);
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let abort_handle = handle.abort_handle();
+        let watcher = EventWatcher { handle };
+        tokio::task::yield_now().await;
+        assert!(ran.load(Ordering::SeqCst), "watcher task should have started");
+        assert!(!abort_handle.is_finished(), "task still running before drop");
+        drop(watcher);
+        for _ in 0..100 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "EventWatcher::drop must abort the watcher task"
+        );
+    }
+
+    /// `EventWatcher::abort()` is an explicit, named teardown that
+    /// behaves identically to dropping the guard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_abort_stops_watcher_task() {
+        let handle = epics_base_rs::runtime::task::spawn(async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let abort_handle = handle.abort_handle();
+        let watcher = EventWatcher { handle };
+        watcher.abort();
+        for _ in 0..100 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "EventWatcher::abort must stop the watcher task"
+        );
     }
 }

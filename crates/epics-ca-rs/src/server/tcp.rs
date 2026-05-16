@@ -107,9 +107,8 @@ fn send_timeout() -> Duration {
 /// Cap on `TlsAcceptor::accept` duration. Round 8 C-G12: without this
 /// a peer that completes TCP but stalls during ClientHello holds a
 /// connection slot until OS-level keepalive (15s/5s probes) reaps it
-/// (~30s); coordinated peers can exhaust the listener under
-/// `EPICS_CAS_MAX_CONNECTIONS`. Default 10 s, override via
-/// `EPICS_CAS_TLS_HANDSHAKE_TMO`. Floored at 1s.
+/// (~30s); coordinated peers can tie up listener resources. Default
+/// 10 s, override via `EPICS_CAS_TLS_HANDSHAKE_TMO`. Floored at 1s.
 #[cfg(feature = "experimental-rust-tls")]
 fn tls_handshake_timeout() -> Duration {
     epics_base_rs::runtime::env::get("EPICS_CAS_TLS_HANDSHAKE_TMO")

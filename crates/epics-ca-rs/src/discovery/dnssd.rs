@@ -35,13 +35,14 @@ use super::Backend;
 /// `discover()` into a DNS-amplification stall during client startup.
 const MAX_INSTANCES: usize = 256;
 
-/// Aggregate wall-clock budget for the whole SRV/A/AAAA resolve phase.
-/// `discover()` runs during `CaClient::new()`; this bounds how long an
-/// untrusted zone can delay client construction regardless of instance
-/// count or per-query latency.
+/// Aggregate wall-clock budget for the whole of `discover()` — the PTR
+/// query plus every per-instance SRV/A/AAAA lookup. `discover()` runs
+/// during `CaClient::new()`; this bounds how long an untrusted zone can
+/// delay client construction regardless of instance count or per-query
+/// latency.
 const RESOLVE_BUDGET: Duration = Duration::from_secs(10);
 
-/// Per-lookup timeout, so one unresponsive SRV/A/AAAA query cannot
+/// Per-lookup timeout, so one unresponsive PTR/SRV/A/AAAA query cannot
 /// consume the entire `RESOLVE_BUDGET` by itself.
 const PER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -79,16 +80,40 @@ impl Backend for DnsSdBackend {
     async fn discover(&self) -> Vec<SocketAddr> {
         let svc = self.service_fqdn();
 
+        // The whole of `discover()` — the PTR query plus the per-instance
+        // SRV/A/AAAA lookups — is hard-bounded by the aggregate
+        // `RESOLVE_BUDGET` deadline: every individual lookup is timed out
+        // at `min(PER_LOOKUP_TIMEOUT, remaining budget)`, so total wall
+        // time cannot exceed `RESOLVE_BUDGET` plus the latency of at most
+        // one in-flight lookup. `discover()` runs during `CaClient::new()`,
+        // so this bounds how long an untrusted/slow zone can stall client
+        // construction. Whatever resolved before the deadline is returned.
+        let deadline = Instant::now() + RESOLVE_BUDGET;
+        // Per-lookup timeout clamped to the remaining aggregate budget,
+        // so a lookup started late in the phase cannot overshoot it.
+        let lookup_timeout =
+            || PER_LOOKUP_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+
         // Step 1: PTR query on the service-type name. RFC 6763 §4.1
         // places PTR records here, one per service instance.
         // `srv_lookup` would NOT work — it issues a single SRV query
         // and does not chase PTR; SRV records do not live at the
         // service-type name.
-        let ptr = match self.resolver.lookup(svc.as_str(), RecordType::PTR).await {
-            Ok(r) => r,
-            Err(e) => {
+        let ptr = match tokio::time::timeout(
+            lookup_timeout(),
+            self.resolver.lookup(svc.as_str(), RecordType::PTR),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 tracing::warn!(zone = %self.zone, error = %e,
                     "DNS-SD: PTR lookup failed");
+                return Vec::new();
+            }
+            Err(_) => {
+                tracing::warn!(zone = %self.zone,
+                    "DNS-SD: PTR lookup timed out");
                 return Vec::new();
             }
         };
@@ -121,19 +146,8 @@ impl Backend for DnsSdBackend {
         // port), then A/AAAA-resolve that SRV's *own* target. Pairing
         // each IP with that SRV's port avoids the cartesian-product
         // bug where two IOCs on ports 5064/5066 would each be emitted
-        // with both ports.
-        //
-        // The whole phase is hard-bounded by the aggregate
-        // `RESOLVE_BUDGET` deadline: every individual lookup is timed
-        // out at `min(PER_LOOKUP_TIMEOUT, remaining budget)`, so total
-        // wall time cannot exceed `RESOLVE_BUDGET` plus the latency of
-        // at most one in-flight lookup. Whatever resolved before the
-        // deadline is returned.
-        let deadline = Instant::now() + RESOLVE_BUDGET;
-        // Per-lookup timeout clamped to the remaining aggregate budget,
-        // so a lookup started late in the phase cannot overshoot it.
-        let lookup_timeout =
-            || PER_LOOKUP_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+        // with both ports. Shares the `deadline`/`lookup_timeout` bound
+        // established above.
         let mut out_set: HashSet<SocketAddr> = HashSet::new();
         let mut out: Vec<SocketAddr> = Vec::new();
         for instance in &instances {

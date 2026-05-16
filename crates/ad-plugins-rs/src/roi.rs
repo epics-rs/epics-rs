@@ -107,6 +107,171 @@ fn find_peak_2d(data: &NDDataBuffer, x_size: usize, y_size: usize) -> (usize, us
     (max_x, max_y)
 }
 
+/// Extract an ROI from an NDArray, dispatching on dimensionality.
+///
+/// 2-D arrays go through [`extract_roi_2d`]. 3-D color arrays
+/// (RGB1/RGB2/RGB3) are handled by [`extract_roi_3d`], which — like C++
+/// `NDPluginROI` via `userDims = {xDim, yDim, colorDim}` — keeps ROI Dim0/Dim1
+/// bound to the image X/Y axes and Dim2 to the color axis regardless of the
+/// physical dimension order.
+pub fn extract_roi(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
+    use ad_core_rs::color::NDColorMode;
+    if src.dims.len() >= 3 {
+        let info = src.info();
+        if matches!(
+            info.color_mode,
+            NDColorMode::RGB1 | NDColorMode::RGB2 | NDColorMode::RGB3
+        ) {
+            return extract_roi_3d(src, config);
+        }
+    }
+    extract_roi_2d(src, config)
+}
+
+/// Extract an ROI from a 3-D RGB color array.
+///
+/// Mirrors C++ `NDPluginROI`: ROI `dims[0]` selects the X axis, `dims[1]` the
+/// Y axis and `dims[2]` the color axis (`userDims = {xDim, yDim, colorDim}`),
+/// so the ROI geometry is independent of the RGB1/RGB2/RGB3 memory layout.
+/// Per-axis binning and reverse are applied; the output keeps the source
+/// color mode and dimension order.
+pub fn extract_roi_3d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
+    let info = src.info();
+    let (src_x, src_y, src_c) = (info.x_size, info.y_size, info.color_size.max(1));
+    if src_x == 0 || src_y == 0 || src_c == 0 {
+        return None;
+    }
+
+    // Resolve offset/size per axis (C++ NDPluginROI clamping).
+    let resolve = |cfg: &ROIDimConfig, dim_size: usize| -> (usize, usize) {
+        if !cfg.enable || dim_size == 0 {
+            return (0, dim_size);
+        }
+        let offset = cfg.min.min(dim_size - 1);
+        let size = if cfg.auto_size { dim_size } else { cfg.size };
+        let size = size.max(1).min(dim_size - offset);
+        (offset, size)
+    };
+    let (x_min, x_roi) = resolve(&config.dims[0], src_x);
+    let (y_min, y_roi) = resolve(&config.dims[1], src_y);
+    let (c_min, c_roi) = resolve(&config.dims[2], src_c);
+
+    let bin_x = config.dims[0].bin.max(1).min(x_roi);
+    let bin_y = config.dims[1].bin.max(1).min(y_roi);
+    let bin_c = config.dims[2].bin.max(1).min(c_roi);
+    let (out_x, out_y, out_c) = (x_roi / bin_x, y_roi / bin_y, c_roi / bin_c);
+    if out_x == 0 || out_y == 0 || out_c == 0 {
+        return None;
+    }
+
+    // Source strides (elements) for X/Y/color.
+    let (sxs, sys, scs) = (
+        info.x_stride.max(1),
+        info.y_stride.max(1),
+        info.color_stride.max(1),
+    );
+    // Destination layout keeps the source color mode.
+    let (dims, dxs, dys, dcs) = match info.color_mode {
+        ad_core_rs::color::NDColorMode::RGB1 => (
+            vec![
+                NDDimension::new(out_c),
+                NDDimension::new(out_x),
+                NDDimension::new(out_y),
+            ],
+            out_c,
+            out_x * out_c,
+            1usize,
+        ),
+        ad_core_rs::color::NDColorMode::RGB2 => (
+            vec![
+                NDDimension::new(out_x),
+                NDDimension::new(out_c),
+                NDDimension::new(out_y),
+            ],
+            1usize,
+            out_x * out_c,
+            out_x,
+        ),
+        _ => (
+            vec![
+                NDDimension::new(out_x),
+                NDDimension::new(out_y),
+                NDDimension::new(out_c),
+            ],
+            1usize,
+            out_x,
+            out_x * out_y,
+        ),
+    };
+    let total = out_x * out_y * out_c;
+
+    macro_rules! extract3d {
+        ($vec:expr, $T:ty, $zero:expr) => {{
+            let mut out = vec![$zero; total];
+            for oc in 0..out_c {
+                for oy in 0..out_y {
+                    for ox in 0..out_x {
+                        let mut sum = 0.0f64;
+                        for bc in 0..bin_c {
+                            for by in 0..bin_y {
+                                for bx in 0..bin_x {
+                                    let sx = x_min + ox * bin_x + bx;
+                                    let sy = y_min + oy * bin_y + by;
+                                    let sc = c_min + oc * bin_c + bc;
+                                    sum += $vec[sy * sys + sx * sxs + sc * scs] as f64;
+                                }
+                            }
+                        }
+                        let dx = if config.dims[0].reverse {
+                            out_x - 1 - ox
+                        } else {
+                            ox
+                        };
+                        let dy = if config.dims[1].reverse {
+                            out_y - 1 - oy
+                        } else {
+                            oy
+                        };
+                        let dc = if config.dims[2].reverse {
+                            out_c - 1 - oc
+                        } else {
+                            oc
+                        };
+                        let scaled = if config.enable_scale && config.scale != 0.0 {
+                            sum / config.scale
+                        } else {
+                            sum
+                        };
+                        out[dy * dys + dx * dxs + dc * dcs] = scaled as $T;
+                    }
+                }
+            }
+            out
+        }};
+    }
+
+    let out_data = match &src.data {
+        NDDataBuffer::U8(v) => NDDataBuffer::U8(extract3d!(v, u8, 0)),
+        NDDataBuffer::U16(v) => NDDataBuffer::U16(extract3d!(v, u16, 0)),
+        NDDataBuffer::I8(v) => NDDataBuffer::I8(extract3d!(v, i8, 0)),
+        NDDataBuffer::I16(v) => NDDataBuffer::I16(extract3d!(v, i16, 0)),
+        NDDataBuffer::I32(v) => NDDataBuffer::I32(extract3d!(v, i32, 0)),
+        NDDataBuffer::U32(v) => NDDataBuffer::U32(extract3d!(v, u32, 0)),
+        NDDataBuffer::I64(v) => NDDataBuffer::I64(extract3d!(v, i64, 0)),
+        NDDataBuffer::U64(v) => NDDataBuffer::U64(extract3d!(v, u64, 0)),
+        NDDataBuffer::F32(v) => NDDataBuffer::F32(extract3d!(v, f32, 0.0)),
+        NDDataBuffer::F64(v) => NDDataBuffer::F64(extract3d!(v, f64, 0.0)),
+    };
+
+    let mut arr = NDArray::new(dims, src.data.data_type());
+    arr.data = out_data;
+    arr.unique_id = src.unique_id;
+    arr.timestamp = src.timestamp;
+    arr.time_stamp = src.time_stamp;
+    arr.attributes = src.attributes.clone();
+    Some(arr)
+}
+
 /// Extract ROI sub-region from a 2D array.
 pub fn extract_roi_2d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     if src.dims.len() < 2 {
@@ -116,28 +281,24 @@ pub fn extract_roi_2d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     let src_x = src.dims[0].size;
     let src_y = src.dims[1].size;
 
-    // Resolve effective min/size for X dimension
-    // C++: when autoSize, size = full dimension size (src_dim), offset is clamped later
-    let (eff_x_min, eff_x_size) = if !config.dims[0].enable {
-        (0, src_x)
-    } else if config.dims[0].auto_size {
-        (config.dims[0].min.min(src_x), src_x)
-    } else {
-        let min = config.dims[0].min.min(src_x);
-        let size = config.dims[0].size.min(src_x.saturating_sub(min));
-        (min, size)
+    // Resolve effective min/size for one dimension, matching C++ NDPluginROI:
+    //   offset  = MAX(offset, 0); offset = MIN(offset, dimSize-1);
+    //   size    = autoSize ? dimSize : size;
+    //   size    = MAX(size, 1); size = MIN(size, dimSize - offset);
+    // When the dimension is disabled C++ uses offset=0, size=dimSize.
+    let resolve = |cfg: &ROIDimConfig, dim_size: usize| -> (usize, usize) {
+        if !cfg.enable || dim_size == 0 {
+            return (0, dim_size);
+        }
+        // offset clamped to [0, dimSize-1] (one past the last index is illegal).
+        let offset = cfg.min.min(dim_size - 1);
+        let size = if cfg.auto_size { dim_size } else { cfg.size };
+        // size clamped to [1, dimSize - offset].
+        let size = size.max(1).min(dim_size - offset);
+        (offset, size)
     };
-
-    // Resolve effective min/size for Y dimension
-    let (eff_y_min, eff_y_size) = if !config.dims[1].enable {
-        (0, src_y)
-    } else if config.dims[1].auto_size {
-        (config.dims[1].min.min(src_y), src_y)
-    } else {
-        let min = config.dims[1].min.min(src_y);
-        let size = config.dims[1].size.min(src_y.saturating_sub(min));
-        (min, size)
-    };
+    let (eff_x_min, eff_x_size) = resolve(&config.dims[0], src_x);
+    let (eff_y_min, eff_y_size) = resolve(&config.dims[1], src_y);
 
     // Apply autocenter: shift ROI min so that the ROI is centered on the
     // centroid or peak, keeping the effective size the same.
@@ -172,8 +333,11 @@ pub fn extract_roi_2d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
         return None;
     }
 
-    let bin_x = config.dims[0].bin.max(1);
-    let bin_y = config.dims[1].bin.max(1);
+    // C++: binning = MAX(binning, 1); binning = MIN(binning, size).
+    // A bin larger than the ROI is clamped to the ROI size, yielding a
+    // 1-pixel output rather than collapsing to an empty (sink) result.
+    let bin_x = config.dims[0].bin.max(1).min(roi_x_size);
+    let bin_y = config.dims[1].bin.max(1).min(roi_y_size);
     let out_x = roi_x_size / bin_x;
     let out_y = roi_y_size / bin_y;
 
@@ -325,7 +489,7 @@ impl NDPluginProcess for ROIProcessor {
             updates.push(ParamUpdate::int32(dim_params.max_size, dim_size));
         }
 
-        match extract_roi_2d(array, &self.config) {
+        match extract_roi(array, &self.config) {
             Some(roi_arr) => ProcessResult {
                 output_arrays: vec![Arc::new(roi_arr)],
                 param_updates: updates,
@@ -783,9 +947,11 @@ mod tests {
         };
 
         let roi = extract_roi_2d(&arr, &config).unwrap();
-        // C++: autoSize uses full dimension size, not src_dim - min
-        assert_eq!(roi.dims[0].size, 4); // full dim size
-        assert_eq!(roi.dims[1].size, 4); // full dim size
+        // C++: autoSize sets size = dimSize, then size = MIN(size, dimSize -
+        // offset). With offset_x = 1 the X size clamps to 4 - 1 = 3; the Y
+        // dimension with offset 0 stays at the full 4.
+        assert_eq!(roi.dims[0].size, 3);
+        assert_eq!(roi.dims[1].size, 4);
     }
 
     #[test]
@@ -861,6 +1027,144 @@ mod tests {
         // In the ROI, the peak is at local (6-4, 5-3) = (2, 2)
         if let NDDataBuffer::U8(ref v) = roi.data {
             assert_eq!(v[2 * 4 + 2], 255); // peak at local (2,2)
+        }
+    }
+
+    #[test]
+    fn test_offset_clamp_to_last_column() {
+        // Regression: an offset equal to the dim size must clamp to dimSize-1
+        // and still produce a 1-pixel ROI (C++ MIN(offset, dimSize-1)),
+        // instead of collapsing to an empty sink.
+        let arr = make_4x4_u8();
+        let mut config = ROIConfig::default();
+        // min == src_x (4): one past the last valid index.
+        config.dims[0] = ROIDimConfig {
+            min: 4,
+            size: 10,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        config.dims[1] = ROIDimConfig {
+            min: 0,
+            size: 1,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        let roi = extract_roi_2d(&arr, &config).unwrap();
+        // offset clamps to 3, size clamps to 4-3 = 1.
+        assert_eq!(roi.dims[0].size, 1);
+        if let NDDataBuffer::U8(ref v) = roi.data {
+            assert_eq!(v[0], 3); // last column of row 0
+        }
+    }
+
+    #[test]
+    fn test_bin_larger_than_roi_clamps() {
+        // Regression: a bin larger than the ROI is clamped to the ROI size
+        // (C++ MIN(binning, size)), yielding a 1-pixel output instead of a
+        // None sink.
+        let arr = make_4x4_u8();
+        let mut config = ROIConfig::default();
+        config.dims[0] = ROIDimConfig {
+            min: 0,
+            size: 2,
+            bin: 99, // far larger than the ROI
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        config.dims[1] = ROIDimConfig {
+            min: 0,
+            size: 1,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        let roi = extract_roi_2d(&arr, &config).unwrap();
+        // bin clamps to size 2 => out_x = 2/2 = 1.
+        assert_eq!(roi.dims[0].size, 1);
+        if let NDDataBuffer::U8(ref v) = roi.data {
+            // sum of the 2-pixel bin: 0 + 1 = 1
+            assert_eq!(v[0], 1);
+        }
+    }
+
+    /// 2x2 RGB1 image: index = y*6 + x*3 + c, value = 100*y + 10*x + c.
+    fn make_rgb1_2x2() -> NDArray {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let mut arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(2),
+                NDDimension::new(2),
+            ],
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(ad_core_rs::color::NDColorMode::RGB1 as i32),
+        ));
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for y in 0..2 {
+                for x in 0..2 {
+                    for c in 0..3 {
+                        v[y * 6 + x * 3 + c] = (100 * y + 10 * x + c) as u8;
+                    }
+                }
+            }
+        }
+        arr
+    }
+
+    #[test]
+    fn test_roi_3d_rgb1_x_subregion() {
+        // ROI on an RGB1 image: Dim0 selects X, the color axis is preserved.
+        let arr = make_rgb1_2x2();
+        let mut config = ROIConfig::default();
+        // X: take only column 1.
+        config.dims[0] = ROIDimConfig {
+            min: 1,
+            size: 1,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        config.dims[1] = ROIDimConfig {
+            min: 0,
+            size: 2,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        config.dims[2] = ROIDimConfig {
+            min: 0,
+            size: 3,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        let roi = extract_roi(&arr, &config).unwrap();
+        // RGB1 layout: dims = [color=3, x=1, y=2].
+        assert_eq!(roi.dims[0].size, 3);
+        assert_eq!(roi.dims[1].size, 1);
+        assert_eq!(roi.dims[2].size, 2);
+        if let NDDataBuffer::U8(ref v) = roi.data {
+            // pixel (x=1,y=0) channels => 10,11,12
+            assert_eq!(&v[0..3], &[10, 11, 12]);
+            // pixel (x=1,y=1) channels => 110,111,112
+            assert_eq!(&v[3..6], &[110, 111, 112]);
+        } else {
+            panic!("not u8");
         }
     }
 }

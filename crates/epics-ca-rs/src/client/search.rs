@@ -923,11 +923,15 @@ fn handle_udp_response(
                     .unwrap_or(false);
 
                 // Circuit breaker OPEN → reject responses from this server
-                // entirely. allow() also performs OPEN→HALF_OPEN transition
-                // when the cooldown has elapsed, permitting one probe.
-                let breaker_blocked = !state.breakers.allow(server_addr);
-
-                if penalized || breaker_blocked {
+                // entirely. This is a READ-ONLY check: `is_open()` does not
+                // perform the OPEN→HALF_OPEN transition or consume the
+                // single HALF_OPEN probe slot. Probe-slot consumption is
+                // deferred until we confirm a real connect will follow
+                // (the cid is in `state.pending`); a passive SEARCH reply
+                // for an unknown cid must not burn the probe slot, which
+                // would strand the breaker in HALF_OPEN for up to
+                // `probe_timeout` (30s) with no connect to resolve it.
+                if penalized || state.breakers.is_open(server_addr) {
                     // Don't consume this response — let the channel keep
                     // searching for a better server.
                     offset += CaHeader::SIZE + align8(hdr.postsize as usize);
@@ -942,10 +946,23 @@ fn handle_udp_response(
                     continue;
                 }
 
-                if let Some(p) = state.pending.remove(&cid) {
-                    state.buckets[p.bucket].retain(|x| *x != cid);
+                if let Some(p) = state.pending.get(&cid) {
+                    // A real connect will follow this Found — NOW consume
+                    // the breaker probe slot. `allow()` performs the
+                    // OPEN→HALF_OPEN transition (cooldown already checked
+                    // by `is_open()` above) and returns false when a probe
+                    // is already in flight; in that case leave the cid
+                    // pending so a later round can retry.
+                    if !state.breakers.allow(server_addr) {
+                        offset += CaHeader::SIZE + align8(hdr.postsize as usize);
+                        continue;
+                    }
+                    let bucket = p.bucket;
+                    let pv_name = p.pv_name.clone();
+                    state.pending.remove(&cid);
+                    state.buckets[bucket].retain(|x| *x != cid);
                     tracing::debug!(
-                        pv = %p.pv_name, cid, server = %server_addr,
+                        pv = %pv_name, cid, server = %server_addr,
                         "PV search resolved"
                     );
                     let _ = response_tx.send(SearchResponse::Found { cid, server_addr });

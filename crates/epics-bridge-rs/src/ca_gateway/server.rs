@@ -40,7 +40,12 @@ use super::stats::Stats;
 use super::upstream::{UpstreamManager, UpstreamManagerConfig};
 
 /// Configuration for [`GatewayServer`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually (see below) rather than derived:
+/// the `ca-gateway-tls` `upstream_tls` field holds an
+/// `epics_ca_rs::tls::TlsConfig`, which does not implement `Debug`.
+/// The manual impl redacts the two TLS fields to a presence marker.
+#[derive(Clone)]
 pub struct GatewayConfig {
     /// Path to `.pvlist` file.
     pub pvlist_path: Option<PathBuf>,
@@ -76,6 +81,23 @@ pub struct GatewayConfig {
     /// Available with the `ca-gateway-tls` feature.
     #[cfg(feature = "ca-gateway-tls")]
     pub tls: Option<std::sync::Arc<epics_ca_rs::tls::ServerConfig>>,
+    /// Optional TLS client config for the gateway's *upstream*
+    /// connections to the real IOC (B10). Independent of the
+    /// downstream [`Self::tls`] termination: a site can run plaintext
+    /// downstream + TLS upstream, TLS both ends, or any mix. When
+    /// `Some`, the upstream `CaClient` wraps every TCP virtual circuit
+    /// to the IOC in TLS. `None` keeps upstream traffic plaintext.
+    /// Available with the `ca-gateway-tls` feature.
+    #[cfg(feature = "ca-gateway-tls")]
+    pub upstream_tls: Option<epics_ca_rs::tls::TlsConfig>,
+    /// Override SNI / cert-hostname-verification name for the upstream
+    /// TLS connections. Forwarded to `CaClientConfig::tls_server_name`.
+    /// When `None`, the upstream client falls back to the IOC's IP
+    /// literal (which only validates IP-bound certs). Set this to the
+    /// DNS name embedded in the upstream IOC's server certificate.
+    /// Available with the `ca-gateway-tls` feature.
+    #[cfg(feature = "ca-gateway-tls")]
+    pub upstream_tls_server_name: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -96,7 +118,45 @@ impl Default for GatewayConfig {
             read_only: false,
             #[cfg(feature = "ca-gateway-tls")]
             tls: None,
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls: None,
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls_server_name: None,
         }
+    }
+}
+
+// Manual `Debug` — `epics_ca_rs::tls::TlsConfig` (the `upstream_tls`
+// field type) does not implement `Debug`, so the derive cannot be
+// used. The TLS server config (`tls`) and upstream client config
+// (`upstream_tls`) are redacted to a presence marker; certificate
+// material has no business in a `Debug` dump anyway.
+impl std::fmt::Debug for GatewayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("GatewayConfig");
+        d.field("pvlist_path", &self.pvlist_path)
+            .field("pvlist_content", &self.pvlist_content)
+            .field("access_path", &self.access_path)
+            .field("putlog_path", &self.putlog_path)
+            .field("command_path", &self.command_path)
+            .field("preload_path", &self.preload_path)
+            .field("server_port", &self.server_port)
+            .field("timeouts", &self.timeouts)
+            .field("stats_prefix", &self.stats_prefix)
+            .field("cleanup_interval", &self.cleanup_interval)
+            .field("stats_interval", &self.stats_interval)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("read_only", &self.read_only);
+        #[cfg(feature = "ca-gateway-tls")]
+        {
+            d.field("tls", &self.tls.as_ref().map(|_| "<ServerConfig>"));
+            d.field(
+                "upstream_tls",
+                &self.upstream_tls.as_ref().map(|_| "<TlsConfig>"),
+            );
+            d.field("upstream_tls_server_name", &self.upstream_tls_server_name);
+        }
+        d.finish()
     }
 }
 
@@ -189,14 +249,21 @@ impl GatewayServer {
             stats: stats.clone(),
             read_only: config.read_only,
             beacon_anomaly: beacon_anomaly.clone(),
+            // B10: forward the upstream-side TLS config so the
+            // gateway's CaClient to the real IOC can also use TLS,
+            // independently of downstream TLS termination.
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls: config.upstream_tls.clone(),
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls_server_name: config.upstream_tls_server_name.clone(),
         })
         .await?;
         let upstream = Arc::new(upstream);
 
         // Downstream server — wrap each accepted client in TLS when
-        // configured. Upstream traffic to the IOC remains plaintext
-        // unless the upstream side is also TLS-aware (separate
-        // config; not yet wired here).
+        // configured. Upstream traffic to the IOC is encrypted
+        // independently via `GatewayConfig::upstream_tls` (B10,
+        // wired into `UpstreamManager::new` above).
         let downstream = Arc::new({
             #[cfg(feature = "ca-gateway-tls")]
             {
@@ -684,6 +751,29 @@ mod tests {
         let pvlist = server.pvlist().load_full();
         assert!(pvlist.match_name("Beam:current").is_some());
         assert!(pvlist.match_name("test:foo").is_none());
+    }
+
+    /// B10: `GatewayServer::build` must succeed when an upstream TLS
+    /// client config is supplied. The config flows
+    /// `GatewayConfig::upstream_tls` → `UpstreamManagerConfig` →
+    /// `CaClient::new_with_config`. No upstream IOC is contacted at
+    /// build time, so this exercises the plumbing end to end.
+    #[cfg(feature = "ca-gateway-tls")]
+    #[tokio::test]
+    async fn build_with_upstream_tls() {
+        use epics_ca_rs::tls::{Roots, TlsConfig};
+        let config = GatewayConfig {
+            pvlist_content: Some("".to_string()),
+            upstream_tls: Some(TlsConfig::client_from_roots(Roots::empty())),
+            upstream_tls_server_name: Some("ioc.example.com".to_string()),
+            ..Default::default()
+        };
+        let server = GatewayServer::build(config).await;
+        assert!(
+            server.is_ok(),
+            "build with upstream TLS failed: {:?}",
+            server.err()
+        );
     }
 
     #[tokio::test]

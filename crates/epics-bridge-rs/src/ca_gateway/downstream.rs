@@ -57,9 +57,10 @@ impl DownstreamServer {
 
     /// Variant of [`Self::new`] that also wraps every accepted
     /// connection in TLS. The gateway terminates TLS from clients;
-    /// upstream traffic remains plaintext (see `upstream.rs` for the
-    /// upstream-side TLS hooks). Available with the
-    /// `ca-gateway-tls` feature.
+    /// upstream traffic is encrypted independently when
+    /// `GatewayConfig::upstream_tls` is set (B10) — see `upstream.rs`
+    /// `UpstreamManager::new`. Available with the `ca-gateway-tls`
+    /// feature.
     #[cfg(feature = "ca-gateway-tls")]
     pub fn new_with_tls(
         shadow_db: Arc<PvDatabase>,

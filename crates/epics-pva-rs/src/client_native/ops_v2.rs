@@ -28,7 +28,7 @@ use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, ReadExt, WriteExt};
 use crate::pv_request::{build_pv_request_fields, build_pv_request_value_only};
-use crate::pvdata::encode::{encode_pv_field, encode_type_desc};
+use crate::pvdata::encode::{encode_pv_field, encode_pv_field_with_bitset, encode_type_desc};
 use crate::pvdata::{
     FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue,
 };
@@ -500,7 +500,10 @@ pub async fn op_put_field(
     let mut changed = BitSet::new();
     changed.set(bit);
     changed.write_into(order, &mut payload);
-    encode_pv_field(&value, &intro, order, &mut payload);
+    // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
+    // only the fields whose bit is set. Encode consistently so a desync
+    // does not corrupt the server-side decode.
+    encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);
@@ -583,7 +586,9 @@ pub async fn op_put_value(
         changed.set(0);
     }
     changed.write_into(order, &mut payload);
-    encode_pv_field(value, &intro, order, &mut payload);
+    // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
+    // only the fields whose bit is set. Encode consistently.
+    encode_pv_field_with_bitset(value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);
@@ -668,7 +673,9 @@ async fn op_put_inner(
         changed.set(0);
     }
     changed.write_into(order, &mut payload);
-    encode_pv_field(&value, &intro, order, &mut payload);
+    // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
+    // only the fields whose bit is set. Encode consistently.
+    encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
     header.write_into(&mut frame);
@@ -1835,7 +1842,9 @@ pub async fn op_put_get(
         changed.set(0);
     }
     changed.write_into(order, &mut data);
-    encode_pv_field(&value, &intro, order, &mut data);
+    // pvxs `from_wire_valid` decodes a BitSet delta — only the fields
+    // whose bit is set. Encode consistently.
+    encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut data);
     let data_h = PvaHeader::application(false, order, Command::PutGet.code(), data.len() as u32);
     let mut data_frame = Vec::with_capacity(8 + data.len());
     data_h.write_into(&mut data_frame);
@@ -2630,5 +2639,91 @@ mod tests {
             other => panic!("expected structure, got {other:?}"),
         }
         assert_round_trips(&desc, &v);
+    }
+
+    /// F4 regression: the PUT EXEC DATA frame must encode a BitSet *delta*
+    /// — only the fields whose bit is set — so a pvxs server's
+    /// `from_wire_valid` (serverget.cpp:451) decodes the exact bytes the
+    /// client emitted. Previously the BitSet marked only `value` while
+    /// `encode_pv_field` wrote the *full* NT structure, desyncing the
+    /// server-side decode.
+    #[test]
+    fn put_data_frame_bitset_matches_encoded_field_set() {
+        use crate::pvdata::encode::decode_pv_field_with_bitset;
+
+        // NT-style wrapper with several non-`value` siblings.
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
+                (
+                    "timeStamp".into(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: vec![
+                            ("secondsPastEpoch".into(), FieldDesc::Scalar(ScalarType::Long)),
+                            ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let value = build_put_value(&desc, "42.5").unwrap();
+
+        // Same BitSet the PUT ops build: only the `value` bit.
+        let mut changed = BitSet::new();
+        let value_bit = desc.bit_for_path("value").expect("value bit");
+        changed.set(value_bit);
+
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            // Delta encode — what op_put_inner / op_put_value now emit.
+            let mut delta = Vec::new();
+            encode_pv_field_with_bitset(&value, &desc, &changed, 0, order, &mut delta);
+
+            // Full encode — the previous (buggy) emission.
+            let mut full = Vec::new();
+            encode_pv_field(&value, &desc, order, &mut full);
+
+            // The delta must be strictly smaller — siblings are omitted.
+            assert!(
+                delta.len() < full.len(),
+                "delta ({}) must omit unmarked fields vs full ({}), order={order:?}",
+                delta.len(),
+                full.len()
+            );
+
+            // Decoding the delta with the SAME BitSet must consume every
+            // byte and reproduce the marked field — this is exactly the
+            // pvxs `from_wire_valid` contract.
+            let mut cur = Cursor::new(delta.as_slice());
+            let decoded = decode_pv_field_with_bitset(&desc, &changed, 0, &mut cur, order)
+                .unwrap_or_else(|e| panic!("delta decode failed ({order:?}): {e:?}"));
+            assert_eq!(
+                cur.position() as usize,
+                delta.len(),
+                "BitSet-driven decode left trailing bytes, order={order:?}"
+            );
+            match &decoded {
+                PvField::Structure(s) => {
+                    assert_eq!(
+                        s.get_field("value"),
+                        Some(&PvField::Scalar(ScalarValue::Double(42.5))),
+                        "value field mismatch, order={order:?}"
+                    );
+                }
+                other => panic!("expected structure, got {other:?}"),
+            }
+        }
     }
 }

@@ -261,6 +261,47 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
+    /// Trigger record/PV **processing** without transferring a value
+    /// (PVA wire command `PROCESS`, cmd 16). Unlike PUT-with-
+    /// `record[process=true]`, this carries no value payload — it is
+    /// the wire equivalent of an EPICS `dbProcess` / `caput .PROC`.
+    ///
+    /// Default impl returns `Ok(())` — sources whose PVs have no
+    /// processing semantics (constant / mailbox PVs) treat PROCESS as
+    /// a no-op success, matching how a passive record handles a `.PROC`
+    /// write. Sources backed by a processable record (IOC database,
+    /// `SharedPV` with an `on_process` hook) override to actually run
+    /// the processing chain. An `Err` surfaces to the client as a
+    /// PROCESS error status.
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let _ = name;
+        async move { Ok(()) }
+    }
+
+    /// Type-state-enforced PROCESS. pvxs treats `process()` as a
+    /// WRITE-class operation for ACF (it mutates record state), so a
+    /// non-`ReadWrite` token is refused with an error; on `ReadWrite`
+    /// it delegates to the ctx-less [`Self::process`]. Sources that
+    /// need credential-aware routing override this directly.
+    fn process_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async move {
+            if !checked.allows_write() {
+                return Err(format!(
+                    "PROCESS denied by access security: '{}' from {}/{}/{}",
+                    checked.pv_name(),
+                    ctx.host,
+                    ctx.account,
+                    ctx.method,
+                ));
+            }
+            self.process(checked.pv_name()).await
+        }
+    }
+
     /// Notify the source that the per-connection monitor outbox for
     /// `name` just crossed UP through its high watermark. Producers
     /// can throttle their post() rate in response. Default impl is
@@ -406,6 +447,16 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send + 'a>,
     >;
+    fn process<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Dyn forwarder for type-state PROCESS.
+    fn process_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
     fn notify_watermark_high(&self, name: &str);
     fn notify_watermark_low(&self, name: &str);
 }
@@ -545,6 +596,21 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
             request_desc,
             request_value,
             ctx,
+        ))
+    }
+    fn process<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::process(self, name))
+    }
+    fn process_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::process_checked(
+            self, checked, ctx,
         ))
     }
     fn notify_watermark_high(&self, name: &str) {

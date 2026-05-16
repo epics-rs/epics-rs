@@ -25,8 +25,8 @@ use tracing::{debug, error, warn};
 use crate::client_native::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
-    BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, PVA_VERSION, PvaHeader, Status,
-    WriteExt, encode_size_into, encode_string_into,
+    BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, PVA_VERSION, PvaHeader, QosFlags,
+    Status, WriteExt, encode_size_into, encode_string_into,
 };
 use crate::pvdata::encode::{
     EncodeTypeCache, decode_pv_field, decode_type_desc, encode_pv_field, encode_type_desc,
@@ -349,6 +349,24 @@ enum OpKind {
     Put,
     Monitor,
     Rpc,
+    /// PVA `PUT_GET` (cmd 12): atomic put-then-get round trip.
+    PutGet,
+    /// PVA `PROCESS` (cmd 16): trigger record processing, no value.
+    Process,
+}
+
+impl OpKind {
+    /// Wire command this op kind maps to.
+    fn command(self) -> Command {
+        match self {
+            OpKind::Get => Command::Get,
+            OpKind::Put => Command::Put,
+            OpKind::Monitor => Command::Monitor,
+            OpKind::Rpc => Command::Rpc,
+            OpKind::PutGet => Command::PutGet,
+            OpKind::Process => Command::Process,
+        }
+    }
 }
 
 /// Run the TCP listener forever. Backwards-compat wrapper that
@@ -1070,21 +1088,33 @@ async fn handle_connection_io(
                 handle_message(&frame, order, &peer);
             }
             Some(Command::PutGet) => {
-                // I-1 (Round I): atomic put-then-get. The pvxs
-                // wire spec defines this as a separate command but
-                // pvxs itself rarely implements it — production
-                // sites use `record[process=true]` in the PUT
-                // pvRequest options instead. We respond with a
-                // typed "not supported" error so legacy clients
-                // get a clean failure message rather than a
-                // protocol parse error or silent timeout.
-                handle_unsupported_op(&frame, &tx, Command::PutGet, "PUT_GET", order).await;
+                // F11: atomic put-then-get. The PVA wire spec defines
+                // PUT_GET as a separate command (cmd 12). pvxs leaves
+                // `handle_PUT_GET` empty, but we implement the full
+                // INIT/PUT/GET/DESTROY lifecycle on the Rust side so
+                // a PUT_GET-capable client gets a real round trip.
+                peer_entry.op_init();
+                handle_put_get(
+                    &source,
+                    &frame,
+                    &tx,
+                    &mut channels,
+                    order,
+                    &config,
+                    &mut encode_type_cache,
+                    peer,
+                    &cred,
+                )
+                .await?;
             }
             Some(Command::Process) => {
-                // I-1: same handling as PutGet — modern PVA uses
-                // pvRequest options, not the wire-level PROCESS
-                // command. Respond clean.
-                handle_unsupported_op(&frame, &tx, Command::Process, "PROCESS", order).await;
+                // F11: trigger record processing with no value
+                // transfer (PVA cmd 16). Full INIT/PROCESS/DESTROY
+                // lifecycle — routed through the source's typed
+                // `process_checked` (WRITE-class ACF gate).
+                peer_entry.op_init();
+                handle_process(&source, &frame, &tx, &mut channels, order, &config, peer, &cred)
+                    .await?;
             }
             Some(Command::OriginTag) => {
                 // I-5: pvxs origin-tag is an optional payload for
@@ -1141,39 +1171,332 @@ async fn handle_connection_io(
     }
 }
 
-/// I-1: respond to a wire command we don't implement with a typed
-/// error frame instead of letting the client time out. The
-/// response shape mirrors the standard op error response so a
-/// pvxs / pvAccessJava client surfaces the message verbatim
-/// instead of a protocol violation.
-async fn handle_unsupported_op(
+/// Build a minimal [`OpState`] for non-MONITOR ops (GET / PUT /
+/// PUT_GET / PROCESS). The monitor-specific fields are all defaulted
+/// to inert values — these ops never spawn a subscriber task.
+fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState {
+    OpState {
+        intro,
+        kind,
+        monitor_started: false,
+        monitor_abort: None,
+        mask,
+        monitor_window: None,
+        monitor_window_notify: None,
+        monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        monitor_filters: Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
+        put_auto_exec: true,
+    }
+}
+
+/// F11: PVA `PUT_GET` (cmd 12) handler — atomic put-then-get.
+///
+/// Sub-command lifecycle, mirroring the GET / PUT handlers:
+/// - INIT  (`subcmd & 0x08`): decode the pvRequest, register the op,
+///   reply `ioid + subcmd + status + putIF + getIF`. We serve a
+///   single channel introspection for both the put and the get
+///   structure (the common NT case where the put and readback types
+///   are identical).
+/// - PUT-GET (`subcmd & 0x08 == 0`): decode `changed bitset + put
+///   value`, run the WRITE-gated `put_value_checked`, then the
+///   READ-gated `get_value_checked`, and reply
+///   `ioid + subcmd + status + getBitset + getValue`.
+/// - DESTROY (`subcmd & 0x10`): drop the op slot.
+///
+/// pvxs leaves `handle_PUT_GET` empty; this implements the operation
+/// properly per the wire spec so a PUT_GET-capable client works.
+#[allow(clippy::too_many_arguments)]
+async fn handle_put_get(
+    source: &DynSource,
     frame: &Frame,
     tx: &SrvTx,
-    cmd: Command,
-    label: &str,
+    channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
-) {
-    use crate::proto::WriteExt;
+    config: &PvaServerConfig,
+    encode_cache: &mut EncodeTypeCache,
+    peer: std::net::SocketAddr,
+    cred: &ClientCredentials,
+) -> PvaResult<()> {
     let mut cur = frame.cursor();
-    let _sid = cur.get_u32(order).unwrap_or(0);
-    let ioid = cur.get_u32(order).unwrap_or(0);
-    let subcmd = cur.get_u8().unwrap_or(0);
+    let sid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+
+    let ch = match channels.get_mut(&sid) {
+        Some(c) => c,
+        None => {
+            send_op_error(tx, OpKind::PutGet, ioid, "unknown channel sid", order).await?;
+            return Ok(());
+        }
+    };
+
+    // DESTROY phase — release the op slot, no reply.
+    if subcmd & QosFlags::DESTROY != 0 {
+        ch.ops.remove(&ioid);
+        return Ok(());
+    }
+
+    if subcmd & QosFlags::INIT != 0 {
+        // Per-channel concurrent-op cap (same rule as `handle_op`).
+        if !ch.ops.contains_key(&ioid) && ch.ops.len() >= config.max_ops_per_channel {
+            send_op_error(
+                tx,
+                OpKind::PutGet,
+                ioid,
+                "max ops per channel exceeded",
+                order,
+            )
+            .await?;
+            return Ok(());
+        }
+        let intro = ch.introspection.clone().unwrap_or(FieldDesc::Variant);
+        // pvRequest: `type + value` (pvxs clientget.cpp). Translate to
+        // a field mask the GET leg consults; default to all-fields.
+        let req_desc = decode_type_desc(&mut cur, order).ok();
+        let _req_value = req_desc
+            .as_ref()
+            .and_then(|d| decode_pv_field(d, &mut cur, order).ok());
+        let mask = req_desc
+            .as_ref()
+            .and_then(|d| crate::pv_request::request_to_mask(&intro, d).ok())
+            .unwrap_or_else(|| BitSet::all_set(intro.total_bits()));
+
+        ch.ops.insert(
+            ioid,
+            non_monitor_op_state(intro.clone(), OpKind::PutGet, mask),
+        );
+
+        // INIT response: ioid + subcmd + status + putIF + getIF.
+        // pvxs `serverget.cpp` emits two type descriptors for PUT_GET
+        // (the put-request and get-response structures). We serve the
+        // same channel introspection for both legs.
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        payload.put_u8(subcmd);
+        Status::ok().write_into(order, &mut payload);
+        if config.emit_type_cache {
+            encode_type_desc_cached(&intro, order, encode_cache, &mut payload);
+            encode_type_desc_cached(&intro, order, encode_cache, &mut payload);
+        } else {
+            encode_type_desc(&intro, order, &mut payload);
+            encode_type_desc(&intro, order, &mut payload);
+        }
+        let h =
+            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
+        let mut buf = Vec::new();
+        h.write_into(&mut buf);
+        buf.extend_from_slice(&payload);
+        let _ = tx.send(buf).await;
+        return Ok(());
+    }
+
+    // PUT-GET data phase.
+    let op = ch.ops.get(&ioid).cloned();
+    let (intro, mask) = match op {
+        Some(o) => (o.intro, o.mask),
+        None => {
+            send_op_error(tx, OpKind::PutGet, ioid, "operation not initialised", order).await?;
+            return Ok(());
+        }
+    };
+    let pv_name = ch.name.clone();
+
+    // The data frame carries the put bitset + put value, exactly like
+    // a PUT EXEC. pvxs clientget.cpp PUT_GET state sends `0x00`.
+    let _changed =
+        BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let put_value = decode_pv_field(&intro, &mut cur, order)
+        .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
+
+    let ctx = crate::server_native::source::ChannelContext {
+        peer,
+        account: cred.account.clone(),
+        method: cred.method.clone(),
+        host: cred.host.clone(),
+    };
 
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
-    // Echo the request subcmd per pvxs `serverget.cpp:83`. The
-    // unsupported-op error mirrors the regular op error response
-    // shape so pvxs / pvAccessJava clients surface the message
-    // verbatim instead of a protocol-violation diagnostic.
     payload.put_u8(subcmd);
-    let status = Status::error(format!("{label} not supported by this server"));
-    status.write_into(order, &mut payload);
 
-    let header = PvaHeader::application(true, order, cmd.code(), payload.len() as u32);
+    // PUT leg — WRITE-gated.
+    let put_result = {
+        let checked = source
+            .access_gate()
+            .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+            .await;
+        source
+            .put_value_checked(checked, put_value, ctx.clone())
+            .await
+    };
+    if let Err(msg) = put_result {
+        Status::error(msg).write_into(order, &mut payload);
+        let h =
+            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
+        let mut buf = Vec::new();
+        h.write_into(&mut buf);
+        buf.extend_from_slice(&payload);
+        let _ = tx.send(buf).await;
+        return Ok(());
+    }
+
+    // GET leg — READ-gated, re-checked through the same gate. Mirror
+    // the PUT-with-getback path: a peer with WRITE-only ASG still
+    // gets an OK status, just an empty (zero-field) readback bitset.
+    let read_checked = source
+        .access_gate()
+        .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+        .await;
+    match source.get_value_checked(read_checked, ctx).await {
+        Some(v) => {
+            Status::ok().write_into(order, &mut payload);
+            mask.write_into(order, &mut payload);
+            crate::pvdata::encode::encode_pv_field_with_bitset(
+                &v,
+                &intro,
+                &mask,
+                0,
+                order,
+                &mut payload,
+            );
+        }
+        None => {
+            // PUT committed but READ denied / PV vanished: emit OK +
+            // an all-zero bitset so the client decodes zero fields
+            // and consumes no value bytes (same shape as the
+            // PUT-getback path).
+            Status::ok().write_into(order, &mut payload);
+            let empty = BitSet::with_capacity(intro.total_bits());
+            empty.write_into(order, &mut payload);
+        }
+    }
+    let h = PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
     let mut buf = Vec::new();
-    header.write_into(&mut buf);
+    h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
     let _ = tx.send(buf).await;
+    Ok(())
+}
+
+/// F11: PVA `PROCESS` (cmd 16) handler — trigger record processing
+/// with no value transfer.
+///
+/// Sub-command lifecycle:
+/// - INIT  (`subcmd & 0x08`): decode + discard the pvRequest, register
+///   the op, reply `ioid + subcmd + status` (no introspection — there
+///   is no value type to negotiate).
+/// - PROCESS (`subcmd & 0x08 == 0`): run the WRITE-gated
+///   `process_checked` on the source, reply `ioid + subcmd + status`.
+/// - DESTROY (`subcmd & 0x10`): drop the op slot.
+#[allow(clippy::too_many_arguments)]
+async fn handle_process(
+    source: &DynSource,
+    frame: &Frame,
+    tx: &SrvTx,
+    channels: &mut HashMap<u32, ChannelState>,
+    order: ByteOrder,
+    config: &PvaServerConfig,
+    peer: std::net::SocketAddr,
+    cred: &ClientCredentials,
+) -> PvaResult<()> {
+    let mut cur = frame.cursor();
+    let sid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+
+    let ch = match channels.get_mut(&sid) {
+        Some(c) => c,
+        None => {
+            send_op_error(tx, OpKind::Process, ioid, "unknown channel sid", order).await?;
+            return Ok(());
+        }
+    };
+
+    if subcmd & QosFlags::DESTROY != 0 {
+        ch.ops.remove(&ioid);
+        return Ok(());
+    }
+
+    if subcmd & QosFlags::INIT != 0 {
+        if !ch.ops.contains_key(&ioid) && ch.ops.len() >= config.max_ops_per_channel {
+            send_op_error(
+                tx,
+                OpKind::Process,
+                ioid,
+                "max ops per channel exceeded",
+                order,
+            )
+            .await?;
+            return Ok(());
+        }
+        let intro = ch.introspection.clone().unwrap_or(FieldDesc::Variant);
+        // The PROCESS pvRequest carries no field selection of interest
+        // (process transfers no value) — decode-and-discard so any
+        // trailing bytes are consumed cleanly.
+        let _ = decode_type_desc(&mut cur, order)
+            .ok()
+            .and_then(|d| decode_pv_field(&d, &mut cur, order).ok());
+        let mask = BitSet::all_set(intro.total_bits());
+        ch.ops
+            .insert(ioid, non_monitor_op_state(intro, OpKind::Process, mask));
+
+        // INIT response: ioid + subcmd + status. No type descriptor —
+        // PROCESS negotiates no value.
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        payload.put_u8(subcmd);
+        Status::ok().write_into(order, &mut payload);
+        let h =
+            PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
+        let mut buf = Vec::new();
+        h.write_into(&mut buf);
+        buf.extend_from_slice(&payload);
+        let _ = tx.send(buf).await;
+        return Ok(());
+    }
+
+    // PROCESS data phase — no payload to decode.
+    if !ch.ops.contains_key(&ioid) {
+        send_op_error(tx, OpKind::Process, ioid, "operation not initialised", order).await?;
+        return Ok(());
+    }
+    let pv_name = ch.name.clone();
+    let ctx = crate::server_native::source::ChannelContext {
+        peer,
+        account: cred.account.clone(),
+        method: cred.method.clone(),
+        host: cred.host.clone(),
+    };
+    // Processing mutates record state — WRITE-gated, like PUT.
+    let result = {
+        let checked = source
+            .access_gate()
+            .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+            .await;
+        source.process_checked(checked, ctx).await
+    };
+
+    let mut payload = Vec::new();
+    payload.put_u32(ioid, order);
+    payload.put_u8(subcmd);
+    match result {
+        Ok(()) => Status::ok().write_into(order, &mut payload),
+        Err(msg) => Status::error(msg).write_into(order, &mut payload),
+    }
+    let h = PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
+    let mut buf = Vec::new();
+    h.write_into(&mut buf);
+    buf.extend_from_slice(&payload);
+    let _ = tx.send(buf).await;
+    Ok(())
 }
 
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
@@ -1655,12 +1978,7 @@ async fn handle_op(
         );
 
         // Build INIT response: ioid + subcmd + status + introspection
-        let cmd = match kind {
-            OpKind::Get => Command::Get,
-            OpKind::Put => Command::Put,
-            OpKind::Monitor => Command::Monitor,
-            OpKind::Rpc => Command::Rpc,
-        };
+        let cmd = kind.command();
 
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
@@ -2409,6 +2727,11 @@ async fn handle_op(
             buf.extend_from_slice(&payload);
             let _ = tx.send(buf).await;
         }
+        // PUT_GET / PROCESS have dedicated handlers (`handle_put_get`,
+        // `handle_process`) and are never dispatched into `handle_op`.
+        OpKind::PutGet | OpKind::Process => unreachable!(
+            "PUT_GET / PROCESS are routed to their own handlers, not handle_op"
+        ),
     }
     Ok(())
 }
@@ -2486,12 +2809,7 @@ async fn send_op_error(
     msg: &str,
     order: ByteOrder,
 ) -> PvaResult<()> {
-    let cmd = match kind {
-        OpKind::Get => Command::Get,
-        OpKind::Put => Command::Put,
-        OpKind::Monitor => Command::Monitor,
-        OpKind::Rpc => Command::Rpc,
-    };
+    let cmd = kind.command();
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
     payload.put_u8(0x08); // INIT phase err

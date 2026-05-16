@@ -22,6 +22,8 @@ mod test_client_server_lifecycle;
 mod test_monitor_finish;
 #[path = "parity/test_monitor_reload_deny_composite.rs"]
 mod test_monitor_reload_deny_composite;
+#[path = "parity/test_put_get_process.rs"]
+mod test_put_get_process;
 #[path = "parity/test_pvrequest_filter.rs"]
 mod test_pvrequest_filter;
 #[path = "parity/testbitmask_port.rs"]

@@ -26,7 +26,7 @@ use tracing::debug;
 
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
-use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, WriteExt};
+use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, ReadExt, WriteExt};
 use crate::pv_request::{build_pv_request_fields, build_pv_request_value_only};
 use crate::pvdata::encode::{encode_pv_field, encode_type_desc};
 use crate::pvdata::{
@@ -1770,6 +1770,250 @@ pub async fn op_rpc(
     let _ = server.send(destroy).await;
     server.unregister_ioid(ioid);
     result
+}
+
+// ── PUT_GET (cmd 12) ────────────────────────────────────────────────────
+
+/// F11: PVA `PUT_GET` (cmd 12) — atomic put-then-get round trip.
+///
+/// Puts `value_str` to the channel's `.value` field, then receives the
+/// (possibly post-processed) value back, all in one operation. The
+/// wire lifecycle mirrors the GET / PUT ops:
+///
+/// 1. INIT (`subcmd 0x08`): send the pvRequest; server replies with
+///    `status + putIF + getIF` (two type descriptors).
+/// 2. PUT-GET (`subcmd 0x00`): send `put bitset + put value`; server
+///    applies the put then replies `status + get bitset + get value`.
+/// 3. DESTROY (`subcmd 0x10`): release the op.
+///
+/// pvxs leaves `handle_PUT_GET` empty; the Rust server implements the
+/// full operation (see `server_native::tcp::handle_put_get`).
+pub async fn op_put_get(
+    channel: &Arc<Channel>,
+    value_str: &str,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let pv_req = build_pv_request_value_only(big_endian);
+    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+    let cache = server.type_cache();
+
+    // INIT — `sid + ioid + 0x08 + pvRequest`.
+    let mut init = Vec::with_capacity(9 + pv_req.len());
+    init.put_u32(sid, order);
+    init.put_u32(ioid, order);
+    init.put_u8(QosFlags::INIT);
+    init.extend_from_slice(&pv_req);
+    let init_h = PvaHeader::application(false, order, Command::PutGet.code(), init.len() as u32);
+    let mut init_frame = Vec::with_capacity(8 + init.len());
+    init_h.write_into(&mut init_frame);
+    init_frame.extend_from_slice(&init);
+    server.send(init_frame).await?;
+
+    let init_resp = await_frame(&mut stream, op_timeout).await?;
+    let intro = decode_put_get_init(&init_resp, &mut cache.lock())?;
+    ioid_guard.arm_destroy(sid);
+
+    // Build the value against the negotiated introspection.
+    let value = build_put_value(&intro, value_str)?;
+
+    // PUT-GET data — `sid + ioid + 0x00 + put bitset + put value`.
+    let mut data = Vec::new();
+    data.put_u32(sid, order);
+    data.put_u32(ioid, order);
+    data.put_u8(0x00);
+    let mut changed = BitSet::new();
+    if let Some(bit) = intro.bit_for_path("value") {
+        changed.set(bit);
+    } else {
+        changed.set(0);
+    }
+    changed.write_into(order, &mut data);
+    encode_pv_field(&value, &intro, order, &mut data);
+    let data_h = PvaHeader::application(false, order, Command::PutGet.code(), data.len() as u32);
+    let mut data_frame = Vec::with_capacity(8 + data.len());
+    data_h.write_into(&mut data_frame);
+    data_frame.extend_from_slice(&data);
+    server.send(data_frame).await?;
+
+    let resp_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = decode_put_get_data(&resp_frame, &intro);
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send(destroy).await;
+    server.unregister_ioid(ioid);
+    result.map(|v| (intro, v))
+}
+
+/// Decode a `PUT_GET` INIT response: `ioid + subcmd + status + putIF +
+/// getIF`. Returns the get-leg introspection (used to encode the put
+/// value and decode the readback). On a non-success status this is an
+/// error.
+fn decode_put_get_init(
+    frame: &super::decode::Frame,
+    type_cache: &mut crate::pvdata::encode::TypeCache,
+) -> PvaResult<FieldDesc> {
+    if frame.header.command != Command::PutGet.code() {
+        return Err(PvaError::Protocol(format!(
+            "expected PUT_GET INIT, got command {}",
+            frame.header.command
+        )));
+    }
+    let order = frame.order();
+    let mut cur = frame.cursor();
+    let _ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    if subcmd & QosFlags::INIT == 0 {
+        return Err(PvaError::Protocol(format!(
+            "expected PUT_GET INIT subcmd, got 0x{subcmd:02x}"
+        )));
+    }
+    let status =
+        crate::proto::Status::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    if !status.is_success() {
+        return Err(PvaError::Protocol(format!(
+            "PUT_GET INIT failed: {status:?}"
+        )));
+    }
+    // putIF then getIF. The put structure is decoded (advancing the
+    // cursor + populating the type cache) but the get structure is
+    // what the data legs use.
+    let _put_if =
+        crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
+            .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let get_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    Ok(get_if)
+}
+
+/// Decode a `PUT_GET` data response: `ioid + subcmd + status + get
+/// bitset + get value`.
+fn decode_put_get_data(
+    frame: &super::decode::Frame,
+    intro: &FieldDesc,
+) -> PvaResult<PvField> {
+    if frame.header.command != Command::PutGet.code() {
+        return Err(PvaError::Protocol(format!(
+            "expected PUT_GET data, got command {}",
+            frame.header.command
+        )));
+    }
+    let order = frame.order();
+    let mut cur = frame.cursor();
+    let _ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    let status =
+        crate::proto::Status::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    if !status.is_success() {
+        return Err(PvaError::Protocol(format!("PUT_GET: {status:?}")));
+    }
+    let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let value =
+        crate::pvdata::encode::decode_pv_field_with_bitset(intro, &changed, 0, &mut cur, order)
+            .map_err(|e| PvaError::Decode(e.to_string()))?;
+    Ok(value)
+}
+
+// ── PROCESS (cmd 16) ────────────────────────────────────────────────────
+
+/// F11: PVA `PROCESS` (cmd 16) — trigger record processing without
+/// transferring a value.
+///
+/// Wire lifecycle:
+/// 1. INIT (`subcmd 0x08`): send the pvRequest; server replies
+///    `status` (no introspection — there is no value type).
+/// 2. PROCESS (`subcmd 0x00`): no payload; server runs the processing
+///    hook and replies `status`.
+/// 3. DESTROY (`subcmd 0x10`): release the op.
+pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResult<()> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let pv_req = build_pv_request_value_only(big_endian);
+    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+
+    // INIT — `sid + ioid + 0x08 + pvRequest`.
+    let mut init = Vec::with_capacity(9 + pv_req.len());
+    init.put_u32(sid, order);
+    init.put_u32(ioid, order);
+    init.put_u8(QosFlags::INIT);
+    init.extend_from_slice(&pv_req);
+    let init_h = PvaHeader::application(false, order, Command::Process.code(), init.len() as u32);
+    let mut init_frame = Vec::with_capacity(8 + init.len());
+    init_h.write_into(&mut init_frame);
+    init_frame.extend_from_slice(&init);
+    server.send(init_frame).await?;
+
+    let init_resp = await_frame(&mut stream, op_timeout).await?;
+    decode_process_status(&init_resp, QosFlags::INIT)?;
+    ioid_guard.arm_destroy(sid);
+
+    // PROCESS data — `sid + ioid + 0x00`, no payload.
+    let mut data = Vec::with_capacity(9);
+    data.put_u32(sid, order);
+    data.put_u32(ioid, order);
+    data.put_u8(0x00);
+    let data_h = PvaHeader::application(false, order, Command::Process.code(), data.len() as u32);
+    let mut data_frame = Vec::with_capacity(8 + data.len());
+    data_h.write_into(&mut data_frame);
+    data_frame.extend_from_slice(&data);
+    server.send(data_frame).await?;
+
+    let resp_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = decode_process_status(&resp_frame, 0x00);
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send(destroy).await;
+    server.unregister_ioid(ioid);
+    result
+}
+
+/// Decode a `PROCESS` response: `ioid + subcmd + status`.
+/// `expected_init` is `QosFlags::INIT` when an INIT reply is expected,
+/// `0x00` for the PROCESS-done reply — only used to label errors.
+fn decode_process_status(
+    frame: &super::decode::Frame,
+    expected_init: u8,
+) -> PvaResult<()> {
+    if frame.header.command != Command::Process.code() {
+        return Err(PvaError::Protocol(format!(
+            "expected PROCESS response, got command {}",
+            frame.header.command
+        )));
+    }
+    let order = frame.order();
+    let mut cur = frame.cursor();
+    let _ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    let status =
+        crate::proto::Status::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    if !status.is_success() {
+        let phase = if expected_init & QosFlags::INIT != 0 {
+            "PROCESS INIT"
+        } else {
+            "PROCESS"
+        };
+        return Err(PvaError::Protocol(format!("{phase} failed: {status:?}")));
+    }
+    Ok(())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────

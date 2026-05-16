@@ -452,6 +452,40 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let name = name.to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    return src.process(&name).await;
+                }
+            }
+            Err(format!("no source serves '{name}'"))
+        }
+    }
+
+    fn process_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .await;
+                    return src.process_checked(inner_checked, ctx).await;
+                }
+            }
+            Err(format!("no source serves '{name}'"))
+        }
+    }
+
     fn notify_watermark_high(&self, name: &str) {
         for src in self.snapshot() {
             // No has_pv check — fire on every source that registered.

@@ -29,7 +29,8 @@ use crate::pvdata::{FieldDesc, PvField};
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
     DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, SubscriptionHandle, op_get, op_monitor,
-    op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle, op_put, op_rpc,
+    op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle, op_process, op_put,
+    op_put_get, op_rpc,
 };
 use super::search_engine::SearchEngine;
 
@@ -942,6 +943,33 @@ impl PvaClient {
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
         op_rpc(&ch, request_desc, request_value, self.inner.timeout).await
+    }
+
+    /// PVA `PUT_GET` (cmd 12) — atomic put-then-get. PUTs `value_str`
+    /// to the channel's `.value` field and returns the (possibly
+    /// post-processed) value back in one round trip. Returns the
+    /// readback `(introspection, value)`.
+    ///
+    /// Use this when a write has a side effect on the value (a record
+    /// that recalculates on process) and you want the updated value
+    /// without a separate GET — it is a single wire operation and the
+    /// server applies the put then reads back atomically.
+    pub async fn pvput_get(
+        &self,
+        pv_name: &str,
+        value_str: &str,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        op_put_get(&ch, value_str, self.inner.timeout).await
+    }
+
+    /// PVA `PROCESS` (cmd 16) — trigger record processing without
+    /// transferring a value. The wire equivalent of an EPICS
+    /// `caput .PROC` / `dbProcess`. Succeeds with `()`; a processing
+    /// failure surfaces as a [`PvaError::Protocol`].
+    pub async fn pvprocess(&self, pv_name: &str) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        op_process(&ch, self.inner.timeout).await
     }
 
     /// Snapshot of the client's current state — channel cache size,

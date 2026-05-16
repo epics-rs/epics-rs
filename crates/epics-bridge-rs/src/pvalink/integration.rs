@@ -684,7 +684,7 @@ impl LinkSet for PvaLinkResolver {
                     .await
                     .map_err(|e| e.to_string())?;
                 if array_path {
-                    let pv_field = crate::qsrv::convert::epics_to_pv_field(&value);
+                    let pv_field = crate::convert::epics_to_pv_field(&value);
                     link.write_pv_field(&pv_field)
                         .await
                         .map_err(|e| e.to_string())

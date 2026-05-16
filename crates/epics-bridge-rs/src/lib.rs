@@ -59,6 +59,13 @@
 pub mod error;
 pub use error::{BridgeError, BridgeResult};
 
+// `EpicsValue` <-> `PvField` conversion helpers. Shared by the QSRV
+// bridge and PVA links — both need to translate record values to/from
+// pvData. Gated on the consumers that enable `epics-pva-rs` (the only
+// extra dependency it uses) so a CA-only build still drops it.
+#[cfg(any(feature = "qsrv", feature = "pvalink"))]
+pub mod convert;
+
 #[cfg(feature = "qsrv")]
 pub mod qsrv;
 

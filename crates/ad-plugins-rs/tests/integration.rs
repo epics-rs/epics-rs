@@ -438,7 +438,9 @@ fn test_roi_param_change_enables_output() {
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(10));
 
-    // Send array — ROI1 has default size=0, should produce NO output
+    // Send array — ROI1 has default size=0. Matching C++ NDPluginROI
+    // (size = MAX(size, 1)), an enabled ROI dim with size 0 clamps to a
+    // 1-pixel ROI and still produces an output, so STATS1 receives it.
     let mut arr = NDArray::new(
         vec![NDDimension::new(8), NDDimension::new(8)],
         NDDataType::UInt8,
@@ -448,8 +450,8 @@ fn test_roi_param_change_enables_output() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(
         *last_id.lock(),
-        -1,
-        "STATS1 should NOT receive with ROI size=0"
+        100,
+        "ROI size=0 clamps to a 1-pixel ROI (C++ MAX(size,1)) and still emits"
     );
 
     // Now set ROI size via param write (like PINI or user).

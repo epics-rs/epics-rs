@@ -200,6 +200,7 @@ pub fn result_to_reply(result: &RequestResult, request_id: u64) -> PortReply {
         ReplyPayload::OctetData {
             data: data.clone(),
             nbytes: result.nbytes,
+            eom_reason: result.eom_reason,
         }
     } else if let Some(v) = result.int_val {
         ReplyPayload::Value(ParamValue::Int32(v))
@@ -229,11 +230,15 @@ pub fn result_to_reply(result: &RequestResult, request_id: u64) -> PortReply {
     } else if let Some(v) = result.reason {
         // DrvUserCreate returns reason index
         ReplyPayload::Value(ParamValue::Int32(v as i32))
+    } else if let Some((low, high)) = result.bounds {
+        // GetBoundsInt32 / GetBoundsInt64
+        ReplyPayload::Bounds { low, high }
     } else if let Some(ref v) = result.option_value {
         // GetOption returns a string value
         ReplyPayload::OctetData {
             data: v.as_bytes().to_vec(),
             nbytes: v.len(),
+            eom_reason: 0,
         }
     } else {
         ReplyPayload::Ack
@@ -359,6 +364,35 @@ mod tests {
     }
 
     #[test]
+    fn result_to_reply_bounds() {
+        // GetBoundsInt32/Int64 results carry low/high in `bounds` only —
+        // they must not collapse to an empty Ack.
+        let result = RequestResult::bounds_read(-2048, 2047);
+        let reply = result_to_reply(&result, 8);
+        assert_eq!(
+            reply.payload,
+            ReplyPayload::Bounds {
+                low: -2048,
+                high: 2047,
+            }
+        );
+    }
+
+    #[test]
+    fn result_to_reply_octet_carries_eom_reason() {
+        let result = RequestResult::octet_read_eom(vec![0x41], 1, 0x01 | 0x02);
+        let reply = result_to_reply(&result, 9);
+        assert_eq!(
+            reply.payload,
+            ReplyPayload::OctetData {
+                data: vec![0x41],
+                nbytes: 1,
+                eom_reason: 0x03,
+            }
+        );
+    }
+
+    #[test]
     fn result_to_reply_octet_read() {
         let result = RequestResult::octet_read(vec![0x48, 0x65], 2);
         let reply = result_to_reply(&result, 4);
@@ -367,6 +401,7 @@ mod tests {
             ReplyPayload::OctetData {
                 data: vec![0x48, 0x65],
                 nbytes: 2,
+                eom_reason: 0,
             }
         );
     }

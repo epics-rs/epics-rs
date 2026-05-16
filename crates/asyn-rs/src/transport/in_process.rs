@@ -98,7 +98,15 @@ impl RuntimeClient for InProcessClient {
 
             tokio::spawn(async move {
                 loop {
-                    match broadcast_rx.recv().await {
+                    // Exit promptly when the consumer drops its receiver,
+                    // rather than parking on `recv()` until the broadcast
+                    // channel closes (i.e. the port is destroyed) — that
+                    // leaked a task per short-lived subscription.
+                    let recv = tokio::select! {
+                        _ = tx.closed() => break,
+                        recv = broadcast_rx.recv() => recv,
+                    };
+                    match recv {
                         Ok(iv) => {
                             if let Some(r) = filter.reason {
                                 if iv.reason != r {

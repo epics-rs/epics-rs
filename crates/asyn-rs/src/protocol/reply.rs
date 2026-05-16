@@ -8,7 +8,16 @@ use super::value::{AlarmMeta, ParamValue, Timestamp};
 pub enum ReplyPayload {
     Ack,
     Value(ParamValue),
-    OctetData { data: Vec<u8>, nbytes: usize },
+    /// Octet read result. `eom_reason` carries the asynOctet EOM flags
+    /// (`ASYN_EOM_CNT | ASYN_EOM_EOS | ASYN_EOM_END`) so a protocol
+    /// consumer can tell how the read terminated.
+    OctetData {
+        data: Vec<u8>,
+        nbytes: usize,
+        eom_reason: u32,
+    },
+    /// Result of `GetBoundsInt32` / `GetBoundsInt64`.
+    Bounds { low: i64, high: i64 },
     Subscribed { subscription_id: u64 },
     Error { code: ReplyStatus, detail: String },
 }
@@ -62,6 +71,7 @@ mod tests {
             payload: ReplyPayload::OctetData {
                 data: vec![0x48, 0x65, 0x6c, 0x6c, 0x6f],
                 nbytes: 5,
+                eom_reason: 0,
             },
             alarm: None,
             timestamp: None,
@@ -110,6 +120,7 @@ mod tests {
             ReplyPayload::OctetData {
                 data: vec![1],
                 nbytes: 1,
+                eom_reason: 0,
             },
             ReplyPayload::Subscribed { subscription_id: 0 },
             ReplyPayload::Error {

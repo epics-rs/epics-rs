@@ -19,13 +19,31 @@
 
 #![cfg(feature = "discovery")]
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::proto::rr::{RData, RecordType};
 
 use super::Backend;
+
+/// Cap on service instances processed from a single PTR answer. A
+/// hostile or misconfigured zone could return thousands; each instance
+/// costs an SRV + A + AAAA round-trip, so an uncapped count turns
+/// `discover()` into a DNS-amplification stall during client startup.
+const MAX_INSTANCES: usize = 256;
+
+/// Aggregate wall-clock budget for the whole SRV/A/AAAA resolve phase.
+/// `discover()` runs during `CaClient::new()`; this bounds how long an
+/// untrusted zone can delay client construction regardless of instance
+/// count or per-query latency.
+const RESOLVE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Per-lookup timeout, so one unresponsive SRV/A/AAAA query cannot
+/// consume the entire `RESOLVE_BUDGET` by itself.
+const PER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct DnsSdBackend {
     zone: String,
@@ -75,13 +93,22 @@ impl Backend for DnsSdBackend {
             }
         };
 
-        // Collect the instance FQDNs the PTR records point at.
+        // Collect the instance FQDNs the PTR records point at. Dedup
+        // via a HashSet (O(1)) and cap the count: a hostile zone could
+        // return an unbounded PTR answer, and each instance below costs
+        // three sequential DNS round-trips.
+        let mut seen_instances: HashSet<String> = HashSet::new();
         let mut instances: Vec<String> = Vec::new();
         for rdata in ptr.iter() {
             if let RData::PTR(target) = rdata {
                 let name = target.to_string();
-                if !instances.contains(&name) {
+                if seen_instances.insert(name.clone()) {
                     instances.push(name);
+                    if instances.len() >= MAX_INSTANCES {
+                        tracing::warn!(zone = %self.zone, cap = MAX_INSTANCES,
+                            "DNS-SD: PTR answer exceeds instance cap; truncating");
+                        break;
+                    }
                 }
             }
         }
@@ -95,13 +122,36 @@ impl Backend for DnsSdBackend {
         // each IP with that SRV's port avoids the cartesian-product
         // bug where two IOCs on ports 5064/5066 would each be emitted
         // with both ports.
+        //
+        // The whole phase is bounded two ways: a per-lookup timeout so
+        // one stuck query cannot stall startup, and an aggregate
+        // `RESOLVE_BUDGET` deadline checked per instance so a large but
+        // responsive zone cannot either. Whatever resolved before the
+        // deadline is returned.
+        let deadline = Instant::now() + RESOLVE_BUDGET;
+        let mut out_set: HashSet<SocketAddr> = HashSet::new();
         let mut out: Vec<SocketAddr> = Vec::new();
         for instance in &instances {
-            let srv = match self.resolver.srv_lookup(instance.as_str()).await {
-                Ok(r) => r,
-                Err(e) => {
+            if Instant::now() >= deadline {
+                tracing::warn!(zone = %self.zone, budget = ?RESOLVE_BUDGET,
+                    "DNS-SD: resolve budget exhausted; returning partial result");
+                break;
+            }
+            let srv = match tokio::time::timeout(
+                PER_LOOKUP_TIMEOUT,
+                self.resolver.srv_lookup(instance.as_str()),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     tracing::warn!(zone = %self.zone, instance = %instance, error = %e,
                         "DNS-SD: SRV lookup failed");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(zone = %self.zone, instance = %instance,
+                        "DNS-SD: SRV lookup timed out");
                     continue;
                 }
             };
@@ -109,19 +159,29 @@ impl Backend for DnsSdBackend {
                 let port = record.port();
                 let target = record.target().to_string();
                 // A records.
-                if let Ok(v4) = self.resolver.ipv4_lookup(target.as_str()).await {
+                if let Ok(Ok(v4)) = tokio::time::timeout(
+                    PER_LOOKUP_TIMEOUT,
+                    self.resolver.ipv4_lookup(target.as_str()),
+                )
+                .await
+                {
                     for ip in v4.iter() {
                         let addr = SocketAddr::new(std::net::IpAddr::V4(**ip), port);
-                        if !out.contains(&addr) {
+                        if out_set.insert(addr) {
                             out.push(addr);
                         }
                     }
                 }
                 // AAAA records.
-                if let Ok(v6) = self.resolver.ipv6_lookup(target.as_str()).await {
+                if let Ok(Ok(v6)) = tokio::time::timeout(
+                    PER_LOOKUP_TIMEOUT,
+                    self.resolver.ipv6_lookup(target.as_str()),
+                )
+                .await
+                {
                     for ip in v6.iter() {
                         let addr = SocketAddr::new(std::net::IpAddr::V6(**ip), port);
-                        if !out.contains(&addr) {
+                        if out_set.insert(addr) {
                             out.push(addr);
                         }
                     }

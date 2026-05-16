@@ -879,12 +879,12 @@ mod tests {
         let mut writer = Hdf5Writer::new();
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        arr.attributes.add(NDAttribute {
-            name: "exposure".into(),
-            description: "".into(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::Float64(0.5),
-        });
+        arr.attributes.add(NDAttribute::new_static(
+                "exposure",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Float64(0.5),
+            ));
 
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
         writer.write_file(&arr).unwrap();

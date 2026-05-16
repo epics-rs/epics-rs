@@ -154,12 +154,12 @@ pub fn compress_lz4(src: &NDArray) -> NDArray {
     });
 
     // Store original data type so decompression can reconstruct the buffer.
-    arr.attributes.add(NDAttribute {
-        name: ATTR_ORIGINAL_DATA_TYPE.into(),
-        description: "Original NDDataType ordinal before codec compression".into(),
-        source: NDAttrSource::Driver,
-        value: NDAttrValue::UInt8(original_data_type as u8),
-    });
+    arr.attributes.add(NDAttribute::new_static(
+                ATTR_ORIGINAL_DATA_TYPE,
+                "Original NDDataType ordinal before codec compression",
+                NDAttrSource::Driver,
+                NDAttrValue::UInt8(original_data_type as u8),
+            ));
 
     tracing::debug!(
         original_size,
@@ -364,12 +364,12 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
 
     let compressed_size = compressed.len();
     let mut arr = src.clone();
-    arr.attributes.add(NDAttribute {
-        name: ATTR_ORIGINAL_DATA_TYPE.to_string(),
-        description: String::new(),
-        source: NDAttrSource::Driver,
-        value: NDAttrValue::Int64(src.data.data_type() as u8 as i64),
-    });
+    arr.attributes.add(NDAttribute::new_static(
+                ATTR_ORIGINAL_DATA_TYPE,
+                String::new(),
+                NDAttrSource::Driver,
+                NDAttrValue::Int64(src.data.data_type() as u8 as i64),
+            ));
     arr.data = NDDataBuffer::U8(compressed);
     arr.codec = Some(Codec {
         name: CodecName::Blosc,
@@ -670,12 +670,12 @@ mod tests {
             NDDataType::UInt8,
         );
         // info() reads ColorMode for 3D arrays
-        arr.attributes.add(NDAttribute {
-            name: "ColorMode".into(),
-            description: "Color Mode".into(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::Int32(2), // RGB1
-        });
+        arr.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "Color Mode",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(2), // RGB1
+        ));
         if let NDDataBuffer::U8(ref mut v) = arr.data {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u8;

@@ -253,12 +253,12 @@ mod tests {
     fn make_array_with_attr(name: &str, value: f64, uid: i32) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = uid;
-        arr.attributes.add(NDAttribute {
-            name: name.to_string(),
-            description: String::new(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::Float64(value),
-        });
+        arr.attributes.add(NDAttribute::new_static(
+                name,
+                String::new(),
+                NDAttrSource::Driver,
+                NDAttrValue::Float64(value),
+            ));
         arr
     }
 
@@ -352,12 +352,12 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        arr.attributes.add(NDAttribute {
-            name: "Label".to_string(),
-            description: String::new(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::String("hello".to_string()),
-        });
+        arr.attributes.add(NDAttribute::new_static(
+                "Label",
+                String::new(),
+                NDAttrSource::Driver,
+                NDAttrValue::String("hello".to_string()),
+            ));
 
         proc.process_array(&arr, &pool);
         assert!((proc.value() - 0.0).abs() < 1e-10);
@@ -369,12 +369,12 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        arr.attributes.add(NDAttribute {
-            name: "Counter".to_string(),
-            description: String::new(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::Int32(7),
-        });
+        arr.attributes.add(NDAttribute::new_static(
+                "Counter",
+                String::new(),
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(7),
+            ));
 
         proc.process_array(&arr, &pool);
         assert!((proc.value() - 7.0).abs() < 1e-10);

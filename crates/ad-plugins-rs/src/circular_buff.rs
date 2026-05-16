@@ -494,30 +494,30 @@ mod tests {
     fn make_array_with_attr(id: i32, attr_val: f64) -> Arc<NDArray> {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = id;
-        arr.attributes.add(NDAttribute {
-            name: "trigger".into(),
-            description: "".into(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::Float64(attr_val),
-        });
+        arr.attributes.add(NDAttribute::new_static(
+                "trigger",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Float64(attr_val),
+            ));
         Arc::new(arr)
     }
 
     fn make_array_with_attrs(id: i32, a_val: f64, b_val: f64) -> Arc<NDArray> {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = id;
-        arr.attributes.add(NDAttribute {
-            name: "attr_a".into(),
-            description: "".into(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::Float64(a_val),
-        });
-        arr.attributes.add(NDAttribute {
-            name: "attr_b".into(),
-            description: "".into(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::Float64(b_val),
-        });
+        arr.attributes.add(NDAttribute::new_static(
+                "attr_a",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Float64(a_val),
+            ));
+        arr.attributes.add(NDAttribute::new_static(
+                "attr_b",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Float64(b_val),
+            ));
         Arc::new(arr)
     }
 

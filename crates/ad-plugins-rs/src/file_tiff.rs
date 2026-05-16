@@ -84,12 +84,12 @@ impl TiffWriter {
     }
 
     fn attach_color_mode(array: &mut NDArray, color_mode: NDColorMode) {
-        array.attributes.add(NDAttribute {
-            name: "ColorMode".into(),
-            description: "Color mode".into(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::Int32(color_mode as i32),
-        });
+        array.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "Color mode",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(color_mode as i32),
+            ));
     }
 }
 

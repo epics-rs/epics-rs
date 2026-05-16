@@ -305,12 +305,12 @@ impl NDPluginProcess for PosPluginProcessor {
 
         let mut out = array.clone();
         for (key, value) in &position {
-            out.attributes.add(NDAttribute {
-                name: key.clone(),
-                description: String::new(),
-                source: NDAttrSource::Driver,
-                value: NDAttrValue::Float64(*value),
-            });
+            out.attributes.add(NDAttribute::new_static(
+                key.clone(),
+                String::new(),
+                NDAttrSource::Driver,
+                NDAttrValue::Float64(*value),
+            ));
         }
 
         self.advance();

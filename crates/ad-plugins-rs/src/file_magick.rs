@@ -441,12 +441,12 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        arr.attributes.add(NDAttribute {
-            name: "ColorMode".into(),
-            description: "Color Mode".into(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::Int32(2), // RGB1
-        });
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "Color Mode",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(2), // RGB1
+        ));
         if let NDDataBuffer::U8(ref mut v) = arr.data {
             for i in 0..48 {
                 v[i] = (i * 5) as u8;

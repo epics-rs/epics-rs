@@ -648,12 +648,12 @@ fn test_attribute_plugin_value_extraction() {
     let mut proc = AttributeProcessor::new("exposure");
 
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-    arr.attributes.add(NDAttribute {
-        name: "exposure".into(),
-        description: "".into(),
-        source: NDAttrSource::Driver,
-        value: NDAttrValue::Float64(0.5),
-    });
+    arr.attributes.add(NDAttribute::new_static(
+        "exposure",
+        "",
+        NDAttrSource::Driver,
+        NDAttrValue::Float64(0.5),
+    ));
 
     let result = proc.process_array(&arr, &pool);
     // AttributeProcessor is a sink (no output arrays)

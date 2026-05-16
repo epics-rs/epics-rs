@@ -206,12 +206,12 @@ mod tests {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = uid;
         for (name, value) in attrs {
-            arr.attributes.add(NDAttribute {
-                name: name.to_string(),
-                description: String::new(),
-                source: NDAttrSource::Driver,
-                value: NDAttrValue::Float64(*value),
-            });
+            arr.attributes.add(NDAttribute::new_static(
+                *name,
+                String::new(),
+                NDAttrSource::Driver,
+                NDAttrValue::Float64(*value),
+            ));
         }
         arr
     }
@@ -223,12 +223,12 @@ mod tests {
 
         let mut arr = make_array_with_attrs(1, &[("Temp", 25.0), ("Gain", 1.5)]);
         // Add a string attribute that should be excluded
-        arr.attributes.add(NDAttribute {
-            name: "Label".to_string(),
-            description: String::new(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::String("test".to_string()),
-        });
+        arr.attributes.add(NDAttribute::new_static(
+                "Label",
+                String::new(),
+                NDAttrSource::Driver,
+                NDAttrValue::String("test".to_string()),
+            ));
 
         proc.process_array(&arr, &pool);
 

@@ -47,13 +47,23 @@ impl PortRuntimeHandle {
     /// Closes the shutdown channel, causing the actor thread to exit after
     /// completing any in-progress request. Does not wait for the thread to stop.
     pub fn shutdown(&self) {
-        self.shutdown_tx.lock().unwrap().take();
+        // Poison-tolerant: shutdown must stay infallible even if a thread
+        // panicked while holding the lock.
+        self.shutdown_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     /// Signal shutdown and wait for the actor thread to exit.
     pub fn shutdown_and_wait(&self) {
         self.shutdown();
-        if let Some(rx) = self.completion_rx.lock().unwrap().take() {
+        let rx = self
+            .completion_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(rx) = rx {
             let _ = rx.recv();
         }
     }

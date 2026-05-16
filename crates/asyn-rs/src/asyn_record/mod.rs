@@ -114,7 +114,7 @@ fn menu_index_to_baud_rate(idx: i32) -> i32 {
 /// as the two raw bytes `0x0D 0x0A`, not the four-byte literal.
 fn translate_escape(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
-    let mut chars = s.bytes();
+    let mut chars = s.bytes().peekable();
     while let Some(c) = chars.next() {
         if c != b'\\' {
             out.push(c);
@@ -134,7 +134,23 @@ fn translate_escape(s: &str) -> Vec<u8> {
             b'\\' => b'\\',
             b'"' => b'"',
             b'\'' => b'\'',
-            b'0' => 0x00,
+            b'0'..=b'7' => {
+                // Octal escape `\N`, `\NN`, `\NNN` — C `dbTranslateEscape`
+                // consumes up to three octal digits. `\0` with no further
+                // digits still decodes to NUL.
+                let mut val = u32::from(next - b'0');
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(&d) if (b'0'..=b'7').contains(&d) => {
+                            val = val * 8 + u32::from(d - b'0');
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push((val & 0xFF) as u8);
+                continue;
+            }
             b'a' => 0x07,
             b'b' => 0x08,
             b'f' => 0x0C,
@@ -1106,6 +1122,21 @@ impl AsynRecord {
         }
     }
 
+    /// Build an `AsynUser` for an I/O transfer, applying the record's
+    /// `TMOT` timeout field. C `asynRecord.c` sets
+    /// `pasynUser->timeout = precord->tmot` before every transfer; a
+    /// non-positive `tmot` falls back to the 1 s default.
+    fn io_user(&self) -> crate::user::AsynUser {
+        let timeout = if self.tmot > 0.0 {
+            std::time::Duration::from_secs_f64(self.tmot)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+        crate::user::AsynUser::new(self.resolved_reason)
+            .with_addr(self.addr)
+            .with_timeout(timeout)
+    }
+
     /// Perform I/O based on TMOD and IFACE.
     fn perform_io(&mut self) -> CaResult<()> {
         let entry = match &self.port_entry {
@@ -1123,13 +1154,23 @@ impl AsynRecord {
         if matches!(tmod, TransferMode::Write | TransferMode::WriteRead) {
             match iface {
                 InterfaceType::Octet => {
-                    let data = self.aout.as_bytes().to_vec();
+                    // C asynRecord.c writes NOWT bytes from the output
+                    // buffer (NOWT defaults to OMAX), not the whole AOUT
+                    // string. Rust `io_write_octet` is all-or-error, so a
+                    // successful write transferred exactly the slice.
+                    let full = self.aout.as_bytes();
+                    let n = if self.nowt > 0 {
+                        (self.nowt as usize).min(full.len())
+                    } else {
+                        full.len()
+                    };
+                    let data = full[..n].to_vec();
                     match entry.handle.submit_blocking(
-                        crate::request::RequestOp::OctetWrite { data: data.clone() },
-                        crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
+                        crate::request::RequestOp::OctetWrite { data },
+                        self.io_user(),
                     ) {
                         Ok(_) => {
-                            self.nawt = data.len() as i32;
+                            self.nawt = n as i32;
                         }
                         Err(e) => {
                             self.errs = format!("write: {e}");
@@ -1137,10 +1178,9 @@ impl AsynRecord {
                     }
                 }
                 InterfaceType::Int32 => {
-                    match entry.handle.write_int32_blocking(
-                        self.resolved_reason,
-                        self.addr,
-                        self.i32out,
+                    match entry.handle.submit_blocking(
+                        crate::request::RequestOp::Int32Write { value: self.i32out },
+                        self.io_user(),
                     ) {
                         Ok(_) => {}
                         Err(e) => {
@@ -1154,7 +1194,7 @@ impl AsynRecord {
                             value: self.ui32out,
                             mask: self.ui32mask,
                         },
-                        crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
+                        self.io_user(),
                     ) {
                         Ok(_) => {}
                         Err(e) => {
@@ -1163,10 +1203,9 @@ impl AsynRecord {
                     }
                 }
                 InterfaceType::Float64 => {
-                    match entry.handle.write_float64_blocking(
-                        self.resolved_reason,
-                        self.addr,
-                        self.f64out,
+                    match entry.handle.submit_blocking(
+                        crate::request::RequestOp::Float64Write { value: self.f64out },
+                        self.io_user(),
                     ) {
                         Ok(_) => {}
                         Err(e) => {
@@ -1181,16 +1220,23 @@ impl AsynRecord {
         if matches!(tmod, TransferMode::Read | TransferMode::WriteRead) {
             match iface {
                 InterfaceType::Octet => {
+                    // Clamp against negative IMAX/NRRD — both are settable
+                    // Long fields; a negative value sign-extends to a huge
+                    // usize and would request a multi-GB buffer.
+                    let imax = self.imax.max(0) as usize;
                     let buf_size = if self.nrrd > 0 {
-                        self.nrrd as usize
+                        (self.nrrd as usize).min(imax)
                     } else {
-                        self.imax as usize
+                        imax
                     };
                     match entry.handle.submit_blocking(
                         crate::request::RequestOp::OctetRead { buf_size },
-                        crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
+                        self.io_user(),
                     ) {
                         Ok(result) => {
+                            // C asynRecord.c stores the driver's returned
+                            // EOM reason into EOMR after every octet read.
+                            self.eomr = result.eom_reason as i32;
                             if let Some(data) = result.data {
                                 self.nord = data.len() as i32;
                                 self.ainp = String::from_utf8_lossy(&data).to_string();
@@ -1207,10 +1253,12 @@ impl AsynRecord {
                 InterfaceType::Int32 => {
                     match entry
                         .handle
-                        .read_int32_blocking(self.resolved_reason, self.addr)
+                        .submit_blocking(crate::request::RequestOp::Int32Read, self.io_user())
                     {
-                        Ok(v) => {
-                            self.i32inp = v;
+                        Ok(result) => {
+                            if let Some(v) = result.int_val {
+                                self.i32inp = v;
+                            }
                         }
                         Err(e) => {
                             self.errs = format!("read: {e}");
@@ -1222,7 +1270,7 @@ impl AsynRecord {
                         crate::request::RequestOp::UInt32DigitalRead {
                             mask: self.ui32mask,
                         },
-                        crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
+                        self.io_user(),
                     ) {
                         Ok(result) => {
                             if let Some(v) = result.uint_val {
@@ -1237,10 +1285,12 @@ impl AsynRecord {
                 InterfaceType::Float64 => {
                     match entry
                         .handle
-                        .read_float64_blocking(self.resolved_reason, self.addr)
+                        .submit_blocking(crate::request::RequestOp::Float64Read, self.io_user())
                     {
-                        Ok(v) => {
-                            self.f64inp = v;
+                        Ok(result) => {
+                            if let Some(v) = result.float_val {
+                                self.f64inp = v;
+                            }
                         }
                         Err(e) => {
                             self.errs = format!("read: {e}");
@@ -2114,5 +2164,19 @@ mod tests {
         assert_eq!(translate_escape("\\x"), vec![b'\\', b'x']);
         // Dangling backslash passes through.
         assert_eq!(translate_escape("a\\"), vec![b'a', b'\\']);
+    }
+
+    #[test]
+    fn test_translate_escape_octal() {
+        // C dbTranslateEscape decodes octal \N, \NN, \NNN.
+        assert_eq!(translate_escape("\\033"), vec![0x1B]); // ESC
+        assert_eq!(translate_escape("\\7"), vec![0x07]); // BEL, one digit
+        assert_eq!(translate_escape("\\101"), vec![b'A']); // 0o101 == 65
+        // Octal escape followed by a non-octal byte stops the run.
+        assert_eq!(translate_escape("\\0119"), vec![0x09, b'9']);
+        // \0 with no further digits still decodes to NUL.
+        assert_eq!(translate_escape("\\0"), vec![0x00]);
+        // A terminator built from two octal escapes (e.g. CR LF).
+        assert_eq!(translate_escape("\\015\\012"), vec![0x0D, 0x0A]);
     }
 }

@@ -93,6 +93,14 @@ impl OctetInterpose for EosInterpose {
         }
 
         let maxchars = buf.len();
+        if maxchars == 0 {
+            // A zero-length destination buffer can store nothing — return
+            // here so the scan loop never indexes `buf[0]` and panics.
+            return Ok(OctetReadResult {
+                nbytes_transferred: 0,
+                eom_reason: EomReason::CNT,
+            });
+        }
         let mut n_read: usize = 0;
         let mut eom = EomReason::empty();
 

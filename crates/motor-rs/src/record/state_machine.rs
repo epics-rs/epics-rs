@@ -272,9 +272,11 @@ impl MotorRecord {
             self.set_phase(MotionPhase::Retry);
             self.stat.mip = MipFlags::RETRY;
 
-            let retry_target = self.compute_retry_target();
             let frac = self.retry.frac;
             if self.use_relative_moves() {
+                // C use_rel retry: position = relpos * frac, where relpos is
+                // the RMOD-scaled remaining distance (compute_retry_target).
+                let retry_target = self.compute_retry_target();
                 let rel_distance = (retry_target - self.pos.drbv) * frac;
                 effects.commands.push(MotorCommand::MoveRelative {
                     distance: rel_distance,
@@ -282,9 +284,13 @@ impl MotorRecord {
                     acceleration: self.move_accel_egu(),
                 });
             } else {
-                let position = self.pos.dval + frac * (retry_target - self.pos.dval);
+                // C absolute retry: position = currpos + frac*(newpos-currpos)
+                // with currpos = ldvl/mres and newpos = dval/mres. The prior
+                // move's load_pos set ldvl = dval, so currpos == newpos and
+                // position collapses to dval. RMOD scaling never reaches the
+                // absolute path in C — it only scales relpos (use_rel).
                 effects.commands.push(MotorCommand::MoveAbsolute {
-                    position,
+                    position: self.pos.dval,
                     velocity: self.vel.velo,
                     acceleration: self.move_accel_egu(),
                 });
@@ -337,10 +343,11 @@ impl MotorRecord {
             self.set_phase(MotionPhase::Retry);
             self.stat.mip = MipFlags::RETRY;
 
-            let retry_target = self.compute_retry_target();
             let frac = self.retry.frac;
             if self.use_relative_moves() {
-                // C: FRAC applied to relative distance
+                // C use_rel retry: position = relpos * frac, where relpos is
+                // the RMOD-scaled remaining distance (compute_retry_target).
+                let retry_target = self.compute_retry_target();
                 let rel_distance = (retry_target - self.pos.drbv) * frac;
                 effects.commands.push(MotorCommand::MoveRelative {
                     distance: rel_distance,
@@ -348,11 +355,11 @@ impl MotorRecord {
                     acceleration: self.move_accel_egu(),
                 });
             } else {
-                // C: absolute retry uses dval as base, FRAC interpolates
-                // position = dval + frac * (retry_target - dval)
-                let position = self.pos.dval + frac * (retry_target - self.pos.dval);
+                // C absolute retry: currpos == newpos == dval (the prior
+                // move's load_pos set ldvl = dval), so position is dval.
+                // RMOD scaling applies only to the use_rel path.
                 effects.commands.push(MotorCommand::MoveAbsolute {
-                    position,
+                    position: self.pos.dval,
                     velocity: self.vel.velo,
                     acceleration: self.move_accel_egu(),
                 });

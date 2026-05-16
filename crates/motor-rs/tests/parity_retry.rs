@@ -71,11 +71,38 @@ fn rmod_arithmetic_retry() {
     let effects = rec.check_completion();
 
     assert_eq!(rec.stat.phase, MotionPhase::Retry);
-    // C Arithmetic: factor = (rtry - rcnt + 1) / rtry = (5 - 1 + 1) / 5 = 1.0
-    // retry_target = 9.0 + (10.0 - 9.0) * 1.0 = 10.0
-    // For use_rel=false: position = dval + frac*(retry_target - dval) = 10 + 0.5*(10-10) = 10.0
+    // C absolute (use_rel=false) retry: position = dval, regardless of RMOD.
     if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
         assert!((*position - 10.0).abs() < 1e-10);
+    } else {
+        panic!("expected MoveAbsolute");
+    }
+}
+
+#[test]
+fn rmod_arithmetic_absolute_retry_targets_dval_for_rcnt_ge_2() {
+    // C: the absolute (use_rel=false) retry path computes
+    // position = currpos + frac*(newpos-currpos) with currpos == newpos == dval,
+    // so it is always dval. RMOD's factor scaling only reaches the use_rel
+    // path. A factor < 1 (rcnt >= 2) must NOT pull the absolute target off dval.
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.01;
+    rec.retry.rtry = 5;
+    rec.retry.frac = 0.5;
+    rec.retry.rmod = RetryMode::Arithmetic;
+    // make_record sets neither UEIP nor URIP → use_rel == false.
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.retry.rcnt = 1; // one retry already done; this completion makes rcnt=2
+
+    complete_move(&mut rec, 9.0); // error 1.0 > rdbd
+    let effects = rec.check_completion();
+
+    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.retry.rcnt, 2); // factor = (5-2+1)/5 = 0.8 < 1
+    if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
+        // Old (buggy) behaviour scaled this to 9.84; C parity is dval = 10.0.
+        assert!((*position - 10.0).abs() < 1e-10, "got {position}");
     } else {
         panic!("expected MoveAbsolute");
     }

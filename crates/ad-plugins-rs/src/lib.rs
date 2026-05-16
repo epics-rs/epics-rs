@@ -26,6 +26,7 @@ pub mod file_netcdf;
 pub mod file_nexus;
 pub mod file_tiff;
 pub mod gather;
+pub mod hdf5_layout;
 pub mod overlay;
 pub mod par_util;
 pub mod passthrough;

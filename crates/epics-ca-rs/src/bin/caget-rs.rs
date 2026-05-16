@@ -376,12 +376,21 @@ async fn main() {
                 failed = true;
             }
             Err(e) if e.contains("timeout") => {
-                println!(
-                    "{}{}*** no data available (timeout)",
-                    pad_name(true, pv_name),
-                    sep
-                );
-                failed = true;
+                // C `caget`: `connect_pvs` returns 1 only on a
+                // `ca_pend_io` connect timeout; the data-read function
+                // (`caget.c:348`) always returns 0. A CONNECTED PV
+                // whose GET times out therefore does NOT change the
+                // exit code — print the timeout line but leave
+                // `failed` untouched.
+                if args.terse {
+                    println!("*** no data available (timeout)");
+                } else {
+                    println!(
+                        "{}{}*** no data available (timeout)",
+                        pad_name(true, pv_name),
+                        sep
+                    );
+                }
             }
             Err(e) => {
                 println!(

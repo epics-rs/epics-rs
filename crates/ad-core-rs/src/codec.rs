@@ -3,6 +3,8 @@
 pub enum CodecName {
     None,
     JPEG,
+    /// Zlib (deflate) compression (C++ `NDCODEC_ZLIB`).
+    Zlib,
     LZ4,
     Blosc,
     BSLZ4,
@@ -17,6 +19,7 @@ impl CodecName {
         match self {
             Self::None => "",
             Self::JPEG => "jpeg",
+            Self::Zlib => "zlib",
             Self::LZ4 => "lz4",
             Self::Blosc => "blosc",
             Self::BSLZ4 => "bslz4",
@@ -78,6 +81,7 @@ mod tests {
         // G12: name strings must match C++ NDCodecName.
         assert_eq!(CodecName::None.as_str(), "");
         assert_eq!(CodecName::JPEG.as_str(), "jpeg");
+        assert_eq!(CodecName::Zlib.as_str(), "zlib");
         assert_eq!(CodecName::LZ4.as_str(), "lz4");
         assert_eq!(CodecName::Blosc.as_str(), "blosc");
         assert_eq!(CodecName::BSLZ4.as_str(), "bslz4");

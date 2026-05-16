@@ -167,8 +167,8 @@ enum Hdf5Handle {
     Swmr {
         writer: SwmrFileWriter,
         ds_index: usize,
-        /// SWMR compression is requested but the public `rust-hdf5` 0.2.0
-        /// SWMR API exposes no filtered streaming dataset constructor.
+        /// True only when a compression type was requested but no filter
+        /// pipeline could be built for it; false when compression is applied.
         compression_dropped: bool,
     },
 }
@@ -428,7 +428,7 @@ impl Hdf5Writer {
         matches!(self.handle, Some(Hdf5Handle::Swmr { .. }))
     }
 
-    /// Whether SWMR compression had to be silently dropped (crate limitation).
+    /// Whether a requested SWMR compression type had no buildable pipeline.
     pub fn swmr_compression_dropped(&self) -> bool {
         matches!(
             self.handle,
@@ -579,12 +579,35 @@ impl Hdf5Writer {
 
         let frame_dims: Vec<u64> = array.dims.iter().rev().map(|d| d.size as u64).collect();
 
+        // rust-hdf5 0.2.13 exposes `create_streaming_dataset_compressed`, so
+        // the filter pipeline IS applied to SWMR streaming datasets.
+        let element_size = array.data.data_type().element_size();
+        let pipeline = self.build_pipeline(element_size);
+
         macro_rules! create_ds {
             ($t:ty) => {
-                swmr.create_streaming_dataset::<$t>(&self.dataset_name, &frame_dims)
-                    .map_err(|e| {
-                        ADError::UnsupportedConversion(format!("SWMR create dataset error: {}", e))
-                    })
+                match pipeline.clone() {
+                    Some(pl) => swmr
+                        .create_streaming_dataset_compressed::<$t>(
+                            &self.dataset_name,
+                            &frame_dims,
+                            pl,
+                        )
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!(
+                                "SWMR create compressed dataset error: {}",
+                                e
+                            ))
+                        }),
+                    None => swmr
+                        .create_streaming_dataset::<$t>(&self.dataset_name, &frame_dims)
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!(
+                                "SWMR create dataset error: {}",
+                                e
+                            ))
+                        }),
+                }
             };
         }
 
@@ -604,16 +627,16 @@ impl Hdf5Writer {
         swmr.start_swmr()
             .map_err(|e| ADError::UnsupportedConversion(format!("SWMR start error: {}", e)))?;
 
-        // The public rust-hdf5 0.2.0 SWMR API (`SwmrFileWriter`) has no
-        // filtered streaming-dataset constructor, so compression cannot be
-        // applied here. Record the fact and warn loudly — never drop it
-        // silently.
-        let compression_dropped = self.compression_type != COMPRESS_NONE;
+        // Compression is applied to SWMR datasets via the filter pipeline
+        // above. `compression_dropped` is only set when a compression type was
+        // requested but no pipeline could be built for it (an unsupported
+        // compressor) — never a silent drop.
+        let compression_dropped = self.compression_type != COMPRESS_NONE && pipeline.is_none();
         if compression_dropped {
             eprintln!(
-                "NDFileHDF5: WARNING — SWMR mode requested with compression \
-                 type {} but rust-hdf5 0.2.0 exposes no filtered SWMR \
-                 dataset API; the SWMR file will be written UNCOMPRESSED.",
+                "NDFileHDF5: WARNING — SWMR mode requested compression type {} \
+                 but no filter pipeline could be built for it; the SWMR file \
+                 will be written UNCOMPRESSED.",
                 self.compression_type
             );
         }
@@ -846,7 +869,13 @@ impl Hdf5Writer {
                 }
                 .shape(&shape[..])
                 .chunk(&chunk[..])
-                .max_shape(&max_shape[..]);
+                .max_shape(&max_shape[..])
+                // C parity: NDFileHDF5 sets HDF5_fillValue on the dataset
+                // creation property list (H5Pset_fill_value). rust-hdf5 0.2.13
+                // exposes `DatasetBuilder::fill_value`, which writes it into the
+                // DCPL fill-value message so unwritten chunks read back as
+                // `fill` rather than zero.
+                .fill_value(fill as $t);
                 if let Some(ref pl) = pipeline {
                     builder = builder.filter_pipeline(pl.clone());
                 }
@@ -859,18 +888,9 @@ impl Hdf5Writer {
                     .shape(())
                     .create(DTYPE_ATTR)
                     .and_then(|a| a.write_numeric(&dtype_ordinal));
-                // Record the configured fill value.
-                //
-                // CRATE LIMITATION: C++ NDFileHDF5 sets HDF5_fillValue on the
-                // dataset creation property list (H5Pset_fill_value). rust-hdf5
-                // 0.2.12 hard-codes the HDF5 Fill Value message to zeros for
-                // chunked datasets (writer.rs `fill_value: None`) and exposes
-                // no DatasetBuilder / create_dataset API to override it, so the
-                // value cannot reach the DCPL. The closest correct alternative
-                // is to record it as a dataset attribute named HDF5_fillValue;
-                // downstream tooling can read it, but unwritten chunks still
-                // read back as zero, not `fill`. A true fix needs a rust-hdf5
-                // release with a fill-value API.
+                // Also expose the fill value as an attribute for tooling that
+                // inspects HDF5_fillValue directly (the DCPL above is the
+                // authoritative copy).
                 let _ = ds
                     .new_attr::<f64>()
                     .shape(())
@@ -2060,8 +2080,10 @@ mod tests {
 
     #[test]
     fn test_fill_value_recorded_on_dataset() {
-        // rust-hdf5 0.2.12 cannot set the DCPL fill value, so the configured
-        // HDF5_fillValue is recorded as a dataset attribute. Verify it round-trips.
+        // The configured HDF5_fillValue reaches the DCPL via rust-hdf5 0.2.13's
+        // `DatasetBuilder::fill_value`; it is also mirrored as a dataset
+        // attribute for tooling. Verify both the attribute and that an
+        // unwritten region of a fill-valued dataset reads back as `fill`.
         let path = temp_path("hdf5_fill");
         let mut writer = Hdf5Writer::new();
         writer.set_fill_value(7.5);
@@ -2078,8 +2100,24 @@ mod tests {
         let ds = h5.dataset("data").unwrap();
         let fv: f64 = ds.attr("HDF5_fillValue").unwrap().read_numeric().unwrap();
         assert_eq!(fv, 7.5);
-
         std::fs::remove_file(&path).ok();
+
+        // Direct DCPL check: a fixed-shape dataset created with fill_value and
+        // never written reads back the fill value, not zero.
+        let path2 = temp_path("hdf5_fill_dcpl");
+        {
+            let f = H5File::create(&path2).unwrap();
+            let _ = f
+                .new_dataset::<i32>()
+                .shape(&[8][..])
+                .fill_value(42i32)
+                .create("unwritten")
+                .unwrap();
+        }
+        let h5b = H5File::open(&path2).unwrap();
+        let vals: Vec<i32> = h5b.dataset("unwritten").unwrap().read_raw().unwrap();
+        assert_eq!(vals, vec![42i32; 8]);
+        std::fs::remove_file(&path2).ok();
     }
 
     #[test]
@@ -2448,10 +2486,10 @@ mod tests {
     }
 
     #[test]
-    fn test_swmr_compression_dropped_is_flagged() {
-        // rust-hdf5 0.2.0 exposes no filtered SWMR dataset API. When SWMR is
-        // combined with compression the writer must flag the drop, never
-        // silently produce an uncompressed file as if it were compressed.
+    fn test_swmr_compression_is_applied() {
+        // rust-hdf5 0.2.13 exposes a filtered SWMR dataset constructor, so
+        // SWMR + compression produces a genuinely compressed file — the
+        // compression is NOT dropped, and the data round-trips.
         let path = temp_path("hdf5_swmr_comp");
         let mut writer = Hdf5Writer::new();
         writer.set_swmr_mode(true);
@@ -2463,11 +2501,19 @@ mod tests {
         );
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
         assert!(
-            writer.swmr_compression_dropped(),
-            "SWMR+compression must be flagged as dropped"
+            !writer.swmr_compression_dropped(),
+            "SWMR+ZLIB must apply compression, not drop it"
         );
         writer.write_file(&arr).unwrap();
+        writer.write_file(&arr).unwrap();
         writer.close_file().unwrap();
+
+        // The compressed SWMR dataset round-trips.
+        let mut reader = rust_hdf5::swmr::SwmrFileReader::open(&path).unwrap();
+        let shape = reader.dataset_shape("data").unwrap();
+        assert_eq!(shape, vec![2, 8, 8]);
+        let data: Vec<u16> = reader.read_dataset("data").unwrap();
+        assert_eq!(data.len(), 2 * 8 * 8);
 
         std::fs::remove_file(&path).ok();
     }

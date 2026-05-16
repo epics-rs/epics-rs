@@ -391,47 +391,19 @@ impl NexusWriter {
         self.template = None;
     }
 
-    /// Write the NeXus `NX_class` group marker.
+    /// Write the NeXus `NX_class` group marker as a true HDF5 group attribute.
     ///
-    /// CRATE LIMITATION: real NeXus requires `NX_class` to be an HDF5 *group
-    /// attribute*. `rust-hdf5` 0.2.12 only supports attributes on the root
-    /// group (`H5File::set_attr_string`) and on datasets — its `GroupInfo`
-    /// struct (writer.rs) has no `attributes` field, so a non-root group
-    /// cannot carry an attribute through this crate at all.
-    ///
-    /// Closest correct alternative used here:
-    /// - For the **root** group the class name IS written as a true group
-    ///   attribute (`apply_root_nx_class`), which NeXus readers honour.
-    /// - For **non-root** groups (`entry`, `instrument`, ...) the class name
-    ///   is written as a child string dataset `NX_class` carrying a `value`
-    ///   string attribute. This is NOT NeXus-spec-compliant; a NeXus-aware
-    ///   reader will not recognise the group class. It is the best a
-    ///   pure-Rust HDF5 writer with no group-attribute support can do.
-    ///   Fixing it properly requires either a `rust-hdf5` release that adds
-    ///   group attributes, or switching to the C `hdf5`/`libNeXus` bindings.
+    /// NeXus requires `NX_class` to be an HDF5 *group attribute*. rust-hdf5
+    /// 0.2.13 exposes `H5Group::set_attr_string`, so the class name is written
+    /// as a real attribute on the group itself — NeXus-aware readers (nexpy,
+    /// DAWN, h5py NeXus) recognise the group class.
     fn write_nx_class(group: &rust_hdf5::H5Group, class_name: &str) -> ADResult<()> {
-        let ds = group
-            .new_dataset::<u8>()
-            .shape([1usize])
-            .create("NX_class")
-            .map_err(|e| {
-                ADError::UnsupportedConversion(format!("NX_class dataset error: {}", e))
-            })?;
-        ds.write_raw(&[0u8])
-            .map_err(|e| ADError::UnsupportedConversion(format!("NX_class write error: {}", e)))?;
-        let attr = ds
-            .new_attr::<rust_hdf5::types::VarLenUnicode>()
-            .shape(())
-            .create("value")
-            .map_err(|e| ADError::UnsupportedConversion(format!("NX_class attr error: {}", e)))?;
-        attr.write_string(class_name).map_err(|e| {
-            ADError::UnsupportedConversion(format!("NX_class attr write error: {}", e))
-        })?;
-        Ok(())
+        group.set_attr_string("NX_class", class_name).map_err(|e| {
+            ADError::UnsupportedConversion(format!("NX_class group attr error: {}", e))
+        })
     }
 
-    /// Write `NX_class` as a true HDF5 attribute on the root group — the one
-    /// group `rust-hdf5` 0.2.12 supports attributes on.
+    /// Write `NX_class` as a true HDF5 attribute on the root group.
     fn apply_root_nx_class(file: &H5File, class_name: &str) {
         let _ = file.set_attr_string("NX_class", class_name);
     }
@@ -551,9 +523,8 @@ impl NexusWriter {
                 }
             }
             Some("Attr") | None if node.name == "Attr" => {
-                // Group/dataset attribute node — see write_nx_class crate
-                // limitation: rust-hdf5 cannot attach attributes to non-root
-                // groups. Emit it as a child string dataset instead.
+                // Group attribute node — written as a true HDF5 group
+                // attribute (rust-hdf5 0.2.13 `H5Group::set_attr_string`).
                 if let Some(parent) = parent {
                     let attr_name = node.attr("name").unwrap_or(&node.name);
                     let value = if node.attr("type") == Some("ND_ATTR") {
@@ -564,7 +535,12 @@ impl NexusWriter {
                     } else {
                         node.text.clone()
                     };
-                    Self::write_const_dataset(parent, attr_name, &value)?;
+                    parent.set_attr_string(attr_name, &value).map_err(|e| {
+                        ADError::UnsupportedConversion(format!(
+                            "NeXus group attr error: {}",
+                            e
+                        ))
+                    })?;
                 }
             }
             _ => {
@@ -667,8 +643,7 @@ impl NDFileWriter for NexusWriter {
         let h5file = H5File::create(path)
             .map_err(|e| ADError::UnsupportedConversion(format!("NeXus create error: {}", e)))?;
 
-        // Root-group NX_class is a true HDF5 attribute (the one group
-        // rust-hdf5 0.2.12 supports attributes on).
+        // Root-group NX_class is a true HDF5 attribute.
         Self::apply_root_nx_class(&h5file, "NXroot");
 
         self.dataset = None;
@@ -685,8 +660,8 @@ impl NDFileWriter for NexusWriter {
             self.data_group_path = data_group;
             self.data_node_name = data_node;
         } else {
-            // Built-in NXentry/NXdata hierarchy. NX_class on non-root groups
-            // uses the documented child-dataset fallback (see write_nx_class).
+            // Built-in NXentry/NXdata hierarchy. NX_class on every group is a
+            // true HDF5 group attribute (rust-hdf5 0.2.13).
             let entry = h5file.create_group("entry").map_err(|e| {
                 ADError::UnsupportedConversion(format!("NeXus group error: {}", e))
             })?;
@@ -753,6 +728,13 @@ impl NDFileWriter for NexusWriter {
             let mut ds_shape = vec![1usize];
             ds_shape.extend_from_slice(&frame_shape);
             let chunk_dims = ds_shape.clone();
+            // Only the leading frame axis is unlimited. rust-hdf5 0.2.13 picks
+            // the chunk index from the unlimited-dimension count: one unlimited
+            // dim → extensible array (linear `write_chunk`); two or more →
+            // v2 B-tree (which requires `write_chunk_at`). `.resizable()` would
+            // make every axis unlimited and force the v2 B-tree path.
+            let mut image_max_shape: Vec<Option<usize>> = vec![None];
+            image_max_shape.extend(frame_shape.iter().map(|&d| Some(d)));
 
             // Create the image dataset typed per the NDArray data type; all
             // ten NDArray types are covered so read_file can recover them.
@@ -762,7 +744,7 @@ impl NDFileWriter for NexusWriter {
                         .new_dataset::<$t>()
                         .shape(&ds_shape[..])
                         .chunk(&chunk_dims[..])
-                        .resizable()
+                        .max_shape(&image_max_shape[..])
                         .create($name)
                         .map_err(|e| {
                             ADError::UnsupportedConversion(format!(
@@ -1415,6 +1397,43 @@ mod tests {
             .read_raw()
             .unwrap();
         assert_eq!(nx_vals, det);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_nx_class_is_true_group_attribute() {
+        // NeXus requires NX_class to be an HDF5 group attribute, not a child
+        // dataset. rust-hdf5 0.2.13 supports group attributes on every group.
+        let path = temp_path("nexus_nxclass");
+        let mut writer = NexusWriter::new();
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(3), NDDimension::new(2)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
+        }
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        // Non-root groups carry NX_class as a real group attribute.
+        for (group, class) in [
+            ("entry", "NXentry"),
+            ("entry/instrument", "NXinstrument"),
+            ("entry/instrument/detector", "NXdetector"),
+            ("entry/data", "NXdata"),
+        ] {
+            let g = h5.root_group().group(group).expect("group exists");
+            let got = g
+                .attr_string("NX_class")
+                .unwrap_or_else(|_| panic!("{} must have NX_class group attribute", group));
+            assert_eq!(got, class, "{} NX_class", group);
+        }
+        // No child `NX_class` dataset (the old workaround) anywhere.
+        assert!(h5.dataset("entry/NX_class").is_err());
 
         std::fs::remove_file(&path).ok();
     }

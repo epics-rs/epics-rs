@@ -522,14 +522,16 @@ impl Hdf5Writer {
     /// HDF5 attributes (`HDF5_nExtraDims`, `HDF5_extraDimSize0..`,
     /// `HDF5_extraDimName0..`) so the N-dimensional layout is recoverable.
     ///
-    /// A true N-D leading layout (`[extra_0, .., extra_{N-1}, Y, X]`) cannot
-    /// be used: `rust-hdf5` 0.2.13's chunked read path mis-places chunks
-    /// whenever more than one axis has a chunk grid larger than 1 (verified
-    /// empirically). A single flat leading axis keeps exactly one multi-chunk
-    /// axis, which the crate reconstructs correctly.
-    ///
-    /// The chunk shape is `[1, Y, X]` — one full frame per chunk, giving a
-    /// proper per-frame hyperslab offset.
+    /// The chunk shape is `[1, rc, cc]` for a 2-D frame, where `rc`/`cc` are
+    /// the row/column chunk sizes from `HDF5_nRowChunks` / `HDF5_nColChunks`
+    /// (0, auto, or out-of-range → the full dimension, matching C++
+    /// `NDFileHDF5` chunk-size selection). A frame is written as a grid of
+    /// `write_chunk_at` tiles. `HDF5_nFramesChunks` is NOT applied to the
+    /// chunk frame axis: a partial final multi-frame chunk would over-extend
+    /// the dataset's logical frame count and `rust-hdf5` 0.2.14
+    /// `extend_dataset` refuses to shrink it back — so the frame axis stays
+    /// one frame per chunk. Frames with other than two dimensions are not
+    /// sub-tiled (full per-frame chunk).
     ///
     /// Returns `(shape, chunk, extra_dim_extent)` where `extra_dim_extent` is
     /// `Some(total_frames)` when extra dims fix the dataset size up front, or
@@ -552,24 +554,91 @@ impl Hdf5Writer {
 
         let ndims = shape.len();
         let mut chunk = vec![1usize; ndims];
-        // Spatial chunk == full per-frame extent (one chunk per frame).
-        for (i, &d) in frame_dims.iter().enumerate() {
-            chunk[1 + i] = d.max(1);
+        if frame_dims.len() == 2 {
+            // 2-D frame: honor the user row/column chunk sizes.
+            let y = frame_dims[0].max(1);
+            let x = frame_dims[1].max(1);
+            chunk[1] = Self::clamp_chunk(self.chunk.n_row_chunks, y, self.chunk.auto);
+            chunk[2] = Self::clamp_chunk(self.chunk.n_col_chunks, x, self.chunk.auto);
+        } else {
+            // Other rank: one full per-frame chunk (no sub-tiling).
+            for (i, &d) in frame_dims.iter().enumerate() {
+                chunk[1 + i] = d.max(1);
+            }
         }
         (shape, chunk, extra_extent)
     }
 
-    /// Write one frame's bytes into the primary dataset at frame index
-    /// `frame_idx`. With one chunk per frame the linear chunk index is the
-    /// frame index — a proper per-frame hyperslab offset.
+    /// C++ `NDFileHDF5` chunk-size rule: 0, auto, or a value larger than the
+    /// dimension means "chunk the whole dimension"; otherwise the user value.
+    ///
+    /// Additional constraint: the chunk size must divide the dimension evenly.
+    /// `rust-hdf5` 0.2.14 `write_chunk_at` rounds the dataset's logical extent
+    /// up to a whole number of chunks and `extend_dataset` cannot shrink it
+    /// back, so a non-dividing chunk size would pad the frame dimension with
+    /// spurious rows/columns. A non-dividing request falls back to the full
+    /// dimension (one chunk) rather than corrupting the frame shape.
+    fn clamp_chunk(requested: usize, dim: usize, auto: bool) -> usize {
+        if auto || requested == 0 || requested > dim || dim % requested != 0 {
+            dim
+        } else {
+            requested
+        }
+    }
+
+    /// Write one frame into the primary dataset at frame index `frame_idx`.
+    ///
+    /// The frame is split into `ceil(Y/rc) x ceil(X/cc)` chunk tiles, each
+    /// written with `write_chunk_at(&[frame_idx, row_tile, col_tile], ..)`.
+    /// Edge tiles are zero-padded to the full chunk size. When the chunk
+    /// covers the whole frame this is a single `write_chunk_at` call.
     fn write_frame_chunk(
         ds: &rust_hdf5::H5Dataset,
         frame_idx: usize,
         frame_bytes: &[u8],
+        frame_dims: &[usize],
+        chunk: &[usize],
+        elem_size: usize,
     ) -> ADResult<()> {
-        ds.write_chunk(frame_idx, frame_bytes).map_err(|e| {
-            ADError::UnsupportedConversion(format!("HDF5 write_chunk error: {}", e))
-        })
+        // Non-2-D frame, or chunk == whole frame: one tile.
+        if frame_dims.len() != 2 || (chunk[1] >= frame_dims[0] && chunk[2] >= frame_dims[1]) {
+            let mut coords = vec![0usize; chunk.len()];
+            coords[0] = frame_idx;
+            return ds.write_chunk_at(&coords, frame_bytes).map_err(|e| {
+                ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
+            });
+        }
+
+        let (y, x) = (frame_dims[0], frame_dims[1]);
+        let (rc, cc) = (chunk[1], chunk[2]);
+        let row_tiles = y.div_ceil(rc);
+        let col_tiles = x.div_ceil(cc);
+        for ry in 0..row_tiles {
+            for cx in 0..col_tiles {
+                let mut tile = vec![0u8; rc * cc * elem_size];
+                for r in 0..rc {
+                    let sy = ry * rc + r;
+                    if sy >= y {
+                        break;
+                    }
+                    for c in 0..cc {
+                        let sx = cx * cc + c;
+                        if sx >= x {
+                            break;
+                        }
+                        let src = (sy * x + sx) * elem_size;
+                        let dst = (r * cc + c) * elem_size;
+                        tile[dst..dst + elem_size]
+                            .copy_from_slice(&frame_bytes[src..src + elem_size]);
+                    }
+                }
+                ds.write_chunk_at(&[frame_idx, ry, cx], &tile)
+                    .map_err(|e| {
+                        ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// Open file in SWMR streaming mode.
@@ -647,8 +716,7 @@ impl Hdf5Writer {
             compression_dropped,
         });
         self.open_data_type = Some(array.data.data_type());
-        self.open_frame_dims =
-            Some(array.dims.iter().rev().map(|d| d.size).collect::<Vec<_>>());
+        self.open_frame_dims = Some(array.dims.iter().rev().map(|d| d.size).collect::<Vec<_>>());
         Ok(())
     }
 
@@ -671,10 +739,8 @@ impl Hdf5Writer {
                     .detector_dataset_path()
                     .map(strip)
                     .unwrap_or_else(|| self.dataset_name.clone());
-                self.resolved_ndattr_group = layout
-                    .ndattr_default_group()
-                    .map(strip)
-                    .unwrap_or_default();
+                self.resolved_ndattr_group =
+                    layout.ndattr_default_group().map(strip).unwrap_or_default();
                 self.resolved_perf_group = layout
                     .dataset_group_path("timestamp")
                     .map(strip)
@@ -742,10 +808,7 @@ impl Hdf5Writer {
                 None => file.create_group(leaf),
             }
             .map_err(|e| {
-                ADError::UnsupportedConversion(format!(
-                    "HDF5 layout group '{}': {}",
-                    path, e
-                ))
+                ADError::UnsupportedConversion(format!("HDF5 layout group '{}': {}", path, e))
             })?;
             created.insert(path.clone());
         }
@@ -763,16 +826,11 @@ impl Hdf5Writer {
                 None => file.root_group().group(seg),
             }
             .map_err(|e| {
-                ADError::UnsupportedConversion(format!(
-                    "HDF5 group reopen '{}': {}",
-                    seg, e
-                ))
+                ADError::UnsupportedConversion(format!("HDF5 group reopen '{}': {}", seg, e))
             })?;
             current = Some(next);
         }
-        current.ok_or_else(|| {
-            ADError::UnsupportedConversion("empty group path".into())
-        })
+        current.ok_or_else(|| ADError::UnsupportedConversion("empty group path".into()))
     }
 
     /// Create the primary image dataset on first frame in standard mode.
@@ -1005,9 +1063,10 @@ impl Hdf5Writer {
             )));
         }
 
-        let (shape, _chunk, _extra) = self.primary_layout(&frame_dims);
+        let (shape, chunk, _extra) = self.primary_layout(&frame_dims);
         let frame_idx = self.frame_count;
         let extra_extent = self.open_extra_extent;
+        let elem_size = array.data.data_type().element_size();
 
         // With a fixed extra-dim layout, the frame counter must not exceed
         // the product of the extra-dim sizes.
@@ -1028,7 +1087,7 @@ impl Hdf5Writer {
             _ => {
                 return Err(ADError::UnsupportedConversion(
                     "HDF5 primary dataset not initialised".into(),
-                ))
+                ));
             }
         };
 
@@ -1048,7 +1107,7 @@ impl Hdf5Writer {
         // (see `nd_buffer_to_le_bytes`). `write_chunk` is the only chunked
         // write path the crate exposes, so a typed write is not possible.
         let frame_bytes = nd_buffer_to_le_bytes(&array.data);
-        Self::write_frame_chunk(ds, frame_idx, &frame_bytes)?;
+        Self::write_frame_chunk(ds, frame_idx, &frame_bytes, &frame_dims, &chunk, elem_size)?;
 
         // Append NDAttribute values for this frame.
         if self.store_attributes {
@@ -1344,7 +1403,10 @@ impl NDFileWriter for Hdf5Writer {
         } else {
             let h5file = H5File::create(path)
                 .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 create error: {}", e)))?;
-            self.handle = Some(Hdf5Handle::Standard { file: h5file, primary: None });
+            self.handle = Some(Hdf5Handle::Standard {
+                file: h5file,
+                primary: None,
+            });
             Ok(())
         }
     }
@@ -1408,7 +1470,7 @@ impl NDFileWriter for Hdf5Writer {
                 return Err(ADError::UnsupportedConversion(format!(
                     "unsupported HDF5 element size {}",
                     other
-                )))
+                )));
             }
         });
 
@@ -2022,13 +2084,96 @@ mod tests {
             "must not write per-frame datasets"
         );
         let ds = h5.dataset("data").unwrap();
-        assert_eq!(ds.shape(), vec![3, 4, 4], "rank/shape must be [nframes,Y,X]");
+        assert_eq!(
+            ds.shape(),
+            vec![3, 4, 4],
+            "rank/shape must be [nframes,Y,X]"
+        );
         let raw: Vec<u8> = ds.read_raw().unwrap();
         assert_eq!(raw.len(), 3 * 4 * 4);
         // Frame 0 all zeros, frame 1 all ones, frame 2 all twos.
         assert_eq!(raw[0], 0);
         assert_eq!(raw[16], 1);
         assert_eq!(raw[32], 2);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_sub_frame_chunking() {
+        // nRowChunks/nColChunks that divide the frame produce a sub-frame
+        // chunk grid written via write_chunk_at tiles; the dataset shape
+        // stays exactly [N, Y, X] (no padding) and the data round-trips.
+        let path = temp_path("hdf5_subchunk");
+        let mut writer = Hdf5Writer::new();
+        writer.set_chunk_size_auto(false); // honor explicit chunk sizes
+        writer.set_n_row_chunks(4); // Y = 8 → 2 row tiles
+        writer.set_n_col_chunks(4); // X = 8 → 2 col tiles
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        for f in 0..3u16 {
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = f * 1000 + i as u16;
+                }
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&arr).unwrap();
+        }
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![3, 8, 8], "shape must not be chunk-padded");
+        assert_eq!(
+            ds.chunk_dims(),
+            Some(vec![1, 4, 4]),
+            "chunk grid must be the sub-frame tile size"
+        );
+        let raw: Vec<u16> = ds.read_raw().unwrap();
+        assert_eq!(raw.len(), 3 * 64);
+        for f in 0..3u16 {
+            for i in 0..64usize {
+                assert_eq!(
+                    raw[f as usize * 64 + i],
+                    f * 1000 + i as u16,
+                    "frame {} elem {}",
+                    f,
+                    i
+                );
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_non_dividing_chunk_falls_back_to_full() {
+        // A chunk size that does not divide the frame must fall back to the
+        // full dimension — never pad the dataset shape.
+        let path = temp_path("hdf5_subchunk_nd");
+        let mut writer = Hdf5Writer::new();
+        writer.set_chunk_size_auto(false); // honor explicit chunk sizes
+        writer.set_n_row_chunks(3); // Y = 8, 8 % 3 != 0 → full
+        writer.set_n_col_chunks(4); // X = 8 → honored
+
+        let arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![1, 8, 8]);
+        assert_eq!(ds.chunk_dims(), Some(vec![1, 8, 4]));
 
         std::fs::remove_file(&path).ok();
     }
@@ -2368,8 +2513,20 @@ mod tests {
             assert_eq!(data[64 + i], i as u16, "frame1 element {}", i);
         }
         // Requested geometry preserved as attributes.
-        assert_eq!(ds.attr("HDF5_nRowChunks").unwrap().read_numeric::<i32>().unwrap(), 4);
-        assert_eq!(ds.attr("HDF5_nColChunks").unwrap().read_numeric::<i32>().unwrap(), 2);
+        assert_eq!(
+            ds.attr("HDF5_nRowChunks")
+                .unwrap()
+                .read_numeric::<i32>()
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            ds.attr("HDF5_nColChunks")
+                .unwrap()
+                .read_numeric::<i32>()
+                .unwrap(),
+            2
+        );
         assert_eq!(
             ds.attr("HDF5_nFramesChunks")
                 .unwrap()
@@ -2445,7 +2602,10 @@ mod tests {
             3
         );
         assert_eq!(
-            ds.attr("HDF5_extraDimName0").unwrap().read_string().unwrap(),
+            ds.attr("HDF5_extraDimName0")
+                .unwrap()
+                .read_string()
+                .unwrap(),
             "scanY"
         );
 

@@ -198,9 +198,11 @@ fn parse_token(tok: &str) -> Option<DiscoveryConfig> {
 /// [`SocketAddr`].
 ///
 /// An entry may be `<ip>:<port>` or a bare `<ip>`. A bare address
-/// defaults to the standard CA server port (5064) — the same way
-/// `EPICS_CA_ADDR_LIST` parsing (`server::addr_list::resolve_token`)
-/// treats port-less entries — instead of being silently dropped.
+/// defaults to the resolved CA server port (`EPICS_CA_SERVER_PORT`, or
+/// 5064) — consistent with `EPICS_CA_ADDR_LIST` parsing, which passes
+/// the same env-resolved port as `default_port` to
+/// `server::addr_list::resolve_token` — instead of being silently
+/// dropped.
 fn parse_static_addr(entry: &str) -> Option<SocketAddr> {
     use std::net::IpAddr;
 
@@ -208,7 +210,10 @@ fn parse_static_addr(entry: &str) -> Option<SocketAddr> {
         return Some(addr);
     }
     if let Ok(ip) = entry.parse::<IpAddr>() {
-        return Some(SocketAddr::new(ip, crate::protocol::CA_SERVER_PORT));
+        let port = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(crate::protocol::CA_SERVER_PORT);
+        return Some(SocketAddr::new(ip, port));
     }
     tracing::warn!(entry = %entry, "EPICS_CA_DISCOVERY static: dropped unparseable address");
     None

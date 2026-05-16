@@ -1679,7 +1679,16 @@ impl RecordInstance {
     /// silent compromise — `record_tests.rs::deadband_*` pins both
     /// the NaN-sentinel behaviour and the C four-quadrant transitions.
     pub fn check_deadband_ext(&mut self) -> (bool, bool) {
-        let val = match self.record.val().and_then(|v| v.to_f64()) {
+        // The deadband is evaluated against `monitor_deadband_value()`,
+        // not `val()` directly: a record whose monitored quantity is
+        // not its primary value (e.g. the motor record, VAL=setpoint /
+        // RBV=readback — C `monitor()` deadbands RBV) overrides that
+        // hook. Default is `val()`, so other records are unaffected.
+        let val = match self
+            .record
+            .monitor_deadband_value()
+            .and_then(|v| v.to_f64())
+        {
             Some(v) => v,
             None => return (true, true),
         };

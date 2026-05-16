@@ -648,6 +648,38 @@ fn test_put_accu_does_not_recompute() {
     assert!((rec.vel.accs - 5.0).abs() < 1e-12);
 }
 
+// --- STOP is sent unconditionally (C: motorRecord.cc "just in case") ---
+
+#[test]
+fn test_stop_emits_command_even_when_record_idle() {
+    // After an InPosition retry the record finalizes to Idle while the servo
+    // may still be settling; a STOP must still reach the driver.
+    let mut rec = MotorRecord::new();
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Stop);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "STOP must be forwarded even when the record is idle"
+    );
+}
+
+#[test]
+fn test_spmg_stop_emits_command_even_when_record_idle() {
+    let mut rec = MotorRecord::new();
+    rec.ctrl.spmg = SpmgMode::Stop;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. }))
+    );
+}
+
 // --- DLY + STOP: DELAY wins (C: 38186d00 2017-03) ---
 
 #[test]

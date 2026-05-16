@@ -395,23 +395,26 @@ impl MotorRecord {
     /// Handle STOP command.
     fn handle_stop(&mut self, effects: &mut ProcessEffects) {
         self.ctrl.stop = false; // pulse field
-        // C motorRecord.cc — STOP_AXIS is sent whenever motion is in flight.
-        // An externally initiated move keeps phase==Idle but sets
-        // MIP_EXTERNAL, so it must be covered here too.
+        // Record-side state changes (MIP_STOP, target sync) apply only when
+        // the record believes motion is in flight.
         let in_motion = self.stat.phase != MotionPhase::Idle
             || self.stat.mip.contains(MipFlags::EXTERNAL);
         if in_motion {
             self.stat.mip.insert(MipFlags::STOP);
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
-            effects.commands.push(MotorCommand::Stop {
-                acceleration: self.move_accel_egu(),
-            });
             // Sync VAL to RBV after stop
             self.pos.val = self.pos.rbv;
             self.pos.dval = self.pos.drbv;
             self.pos.rval = self.pos.rrbv;
         }
+        // C motorRecord.cc — STOP_AXIS is sent unconditionally ("just in
+        // case"): the driver may still be settling even when the record
+        // considers itself idle (e.g. after an InPosition retry, which
+        // finalizes the record but leaves the servo moving).
+        effects.commands.push(MotorCommand::Stop {
+            acceleration: self.move_accel_egu(),
+        });
     }
 
     /// Start jogging.
@@ -624,21 +627,22 @@ impl MotorRecord {
 
         match new {
             SpmgMode::Stop => {
-                // Cover externally initiated moves (phase==Idle, MIP_EXTERNAL).
                 let in_motion = self.stat.phase != MotionPhase::Idle
                     || self.stat.mip.contains(MipFlags::EXTERNAL);
                 if in_motion {
                     self.internal.backlash_pending = false;
                     self.internal.pending_retarget = None;
-                    effects.commands.push(MotorCommand::Stop {
-                        acceleration: self.move_accel_egu(),
-                    });
                     // Sync VAL = RBV
                     self.pos.val = self.pos.rbv;
                     self.pos.dval = self.pos.drbv;
                     self.pos.rval = self.pos.rrbv;
                     self.finalize_motion(effects);
                 }
+                // C: STOP_AXIS is sent unconditionally — the driver may still
+                // be settling even when the record is idle.
+                effects.commands.push(MotorCommand::Stop {
+                    acceleration: self.move_accel_egu(),
+                });
             }
             SpmgMode::Pause => {
                 if self.stat.phase != MotionPhase::Idle {

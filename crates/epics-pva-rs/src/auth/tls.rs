@@ -2,14 +2,41 @@
 //!
 //! Wraps `rustls` with the conventions pvxs uses for cert distribution:
 //!
-//! - `EPICS_PVAS_TLS_KEYCHAIN`  — server cert + private key (PEM bundle)
-//! - `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD` — password (currently unused; PEM
-//!   keys aren't password-protected in our pipeline)
-//! - `EPICS_PVA_TLS_KEYCHAIN`   — client cert (mutual TLS)
+//! - `EPICS_PVAS_TLS_KEYCHAIN`  — server cert + private key. Accepts a
+//!   PEM bundle *or* a PKCS#12 (`.p12`/`.pfx`) keychain — the format is
+//!   auto-detected from the file content, not the extension.
+//! - `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD` — password used to decrypt a
+//!   PKCS#12 keychain (also accepted on the client side as
+//!   `EPICS_PVA_TLS_KEYCHAIN_PASSWORD`). PEM keys in our pipeline are
+//!   unencrypted, so the password is only consulted for PKCS#12 input.
+//! - `EPICS_PVA_TLS_KEYCHAIN`   — client cert (mutual TLS); PEM or PKCS#12.
 //! - `EPICS_PVA_TLS_OPTIONS`    — option string; we recognise
 //!   `client_cert=optional` / `client_cert=require`
 //! - `EPICS_PVA_TLS_DISABLE`    — set to `YES` to disable TLS even when
 //!   configured
+//!
+//! ## PKCS#12 parity with pvxs
+//!
+//! pvxs (`src/ossl.cpp`) calls OpenSSL `PKCS12_parse`, which splits a
+//! keychain into a leaf certificate, its private key, and a stack of CA
+//! certificates. We reproduce that split with the pure-Rust `p12` crate
+//! (gated behind the `pkcs12` feature, on by default):
+//!
+//! - the certificate whose PKCS#12 `localKeyID` attribute matches the
+//!   private key bag's is the leaf — it is installed as the cert
+//!   presented on the wire (this is how `PKCS12_parse` pairs them too);
+//! - every other certificate in the bag is treated as a CA. Mirroring
+//!   the comment in `ossl_setup_common`, any CA shipped inside the
+//!   PKCS#12 is *trusted* (added to the verifier root store) — a CA
+//!   would never appear in a valid chain otherwise.
+//!
+//! Note: `p12` 0.6 implements the classic PKCS#12 PBE algorithms
+//! (`pbeWithSHA1And3-KeyTripleDES-CBC` for keys,
+//! `pbeWithSHA1And40BitRC2-CBC` for certs). PKCS#12 files written with
+//! OpenSSL 3.x defaults use PBES2 (PBKDF2 + AES) and will fail to
+//! decrypt — generate keychains with `openssl pkcs12 -legacy` (or the
+//! explicit `-keypbe`/`-certpbe` classic algorithms) for compatibility.
+//! This is a documented limitation; see the crate-level UNFIXED notes.
 //!
 //! This module produces ready-to-use `rustls::ClientConfig` / `ServerConfig`
 //! values; the client/server runtime layers wrap them in `TlsConnector`/
@@ -18,8 +45,8 @@
 //! which can decide per-target whether to upgrade the socket.
 
 use std::fs::File;
-use std::io::BufReader;
-use std::path::PathBuf;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -50,6 +77,16 @@ pub enum TlsConfigError {
     Rustls(#[from] rustls::Error),
     #[error("verifier error: {0}")]
     Verifier(String),
+    /// PKCS#12 keychain failed to parse or decrypt. Most commonly a
+    /// wrong/missing `EPICS_PVA*_TLS_KEYCHAIN_PASSWORD`, or a keychain
+    /// encrypted with a PBE algorithm `p12` does not implement (PBES2 /
+    /// AES — use `openssl pkcs12 -legacy` to re-encode).
+    #[error("PKCS#12 parse error in {path:?}: {reason}")]
+    Pkcs12 { path: PathBuf, reason: String },
+    /// The crate was built without the `pkcs12` feature but the keychain
+    /// content is not PEM (no `-----BEGIN` marker).
+    #[error("{0:?} is not a PEM bundle and PKCS#12 support is disabled (enable the `pkcs12` feature)")]
+    Pkcs12Disabled(PathBuf),
 }
 
 /// Server-side TLS configuration.
@@ -89,16 +126,34 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     let keychain = crate::config::env::expand_dollar_vars(&keychain);
     let path = PathBuf::from(keychain);
 
-    let (certs, key) = read_pem_bundle(&path)?;
+    // PKCS#12 keychains carry the password from the env; PEM keys in
+    // our pipeline are unencrypted so the password is harmless there.
+    let password = crate::config::env::server_tls_keychain_password();
+    let Keychain {
+        certs,
+        key,
+        ca_certs,
+    } = load_keychain(&path, password.as_deref())?;
+    let key = key.ok_or_else(|| TlsConfigError::NoKey(path.to_path_buf()))?;
 
     let options = std::env::var("EPICS_PVA_TLS_OPTIONS").unwrap_or_default();
     let require_client_cert = options.contains("client_cert=require");
     let optional_client_cert = require_client_cert || options.contains("client_cert=optional");
 
+    // Presented chain = leaf + any CA certs the keychain carried, so a
+    // peer that lacks the intermediates can still build the path.
+    // (pvxs does the same via `SSL_CTX_build_cert_chain`.) For PEM
+    // input `ca_certs` is empty and this is exactly the old `certs`.
+    let chain: Vec<CertificateDer<'static>> =
+        certs.iter().chain(ca_certs.iter()).cloned().collect();
+
     let config = if optional_client_cert {
         // Build a client verifier whose root CA store is the same bundle.
+        // For PKCS#12, `ca_certs` holds the CA stack `PKCS12_parse`
+        // split out; for PEM the whole bundle (including the leaf) is
+        // offered and the verifier rejects non-CA entries on its own.
         let mut roots = RootCertStore::empty();
-        for cert in &certs {
+        for cert in certs.iter().chain(ca_certs.iter()) {
             // Best-effort: skip non-CA leaf certs — verifier will reject any.
             let _ = roots.add(cert.clone());
         }
@@ -114,11 +169,11 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
         };
         ServerConfig::builder()
             .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)?
+            .with_single_cert(chain, key)?
     } else {
         ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(certs, key)?
+            .with_single_cert(chain, key)?
     };
 
     Ok(Some(TlsServerConfig {
@@ -141,11 +196,11 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
         // PVA-466: expand $(VAR) / ${VAR} in path env.
         let ca_path = crate::config::env::expand_dollar_vars(&ca_path);
         let path = PathBuf::from(&ca_path);
-        let (certs, _) = read_pem_bundle(&path).or_else(|e| match e {
-            TlsConfigError::NoKey(_) => read_pem_bundle_certs_only(&path).map(|c| (c, dummy_key())),
-            other => Err(other),
-        })?;
-        for cert in certs {
+        let password = crate::config::env::client_tls_keychain_password();
+        // A CA keychain may have no private key (PEM cert-only or a
+        // PKCS#12 trust store) — that is fine, we only want the certs.
+        let kc = load_keychain(&path, password.as_deref())?;
+        for cert in kc.certs.into_iter().chain(kc.ca_certs) {
             let _ = roots.add(cert);
         }
     }
@@ -156,9 +211,18 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
         // PVA-466: expand $(VAR) / ${VAR} in path env.
         let keychain = crate::config::env::expand_dollar_vars(&keychain);
         let path = PathBuf::from(keychain);
-        let (certs, key) = read_pem_bundle(&path)?;
+        let password = crate::config::env::client_tls_keychain_password();
+        let Keychain {
+            certs,
+            key,
+            ca_certs,
+        } = load_keychain(&path, password.as_deref())?;
+        let key = key.ok_or_else(|| TlsConfigError::NoKey(path.to_path_buf()))?;
+        // Present leaf + carried CA chain (see server-side rationale).
+        let chain: Vec<CertificateDer<'static>> =
+            certs.into_iter().chain(ca_certs).collect();
         builder
-            .with_client_auth_cert(certs, key)
+            .with_client_auth_cert(chain, key)
             .map_err(TlsConfigError::Rustls)?
     } else {
         builder.with_no_client_auth()
@@ -169,64 +233,203 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
     }))
 }
 
-// ─── PEM I/O helpers ────────────────────────────────────────────────────
+// ─── Keychain loading (PEM or PKCS#12) ──────────────────────────────────
 
-fn read_pem_bundle(
-    path: &PathBuf,
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsConfigError> {
-    let file = File::open(path).map_err(|source| TlsConfigError::Io {
-        path: path.clone(),
+/// A loaded keychain, split the way pvxs's `PKCS12_parse` splits one:
+/// the leaf certificate(s) + private key, plus a separate CA stack.
+#[derive(Debug)]
+struct Keychain {
+    /// Leaf certificate(s). For a PEM bundle this is the whole cert
+    /// list (leaf first, intermediates after); for PKCS#12 it is just
+    /// the cert that matches the private key.
+    certs: Vec<CertificateDer<'static>>,
+    /// Private key, when the keychain carries one. `None` for a
+    /// cert-only PEM file or a PKCS#12 trust store.
+    key: Option<PrivateKeyDer<'static>>,
+    /// CA certificates the keychain carried (PKCS#12 only; empty for
+    /// PEM, where intermediates stay inside `certs`).
+    ca_certs: Vec<CertificateDer<'static>>,
+}
+
+/// Read `path` and parse it as either a PEM bundle or a PKCS#12
+/// keychain. The format is auto-detected from the content: a file
+/// containing a `-----BEGIN` marker is treated as PEM, anything else
+/// is handed to the PKCS#12 parser. `password` is only consulted for
+/// PKCS#12 input.
+fn load_keychain(
+    path: &Path,
+    password: Option<&str>,
+) -> Result<Keychain, TlsConfigError> {
+    let mut file = File::open(path).map_err(|source| TlsConfigError::Io {
+        path: path.to_path_buf(),
         source,
     })?;
-    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| TlsConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
+    if is_pem(&bytes) {
+        load_pem_keychain(path, &bytes)
+    } else {
+        load_pkcs12_keychain(path, &bytes, password.unwrap_or(""))
+    }
+}
+
+/// True iff `bytes` looks like PEM — i.e. contains a `-----BEGIN`
+/// armour header. PKCS#12 / DER input is binary and never does.
+fn is_pem(bytes: &[u8]) -> bool {
+    // Scan for the literal marker; a PEM file may be prefixed with
+    // comments or blank lines before the first block.
+    bytes
+        .windows(11)
+        .any(|w| w == b"-----BEGIN ")
+}
+
+fn load_pem_keychain(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<Keychain, TlsConfigError> {
+    let mut reader = BufReader::new(bytes);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| TlsConfigError::Pem {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         })?;
     if certs.is_empty() {
-        return Err(TlsConfigError::NoCert(path.clone()));
+        return Err(TlsConfigError::NoCert(path.to_path_buf()));
     }
 
-    // Re-open to scan keys (rustls_pemfile consumes the reader).
-    let file = File::open(path).map_err(|source| TlsConfigError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let mut reader = BufReader::new(file);
-
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|source| TlsConfigError::Pem {
-            path: path.clone(),
+    let mut reader = BufReader::new(bytes);
+    let key = rustls_pemfile::private_key(&mut reader).map_err(|source| {
+        TlsConfigError::Pem {
+            path: path.to_path_buf(),
             source,
-        })?
-        .ok_or_else(|| TlsConfigError::NoKey(path.clone()))?;
+        }
+    })?;
 
-    Ok((certs, key))
+    Ok(Keychain {
+        certs,
+        key,
+        ca_certs: Vec::new(),
+    })
 }
 
-fn read_pem_bundle_certs_only(
-    path: &PathBuf,
-) -> Result<Vec<CertificateDer<'static>>, TlsConfigError> {
-    let file = File::open(path).map_err(|source| TlsConfigError::Io {
-        path: path.clone(),
-        source,
+/// Parse a PKCS#12 keychain, splitting leaf cert / key / CA stack the
+/// way pvxs's `PKCS12_parse` does. Requires the `pkcs12` feature.
+///
+/// Leaf-vs-CA pairing uses the PKCS#12 `localKeyID` attribute — the
+/// same mechanism OpenSSL's `PKCS12_parse` uses to associate a cert
+/// with its key. The cert bag whose `localKeyID` matches the key
+/// bag's is the leaf; every other cert is a CA. When no `localKeyID`
+/// is present (or no key bag exists), the first cert is taken as the
+/// leaf and the rest as CAs.
+#[cfg(feature = "pkcs12")]
+fn load_pkcs12_keychain(
+    path: &Path,
+    bytes: &[u8],
+    password: &str,
+) -> Result<Keychain, TlsConfigError> {
+    use p12::SafeBagKind;
+
+    let pfx = p12::PFX::parse(bytes).map_err(|e| TlsConfigError::Pkcs12 {
+        path: path.to_path_buf(),
+        reason: format!("not a valid PKCS#12 structure: {e}"),
     })?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| TlsConfigError::Pem {
-            path: path.clone(),
-            source,
-        })
+
+    // Reject a wrong password up front with a clear message rather
+    // than letting the later bag decryption fail opaquely. An empty
+    // (password-less) keychain still verifies here.
+    if !pfx.verify_mac(password) {
+        return Err(TlsConfigError::Pkcs12 {
+            path: path.to_path_buf(),
+            reason: "MAC verification failed (wrong EPICS_PVA*_TLS_KEYCHAIN_PASSWORD?)"
+                .to_string(),
+        });
+    }
+
+    let bags = pfx.bags(password).map_err(|e| TlsConfigError::Pkcs12 {
+        path: path.to_path_buf(),
+        reason: format!(
+            "could not decrypt PKCS#12 bags (PBES2/AES keychains are \
+             unsupported — re-encode with `openssl pkcs12 -legacy`): {e}"
+        ),
+    })?;
+
+    // First key bag wins (EPICS keychains hold one end-entity key).
+    // `get_key` yields a decrypted PKCS#8 `PrivateKeyInfo` DER blob.
+    let key_bmp = bmp_password(password);
+    let mut key: Option<PrivateKeyDer<'static>> = None;
+    let mut key_local_id: Option<Vec<u8>> = None;
+    for bag in &bags {
+        if let SafeBagKind::Pkcs8ShroudedKeyBag(_) = bag.bag {
+            if let Some(der) = bag.bag.get_key(&key_bmp) {
+                key = Some(PrivateKeyDer::Pkcs8(der.into()));
+                key_local_id = bag.local_key_id();
+                break;
+            }
+        }
+    }
+
+    // Collect cert bags, pairing on `localKeyID`.
+    let mut certs: Vec<CertificateDer<'static>> = Vec::new();
+    let mut ca_certs: Vec<CertificateDer<'static>> = Vec::new();
+    for bag in &bags {
+        let Some(der) = bag.bag.get_x509_cert() else {
+            continue;
+        };
+        let cert = CertificateDer::from(der);
+        let is_leaf = match (&key_local_id, bag.local_key_id()) {
+            (Some(want), Some(got)) => *want == got && certs.is_empty(),
+            _ => false,
+        };
+        if is_leaf {
+            certs.push(cert);
+        } else {
+            ca_certs.push(cert);
+        }
+    }
+
+    // No `localKeyID` pairing (or no key): take the first cert as the
+    // leaf so the keychain is still usable.
+    if certs.is_empty() {
+        if ca_certs.is_empty() {
+            return Err(TlsConfigError::NoCert(path.to_path_buf()));
+        }
+        certs.push(ca_certs.remove(0));
+    }
+
+    Ok(Keychain {
+        certs,
+        key,
+        ca_certs,
+    })
 }
 
-fn dummy_key() -> PrivateKeyDer<'static> {
-    // Never used — only here to satisfy the tuple shape of `read_pem_bundle`'s
-    // signature in the CA-only fallback path.
-    PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(Vec::new()))
+/// Encode a password as a PKCS#12 BMPString (UTF-16BE + NUL terminator)
+/// — the form `p12`'s `SafeBagKind::get_key` expects. Mirrors the
+/// crate-internal `bmp_string` helper, which is not public.
+#[cfg(feature = "pkcs12")]
+fn bmp_password(password: &str) -> Vec<u8> {
+    let mut bytes: Vec<u8> = password
+        .encode_utf16()
+        .flat_map(|c| c.to_be_bytes())
+        .collect();
+    bytes.push(0);
+    bytes.push(0);
+    bytes
+}
+
+#[cfg(not(feature = "pkcs12"))]
+fn load_pkcs12_keychain(
+    path: &Path,
+    _bytes: &[u8],
+    _password: &str,
+) -> Result<Keychain, TlsConfigError> {
+    Err(TlsConfigError::Pkcs12Disabled(path.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -273,6 +476,285 @@ mod tests {
         }
         if let Some(v) = prev_disable {
             unsafe { std::env::set_var("EPICS_PVA_TLS_DISABLE", v) }
+        }
+    }
+
+    // ─── format auto-detection ──────────────────────────────────────
+
+    #[test]
+    fn is_pem_detects_armour() {
+        assert!(is_pem(b"-----BEGIN CERTIFICATE-----\nMII...\n"));
+        assert!(is_pem(b"# leading comment\n-----BEGIN PRIVATE KEY-----\n"));
+        // Binary DER (PKCS#12 starts with a SEQUENCE tag 0x30) is not PEM.
+        assert!(!is_pem(&[0x30, 0x82, 0x0a, 0x00, 0x02, 0x01, 0x03]));
+        assert!(!is_pem(b""));
+    }
+
+    #[test]
+    fn bmp_password_is_utf16be_nul_terminated() {
+        // "ab" -> 0x00 0x61 0x00 0x62 + 0x00 0x00
+        #[cfg(feature = "pkcs12")]
+        {
+            assert_eq!(bmp_password("ab"), vec![0x00, 0x61, 0x00, 0x62, 0, 0]);
+            assert_eq!(bmp_password(""), vec![0, 0]);
+        }
+        let _ = "ab"; // keep test non-empty when feature is off
+    }
+
+    // ─── PKCS#12 keychain loading ───────────────────────────────────
+    //
+    // These tests generate fixtures with the `openssl` CLI using the
+    // *legacy* PBE algorithms (`-keypbe`/`-certpbe`), because the `p12`
+    // crate (0.6) does not implement PBES2/AES. If `openssl` is not on
+    // PATH the test is skipped — fixture generation, not the loader,
+    // is what's unavailable.
+
+    #[cfg(feature = "pkcs12")]
+    struct Pem {
+        cert: String,
+        key: String,
+    }
+
+    /// Generate a self-signed leaf cert+key as PEM via `rcgen`.
+    #[cfg(feature = "pkcs12")]
+    fn gen_self_signed(cn: &str) -> Pem {
+        let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        Pem {
+            cert: cert.pem(),
+            key: key.serialize_pem(),
+        }
+    }
+
+    /// Build a legacy-PBE PKCS#12 from PEM cert+key using `openssl`.
+    /// Returns the `.p12` bytes, or `None` if `openssl` is unavailable.
+    #[cfg(feature = "pkcs12")]
+    fn make_p12(pem: &Pem, ca_pem: Option<&str>, password: &str) -> Option<Vec<u8>> {
+        use std::io::Write;
+        let dir = tempfile::tempdir().ok()?;
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let p12_path = dir.path().join("out.p12");
+        std::fs::File::create(&cert_path)
+            .ok()?
+            .write_all(pem.cert.as_bytes())
+            .ok()?;
+        std::fs::File::create(&key_path)
+            .ok()?
+            .write_all(pem.key.as_bytes())
+            .ok()?;
+
+        let mut cmd = std::process::Command::new("openssl");
+        cmd.arg("pkcs12")
+            .arg("-export")
+            // `-legacy` selects the classic PKCS#12 PBE algorithms
+            // (3DES for keys, RC2-40 for certs) *and* loads OpenSSL's
+            // legacy provider so those algorithms are available — this
+            // is exactly the subset the pure-Rust `p12` crate decrypts.
+            .arg("-legacy")
+            .arg("-macalg")
+            .arg("sha1")
+            .arg("-in")
+            .arg(&cert_path)
+            .arg("-inkey")
+            .arg(&key_path)
+            .arg("-out")
+            .arg(&p12_path)
+            .arg("-passout")
+            .arg(format!("pass:{password}"));
+        if let Some(ca) = ca_pem {
+            let ca_path = dir.path().join("ca.pem");
+            std::fs::File::create(&ca_path)
+                .ok()?
+                .write_all(ca.as_bytes())
+                .ok()?;
+            cmd.arg("-certfile").arg(&ca_path);
+        }
+        let status = cmd.status().ok()?;
+        if !status.success() {
+            return None;
+        }
+        std::fs::read(&p12_path).ok()
+    }
+
+    #[cfg(feature = "pkcs12")]
+    fn write_temp(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keychain");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    fn pkcs12_loads_leaf_and_key_with_password() {
+        let pem = gen_self_signed("epics-pkcs12-leaf");
+        let Some(p12) = make_p12(&pem, None, "secret123") else {
+            eprintln!("skipping: `openssl` not available for fixture generation");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        // Correct password -> leaf cert + key extracted.
+        let kc = load_keychain(&path, Some("secret123")).expect("load p12");
+        assert_eq!(kc.certs.len(), 1, "one leaf cert expected");
+        assert!(kc.key.is_some(), "private key must be extracted");
+        assert!(matches!(kc.key, Some(PrivateKeyDer::Pkcs8(_))));
+        // Self-signed leaf, no separate CA chain.
+        assert!(kc.ca_certs.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    fn pkcs12_wrong_password_is_rejected() {
+        let pem = gen_self_signed("epics-pkcs12-leaf");
+        let Some(p12) = make_p12(&pem, None, "secret123") else {
+            eprintln!("skipping: `openssl` not available");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        let err = load_keychain(&path, Some("wrong-password")).unwrap_err();
+        match err {
+            TlsConfigError::Pkcs12 { reason, .. } => {
+                assert!(reason.contains("MAC"), "got: {reason}");
+            }
+            other => panic!("expected Pkcs12 MAC error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    fn pkcs12_with_ca_chain_splits_leaf_from_ca() {
+        // A CA + a leaf signed by it; pack both into one PKCS#12 and
+        // confirm the loader puts the leaf in `certs` and the CA in
+        // `ca_certs`, matching pvxs `PKCS12_parse` semantics.
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "epics-test-ca");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut leaf_params =
+            rcgen::CertificateParams::new(vec!["epics-leaf".to_string()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "epics-leaf");
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let pem = Pem {
+            cert: leaf_cert.pem(),
+            key: leaf_key.serialize_pem(),
+        };
+        let Some(p12) = make_p12(&pem, Some(&ca_cert.pem()), "pw") else {
+            eprintln!("skipping: `openssl` not available");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        let kc = load_keychain(&path, Some("pw")).expect("load p12 w/ CA");
+        assert_eq!(kc.certs.len(), 1, "exactly one leaf");
+        assert_eq!(kc.ca_certs.len(), 1, "exactly one CA cert");
+        assert!(kc.key.is_some());
+        // Leaf and CA must be distinct certs.
+        assert_ne!(kc.certs[0].as_ref(), kc.ca_certs[0].as_ref());
+    }
+
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    #[serial(epics_env)]
+    fn server_config_loads_from_pkcs12_env() {
+        let pem = gen_self_signed("epics-pkcs12-server");
+        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
+            eprintln!("skipping: `openssl` not available");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        // Drive the full env-var path: keychain + password env vars.
+        let _g = EnvGuard::set(&[
+            ("EPICS_PVAS_TLS_KEYCHAIN", Some(path.to_str().unwrap())),
+            ("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD", Some("kc-pw")),
+            ("EPICS_PVA_TLS_DISABLE", None),
+            ("EPICS_PVA_TLS_OPTIONS", None),
+        ]);
+        let cfg = load_server_config()
+            .expect("load_server_config")
+            .expect("Some(config)");
+        assert!(!cfg.require_client_cert);
+    }
+
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    #[serial(epics_env)]
+    fn server_config_pkcs12_wrong_password_env_errors() {
+        let pem = gen_self_signed("epics-pkcs12-server");
+        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
+            eprintln!("skipping: `openssl` not available");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        let _g = EnvGuard::set(&[
+            ("EPICS_PVAS_TLS_KEYCHAIN", Some(path.to_str().unwrap())),
+            ("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD", Some("not-the-password")),
+            ("EPICS_PVA_TLS_DISABLE", None),
+            ("EPICS_PVA_TLS_OPTIONS", None),
+        ]);
+        match load_server_config() {
+            Err(TlsConfigError::Pkcs12 { .. }) => {}
+            Err(other) => panic!("expected Pkcs12 error, got {other:?}"),
+            Ok(_) => panic!("expected error for wrong PKCS#12 password"),
+        }
+    }
+
+    /// RAII env-var guard: sets the given vars on construction (or
+    /// removes them when the value is `None`) and restores the prior
+    /// state on drop. Keeps env-mutating tests hermetic.
+    #[cfg(feature = "pkcs12")]
+    struct EnvGuard {
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+
+    #[cfg(feature = "pkcs12")]
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let prev = vars
+                .iter()
+                .map(|(k, _)| (*k, std::env::var(k).ok()))
+                .collect();
+            for (k, v) in vars {
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+            Self { prev }
+        }
+    }
+
+    #[cfg(feature = "pkcs12")]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
         }
     }
 }

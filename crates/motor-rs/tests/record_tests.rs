@@ -285,6 +285,65 @@ fn test_tweak_forward() {
 }
 
 #[test]
+fn test_tweak_in_set_mode_redefines_coordinates_without_moving() {
+    // C: a tweak that changes VAL in SET mode redefines coordinates (the
+    // VAL-change path), it does not move the motor.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.conv.set = true; // SET mode
+    rec.ctrl.twv = 5.0;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.off = 0.0;
+
+    rec.ctrl.twf = true;
+    let effects = rec.plan_motion(CommandSource::Twf);
+
+    assert_eq!(rec.pos.val, 15.0);
+    // SET + FOFF=Variable: DVAL unchanged, OFF re-derived (15 - 1*10 = 5).
+    assert_eq!(rec.pos.dval, 10.0);
+    assert_eq!(rec.pos.off, 5.0);
+    // No move command — only SetPosition (coordinate redefinition).
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. })),
+        "SET-mode tweak must not move the motor"
+    );
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+    );
+}
+
+#[test]
+fn test_tweak_blocked_when_loadpos_blocked_in_set_mode() {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.conv.set = true;
+    rec.conv.loadpos_blocked = true;
+    rec.ctrl.twv = 5.0;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.off = 0.0;
+
+    rec.ctrl.twf = true;
+    let effects = rec.plan_motion(CommandSource::Twf);
+    // LOAD_POS blocked: tweak refused, VAL/DVAL/OFF unchanged.
+    assert_eq!(rec.pos.val, 10.0);
+    assert_eq!(rec.pos.dval, 10.0);
+    assert_eq!(rec.pos.off, 0.0);
+    assert!(effects.commands.is_empty());
+}
+
+#[test]
 fn test_field_list_coverage() {
     let rec = MotorRecord::new();
     let fields = rec.field_list();

@@ -601,7 +601,35 @@ impl MotorRecord {
         };
         self.pos.val += delta;
 
-        // Cascade from VAL
+        // C motorRecord.cc — a tweak that changes VAL flows through the same
+        // VAL-change path: in SET mode it redefines coordinates rather than
+        // moving the motor.
+        if self.conv.set && !self.conv.igset {
+            // #231: LOAD_POS blocked — refuse the redefinition entirely.
+            if self.conv.loadpos_blocked {
+                self.pos.val -= delta; // undo: keep VAL/DVAL/OFF consistent
+                return;
+            }
+            if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
+                self.pos.val,
+                self.conv.dir,
+                self.pos.off,
+                self.conv.foff,
+                self.conv.mres,
+                true,
+                self.pos.dval,
+            ) {
+                self.pos.dval = dval;
+                self.pos.rval = rval;
+                self.pos.off = off;
+            }
+            effects.commands.push(MotorCommand::SetPosition {
+                position: self.pos.dval,
+            });
+            return;
+        }
+
+        // Normal (non-SET) tweak: cascade VAL->DVAL and issue a move.
         if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
             self.pos.val,
             self.conv.dir,

@@ -332,6 +332,20 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// The value the MDEL/ADEL deadband is evaluated against.
+    ///
+    /// For most records C `monitor()` applies the value deadband to
+    /// `VAL`, so the default is [`Self::val`]. A record whose monitored
+    /// quantity is not its primary value must override this: the motor
+    /// record, for instance, has `VAL` as the setpoint and applies
+    /// MDEL/ADEL to `RBV` (the readback) — its C `monitor()` deadbands
+    /// `RBV`, not `VAL`. Such a record returns its readback field here.
+    ///
+    /// Default is `val()`, so existing records are unaffected.
+    fn monitor_deadband_value(&self) -> Option<EpicsValue> {
+        self.val()
+    }
+
     /// Initialize record (pass 0: field defaults; pass 1: dependent init).
     fn init_record(&mut self, _pass: u8) -> CaResult<()> {
         Ok(())

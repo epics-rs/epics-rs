@@ -10,7 +10,37 @@ use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
 };
 
-use image::{DynamicImage, ImageFormat};
+use image::codecs::png::{CompressionType as PngCompression, FilterType as PngFilter};
+use image::{DynamicImage, ImageEncoder, ImageFormat};
+
+/// GraphicsMagick `CompressionType` ordinals as used by C++ NDFileMagick.cpp:20
+/// (`compressionTypes[]`). The `MAGICK_COMPRESS_TYPE` param indexes this list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MagickCompression {
+    None = 0,
+    BZip = 1,
+    Fax = 2,
+    Group4 = 3,
+    Jpeg = 4,
+    Lzw = 5,
+    Rle = 6,
+    Zip = 7,
+}
+
+impl MagickCompression {
+    fn from_index(idx: i32) -> Self {
+        match idx {
+            1 => Self::BZip,
+            2 => Self::Fax,
+            3 => Self::Group4,
+            4 => Self::Jpeg,
+            5 => Self::Lzw,
+            6 => Self::Rle,
+            7 => Self::Zip,
+            _ => Self::None,
+        }
+    }
+}
 
 /// NDFileMagick: file writer using the `image` crate.
 ///
@@ -20,6 +50,7 @@ pub struct MagickWriter {
     current_path: Option<PathBuf>,
     quality: u8,
     bit_depth: u32,
+    compress_type: MagickCompression,
 }
 
 impl MagickWriter {
@@ -27,7 +58,11 @@ impl MagickWriter {
         Self {
             current_path: None,
             quality: 100,
-            bit_depth: 8,
+            // 0 = keep the native depth of the NDArray data type. GraphicsMagick
+            // `image.depth(0)` is likewise a no-op; an explicit 8/16/32 forces
+            // the output sample depth.
+            bit_depth: 0,
+            compress_type: MagickCompression::None,
         }
     }
 
@@ -37,6 +72,10 @@ impl MagickWriter {
 
     pub fn set_bit_depth(&mut self, depth: u32) {
         self.bit_depth = depth;
+    }
+
+    pub fn set_compress_type(&mut self, idx: i32) {
+        self.compress_type = MagickCompression::from_index(idx);
     }
 
     fn color_mode(array: &NDArray) -> NDColorMode {
@@ -54,7 +93,42 @@ impl MagickWriter {
     }
 
     /// Convert NDArray to DynamicImage for encoding.
-    fn array_to_image(array: &NDArray) -> ADResult<DynamicImage> {
+    ///
+    /// `bit_depth` selects the output sample depth (C++ `image.depth(depth)`):
+    /// `0` keeps the native NDArray depth, `<= 8` produces an 8-bit image,
+    /// anything larger a 16-bit image.
+    fn array_to_image(array: &NDArray, bit_depth: u32) -> ADResult<DynamicImage> {
+        let img = Self::array_to_image_native(array)?;
+        Ok(Self::apply_bit_depth(img, bit_depth))
+    }
+
+    /// Apply the requested output bit depth by converting the DynamicImage.
+    fn apply_bit_depth(img: DynamicImage, bit_depth: u32) -> DynamicImage {
+        if bit_depth == 0 {
+            // Keep native depth.
+            return img;
+        }
+        let is_rgb = matches!(
+            img,
+            DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgb16(_)
+        );
+        if bit_depth <= 8 {
+            if is_rgb {
+                DynamicImage::ImageRgb8(img.to_rgb8())
+            } else {
+                DynamicImage::ImageLuma8(img.to_luma8())
+            }
+        } else {
+            if is_rgb {
+                DynamicImage::ImageRgb16(img.to_rgb16())
+            } else {
+                DynamicImage::ImageLuma16(img.to_luma16())
+            }
+        }
+    }
+
+    /// Convert NDArray to DynamicImage at the native depth of the data type.
+    fn array_to_image_native(array: &NDArray) -> ADResult<DynamicImage> {
         let info = array.info();
         let width = info.x_size as u32;
         let height = info.y_size as u32;
@@ -147,9 +221,28 @@ impl MagickWriter {
                 }
             }
             NDDataBuffer::F32(v) => {
+                // Scale by the actual data range, not a fixed [0,1] clamp
+                // (C++ NDFileMagick scales by the image's min/max range).
+                let mut min = f32::INFINITY;
+                let mut max = f32::NEG_INFINITY;
+                for &f in v {
+                    if f.is_finite() {
+                        min = min.min(f);
+                        max = max.max(f);
+                    }
+                }
+                let range = if min.is_finite() && max > min {
+                    max - min
+                } else {
+                    1.0
+                };
+                let offset = if min.is_finite() { min } else { 0.0 };
                 let u16_data: Vec<u16> = v
                     .iter()
-                    .map(|&f| (f.clamp(0.0, 1.0) * 65535.0) as u16)
+                    .map(|&f| {
+                        let norm = ((f - offset) / range).clamp(0.0, 1.0);
+                        (norm * 65535.0).round() as u16
+                    })
                     .collect();
                 if is_rgb {
                     image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_raw(
@@ -189,22 +282,54 @@ impl NDFileWriter for MagickWriter {
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
 
-        let img = Self::array_to_image(array)?;
+        let img = Self::array_to_image(array, self.bit_depth)?;
 
         // Determine format from extension, default to PNG
         let format = ImageFormat::from_path(path).unwrap_or(ImageFormat::Png);
 
-        // For JPEG, use quality setting
-        if format == ImageFormat::Jpeg {
-            let mut buf = Vec::new();
-            let encoder =
-                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, self.quality);
-            img.write_with_encoder(encoder)
-                .map_err(|e| ADError::UnsupportedConversion(format!("Magick encode error: {e}")))?;
-            std::fs::write(path, &buf)?;
-        } else {
-            img.save(path)
-                .map_err(|e| ADError::UnsupportedConversion(format!("Magick save error: {e}")))?;
+        match format {
+            ImageFormat::Jpeg => {
+                // JPEG: use the quality setting.
+                let mut buf = Vec::new();
+                let encoder =
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, self.quality);
+                img.write_with_encoder(encoder).map_err(|e| {
+                    ADError::UnsupportedConversion(format!("Magick encode error: {e}"))
+                })?;
+                std::fs::write(path, &buf)?;
+            }
+            ImageFormat::Png => {
+                // PNG: map the GraphicsMagick compression type onto the PNG
+                // deflate compression level. Zip/BZip → best, None → uncompressed,
+                // everything else → the encoder default.
+                let compression = match self.compress_type {
+                    MagickCompression::None => PngCompression::Uncompressed,
+                    MagickCompression::Zip | MagickCompression::BZip => PngCompression::Best,
+                    _ => PngCompression::default(),
+                };
+                let mut buf = Vec::new();
+                let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                    &mut buf,
+                    compression,
+                    PngFilter::Adaptive,
+                );
+                let rgb = img.color();
+                encoder
+                    .write_image(img.as_bytes(), img.width(), img.height(), rgb.into())
+                    .map_err(|e| {
+                        ADError::UnsupportedConversion(format!("Magick PNG encode error: {e}"))
+                    })?;
+                std::fs::write(path, &buf)?;
+            }
+            _ => {
+                // Other formats: the `image` crate's high-level save() has no
+                // compression knob; GraphicsMagick's CompressionType does not
+                // map onto these codecs, so the compress-type param has no
+                // effect for them (matches `image` crate capability).
+                img.save(path).map_err(|e| {
+                    ADError::UnsupportedConversion(format!("Magick save error: {e}"))
+                })?;
+            }
         }
 
         Ok(())
@@ -350,8 +475,7 @@ impl NDPluginProcess for MagickFileProcessor {
             return ParamChangeResult::empty();
         }
         if Some(reason) == self.compress_type_idx {
-            // CompressType stored but not actively used by `image` crate;
-            // format-specific compression is handled by each codec internally.
+            self.ctrl.writer.set_compress_type(params.value.as_i32());
             return ParamChangeResult::empty();
         }
         self.ctrl.on_param_change(reason, params)
@@ -471,6 +595,88 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::Float64,
         );
-        assert!(MagickWriter::array_to_image(&arr).is_err());
+        assert!(MagickWriter::array_to_image(&arr, 8).is_err());
+    }
+
+    #[test]
+    fn test_bit_depth_controls_output_depth() {
+        // u16 input with bit_depth 8 → 8-bit output image.
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i * 4000) as u16;
+            }
+        }
+        let img8 = MagickWriter::array_to_image(&arr, 8).unwrap();
+        assert!(matches!(img8, DynamicImage::ImageLuma8(_)));
+        let img16 = MagickWriter::array_to_image(&arr, 16).unwrap();
+        assert!(matches!(img16, DynamicImage::ImageLuma16(_)));
+    }
+
+    #[test]
+    fn test_f32_scales_by_actual_range() {
+        // Values well outside [0,1] must not all saturate to white.
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(2), NDDimension::new(2)],
+            NDDataType::Float32,
+        );
+        if let NDDataBuffer::F32(ref mut v) = arr.data {
+            v[0] = 100.0;
+            v[1] = 200.0;
+            v[2] = 300.0;
+            v[3] = 400.0;
+        }
+        let img = MagickWriter::array_to_image(&arr, 16).unwrap();
+        if let DynamicImage::ImageLuma16(buf) = img {
+            let raw = buf.into_raw();
+            // min maps to 0, max maps to 65535, intermediate values spread out.
+            assert_eq!(raw[0], 0);
+            assert_eq!(raw[3], 65535);
+            assert!(raw[1] > 0 && raw[1] < raw[2]);
+        } else {
+            panic!("expected 16-bit luma image");
+        }
+    }
+
+    #[test]
+    fn test_compress_type_applied_to_png() {
+        // None vs Best compression must produce different PNG file sizes for
+        // compressible data — proving the param is not discarded.
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(64), NDDimension::new(64)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for x in v.iter_mut() {
+                *x = 128; // uniform → highly compressible
+            }
+        }
+
+        let path_none = temp_path("png");
+        let mut w_none = MagickWriter::new();
+        w_none.set_compress_type(0); // None
+        w_none.open_file(&path_none, NDFileMode::Single, &arr).unwrap();
+        w_none.write_file(&arr).unwrap();
+        w_none.close_file().unwrap();
+
+        let path_zip = temp_path("png");
+        let mut w_zip = MagickWriter::new();
+        w_zip.set_compress_type(7); // Zip
+        w_zip.open_file(&path_zip, NDFileMode::Single, &arr).unwrap();
+        w_zip.write_file(&arr).unwrap();
+        w_zip.close_file().unwrap();
+
+        let size_none = std::fs::metadata(&path_none).unwrap().len();
+        let size_zip = std::fs::metadata(&path_zip).unwrap().len();
+        assert!(
+            size_zip < size_none,
+            "Zip ({size_zip}) should be smaller than None ({size_none})"
+        );
+
+        std::fs::remove_file(&path_none).ok();
+        std::fs::remove_file(&path_zip).ok();
     }
 }

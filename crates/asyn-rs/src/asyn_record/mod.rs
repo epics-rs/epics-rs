@@ -112,6 +112,11 @@ fn menu_index_to_baud_rate(idx: i32) -> i32 {
 /// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) so a
 /// configured `\r\n` terminator in the DB field reaches the driver
 /// as the two raw bytes `0x0D 0x0A`, not the four-byte literal.
+/// `asynFMT` menu value for binary I/O format — selects the raw BOUT /
+/// BINP byte buffers over the ASCII AOUT / AINP string buffers.
+/// (`asynFMT_Binary` in EPICS `asynRecord.dbd`; ASCII = 0, Hybrid = 1.)
+const ASYN_FMT_BINARY: i32 = 2;
+
 fn translate_escape(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     let mut chars = s.bytes().peekable();
@@ -1163,11 +1168,17 @@ impl AsynRecord {
         if matches!(tmod, TransferMode::Write | TransferMode::WriteRead) {
             match iface {
                 InterfaceType::Octet => {
-                    // C asynRecord.c writes NOWT bytes from the output
-                    // buffer (NOWT defaults to OMAX), not the whole AOUT
-                    // string. Rust `io_write_octet` is all-or-error, so a
-                    // successful write transferred exactly the slice.
-                    let full = self.aout.as_bytes();
+                    // C asynRecord.c selects the output buffer by OFMT:
+                    // Binary (asynFMT_Binary) writes the raw BOUT byte
+                    // array, ASCII / Hybrid write the AOUT string. NOWT
+                    // bytes are written (NOWT defaults to OMAX), not the
+                    // whole buffer. Rust `io_write_octet` is all-or-error,
+                    // so a successful write transferred exactly the slice.
+                    let full: &[u8] = if self.ofmt == ASYN_FMT_BINARY {
+                        &self.bout
+                    } else {
+                        self.aout.as_bytes()
+                    };
                     let n = if self.nowt > 0 {
                         (self.nowt as usize).min(full.len())
                     } else {

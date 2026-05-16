@@ -399,7 +399,14 @@ impl NDArray {
                             (xs, ys, cs, 0, 1, 2, 1, xs, xs * ys)
                         }
                         _ => {
-                            // Mono or other: treat as dim[0]=X, dim[1]=Y, dim[2]=Z
+                            // Mono / Bayer / YUV444 / YUV422 / YUV411: treated
+                            // as a plain 3-D array (dim[0]=X, dim[1]=Y,
+                            // dim[2]=Z). G4: C++ NDArray::getInfo has the SAME
+                            // limitation — it only special-cases RGB1/RGB2/RGB3
+                            // and falls through to this generic 3-D layout for
+                            // YUV modes. This is a shared C-parity gap, not a
+                            // Rust regression; YUV layout-awareness would have
+                            // to be added to both implementations together.
                             let xs = self.dims[0].size;
                             let ys = self.dims[1].size;
                             let cs = self.dims[2].size;

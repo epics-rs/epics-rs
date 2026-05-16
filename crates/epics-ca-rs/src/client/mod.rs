@@ -2093,6 +2093,11 @@ async fn run_coordinator(
                                 cid,
                                 data_type,
                                 count,
+                                // The public subscribe API auto-derives the
+                                // DBR type from the channel's native type;
+                                // no user-chosen type path exists yet, so
+                                // these must re-derive on NativeTypeChanged.
+                                type_user_supplied: false,
                                 mask,
                                 server_addr,
                                 deadband,
@@ -2483,6 +2488,7 @@ async fn run_coordinator(
                                 sid,
                                 data_type,
                                 element_count,
+                                native_changed,
                                 server_addr,
                                 &transport_tx,
                             );

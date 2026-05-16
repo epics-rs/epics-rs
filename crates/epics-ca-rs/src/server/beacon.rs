@@ -18,8 +18,11 @@ use epics_base_rs::error::CaResult;
 /// (e.g. site-wide gateways) are sent the same beacon stream.
 ///
 /// When `reset` is notified (e.g. on TCP connect/disconnect), the interval
-/// resets to the initial 20ms, matching C EPICS behavior. This lets clients
-/// detect server state changes quickly via beacon anomaly detection.
+/// resets to the initial 20ms. This is a Rust enhancement, NOT C parity:
+/// C `rsrv` only resets the beacon interval on `ctlPause`, never on client
+/// connect/disconnect. The faster beacons after a connect let clients
+/// detect server state changes quickly via beacon anomaly detection; the
+/// behavior is benign (a short burst of extra beacons) and deliberate.
 ///
 /// `signer` is an opt-in Ed25519 [`signed_beacon::SignedBeaconEmitter`]
 /// that emits a companion datagram immediately after each beacon so

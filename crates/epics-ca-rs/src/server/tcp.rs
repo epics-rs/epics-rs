@@ -433,7 +433,10 @@ impl ClientState {
 /// (port 0) if the configured port is already in use.
 ///
 /// Notifies `beacon_reset` on each client connect/disconnect so the beacon
-/// emitter restarts its fast beacon cycle (matching C EPICS behavior).
+/// emitter restarts its fast beacon cycle. This is a Rust enhancement, NOT
+/// C parity: C `rsrv` resets the beacon interval only on `ctlPause`, never
+/// on connect/disconnect. The extra fast beacons are benign and help
+/// clients notice server state changes promptly.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tcp_listener(
     db: Arc<PvDatabase>,
@@ -654,6 +657,10 @@ async fn accept_loop(
         let db = db.clone();
         let acf = acf.clone();
         let beacon_reset = beacon_reset.clone();
+        // Rust enhancement (NOT C parity): C `rsrv` never resets the
+        // beacon interval on connect — only on `ctlPause`. We restart
+        // the fast beacon cycle here so clients notice the new server
+        // state quickly; the extra beacons are benign.
         beacon_reset.notify_one();
         if let Some(tx) = &conn_events {
             let _ = tx.send(ServerConnectionEvent::Connected(peer));
@@ -807,6 +814,10 @@ async fn accept_loop(
                     .await
                 }
             };
+            // Rust enhancement (NOT C parity): C `rsrv` never resets
+            // the beacon interval on disconnect — only on `ctlPause`.
+            // Restarting the fast beacon cycle here is a deliberate,
+            // benign addition.
             beacon_reset.notify_one();
             if let Some(tx) = &conn_events {
                 let _ = tx.send(ServerConnectionEvent::Disconnected(peer));

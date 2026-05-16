@@ -965,12 +965,19 @@ fn handle_udp_response(
                 }
 
                 if let Some(p) = state.pending.get(&cid) {
-                    // A real connect will follow this Found — NOW consume
-                    // the breaker probe slot. `allow()` performs the
+                    // A connect normally follows this Found — consume the
+                    // breaker probe slot here. `allow()` performs the
                     // OPEN→HALF_OPEN transition (a probe-ready breaker
                     // passed the `is_blocking()` gate above) and returns
                     // false when a probe is already in flight; in that case
                     // leave the cid pending so a later round can retry.
+                    // Caveat: if the downstream `Found` handler drops this
+                    // event (e.g. the channel already advanced to
+                    // Connecting via another server), the probe slot is
+                    // consumed without a paired record_success/_failure —
+                    // `allow()`'s `probe_timeout` self-heal admits a fresh
+                    // probe after 30s, so the breaker is delayed, not
+                    // stranded.
                     if !state.breakers.allow(server_addr) {
                         offset += CaHeader::SIZE + align8(hdr.postsize as usize);
                         continue;

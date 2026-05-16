@@ -1776,10 +1776,11 @@ impl CaChannel {
         };
 
         let native = DbFieldType::from_u16(snap.native_type as u16)?;
-        // Use the Int64-aware DBR helpers consistently. They remap
-        // `Int64` (which has no CA wire type) to the `*_DOUBLE` family;
-        // raw `native as u16 + N` arithmetic on the enum discriminant
-        // would produce an invalid type code for an Int64 channel.
+        // `from_u16` only yields the six CA wire types (0..6), so `native`
+        // is never `Int64` on this path. The `*_dbr_type()` helpers are
+        // used for consistency with the rest of the codebase — they would
+        // remap `Int64` to the `*_DOUBLE` family if it could occur — not
+        // because Int64 is reachable here.
         let request_type = match class {
             DbrClass::Time => native.time_dbr_type(),
             DbrClass::Ctrl => native.ctrl_dbr_type(),

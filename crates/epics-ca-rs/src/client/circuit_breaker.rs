@@ -392,6 +392,28 @@ mod tests {
     }
 
     #[test]
+    fn stale_half_open_probe_self_heals_after_probe_timeout() {
+        // If a HALF_OPEN probe is admitted but neither record_success
+        // nor record_failure ever fires (the probe future was dropped —
+        // caller cancellation/panic), `allow()` must treat a probe
+        // older than `probe_timeout` as failed and admit a fresh one,
+        // rather than stranding the breaker in HALF_OPEN forever.
+        let mut reg = CircuitBreakerRegistry::with_config(fast_config());
+        for _ in 0..3 {
+            reg.record_failure(addr());
+        }
+        std::thread::sleep(Duration::from_millis(60)); // cooldown elapses
+        assert!(reg.allow(addr()), "first probe admitted (now HALF_OPEN)");
+        assert!(!reg.allow(addr()), "probe in flight — further traffic denied");
+        // Do NOT resolve the probe; let it age past probe_timeout (500ms).
+        std::thread::sleep(Duration::from_millis(550));
+        assert!(
+            reg.allow(addr()),
+            "stale probe treated as failed — a fresh probe is admitted"
+        );
+    }
+
+    #[test]
     fn old_failures_drop_out_of_window() {
         let mut reg = CircuitBreakerRegistry::with_config(BreakerConfig {
             window: Duration::from_millis(100),

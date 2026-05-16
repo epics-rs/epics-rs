@@ -210,7 +210,11 @@ fn parse_record_def(
         }};
     }
 
-    let record: Box<dyn epics_base_rs::server::record::Record> = match rec_type.as_str() {
+    // Every arm returns directly: the numeric arms parse a typed value
+    // (falling back to a default when the candidate value segment does
+    // not parse), the string arms split off the `:VALUE` segment when
+    // present, and the catch-all returns an error.
+    match rec_type.as_str() {
         "ai" => {
             let (n, val) = parse_or_default!(f64, 0.0);
             return Ok((n.to_string(), Box::new(AiRecord::new(val))));
@@ -243,16 +247,32 @@ fn parse_record_def(
             let (n, val) = parse_or_default!(u16, 0);
             return Ok((n.to_string(), Box::new(MbboRecord::new(val))));
         }
-        "stringin" => Box::new(StringinRecord::new(remainder)),
-        "stringout" => Box::new(StringoutRecord::new(remainder)),
-        _ => {
-            return Err(epics_base_rs::error::CaError::InvalidValue(format!(
-                "unknown record type '{rec_type}'"
-            )));
+        "stringin" => {
+            // Match the numeric arms: when a `:VALUE` segment is
+            // present, `name` is the record name and `value_str` the
+            // value; with no value segment, `remainder` is the whole
+            // name and the value defaults to empty. (Unlike the
+            // numeric arms there is no parse step — any string is a
+            // valid value.)
+            let (n, val) = if value_str.is_empty() {
+                (remainder, "")
+            } else {
+                (name, value_str)
+            };
+            return Ok((n.to_string(), Box::new(StringinRecord::new(val))));
         }
-    };
-
-    Ok((remainder.to_string(), record))
+        "stringout" => {
+            let (n, val) = if value_str.is_empty() {
+                (remainder, "")
+            } else {
+                (name, value_str)
+            };
+            return Ok((n.to_string(), Box::new(StringoutRecord::new(val))));
+        }
+        _ => Err(epics_base_rs::error::CaError::InvalidValue(format!(
+            "unknown record type '{rec_type}'"
+        ))),
+    }
 }
 
 fn parse_macros(macro_strs: &[String]) -> HashMap<String, String> {

@@ -296,6 +296,10 @@ async fn main() {
 
     let fmt = args.value_format();
     let sep = fmt.field_separator;
+    // C `caget.c:286` gates the array count prefix on
+    // `reqElems || nElems > 1`. `reqElems` is non-zero iff the user
+    // passed `-#` on the command line.
+    let req_elems_present = args.max_elements.is_some();
     // Mirror C `caget.c::main` (line 260): pad the PV name column to
     // 30 characters only when the value is a scalar AND the field
     // separator is the default space. Custom `-F` separator and
@@ -311,7 +315,7 @@ async fn main() {
     for (pv_name, result) in &results {
         match result {
             Ok(GetResult::Plain(value)) => {
-                let rendered = format_value(value, &fmt, None);
+                let rendered = format_value(value, &fmt, None, req_elems_present);
                 let is_scalar = value.count() == 1;
                 if args.terse {
                     println!("{rendered}");
@@ -327,7 +331,7 @@ async fn main() {
                 // fields) on NO_ALARM. Mirror that exactly using the
                 // alarm pair the DBR_TIME response carried.
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(&snap.value, &fmt, enum_strings);
+                let rendered = format_value(&snap.value, &fmt, enum_strings, req_elems_present);
                 let is_scalar = snap.value.count() == 1;
                 let ts = format_server_timestamp(snap.timestamp);
                 let stat = snap.alarm.status;
@@ -353,20 +357,40 @@ async fn main() {
                 }
             }
             Err(e) if e.contains("not connected") || e.contains("isconnect") => {
-                println!(
-                    "{}{}*** Not connected (PV not found)",
-                    pad_name(true, pv_name),
-                    sep
-                );
+                // C prints two different strings: plain/terse mode
+                // (caget.c:265) prints lowercase `*** not connected`;
+                // only `-a`/wide mode (print_time_val_sts,
+                // tool_lib.c:521) prints `*** Not connected (PV not
+                // found)`.
+                if args.wide {
+                    println!(
+                        "{}{}*** Not connected (PV not found)",
+                        pad_name(true, pv_name),
+                        sep
+                    );
+                } else if args.terse {
+                    println!("*** not connected");
+                } else {
+                    println!("{}{}*** not connected", pad_name(true, pv_name), sep);
+                }
                 failed = true;
             }
             Err(e) if e.contains("timeout") => {
-                println!(
-                    "{}{}*** no data available (timeout)",
-                    pad_name(true, pv_name),
-                    sep
-                );
-                failed = true;
+                // C `caget`: `connect_pvs` returns 1 only on a
+                // `ca_pend_io` connect timeout; the data-read function
+                // (`caget.c:348`) always returns 0. A CONNECTED PV
+                // whose GET times out therefore does NOT change the
+                // exit code — print the timeout line but leave
+                // `failed` untouched.
+                if args.terse {
+                    println!("*** no data available (timeout)");
+                } else {
+                    println!(
+                        "{}{}*** no data available (timeout)",
+                        pad_name(true, pv_name),
+                        sep
+                    );
+                }
             }
             Err(e) => {
                 println!(

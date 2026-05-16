@@ -189,13 +189,18 @@ async fn main() {
 
     // Print "*** Not connected" for PVs that didn't connect within
     // the wait window. Mirrors `tool_lib.c::print_time_val_sts` line
-    // 521 — "*** Not connected (PV not found)".
+    // 521 — "*** Not connected (PV not found)". Honor `-F`: C pads the
+    // name to 30 only with the default space separator, and emits the
+    // field separator between the name and the message.
+    let sep = args.field_separator.unwrap_or(' ');
     for (i, pv_name) in args.pv_names.iter().enumerate() {
         if !connected_flags[i].load(Ordering::Acquire) {
-            println!(
-                "{pv_name:<width$} *** Not connected (PV not found)",
-                width = PV_NAME_WIDTH
-            );
+            let name_col = if sep == ' ' {
+                format!("{pv_name:<width$}", width = PV_NAME_WIDTH)
+            } else {
+                pv_name.clone()
+            };
+            println!("{name_col}{sep}*** Not connected (PV not found)");
         }
     }
 
@@ -262,6 +267,7 @@ async fn monitor_pv(
     let mut conn_rx = channel.connection_events();
     let pv = pv_name.clone();
     let flag = connected_flag.clone();
+    let sep = fmt.field_separator;
     tokio::spawn(async move {
         while let Ok(evt) = conn_rx.recv().await {
             match evt {
@@ -271,8 +277,14 @@ async fn monitor_pv(
                 ConnectionEvent::Disconnected => {
                     let now = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
                     // C `tool_lib.c::print_time_val_sts` ECA_DISCONN
-                    // branch: `name pad ts *** disconnected`.
-                    println!("{pv:<width$} {now} *** disconnected", width = PV_NAME_WIDTH);
+                    // branch: `name <sep> ts *** disconnected`. Pad the
+                    // name to 30 only with the default space separator.
+                    let name_col = if sep == ' ' {
+                        format!("{pv:<width$}", width = PV_NAME_WIDTH)
+                    } else {
+                        pv.clone()
+                    };
+                    println!("{name_col}{sep}{now} *** disconnected");
                 }
                 _ => {}
             }
@@ -282,8 +294,6 @@ async fn monitor_pv(
     let Ok(mut monitor) = channel.subscribe().await else {
         return;
     };
-
-    let sep = fmt.field_separator;
     while let Some(result) = monitor.recv().await {
         match result {
             Ok(snap) => {

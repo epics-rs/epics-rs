@@ -297,6 +297,29 @@ fn format_float(x: f64, fmt: &ValueFormat) -> String {
     }
 }
 
+/// Decimal exponent of `abs` after rounding to `precision` significant
+/// digits — i.e. `floor(log10(round_to_sig_digits(abs, precision)))`.
+///
+/// C `%g` rounds to `precision` significant digits FIRST and only then
+/// decides between `%e` and `%f`. At a rounding boundary the rounded
+/// magnitude can tick up by a power of ten (e.g. `999999.5` at
+/// precision 6 rounds to `1000000`, exponent 5 → 6), which flips the
+/// fixed-vs-scientific choice. Computing the decision exponent from the
+/// UNROUNDED value misses that — see the regression test
+/// `g_rounding_boundary_picks_scientific`.
+fn decision_exponent(abs: f64, precision: usize) -> i32 {
+    let raw_exp = abs.log10().floor() as i32;
+    // Scale so the value has `precision` digits before the decimal
+    // point, round half-to-even, and read back the magnitude. If the
+    // round carries into a new decade the exponent increments.
+    let scale = 10f64.powi(precision as i32 - 1 - raw_exp);
+    let rounded_scaled = (abs * scale).round();
+    if rounded_scaled <= 0.0 {
+        return raw_exp;
+    }
+    raw_exp + (rounded_scaled.log10().floor() as i32 - (precision as i32 - 1))
+}
+
 /// `%g`-equivalent formatter. C semantics: choose `%e` or `%f`
 /// depending on the exponent, drop trailing zeros and the trailing
 /// decimal point. Precision is the *significant-digit* count.
@@ -305,7 +328,10 @@ fn format_g(x: f64, precision: usize) -> String {
         return "0".to_string();
     }
     let abs = x.abs();
-    let exp = abs.log10().floor() as i32;
+    // C `%g` rounds to `precision` significant digits before choosing
+    // the format, so the decision exponent must come from the rounded
+    // magnitude, not the raw value.
+    let exp = decision_exponent(abs, precision);
     // C `%g` uses fixed-point when `precision > exp >= -4`. Compare as
     // i32 to avoid the silent `i32 → usize` wrap for negative `exp`.
     if exp >= -4 && exp < precision as i32 {
@@ -393,6 +419,23 @@ mod tests {
         assert_eq!(format_g(0.0001, 6), "0.0001");
         // C `printf("%g", 1234567.0)` → "1.23457e+06"
         assert_eq!(format_g(1234567.0, 6), "1.23457e+06");
+    }
+
+    /// C `%g` rounds to `precision` significant digits BEFORE deciding
+    /// between `%e` and `%f`. At a rounding boundary the rounded
+    /// magnitude can carry into a new decade and flip the choice:
+    /// `printf("%g", 999999.5)` → "1e+06" (not "1000000"), because the
+    /// rounded value `1000000` has exponent 6 >= precision 6.
+    #[test]
+    fn g_rounding_boundary_picks_scientific() {
+        // 999999.5 rounds up to 1000000 → exponent ticks 5 → 6 → %e.
+        assert_eq!(format_g(999999.5, 6), "1e+06");
+        // Just below the boundary stays fixed-point.
+        assert_eq!(format_g(999998.0, 6), "999998");
+        // 9.999995 rounds to 10 (exponent 0 → 1, still fixed range).
+        assert_eq!(format_g(9.999995, 6), "10");
+        // Negative value at the same boundary keeps the sign.
+        assert_eq!(format_g(-999999.5, 6), "-1e+06");
     }
 
     #[test]

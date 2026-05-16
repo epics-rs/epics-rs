@@ -1517,8 +1517,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // When a capability-token verifier is configured AND the
             // payload arrives in `cap:<token>` form, verify the token
             // and store the resolved subject. Unverifiable tokens are
-            // logged and replaced with an `unverified:` sentinel that
-            // ACF rules can deliberately deny. Plain (non-`cap:`)
+            // logged and replaced with a fixed `unverified` sentinel
+            // that ACF rules can deliberately deny. Plain (non-`cap:`)
             // usernames pass through unchanged for backwards compat.
             #[cfg(feature = "cap-tokens")]
             {
@@ -1538,9 +1538,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             claims.sub
                         }
                         Err(e) => {
+                            // Do NOT fold the raw token into the username:
+                            // it then lands in the ACF identity and the
+                            // audit log. A structurally valid but rejected
+                            // token (aud/binding/expiry mismatch) is a real
+                            // bearer credential, and a garbage token is
+                            // attacker-controlled bytes — neither belongs
+                            // there. A fixed sentinel is enough for ACF to
+                            // deny; the reason is in the warn log.
                             tracing::warn!(peer = %state.peer, error = %e,
                                 "cap-token verification failed");
-                            format!("unverified:{}", &raw)
+                            "unverified".to_string()
                         }
                     },
                     _ => raw,

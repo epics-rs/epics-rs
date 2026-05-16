@@ -16,6 +16,16 @@
 //! [`Backend`] trait works without the feature — applications can
 //! plug in custom discovery backends (Consul, etcd, site CMDB, ...)
 //! without depending on mdns-sd or hickory-resolver.
+//!
+//! # Trust model
+//!
+//! Discovery is **unauthenticated**. mDNS multicast and unicast DNS-SD
+//! have no notion of identity — a discovered address is whoever
+//! answered. A hostile mDNS responder on the LAN, or a poisoned DNS
+//! zone, can steer a client onto a rogue IOC, exactly as a spoofed
+//! `EPICS_CA_ADDR_LIST` entry could. Discovery decides *where to look*,
+//! never *who to trust*: integrity and authenticity of PV traffic must
+//! come from the mTLS + capability-token layer, not from discovery.
 
 use std::net::SocketAddr;
 

@@ -187,6 +187,9 @@ impl SubscriptionRegistry {
                     rec.data_type = None;
                     rec.count = None;
                 }
+                // native_type is the server-reported CA wire type (0..6),
+                // so `+ 14` always lands in the DBR_TIME range; Int64 (7)
+                // cannot reach here.
                 let data_type = *rec.data_type.get_or_insert(native_type + 14);
                 let count = *rec.count.get_or_insert(element_count);
                 let _ = transport_tx.send(TransportCommand::Subscribe {

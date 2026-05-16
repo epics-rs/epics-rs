@@ -1777,10 +1777,12 @@ impl CaChannel {
 
         let native = DbFieldType::from_u16(snap.native_type as u16)?;
         // `from_u16` only yields the six CA wire types (0..6), so `native`
-        // is never `Int64` on this path. The `*_dbr_type()` helpers are
-        // used for consistency with the rest of the codebase — they would
-        // remap `Int64` to the `*_DOUBLE` family if it could occur — not
-        // because Int64 is reachable here.
+        // is never `Int64` on this path; every arm below is therefore
+        // correct as written. The `Sts/Time/Ctrl/Gr` helpers route
+        // through `ca_wire_type()` (which would remap an `Int64` to the
+        // `*_DOUBLE` family); the `Plain` arm's `to_dbr_type()` is an
+        // identity map and relies solely on `native` being wire-bounded.
+        // The helpers are used for consistency, not for Int64 safety.
         let request_type = match class {
             DbrClass::Time => native.time_dbr_type(),
             DbrClass::Ctrl => native.ctrl_dbr_type(),
@@ -2266,7 +2268,9 @@ async fn run_coordinator(
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
                             });
                             let connected = ch.state == ChannelState::Connected;
-                            let data_type = ch.native_type.map(|t| t as u16 + 14);
+                            // `time_dbr_type()` (not `as u16 + 14`) for
+                            // consistency with the rest of the codebase.
+                            let data_type = ch.native_type.map(|t| t.time_dbr_type());
                             let count = ch.native_type.map(|_| ch.element_count);
 
                             subscriptions.add(subscription::SubscriptionRecord {

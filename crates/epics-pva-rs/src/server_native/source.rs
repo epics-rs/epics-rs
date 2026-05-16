@@ -63,6 +63,21 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// True iff `name` resolves to a known PV.
     fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
 
+    /// True iff `name` should be answered to a UDP SEARCH broadcast.
+    ///
+    /// Distinct from [`Self::has_pv`]: a name may be reachable via a
+    /// direct TCP connect (`has_pv` true) yet deliberately NOT be
+    /// advertised on UDP discovery (`searchable` false). pvxs's
+    /// built-in `ServerSource` does exactly this — `onSearch` is empty
+    /// so the `server` PV resolves only by direct connect, never by
+    /// broadcast SEARCH (`serversource.cpp`). The default impl
+    /// delegates to `has_pv`, so ordinary sources are unaffected; the
+    /// built-in [`crate::server_native::ServerInfoSource`] overrides
+    /// this to return `false`.
+    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+        self.has_pv(name)
+    }
+
     /// Fetch the type descriptor for a PV (used by GET-INIT and GET_FIELD).
     fn get_introspection(
         &self,
@@ -371,6 +386,11 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    /// Dyn forwarder for [`ChannelSource::searchable`].
+    fn searchable<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn get_introspection<'a>(
         &'a self,
         name: &'a str,
@@ -480,6 +500,12 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::has_pv(self, name))
+    }
+    fn searchable<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::searchable(self, name))
     }
     fn get_introspection<'a>(
         &'a self,

@@ -18,11 +18,13 @@
 //! — the `server` PV is *not* UDP-search-advertised; clients reach it
 //! by connecting directly to the known host:port. We mirror that by
 //! keeping [`ServerInfoSource::list_pvs`] empty so `server` never
-//! self-lists in `op=channels` output nor in beacon advertisements.
-//! `has_pv("server")` still returns `true`, which (unlike pvxs's
-//! create-only hook) also lets a UDP SEARCH for the literal name
-//! `server` succeed — a benign superset of pvxs behaviour, see the
-//! module note in `server_native/mod.rs` registration code.
+//! self-lists in `op=channels` output nor in beacon advertisements,
+//! AND by [`ServerInfoSource::searchable`] returning `false` so a UDP
+//! SEARCH for the literal name `server` is never answered (F6).
+//! `has_pv("server")` still returns `true`, which keeps the direct
+//! TCP-connect GET / RPC path working — matching pvxs exactly: the
+//! `server` PV is reachable by direct connect but invisible to
+//! broadcast discovery.
 //!
 //! Registered automatically by [`crate::server_native::PvaServer::start`]
 //! at `order = i32::MAX` so every user source takes precedence on name
@@ -220,6 +222,16 @@ impl ChannelSource for ServerInfoSource {
     fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let matches = name == SERVER_PV_NAME;
         async move { matches }
+    }
+
+    /// Always `false` — pvxs's `ServerSource::onSearch` is empty, so
+    /// the `server` PV is never advertised on UDP discovery. A client
+    /// reaches it only by a direct TCP connect to a known host:port.
+    /// Returning `false` here keeps a broadcast SEARCH for the literal
+    /// name `server` unanswered while `has_pv("server") == true` still
+    /// lets the direct-connect GET / RPC path resolve it.
+    fn searchable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+        async { false }
     }
 
     fn get_introspection(

@@ -681,7 +681,12 @@ async fn process_search_datagram(
 
                 let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
                 for (cid, name) in &req.queries {
-                    if source.has_pv(name).await {
+                    // `searchable` (not `has_pv`): a name hosted only
+                    // by a non-search-advertised source — the built-in
+                    // `ServerInfoSource` / `server` PV — must not be
+                    // answered to a broadcast SEARCH. Direct TCP
+                    // connect still resolves it via `has_pv`.
+                    if source.searchable(name).await {
                         matched_cids.push(*cid);
                     }
                 }
@@ -851,7 +856,10 @@ async fn process_v6_search_datagram(
                 let reply_dest = udp_src;
                 let mut matched_cids: Vec<u32> = Vec::with_capacity(req.queries.len());
                 for (cid, name) in &req.queries {
-                    if source.has_pv(name).await {
+                    // `searchable` (not `has_pv`): non-search-advertised
+                    // built-in sources (the `server` PV) must stay
+                    // unanswered on broadcast SEARCH. See the v4 path.
+                    if source.searchable(name).await {
                         matched_cids.push(*cid);
                     }
                 }
@@ -1386,6 +1394,84 @@ mod tests {
         assert!(
             r.is_err(),
             "isAny() reply addr on FromOriginTag must drop SEARCH; got {r:?}"
+        );
+    }
+
+    /// F6: a UDP SEARCH for the built-in `server` PV MUST NOT be
+    /// answered — pvxs `ServerSource::onSearch` is empty so `server`
+    /// resolves only by direct TCP connect, never by broadcast
+    /// discovery. The built-in `ServerInfoSource::searchable` returns
+    /// `false`, so `process_search_datagram` adds no matched CID and
+    /// (with `must_reply=false`) emits nothing. The same source's
+    /// `get_value("server")` — the direct-connect GET path — still
+    /// returns the server-info structure.
+    #[tokio::test]
+    async fn server_pv_not_answered_to_udp_search_but_direct_get_works() {
+        use crate::server_native::server_info::{SERVER_PV_NAME, ServerInfoSource};
+        use crate::server_native::peers::PeerRegistry;
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let peers = PeerRegistry::new();
+        let server_src =
+            ServerInfoSource::new([0xCD; 12], peers, || async { Vec::<String>::new() });
+
+        // Direct-connect path still resolves `server`.
+        assert!(
+            server_src.has_pv(SERVER_PV_NAME).await,
+            "has_pv must still resolve `server` for direct TCP connect"
+        );
+        assert!(
+            !server_src.searchable(SERVER_PV_NAME).await,
+            "`server` must NOT be UDP-search-advertised"
+        );
+        assert!(
+            server_src.get_value(SERVER_PV_NAME).await.is_some(),
+            "direct GET of `server` must still return the info structure"
+        );
+
+        // UDP search path: a broadcast SEARCH naming `server` must
+        // produce no reply on the sniffer socket.
+        let source: DynSource = Arc::new(server_src);
+        let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        let sniffer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("sniffer bind");
+        let sniffer_addr = sniffer.local_addr().unwrap();
+
+        // Non-unicast SEARCH (no MustReply) for the literal name
+        // `server`, reply addr = the sniffer socket.
+        let codec = PvaCodec { big_endian: false };
+        let frame = codec.build_search(
+            7,
+            42,
+            SERVER_PV_NAME,
+            [127, 0, 0, 1],
+            sniffer_addr.port(),
+            false,
+        );
+
+        process_search_datagram(
+            &source,
+            &socket,
+            None,
+            5076,
+            &frame,
+            sniffer_addr,
+            Ipv4Addr::LOCALHOST,
+            Origin::Direct,
+            5076,
+            [0u8; 12],
+            "tcp",
+        )
+        .await;
+
+        let mut buf = [0u8; 4096];
+        let r = tokio::time::timeout(Duration::from_millis(200), sniffer.recv_from(&mut buf)).await;
+        assert!(
+            r.is_err(),
+            "UDP SEARCH for `server` must NOT be answered; sniffer got {r:?}"
         );
     }
 

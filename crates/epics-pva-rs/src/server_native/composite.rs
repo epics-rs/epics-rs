@@ -224,6 +224,24 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    /// Route to the first source that *hosts* the name and ask THAT
+    /// source whether it is UDP-search-advertised. A name hosted by a
+    /// non-searchable source (the built-in `ServerInfoSource`) must
+    /// stay unanswered on broadcast SEARCH even though `has_pv` is
+    /// true — so we cannot just OR `searchable` across sources.
+    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+        let sources = self.snapshot();
+        let name = name.to_string();
+        async move {
+            for src in sources {
+                if src.has_pv(&name).await {
+                    return src.searchable(&name).await;
+                }
+            }
+            false
+        }
+    }
+
     fn get_introspection(
         &self,
         name: &str,

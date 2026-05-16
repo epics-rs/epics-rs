@@ -31,6 +31,13 @@ pub(crate) struct SubscriptionRecord {
     pub cid: u32,
     pub data_type: Option<u16>,
     pub count: Option<u32>,
+    /// `true` when `data_type`/`count` were chosen explicitly by the
+    /// caller, `false` when they were auto-derived from the channel's
+    /// native type at subscribe time. Auto-derived values must be
+    /// re-derived when the IOC redefines the record (the channel
+    /// reports `NativeTypeChanged` on reconnect); user-supplied values
+    /// are preserved across reconnects. See `restore_for_channel`.
+    pub type_user_supplied: bool,
     pub mask: u16,
     pub server_addr: SocketAddr,
     pub callback_tx: mpsc::Sender<CaResult<Snapshot>>,
@@ -137,12 +144,20 @@ impl SubscriptionRegistry {
     /// Generate restore commands for subscriptions tied to the given cid,
     /// using the new sid.
     /// Restore subscriptions after reconnect. Returns (restored, failed) counts.
+    ///
+    /// `native_changed` is `true` when this (re)connection reports a
+    /// native DBR type different from the one observed before (the IOC
+    /// redefined the record, or the channel reconnected to a different
+    /// IOC). When set, auto-derived `data_type`/`count` are reset to
+    /// `None` so they re-derive from the fresh `native_type`; subscriptions
+    /// created with an explicit user-chosen type keep their type.
     pub fn restore_for_channel(
         &mut self,
         cid: u32,
         new_sid: u32,
         native_type: u16,
         element_count: u32,
+        native_changed: bool,
         server_addr: std::net::SocketAddr,
         transport_tx: &mpsc::UnboundedSender<TransportCommand>,
     ) -> (u32, u32) {
@@ -163,6 +178,14 @@ impl SubscriptionRegistry {
             if rec.cid == cid && rec.needs_restore {
                 rec.needs_restore = false;
                 rec.server_addr = server_addr;
+                // The IOC redefined the record: a previously auto-derived
+                // type/count is now stale and would decode monitor frames
+                // against the wrong DBR type. Drop it so it re-derives from
+                // the fresh native type below. User-supplied types are kept.
+                if native_changed && !rec.type_user_supplied {
+                    rec.data_type = None;
+                    rec.count = None;
+                }
                 let data_type = *rec.data_type.get_or_insert(native_type + 14);
                 let count = *rec.count.get_or_insert(element_count);
                 let _ = transport_tx.send(TransportCommand::Subscribe {
@@ -243,5 +266,116 @@ fn try_deliver_err(
             MonitorDeliveryOutcome::Queued(server_addr)
         }
         Err(_) => MonitorDeliveryOutcome::Dropped(server_addr),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:5064".parse().unwrap()
+    }
+
+    /// Builds a record plus its callback receiver. The caller must keep
+    /// the returned receiver alive — `restore_for_channel` drops any
+    /// subscription whose callback receiver has been closed.
+    fn record(
+        subid: u32,
+        cid: u32,
+        type_user_supplied: bool,
+    ) -> (SubscriptionRecord, mpsc::Receiver<CaResult<Snapshot>>) {
+        let (callback_tx, rx) = mpsc::channel(8);
+        let rec = SubscriptionRecord {
+            subid,
+            cid,
+            data_type: None,
+            count: None,
+            type_user_supplied,
+            mask: 1,
+            server_addr: addr(),
+            callback_tx,
+            needs_restore: true,
+            deadband: 0.0,
+            last_value: None,
+            pending_deliveries: 0,
+        };
+        (rec, rx)
+    }
+
+    /// Drains a `TransportCommand::Subscribe` and returns its
+    /// `(data_type, count)`.
+    fn drained_type(rx: &mut mpsc::UnboundedReceiver<TransportCommand>) -> (u16, u32) {
+        match rx.try_recv() {
+            Ok(TransportCommand::Subscribe {
+                data_type, count, ..
+            }) => (data_type, count),
+            Ok(_) => panic!("expected Subscribe command, got a different TransportCommand"),
+            Err(e) => panic!("expected Subscribe command, channel error: {e:?}"),
+        }
+    }
+
+    /// An auto-derived subscription must re-derive `data_type`/`count`
+    /// when the channel reports its native type changed on reconnect.
+    /// Without the reset, monitor frames would decode against the
+    /// stale DBR type locked in by the first connect.
+    #[test]
+    fn auto_derived_type_resets_on_native_change() {
+        let mut reg = SubscriptionRegistry::new();
+        let (rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        reg.add(rec);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // First connect: native type DBR_SHORT(1), count 1.
+        // data_type derives to STS-class 1 + 14 = 15.
+        let (restored, failed) = reg.restore_for_channel(100, 7, 1, 1, false, addr(), &tx);
+        assert_eq!((restored, failed), (1, 0));
+        assert_eq!(drained_type(&mut rx), (15, 1));
+
+        // IOC redefines the record: reconnect with native type
+        // DBR_DOUBLE(6), count 3, native_changed = true.
+        reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
+        let (restored, failed) = reg.restore_for_channel(100, 8, 6, 3, true, addr(), &tx);
+        assert_eq!((restored, failed), (1, 0));
+        // data_type must re-derive to 6 + 14 = 20, count to 3.
+        assert_eq!(drained_type(&mut rx), (20, 3));
+    }
+
+    /// A subscription created with an explicit user-chosen type keeps
+    /// that type across a native-type change — only auto-derived ones
+    /// are reset.
+    #[test]
+    fn user_supplied_type_preserved_on_native_change() {
+        let mut reg = SubscriptionRegistry::new();
+        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ true);
+        rec.data_type = Some(19); // explicit DBR_TIME_SHORT
+        rec.count = Some(2);
+        reg.add(rec);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let (restored, _) = reg.restore_for_channel(100, 8, 6, 5, true, addr(), &tx);
+        assert_eq!(restored, 1);
+        // User-supplied type/count survive the native-type change.
+        assert_eq!(drained_type(&mut rx), (19, 2));
+    }
+
+    /// Without a native-type change, an auto-derived type stays locked
+    /// to its first-connect value (the established reconnect behaviour).
+    #[test]
+    fn auto_derived_type_stable_without_native_change() {
+        let mut reg = SubscriptionRegistry::new();
+        let (rec, _cb_rx) = record(1, 100, false);
+        reg.add(rec);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let (restored, _) = reg.restore_for_channel(100, 7, 1, 1, false, addr(), &tx);
+        assert_eq!(restored, 1);
+        assert_eq!(drained_type(&mut rx), (15, 1));
+
+        reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
+        let (restored, _) = reg.restore_for_channel(100, 8, 6, 3, false, addr(), &tx);
+        assert_eq!(restored, 1);
+        // native_changed = false → type/count stay at first-connect values.
+        assert_eq!(drained_type(&mut rx), (15, 1));
     }
 }

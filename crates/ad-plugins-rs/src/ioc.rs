@@ -335,7 +335,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             use crate::file_jpeg::JpegFileProcessor;
             create_plugin_runtime(
                 port_name,
-                JpegFileProcessor::new(90),
+                JpegFileProcessor::new(50),
                 pool,
                 queue_size,
                 ndarray_port,

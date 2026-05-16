@@ -41,9 +41,25 @@ impl Default for FFTConfig {
     }
 }
 
+/// Smallest power of two greater than or equal to `n` (C++ `nextPow2`).
+///
+/// `next_pow2(0)` and `next_pow2(1)` return 1.
+pub fn next_pow2(n: usize) -> usize {
+    if n <= 1 {
+        return 1;
+    }
+    let mut p = 1usize;
+    while p < n {
+        p <<= 1;
+    }
+    p
+}
+
 /// Compute 1D FFT magnitude for each row of a 2D array using rustfft.
-/// Returns a Float64 array with half the width (positive frequencies only, matching C++).
-/// Magnitudes are normalized by N (C++: `FFTAbsValue[j] = sqrt(...) / nTimeX`).
+/// Returns a Float64 array with half the *padded* width (positive frequencies
+/// only). Like C++ NDPluginFFT, each row is zero-padded to the next power of
+/// two before the transform, and `nFreqX = paddedWidth / 2`.
+/// Magnitudes are normalized by the padded length.
 pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
     if src.dims.is_empty() {
         return None;
@@ -60,28 +76,34 @@ pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
         return None;
     }
 
-    let mut planner = FftPlanner::<f64>::new();
-    let fft = planner.plan_fft_forward(width);
+    // C++ rounds the time dimension up to the next power of two and zero-pads.
+    let padded = next_pow2(width);
 
-    // C++: nFreqX = nTimeX / 2 (only positive frequencies)
-    let n_freq = width / 2;
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(padded);
+
+    // C++: nFreqX = paddedWidth / 2 (only positive frequencies)
+    let n_freq = padded / 2;
     if n_freq == 0 {
         return None;
     }
-    let scale = 1.0 / width as f64;
+    let scale = 1.0 / padded as f64;
 
     let mut magnitudes = vec![0.0f64; n_freq * height];
-    let mut row_buf = vec![Complex::new(0.0, 0.0); width];
+    let mut row_buf = vec![Complex::new(0.0, 0.0); padded];
 
     for row in 0..height {
-        // Fill complex buffer: real = pixel value, imag = 0
+        // Fill complex buffer: real = pixel value, imag = 0; tail zero-padded.
+        for c in row_buf.iter_mut() {
+            *c = Complex::new(0.0, 0.0);
+        }
         for i in 0..width {
             row_buf[i] = Complex::new(src.data.get_as_f64(row * width + i).unwrap_or(0.0), 0.0);
         }
 
         fft.process(&mut row_buf);
 
-        // Compute magnitudes (normalized by N, only first half)
+        // Compute magnitudes (normalized by padded N, only first half)
         for i in 0..n_freq {
             magnitudes[row * n_freq + i] = row_buf[i].norm() * scale;
         }
@@ -110,24 +132,31 @@ pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
         return None;
     }
 
-    let w = src.dims[0].size;
-    let h = src.dims[1].size;
+    let src_w = src.dims[0].size;
+    let src_h = src.dims[1].size;
 
-    if w == 0 || h == 0 {
+    if src_w == 0 || src_h == 0 {
         return None;
     }
+
+    // C++ zero-pads each dimension to the next power of two.
+    let w = next_pow2(src_w);
+    let h = next_pow2(src_h);
 
     let mut planner = FftPlanner::<f64>::new();
     let fft_row = planner.plan_fft_forward(w);
     let fft_col = planner.plan_fft_forward(h);
 
-    // Step 1: Row FFTs — build a w×h complex buffer
+    // Step 1: Row FFTs — build a padded w×h complex buffer (zero-padded).
     let mut data = vec![Complex::new(0.0, 0.0); w * h];
     let mut row_buf = vec![Complex::new(0.0, 0.0); w];
 
-    for row in 0..h {
-        for i in 0..w {
-            row_buf[i] = Complex::new(src.data.get_as_f64(row * w + i).unwrap_or(0.0), 0.0);
+    for row in 0..src_h {
+        for c in row_buf.iter_mut() {
+            *c = Complex::new(0.0, 0.0);
+        }
+        for i in 0..src_w {
+            row_buf[i] = Complex::new(src.data.get_as_f64(row * src_w + i).unwrap_or(0.0), 0.0);
         }
         fft_row.process(&mut row_buf);
         data[row * w..(row * w + w)].copy_from_slice(&row_buf);
@@ -148,7 +177,7 @@ pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
         }
     }
 
-    // Step 3: Compute magnitudes (half spectrum, normalized by N*M)
+    // Step 3: Compute magnitudes (half spectrum, normalized by padded N*M)
     let n_freq_x = w / 2;
     let n_freq_y = h / 2;
     if n_freq_x == 0 || n_freq_y == 0 {
@@ -272,19 +301,24 @@ impl FFTProcessor {
             return None;
         }
 
-        let fft = self.planner.plan_fft_forward(width);
+        // C++ zero-pads the time series to the next power of two.
+        let padded = next_pow2(width);
+        let fft = self.planner.plan_fft_forward(padded);
 
-        // C++: nFreqX = nTimeX / 2 (only positive frequencies)
-        let n_freq = width / 2;
+        // C++: nFreqX = paddedWidth / 2 (only positive frequencies)
+        let n_freq = padded / 2;
         if n_freq == 0 {
             return None;
         }
-        let scale = 1.0 / width as f64;
+        let scale = 1.0 / padded as f64;
 
         let mut magnitudes = vec![0.0f64; n_freq * height];
-        let mut row_buf = vec![Complex::new(0.0, 0.0); width];
+        let mut row_buf = vec![Complex::new(0.0, 0.0); padded];
 
         for row in 0..height {
+            for c in row_buf.iter_mut() {
+                *c = Complex::new(0.0, 0.0);
+            }
             for i in 0..width {
                 row_buf[i] = Complex::new(src.data.get_as_f64(row * width + i).unwrap_or(0.0), 0.0);
             }
@@ -329,7 +363,10 @@ impl FFTProcessor {
         let fft = self.planner.plan_fft_inverse(width);
         let scale = 1.0 / width as f64;
 
-        let mut magnitudes = vec![0.0f64; width * height];
+        // An inverse transform of a real-valued spectrum yields signed real
+        // samples: take the real part, not the modulus, so negative samples
+        // survive a forward->inverse round trip.
+        let mut samples = vec![0.0f64; width * height];
         let mut row_buf = vec![Complex::new(0.0, 0.0); width];
 
         for row in 0..height {
@@ -341,13 +378,13 @@ impl FFTProcessor {
             }
             fft.process(&mut row_buf);
             for (i, c) in row_buf.iter().enumerate() {
-                magnitudes[row * width + i] = c.norm() * scale;
+                samples[row * width + i] = c.re * scale;
             }
         }
 
         let dims = src.dims.clone();
         let mut arr = NDArray::new(dims, NDDataType::Float64);
-        arr.data = NDDataBuffer::F64(magnitudes);
+        arr.data = NDDataBuffer::F64(samples);
         arr.unique_id = src.unique_id;
         arr.timestamp = src.timestamp;
         arr.attributes = src.attributes.clone();
@@ -359,12 +396,16 @@ impl FFTProcessor {
             return None;
         }
 
-        let w = src.dims[0].size;
-        let h = src.dims[1].size;
+        let src_w = src.dims[0].size;
+        let src_h = src.dims[1].size;
 
-        if w == 0 || h == 0 {
+        if src_w == 0 || src_h == 0 {
             return None;
         }
+
+        // C++ zero-pads each dimension to the next power of two.
+        let w = next_pow2(src_w);
+        let h = next_pow2(src_h);
 
         let fft_row = self.planner.plan_fft_forward(w);
         let fft_col = self.planner.plan_fft_forward(h);
@@ -372,9 +413,12 @@ impl FFTProcessor {
         let mut data = vec![Complex::new(0.0, 0.0); w * h];
         let mut row_buf = vec![Complex::new(0.0, 0.0); w];
 
-        for row in 0..h {
-            for i in 0..w {
-                row_buf[i] = Complex::new(src.data.get_as_f64(row * w + i).unwrap_or(0.0), 0.0);
+        for row in 0..src_h {
+            for c in row_buf.iter_mut() {
+                *c = Complex::new(0.0, 0.0);
+            }
+            for i in 0..src_w {
+                row_buf[i] = Complex::new(src.data.get_as_f64(row * src_w + i).unwrap_or(0.0), 0.0);
             }
             fft_row.process(&mut row_buf);
             data[row * w..(row * w + w)].copy_from_slice(&row_buf);
@@ -391,7 +435,7 @@ impl FFTProcessor {
             }
         }
 
-        // C++: nFreqX = nTimeX/2, nFreqY = nTimeY/2; normalize by N*M
+        // C++: nFreqX = paddedX/2, nFreqY = paddedY/2; normalize by padded N*M
         let n_freq_x = w / 2;
         let n_freq_y = h / 2;
         if n_freq_x == 0 || n_freq_y == 0 {
@@ -462,11 +506,12 @@ impl FFTProcessor {
             data[row * w..(row * w + w)].copy_from_slice(&row_buf);
         }
 
-        let magnitudes: Vec<f64> = data.iter().map(|c| c.norm() * scale).collect();
+        // Inverse transform yields signed real samples: keep the real part.
+        let samples: Vec<f64> = data.iter().map(|c| c.re * scale).collect();
 
         let dims = vec![NDDimension::new(w), NDDimension::new(h)];
         let mut arr = NDArray::new(dims, NDDataType::Float64);
-        arr.data = NDDataBuffer::F64(magnitudes);
+        arr.data = NDDataBuffer::F64(samples);
         arr.unique_id = src.unique_id;
         arr.timestamp = src.timestamp;
         arr.attributes = src.attributes.clone();
@@ -947,5 +992,73 @@ mod tests {
         let result = fft_1d_rows(&arr, false).unwrap();
         assert_eq!(result.unique_id, 42);
         assert_eq!(result.timestamp, arr.timestamp);
+    }
+
+    #[test]
+    fn test_next_pow2() {
+        assert_eq!(next_pow2(0), 1);
+        assert_eq!(next_pow2(1), 1);
+        assert_eq!(next_pow2(2), 2);
+        assert_eq!(next_pow2(3), 4);
+        assert_eq!(next_pow2(5), 8);
+        assert_eq!(next_pow2(8), 8);
+        assert_eq!(next_pow2(100), 128);
+    }
+
+    #[test]
+    fn test_fft_1d_pads_to_power_of_two() {
+        // Regression: a non-power-of-2 width is zero-padded to the next
+        // power of two; nFreqX = paddedWidth / 2.
+        let n = 5; // -> padded to 8 -> n_freq = 4
+        let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
+        if let NDDataBuffer::F64(ref mut v) = arr.data {
+            for i in 0..n {
+                v[i] = 1.0;
+            }
+        }
+        let result = fft_1d_rows(&arr, false).unwrap();
+        assert_eq!(result.dims[0].size, 4); // 8 / 2, not 5 / 2 = 2
+    }
+
+    #[test]
+    fn test_fft_2d_pads_to_power_of_two() {
+        // 6x3 -> padded 8x4 -> n_freq 4x2.
+        let arr = NDArray::new(
+            vec![NDDimension::new(6), NDDimension::new(3)],
+            NDDataType::Float64,
+        );
+        let result = fft_2d(&arr, false).unwrap();
+        assert_eq!(result.dims[0].size, 4); // 8 / 2
+        assert_eq!(result.dims[1].size, 2); // 4 / 2
+    }
+
+    #[test]
+    fn test_inverse_fft_preserves_sign() {
+        // Regression: the inverse transform must yield signed real samples.
+        // Build a spectrum whose inverse is a signed cosine and verify the
+        // output contains negative values (the old code took the modulus).
+        let n = 8;
+        let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
+        if let NDDataBuffer::F64(ref mut v) = arr.data {
+            // Spectrum with a single non-DC bin: inverse is a real cosine
+            // that swings negative.
+            v[1] = 4.0;
+            v[n - 1] = 4.0;
+        }
+        let config = FFTConfig {
+            mode: FFTMode::Rows1D,
+            direction: FFTDirection::Inverse,
+            suppress_dc: false,
+            num_average: 0,
+        };
+        let mut proc = FFTProcessor::with_config(config);
+        let pool = NDArrayPool::new(0);
+        let result = proc.process_array(&arr, &pool);
+        if let NDDataBuffer::F64(ref v) = result.output_arrays[0].data {
+            let has_negative = v.iter().any(|&x| x < -1e-6);
+            assert!(has_negative, "inverse FFT must keep negative samples: {v:?}");
+        } else {
+            panic!("expected F64 data");
+        }
     }
 }

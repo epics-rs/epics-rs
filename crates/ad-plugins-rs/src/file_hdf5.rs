@@ -903,7 +903,7 @@ impl Hdf5Writer {
                     let es = MAX_ATTRIBUTE_STRING_SIZE;
                     let ds = group
                         .new_dataset::<u8>()
-                        .shape(&[n, es])
+                        .shape([n, es])
                         .chunk(&[chunk, es])
                         .max_shape(&[None, Some(es)])
                         .create(&ad.name)
@@ -942,7 +942,7 @@ impl Hdf5Writer {
             .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 group error: {}", e)))?;
         let ds = group
             .new_dataset::<f64>()
-            .shape(&[n, 5])
+            .shape([n, 5])
             .chunk(&[1, 5])
             .max_shape(&[None, Some(5)])
             .create("timestamp")

@@ -145,11 +145,11 @@ impl Hdf5Layout {
     pub fn from_file(path: &std::path::Path) -> Result<Hdf5Layout, LayoutError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| LayoutError(format!("cannot read layout file: {}", e)))?;
-        Self::from_str(&text)
+        Self::parse(&text)
     }
 
     /// Parse a layout XML document from a string.
-    pub fn from_str(text: &str) -> Result<Hdf5Layout, LayoutError> {
+    pub fn parse(text: &str) -> Result<Hdf5Layout, LayoutError> {
         let tokens = tokenize(text)?;
         let mut parser = Parser {
             tokens,
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn parses_full_tree() {
-        let layout = Hdf5Layout::from_str(SAMPLE).unwrap();
+        let layout = Hdf5Layout::parse(SAMPLE).unwrap();
         assert_eq!(layout.groups.len(), 1);
         assert_eq!(
             layout.detector_data_destination.as_deref(),
@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn detector_path_resolves() {
-        let layout = Hdf5Layout::from_str(SAMPLE).unwrap();
+        let layout = Hdf5Layout::parse(SAMPLE).unwrap();
         assert_eq!(
             layout.detector_dataset_path().as_deref(),
             Some("/entry/data/data")
@@ -740,21 +740,21 @@ mod tests {
 
     #[test]
     fn rejects_missing_root() {
-        let err = Hdf5Layout::from_str("<foo/>").unwrap_err();
+        let err = Hdf5Layout::parse("<foo/>").unwrap_err();
         assert!(err.0.contains("hdf5_layout"));
     }
 
     #[test]
     fn rejects_missing_dataset_name() {
         let xml = r#"<hdf5_layout><group name="g"><dataset source="detector"/></group></hdf5_layout>"#;
-        let err = Hdf5Layout::from_str(xml).unwrap_err();
+        let err = Hdf5Layout::parse(xml).unwrap_err();
         assert!(err.0.contains("name"));
     }
 
     #[test]
     fn rejects_bad_source() {
         let xml = r#"<hdf5_layout><group name="g"><dataset name="d" source="bogus"/></group></hdf5_layout>"#;
-        let err = Hdf5Layout::from_str(xml).unwrap_err();
+        let err = Hdf5Layout::parse(xml).unwrap_err();
         assert!(err.0.contains("bogus"));
     }
 
@@ -766,7 +766,7 @@ mod tests {
             <dataset name="d" source="constant" value="a &amp; b" type="string"/>
           </group>
         </hdf5_layout>"#;
-        let layout = Hdf5Layout::from_str(xml).unwrap();
+        let layout = Hdf5Layout::parse(xml).unwrap();
         assert_eq!(layout.groups[0].datasets[0].value, "a & b");
     }
 }

@@ -2153,6 +2153,48 @@ mod tests {
     }
 
     #[test]
+    fn test_sub_frame_chunking_with_compression() {
+        // Sub-frame chunk tiles must round-trip through a filter pipeline:
+        // each write_chunk_at tile is compressed independently.
+        let path = temp_path("hdf5_subchunk_zlib");
+        let mut writer = Hdf5Writer::new();
+        writer.set_chunk_size_auto(false);
+        writer.set_n_row_chunks(4);
+        writer.set_n_col_chunks(4);
+        writer.set_compression_type(COMPRESS_ZLIB);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        for f in 0..2u16 {
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = f * 100 + i as u16;
+                }
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&arr).unwrap();
+        }
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![2, 8, 8]);
+        assert_eq!(ds.chunk_dims(), Some(vec![1, 4, 4]));
+        let raw: Vec<u16> = ds.read_raw().unwrap();
+        for f in 0..2u16 {
+            for i in 0..64usize {
+                assert_eq!(raw[f as usize * 64 + i], f * 100 + i as u16);
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn test_non_dividing_chunk_falls_back_to_full() {
         // A chunk size that does not divide the frame must fall back to the
         // full dimension — never pad the dataset shape.

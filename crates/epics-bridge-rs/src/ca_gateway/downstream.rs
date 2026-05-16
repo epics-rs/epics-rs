@@ -5,20 +5,20 @@
 //! subscriptions establish. Downstream clients see PVs as if they
 //! were normal in-process PVs — the gateway is transparent on the wire.
 //!
-//! ## Pre-registration vs lazy resolution
+//! ## Lazy resolution and optional preloading
 //!
-//! The current implementation pre-registers all PVs from the `.pvlist`
-//! at gateway startup, eagerly subscribing to each upstream. This differs
-//! from C++ ca-gateway, which uses lazy on-demand resolution: a downstream
-//! search triggers an upstream search, and the PV is added to the cache
-//! only after the upstream IOC responds.
+//! Resolution is lazy on-demand, matching C++ ca-gateway: a downstream
+//! search for an unknown name triggers an upstream subscription, and the
+//! PV is added to the shadow database only after the upstream IOC
+//! responds. This is implemented by `GatewayServer::install_search_resolver`
+//! (see `server.rs`), which installs a `PvDatabase::set_search_resolver`
+//! hook — the epics-rs equivalent of C++ ca-gateway's
+//! `gateServer::pvExistTest()`.
 //!
-//! Lazy resolution requires a search-hook in `epics-base-rs::PvDatabase`
-//! that calls back into the gateway when an unknown name is searched.
-//! That hook doesn't exist yet — adding it is a future enhancement.
-//! Pre-registration works for any pvlist where the patterns are
-//! enumerable (literal names) or where you're willing to subscribe
-//! to a known set of upstream PVs at startup.
+//! Eager pre-subscription is still available as an *opt-in* convenience:
+//! when `GatewayConfig::preload_path` is set, `GatewayServer::preload_pvs`
+//! subscribes to a known set of upstream PVs at startup. It is not
+//! required for lazy resolution to work.
 
 use std::sync::Arc;
 

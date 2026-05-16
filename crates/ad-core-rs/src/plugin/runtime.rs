@@ -1456,6 +1456,19 @@ async fn clamp_writeback(port: &PortHandle, reason: usize, value: i32) {
         .await;
 }
 
+/// Resolve a `(port, addr)` pair to a WiringRegistry key (G6).
+///
+/// Address 0 keys on the bare port name (the common single-address case);
+/// a non-zero address appends `:<addr>` so a multi-address driver can
+/// register a distinct output per source address.
+fn upstream_key(port: &str, addr: i32) -> String {
+    if port.is_empty() || addr == 0 {
+        port.to_string()
+    } else {
+        format!("{port}:{addr}")
+    }
+}
+
 fn plugin_data_loop<P: NDPluginProcess>(
     shared: Arc<parking_lot::Mutex<SharedProcessorInner<P>>>,
     mut array_rx: NDArrayReceiver,
@@ -1480,7 +1493,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
     let max_byte_rate_reason = plugin_params.max_byte_rate;
     let num_threads_reason = plugin_params.num_threads;
     let max_threads_reason = plugin_params.max_threads;
+    // G6: the upstream connection is keyed by (port, addr). `current_upstream`
+    // is the base port name; `current_addr` is the selected NDArrayAddr; the
+    // effective WiringRegistry key is computed by `upstream_key`.
     let mut current_upstream = initial_upstream;
+    let mut current_addr: i32 = 0;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1604,20 +1621,20 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             // (C++ writeInt32 NDPluginDriver.cpp:724-728).
                             if reason == nd_array_addr_reason {
                                 let new_addr = value.as_i32();
-                                let needs_reconnect = {
-                                    let mut guard = shared.lock();
-                                    let changed = guard.nd_array_addr != new_addr;
-                                    guard.nd_array_addr = new_addr;
-                                    changed
-                                };
-                                if needs_reconnect && !current_upstream.is_empty() {
-                                    // Re-key the wiring edge on (port, addr).
-                                    if let Err(e) = wiring.rewire_by_name(
+                                if new_addr != current_addr {
+                                    let old_key = upstream_key(&current_upstream, current_addr);
+                                    let new_key = upstream_key(&current_upstream, new_addr);
+                                    shared.lock().nd_array_addr = new_addr;
+                                    match wiring.rewire_by_name(
                                         &sender_port_name,
-                                        &current_upstream,
-                                        &current_upstream,
+                                        &old_key,
+                                        &new_key,
                                     ) {
-                                        eprintln!("NDArrayAddr reconnect failed: {e}");
+                                        Ok(()) => current_addr = new_addr,
+                                        Err(e) => {
+                                            eprintln!("NDArrayAddr reconnect failed: {e}");
+                                            shared.lock().nd_array_addr = current_addr;
+                                        }
                                     }
                                 }
                             }
@@ -1691,14 +1708,22 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             if reason == sort_size_reason {
                                 shared.lock().sort_size = value.as_i32();
                             }
-                            // Handle NDArrayPort rewiring
+                            // Handle NDArrayPort rewiring — keyed by (port, addr).
                             if reason == nd_array_port_reason {
                                 if let Some(new_port) = value.as_string() {
                                     if new_port != current_upstream {
-                                        let old = std::mem::replace(&mut current_upstream, new_port.to_string());
-                                        if let Err(e) = wiring.rewire_by_name(&sender_port_name, &old, new_port) {
-                                            eprintln!("NDArrayPort rewire failed: {e}");
-                                            current_upstream = old;
+                                        let old_key =
+                                            upstream_key(&current_upstream, current_addr);
+                                        let new_key = upstream_key(new_port, current_addr);
+                                        match wiring.rewire_by_name(
+                                            &sender_port_name,
+                                            &old_key,
+                                            &new_key,
+                                        ) {
+                                            Ok(()) => current_upstream = new_port.to_string(),
+                                            Err(e) => {
+                                                eprintln!("NDArrayPort rewire failed: {e}")
+                                            }
                                         }
                                     }
                                 }

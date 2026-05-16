@@ -261,6 +261,14 @@ struct ClientState {
     /// username.
     #[cfg(feature = "cap-tokens")]
     cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
+    /// TLS channel binding (SHA-256 of the peer's leaf certificate DER)
+    /// for this connection. `Some(..)` only when the peer connected
+    /// over mTLS and presented a client certificate; `None` for
+    /// plaintext circuits. A cap-token presented over a plaintext
+    /// circuit (`None`) is rejected by `TokenVerifier::verify` —
+    /// mTLS-gating, so a stolen token cannot be replayed off-channel.
+    #[cfg(feature = "cap-tokens")]
+    tls_channel_binding: Option<crate::cap_token::ChannelBinding>,
     /// Pending WRITE_NOTIFY completion tasks. Each entry is the channel
     /// `sid`-tagged AbortHandle of a task awaiting `put_notify_tx` for
     /// an async record write. Aborted on connection drop so a stuck
@@ -297,6 +305,8 @@ impl ClientState {
             rate_limit_strike_threshold: 0,
             #[cfg(feature = "cap-tokens")]
             cap_token_verifier: None,
+            #[cfg(feature = "cap-tokens")]
+            tls_channel_binding: None,
             write_notify_tasks: Vec::new(),
         }
     }
@@ -738,11 +748,12 @@ async fn accept_loop(
                             Ok(Ok(tls_stream)) => {
                                 // Extract verified peer identity + issuer
                                 // from the client certificate, if presented.
-                                let (identity, authority) = tls_stream
-                                    .get_ref()
-                                    .1
-                                    .peer_certificates()
-                                    .and_then(|chain| chain.first())
+                                let leaf_cert =
+                                    tls_stream.get_ref().1.peer_certificates().and_then(
+                                        |chain| chain.first().cloned(),
+                                    );
+                                let (identity, authority) = leaf_cert
+                                    .as_ref()
                                     .map(|cert| {
                                         (
                                             crate::tls::identity_from_cert(cert),
@@ -751,6 +762,17 @@ async fn accept_loop(
                                     })
                                     .map(|(id, auth)| (Some(id), auth))
                                     .unwrap_or((None, None));
+                                // TLS channel binding: SHA-256 of the
+                                // peer's leaf certificate DER. Threaded
+                                // into `handle_client` so cap-token
+                                // verification is bound to this circuit.
+                                #[cfg(feature = "cap-tokens")]
+                                let tls_channel_binding =
+                                    leaf_cert.as_ref().map(|cert| {
+                                        crate::cap_token::ChannelBinding::from_peer_cert_der(
+                                            cert.as_ref(),
+                                        )
+                                    });
                                 if let Some(ref id) = identity {
                                     tracing::info!(
                                         peer = %peer,
@@ -773,6 +795,8 @@ async fn accept_loop(
                                     stats_for_client.clone(),
                                     #[cfg(feature = "cap-tokens")]
                                     cap_token_verifier_for_client.clone(),
+                                    #[cfg(feature = "cap-tokens")]
+                                    tls_channel_binding,
                                 )
                                 .await
                             }
@@ -797,6 +821,9 @@ async fn accept_loop(
                             stats_for_client.clone(),
                             #[cfg(feature = "cap-tokens")]
                             cap_token_verifier_for_client.clone(),
+                            // Plaintext circuit: no channel binding.
+                            #[cfg(feature = "cap-tokens")]
+                            None,
                         )
                         .await
                     }
@@ -817,6 +844,9 @@ async fn accept_loop(
                         stats_for_client.clone(),
                         #[cfg(feature = "cap-tokens")]
                         cap_token_verifier_for_client.clone(),
+                        // No TLS compiled in: never a channel binding.
+                        #[cfg(feature = "cap-tokens")]
+                        None,
                     )
                     .await
                 }
@@ -884,6 +914,12 @@ async fn handle_client<S>(
     // dispatch fixtures that don't spin up a full CaServer.
     stats: Option<Arc<super::ca_server::ServerStats>>,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
+    // TLS channel binding (SHA-256 of the peer's leaf cert DER),
+    // computed at the mTLS accept site. `None` for plaintext peers —
+    // a cap-token presented on a `None` circuit is rejected by
+    // `TokenVerifier::verify`, so the token is cryptographically
+    // bound to the TLS channel it was issued for.
+    #[cfg(feature = "cap-tokens")] tls_channel_binding: Option<crate::cap_token::ChannelBinding>,
 ) -> CaResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -901,6 +937,7 @@ where
     #[cfg(feature = "cap-tokens")]
     {
         state.cap_token_verifier = cap_token_verifier;
+        state.tls_channel_binding = tls_channel_binding;
     }
     // Default hostname: verified TLS identity if present, otherwise the
     // peer IP. Matches C rsrv default with EPICS_CAS_USE_HOST_NAMES=NO,
@@ -1491,7 +1528,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // every well-formed token; cap-tokens was non-
                 // functional whenever a verifier was configured.
                 state.username = match (&state.cap_token_verifier, raw.starts_with("cap:")) {
-                    (Some(v), true) => match v.verify(&raw) {
+                    (Some(v), true) => match v.verify(
+                        &raw,
+                        state.tls_channel_binding.as_ref(),
+                    ) {
                         Ok(claims) => {
                             tracing::debug!(peer = %state.peer, sub = %claims.sub,
                                 "cap-token verified");
@@ -3465,6 +3505,8 @@ mod extended_header_split_tests {
                 None,
                 None,
                 None,
+                None,
+                #[cfg(feature = "cap-tokens")]
                 None,
                 #[cfg(feature = "cap-tokens")]
                 None,

@@ -414,12 +414,60 @@ impl PvaServer {
     }
 
     /// Spawn the UDP responder and TCP listener; return a handle.
+    ///
+    /// The user-supplied `source` is wrapped in a
+    /// [`super::CompositeSource`] together with the built-in
+    /// [`super::server_info::ServerInfoSource`] (F6). The built-in
+    /// source is registered at `order = i32::MAX` — the lowest
+    /// priority slot — so a user source serving a PV literally named
+    /// `server` always wins, mirroring pvxs registering its
+    /// `ServerSource` at `(order = -1, "__server")` (the lowest pvxs
+    /// priority). The built-in source answers GET / RPC against the
+    /// `server` PV so `pvlist`-style clients can enumerate hosted
+    /// channels and read server info (GUID, version, peer counts).
     pub fn start<S>(source: Arc<S>, config: PvaServerConfig) -> Self
     where
         S: ChannelSource + 'static,
     {
-        let dyn_source: DynSource = source as Arc<dyn ChannelSourceObj>;
         let guid = random_guid();
+        // The live per-peer registry is created up-front so the
+        // built-in server-info source can report connection counts.
+        let peers = crate::server_native::peers::PeerRegistry::new();
+
+        // User source kept as a dyn handle: the built-in source's
+        // channel-list closure enumerates it directly (rather than
+        // the composite, which would also include the built-in source
+        // — harmless since its `list_pvs` is empty, but enumerating
+        // the user half keeps the intent explicit).
+        let user_source: DynSource = source as Arc<dyn ChannelSourceObj>;
+        let server_info = Arc::new(super::server_info::ServerInfoSource::new(
+            guid,
+            peers.clone(),
+            {
+                let user_source = user_source.clone();
+                move || {
+                    let user_source = user_source.clone();
+                    async move { user_source.list_pvs().await }
+                }
+            },
+        ));
+
+        // Composite registry: user source at order 0 (highest
+        // priority), built-in `__server` at i32::MAX (lowest). pvxs
+        // `server.cpp:667` registers `ServerSource` analogously.
+        let composite = super::CompositeSource::new();
+        composite
+            .add_source("__user", user_source, 0)
+            .expect("PvaServer::start: register user source");
+        composite
+            .add_source(
+                super::server_info::SERVER_SOURCE_NAME,
+                server_info as DynSource,
+                i32::MAX,
+            )
+            .expect("PvaServer::start: register built-in server source");
+        let dyn_source: DynSource = composite as Arc<dyn ChannelSourceObj>;
+
         let bind_addr = SocketAddr::new(config.bind_ip, config.tcp_port);
 
         // Robustness: bind the TCP listener synchronously here so the
@@ -504,7 +552,6 @@ impl PvaServer {
         } else {
             None
         };
-        let peers = crate::server_native::peers::PeerRegistry::new();
         let tcp_handle = tokio::spawn(crate::server_native::tcp::run_tcp_server_on_listener(
             dyn_source,
             tokio_listener,

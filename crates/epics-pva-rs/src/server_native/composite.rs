@@ -176,18 +176,22 @@ impl ChannelSource for CompositeSource {
         async move {
             for src in snapshot {
                 if src.has_pv(&name).await {
-                    let host = ctx.host.clone();
-                    let account = ctx.account.clone();
-                    let method = ctx.method.clone();
-                    let inner_checked = src
-                        .access_gate()
-                        .check(&name, &host, &account, &method, "")
-                        .await;
-                    return if inner_checked.allows_read() {
-                        Some(inner_checked)
-                    } else {
-                        None
-                    };
+                    // Delegate to the matched source's OWN
+                    // `revalidate_read`, not `access_gate().check()`
+                    // directly. For a leaf source the default
+                    // `revalidate_read` is exactly `gate.check(...)`,
+                    // so behaviour is unchanged. But when the matched
+                    // source is itself a nested `CompositeSource`
+                    // (e.g. `PvaServer::start` wraps the user
+                    // composite together with the built-in
+                    // `__server` source), its `access_gate()` is a
+                    // permissive `open_with_aggregator` — calling
+                    // `check()` on it would always return
+                    // `ReadWrite` and silently re-allow a denied
+                    // monitor. Recursing through `revalidate_read`
+                    // makes the nested composite resolve down to the
+                    // authoritative leaf gate.
+                    return src.revalidate_read(&name, ctx.clone()).await;
                 }
             }
             None

@@ -30,13 +30,25 @@
 //!   PKCS#12 is *trusted* (added to the verifier root store) — a CA
 //!   would never appear in a valid chain otherwise.
 //!
-//! Note: `p12` 0.6 implements the classic PKCS#12 PBE algorithms
-//! (`pbeWithSHA1And3-KeyTripleDES-CBC` for keys,
-//! `pbeWithSHA1And40BitRC2-CBC` for certs). PKCS#12 files written with
-//! OpenSSL 3.x defaults use PBES2 (PBKDF2 + AES) and will fail to
-//! decrypt — generate keychains with `openssl pkcs12 -legacy` (or the
-//! explicit `-keypbe`/`-certpbe` classic algorithms) for compatibility.
-//! This is a documented limitation; see the crate-level UNFIXED notes.
+//! Two PKCS#12 encryption families are supported, auto-detected from
+//! the bag's algorithm OID:
+//!
+//! - **Classic PBE** — `pbeWithSHA1And3-KeyTripleDES-CBC` (keys),
+//!   `pbeWithSHA1And40BitRC2-CBC` (certs). These are what
+//!   `openssl pkcs12 -export -legacy` and OpenSSL 1.x produce. Handled
+//!   by the pure-Rust `p12` crate.
+//! - **PBES2** — PBKDF2 + AES-CBC, the OpenSSL 3.x default (no
+//!   `-legacy` flag). The `p12` crate cannot decrypt these, so the
+//!   loader parses the PKCS#12 ASN.1 with the RustCrypto `pkcs12` /
+//!   `der` / `cms` stack and decrypts the PBES2-protected
+//!   `SafeContents` and `pkcs8ShroudedKeyBag`s with `pkcs5`. The
+//!   OpenSSL-3 keychain MAC (PKCS#12 KDF with SHA-256, HMAC-SHA256) is
+//!   verified before any bag is decrypted.
+//!
+//! The loader tries the classic `p12` path first; when `p12` reports a
+//! bag-decryption failure (the symptom of PBES2 content) it retries
+//! through the RustCrypto PBES2 path. Either OpenSSL major version's
+//! `.p12` output therefore loads with no `-legacy` requirement.
 //!
 //! This module produces ready-to-use `rustls::ClientConfig` / `ServerConfig`
 //! values; the client/server runtime layers wrap them in `TlsConnector`/
@@ -345,14 +357,23 @@ fn load_pkcs12_keychain(
 ) -> Result<Keychain, TlsConfigError> {
     use p12::SafeBagKind;
 
+    // Route by the keychain MAC digest algorithm. The `p12` crate
+    // hard-`assert_eq!`s the MAC digest against SHA-1 and *panics* on
+    // anything else (`p12` 0.6 src/lib.rs:381). OpenSSL 3.x stamps an
+    // HMAC-SHA256 MAC, so we MUST decide *before* calling any `p12`
+    // entry point: SHA-1 MAC → classic `p12` path; anything else →
+    // RustCrypto PBES2 path (which also handles a MAC-less keychain).
+    if !load_pkcs12_pbes2::has_classic_sha1_mac(bytes) {
+        return load_pkcs12_pbes2::load(path, bytes, password);
+    }
+
     let pfx = p12::PFX::parse(bytes).map_err(|e| TlsConfigError::Pkcs12 {
         path: path.to_path_buf(),
         reason: format!("not a valid PKCS#12 structure: {e}"),
     })?;
 
-    // Reject a wrong password up front with a clear message rather
-    // than letting the later bag decryption fail opaquely. An empty
-    // (password-less) keychain still verifies here.
+    // Classic SHA-1 MAC: a failed `verify_mac` is a real wrong
+    // password (no other MAC family reaches this branch).
     if !pfx.verify_mac(password) {
         return Err(TlsConfigError::Pkcs12 {
             path: path.to_path_buf(),
@@ -361,13 +382,14 @@ fn load_pkcs12_keychain(
         });
     }
 
-    let bags = pfx.bags(password).map_err(|e| TlsConfigError::Pkcs12 {
-        path: path.to_path_buf(),
-        reason: format!(
-            "could not decrypt PKCS#12 bags (PBES2/AES keychains are \
-             unsupported — re-encode with `openssl pkcs12 -legacy`): {e}"
-        ),
-    })?;
+    let bags = match pfx.bags(password) {
+        Ok(bags) => bags,
+        // Classic MAC passed but a bag would not decrypt with the
+        // classic PBE primitives — a SHA-1-MAC keychain whose bags are
+        // nonetheless PBES2-encrypted (OpenSSL `-macalg sha1` without
+        // `-legacy`). Retry through the RustCrypto path.
+        Err(_) => return load_pkcs12_pbes2::load(path, bytes, password),
+    };
 
     // First key bag wins (EPICS keychains hold one end-entity key).
     // `get_key` yields a decrypted PKCS#8 `PrivateKeyInfo` DER blob.
@@ -394,6 +416,22 @@ fn load_pkcs12_keychain(
     }
     if cert_bags.is_empty() {
         return Err(TlsConfigError::NoCert(path.to_path_buf()));
+    }
+
+    // Mixed-encryption keychain: the outer SafeContents decrypted with
+    // the classic primitives (so `bags()` succeeded) but the
+    // `pkcs8ShroudedKeyBag` itself is PBES2-shrouded, so `get_key`
+    // could not decrypt it. The RustCrypto loader handles a PBES2
+    // shrouded key, so retry there rather than surfacing a misleading
+    // `NoKey`. (A genuine cert-only trust store also has no key — the
+    // PBES2 loader returns `key: None` for it too, so the retry stays
+    // correct: it never invents a key that is not there.)
+    if key.is_none() {
+        if let Ok(kc) = load_pkcs12_pbes2::load(path, bytes, password) {
+            if kc.key.is_some() {
+                return Ok(kc);
+            }
+        }
     }
 
     // Identify the leaf index — pure logic, see `select_leaf_index`.
@@ -506,6 +544,402 @@ fn bmp_password(password: &str) -> Vec<u8> {
     bytes.push(0);
     bytes.push(0);
     bytes
+}
+
+/// PBES2 (PBKDF2 + AES-CBC) PKCS#12 keychain loader — the OpenSSL 3.x
+/// default encoding the classic `p12` crate cannot decrypt.
+///
+/// `load_pkcs12_keychain` falls through to [`load_pkcs12_pbes2::load`]
+/// whenever the classic path fails (classic MAC mismatch, or a bag the
+/// classic PBE primitives reject). The split mirrors OpenSSL's own
+/// `PKCS12_parse`, which transparently handles both PBE families.
+///
+/// Pipeline (RFC 7292):
+/// 1. Parse the `PFX` SEQUENCE with `der`.
+/// 2. Verify the keychain MAC. OpenSSL 3 stamps a SHA-256 MAC keyed by
+///    the PKCS#12 KDF; a mismatch here is a *real* wrong-password and
+///    is reported as one.
+/// 3. Decode `authSafe` → `AuthenticatedSafe` (`SEQUENCE OF
+///    ContentInfo`). Each element is either plain `id-data`
+///    (`SafeContents` in the clear) or `id-encryptedData` (a PBES2
+///    `EncryptedData` whose decrypted content is `SafeContents`).
+/// 4. Walk every `SafeBag`: `certBag` → X.509 cert DER;
+///    `pkcs8ShroudedKeyBag` → PBES2-encrypted `EncryptedPrivateKeyInfo`,
+///    decrypted to a PKCS#8 `PrivateKeyInfo`; `keyBag` → plain PKCS#8.
+/// 5. Pair leaf vs. CA with the shared [`select_leaf_index`] logic.
+#[cfg(feature = "pkcs12")]
+mod load_pkcs12_pbes2 {
+    use super::{Keychain, TlsConfigError, select_leaf_index};
+    use std::path::Path;
+
+    use cms::content_info::ContentInfo;
+    use cms::encrypted_data::EncryptedData;
+    use const_oid::ObjectIdentifier;
+    use der::asn1::OctetString;
+    use der::{Decode, Encode};
+    use rc_pkcs12::{BagType, CertBag, Pfx, SafeBag};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    /// `id-data` — an unencrypted content blob (RFC 5652).
+    const ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
+    /// `id-encryptedData` — password-encrypted content (RFC 5652).
+    const ID_ENCRYPTED_DATA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.6");
+    /// `pkcs-9-at-localKeyID` — the bag attribute pairing a cert to its key.
+    const OID_LOCAL_KEY_ID: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.21");
+
+    /// `id-sha1` digest algorithm OID (OIW).
+    const OID_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
+    /// `id-sha256` digest algorithm OID (NIST).
+    const OID_SHA256: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+
+    fn err(path: &Path, reason: impl Into<String>) -> TlsConfigError {
+        TlsConfigError::Pkcs12 {
+            path: path.to_path_buf(),
+            reason: reason.into(),
+        }
+    }
+
+    /// True iff the keychain carries a classic SHA-1 PKCS#12 MAC — the
+    /// only MAC the `p12` crate can handle (it panics on any other).
+    /// A MAC-less keychain or any non-SHA-1 MAC returns `false`, which
+    /// routes the load through the RustCrypto path. A structurally
+    /// invalid keychain also returns `false`; the RustCrypto loader
+    /// then surfaces the precise parse error.
+    pub(super) fn has_classic_sha1_mac(bytes: &[u8]) -> bool {
+        match Pfx::from_der(bytes) {
+            Ok(pfx) => pfx
+                .mac_data
+                .map(|m| m.mac.algorithm.oid == OID_SHA1)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Decrypt a PBES2 ciphertext: decode `alg` as a `pkcs5`
+    /// `EncryptionScheme` and run it over `ciphertext`. `pkcs5`'s
+    /// `pbes2` feature covers PBKDF2 + AES-128/192/256-CBC, which is
+    /// the full set OpenSSL 3.x emits for `.p12` bags.
+    fn pbes2_decrypt(
+        path: &Path,
+        alg: &spki::AlgorithmIdentifierOwned,
+        ciphertext: &[u8],
+        password: &str,
+    ) -> Result<Vec<u8>, TlsConfigError> {
+        // `EncryptionScheme` is a DER SEQUENCE with the exact shape of
+        // an `AlgorithmIdentifier` (oid + parameters), so re-encode the
+        // algorithm id and decode it back as the scheme.
+        let alg_der = alg
+            .to_der()
+            .map_err(|e| err(path, format!("re-encoding PBES2 algorithm id failed: {e}")))?;
+        let scheme = pkcs5::EncryptionScheme::from_der(&alg_der).map_err(|e| {
+            err(
+                path,
+                format!(
+                    "unsupported PKCS#12 bag encryption (not PBES2/AES — \
+                     re-encode with `openssl pkcs12 -legacy` if this is a \
+                     classic-PBE keychain): {e}"
+                ),
+            )
+        })?;
+        scheme.decrypt(password, ciphertext).map_err(|e| {
+            err(
+                path,
+                format!("PBES2 bag decryption failed (wrong password?): {e}"),
+            )
+        })
+    }
+
+    /// Verify the PKCS#12 keychain MAC. Reproduces OpenSSL's
+    /// `PKCS12_verify_mac`: derive an HMAC key with the PKCS#12 KDF
+    /// (RFC 7292 Appendix B) over the MAC salt, then HMAC the
+    /// `authSafe` `Data` content. Supports the SHA-1 MAC (OpenSSL 1.x)
+    /// and the SHA-256 MAC (OpenSSL 3.x default). A mismatch is a
+    /// definitive wrong-password verdict.
+    fn verify_mac(
+        path: &Path,
+        pfx: &Pfx,
+        auth_safe_content: &[u8],
+        password: &str,
+    ) -> Result<(), TlsConfigError> {
+        use rc_hmac::{KeyInit, Mac};
+
+        let Some(mac_data) = &pfx.mac_data else {
+            // A MAC-less PKCS#12 is legal (RFC 7292) — nothing to
+            // verify. OpenSSL accepts these too.
+            return Ok(());
+        };
+        let digest_oid = mac_data.mac.algorithm.oid;
+        let salt = mac_data.mac_salt.as_bytes();
+        let rounds = mac_data.iterations;
+        let expected = mac_data.mac.digest.as_bytes();
+
+        // SHA-1 and SHA-256 cover every MAC OpenSSL emits for a `.p12`.
+        let ok = if digest_oid == OID_SHA256 {
+            let key = rc_pkcs12::kdf::derive_key_utf8::<rc_sha2::Sha256>(
+                password,
+                salt,
+                rc_pkcs12::kdf::Pkcs12KeyType::Mac,
+                rounds,
+                32,
+            )
+            .map_err(|e| err(path, format!("PKCS#12 MAC key derivation failed: {e}")))?;
+            let mut mac = <rc_hmac::Hmac<rc_sha2::Sha256>>::new_from_slice(&key)
+                .map_err(|e| err(path, format!("HMAC init failed: {e}")))?;
+            mac.update(auth_safe_content);
+            mac.verify_slice(expected).is_ok()
+        } else if digest_oid == OID_SHA1 {
+            let key = rc_pkcs12::kdf::derive_key_utf8::<rc_sha1::Sha1>(
+                password,
+                salt,
+                rc_pkcs12::kdf::Pkcs12KeyType::Mac,
+                rounds,
+                20,
+            )
+            .map_err(|e| err(path, format!("PKCS#12 MAC key derivation failed: {e}")))?;
+            let mut mac = <rc_hmac::Hmac<rc_sha1::Sha1>>::new_from_slice(&key)
+                .map_err(|e| err(path, format!("HMAC init failed: {e}")))?;
+            mac.update(auth_safe_content);
+            mac.verify_slice(expected).is_ok()
+        } else {
+            return Err(err(
+                path,
+                format!("unsupported PKCS#12 MAC digest OID {digest_oid}"),
+            ));
+        };
+
+        if ok {
+            Ok(())
+        } else {
+            Err(err(
+                path,
+                "MAC verification failed (wrong EPICS_PVA*_TLS_KEYCHAIN_PASSWORD?)",
+            ))
+        }
+    }
+
+    /// Decode a `SafeContents` (`SEQUENCE OF SafeBag`) from DER.
+    fn decode_safe_contents(path: &Path, der: &[u8]) -> Result<Vec<SafeBag>, TlsConfigError> {
+        Vec::<SafeBag>::from_der(der)
+            .map_err(|e| err(path, format!("SafeContents decode failed: {e}")))
+    }
+
+    /// Strip the `[0] EXPLICIT` context-specific wrapper RFC 7292 puts
+    /// around a `SafeBag`'s `bagValue`, returning the inner element's
+    /// DER. `SafeBag::decode_value` keeps the wrapper in `bag_value`,
+    /// so every bag payload must pass through this before its inner
+    /// type (CertBag / EncryptedPrivateKeyInfo / PrivateKeyInfo) can
+    /// be decoded.
+    fn unwrap_explicit_0(
+        path: &Path,
+        bag_value: &[u8],
+        what: &str,
+    ) -> Result<Vec<u8>, TlsConfigError> {
+        use der::asn1::AnyRef;
+        use der::{SliceReader, TagNumber};
+
+        let mut reader = SliceReader::new(bag_value)
+            .map_err(|e| err(path, format!("{what} reader init failed: {e}")))?;
+        let inner = der::asn1::ContextSpecific::<AnyRef<'_>>::decode_explicit(
+            &mut reader,
+            TagNumber(0),
+        )
+        .map_err(|e| err(path, format!("{what} [0] EXPLICIT decode failed: {e}")))?
+        .ok_or_else(|| err(path, format!("{what} missing [0] EXPLICIT bagValue")))?;
+        inner
+            .value
+            .to_der()
+            .map_err(|e| err(path, format!("{what} inner re-encode failed: {e}")))
+    }
+
+    /// Extract a `SafeBag`'s `localKeyID` attribute value, if present.
+    /// The attribute value is an `OCTET STRING`; on any decode mishap
+    /// we treat the id as absent rather than failing the whole load —
+    /// `select_leaf_index` already handles a missing `localKeyID`.
+    fn bag_local_key_id(bag: &SafeBag) -> Option<Vec<u8>> {
+        let attrs = bag.bag_attributes.as_ref()?;
+        for attr in attrs.iter() {
+            if attr.oid == OID_LOCAL_KEY_ID {
+                if let Some(v) = attr.values.iter().next() {
+                    let der = v.to_der().ok()?;
+                    if let Ok(os) = OctetString::from_der(&der) {
+                        return Some(os.as_bytes().to_vec());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Process one `SafeBag`, appending any X.509 cert / private key it
+    /// carries to the running keychain accumulators.
+    fn process_bag(
+        path: &Path,
+        bag: &SafeBag,
+        password: &str,
+        cert_bags: &mut Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        key: &mut Option<PrivateKeyDer<'static>>,
+        key_local_id: &mut Option<Vec<u8>>,
+    ) -> Result<(), TlsConfigError> {
+        // `SafeBag::bag_value` retains the `[0] EXPLICIT` wrapper that
+        // RFC 7292 puts around `bagValue`. Strip it to reach the inner
+        // CertBag / EncryptedPrivateKeyInfo / PrivateKeyInfo SEQUENCE.
+        match BagType::try_from(bag.bag_id) {
+            Ok(BagType::Cert) => {
+                let inner = unwrap_explicit_0(path, &bag.bag_value, "certBag")?;
+                let cert_bag = CertBag::from_der(&inner)
+                    .map_err(|e| err(path, format!("certBag decode failed: {e}")))?;
+                cert_bags.push((
+                    cert_bag.cert_value.as_bytes().to_vec(),
+                    bag_local_key_id(bag),
+                ));
+            }
+            Ok(BagType::Pkcs8) => {
+                // pkcs8ShroudedKeyBag = EncryptedPrivateKeyInfo:
+                // SEQUENCE { encryptionAlgorithm AlgorithmIdentifier,
+                //            encryptedData       OCTET STRING }.
+                let inner = unwrap_explicit_0(path, &bag.bag_value, "pkcs8ShroudedKeyBag")?;
+                let epki = EncryptedPrivateKeyInfo::from_der(&inner)
+                    .map_err(|e| err(path, format!("EncryptedPrivateKeyInfo decode failed: {e}")))?;
+                let pkcs8 = pbes2_decrypt(
+                    path,
+                    &epki.encryption_algorithm,
+                    epki.encrypted_data.as_bytes(),
+                    password,
+                )?;
+                if key.is_none() {
+                    *key = Some(PrivateKeyDer::Pkcs8(pkcs8.into()));
+                    *key_local_id = bag_local_key_id(bag);
+                }
+            }
+            Ok(BagType::Key) => {
+                // keyBag = an unencrypted PKCS#8 PrivateKeyInfo.
+                if key.is_none() {
+                    let inner = unwrap_explicit_0(path, &bag.bag_value, "keyBag")?;
+                    *key = Some(PrivateKeyDer::Pkcs8(inner.into()));
+                    *key_local_id = bag_local_key_id(bag);
+                }
+            }
+            // CRL / secret / nested safeContents bags carry no TLS
+            // material for our purposes — skip them.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// EncryptedPrivateKeyInfo (RFC 5958 §3) as carried inside a
+    /// `pkcs8ShroudedKeyBag`. Decoded with `der` directly to avoid a
+    /// `pkcs8`-crate dependency: the algorithm id feeds straight into
+    /// `pkcs5::EncryptionScheme`.
+    #[derive(der::Sequence)]
+    struct EncryptedPrivateKeyInfo {
+        encryption_algorithm: spki::AlgorithmIdentifierOwned,
+        encrypted_data: OctetString,
+    }
+
+    /// Load a PBES2 (or mixed PBE) PKCS#12 keychain. See module doc.
+    pub(super) fn load(
+        path: &Path,
+        bytes: &[u8],
+        password: &str,
+    ) -> Result<Keychain, TlsConfigError> {
+        let pfx = Pfx::from_der(bytes)
+            .map_err(|e| err(path, format!("not a valid PKCS#12 structure: {e}")))?;
+
+        // `authSafe` must be an `id-data` ContentInfo wrapping the
+        // DER of `AuthenticatedSafe`. The content `Any`'s value bytes
+        // (after the OCTET STRING tag/len) are what the MAC covers.
+        if pfx.auth_safe.content_type != ID_DATA {
+            return Err(err(
+                path,
+                format!(
+                    "PKCS#12 authSafe is not id-data ({}) — public-key \
+                     protected keychains are not supported",
+                    pfx.auth_safe.content_type
+                ),
+            ));
+        }
+        let auth_safe_octets = pfx
+            .auth_safe
+            .content
+            .decode_as::<OctetString>()
+            .map_err(|e| err(path, format!("authSafe content decode failed: {e}")))?;
+        let auth_safe_der = auth_safe_octets.as_bytes();
+
+        verify_mac(path, &pfx, auth_safe_der, password)?;
+
+        // AuthenticatedSafe ::= SEQUENCE OF ContentInfo.
+        let safes = Vec::<ContentInfo>::from_der(auth_safe_der)
+            .map_err(|e| err(path, format!("AuthenticatedSafe decode failed: {e}")))?;
+
+        let mut cert_bags: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        let mut key: Option<PrivateKeyDer<'static>> = None;
+        let mut key_local_id: Option<Vec<u8>> = None;
+
+        for ci in &safes {
+            let safe_contents_der: Vec<u8> = if ci.content_type == ID_DATA {
+                // Plain SafeContents — content is an OCTET STRING.
+                ci.content
+                    .decode_as::<OctetString>()
+                    .map_err(|e| err(path, format!("data SafeContents decode failed: {e}")))?
+                    .as_bytes()
+                    .to_vec()
+            } else if ci.content_type == ID_ENCRYPTED_DATA {
+                // PBES2-encrypted SafeContents.
+                let enc = ci
+                    .content
+                    .decode_as::<EncryptedData>()
+                    .map_err(|e| err(path, format!("EncryptedData decode failed: {e}")))?;
+                let eci = &enc.enc_content_info;
+                let ciphertext = eci.encrypted_content.as_ref().ok_or_else(|| {
+                    err(path, "EncryptedData has no encryptedContent")
+                })?;
+                pbes2_decrypt(path, &eci.content_enc_alg, ciphertext.as_bytes(), password)?
+            } else {
+                // Enveloped (public-key) SafeContents — not supported.
+                continue;
+            };
+
+            for bag in decode_safe_contents(path, &safe_contents_der)? {
+                process_bag(
+                    path,
+                    &bag,
+                    password,
+                    &mut cert_bags,
+                    &mut key,
+                    &mut key_local_id,
+                )?;
+            }
+        }
+
+        if cert_bags.is_empty() {
+            return Err(TlsConfigError::NoCert(path.to_path_buf()));
+        }
+
+        // Reuse the classic path's leaf/CA pairing logic verbatim so
+        // both encodings split the keychain identically.
+        let leaf_idx = select_leaf_index(&cert_bags, key_local_id.as_deref())
+            .map_err(|reason| err(path, reason))?;
+
+        let mut certs: Vec<CertificateDer<'static>> = Vec::new();
+        let mut ca_certs: Vec<CertificateDer<'static>> = Vec::new();
+        for (idx, (der, _)) in cert_bags.into_iter().enumerate() {
+            let cert = CertificateDer::from(der);
+            if idx == leaf_idx {
+                certs.push(cert);
+            } else {
+                ca_certs.push(cert);
+            }
+        }
+
+        Ok(Keychain {
+            certs,
+            key,
+            ca_certs,
+        })
+    }
 }
 
 #[cfg(not(feature = "pkcs12"))]
@@ -756,6 +1190,65 @@ mod tests {
         (dir, path)
     }
 
+    /// Build a PBES2 PKCS#12 from PEM cert+key using `openssl` with NO
+    /// `-legacy` flag — exactly what OpenSSL 3.x emits by default
+    /// (PBKDF2 + AES-256-CBC bags, HMAC-SHA256 MAC). The classic `p12`
+    /// crate cannot decrypt this; the loader must fall through to the
+    /// RustCrypto PBES2 path. Returns `None` if `openssl` is absent or
+    /// is an OpenSSL 1.x build (which does not default to PBES2).
+    #[cfg(feature = "pkcs12")]
+    fn make_p12_pbes2(pem: &Pem, ca_pem: Option<&str>, password: &str) -> Option<Vec<u8>> {
+        use std::io::Write;
+        let dir = tempfile::tempdir().ok()?;
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let p12_path = dir.path().join("out.p12");
+        std::fs::File::create(&cert_path)
+            .ok()?
+            .write_all(pem.cert.as_bytes())
+            .ok()?;
+        std::fs::File::create(&key_path)
+            .ok()?
+            .write_all(pem.key.as_bytes())
+            .ok()?;
+
+        let mut cmd = std::process::Command::new("openssl");
+        // No `-legacy`: OpenSSL 3.x then uses PBES2 (PBKDF2 + AES) for
+        // both key and cert bags and an HMAC-SHA256 keychain MAC.
+        cmd.arg("pkcs12")
+            .arg("-export")
+            .arg("-in")
+            .arg(&cert_path)
+            .arg("-inkey")
+            .arg(&key_path)
+            .arg("-out")
+            .arg(&p12_path)
+            .arg("-passout")
+            .arg(format!("pass:{password}"));
+        if let Some(ca) = ca_pem {
+            let ca_path = dir.path().join("ca.pem");
+            std::fs::File::create(&ca_path)
+                .ok()?
+                .write_all(ca.as_bytes())
+                .ok()?;
+            cmd.arg("-certfile").arg(&ca_path);
+        }
+        let status = cmd.status().ok()?;
+        if !status.success() {
+            return None;
+        }
+        let bytes = std::fs::read(&p12_path).ok()?;
+        // Guard: an OpenSSL 1.x build writes a classic SHA-1-MAC
+        // keychain here, which the `p12` path already covers and does
+        // not exercise the PBES2 loader. Skip the fixture in that case.
+        // (`has_classic_sha1_mac` is a pure `der` parse — it never
+        // touches the panic-prone `p12` MAC check.)
+        if load_pkcs12_pbes2::has_classic_sha1_mac(&bytes) {
+            return None;
+        }
+        Some(bytes)
+    }
+
     #[test]
     #[cfg(feature = "pkcs12")]
     fn pkcs12_loads_leaf_and_key_with_password() {
@@ -834,6 +1327,90 @@ mod tests {
         assert!(kc.key.is_some());
         // Leaf and CA must be distinct certs.
         assert_ne!(kc.certs[0].as_ref(), kc.ca_certs[0].as_ref());
+    }
+
+    /// PVA item #3: a PKCS#12 written with OpenSSL 3.x defaults (PBES2
+    /// = PBKDF2 + AES-256-CBC bags, HMAC-SHA256 MAC, no `-legacy`)
+    /// must load — the classic `p12` crate cannot decrypt these, so
+    /// the loader has to fall through to the RustCrypto PBES2 path.
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    fn pkcs12_pbes2_openssl3_default_loads_leaf_and_key() {
+        let pem = gen_self_signed("epics-pbes2-leaf");
+        let Some(p12) = make_p12_pbes2(&pem, None, "pbes2-pw") else {
+            eprintln!(
+                "skipping: `openssl` unavailable or not an OpenSSL-3 \
+                 (PBES2-default) build"
+            );
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        let kc = load_keychain(&path, Some("pbes2-pw")).expect("load PBES2 p12");
+        assert_eq!(kc.certs.len(), 1, "one leaf cert from PBES2 keychain");
+        assert!(kc.key.is_some(), "PBES2-shrouded private key must decrypt");
+        assert!(matches!(kc.key, Some(PrivateKeyDer::Pkcs8(_))));
+        assert!(kc.ca_certs.is_empty(), "self-signed leaf — no CA stack");
+    }
+
+    /// PBES2 keychain with a CA: the leaf goes to `certs`, the CA to
+    /// `ca_certs`, same split as the classic path.
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    fn pkcs12_pbes2_with_ca_chain_splits_leaf_from_ca() {
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "epics-pbes2-ca");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut leaf_params =
+            rcgen::CertificateParams::new(vec!["epics-pbes2-svc".to_string()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "epics-pbes2-svc");
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let pem = Pem {
+            cert: leaf_cert.pem(),
+            key: leaf_key.serialize_pem(),
+        };
+        let Some(p12) = make_p12_pbes2(&pem, Some(&ca_cert.pem()), "pw") else {
+            eprintln!("skipping: `openssl` unavailable or not OpenSSL-3");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        let kc = load_keychain(&path, Some("pw")).expect("load PBES2 p12 w/ CA");
+        assert_eq!(kc.certs.len(), 1, "exactly one leaf");
+        assert_eq!(kc.ca_certs.len(), 1, "exactly one CA cert");
+        assert!(kc.key.is_some());
+        assert_ne!(kc.certs[0].as_ref(), kc.ca_certs[0].as_ref());
+    }
+
+    /// A wrong password on a PBES2 keychain must be rejected with a
+    /// clear MAC error — the SHA-256 keychain MAC catches it before
+    /// any bag is decrypted.
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    fn pkcs12_pbes2_wrong_password_is_rejected() {
+        let pem = gen_self_signed("epics-pbes2-leaf");
+        let Some(p12) = make_p12_pbes2(&pem, None, "right-pw") else {
+            eprintln!("skipping: `openssl` unavailable or not OpenSSL-3");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+
+        let err = load_keychain(&path, Some("wrong-pw")).unwrap_err();
+        match err {
+            TlsConfigError::Pkcs12 { reason, .. } => {
+                assert!(reason.contains("MAC"), "got: {reason}");
+            }
+            other => panic!("expected Pkcs12 MAC error, got {other:?}"),
+        }
     }
 
     /// F7: `select_leaf_index` must NOT fall back to bag order when no

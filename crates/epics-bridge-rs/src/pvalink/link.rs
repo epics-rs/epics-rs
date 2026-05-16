@@ -303,7 +303,22 @@ impl PvaLink {
                     *q = tail;
                     return Err(PvaLinkError::Pva(e));
                 }
-                Err(e) => return Err(PvaLinkError::Pva(e)),
+                Err(e) => {
+                    // Non-retry hard error: the offending value (idx)
+                    // would fail identically on every retry, so drop
+                    // only it — restore the still-unsent tail
+                    // (`idx+1..`) so a later flush replays the values
+                    // queued behind the failure. The queue was already
+                    // `mem::take`-emptied, so without this the entire
+                    // tail is silently lost.
+                    if idx + 1 < queued.len() {
+                        let mut q = self.put_queue.lock();
+                        let mut tail: Vec<PvField> = queued[idx + 1..].to_vec();
+                        tail.append(&mut q);
+                        *q = tail;
+                    }
+                    return Err(PvaLinkError::Pva(e));
+                }
             }
         }
         Ok(sent)
@@ -766,15 +781,19 @@ mod tests {
 
     #[tokio::test]
     async fn b4_flush_deferred_replays_when_still_disconnected() {
-        // defer link with queued values; flush against no server.
-        // retry=false → flush surfaces the disconnect error and the
-        // values are NOT restored (non-retry drops on hard error).
+        // defer link, retry=false; flush against no server. The first
+        // value's Put fails with a hard error → that one value is
+        // dropped, but the still-unsent tail (`idx+1..`) is restored so
+        // a later flush can replay it. Without the tail restore the
+        // whole queue would be silently lost to the `mem::take`.
         let link = PvaLink::for_test(out_cfg(true, false), None);
         link.write("1").await.unwrap();
         link.write("2").await.unwrap();
         assert_eq!(link.pending_put_count(), 2);
         let r = link.flush_deferred().await;
         assert!(r.is_err());
+        // Only the failing entry ("1") was dropped; "2" stays queued.
+        assert_eq!(link.pending_put_count(), 1);
     }
 
     #[tokio::test]

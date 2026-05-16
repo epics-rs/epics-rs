@@ -231,10 +231,10 @@ impl MotorRecord {
         // C: tdir = msta.RA_DIRECTION (from driver on every poll)
         self.stat.tdir = status.direction;
 
-        // C: 314ef89a (PR #238) — RVEL is the actual velocity reported by
-        // the driver (asyn `motorActVelocity_`), kept separate from the
-        // setpoint VELO.
-        self.stat.rvel = status.velocity;
+        // C: devMotorAsyn.c — RVEL is the raw velocity reported by the
+        // driver, stored as floor(status.velocity) (motorRecord.dbd RVEL is
+        // DBF_LONG "Raw Velocity").
+        self.stat.rvel = status.velocity.floor() as i64;
 
         // Recompute LVIO from current position and soft limits
         self.limits.lvio =

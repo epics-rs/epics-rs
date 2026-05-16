@@ -1129,18 +1129,19 @@ fn test_default_asyn_motor_enable_pco_is_noop() {
     plain.set_pco_config(&user, 0.0, 0.0, 0.0, 0.0).unwrap();
 }
 
-// --- RVEL (motorActVelocity, C: 314ef89a PR #238) ---
+// --- RVEL raw velocity (C: motorRecord.dbd DBF_LONG, devMotorAsyn) ---
 
 #[test]
-fn test_rvel_reflects_driver_actual_velocity() {
+fn test_rvel_is_floored_raw_velocity() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
     let status = MotorStatus {
-        velocity: 3.5,
+        velocity: 3.7,
         ..Default::default()
     };
     rec.process_motor_info(&status);
-    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Double(3.5)));
+    // C devMotorAsyn: rvel = floor(status.velocity)
+    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Int64(3)));
 }
 
 #[test]
@@ -1149,13 +1150,13 @@ fn test_rvel_is_independent_of_velo_setpoint() {
     let mut rec = MotorRecord::new();
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap(); // setpoint
     let status = MotorStatus {
-        velocity: 7.2,
+        velocity: 7.0,
         ..Default::default()
     };
     rec.process_motor_info(&status);
-    // VELO setpoint and RVEL actual are separate values
+    // VELO setpoint and RVEL raw velocity are separate values
     assert_eq!(rec.get_field("VELO"), Some(EpicsValue::Double(10.0)));
-    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Double(7.2)));
+    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Int64(7)));
 }
 
 // --- ACCL safety when VELO==VBAS (C: b201e40e PR #75) ---

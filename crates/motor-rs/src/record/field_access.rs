@@ -404,7 +404,7 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "RVEL",
-        dbf_type: DbFieldType::Double,
+        dbf_type: DbFieldType::Int64,
         read_only: true,
     },
     // PID
@@ -584,7 +584,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "TDIR" => Some(EpicsValue::Short(if rec.stat.tdir { 1 } else { 0 })),
         "ATHM" => Some(EpicsValue::Short(if rec.stat.athm { 1 } else { 0 })),
         "STUP" => Some(EpicsValue::Short(rec.stat.stup)),
-        "RVEL" => Some(EpicsValue::Double(rec.stat.rvel)),
+        "RVEL" => Some(EpicsValue::Int64(rec.stat.rvel)),
         // PID
         "PCOF" => Some(EpicsValue::Double(rec.pid.pcof)),
         "ICOF" => Some(EpicsValue::Double(rec.pid.icof)),

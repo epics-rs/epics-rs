@@ -240,10 +240,11 @@ pub struct StatusFields {
     pub tdir: bool,
     pub athm: bool,
     pub stup: i16,
-    /// Raw (actual) velocity reported by the driver, EGU/sec.
-    /// C: `314ef89a` (PR #238) — sourced from `motorActVelocity_`, separate
-    /// from the setpoint `motorVelocity_`.
-    pub rvel: f64,
+    /// Raw velocity reported by the driver, in motor steps/sec.
+    /// C: `motorRecord.dbd` `field(RVEL,DBF_LONG)` "Raw Velocity"; devMotorAsyn
+    /// fills it with `floor(status.velocity)`. 64-bit here for consistency
+    /// with the other raw fields (epics-modules/motor #192).
+    pub rvel: i64,
 }
 
 impl Default for StatusFields {
@@ -258,7 +259,7 @@ impl Default for StatusFields {
             tdir: false,
             athm: false,
             stup: 0,
-            rvel: 0.0,
+            rvel: 0,
         }
     }
 }

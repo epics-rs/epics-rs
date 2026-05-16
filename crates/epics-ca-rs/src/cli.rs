@@ -313,8 +313,16 @@ fn decision_exponent(abs: f64, precision: usize) -> i32 {
     // point, round half-to-even, and read back the magnitude. If the
     // round carries into a new decade the exponent increments.
     let scale = 10f64.powi(precision as i32 - 1 - raw_exp);
+    // For magnitudes near the f64 range limits the scale factor can
+    // overflow to ±inf (or underflow to 0); `abs * scale` then yields a
+    // non-finite product whose `log10` saturates to a garbage exponent.
+    // The rounded magnitude cannot meaningfully differ from the raw one
+    // at those scales, so fall back to `raw_exp`.
+    if !scale.is_finite() || scale == 0.0 {
+        return raw_exp;
+    }
     let rounded_scaled = (abs * scale).round();
-    if rounded_scaled <= 0.0 {
+    if !rounded_scaled.is_finite() || rounded_scaled <= 0.0 {
         return raw_exp;
     }
     raw_exp + (rounded_scaled.log10().floor() as i32 - (precision as i32 - 1))
@@ -436,6 +444,20 @@ mod tests {
         assert_eq!(format_g(9.999995, 6), "10");
         // Negative value at the same boundary keeps the sign.
         assert_eq!(format_g(-999999.5, 6), "-1e+06");
+    }
+
+    #[test]
+    fn g_extreme_magnitudes_do_not_produce_garbage() {
+        // Magnitudes near the f64 range limits make the internal scale
+        // factor overflow/underflow; decision_exponent must fall back
+        // to the raw exponent instead of saturating to a garbage value.
+        // Tiny: classifies as scientific (exp < -4).
+        assert_eq!(format_g(1e-308, 6), "1e-308");
+        assert_eq!(format_g(5e-300, 6), "5e-300");
+        // Huge: classifies as scientific (exp >= precision).
+        assert_eq!(format_g(1e308, 6), "1e+308");
+        // Smallest normal f64 — no panic, scientific form.
+        assert!(format_g(f64::MIN_POSITIVE, 6).contains("e-"));
     }
 
     #[test]

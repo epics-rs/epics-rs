@@ -88,7 +88,16 @@ pub async fn run_beacon_emitter(
         0
     };
 
+    // `beacon_id` is what each beacon carries on the wire; `beacon_counter`
+    // is the source counter. C `online_notify.c:118` sets
+    // `msg.m_cid = htonl(beaconCounter++)` AFTER the send + sleep, so the
+    // value placed on the wire lags the counter by one cycle: the first
+    // two beacons both carry 0 (the initial m_cid 0, then beaconCounter's
+    // first read which is also 0). We mirror that lag: emit `beacon_id`,
+    // then after send+sleep latch `beacon_id = beacon_counter` and
+    // post-increment `beacon_counter`.
     let mut beacon_id: u32 = 0;
+    let mut beacon_counter: u32 = 0;
     let initial_interval = Duration::from_millis(20);
     let max_interval = max_period.max(initial_interval);
     let mut interval = initial_interval;
@@ -153,8 +162,6 @@ pub async fn run_beacon_emitter(
             s.emit(server_ip, server_port, beacon_id).await;
         }
 
-        beacon_id = beacon_id.wrapping_add(1);
-
         tokio::select! {
             () = epics_base_rs::runtime::task::sleep(interval) => {
                 if interval < max_interval {
@@ -165,5 +172,10 @@ pub async fn run_beacon_emitter(
                 interval = initial_interval;
             }
         }
+        // C `online_notify.c:118`: `msg.m_cid = htonl(beaconCounter++)`
+        // runs here, after the send + sleep. Latch the wire id from the
+        // counter, then post-increment the counter (wrapping).
+        beacon_id = beacon_counter;
+        beacon_counter = beacon_counter.wrapping_add(1);
     }
 }

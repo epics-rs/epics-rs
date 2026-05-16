@@ -910,13 +910,31 @@ impl PvaClient {
     /// Like [`Self::pvinfo`] but also reports which server replied —
     /// useful for diagnostics on multi-source / failover deployments.
     pub async fn pvinfo_full(&self, pv_name: &str) -> PvaResult<(FieldDesc, SocketAddr)> {
+        let (intro, addr, _cred) = self.pvinfo_full_with_credentials(pv_name).await?;
+        Ok((intro, addr))
+    }
+
+    /// Like [`Self::pvinfo_full`] but additionally reports the
+    /// server's verified X.509 identity (`pvas://` only) — the
+    /// credentials pvxs `pvxinfo -v` prints. The third tuple element
+    /// is `None` for a plain `pva://` connection or a TLS server that
+    /// presented no usable certificate.
+    pub async fn pvinfo_full_with_credentials(
+        &self,
+        pv_name: &str,
+    ) -> PvaResult<(FieldDesc, SocketAddr, Option<crate::auth::X509Credentials>)> {
         let ch = self.channel(pv_name).await?;
         let intro = crate::client_native::ops_v2::op_get_field(&ch, "", self.inner.timeout).await?;
-        let server_addr = match ch.current_state() {
-            super::channel::ChannelState::Active { server, .. } => server.addr,
-            _ => SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+        let (server_addr, cred) = match ch.current_state() {
+            super::channel::ChannelState::Active { server, .. } => {
+                (server.addr, server.server_identity().cloned())
+            }
+            _ => (
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+                None,
+            ),
         };
-        Ok((intro, server_addr))
+        Ok((intro, server_addr, cred))
     }
 
     pub async fn pvrpc(

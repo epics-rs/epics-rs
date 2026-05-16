@@ -345,3 +345,136 @@ async fn mtls_client_cert_populates_x509_credentials() {
 
     server_handle.abort();
 }
+
+/// PVA item #5: the client must extract the *server*'s X.509 identity
+/// from the verified TLS chain and expose it via
+/// `pvinfo_full_with_credentials` — the credentials pvxs `pvxinfo -v`
+/// prints. The server presents a leaf cert (CN `pva-test-server`)
+/// signed by the root CA `EPICS Test Root CA`, so the client must see
+/// `account = "pva-test-server"` and `authority = "EPICS Test Root CA"`.
+#[tokio::test]
+async fn client_extracts_server_x509_identity() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Root CA → server leaf. The client trusts the CA and (server-only
+    // TLS, no client cert) just verifies the server.
+    let (ca_cert, ca_key) = make_ca("EPICS Test Root CA");
+    let ca_der = CertificateDer::from(ca_cert.der().to_vec());
+    let (server_cert, server_key) = make_leaf("pva-test-server", &ca_cert, &ca_key);
+
+    // Server presents leaf + root so the client can build the chain.
+    let server_cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![server_cert.clone(), ca_der.clone()], server_key)
+        .expect("server tls config");
+    let server_tls = Arc::new(TlsServerConfig {
+        config: Arc::new(server_cfg),
+        require_client_cert: false,
+    });
+
+    let mut roots = RootCertStore::empty();
+    roots.add(ca_der.clone()).unwrap();
+    let client_cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_tls = Arc::new(TlsClientConfig {
+        config: Arc::new(client_cfg),
+    });
+
+    let source = Arc::new(StaticSource::new());
+    source.put("SRVID:PV", 3.0).await;
+
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        tls: Some(server_tls),
+        ..Default::default()
+    };
+    let server_handle = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let client = PvaClient::builder()
+        .timeout(Duration::from_secs(3))
+        .server_addr(server_addr)
+        .with_tls(client_tls)
+        .build();
+
+    let (_desc, addr, cred) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pvinfo_full_with_credentials("SRVID:PV"),
+    )
+    .await
+    .expect("pvinfo timed out")
+    .expect("pvinfo failed");
+
+    assert_eq!(addr.port(), tcp, "must report the queried server's port");
+    let cred = cred.expect("TLS connection must yield a server X.509 identity");
+    assert_eq!(
+        cred.account, "pva-test-server",
+        "account must be the server leaf cert CommonName"
+    );
+    assert_eq!(
+        cred.authority, "EPICS Test Root CA",
+        "authority must be the root CA CommonName"
+    );
+
+    server_handle.abort();
+}
+
+/// A plain `pva://` (non-TLS) connection has no peer certificate, so
+/// the client must report `None` for the server identity — the
+/// `pvinfo -v` path then prints the anonymous credential line.
+#[tokio::test]
+async fn plain_connection_has_no_server_identity() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let source = Arc::new(StaticSource::new());
+    source.put("PLAIN:PV", 1.0).await;
+
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 16,
+        max_channels_per_connection: 64,
+        monitor_queue_depth: 8,
+        tls: None,
+        ..Default::default()
+    };
+    let server_handle = tokio::spawn(async move {
+        let _ = run_pva_server(source, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+    let client = PvaClient::builder()
+        .timeout(Duration::from_secs(3))
+        .server_addr(server_addr)
+        .build();
+
+    let (_desc, _addr, cred) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pvinfo_full_with_credentials("PLAIN:PV"),
+    )
+    .await
+    .expect("pvinfo timed out")
+    .expect("pvinfo failed");
+
+    assert!(
+        cred.is_none(),
+        "a plain pva:// connection must have no server X.509 identity"
+    );
+
+    server_handle.abort();
+}

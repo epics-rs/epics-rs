@@ -92,6 +92,12 @@ pub(crate) enum IoidSlot {
 pub struct ServerConn {
     pub addr: SocketAddr,
     pub byte_order: ByteOrder,
+    /// X.509 identity of the *server* peer, derived from the verified
+    /// TLS certificate chain (`pvas://` only — `None` for a plain
+    /// `pva://` TCP connection). Mirrors pvxs `Connected::cred`, which
+    /// `pvxinfo -v` prints as the server's credentials. Populated by
+    /// [`ServerConn::connect_tls`] before the TLS stream is split.
+    server_identity: Option<crate::auth::X509Credentials>,
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     cancel: CancellationToken,
     alive: Arc<AtomicBool>,
@@ -143,7 +149,9 @@ impl ServerConn {
         let (reader, writer) = stream.into_split();
         let reader: DynRead = Box::new(reader);
         let writer: DynWrite = Box::new(writer);
-        Self::run_handshake_and_spawn(target, reader, writer, user, host, op_timeout).await
+        // Plain `pva://` TCP — no TLS, so no server X.509 identity.
+        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, op_timeout)
+            .await
     }
 
     /// Open a TLS-wrapped connection (`pvas://`).
@@ -169,10 +177,31 @@ impl ServerConn {
             .map_err(|_| PvaError::Timeout)?
             .map_err(PvaError::Io)?;
 
+        // Derive the *server*'s X.509 identity from the verified
+        // certificate chain before the stream is split — rustls only
+        // exposes `peer_certificates()` on the whole `TlsStream`. The
+        // chain has already passed the client-side verifier, so this
+        // is the cryptographically-checked server identity that pvxs
+        // `pvxinfo -v` reports (`Connected::cred`).
+        let server_identity = {
+            let (_, conn) = tls_stream.get_ref();
+            conn.peer_certificates()
+                .and_then(crate::auth::x509_credentials_from_chain)
+        };
+
         let (reader, writer) = tokio::io::split(tls_stream);
         let reader: DynRead = Box::new(reader);
         let writer: DynWrite = Box::new(writer);
-        Self::run_handshake_and_spawn(target, reader, writer, user, host, op_timeout).await
+        Self::run_handshake_and_spawn(
+            target,
+            reader,
+            writer,
+            server_identity,
+            user,
+            host,
+            op_timeout,
+        )
+        .await
     }
 
     /// Internal: takes already-split read/write halves, runs the handshake,
@@ -182,6 +211,7 @@ impl ServerConn {
         target: SocketAddr,
         mut reader: DynRead,
         writer: DynWrite,
+        server_identity: Option<crate::auth::X509Credentials>,
         user: &str,
         host: &str,
         op_timeout: Duration,
@@ -464,6 +494,7 @@ impl ServerConn {
         Ok(Arc::new(Self {
             addr: target,
             byte_order,
+            server_identity,
             writer_tx,
             cancel,
             alive,
@@ -478,6 +509,22 @@ impl ServerConn {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// The server peer's verified X.509 identity, or `None` for a
+    /// plain `pva://` connection (or a `pvas://` server presenting no
+    /// usable certificate). Mirrors pvxs `Connected::cred` — the
+    /// `account` / `authority` `pvxinfo -v` prints as the server's
+    /// credentials.
+    pub fn server_identity(&self) -> Option<&crate::auth::X509Credentials> {
+        self.server_identity.as_ref()
+    }
+
+    /// True iff this is a TLS (`pvas://`) connection. Inferred from a
+    /// present server X.509 identity — the identity is only populated
+    /// after a successful TLS handshake.
+    pub fn is_tls(&self) -> bool {
+        self.server_identity.is_some()
     }
 
     /// Get a clone of the per-connection FieldDesc cache (Arc shared).

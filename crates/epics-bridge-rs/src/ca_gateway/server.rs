@@ -405,11 +405,18 @@ impl GatewayServer {
         // Cleanup task
         let cache_for_cleanup = cache.clone();
         let upstream_for_cleanup = upstream.clone();
+        let stats_for_cleanup = stats.clone();
         let cleanup_handle = tokio::spawn(async move {
             let mut tick = tokio::time::interval(cleanup_interval);
             tick.tick().await; // first tick is immediate, skip
             loop {
                 tick.tick().await;
+                // B5 RATE_STATS: count one gateway run-loop iteration.
+                // The cleanup tick is the gateway's canonical periodic
+                // maintenance loop — the tokio analogue of the C++
+                // fdManager event-loop pass that drives gateServer::
+                // loopCount.
+                stats_for_cleanup.record_loop();
                 let removed = cache_for_cleanup.write().await.cleanup(&timeouts).await;
                 if !removed.is_empty() {
                     upstream_for_cleanup.sweep_orphaned().await;

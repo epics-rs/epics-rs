@@ -404,6 +404,9 @@ impl UpstreamManager {
                     let _ = db_clone
                         .put_pv_and_post(&name, snapshot.value.clone())
                         .await;
+                    // B5 RATE_STATS: count the monitor post fanned
+                    // out downstream (C++ gateServer::postEventCount).
+                    stats_for_task.record_post_event();
 
                     // Re-arm the backoff after a successful event.
                     backoff = Duration::from_millis(250);

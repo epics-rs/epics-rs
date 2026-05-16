@@ -32,7 +32,7 @@ use rust_hdf5::{H5Dataset, H5File};
 const DTYPE_ATTR: &str = "NDArrayDataType";
 
 /// Serialize an NDArray data buffer to **little-endian** bytes. `rust-hdf5`
-/// 0.2.0 records every numeric datatype message as little-endian and copies
+/// 0.2.13 records every numeric datatype message as little-endian and copies
 /// the `&[u8]` passed to `write_chunk` verbatim, so a typed dataset fed
 /// host-endian `as_u8_slice()` bytes is only correct on a little-endian host.
 /// This makes the on-disk bytes match the declared LE datatype on every host.
@@ -325,7 +325,7 @@ pub struct NexusWriter {
     ts_dataset: Option<H5Dataset>,
     /// `entry/data/data` dataset — the NXdata-group copy of the image data
     /// (built-in hierarchy only). NeXus readers locate the signal through
-    /// the `NXdata` group, so the data must appear there. `rust-hdf5` 0.2.0
+    /// the `NXdata` group, so the data must appear there. `rust-hdf5` 0.2.13
     /// exposes no hard-link API, so a real HDF5 hard link to the detector
     /// dataset is impossible; the equivalent here is a second dataset in the
     /// NXdata group written from the same frame bytes. `None` in template
@@ -681,7 +681,7 @@ impl NDFileWriter for NexusWriter {
             self.data_group_path = "entry/instrument/detector".to_string();
             self.data_node_name = "data".to_string();
             // The image data must appear inside the NXdata group so NeXus
-            // readers locate the signal. rust-hdf5 0.2.0 has no hard-link
+            // readers locate the signal. rust-hdf5 0.2.13 has no hard-link
             // API, so write_file places a second `data` dataset here from
             // the same frame bytes (documented equivalent of a hard link).
             self.nxdata_group_path = Some("entry/data".to_string());
@@ -718,7 +718,7 @@ impl NDFileWriter for NexusWriter {
 
         // Element type recorded on the data dataset for lossless read-back,
         // and the frame bytes serialized explicitly little-endian (rust-hdf5
-        // 0.2.0 records LE datatypes and copies write_chunk bytes verbatim).
+        // 0.2.13 records LE datatypes and copies write_chunk bytes verbatim).
         let dtype_ordinal = array.data.data_type() as i32;
         let frame_bytes = nd_buffer_to_le_bytes(&array.data);
 

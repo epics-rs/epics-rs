@@ -523,7 +523,7 @@ impl Hdf5Writer {
     /// `HDF5_extraDimName0..`) so the N-dimensional layout is recoverable.
     ///
     /// A true N-D leading layout (`[extra_0, .., extra_{N-1}, Y, X]`) cannot
-    /// be used: `rust-hdf5` 0.2.0's chunked read path mis-places chunks
+    /// be used: `rust-hdf5` 0.2.13's chunked read path mis-places chunks
     /// whenever more than one axis has a chunk grid larger than 1 (verified
     /// empirically). A single flat leading axis keeps exactly one multi-chunk
     /// axis, which the crate reconstructs correctly.
@@ -693,7 +693,7 @@ impl Hdf5Writer {
     /// not just the groups implied by the dataset placement. No-op when no
     /// layout is loaded.
     ///
-    /// `rust-hdf5` 0.2.0's `create_group` errors on a duplicate path, so each
+    /// `rust-hdf5` 0.2.13's `create_group` errors on a duplicate path, so each
     /// distinct group path is created exactly once via a created-set; paths
     /// are processed shortest-first so a parent always exists before a child.
     fn build_layout_groups(&self) -> ADResult<()> {
@@ -1266,7 +1266,7 @@ impl Hdf5Writer {
 
 /// Serialize an NDArray data buffer to **little-endian** bytes.
 ///
-/// `rust-hdf5` 0.2.0 records every numeric datatype message as little-endian
+/// `rust-hdf5` 0.2.13 records every numeric datatype message as little-endian
 /// (`Endianness::LittleEndian`) and its only chunked-write API, `write_chunk`,
 /// copies the supplied `&[u8]` verbatim into the chunk with no byte-swap.
 /// `NDDataBuffer::as_u8_slice()` returns the buffer in *host* byte order, so

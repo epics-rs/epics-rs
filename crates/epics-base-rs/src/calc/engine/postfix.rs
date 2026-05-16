@@ -3,10 +3,17 @@ use super::opcodes::{CoreOp, Opcode};
 use super::token::{ConstName, FuncName, Token};
 use super::{CompiledExpr, ExprKind};
 
-// Operator precedence levels (matching sCalcPostfix.c)
+// Operator precedence levels.
+//
+// NOTE: these numeric levels follow the synApps `sCalcPostfix.c` table, NOT
+// epics-base `postfix.c` (which uses priorities 0-8 — see postfix.c:147-180).
+// Only the *relative* ordering matters for the compiled output, and it is
+// preserved for the epics-base operator subset:
+//   || < && < cmp < +/- < */% < power < unary/functions
+//
 //  2: ||, |, OR, XOR
 //  3: &&, &, AND, >>, <<
-//  4: >?, <?
+//  4: >?, <?                          (synApps-only)
 //  5: ==, !=, <, <=, >, >=, #
 //  6: +, -
 //  7: *, /, %
@@ -99,6 +106,68 @@ fn is_vararg(func: &FuncName) -> bool {
         func,
         FuncName::Min | FuncName::Max | FuncName::Finite | FuncName::IsNan
     )
+}
+
+/// Number of operands consumed by a *non-vararg* function.
+///
+/// Every function emits exactly one result, so its net runtime-stack
+/// effect is `1 - func_arity(f)`. Vararg functions (`MIN`, `MAX`,
+/// `FINITE`, `ISNAN`) never reach this path — they are tracked through
+/// `StackEntry::VarargFunc` with an explicit `nargs` count.
+///
+/// The arity values are verified against the opcode implementations:
+///   - core 1-arg math: `numeric.rs` (`Abs`..`Nint`, `IsInf`, `BitNot`)
+///   - core 2-arg math: `numeric.rs` (`Atan2`, `Fmod`)
+///   - string ops: `string.rs` (`ToString`..`Xor8Append`, `Printf`,
+///     `Sscanf`)
+///   - array ops: `array.rs` (`ConstIndex`..`FitMQ`)
+fn func_arity(func: &FuncName) -> u8 {
+    match func {
+        // 0-arg: produce a value from ambient state, consume nothing.
+        //   ARndm  -> ArrayOp::ArrayRandom  (array.rs: pushes only)
+        //   Ix     -> ArrayOp::ConstIndex   (array.rs: pushes only)
+        FuncName::ARndm | FuncName::Ix => 0,
+
+        // 2-arg core math (numeric.rs: Atan2/Fmod pop2).
+        FuncName::Atan2 | FuncName::Fmod => 2,
+
+        // 2-arg string ops (string.rs: Printf/Sscanf pop2).
+        FuncName::Printf | FuncName::Sscanf => 2,
+
+        // 2-arg array ops.
+        //   NSmoo  -> ArrayOp::NSmooth   (array.rs:527 — pop n, pop array)
+        //   NDeriv -> ArrayOp::NDeriv    (array.rs:538 — pop n, pop array)
+        //   Cat    -> ArrayOp::Cat       (array.rs:553 — pop b, pop a)
+        //   FitPoly-> ArrayOp::FitPoly   (array.rs:592 — pop y, pop x)
+        //   FitQ   -> ArrayOp::FitQ      (array.rs:611 — pop y, pop x)
+        FuncName::NSmoo
+        | FuncName::NDeriv
+        | FuncName::Cat
+        | FuncName::FitPoly
+        | FuncName::FitQ => 2,
+
+        // 3-arg array ops.
+        //   FitMPoly -> ArrayOp::FitMPoly (array.rs:601 — pop mask, y, x)
+        //   FitMQ    -> ArrayOp::FitMQ    (array.rs:629 — pop mask, y, x)
+        FuncName::FitMPoly | FuncName::FitMQ => 3,
+
+        // Everything else is a 1-arg function: one operand in, one out.
+        //   core math: Abs, Sqrt, Sqr, Exp, Log10, LogE, Ln, Log2, Sin,
+        //     Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Ceil, Floor,
+        //     Nint, Int, IsInf, Not
+        //   string 1-arg: Dbl, Str, Len, Byte, TrEsc, Esc, BinRead,
+        //     BinWrite, Crc16, ModBus, Lrc, AModBus, Xor8, AddXor8
+        //   array 1-arg: Avg, Std, FwhmFunc, Sum, AMax, AMin, IxMax,
+        //     IxMin, IxZ, IxNz, Arr, AToD, Smoo, Deriv, Cum
+        // Vararg funcs (Min, Max, Finite, IsNan) are unreachable here.
+        _ => 1,
+    }
+}
+
+/// True when a function takes no operands and therefore behaves like an
+/// operand itself (the next token must be an operator, not an operand).
+fn is_nullary_func(func: &FuncName) -> bool {
+    func_arity(func) == 0
 }
 
 fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
@@ -351,6 +420,14 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                             in_stack_pri: 9,
                         });
                     }
+                    // A nullary function (ARNDM, IX) supplies its own
+                    // operand: it consumes nothing and pushes one value.
+                    // The next token must therefore be an operator, like
+                    // any other operand. Functions with arity >= 1 still
+                    // need an operand to follow.
+                    if !is_vararg(func) && is_nullary_func(func) {
+                        operand_needed = false;
+                    }
                 }
 
                 _ => return Err(CalcError::Syntax),
@@ -447,7 +524,7 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                         runtime_depth += stack_effect(&entry);
                         flush_stack_entry(&entry, &mut output);
                     }
-                    // If there's a pending UNTIL, close it
+                    // If there's a pending UNTIL, close it.
                     if let Some(until_pc) = until_stack.pop() {
                         let end_pc = output.len();
                         output.push(Opcode::Control(super::opcodes::ControlOp::UntilEnd(
@@ -456,6 +533,19 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                         // Patch the Until opcode with the end_pc
                         output[until_pc] =
                             Opcode::Control(super::opcodes::ControlOp::Until(end_pc));
+                        // Runtime effect: the `Until` marker is a no-op (0),
+                        // but `UntilEnd` pops the loop condition (see
+                        // string.rs evaluator: `pop1_f64`) and pushes
+                        // nothing — a net runtime depth delta of -1.
+                        runtime_depth -= 1;
+                    }
+                    // C postfix.c:452-455 — at a `;` terminator the net runtime
+                    // depth must not exceed 1.
+                    if cond_count != 0 {
+                        return Err(CalcError::Conditional);
+                    }
+                    if runtime_depth > 1 {
+                        return Err(CalcError::TooMany);
                     }
                     operand_needed = true;
                 }
@@ -586,14 +676,13 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
         }
     }
 
-    if operand_needed && !output.is_empty() {
-        return Err(CalcError::Incomplete);
-    }
-
+    // C postfix.c flushes the residual operator stack to the output and
+    // accumulates their runtime effect before the final well-formedness check.
     while let Some(entry) = stack.pop() {
         match entry {
             StackEntry::LParen => return Err(CalcError::ParenOpen),
             _ => {
+                runtime_depth += stack_effect(&entry);
                 flush_stack_entry(&entry, &mut output);
             }
         }
@@ -601,6 +690,38 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
 
     if cond_count != 0 {
         return Err(CalcError::Conditional);
+    }
+
+    // End-of-expression well-formedness.
+    //
+    // epics-base `postfix.c:499-502` requires a net runtime depth of exactly
+    // 1 (one value left to fetch). This Rust engine is a synApps superset:
+    // sCalc/aCalc store-assignment (`A:=5`, `BB:=AA`, `AA:="x"`) is a valid
+    // side-effect-only construct that legitimately terminates with the
+    // runtime stack at depth 0. The strict `== 1` rule therefore cannot be
+    // applied globally. (`UNTIL <cond>; <body>` value-producing forms still
+    // end at depth 1 — the `UntilEnd` opcode consumes the loop condition.)
+    //
+    // The rule:
+    //   - depth 1                       -> value-producing expression, OK.
+    //   - depth 0 AND the final emitted
+    //     opcode is a store             -> store-terminated expression, OK.
+    //   - depth 0 otherwise             -> an operand was consumed without a
+    //                                      result (e.g. `CAT(AA)` with too
+    //                                      few args) -> Incomplete.
+    //   - depth > 1                     -> residual values (`1 2`, `A;B`)
+    //                                      -> Incomplete (TooMany already
+    //                                      fired at any `;`).
+    // The empty-program case (`output` is empty before the End sentinel) is
+    // a deliberate Rust special case and is exempt.
+    let ends_with_store = matches!(
+        output.last(),
+        Some(Opcode::Core(CoreOp::StoreVar(_)))
+            | Some(Opcode::Core(CoreOp::StoreDoubleVar(_)))
+    );
+    let depth_ok = runtime_depth == 1 || (runtime_depth == 0 && ends_with_store);
+    if !output.is_empty() && (operand_needed || !depth_ok) {
+        return Err(CalcError::Incomplete);
     }
 
     output.push(Opcode::Core(CoreOp::End));
@@ -637,10 +758,11 @@ fn stack_effect(entry: &StackEntry) -> i32 {
         StackEntry::Op {
             token: Token::Func(f),
             ..
-        } => match f {
-            FuncName::Atan2 | FuncName::Fmod => -1,
-            _ => 0,
-        },
+        } => {
+            // A non-vararg function consumes `func_arity(f)` operands and
+            // pushes exactly one result.
+            1 - func_arity(f) as i32
+        }
         StackEntry::Op { .. } => -1,
         StackEntry::VarargFunc { nargs, .. } => 1 - (*nargs as i32),
         StackEntry::CondEnd => 0,

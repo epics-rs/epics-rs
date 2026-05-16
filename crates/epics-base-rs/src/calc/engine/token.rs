@@ -388,7 +388,9 @@ impl<'a> Tokenizer<'a> {
                 self.pos += 1;
             }
             let s = std::str::from_utf8(&self.input[start + 2..self.pos]).unwrap();
-            return u64::from_str_radix(s, 16)
+            // C postfix.c:283 parses hex literals via epicsParseUInt32 — a
+            // 32-bit unsigned value; anything wider is CALC_ERR_BAD_LITERAL.
+            return u32::from_str_radix(s, 16)
                 .map(|v| v as f64)
                 .map_err(|_| CalcError::BadLiteral);
         }

@@ -30,6 +30,50 @@ pub struct CompiledExpr {
     pub loop_pairs: Vec<(usize, usize)>,
 }
 
+impl CompiledExpr {
+    /// Compute which input arguments this expression reads and which it
+    /// stores into, equivalent to C `calcArgUsage` (`calcPerform.c:429-507`).
+    ///
+    /// Returns `(inputs, stores)` as bitmaps over args A..U (bit 0 = A).
+    /// As in C, an argument that is stored to before any read is not
+    /// reported as an input (`inputs |= bit & ~stores`).
+    pub fn arg_usage(&self) -> (u32, u32) {
+        use opcodes::CoreOp;
+        let mut inputs: u32 = 0;
+        let mut stores: u32 = 0;
+        for op in &self.code {
+            match op {
+                Opcode::Core(CoreOp::End) => break,
+                Opcode::Core(CoreOp::PushVar(idx))
+                | Opcode::Core(CoreOp::PushDoubleVar(idx)) => {
+                    if (*idx as usize) < CALC_NARGS {
+                        inputs |= (1u32 << *idx) & !stores;
+                    }
+                }
+                Opcode::Core(CoreOp::StoreVar(idx))
+                | Opcode::Core(CoreOp::StoreDoubleVar(idx)) => {
+                    if (*idx as usize) < CALC_NARGS {
+                        stores |= 1u32 << *idx;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (inputs, stores)
+    }
+
+    /// Produce a human-readable disassembly of the compiled postfix stream,
+    /// one opcode per line, analogous to C `calcExprDump` (`postfix.c:541-654`).
+    /// Diagnostics only.
+    pub fn disassemble(&self) -> String {
+        let mut out = String::new();
+        for (i, op) in self.code.iter().enumerate() {
+            out.push_str(&format!("{:4}: {:?}\n", i, op));
+        }
+        out
+    }
+}
+
 /// Number of named scalar inputs accepted by the calc engine.
 /// Mirrors `CALCPERFORM_NARGS` in epics-base after PR #655 (12 → 21,
 /// fields A..U). Doubled-letter previous-value slots (LA..LU) and any
@@ -39,17 +83,24 @@ pub const CALC_NARGS: usize = 21;
 #[derive(Debug, Clone)]
 pub struct NumericInputs {
     pub vars: [f64; CALC_NARGS],
+    /// Previous calculation result, read by the `VAL` token (C `FETCH_VAL`,
+    /// `*presult`). Defaults to 0.0 for a fresh evaluation.
+    pub prev_val: f64,
 }
 
 impl NumericInputs {
     pub fn new() -> Self {
         NumericInputs {
             vars: [0.0; CALC_NARGS],
+            prev_val: 0.0,
         }
     }
 
     pub fn with_vars(vars: [f64; CALC_NARGS]) -> Self {
-        NumericInputs { vars }
+        NumericInputs {
+            vars,
+            prev_val: 0.0,
+        }
     }
 }
 
@@ -63,6 +114,8 @@ impl Default for NumericInputs {
 pub struct StringInputs {
     pub num_vars: [f64; CALC_NARGS],    // A..U
     pub str_vars: [String; CALC_NARGS], // AA..UU
+    /// Previous calculation result, read by the `VAL` token (C `FETCH_VAL`).
+    pub prev_val: f64,
 }
 
 impl StringInputs {
@@ -70,6 +123,7 @@ impl StringInputs {
         StringInputs {
             num_vars: [0.0; CALC_NARGS],
             str_vars: std::array::from_fn(|_| String::new()),
+            prev_val: 0.0,
         }
     }
 }
@@ -85,6 +139,8 @@ pub struct ArrayInputs {
     pub num_vars: [f64; CALC_NARGS],
     pub arrays: Vec<Vec<f64>>, // len CALC_NARGS (AA..UU)
     pub array_size: usize,
+    /// Previous calculation result, read by the `VAL` token (C `FETCH_VAL`).
+    pub prev_val: f64,
 }
 
 impl ArrayInputs {
@@ -93,6 +149,7 @@ impl ArrayInputs {
             num_vars: [0.0; CALC_NARGS],
             arrays: vec![Vec::new(); CALC_NARGS],
             array_size,
+            prev_val: 0.0,
         }
     }
 }

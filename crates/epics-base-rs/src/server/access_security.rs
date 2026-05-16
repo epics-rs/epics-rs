@@ -75,6 +75,7 @@ impl AccessChecked {
 /// * `Open` — the source explicitly opts out of ACF entirely
 ///   (e.g. test fixtures, in-process sources that never touch the
 ///   network). All checks return a `ReadWrite` token.
+#[derive(Clone)]
 pub struct AccessGate {
     inner: AccessGateInner,
     /// Round 48 (R48-G3): generation counter bumped whenever the
@@ -124,6 +125,7 @@ pub type AsgAslResolver = std::sync::Arc<
         + Sync,
 >;
 
+#[derive(Clone)]
 enum AccessGateInner {
     /// ACF cell + resolver. The cell may hold `None` for "no
     /// policy attached" — the gate then issues permissive tokens

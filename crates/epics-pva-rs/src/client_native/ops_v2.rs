@@ -29,7 +29,9 @@ use crate::error::{PvaError, PvaResult};
 use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, WriteExt};
 use crate::pv_request::{build_pv_request_fields, build_pv_request_value_only};
 use crate::pvdata::encode::{encode_pv_field, encode_type_desc};
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
+use crate::pvdata::{
+    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue,
+};
 
 use super::channel::Channel;
 use super::decode::{OpResponse, decode_op_response, decode_op_response_cached};
@@ -1895,8 +1897,494 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
             }
             Ok(PvField::Structure(s))
         }
-        _ => Err(PvaError::InvalidValue(format!(
-            "PUT not supported for descriptor {desc}"
+        FieldDesc::Union { variants, .. } => build_put_union(variants, value_str),
+        FieldDesc::UnionArray { variants, .. } => {
+            // Element-per-token: each `;`-separated token becomes one
+            // union element built via `build_put_union`. An empty input
+            // is a legal zero-length array.
+            let mut items = Vec::new();
+            for tok in value_str
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let elem = build_put_union(variants, tok)?;
+                match elem {
+                    PvField::Union {
+                        selector,
+                        variant_name,
+                        value,
+                    } => items.push(UnionItem {
+                        selector,
+                        variant_name,
+                        value: *value,
+                    }),
+                    other => {
+                        return Err(PvaError::InvalidValue(format!(
+                            "internal: build_put_union yielded {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(PvField::UnionArray(items))
+        }
+        FieldDesc::Variant => build_put_variant(value_str),
+        FieldDesc::VariantArray => {
+            // Comma-separated tokens, each inferred independently.
+            let mut items = Vec::new();
+            for tok in value_str
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                match build_put_variant(tok)? {
+                    PvField::Variant(vv) => items.push(*vv),
+                    other => {
+                        return Err(PvaError::InvalidValue(format!(
+                            "internal: build_put_variant yielded {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(PvField::VariantArray(items))
+        }
+        FieldDesc::StructureArray { struct_id, fields } => {
+            // Each `;`-separated token builds one element structure; the
+            // token is routed into the element's `value` field (or, if
+            // there is none, its first scalar leaf) exactly like the
+            // scalar `Structure` arm above. An empty input yields a
+            // zero-length array.
+            let mut items = Vec::new();
+            for tok in value_str
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let element_desc = FieldDesc::Structure {
+                    struct_id: struct_id.clone(),
+                    fields: fields.clone(),
+                };
+                match build_put_struct_element(&element_desc, tok)? {
+                    PvField::Structure(s) => items.push(s),
+                    other => {
+                        return Err(PvaError::InvalidValue(format!(
+                            "internal: structure-array element built as {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(PvField::StructureArray(items))
+        }
+        FieldDesc::BoundedString(_) => Ok(PvField::Scalar(ScalarValue::String(
+            value_str.to_string(),
         ))),
+    }
+}
+
+/// Build a union PUT value (`F4`). The variant is selected either
+/// explicitly — `value_str` of the form `variantName=payload` (or
+/// `variantName:payload`) — or implicitly by picking the first variant
+/// whose descriptor the bare payload parses against. An empty
+/// `value_str` produces the null union (`selector == -1`).
+fn build_put_union(variants: &[(String, FieldDesc)], value_str: &str) -> PvaResult<PvField> {
+    let trimmed = value_str.trim();
+    if trimmed.is_empty() {
+        return Ok(PvField::Union {
+            selector: -1,
+            variant_name: String::new(),
+            value: Box::new(PvField::Null),
+        });
+    }
+
+    // Explicit `name=payload` / `name:payload` selection. The split
+    // point is the first `=` or `:`; a leading variant name that itself
+    // contains neither is required for the explicit form to engage.
+    let explicit = trimmed
+        .find(['=', ':'])
+        .map(|i| (trimmed[..i].trim(), trimmed[i + 1..].trim()));
+    if let Some((name, payload)) = explicit {
+        if let Some(idx) = variants.iter().position(|(n, _)| n == name) {
+            let (_, vdesc) = &variants[idx];
+            let value = build_put_value(vdesc, payload)?;
+            return Ok(PvField::Union {
+                selector: idx as i32,
+                variant_name: name.to_string(),
+                value: Box::new(value),
+            });
+        }
+        // Name not found — fall through to implicit matching against the
+        // whole `value_str` so e.g. a timestamp "1:2:3" still parses.
+    }
+
+    // Implicit: first variant the bare payload builds against cleanly.
+    for (idx, (name, vdesc)) in variants.iter().enumerate() {
+        if let Ok(value) = build_put_value(vdesc, trimmed) {
+            return Ok(PvField::Union {
+                selector: idx as i32,
+                variant_name: name.clone(),
+                value: Box::new(value),
+            });
+        }
+    }
+    Err(PvaError::InvalidValue(format!(
+        "value '{value_str}' does not match any union variant; \
+         use 'variantName=value' to select explicitly"
+    )))
+}
+
+/// Build a variant ("any") PUT value (`F4`). The carried scalar type is
+/// inferred from the textual form — narrowest type wins: `bool` →
+/// `i64` → `f64` → `String`. An empty `value_str` produces the null
+/// variant (no embedded descriptor).
+fn build_put_variant(value_str: &str) -> PvaResult<PvField> {
+    let trimmed = value_str.trim();
+    if trimmed.is_empty() {
+        return Ok(PvField::Variant(Box::new(VariantValue {
+            desc: None,
+            value: PvField::Null,
+        })));
+    }
+    let (st, sv) = if trimmed.eq_ignore_ascii_case("true") {
+        (ScalarType::Boolean, ScalarValue::Boolean(true))
+    } else if trimmed.eq_ignore_ascii_case("false") {
+        (ScalarType::Boolean, ScalarValue::Boolean(false))
+    } else if let Ok(i) = trimmed.parse::<i64>() {
+        (ScalarType::Long, ScalarValue::Long(i))
+    } else if let Ok(d) = trimmed.parse::<f64>() {
+        (ScalarType::Double, ScalarValue::Double(d))
+    } else {
+        (ScalarType::String, ScalarValue::String(trimmed.to_string()))
+    };
+    Ok(PvField::Variant(Box::new(VariantValue {
+        desc: Some(FieldDesc::Scalar(st)),
+        value: PvField::Scalar(sv),
+    })))
+}
+
+/// Build one element of a structure array (`F4`). The token is routed
+/// into the element's `value` field if present, otherwise into its
+/// first scalar / scalar-array leaf; every other field is default-
+/// filled. Distinct from [`build_put_value`]'s `Structure` arm only in
+/// the fallback-to-first-scalar-leaf behaviour, which matters because
+/// structure-array elements are frequently plain `{ value: scalar }`
+/// records without an NT wrapper.
+fn build_put_struct_element(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
+    let FieldDesc::Structure { fields, struct_id } = desc else {
+        return build_put_value(desc, value_str);
+    };
+    // Prefer a field literally named "value"; else the first scalar or
+    // scalar-array leaf.
+    let target = fields
+        .iter()
+        .position(|(n, _)| n == "value")
+        .or_else(|| {
+            fields.iter().position(|(_, d)| {
+                matches!(d, FieldDesc::Scalar(_) | FieldDesc::ScalarArray(_))
+            })
+        });
+    let mut s = PvStructure::new(struct_id);
+    for (idx, (name, child)) in fields.iter().enumerate() {
+        if Some(idx) == target {
+            s.fields.push((name.clone(), build_put_value(child, value_str)?));
+        } else {
+            s.fields.push((
+                name.clone(),
+                crate::pvdata::encode::default_value_for(child),
+            ));
+        }
+    }
+    Ok(PvField::Structure(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pvdata::encode::{decode_pv_field, encode_pv_field};
+    use std::io::Cursor;
+
+    /// Round-trip a built PUT value through encode/decode against its
+    /// descriptor — proves the value built by `build_put_value` is
+    /// wire-valid, not merely well-typed.
+    fn assert_round_trips(desc: &FieldDesc, value: &PvField) {
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut buf = Vec::new();
+            encode_pv_field(value, desc, order, &mut buf);
+            let mut cur = Cursor::new(buf.as_slice());
+            let decoded = decode_pv_field(desc, &mut cur, order)
+                .unwrap_or_else(|e| panic!("decode failed ({order:?}): {e:?}"));
+            assert_eq!(
+                cur.position() as usize,
+                buf.len(),
+                "trailing bytes after decode"
+            );
+            assert_eq!(
+                format!("{decoded}"),
+                format!("{value}"),
+                "round-trip mismatch order={order:?}"
+            );
+        }
+    }
+
+    fn union_desc() -> FieldDesc {
+        FieldDesc::Union {
+            struct_id: String::new(),
+            variants: vec![
+                ("intValue".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("doubleValue".into(), FieldDesc::Scalar(ScalarType::Double)),
+                ("stringValue".into(), FieldDesc::Scalar(ScalarType::String)),
+            ],
+        }
+    }
+
+    #[test]
+    fn put_union_explicit_variant_selection() {
+        let desc = union_desc();
+        let v = build_put_value(&desc, "doubleValue=2.5").unwrap();
+        match &v {
+            PvField::Union {
+                selector,
+                variant_name,
+                value,
+            } => {
+                assert_eq!(*selector, 1);
+                assert_eq!(variant_name, "doubleValue");
+                assert_eq!(**value, PvField::Scalar(ScalarValue::Double(2.5)));
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_explicit_colon_form() {
+        let desc = union_desc();
+        let v = build_put_value(&desc, "stringValue:hello world").unwrap();
+        match &v {
+            PvField::Union {
+                selector, value, ..
+            } => {
+                assert_eq!(*selector, 2);
+                assert_eq!(**value, PvField::Scalar(ScalarValue::String("hello world".into())));
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_implicit_first_matching_variant() {
+        let desc = union_desc();
+        // "7" parses as Int (the first variant) — selector 0.
+        let v = build_put_value(&desc, "7").unwrap();
+        match &v {
+            PvField::Union { selector, .. } => assert_eq!(*selector, 0),
+            other => panic!("expected union, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_empty_is_null() {
+        let desc = union_desc();
+        let v = build_put_value(&desc, "").unwrap();
+        assert!(matches!(v, PvField::Union { selector: -1, .. }));
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_unknown_name_falls_back_to_implicit() {
+        let desc = union_desc();
+        // "1:2:3" — no variant named "1"; the bare string matches the
+        // String variant via implicit fallback.
+        let v = build_put_value(&desc, "1:2:3").unwrap();
+        match &v {
+            PvField::Union {
+                selector, value, ..
+            } => {
+                assert_eq!(*selector, 2, "string variant");
+                assert_eq!(**value, PvField::Scalar(ScalarValue::String("1:2:3".into())));
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_variant_infers_scalar_type() {
+        for (input, expect_st, expect_val) in [
+            ("true", ScalarType::Boolean, ScalarValue::Boolean(true)),
+            ("-42", ScalarType::Long, ScalarValue::Long(-42)),
+            ("3.5", ScalarType::Double, ScalarValue::Double(3.5)),
+            ("text", ScalarType::String, ScalarValue::String("text".into())),
+        ] {
+            let v = build_put_value(&FieldDesc::Variant, input).unwrap();
+            match &v {
+                PvField::Variant(vv) => {
+                    assert_eq!(vv.desc, Some(FieldDesc::Scalar(expect_st)), "input {input}");
+                    assert_eq!(vv.value, PvField::Scalar(expect_val), "input {input}");
+                }
+                other => panic!("expected variant, got {other:?}"),
+            }
+            assert_round_trips(&FieldDesc::Variant, &v);
+        }
+    }
+
+    #[test]
+    fn put_variant_empty_is_null() {
+        let v = build_put_value(&FieldDesc::Variant, "").unwrap();
+        match &v {
+            PvField::Variant(vv) => assert!(vv.desc.is_none()),
+            other => panic!("expected variant, got {other:?}"),
+        }
+        assert_round_trips(&FieldDesc::Variant, &v);
+    }
+
+    #[test]
+    fn put_structure_array_elements() {
+        let desc = FieldDesc::StructureArray {
+            struct_id: "elem_t".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("flag".into(), FieldDesc::Scalar(ScalarType::Boolean)),
+            ],
+        };
+        let v = build_put_value(&desc, "10; 20; 30").unwrap();
+        match &v {
+            PvField::StructureArray(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(
+                    items[1].get_field("value"),
+                    Some(&PvField::Scalar(ScalarValue::Int(20)))
+                );
+            }
+            other => panic!("expected structure array, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_structure_array_first_scalar_leaf_when_no_value_field() {
+        // Element struct has no field named "value"; the token routes
+        // into the first scalar leaf — here "n", declared before the
+        // non-scalar nested struct.
+        let desc = FieldDesc::StructureArray {
+            struct_id: "pair_t".into(),
+            fields: vec![
+                (
+                    "meta".into(),
+                    FieldDesc::Structure {
+                        struct_id: "m_t".into(),
+                        fields: vec![("tag".into(), FieldDesc::Scalar(ScalarType::String))],
+                    },
+                ),
+                ("n".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        let v = build_put_value(&desc, "5; 6").unwrap();
+        match &v {
+            PvField::StructureArray(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(
+                    items[0].get_field("n"),
+                    Some(&PvField::Scalar(ScalarValue::Int(5)))
+                );
+                assert_eq!(
+                    items[1].get_field("n"),
+                    Some(&PvField::Scalar(ScalarValue::Int(6)))
+                );
+            }
+            other => panic!("expected structure array, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_structure_array_empty() {
+        let desc = FieldDesc::StructureArray {
+            struct_id: "elem_t".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+        };
+        let v = build_put_value(&desc, "").unwrap();
+        assert!(matches!(&v, PvField::StructureArray(items) if items.is_empty()));
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_array_elements() {
+        let desc = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: vec![
+                ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("s".into(), FieldDesc::Scalar(ScalarType::String)),
+            ],
+        };
+        let v = build_put_value(&desc, "i=1; s=hi; 2").unwrap();
+        match &v {
+            PvField::UnionArray(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0].selector, 0);
+                assert_eq!(items[1].selector, 1);
+                assert_eq!(items[2].selector, 0, "bare '2' matches Int variant");
+            }
+            other => panic!("expected union array, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_variant_array_elements() {
+        let desc = FieldDesc::VariantArray;
+        let v = build_put_value(&desc, "1, 2.5, hello").unwrap();
+        match &v {
+            PvField::VariantArray(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0].desc, Some(FieldDesc::Scalar(ScalarType::Long)));
+                assert_eq!(items[1].desc, Some(FieldDesc::Scalar(ScalarType::Double)));
+                assert_eq!(items[2].desc, Some(FieldDesc::Scalar(ScalarType::String)));
+            }
+            other => panic!("expected variant array, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_bounded_string() {
+        let desc = FieldDesc::BoundedString(16);
+        let v = build_put_value(&desc, "abc").unwrap();
+        assert_eq!(v, PvField::Scalar(ScalarValue::String("abc".into())));
+        assert_round_trips(&desc, &v);
+    }
+
+    #[test]
+    fn put_union_value_field_inside_structure() {
+        // NT-style wrapper: { value: union, alarm: ... } — build_put_value
+        // recurses into the `value` field which is itself a union.
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTUnion:1.0".into(),
+            fields: vec![
+                ("value".into(), union_desc()),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+        let v = build_put_value(&desc, "intValue=99").unwrap();
+        match &v {
+            PvField::Structure(s) => match s.get_field("value") {
+                Some(PvField::Union {
+                    selector, value, ..
+                }) => {
+                    assert_eq!(*selector, 0);
+                    assert_eq!(**value, PvField::Scalar(ScalarValue::Int(99)));
+                }
+                other => panic!("expected union in value field, got {other:?}"),
+            },
+            other => panic!("expected structure, got {other:?}"),
+        }
+        assert_round_trips(&desc, &v);
     }
 }

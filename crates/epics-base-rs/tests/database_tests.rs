@@ -223,6 +223,123 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
     );
 }
 
+/// B2 regression: a soft-channel record whose INP is an external
+/// `pva://` link must fold the lset's gated alarm severity into its
+/// own `LINK_ALARM`. Previously `read_link_with_alarm` returned
+/// `(None, None)` for any non-Db link, so a connected pva link
+/// carrying a remote MAJOR severity left the owning record at
+/// NO_ALARM.
+#[tokio::test]
+async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
+    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    /// Stub lset: serves a value and a fixed (already gated) severity.
+    struct AlarmingLset;
+    impl LinkSet for AlarmingLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(12.0))
+        }
+        fn alarm_severity(&self, _: &str) -> Option<i32> {
+            Some(2) // MAJOR — as if the link's MS mode let it through
+        }
+        fn alarm_message(&self, _: &str) -> Option<String> {
+            Some("remote major".into())
+        }
+    }
+
+    let db = PvDatabase::new();
+    db.register_link_set("pva", Arc::new(AlarmingLset)).await;
+    db.add_record("PVADST", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PVADST").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:PV".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PVADST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("PVADST").await.expect("record exists");
+    let inst = rec.read().await;
+    // Value was read from the lset.
+    assert_eq!(
+        inst.record.val().and_then(|v| v.to_f64()),
+        Some(12.0),
+        "pva link value must be applied"
+    );
+    // Severity folded into LINK_ALARM.
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Major,
+        "pva link's MAJOR severity must reach the record's SEVR"
+    );
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::LINK_ALARM,
+        "pva link alarm must surface as LINK_ALARM"
+    );
+}
+
+/// B2: when the lset reports no alarm severity (`alarm_severity` →
+/// None — e.g. NMS, or remote NO_ALARM), a connected pva link must
+/// NOT raise any alarm on the owning record.
+#[tokio::test]
+async fn test_pva_link_no_alarm_when_lset_reports_none() {
+    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    struct QuietLset;
+    impl LinkSet for QuietLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(5.0))
+        }
+        // alarm_severity defaults to None.
+    }
+
+    let db = PvDatabase::new();
+    db.register_link_set("pva", Arc::new(QuietLset)).await;
+    db.add_record("PVAQUIET", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("PVAQUIET").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:OK".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PVAQUIET", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("PVAQUIET").await.expect("record exists");
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.val().and_then(|v| v.to_f64()),
+        Some(5.0),
+        "pva link value must still be applied"
+    );
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::NoAlarm,
+        "no lset severity → record stays NO_ALARM"
+    );
+}
+
 /// C `recGbl.c:194/210-211` — when only `amsg` changes (no SEVR/STAT
 /// transition), `stat_mask` is set to `DBE_ALARM` and STAT/AMSG/VAL
 /// are still posted. The Rust port previously only checked

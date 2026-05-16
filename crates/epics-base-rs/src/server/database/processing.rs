@@ -422,15 +422,31 @@ impl PvDatabase {
         // downstream MSS readers saw NoAlarm even when the source was
         // INVALID. Only fires for soft-channel records: hardware-driver
         // alarms travel through device-support's own last_alarm path.
+        //
+        // B2: a soft INP that is an external `pva://` / `ca://` link
+        // also propagates the lset's alarm. The link string carries
+        // no `MonitorSwitch` (the `?sevr=MS` modifier is stripped by
+        // the parser before epics-base-rs sees it), so the lset has
+        // already applied the MS/NMS/MSI gate — a `Some` LinkAlarm
+        // here is one the lset decided to propagate. We fold it in as
+        // `MaximizeStatus` so the gated severity AND message both
+        // reach `LINK_ALARM`, matching pvxs `pvalink_lset.cpp`
+        // `recGblSetSevrMsg`.
         let inp_link_alarm: Option<(
             crate::server::record::MonitorSwitch,
             super::links::LinkAlarm,
         )> = if is_soft {
-            if let crate::server::record::ParsedLink::Db(ref db) = inp_parsed {
-                let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
-                alarm.map(|a| (db.monitor_switch, a))
-            } else {
-                None
+            match inp_parsed {
+                crate::server::record::ParsedLink::Db(ref db) => {
+                    let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
+                    alarm.map(|a| (db.monitor_switch, a))
+                }
+                crate::server::record::ParsedLink::Pva(_)
+                | crate::server::record::ParsedLink::Ca(_) => {
+                    let (_v, alarm) = self.read_link_with_alarm(&inp_parsed).await;
+                    alarm.map(|a| (crate::server::record::MonitorSwitch::MaximizeStatus, a))
+                }
+                _ => None,
             }
         } else {
             None
@@ -481,10 +497,23 @@ impl PvDatabase {
                     if let Some(value) = value {
                         results.push((val_field.clone(), value));
                     }
-                    if let (Some(alarm), crate::server::record::ParsedLink::Db(db)) =
-                        (alarm, &parsed)
-                    {
-                        link_alarms.push((db.monitor_switch, alarm));
+                    // B2: multi-input alarm propagation covers external
+                    // `pva://` / `ca://` links too — see the `inp_link_alarm`
+                    // comment for why the switch is `MaximizeStatus`.
+                    if let Some(alarm) = alarm {
+                        match &parsed {
+                            crate::server::record::ParsedLink::Db(db) => {
+                                link_alarms.push((db.monitor_switch, alarm));
+                            }
+                            crate::server::record::ParsedLink::Pva(_)
+                            | crate::server::record::ParsedLink::Ca(_) => {
+                                link_alarms.push((
+                                    crate::server::record::MonitorSwitch::MaximizeStatus,
+                                    alarm,
+                                ));
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }

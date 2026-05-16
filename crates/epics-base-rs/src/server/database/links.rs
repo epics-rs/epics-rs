@@ -139,8 +139,63 @@ impl PvDatabase {
                 (value, alarm)
             }
             crate::server::record::ParsedLink::Constant(_) => (link.constant_value(), None),
+            // External Pva/Ca link: the value comes from the lset's
+            // cached snapshot, and the alarm severity comes from the
+            // lset's `alarm_severity` accessor. The lset has already
+            // applied the link's `MS`/`NMS`/`MSI` mode gate (that
+            // modifier is stripped from the link string before
+            // epics-base-rs parses it), so a returned `Some(sev)` is
+            // propagated verbatim as a maximize-severity contribution.
+            // Without this, a connected pva link carrying a remote
+            // MINOR/MAJOR severity never folded into the owning
+            // record's LINK_ALARM (B2).
+            crate::server::record::ParsedLink::Pva(name)
+            | crate::server::record::ParsedLink::Ca(name) => {
+                let value = self.resolve_external_pv(name).await;
+                let alarm = self.external_link_alarm(name).await;
+                (value, alarm)
+            }
             _ => (None, None),
         }
+    }
+
+    /// Build a [`LinkAlarm`] from the registered lset's alarm
+    /// accessors for an external (`pva://` / `ca://`) link, or `None`
+    /// when no lset is registered or the lset reports no alarm.
+    ///
+    /// The lset's `alarm_severity` is the gated severity (see
+    /// [`crate::server::database::LinkSet::alarm_severity`]); when it
+    /// is `Some`, the `stat` is `LINK_ALARM` and the message comes
+    /// from `alarm_message`.
+    async fn external_link_alarm(&self, name: &str) -> Option<LinkAlarm> {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+            ("pva", rest)
+        } else if let Some(rest) = name.strip_prefix("ca://") {
+            ("ca", rest)
+        } else {
+            // Bare name — try every registered lset until one reports
+            // a severity (mirrors `resolve_external_pv`'s bare path).
+            let registry = self.inner.link_sets.read().await;
+            for s in registry.schemes() {
+                if let Some(lset) = registry.get(&s) {
+                    if let Some(sev) = lset.alarm_severity(name) {
+                        return Some(LinkAlarm {
+                            stat: crate::server::recgbl::alarm_status::LINK_ALARM,
+                            sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
+                            amsg: lset.alarm_message(name).unwrap_or_default(),
+                        });
+                    }
+                }
+            }
+            return None;
+        };
+        let lset = self.inner.link_sets.read().await.get(scheme)?;
+        let sev = lset.alarm_severity(body)?;
+        Some(LinkAlarm {
+            stat: crate::server::recgbl::alarm_status::LINK_ALARM,
+            sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
+            amsg: lset.alarm_message(body).unwrap_or_default(),
+        })
     }
 
     /// Read a value from a parsed link for INP (only reads DB links when soft channel).

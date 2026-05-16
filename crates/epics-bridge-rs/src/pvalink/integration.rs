@@ -638,6 +638,22 @@ impl LinkSet for PvaLinkResolver {
         link.alarm_message()
     }
 
+    fn alarm_severity(&self, name: &str) -> Option<i32> {
+        // B2: surface the gated link-alarm severity so the owning
+        // record's `LINK_ALARM` actually reflects the remote PV's
+        // alarm. `PvaLink::link_alarm_severity` already applies the
+        // link's `MS`/`NMS`/`MSI` maximize-severity mode, so the
+        // value returned here is final — `None` means "do not
+        // propagate" (NMS, or remote severity below the mode's
+        // threshold, or no value cached).
+        let name = strip_scheme(name)?;
+        let link = block_in_place_or_warn(|| {
+            self.handle
+                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+        })?;
+        link.link_alarm_severity()
+    }
+
     fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
         let name = strip_scheme(name)?;
         let link = block_in_place_or_warn(|| {

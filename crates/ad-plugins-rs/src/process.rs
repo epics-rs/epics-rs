@@ -1365,9 +1365,7 @@ mod tests {
         state.config.auto_offset_scale_pending = true;
 
         // input range [10, 30] => offset=-10, scale=255/20=12.75, clipping on.
-        let out = state
-            .process(&make_f64_array(&[10.0, 20.0, 30.0]))
-            .unwrap();
+        let out = state.process(&make_f64_array(&[10.0, 20.0, 30.0])).unwrap();
         // The pending flag is consumed.
         assert!(!state.config.auto_offset_scale_pending);
         // offset/scale were computed and enabled.

@@ -32,7 +32,7 @@ use crate::params::ndarray_driver::NDArrayDriverParams;
 
 use super::channel::{NDArrayOutput, NDArrayReceiver, NDArraySender, ndarray_channel};
 use super::params::PluginBaseParams;
-use super::wiring::{upstream_key, WiringRegistry};
+use super::wiring::{WiringRegistry, upstream_key};
 
 /// Value sent through the param change channel from control plane to data plane.
 #[derive(Debug, Clone)]
@@ -509,7 +509,9 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                 continue; // G7: dropped by MaxByteRate throttle
             }
             let uid = arr.unique_id;
-            if self.sort_mode != 0 && !self.sort_buffer.first_output && !self.sort_buffer.order_ok(uid)
+            if self.sort_mode != 0
+                && !self.sort_buffer.first_output
+                && !self.sort_buffer.order_ok(uid)
             {
                 // Out of order with sort mode on: buffer it (B2/B3).
                 self.sort_buffer.insert(uid, vec![arr], self.sort_size);
@@ -740,8 +742,9 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             let cur_dims: Vec<i32> = report_arr.dims.iter().map(|d| d.size as i32).collect();
             if cur_dims != self.dims_prev {
                 self.dims_prev = cur_dims.clone();
-                self.port_handle.interrupts().notify(
-                    asyn_rs::interrupt::InterruptValue {
+                self.port_handle
+                    .interrupts()
+                    .notify(asyn_rs::interrupt::InterruptValue {
                         reason: self.ndarray_params.array_dimensions,
                         addr: 0,
                         value: asyn_rs::param::ParamValue::Int32Array(std::sync::Arc::from(
@@ -750,8 +753,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                         timestamp: report_arr.timestamp.to_system_time(),
                         uint32_changed_mask: 0,
                         ..Default::default()
-                    },
-                );
+                    });
             }
 
             addr0.extend([
@@ -1483,7 +1485,14 @@ fn queue_status_batch(
 async fn clamp_writeback(port: &PortHandle, reason: usize, value: i32) {
     use asyn_rs::request::ParamSetValue;
     let _ = port
-        .set_params_and_notify(0, vec![ParamSetValue::Int32 { reason, addr: 0, value }])
+        .set_params_and_notify(
+            0,
+            vec![ParamSetValue::Int32 {
+                reason,
+                addr: 0,
+                value,
+            }],
+        )
         .await;
 }
 
@@ -2555,7 +2564,10 @@ mod tests {
             .write_int32_blocking(handle.plugin_params.process_plugin, 0, 1)
             .unwrap();
         let reprocessed = downstream_rx.blocking_recv().unwrap();
-        assert_eq!(reprocessed.unique_id, 7, "ProcessPlugin re-emits last input");
+        assert_eq!(
+            reprocessed.unique_id, 7,
+            "ProcessPlugin re-emits last input"
+        );
     }
 
     #[test]
@@ -2599,7 +2611,10 @@ mod tests {
         let second = rt.block_on(async {
             tokio::time::timeout(std::time::Duration::from_millis(50), downstream_rx.recv()).await
         });
-        assert!(second.is_err(), "second array throttled out by MinCallbackTime");
+        assert!(
+            second.is_err(),
+            "second array throttled out by MinCallbackTime"
+        );
     }
 
     #[test]

@@ -159,11 +159,11 @@ pub fn compress_lz4(src: &NDArray) -> NDArray {
 
     // Store original data type so decompression can reconstruct the buffer.
     arr.attributes.add(NDAttribute::new_static(
-                ATTR_ORIGINAL_DATA_TYPE,
-                "Original NDDataType ordinal before codec compression",
-                NDAttrSource::Driver,
-                NDAttrValue::UInt8(original_data_type as u8),
-            ));
+        ATTR_ORIGINAL_DATA_TYPE,
+        "Original NDDataType ordinal before codec compression",
+        NDAttrSource::Driver,
+        NDAttrValue::UInt8(original_data_type as u8),
+    ));
 
     tracing::debug!(
         original_size,
@@ -561,11 +561,7 @@ fn bshuf_compress_block(input: &[u8], n: usize, elem_size: usize) -> Vec<u8> {
 }
 
 /// Inverse of [`bshuf_compress_block`].
-fn bshuf_decompress_block(
-    compressed: &[u8],
-    n: usize,
-    elem_size: usize,
-) -> Option<Vec<u8>> {
+fn bshuf_decompress_block(compressed: &[u8], n: usize, elem_size: usize) -> Option<Vec<u8>> {
     let raw_size = n * elem_size;
     let shuffled = decompress(compressed, raw_size).ok()?;
     if shuffled.len() != raw_size {
@@ -588,7 +584,11 @@ pub fn compress_bslz4(src: &NDArray) -> NDArray {
     let raw = src.data.as_u8_slice();
     let data_type = src.data.data_type();
     let elem_size = data_type.element_size();
-    let total_elems = if elem_size > 0 { raw.len() / elem_size } else { 0 };
+    let total_elems = if elem_size > 0 {
+        raw.len() / elem_size
+    } else {
+        0
+    };
     let block_size = bshuf_default_block_size(elem_size);
 
     // bslz4 header: 8-byte total uncompressed size, 4-byte block size.
@@ -852,11 +852,11 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
     let compressed_size = compressed.len();
     let mut arr = src.clone();
     arr.attributes.add(NDAttribute::new_static(
-                ATTR_ORIGINAL_DATA_TYPE,
-                String::new(),
-                NDAttrSource::Driver,
-                NDAttrValue::Int64(src.data.data_type() as u8 as i64),
-            ));
+        ATTR_ORIGINAL_DATA_TYPE,
+        String::new(),
+        NDAttrSource::Driver,
+        NDAttrValue::Int64(src.data.data_type() as u8 as i64),
+    ));
     arr.data = NDDataBuffer::U8(compressed);
     arr.codec = Some(Codec {
         name: CodecName::Blosc,
@@ -1178,10 +1178,10 @@ mod tests {
         );
         // info() reads ColorMode for 3D arrays
         arr.attributes.add(NDAttribute::new_static(
-                "ColorMode",
-                "Color Mode",
-                NDAttrSource::Driver,
-                NDAttrValue::Int32(2), // RGB1
+            "ColorMode",
+            "Color Mode",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(2), // RGB1
         ));
         if let NDDataBuffer::U8(ref mut v) = arr.data {
             for i in 0..v.len() {

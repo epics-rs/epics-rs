@@ -254,11 +254,11 @@ mod tests {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = uid;
         arr.attributes.add(NDAttribute::new_static(
-                name,
-                String::new(),
-                NDAttrSource::Driver,
-                NDAttrValue::Float64(value),
-            ));
+            name,
+            String::new(),
+            NDAttrSource::Driver,
+            NDAttrValue::Float64(value),
+        ));
         arr
     }
 
@@ -353,11 +353,11 @@ mod tests {
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.attributes.add(NDAttribute::new_static(
-                "Label",
-                String::new(),
-                NDAttrSource::Driver,
-                NDAttrValue::String("hello".to_string()),
-            ));
+            "Label",
+            String::new(),
+            NDAttrSource::Driver,
+            NDAttrValue::String("hello".to_string()),
+        ));
 
         proc.process_array(&arr, &pool);
         assert!((proc.value() - 0.0).abs() < 1e-10);
@@ -370,11 +370,11 @@ mod tests {
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.attributes.add(NDAttribute::new_static(
-                "Counter",
-                String::new(),
-                NDAttrSource::Driver,
-                NDAttrValue::Int32(7),
-            ));
+            "Counter",
+            String::new(),
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(7),
+        ));
 
         proc.process_array(&arr, &pool);
         assert!((proc.value() - 7.0).abs() < 1e-10);

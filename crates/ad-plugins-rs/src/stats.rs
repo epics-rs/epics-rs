@@ -1000,8 +1000,7 @@ impl NDPluginProcess for StatsProcessor {
             ));
             let n = result.histogram.len();
             let step = (self.hist_max - self.hist_min) / n as f64;
-            let hist_x: Vec<f64> =
-                (0..n).map(|i| self.hist_min + i as f64 * step).collect();
+            let hist_x: Vec<f64> = (0..n).map(|i| self.hist_min + i as f64 * step).collect();
             updates.push(ParamUpdate::float64_array(p.hist_x_array, hist_x));
         }
 

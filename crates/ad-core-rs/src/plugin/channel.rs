@@ -445,7 +445,10 @@ mod tests {
         let (sender, _receiver) = ndarray_channel("TEST", 1);
 
         // First publish fills the queue.
-        assert_eq!(sender.publish(make_test_array(1)).await, PublishOutcome::Delivered);
+        assert_eq!(
+            sender.publish(make_test_array(1)).await,
+            PublishOutcome::Delivered
+        );
         // Second publish finds the queue full → dropped + counted.
         assert_eq!(
             sender.publish(make_test_array(2)).await,

@@ -459,11 +459,11 @@ impl NDPluginProcess for ColorConvertProcessor {
                 };
                 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
                 out.attributes.add(NDAttribute::new_static(
-                "ColorMode",
-                "Color Mode",
-                NDAttrSource::Driver,
-                NDAttrValue::Int32(color_mode_val),
-            ));
+                    "ColorMode",
+                    "Color Mode",
+                    NDAttrSource::Driver,
+                    NDAttrValue::Int32(color_mode_val),
+                ));
                 ProcessResult::arrays(vec![Arc::new(out)])
             }
             None => ProcessResult::empty(),
@@ -710,11 +710,11 @@ mod tests {
     fn set_color_mode_attr(arr: &mut NDArray, mode: NDColorMode) {
         use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
         arr.attributes.add(NDAttribute::new_static(
-                "ColorMode",
-                String::new(),
-                NDAttrSource::Driver,
-                NDAttrValue::Int32(mode as i32),
-            ));
+            "ColorMode",
+            String::new(),
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(mode as i32),
+        ));
     }
 
     #[test]

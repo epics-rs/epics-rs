@@ -658,14 +658,18 @@ mod tests {
         let path_none = temp_path("png");
         let mut w_none = MagickWriter::new();
         w_none.set_compress_type(0); // None
-        w_none.open_file(&path_none, NDFileMode::Single, &arr).unwrap();
+        w_none
+            .open_file(&path_none, NDFileMode::Single, &arr)
+            .unwrap();
         w_none.write_file(&arr).unwrap();
         w_none.close_file().unwrap();
 
         let path_zip = temp_path("png");
         let mut w_zip = MagickWriter::new();
         w_zip.set_compress_type(7); // Zip
-        w_zip.open_file(&path_zip, NDFileMode::Single, &arr).unwrap();
+        w_zip
+            .open_file(&path_zip, NDFileMode::Single, &arr)
+            .unwrap();
         w_zip.write_file(&arr).unwrap();
         w_zip.close_file().unwrap();
 

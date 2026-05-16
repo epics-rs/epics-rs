@@ -225,7 +225,11 @@ impl AttrPlotProcessor {
 
     /// Push the current frame's attribute values into the buffers.
     fn push_data(&mut self, array: &NDArray) {
-        Self::push_capped(&mut self.uid_buffer, array.unique_id as f64, self.cache_size);
+        Self::push_capped(
+            &mut self.uid_buffer,
+            array.unique_id as f64,
+            self.cache_size,
+        );
         for (i, name) in self.attributes.iter().enumerate() {
             let value = array
                 .attributes
@@ -241,7 +245,11 @@ impl AttrPlotProcessor {
     /// Returns the values padded to `cache_size` (or to the current point
     /// count when `cache_size` is unlimited) with the last valid point.
     fn block_waveform(&self, block: usize) -> Vec<f64> {
-        let selected = self.data_selections.get(block).copied().unwrap_or(ATTRPLOT_NONE_INDEX);
+        let selected = self
+            .data_selections
+            .get(block)
+            .copied()
+            .unwrap_or(ATTRPLOT_NONE_INDEX);
         let src: Option<&VecDeque<f64>> = match selected {
             ATTRPLOT_UID_INDEX => Some(&self.uid_buffer),
             s if s >= 0 && (s as usize) < self.buffers.len() => Some(&self.buffers[s as usize]),
@@ -249,7 +257,11 @@ impl AttrPlotProcessor {
         };
         let size = self.uid_buffer.len();
         // Target length: the fixed cache size, or the live count if unlimited.
-        let target = if self.cache_size > 0 { self.cache_size } else { size };
+        let target = if self.cache_size > 0 {
+            self.cache_size
+        } else {
+            size
+        };
         let mut out: Vec<f64> = match src {
             Some(buf) => buf.iter().copied().collect(),
             None => vec![f64::NAN; size],

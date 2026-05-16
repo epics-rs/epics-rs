@@ -245,11 +245,7 @@ fn write_attr_value(
     };
     // String values are stored as a fixed-width char row.
     if let NDAttrValue::String(s) = value {
-        let mut bytes: Vec<i8> = s
-            .bytes()
-            .take(ATTR_STRING_SIZE)
-            .map(|b| b as i8)
-            .collect();
+        let mut bytes: Vec<i8> = s.bytes().take(ATTR_STRING_SIZE).map(|b| b as i8).collect();
         bytes.resize(ATTR_STRING_SIZE, 0);
         return if multi {
             writer
@@ -263,7 +259,9 @@ fn write_attr_value(
         netcdf3::DataType::I8 => {
             let v = value.as_i64().unwrap_or(0) as i8;
             if multi {
-                writer.write_record_i8(var_name, record_index, &[v]).map_err(werr)
+                writer
+                    .write_record_i8(var_name, record_index, &[v])
+                    .map_err(werr)
             } else {
                 writer.write_var_i8(var_name, &[v]).map_err(werr)
             }
@@ -271,7 +269,9 @@ fn write_attr_value(
         netcdf3::DataType::I16 => {
             let v = value.as_i64().unwrap_or(0) as i16;
             if multi {
-                writer.write_record_i16(var_name, record_index, &[v]).map_err(werr)
+                writer
+                    .write_record_i16(var_name, record_index, &[v])
+                    .map_err(werr)
             } else {
                 writer.write_var_i16(var_name, &[v]).map_err(werr)
             }
@@ -279,7 +279,9 @@ fn write_attr_value(
         netcdf3::DataType::I32 => {
             let v = value.as_i64().unwrap_or(0) as i32;
             if multi {
-                writer.write_record_i32(var_name, record_index, &[v]).map_err(werr)
+                writer
+                    .write_record_i32(var_name, record_index, &[v])
+                    .map_err(werr)
             } else {
                 writer.write_var_i32(var_name, &[v]).map_err(werr)
             }
@@ -287,7 +289,9 @@ fn write_attr_value(
         netcdf3::DataType::F32 => {
             let v = value.as_f64().unwrap_or(0.0) as f32;
             if multi {
-                writer.write_record_f32(var_name, record_index, &[v]).map_err(werr)
+                writer
+                    .write_record_f32(var_name, record_index, &[v])
+                    .map_err(werr)
             } else {
                 writer.write_var_f32(var_name, &[v]).map_err(werr)
             }
@@ -295,7 +299,9 @@ fn write_attr_value(
         netcdf3::DataType::F64 => {
             let v = value.as_f64().unwrap_or(0.0);
             if multi {
-                writer.write_record_f64(var_name, record_index, &[v]).map_err(werr)
+                writer
+                    .write_record_f64(var_name, record_index, &[v])
+                    .map_err(werr)
             } else {
                 writer.write_var_f64(var_name, &[v]).map_err(werr)
             }
@@ -401,10 +407,11 @@ impl NDFileWriter for NetcdfWriter {
         }
 
         // String-attribute fixed dimension (NDFileNetCDF.cpp:135).
-        let has_string_attr = self
-            .frames
-            .iter()
-            .any(|f| f.attrs.iter().any(|a| matches!(a.value, NDAttrValue::String(_))));
+        let has_string_attr = self.frames.iter().any(|f| {
+            f.attrs
+                .iter()
+                .any(|a| matches!(a.value, NDAttrValue::String(_)))
+        });
         if has_string_attr {
             ds.add_fixed_dim(ATTR_STRING_DIM, ATTR_STRING_SIZE)
                 .map_err(map_def)?;
@@ -464,11 +471,8 @@ impl NDFileWriter for NetcdfWriter {
             .map_err(map_def)?;
             ds.add_global_attr_string(&format!("Attr_{}_Source", attr.name), &attr.source)
                 .map_err(map_def)?;
-            ds.add_global_attr_string(
-                &format!("Attr_{}_SourceType", attr.name),
-                &attr.source_type,
-            )
-            .map_err(map_def)?;
+            ds.add_global_attr_string(&format!("Attr_{}_SourceType", attr.name), &attr.source_type)
+                .map_err(map_def)?;
         }
 
         // Global attributes

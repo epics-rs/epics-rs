@@ -366,7 +366,9 @@ fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
         E::Long(v) => NDAttrValue::Int32(*v),
         E::Double(v) => NDAttrValue::Float64(*v),
         E::Int64(v) => NDAttrValue::Int64(*v),
-        E::ShortArray(a) => a.first().map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int16(*v)),
+        E::ShortArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int16(*v)),
         E::FloatArray(a) => a
             .first()
             .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Float32(*v)),
@@ -376,8 +378,12 @@ fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
         E::DoubleArray(a) => a
             .first()
             .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Float64(*v)),
-        E::LongArray(a) => a.first().map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int32(*v)),
-        E::CharArray(a) => a.first().map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt8(*v)),
+        E::LongArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int32(*v)),
+        E::CharArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt8(*v)),
         E::Int64Array(a) => a
             .first()
             .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int64(*v)),
@@ -754,8 +760,7 @@ mod tests {
             NDAttrValue::Int32(p.parse::<i32>().unwrap_or(0) * 2)
         });
         let src = FunctionAttributeSource::new(registry.clone(), "double", "21");
-        let mut attr =
-            NDAttribute::new_with_source("Doubled", "", NDAttrSource::Function, src);
+        let mut attr = NDAttribute::new_with_source("Doubled", "", NDAttrSource::Function, src);
         assert_eq!(attr.value, NDAttrValue::Int32(42));
         attr.update();
         assert_eq!(attr.value, NDAttrValue::Int32(42));

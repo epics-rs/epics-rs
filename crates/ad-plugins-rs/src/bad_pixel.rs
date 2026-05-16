@@ -334,7 +334,6 @@ impl NDPluginProcess for BadPixelProcessor {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

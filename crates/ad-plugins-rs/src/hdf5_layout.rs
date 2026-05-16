@@ -155,10 +155,7 @@ impl Hdf5Layout {
     /// Parse a layout XML document from a string.
     pub fn parse(text: &str) -> Result<Hdf5Layout, LayoutError> {
         let tokens = tokenize(text)?;
-        let mut parser = Parser {
-            tokens,
-            pos: 0,
-        };
+        let mut parser = Parser { tokens, pos: 0 };
         parser.parse_document()
     }
 
@@ -409,20 +406,14 @@ impl Parser {
         let mut layout = Hdf5Layout::default();
         match self.tokens.get(self.pos).cloned() {
             Some(Token::Open {
-                name,
-                self_closing,
-                ..
+                name, self_closing, ..
             }) if name == "hdf5_layout" => {
                 self.pos += 1;
                 if self_closing {
                     return Ok(layout);
                 }
             }
-            _ => {
-                return Err(LayoutError(
-                    "root element <hdf5_layout> not found".into(),
-                ))
-            }
+            _ => return Err(LayoutError("root element <hdf5_layout> not found".into())),
         }
 
         loop {
@@ -441,8 +432,7 @@ impl Parser {
                         "global" => {
                             let n = attr_get(&attrs, "name").unwrap_or_default();
                             if n == "detector_data_destination" {
-                                layout.detector_data_destination =
-                                    attr_get(&attrs, "ndattribute");
+                                layout.detector_data_destination = attr_get(&attrs, "ndattribute");
                             }
                             if !self_closing {
                                 self.skip_to_close("global")?;
@@ -452,7 +442,7 @@ impl Parser {
                             return Err(LayoutError(format!(
                                 "unexpected element <{}> in <hdf5_layout>",
                                 other
-                            )))
+                            )));
                         }
                     }
                 }
@@ -464,13 +454,9 @@ impl Parser {
                     return Err(LayoutError(format!(
                         "unexpected </{}> at document level",
                         other
-                    )))
+                    )));
                 }
-                None => {
-                    return Err(LayoutError(
-                        "unterminated <hdf5_layout> element".into(),
-                    ))
-                }
+                None => return Err(LayoutError("unterminated <hdf5_layout> element".into())),
             }
         }
         Ok(layout)
@@ -522,7 +508,7 @@ impl Parser {
                             return Err(LayoutError(format!(
                                 "unexpected <{}> inside <group name=\"{}\">",
                                 other, name
-                            )))
+                            )));
                         }
                     }
                 }
@@ -534,13 +520,13 @@ impl Parser {
                     return Err(LayoutError(format!(
                         "mismatched </{}>, expected </group>",
                         other
-                    )))
+                    )));
                 }
                 None => {
                     return Err(LayoutError(format!(
                         "unterminated <group name=\"{}\">",
                         name
-                    )))
+                    )));
                 }
             }
         }
@@ -598,13 +584,13 @@ impl Parser {
                     return Err(LayoutError(format!(
                         "mismatched </{}>, expected </dataset>",
                         other
-                    )))
+                    )));
                 }
                 None => {
                     return Err(LayoutError(format!(
                         "unterminated <dataset name=\"{}\">",
                         name
-                    )))
+                    )));
                 }
             }
         }
@@ -646,7 +632,7 @@ fn parse_attribute(attrs: &[(String, String)]) -> Result<LayoutAttribute, Layout
             return Err(LayoutError(format!(
                 "<attribute name=\"{}\"> invalid source '{}'",
                 name, other
-            )))
+            )));
         }
     };
     Ok(LayoutAttribute {
@@ -681,10 +667,7 @@ fn parse_source(attrs: &[(String, String)], name: &str) -> Result<LayoutSource, 
 }
 
 fn attr_get(attrs: &[(String, String)], key: &str) -> Option<String> {
-    attrs
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.clone())
+    attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
 fn attr_bool(attrs: &[(String, String)], key: &str) -> bool {
@@ -717,10 +700,7 @@ mod tests {
     fn parses_full_tree() {
         let layout = Hdf5Layout::parse(SAMPLE).unwrap();
         assert_eq!(layout.groups.len(), 1);
-        assert_eq!(
-            layout.detector_data_destination.as_deref(),
-            Some("detdest")
-        );
+        assert_eq!(layout.detector_data_destination.as_deref(), Some("detdest"));
         let entry = &layout.groups[0];
         assert_eq!(entry.name, "entry");
         assert_eq!(entry.attributes.len(), 1);
@@ -768,7 +748,8 @@ mod tests {
 
     #[test]
     fn rejects_missing_dataset_name() {
-        let xml = r#"<hdf5_layout><group name="g"><dataset source="detector"/></group></hdf5_layout>"#;
+        let xml =
+            r#"<hdf5_layout><group name="g"><dataset source="detector"/></group></hdf5_layout>"#;
         let err = Hdf5Layout::parse(xml).unwrap_err();
         assert!(err.0.contains("name"));
     }

@@ -540,11 +540,11 @@ mod tests {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = id;
         arr.attributes.add(NDAttribute::new_static(
-                "trigger",
-                "",
-                NDAttrSource::Driver,
-                NDAttrValue::Float64(attr_val),
-            ));
+            "trigger",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Float64(attr_val),
+        ));
         Arc::new(arr)
     }
 
@@ -552,17 +552,17 @@ mod tests {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = id;
         arr.attributes.add(NDAttribute::new_static(
-                "attr_a",
-                "",
-                NDAttrSource::Driver,
-                NDAttrValue::Float64(a_val),
-            ));
+            "attr_a",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Float64(a_val),
+        ));
         arr.attributes.add(NDAttribute::new_static(
-                "attr_b",
-                "",
-                NDAttrSource::Driver,
-                NDAttrValue::Float64(b_val),
-            ));
+            "attr_b",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Float64(b_val),
+        ));
         Arc::new(arr)
     }
 

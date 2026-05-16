@@ -670,9 +670,7 @@ impl NDPluginProcess for FFTProcessor {
         let mut averaged_mags: Option<Vec<f64>> = None;
         if self.config.direction == FFTDirection::Forward {
             let suppress_dc = self.config.suppress_dc;
-            if let Some((time_series, real, imag)) =
-                self.compute_row_spectrum(array, suppress_dc)
-            {
+            if let Some((time_series, real, imag)) = self.compute_row_spectrum(array, suppress_dc) {
                 let n_time = time_series.len();
                 let n_freq = real.len();
                 if let Some(idx) = self.params.time_series {
@@ -1196,11 +1194,8 @@ mod tests {
     /// Register the FFT params on a scratch port and return the processor.
     fn fft_proc_with_params(config: FFTConfig) -> FFTProcessor {
         let mut proc = FFTProcessor::with_config(config);
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "FFT_TEST",
-            1,
-            asyn_rs::port::PortFlags::default(),
-        );
+        let mut base =
+            asyn_rs::port::PortDriverBase::new("FFT_TEST", 1, asyn_rs::port::PortFlags::default());
         proc.register_params(&mut base).unwrap();
         proc
     }
@@ -1208,9 +1203,9 @@ mod tests {
     /// Find a Float64Array update by param reason.
     fn find_array_update(updates: &[ParamUpdate], reason: usize) -> Option<&[f64]> {
         updates.iter().find_map(|u| match u {
-            ParamUpdate::Float64Array { reason: r, value, .. } if *r == reason => {
-                Some(value.as_slice())
-            }
+            ParamUpdate::Float64Array {
+                reason: r, value, ..
+            } if *r == reason => Some(value.as_slice()),
             _ => None,
         })
     }
@@ -1364,7 +1359,10 @@ mod tests {
             .iter()
             .filter(|x| matches!(x, ParamUpdate::Float64Array { .. }))
             .count();
-        assert_eq!(array_updates, 0, "inverse FFT must not emit spectrum waveforms");
+        assert_eq!(
+            array_updates, 0,
+            "inverse FFT must not emit spectrum waveforms"
+        );
     }
 
     #[test]
@@ -1391,7 +1389,10 @@ mod tests {
         let result = proc.process_array(&arr, &pool);
         if let NDDataBuffer::F64(ref v) = result.output_arrays[0].data {
             let has_negative = v.iter().any(|&x| x < -1e-6);
-            assert!(has_negative, "inverse FFT must keep negative samples: {v:?}");
+            assert!(
+                has_negative,
+                "inverse FFT must keep negative samples: {v:?}"
+            );
         } else {
             panic!("expected F64 data");
         }

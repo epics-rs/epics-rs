@@ -153,8 +153,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
         {
             // B9: eager open — needs a frame to know the layout.
             if let Some(array) = self.latest_array.clone() {
-                self.file_base
-                    .open_stream_eager(&mut self.writer, &array)?;
+                self.file_base.open_stream_eager(&mut self.writer, &array)?;
             }
         }
         self.capture_active = true;
@@ -205,8 +204,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
                 if dest.len() <= 1 {
                     return true;
                 }
-                dest.eq_ignore_ascii_case("all")
-                    || dest.eq_ignore_ascii_case(&self.port_name)
+                dest.eq_ignore_ascii_case("all") || dest.eq_ignore_ascii_case(&self.port_name)
             }
             None => true,
         }
@@ -220,7 +218,10 @@ impl<W: NDFileWriter> FilePluginController<W> {
             Some(idx) => idx,
             None => return,
         };
-        let path = self.file_base.file_path.trim_end_matches(std::path::MAIN_SEPARATOR);
+        let path = self
+            .file_base
+            .file_path
+            .trim_end_matches(std::path::MAIN_SEPARATOR);
         let exists = !path.is_empty() && std::path::Path::new(path).is_dir();
         updates.push(ParamUpdate::Int32 {
             reason: idx,
@@ -233,7 +234,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
     /// to the file base, returning param updates for the changed PVs and
     /// whether a mid-stream file reopen is required (C++ `attrFileNameSet` /
     /// `attrFileNameCheck`).
-    fn apply_filename_attributes(&mut self, array: &NDArray, updates: &mut Vec<ParamUpdate>) -> bool {
+    fn apply_filename_attributes(
+        &mut self,
+        array: &NDArray,
+        updates: &mut Vec<ParamUpdate>,
+    ) -> bool {
         let mut reopen = false;
         if let Some(attr) = array.attributes.get("FilePluginFileName") {
             let name = attr.value.as_string();
@@ -242,7 +247,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
                     self.file_base.file_name = name.clone();
                     reopen = true;
                     if let Some(idx) = self.params.file_name {
-                        updates.push(ParamUpdate::Octet { reason: idx, addr: 0, value: name });
+                        updates.push(ParamUpdate::Octet {
+                            reason: idx,
+                            addr: 0,
+                            value: name,
+                        });
                     }
                 }
             }
@@ -255,7 +264,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
                     self.file_base.auto_increment = false; // C parity
                     reopen = true;
                     if let Some(idx) = self.params.file_number {
-                        updates.push(ParamUpdate::Int32 { reason: idx, addr: 0, value: num });
+                        updates.push(ParamUpdate::Int32 {
+                            reason: idx,
+                            addr: 0,
+                            value: num,
+                        });
                     }
                 }
             }
@@ -346,12 +359,15 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         return proc_result;
                     }
                     // G9: attribute-driven filename override / mid-stream reopen.
-                    let reopen = self.apply_filename_attributes(&array, &mut proc_result.param_updates);
+                    let reopen =
+                        self.apply_filename_attributes(&array, &mut proc_result.param_updates);
                     if reopen && self.file_base.is_open() {
                         if let Err(e) = self.file_base.force_close(&mut self.writer) {
-                            return ProcessResult::sink(
-                                self.error_updates(false, false, e.to_string()),
-                            );
+                            return ProcessResult::sink(self.error_updates(
+                                false,
+                                false,
+                                e.to_string(),
+                            ));
                         }
                     }
                     let r = self.file_base.process_array(array, &mut self.writer);
@@ -560,11 +576,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
                     ));
                 }
             } else if let Err(e) = self.stop_capture(&mut updates) {
-                return ParamChangeResult::updates(self.error_updates(
-                    false,
-                    false,
-                    e.to_string(),
-                ));
+                return ParamChangeResult::updates(self.error_updates(false, false, e.to_string()));
             }
         }
 
@@ -724,7 +736,12 @@ mod tests {
     }
     impl MockWriter {
         fn new(multi: bool) -> Self {
-            Self { opens: 0, writes: 0, closes: 0, multi }
+            Self {
+                opens: 0,
+                writes: 0,
+                closes: 0,
+                multi,
+            }
         }
     }
     impl NDFileWriter for MockWriter {
@@ -812,7 +829,10 @@ mod tests {
         assert!(c.file_base.is_open());
 
         c.process_array(&with_i32_attr(array(3), "FilePluginClose", 1));
-        assert!(!c.file_base.is_open(), "FilePluginClose must close the file");
+        assert!(
+            !c.file_base.is_open(),
+            "FilePluginClose must close the file"
+        );
         assert!(!c.capture_active, "close attribute stops capture");
     }
 
@@ -842,7 +862,10 @@ mod tests {
         c.process_array(&array(1)); // cache a frame for the layout
         let mut updates = Vec::new();
         c.start_capture(&mut updates).unwrap();
-        assert!(c.file_base.is_open(), "non-lazy stream opens at capture start");
+        assert!(
+            c.file_base.is_open(),
+            "non-lazy stream opens at capture start"
+        );
         assert_eq!(c.writer.opens, 1);
     }
 
@@ -856,7 +879,10 @@ mod tests {
         c.process_array(&array(1));
         let mut updates = Vec::new();
         c.start_capture(&mut updates).unwrap();
-        assert!(!c.file_base.is_open(), "lazy stream does NOT open at capture start");
+        assert!(
+            !c.file_base.is_open(),
+            "lazy stream does NOT open at capture start"
+        );
         c.process_array(&array(2));
         assert!(c.file_base.is_open(), "lazy stream opens on first frame");
     }
@@ -907,7 +933,10 @@ mod tests {
             value: ParamChangeValue::Int32(NDFileMode::Capture as i32),
         };
         c.on_param_change(5, &snap);
-        assert!(!c.file_base.is_open(), "mode switch must close the open stream");
+        assert!(
+            !c.file_base.is_open(),
+            "mode switch must close the open stream"
+        );
         assert!(!c.capture_active);
     }
 
@@ -924,7 +953,11 @@ mod tests {
         for id in 1..=5 {
             c.process_array(&array(id));
         }
-        assert_eq!(c.file_base.num_captured(), 5, "all frames buffered, no flush");
+        assert_eq!(
+            c.file_base.num_captured(),
+            5,
+            "all frames buffered, no flush"
+        );
         assert_eq!(c.writer.writes, 0, "num_capture==0 never auto-flushes");
         assert!(c.capture_active, "still capturing");
     }
@@ -938,17 +971,18 @@ mod tests {
         c.file_base.set_mode(NDFileMode::Single);
         c.auto_save = true;
         let r1 = c.process_array(&array(1));
-        let counter1 = r1
-            .param_updates
-            .iter()
-            .find_map(|u| match u {
-                ParamUpdate::Int32 { reason: 99, value, .. } => Some(*value),
-                _ => None,
-            });
+        let counter1 = r1.param_updates.iter().find_map(|u| match u {
+            ParamUpdate::Int32 {
+                reason: 99, value, ..
+            } => Some(*value),
+            _ => None,
+        });
         assert_eq!(counter1, Some(1), "first saved frame → ArrayCounter 1");
         let r2 = c.process_array(&array(2));
         let counter2 = r2.param_updates.iter().find_map(|u| match u {
-            ParamUpdate::Int32 { reason: 99, value, .. } => Some(*value),
+            ParamUpdate::Int32 {
+                reason: 99, value, ..
+            } => Some(*value),
             _ => None,
         });
         assert_eq!(counter2, Some(2));

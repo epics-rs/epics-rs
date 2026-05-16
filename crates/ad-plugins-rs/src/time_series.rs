@@ -969,7 +969,8 @@ mod tests {
         let jh = std::thread::spawn(move || ts_data_thread(shared_clone, rx));
 
         for v in [10.0, 20.0, 30.0, 40.0] {
-            tx.blocking_send(TimeSeriesData { values: vec![v] }).unwrap();
+            tx.blocking_send(TimeSeriesData { values: vec![v] })
+                .unwrap();
         }
         drop(tx);
         jh.join().unwrap();
@@ -997,7 +998,8 @@ mod tests {
         let shared_clone = shared.clone();
         let jh = std::thread::spawn(move || ts_data_thread(shared_clone, rx));
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
-            tx.blocking_send(TimeSeriesData { values: vec![v] }).unwrap();
+            tx.blocking_send(TimeSeriesData { values: vec![v] })
+                .unwrap();
         }
         drop(tx);
         jh.join().unwrap();
@@ -1026,7 +1028,8 @@ mod tests {
         let shared_clone = shared.clone();
         let jh = std::thread::spawn(move || ts_data_thread(shared_clone, rx));
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
-            tx.blocking_send(TimeSeriesData { values: vec![v] }).unwrap();
+            tx.blocking_send(TimeSeriesData { values: vec![v] })
+                .unwrap();
         }
         drop(tx);
         jh.join().unwrap();
@@ -1042,8 +1045,7 @@ mod tests {
         // Writing TS_ACQUIRE_MODE must switch the buffer mode AND flip the
         // time axis from ascending (Fixed) to signed-ending-at-0 (Circular).
         let shared = Arc::new(Mutex::new(SharedTsState::new(1, 4)));
-        let mut driver =
-            TimeSeriesPortDriver::new("TEST_TS_MODE", &["Ch0"], 4, shared.clone());
+        let mut driver = TimeSeriesPortDriver::new("TEST_TS_MODE", &["Ch0"], 4, shared.clone());
 
         // Fixed mode axis: 0, 1, 2, 3.
         let axis = driver
@@ -1071,8 +1073,7 @@ mod tests {
     fn test_num_average_param_drives_state() {
         // Writing TS_NUM_AVERAGE must update SharedTsState::num_average.
         let shared = Arc::new(Mutex::new(SharedTsState::new(1, 10)));
-        let mut driver =
-            TimeSeriesPortDriver::new("TEST_TS_NAVG", &["Ch0"], 10, shared.clone());
+        let mut driver = TimeSeriesPortDriver::new("TEST_TS_NAVG", &["Ch0"], 10, shared.clone());
         let mut user = AsynUser::new(driver.params.ts_num_average);
         driver.write_int32(&mut user, 5).unwrap();
         assert_eq!(shared.lock().num_average, 5);

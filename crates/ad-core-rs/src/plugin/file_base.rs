@@ -141,11 +141,7 @@ impl NDPluginFileBase {
                                 None => (spec.parse::<usize>().unwrap_or(0), 0),
                             };
                             // Apply precision first (zero-pad the number).
-                            let digits = format!(
-                                "{:0>prec$}",
-                                self.file_number,
-                                prec = precision
-                            );
+                            let digits = format!("{:0>prec$}", self.file_number, prec = precision);
                             // Then pad to the field width. The `0` flag
                             // zero-pads (ignored when left-justified or when an
                             // explicit precision is given, per C printf).
@@ -691,8 +687,14 @@ mod tests {
         .unwrap();
 
         // Capture buffer flushed at num_capture=2; both driver files deleted.
-        assert!(!f1.exists(), "driver file 1 should be deleted in capture mode");
-        assert!(!f2.exists(), "driver file 2 should be deleted in capture mode");
+        assert!(
+            !f1.exists(),
+            "driver file 1 should be deleted in capture mode"
+        );
+        assert!(
+            !f2.exists(),
+            "driver file 2 should be deleted in capture mode"
+        );
     }
 
     #[test]
@@ -715,7 +717,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!f1.exists(), "driver file should be deleted in capture mode");
+        assert!(
+            !f1.exists(),
+            "driver file should be deleted in capture mode"
+        );
     }
 
     #[test]

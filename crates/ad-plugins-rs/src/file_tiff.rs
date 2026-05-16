@@ -141,11 +141,11 @@ impl TiffWriter {
 
     fn attach_color_mode(array: &mut NDArray, color_mode: NDColorMode) {
         array.attributes.add(NDAttribute::new_static(
-                "ColorMode",
-                "Color mode",
-                NDAttrSource::Driver,
-                NDAttrValue::Int32(color_mode as i32),
-            ));
+            "ColorMode",
+            "Color mode",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(color_mode as i32),
+        ));
     }
 }
 
@@ -210,10 +210,7 @@ impl NDFileWriter for TiffWriter {
                 macro_rules! tag {
                     ($tag:expr, $val:expr) => {
                         image.encoder().write_tag($tag, $val).map_err(|e| {
-                            ADError::UnsupportedConversion(format!(
-                                "TIFF tag write error: {}",
-                                e
-                            ))
+                            ADError::UnsupportedConversion(format!("TIFF tag write error: {}", e))
                         })?;
                     };
                 }
@@ -711,7 +708,11 @@ mod tests {
         assert_eq!(decoder.get_tag_u32(Tag::Unknown(65003)).unwrap(), 500);
         // Standard Software tag.
         assert_eq!(
-            decoder.get_tag(Tag::Software).unwrap().into_string().unwrap(),
+            decoder
+                .get_tag(Tag::Software)
+                .unwrap()
+                .into_string()
+                .unwrap(),
             "EPICS areaDetector"
         );
 

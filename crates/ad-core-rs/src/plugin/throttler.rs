@@ -51,8 +51,9 @@ impl Throttler {
         let now = Instant::now();
         let refill_count = (now.duration_since(self.last_refill).as_secs_f64() * 1000.0) as i64;
         if refill_count != 0 {
-            self.available =
-                self.limit.min(self.available + refill_count as f64 * self.refill_amount);
+            self.available = self
+                .limit
+                .min(self.available + refill_count as f64 * self.refill_amount);
             self.last_refill = now;
         }
         self.available

@@ -1056,9 +1056,36 @@ static FONT_9X15B_DATA: [u8; 5730] = [
 
 /// The 4 ADCore bitmap fonts, indexed by the `Font` param (0..=3).
 pub static FONTS: [BitmapFont; 4] = [
-    BitmapFont { width: 6, height: 13, bytes_per_char: 1, first_char: 32, num_chars: 191, bitmap: &FONT_6X13_DATA },
-    BitmapFont { width: 6, height: 13, bytes_per_char: 1, first_char: 32, num_chars: 191, bitmap: &FONT_6X13B_DATA },
-    BitmapFont { width: 9, height: 15, bytes_per_char: 2, first_char: 32, num_chars: 191, bitmap: &FONT_9X15_DATA },
-    BitmapFont { width: 9, height: 15, bytes_per_char: 2, first_char: 32, num_chars: 191, bitmap: &FONT_9X15B_DATA },
+    BitmapFont {
+        width: 6,
+        height: 13,
+        bytes_per_char: 1,
+        first_char: 32,
+        num_chars: 191,
+        bitmap: &FONT_6X13_DATA,
+    },
+    BitmapFont {
+        width: 6,
+        height: 13,
+        bytes_per_char: 1,
+        first_char: 32,
+        num_chars: 191,
+        bitmap: &FONT_6X13B_DATA,
+    },
+    BitmapFont {
+        width: 9,
+        height: 15,
+        bytes_per_char: 2,
+        first_char: 32,
+        num_chars: 191,
+        bitmap: &FONT_9X15_DATA,
+    },
+    BitmapFont {
+        width: 9,
+        height: 15,
+        bytes_per_char: 2,
+        first_char: 32,
+        num_chars: 191,
+        bitmap: &FONT_9X15B_DATA,
+    },
 ];
-

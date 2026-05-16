@@ -90,7 +90,13 @@ fn strides_for(color_mode: NDColorMode, xs: usize, ys: usize, cs: usize) -> (usi
 
 /// Build the destination dimension vector for `color_mode` with the given
 /// X/Y/color sizes, matching the C++ dimension order per color mode.
-fn dims_for(color_mode: NDColorMode, xs: usize, ys: usize, cs: usize, ndims: usize) -> Vec<NDDimension> {
+fn dims_for(
+    color_mode: NDColorMode,
+    xs: usize,
+    ys: usize,
+    cs: usize,
+    ndims: usize,
+) -> Vec<NDDimension> {
     if ndims < 3 {
         return vec![NDDimension::new(xs), NDDimension::new(ys)];
     }
@@ -138,7 +144,11 @@ pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
         (src_w, src_h)
     };
 
-    let (sxs, sys, scs) = (info.x_stride, info.y_stride.max(1), info.color_stride.max(1));
+    let (sxs, sys, scs) = (
+        info.x_stride,
+        info.y_stride.max(1),
+        info.color_stride.max(1),
+    );
     let (dxs, dys, dcs) = strides_for(info.color_mode, dst_w, dst_h, color);
     let total = dst_w * dst_h * color;
 

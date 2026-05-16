@@ -359,10 +359,26 @@ pub fn draw_overlays(src: &NDArray, overlays: &[OverlayDef]) -> NDArray {
             draw_on_typed_buffer!(data.as_mut_slice(), u32, overlays, w, h, arr.timestamp, xor);
         }
         NDDataBuffer::F32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), f32, overlays, w, h, arr.timestamp, set_only);
+            draw_on_typed_buffer!(
+                data.as_mut_slice(),
+                f32,
+                overlays,
+                w,
+                h,
+                arr.timestamp,
+                set_only
+            );
         }
         NDDataBuffer::F64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), f64, overlays, w, h, arr.timestamp, set_only);
+            draw_on_typed_buffer!(
+                data.as_mut_slice(),
+                f64,
+                overlays,
+                w,
+                h,
+                arr.timestamp,
+                set_only
+            );
         }
         NDDataBuffer::I8(data) => {
             draw_on_typed_buffer!(data.as_mut_slice(), i8, overlays, w, h, arr.timestamp, xor);
@@ -899,11 +915,7 @@ mod tests {
                     for col in 0..bmp.width {
                         let expect = font_pixel(bmp, ch, row, col);
                         let px = v[row * w + ci * bmp.width + col];
-                        assert_eq!(
-                            px != 0,
-                            expect,
-                            "glyph {ch} pixel ({col},{row}) mismatch"
-                        );
+                        assert_eq!(px != 0, expect, "glyph {ch} pixel ({col},{row}) mismatch");
                     }
                 }
             }
@@ -1165,18 +1177,17 @@ mod tests {
 
     fn find_int_update(updates: &[ParamUpdate], reason: usize) -> Option<i32> {
         updates.iter().find_map(|u| match u {
-            ParamUpdate::Int32 { reason: r, value, .. } if *r == reason => Some(*value),
+            ParamUpdate::Int32 {
+                reason: r, value, ..
+            } if *r == reason => Some(*value),
             _ => None,
         })
     }
 
     fn setup_processor() -> (OverlayProcessor, OverlayParamIndices) {
         let mut p = OverlayProcessor::new(vec![]);
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "OV_TEST",
-            8,
-            asyn_rs::port::PortFlags::default(),
-        );
+        let mut base =
+            asyn_rs::port::PortDriverBase::new("OV_TEST", 8, asyn_rs::port::PortFlags::default());
         p.register_params(&mut base).unwrap();
         let params = OverlayParamIndices {
             position_x: base.find_param("OVERLAY_POSITION_X"),
@@ -1221,7 +1232,10 @@ mod tests {
         // CenterX stays 200; PositionX moves to 200 - 60/2 = 170.
         assert_eq!(p.slots[0].center_x, 200);
         assert_eq!(p.slots[0].position_x, 170);
-        assert_eq!(find_int_update(&updates, idx.position_x.unwrap()), Some(170));
+        assert_eq!(
+            find_int_update(&updates, idx.position_x.unwrap()),
+            Some(170)
+        );
     }
 
     #[test]

@@ -1574,9 +1574,15 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
     if rec.conv.mres == 0.0 {
         return;
     }
-    // Seed raw limits from dial on first call (init): when RHLM/RLLM start at
-    // their default 0, treat the existing dial limits as the source. From then
-    // on, raw limits stay invariant under MRES change.
+    // Seed raw limits from the dial limits the first time MRES changes after
+    // init: RHLM/RLLM default to 0. Once any HLM/LLM/DHLM/DLLM/RHLM/RLLM put
+    // has run, rhlm/rllm hold a meaningful value and seeding is skipped.
+    //
+    // Invariant: every put that can leave rhlm==rllm==0 also leaves
+    // dhlm==dllm==0 (HLM/LLM/DHLM/DLLM/RHLM/RLLM handlers always update the
+    // raw/dial pair together). So when raw_unset is true, dhlm/dllm are 0 too
+    // and the seed below is a 0->0 no-op. 0/0 is the "limits disabled"
+    // convention (see check_soft_limits), never an active limit pair.
     let raw_unset = rec.limits.rhlm == 0.0 && rec.limits.rllm == 0.0;
     if raw_unset && old_mres != 0.0 {
         rec.limits.rhlm = rec.limits.dhlm / old_mres;

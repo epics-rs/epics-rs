@@ -147,16 +147,6 @@ impl MotorDeviceSupport {
                     tracing::info!("motor command: ProfileReadback");
                     motor.readback_profile(&user).map(|_| ())
                 }
-                MotorCommand::MoveToHome {
-                    position,
-                    velocity,
-                    acceleration,
-                } => {
-                    tracing::info!(
-                        "motor command: MoveToHome position={position} velocity={velocity} accel={acceleration}"
-                    );
-                    motor.move_to_home(&user, *position, *velocity, *acceleration)
-                }
                 MotorCommand::EnablePco { enable } => {
                     tracing::info!("motor command: EnablePco({enable})");
                     motor.enable_pco(&user, *enable)

@@ -353,13 +353,6 @@ impl AxisRuntime {
                 MotorCommand::ProfileExecute => self.motor.execute_profile(&user),
                 MotorCommand::ProfileAbort => self.motor.abort_profile(&user),
                 MotorCommand::ProfileReadback => self.motor.readback_profile(&user).map(|_| ()),
-                MotorCommand::MoveToHome {
-                    position,
-                    velocity,
-                    acceleration,
-                } => self
-                    .motor
-                    .move_to_home(&user, *position, *velocity, *acceleration),
                 MotorCommand::EnablePco { enable } => self.motor.enable_pco(&user, *enable),
                 MotorCommand::SetPcoConfig {
                     start,

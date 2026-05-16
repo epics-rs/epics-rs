@@ -257,12 +257,6 @@ pub enum MotorCommand {
         velocity: f64,
         acceleration: f64,
     },
-    /// Absolute move to a controller-defined home position (C: a6f64591).
-    MoveToHome {
-        position: f64,
-        velocity: f64,
-        acceleration: f64,
-    },
     Stop {
         acceleration: f64,
     },

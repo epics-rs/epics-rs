@@ -28,28 +28,10 @@ No C dependencies. Just `cargo build`.
 - Builder pattern for easy motor setup
 - SimMotor for testing (time-based linear interpolation)
 
-## What's New in v0.2
+## Benchmarks
 
-### v0.2.0 — Per-Axis Actor Runtime
-
-**AxisRuntime** — unified per-axis actor that replaces the shared-state poll loop:
-
-- **AxisRuntime** — single async task per axis, owns motor driver exclusively (no `Arc<Mutex>`)
-- **AxisHandle** — cloneable async interface (`execute()`, `get_status()`, polling, delay)
-- `select!` multiplexes commands and poll timer (no `SharedDeviceState` mutex)
-- I/O Intr notification channel for scan integration
-
-```rust
-use motor_rs::axis_runtime::create_axis_runtime;
-
-let (handle, _jh) = create_axis_runtime(sim_motor, Duration::from_millis(100));
-handle.execute(actions).await;
-let status = handle.get_status().await;
-```
-
-### v0.2.1 — Benchmarks
-
-- **Criterion benchmark** (`benches/motor.rs`): `motor_move_to_done` measures full move cycle through AxisRuntime
+- **Criterion benchmark** (`benches/motor.rs`): `motor_move_to_done` measures
+  a full record-level move cycle (VAL write → plan → completion).
 
 ## Architecture
 
@@ -68,8 +50,7 @@ motor-rs/
     coordinate.rs       # Dial ↔ user ↔ raw coordinate conversion (raw is i64)
     device_state.rs     # Shared mailbox between record, device support, poll loop
     device_support.rs   # MotorDeviceSupport — bridges record to AsynMotor drivers
-    axis_runtime.rs     # AxisRuntime — per-axis actor with exclusive driver ownership
-    poll_loop.rs        # Async polling task for motor status
+    poll_loop.rs        # Async per-axis polling task for motor status
     builder.rs          # MotorBuilder — fluent API for motor assembly
     sim_motor.rs        # SimMotor — simulated motor for testing
   benches/

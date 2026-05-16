@@ -576,8 +576,17 @@ impl Hdf5Writer {
 
         // The public rust-hdf5 0.2.0 SWMR API (`SwmrFileWriter`) has no
         // filtered streaming-dataset constructor, so compression cannot be
-        // applied here. Record the fact so the processor can surface it.
+        // applied here. Record the fact and warn loudly — never drop it
+        // silently.
         let compression_dropped = self.compression_type != COMPRESS_NONE;
+        if compression_dropped {
+            eprintln!(
+                "NDFileHDF5: WARNING — SWMR mode requested with compression \
+                 type {} but rust-hdf5 0.2.0 exposes no filtered SWMR \
+                 dataset API; the SWMR file will be written UNCOMPRESSED.",
+                self.compression_type
+            );
+        }
 
         self.handle = Some(Hdf5Handle::Swmr {
             writer: swmr,
@@ -1987,6 +1996,31 @@ mod tests {
 
         let data: Vec<f32> = reader.read_dataset("data").unwrap();
         assert_eq!(data.len(), 3 * 8 * 8);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_swmr_compression_dropped_is_flagged() {
+        // rust-hdf5 0.2.0 exposes no filtered SWMR dataset API. When SWMR is
+        // combined with compression the writer must flag the drop, never
+        // silently produce an uncompressed file as if it were compressed.
+        let path = temp_path("hdf5_swmr_comp");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        writer.set_compression_type(COMPRESS_ZLIB);
+
+        let arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        assert!(
+            writer.swmr_compression_dropped(),
+            "SWMR+compression must be flagged as dropped"
+        );
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
 
         std::fs::remove_file(&path).ok();
     }

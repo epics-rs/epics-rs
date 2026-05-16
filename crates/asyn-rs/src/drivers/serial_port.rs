@@ -345,7 +345,12 @@ impl OctetNext for SerialIoState {
 
         Ok(OctetReadResult {
             nbytes_transferred: n as usize,
-            eom_reason: EomReason::CNT,
+            // C parity: CNT only when the requested count was reached.
+            eom_reason: if n as usize >= buf.len() {
+                EomReason::CNT
+            } else {
+                EomReason::empty()
+            },
         })
     }
 

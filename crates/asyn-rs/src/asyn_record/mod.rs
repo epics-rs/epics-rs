@@ -1258,6 +1258,8 @@ impl AsynRecord {
                         Ok(result) => {
                             if let Some(v) = result.int_val {
                                 self.i32inp = v;
+                            } else {
+                                self.errs = "read: int32 read returned no value".to_string();
                             }
                         }
                         Err(e) => {
@@ -1290,6 +1292,8 @@ impl AsynRecord {
                         Ok(result) => {
                             if let Some(v) = result.float_val {
                                 self.f64inp = v;
+                            } else {
+                                self.errs = "read: float64 read returned no value".to_string();
                             }
                         }
                         Err(e) => {

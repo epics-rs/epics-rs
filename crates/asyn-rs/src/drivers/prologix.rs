@@ -327,8 +327,20 @@ impl PortDriver for DrvAsynPrologixPort {
         if user.addr < 0 {
             self.inner.disconnect(user)?;
         }
+        // Drop any buffered read remainder — it belongs to the old
+        // connection and must not leak into the next session.
+        self.state.lock().unwrap().read_carry.clear();
         self.base.set_connected(false);
         Ok(())
+    }
+
+    fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        // OctetWriteRead does flush -> write -> read to drop stale input.
+        // The transport flush cannot see `read_carry` (an application
+        // buffer), so clear it here too or a stale carry would be
+        // returned as the response to the new command.
+        self.state.lock().unwrap().read_carry.clear();
+        self.inner.io_flush(user)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {

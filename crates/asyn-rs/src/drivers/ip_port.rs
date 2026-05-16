@@ -269,7 +269,14 @@ impl OctetNext for IpIoState {
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
-                        eom_reason: EomReason::CNT,
+                        // C parity: CNT means the requested count was
+                        // reached. A short read leaves the reason empty
+                        // so the EOS interpose keeps reading.
+                        eom_reason: if n >= buf.len() {
+                            EomReason::CNT
+                        } else {
+                            EomReason::empty()
+                        },
                     }),
                     Err(e)
                         if e.kind() == std::io::ErrorKind::TimedOut
@@ -292,7 +299,14 @@ impl OctetNext for IpIoState {
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
-                        eom_reason: EomReason::CNT,
+                        // C parity: CNT means the requested count was
+                        // reached. A short read leaves the reason empty
+                        // so the EOS interpose keeps reading.
+                        eom_reason: if n >= buf.len() {
+                            EomReason::CNT
+                        } else {
+                            EomReason::empty()
+                        },
                     }),
                     Err(e)
                         if e.kind() == std::io::ErrorKind::TimedOut
@@ -316,7 +330,14 @@ impl OctetNext for IpIoState {
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
-                        eom_reason: EomReason::CNT,
+                        // C parity: CNT means the requested count was
+                        // reached. A short read leaves the reason empty
+                        // so the EOS interpose keeps reading.
+                        eom_reason: if n >= buf.len() {
+                            EomReason::CNT
+                        } else {
+                            EomReason::empty()
+                        },
                     }),
                     Err(e)
                         if e.kind() == std::io::ErrorKind::TimedOut
@@ -444,12 +465,20 @@ impl DrvAsynIPPort {
                         continue;
                     }
                 };
-                socket.set_reuse_address(true)?;
-                let local_addr: std::net::SocketAddr =
-                    local_str.parse().map_err(|_| AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("invalid local address: {local_str}"),
-                    })?;
+                if let Err(e) = socket.set_reuse_address(true) {
+                    last_err = Some(AsynError::Io(e));
+                    continue;
+                }
+                let local_addr: std::net::SocketAddr = match local_str.parse() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        last_err = Some(AsynError::Status {
+                            status: AsynStatus::Error,
+                            message: format!("invalid local address: {local_str}"),
+                        });
+                        continue;
+                    }
+                };
                 if let Err(e) = socket.bind(&local_addr.into()) {
                     last_err = Some(AsynError::Io(e));
                     continue;

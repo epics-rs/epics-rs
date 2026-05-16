@@ -4,6 +4,16 @@
 //! put, and monitor operations. They also exercise the error paths
 //! fixed in the DBR_TIME/CTRL work (ECA error propagation, snapshot
 //! None handling, etc.).
+//!
+//! Gated on the `ca-server-tls-test` feature: `run_tcp_listener`'s
+//! `tls` / `cap_token_verifier` params are `#[cfg]`-gated on
+//! `epics-ca-rs`'s `experimental-rust-tls` / `cap-tokens` features.
+//! `ca-server-tls-test` forces both on, so whenever this file
+//! compiles the function has its full 12-arg signature and the call
+//! below matches deterministically — under any workspace feature
+//! union (e.g. `epics-bridge-rs` pulling those `epics-ca-rs` features
+//! in independently).
+#![cfg(feature = "ca-server-tls-test")]
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -50,16 +60,8 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
             None, // audit
             drain,
             None, // stats: not asserted in this test
-            // NOTE: `run_tcp_listener`'s `tls` and `cap_token_verifier`
-            // params are `#[cfg]`-gated on `epics-ca-rs`'s own
-            // `experimental-rust-tls` / `cap-tokens` features. `epics-ca-rs`
-            // is a *dev-dependency* here (`path`, no `version`, so
-            // `cargo publish` strips it) and a real feature passthrough
-            // (`["epics-ca-rs/experimental-rust-tls"]`) is therefore not
-            // possible — dev-deps are stripped before feature resolution.
-            // Consequently those `epics-ca-rs` features are never active in
-            // any `epics-base-rs` build, so the function always exposes
-            // exactly 10 parameters from this crate's point of view.
+            None, // tls: not exercised in this test
+            None, // cap_token_verifier: not exercised in this test
         )
         .await;
     });

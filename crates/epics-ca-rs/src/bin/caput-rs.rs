@@ -269,15 +269,22 @@ async fn main() {
         // operators occasionally write `caput PV "alpha beta"`.
         let joined = args.values.join(" ");
 
-        // ENUM special treatment, mirroring C `caput.c:455-510`:
+        // ENUM special treatment. Close to C `caput.c:455-510` but not
+        // a strict mirror — C fetches `DBR_GR_ENUM`, matches the value
+        // against the IOC's menu strings client-side, and only then
+        // chooses string vs numeric. We do not fetch the menu; we let
+        // the server classify:
         //
         // * `-n` (force_numeric / enumAsNr): interpret as a number.
         // * `-s` (force_string / enumAsString): always send the value
         //   as DBR_STRING and let the SERVER resolve the menu string.
         // * default: a plain integer index goes through the numeric
         //   path; anything else is sent as DBR_STRING for server-side
-        //   menu resolution. The client cannot resolve site-custom
-        //   menus, so this is the only way to write them by name.
+        //   menu resolution. Divergence from C: a menu choice literally
+        //   named e.g. "2" is sent as a numeric index, and invalid input
+        //   is rejected by the server rather than locally. The client
+        //   has no access to site-custom menu definitions, so deferring
+        //   to the server is the only way to write them by name.
         let is_plain_integer = parse_plain_integer(&joined).is_some();
         if native_type == epics_ca_rs::DbFieldType::Enum
             && !args.force_numeric

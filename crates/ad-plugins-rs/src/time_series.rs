@@ -91,9 +91,15 @@ impl Default for TsReceiverRegistry {
 }
 
 /// Accumulation mode for time series.
+///
+/// Mirrors C++ `TSAcquireMode`: `OneShot` == `TSAcquireModeFixed` (acquisition
+/// stops once `num_points` output points are collected); `RingBuffer` ==
+/// `TSAcquireModeCircular` (the buffer wraps and acquisition continues).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeSeriesMode {
+    /// C++ `TSAcquireModeFixed`: stop at `num_points`.
     OneShot,
+    /// C++ `TSAcquireModeCircular`: wrap and keep acquiring.
     RingBuffer,
 }
 
@@ -209,6 +215,15 @@ pub struct SharedTsState {
     pub start_time: Option<Instant>,
     pub num_points: usize,
     pub mode: TimeSeriesMode,
+    /// Number of input samples averaged into one output time point
+    /// (C++ `numAverage_`). `1` means each input sample is one output point.
+    pub num_average: usize,
+    /// Running per-channel sum of the input samples for the in-progress
+    /// output point (C++ `averageStore_`).
+    average_store: Vec<f64>,
+    /// Number of input samples accumulated into `average_store` so far
+    /// (C++ `numAveraged_`).
+    num_averaged: usize,
 }
 
 impl SharedTsState {
@@ -222,7 +237,43 @@ impl SharedTsState {
             start_time: None,
             num_points,
             mode: TimeSeriesMode::OneShot,
+            num_average: 1,
+            average_store: vec![0.0; num_channels],
+            num_averaged: 0,
         }
+    }
+
+    /// Reset the running average accumulator (C++ resets `numAveraged_` and
+    /// `averageStore_` on start/erase, resize, mode change).
+    fn reset_average(&mut self) {
+        for v in &mut self.average_store {
+            *v = 0.0;
+        }
+        self.num_averaged = 0;
+    }
+
+    /// Accumulate one input sample vector and, once `num_average` samples
+    /// have been collected, push the per-channel average into the buffers.
+    ///
+    /// Port of the inner loop of C++ `doAddToTimeSeriesT`: each call is one
+    /// input time point; `num_average` of them produce one output point.
+    /// Returns `true` when an output point was emitted this call.
+    fn accumulate(&mut self, values: &[f64]) -> bool {
+        let n = values.len().min(self.average_store.len());
+        for i in 0..n {
+            self.average_store[i] += values[i];
+        }
+        self.num_averaged += 1;
+        if self.num_averaged < self.num_average.max(1) {
+            return false;
+        }
+        let divisor = self.num_averaged as f64;
+        let nb = n.min(self.buffers.len());
+        for i in 0..nb {
+            self.buffers[i].add_value(self.average_store[i] / divisor);
+        }
+        self.reset_average();
+        true
     }
 }
 
@@ -343,6 +394,36 @@ impl TimeSeriesPortDriver {
         }
     }
 
+    /// Build the time axis for the current mode.
+    ///
+    /// Fixed (OneShot) mode uses an ascending axis `i * time_per_point`;
+    /// Circular (RingBuffer) mode uses a signed axis ending at 0, so the
+    /// most recent point is t=0 and older points are negative — C++
+    /// `createAxisArray`: `timeAxis_[i] = -(numTimePoints-1-i)*timePerPoint`.
+    fn build_time_axis(&self, num_points: usize, mode: TimeSeriesMode) -> Vec<f64> {
+        (0..num_points)
+            .map(|i| match mode {
+                TimeSeriesMode::OneShot => i as f64 * self.time_per_point,
+                TimeSeriesMode::RingBuffer => {
+                    -((num_points.saturating_sub(1) - i) as f64) * self.time_per_point
+                }
+            })
+            .collect()
+    }
+
+    /// Recompute and publish the time axis param for the current mode.
+    fn refresh_time_axis(&mut self) {
+        let (num_points, mode) = {
+            let s = self.shared.lock();
+            (s.num_points, s.mode)
+        };
+        let axis = self.build_time_axis(num_points, mode);
+        let _ = self
+            .base
+            .params
+            .set_float64_array(self.params.ts_time_axis, 0, axis);
+    }
+
     /// Copy buffer data to Float64Array params and call callbacks.
     fn update_waveform_params(&mut self) {
         let state = self.shared.lock();
@@ -408,6 +489,9 @@ impl PortDriver for TimeSeriesPortDriver {
                             buf.reset();
                         }
                     }
+                    // Start always resets the running average accumulator
+                    // (C++ doTimeSeriesCallbacks / start path).
+                    state.reset_average();
                     state.acquiring = true;
                     state.start_time = Some(Instant::now());
                 }
@@ -423,22 +507,18 @@ impl PortDriver for TimeSeriesPortDriver {
             self.update_waveform_params();
         } else if reason == self.params.ts_num_points {
             let new_size = value.max(1) as usize;
-            let mut state = self.shared.lock();
-            state.num_points = new_size;
-            for buf in state.buffers.iter_mut() {
-                buf.resize(new_size);
+            {
+                let mut state = self.shared.lock();
+                state.num_points = new_size;
+                for buf in state.buffers.iter_mut() {
+                    buf.resize(new_size);
+                }
+                state.reset_average();
+                state.acquiring = false;
             }
-            state.acquiring = false;
-            drop(state);
 
-            // Update time axis
-            let time_axis: Vec<f64> = (0..new_size)
-                .map(|i| i as f64 * self.time_per_point)
-                .collect();
-            let _ = self
-                .base
-                .params
-                .set_float64_array(self.params.ts_time_axis, 0, time_axis);
+            // Rebuild the time axis for the current mode.
+            self.refresh_time_axis();
 
             // Re-initialize channel waveforms
             for i in 0..self.num_channels {
@@ -454,19 +534,35 @@ impl PortDriver for TimeSeriesPortDriver {
                 .set_int32_param(self.params.ts_current_point, 0, 0)?;
             self.base.set_int32_param(self.params.ts_acquire, 0, 0)?;
             self.base.call_param_callbacks(0)?;
+        } else if reason == self.params.ts_num_average {
+            // numAverage: input samples averaged per output time point
+            // (C++ P_TSNumAverage). Resets the running accumulator.
+            let n = value.max(1) as usize;
+            {
+                let mut state = self.shared.lock();
+                state.num_average = n;
+                state.reset_average();
+            }
+            self.base.set_int32_param(reason, 0, n as i32)?;
+            self.base.call_param_callbacks(0)?;
         } else if reason == self.params.ts_acquire_mode {
+            // 0 == TSAcquireModeFixed (OneShot), 1 == TSAcquireModeCircular.
             let mode = if value == 0 {
                 TimeSeriesMode::OneShot
             } else {
                 TimeSeriesMode::RingBuffer
             };
-            let mut state = self.shared.lock();
-            state.mode = mode;
-            for buf in state.buffers.iter_mut() {
-                buf.set_mode(mode);
+            {
+                let mut state = self.shared.lock();
+                state.mode = mode;
+                for buf in state.buffers.iter_mut() {
+                    buf.set_mode(mode);
+                }
+                state.reset_average();
+                state.acquiring = false;
             }
-            state.acquiring = false;
-            drop(state);
+            // Circular mode flips the time axis to a signed (ending-at-0) one.
+            self.refresh_time_axis();
 
             self.base.set_int32_param(reason, 0, value)?;
             self.base.set_int32_param(self.params.ts_acquire, 0, 0)?;
@@ -485,15 +581,8 @@ impl PortDriver for TimeSeriesPortDriver {
         if reason == self.params.ts_time_per_point {
             self.time_per_point = value;
             self.base.set_float64_param(reason, user.addr, value)?;
-            // Rebuild time axis with new scaling
-            let num_points = self.shared.lock().num_points;
-            let time_axis: Vec<f64> = (0..num_points)
-                .map(|i| i as f64 * self.time_per_point)
-                .collect();
-            let _ = self
-                .base
-                .params
-                .set_float64_array(self.params.ts_time_axis, 0, time_axis);
+            // Rebuild the time axis with the new scaling for the current mode.
+            self.refresh_time_axis();
             self.base.call_param_callbacks(user.addr)?;
         } else {
             self.base.set_float64_param(reason, user.addr, value)?;
@@ -514,19 +603,27 @@ impl PortDriver for TimeSeriesPortDriver {
     }
 }
 
-/// Background thread that receives data from a plugin and accumulates into shared buffers.
+/// Background thread that receives data from a plugin and accumulates into
+/// shared buffers.
+///
+/// Each received `TimeSeriesData` is one input time point. `num_average`
+/// consecutive input points are averaged into one output time point
+/// (C++ `doAddToTimeSeriesT`). In `OneShot`/Fixed mode acquisition auto-stops
+/// once `num_points` output points exist; in `RingBuffer`/Circular mode the
+/// `TimeSeries` ring buffer wraps and acquisition continues.
 fn ts_data_thread(shared: Arc<Mutex<SharedTsState>>, mut data_rx: TimeSeriesReceiver) {
     while let Some(data) = data_rx.blocking_recv() {
         let mut state = shared.lock();
         if !state.acquiring {
             continue;
         }
-        let n = data.values.len().min(state.buffers.len());
-        for i in 0..n {
-            state.buffers[i].add_value(data.values[i]);
-        }
-        // Auto-stop for OneShot mode
-        if state.mode == TimeSeriesMode::OneShot && state.buffers[0].count() >= state.num_points {
+        let emitted = state.accumulate(&data.values);
+        // Auto-stop for Fixed (OneShot) mode once num_points output points
+        // have been collected. Only check when an output point was emitted.
+        if emitted
+            && state.mode == TimeSeriesMode::OneShot
+            && state.buffers[0].count() >= state.num_points
+        {
             state.acquiring = false;
         }
     }
@@ -827,6 +924,161 @@ mod tests {
 
         let state = shared.lock();
         assert_eq!(state.buffers[0].count(), 0);
+    }
+
+    #[test]
+    fn test_num_average_averages_input_samples() {
+        // numAverage = 3: every 3 input samples produce one averaged output
+        // point. Channel A inputs 0,1,2 -> mean 1; 3,4,5 -> mean 4.
+        let mut state = SharedTsState::new(1, 10);
+        state.num_average = 3;
+        assert!(!state.accumulate(&[0.0]));
+        assert!(!state.accumulate(&[1.0]));
+        assert!(state.accumulate(&[2.0])); // emits mean of 0,1,2 = 1
+        assert!(!state.accumulate(&[3.0]));
+        assert!(!state.accumulate(&[4.0]));
+        assert!(state.accumulate(&[5.0])); // emits mean of 3,4,5 = 4
+        let vals = state.buffers[0].values();
+        assert_eq!(vals.len(), 2);
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        assert!((vals[1] - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_num_average_one_is_passthrough() {
+        // numAverage = 1: each input sample is one output point unchanged.
+        let mut state = SharedTsState::new(2, 10);
+        state.num_average = 1;
+        assert!(state.accumulate(&[5.0, 50.0]));
+        assert!(state.accumulate(&[6.0, 60.0]));
+        assert_eq!(state.buffers[0].values(), vec![5.0, 6.0]);
+        assert_eq!(state.buffers[1].values(), vec![50.0, 60.0]);
+    }
+
+    #[test]
+    fn test_num_average_drives_ingestion_thread() {
+        // The data thread must average numAverage=2 samples per output point.
+        let shared = Arc::new(Mutex::new(SharedTsState::new(1, 5)));
+        {
+            let mut s = shared.lock();
+            s.num_average = 2;
+            s.acquiring = true;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let shared_clone = shared.clone();
+        let jh = std::thread::spawn(move || ts_data_thread(shared_clone, rx));
+
+        for v in [10.0, 20.0, 30.0, 40.0] {
+            tx.blocking_send(TimeSeriesData { values: vec![v] }).unwrap();
+        }
+        drop(tx);
+        jh.join().unwrap();
+
+        // 4 input samples / numAverage 2 -> 2 output points: 15, 35.
+        let state = shared.lock();
+        let vals = state.buffers[0].values();
+        assert_eq!(vals.len(), 2);
+        assert!((vals[0] - 15.0).abs() < 1e-10);
+        assert!((vals[1] - 35.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_fixed_mode_stops_at_num_points() {
+        // Fixed (OneShot) mode: acquisition auto-stops once num_points output
+        // points are collected, even with more input pending.
+        let shared = Arc::new(Mutex::new(SharedTsState::new(1, 3)));
+        {
+            let mut s = shared.lock();
+            s.num_average = 1;
+            s.mode = TimeSeriesMode::OneShot;
+            s.acquiring = true;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let shared_clone = shared.clone();
+        let jh = std::thread::spawn(move || ts_data_thread(shared_clone, rx));
+        for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
+            tx.blocking_send(TimeSeriesData { values: vec![v] }).unwrap();
+        }
+        drop(tx);
+        jh.join().unwrap();
+
+        let state = shared.lock();
+        assert!(!state.acquiring, "Fixed mode must auto-stop");
+        assert_eq!(state.buffers[0].count(), 3);
+        assert_eq!(state.buffers[0].values(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_circular_mode_wraps_and_keeps_acquiring() {
+        // Circular (RingBuffer) mode: the buffer wraps; acquisition does not
+        // auto-stop.
+        let shared = Arc::new(Mutex::new(SharedTsState::new(1, 3)));
+        {
+            let mut s = shared.lock();
+            s.num_average = 1;
+            s.mode = TimeSeriesMode::RingBuffer;
+            for buf in s.buffers.iter_mut() {
+                buf.set_mode(TimeSeriesMode::RingBuffer);
+            }
+            s.acquiring = true;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let shared_clone = shared.clone();
+        let jh = std::thread::spawn(move || ts_data_thread(shared_clone, rx));
+        for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
+            tx.blocking_send(TimeSeriesData { values: vec![v] }).unwrap();
+        }
+        drop(tx);
+        jh.join().unwrap();
+
+        let state = shared.lock();
+        assert!(state.acquiring, "Circular mode must keep acquiring");
+        // Ring buffer of 3 keeps the last 3 points: 3,4,5.
+        assert_eq!(state.buffers[0].values(), vec![3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_acquire_mode_param_drives_behavior_and_axis() {
+        // Writing TS_ACQUIRE_MODE must switch the buffer mode AND flip the
+        // time axis from ascending (Fixed) to signed-ending-at-0 (Circular).
+        let shared = Arc::new(Mutex::new(SharedTsState::new(1, 4)));
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS_MODE", &["Ch0"], 4, shared.clone());
+
+        // Fixed mode axis: 0, 1, 2, 3.
+        let axis = driver
+            .base
+            .params
+            .get_float64_array(driver.params.ts_time_axis, 0)
+            .unwrap();
+        assert_eq!(&*axis, &[0.0, 1.0, 2.0, 3.0]);
+
+        // Switch to Circular mode.
+        let mut user = AsynUser::new(driver.params.ts_acquire_mode);
+        driver.write_int32(&mut user, 1).unwrap();
+        assert_eq!(shared.lock().mode, TimeSeriesMode::RingBuffer);
+
+        // Circular axis: -3, -2, -1, 0 (most recent point is t=0).
+        let axis = driver
+            .base
+            .params
+            .get_float64_array(driver.params.ts_time_axis, 0)
+            .unwrap();
+        assert_eq!(&*axis, &[-3.0, -2.0, -1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_num_average_param_drives_state() {
+        // Writing TS_NUM_AVERAGE must update SharedTsState::num_average.
+        let shared = Arc::new(Mutex::new(SharedTsState::new(1, 10)));
+        let mut driver =
+            TimeSeriesPortDriver::new("TEST_TS_NAVG", &["Ch0"], 10, shared.clone());
+        let mut user = AsynUser::new(driver.params.ts_num_average);
+        driver.write_int32(&mut user, 5).unwrap();
+        assert_eq!(shared.lock().num_average, 5);
+        // A value of 0 is clamped to 1.
+        driver.write_int32(&mut user, 0).unwrap();
+        assert_eq!(shared.lock().num_average, 1);
     }
 
     #[test]

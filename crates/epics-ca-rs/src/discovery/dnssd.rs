@@ -123,12 +123,17 @@ impl Backend for DnsSdBackend {
         // bug where two IOCs on ports 5064/5066 would each be emitted
         // with both ports.
         //
-        // The whole phase is bounded two ways: a per-lookup timeout so
-        // one stuck query cannot stall startup, and an aggregate
-        // `RESOLVE_BUDGET` deadline checked per instance so a large but
-        // responsive zone cannot either. Whatever resolved before the
+        // The whole phase is hard-bounded by the aggregate
+        // `RESOLVE_BUDGET` deadline: every individual lookup is timed
+        // out at `min(PER_LOOKUP_TIMEOUT, remaining budget)`, so total
+        // wall time cannot exceed `RESOLVE_BUDGET` plus the latency of
+        // at most one in-flight lookup. Whatever resolved before the
         // deadline is returned.
         let deadline = Instant::now() + RESOLVE_BUDGET;
+        // Per-lookup timeout clamped to the remaining aggregate budget,
+        // so a lookup started late in the phase cannot overshoot it.
+        let lookup_timeout =
+            || PER_LOOKUP_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
         let mut out_set: HashSet<SocketAddr> = HashSet::new();
         let mut out: Vec<SocketAddr> = Vec::new();
         for instance in &instances {
@@ -138,7 +143,7 @@ impl Backend for DnsSdBackend {
                 break;
             }
             let srv = match tokio::time::timeout(
-                PER_LOOKUP_TIMEOUT,
+                lookup_timeout(),
                 self.resolver.srv_lookup(instance.as_str()),
             )
             .await
@@ -160,7 +165,7 @@ impl Backend for DnsSdBackend {
                 let target = record.target().to_string();
                 // A records.
                 if let Ok(Ok(v4)) = tokio::time::timeout(
-                    PER_LOOKUP_TIMEOUT,
+                    lookup_timeout(),
                     self.resolver.ipv4_lookup(target.as_str()),
                 )
                 .await
@@ -174,7 +179,7 @@ impl Backend for DnsSdBackend {
                 }
                 // AAAA records.
                 if let Ok(Ok(v6)) = tokio::time::timeout(
-                    PER_LOOKUP_TIMEOUT,
+                    lookup_timeout(),
                     self.resolver.ipv6_lookup(target.as_str()),
                 )
                 .await

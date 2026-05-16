@@ -1027,6 +1027,18 @@ where
                     )));
                 }
             }
+            // C `rsrv/camessage.c:~2410`: when the buffer holds a
+            // partial extended-form header (16..24 bytes of a message
+            // whose `m_postsize == 0xffff`), C does `status = RSRV_OK;
+            // break;` to await the remaining bytes — it does NOT
+            // disconnect. Without this guard, `from_bytes_extended`
+            // returns `Err("extended header incomplete")` and the `?`
+            // below closes the connection on a benign TCP segment
+            // boundary. The ECA_TOLARGE pre-check above is gated on
+            // `buf.len() >= 24`, so it never masks this 16..24 window.
+            if buf.len() < 24 && buf[2] == 0xFF && buf[3] == 0xFF {
+                break;
+            }
             let (hdr, hdr_size) = CaHeader::from_bytes_extended(&accumulated[offset..])?;
             let actual_post = hdr.actual_postsize();
             // C `rsrv/camessage.c:2452` rejects misaligned payloads
@@ -3392,5 +3404,90 @@ mod multi_nic_listener_tests {
                 std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", v);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod extended_header_split_tests {
+    //! C-parity regression: a TCP segment that ends in the middle of an
+    //! extended-form header (16..24 bytes, `m_postsize == 0xffff`) must
+    //! make the framing loop *wait* for the rest of the header, not
+    //! disconnect the client. C `rsrv/camessage.c:~2410` does
+    //! `status = RSRV_OK; break;` for this partial-header case.
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Feed exactly 20 bytes of an extended-form header (a 16-byte base
+    /// header with `postsize == 0xFFFF`, plus 4 of the 8 extended
+    /// bytes) and assert `handle_client` does NOT return early with an
+    /// error: it must block awaiting the remaining 4 bytes. Pre-fix,
+    /// `from_bytes_extended` returned `Err("extended header
+    /// incomplete")` and the `?` closed the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_extended_header_waits_not_disconnects() {
+        let db = Arc::new(PvDatabase::new());
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+
+        let (client_io, server_io) = tokio::io::duplex(256);
+        let peer: SocketAddr = "127.0.0.1:55123".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        // Build a CA_PROTO_READ_NOTIFY header in extended form:
+        // postsize=0xFFFF marks extended; write only 20 of the 24
+        // header bytes so the framing loop sees a partial ext header.
+        let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        hdr.postsize = 0xFFFF;
+        let base = hdr.to_bytes();
+        let mut prefix = base.to_vec();
+        // 4 of the 8 extended bytes (extended postsize = 0).
+        prefix.extend_from_slice(&[0u8, 0, 0, 0]);
+        assert_eq!(prefix.len(), 20);
+
+        let mut client = client_io;
+        client.write_all(&prefix).await.expect("write prefix");
+        client.flush().await.expect("flush prefix");
+
+        // The handler must still be running — it is waiting for the
+        // remaining 4 bytes, not disconnected with an error.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handle.is_finished(),
+            "handle_client returned on a partial extended header — \
+             must wait for more bytes (C camessage.c RSRV_OK; break)"
+        );
+
+        // Close the write half: a clean EOF on a partial frame must
+        // resolve to Ok(()), never an Err.
+        drop(client);
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_client completes after EOF")
+            .expect("join ok");
+        assert!(
+            res.is_ok(),
+            "clean EOF after partial extended header must be Ok, got {res:?}"
+        );
     }
 }

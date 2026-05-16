@@ -1429,17 +1429,15 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
 
 /// Build a param batch reporting the input-queue depth.
 ///
-/// `QUEUE_SIZE` = total capacity, `QUEUE_FREE` = free slots
-/// (`max_capacity - pending`). G2: the param is named `QUEUE_FREE` and the
-/// reconciled semantics are *free slots*, matching C++
-/// `NDPluginDriverQueueFree = queueSize - pending()`.
+/// `QUEUE_SIZE` = total capacity, `QUEUE_FREE` = free slots. G2: the param is
+/// named `QUEUE_FREE` and the reconciled semantics are *free slots*, matching
+/// C++ `NDPluginDriverQueueFree = queueSize - pending()`.
 fn queue_status_batch(
     plugin_params: &PluginBaseParams,
     max_capacity: usize,
-    pending: usize,
+    free: i32,
 ) -> ParamBatch {
     use asyn_rs::request::ParamSetValue;
-    let free = max_capacity.saturating_sub(pending);
     ParamBatch {
         addr0: vec![
             ParamSetValue::Int32 {
@@ -1450,7 +1448,7 @@ fn queue_status_batch(
             ParamSetValue::Int32 {
                 reason: plugin_params.queue_use,
                 addr: 0,
-                value: free as i32,
+                value: free,
             },
         ],
         extra: std::collections::HashMap::new(),
@@ -1517,6 +1515,9 @@ fn plugin_data_loop<P: NDPluginProcess>(
         // Re-created when sort_time changes.
         let mut sort_flush_interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         let mut sort_flush_active = false;
+        // Last published QueueFree value — only flush the queue params when it
+        // changes, so a steady queue depth does not spam param callbacks.
+        let mut last_queue_free: Option<i32> = None;
 
         loop {
             tokio::select! {
@@ -1552,20 +1553,26 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 (output, senders, port)
                             };
                             // G2: update QueueSize/QueueFree from the channel
-                            // depth on every processed array (C++ NDPluginDriver
-                            // .cpp:512-513). QueueFree = max_capacity - pending.
-                            let queue_batch = queue_status_batch(
-                                &plugin_params,
-                                array_rx.max_capacity(),
-                                array_rx.pending(),
-                            );
+                            // depth (C++ NDPluginDriver.cpp:512-513). QueueFree
+                            // = max_capacity - pending. Only flush when the
+                            // value changed to avoid no-op param callbacks.
+                            let max_cap = array_rx.max_capacity();
+                            let free = max_cap.saturating_sub(array_rx.pending()) as i32;
+                            let queue_batch = if last_queue_free != Some(free) {
+                                last_queue_free = Some(free);
+                                Some(queue_status_batch(&plugin_params, max_cap, free))
+                            } else {
+                                None
+                            };
                             // msg dropped here → completion signaled (if tracked)
                             // Publish arrays and flush params outside the lock, in async context.
                             if let Some(po) = process_output {
                                 po.publish_arrays(&senders).await;
                                 po.batch.flush(&port).await;
                             }
-                            queue_batch.flush(&port).await;
+                            if let Some(qb) = queue_batch {
+                                qb.flush(&port).await;
+                            }
                         }
                         None => break,
                     }

@@ -418,13 +418,13 @@ impl MotorRecord {
 
     /// Start jogging.
     fn start_jog(&mut self, forward: bool, effects: &mut ProcessEffects) {
-        // C: if motor is moving, stop first then queue jog for after stop
+        // C: if motor is moving, stop first then queue jog for after stop.
+        // The queued request lives in internal.queued_motion, NOT in the MIP
+        // JOGF/JOGR bits — otherwise a plain STOP on an active jog (which also
+        // leaves JOGF|STOP set) would be replayed as a queued jog.
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
-            self.stat.mip = if forward {
-                MipFlags::JOGF
-            } else {
-                MipFlags::JOGR
-            } | MipFlags::STOP;
+            self.stat.mip = MipFlags::STOP;
+            self.internal.queued_motion = Some(QueuedMotion::Jog { forward });
             self.internal.backlash_pending = false;
             effects.commands.push(MotorCommand::Stop {
                 acceleration: self.move_accel_egu(),
@@ -503,13 +503,11 @@ impl MotorRecord {
 
     /// Start homing.
     fn start_home(&mut self, forward: bool, effects: &mut ProcessEffects) {
-        // C: if motor is moving, stop first then queue home for after stop
+        // C: if motor is moving, stop first then queue home for after stop.
+        // Queued request goes in internal.queued_motion (see start_jog).
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
-            self.stat.mip = if forward {
-                MipFlags::HOMF
-            } else {
-                MipFlags::HOMR
-            } | MipFlags::STOP;
+            self.stat.mip = MipFlags::STOP;
+            self.internal.queued_motion = Some(QueuedMotion::Home { forward });
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
             effects.commands.push(MotorCommand::Stop {

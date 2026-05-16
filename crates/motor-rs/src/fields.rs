@@ -338,6 +338,12 @@ pub struct InternalFields {
     pub backlash_pending: bool,
     /// Pending retarget value (for NTM stop-and-replan)
     pub pending_retarget: Option<f64>,
+    /// A jog/home command that arrived while the axis was already moving.
+    /// The record stops the current motion first and re-issues this once the
+    /// driver reports done. Kept separate from the MIP JOGF/JOGR/HOMF/HOMR
+    /// bits so a plain STOP on an *active* jog/home is not mistaken for a
+    /// queued request.
+    pub queued_motion: Option<QueuedMotion>,
     /// Remember jog direction for backlash (cleared by stop_jog)
     pub jog_was_forward: bool,
     /// True after the initial DMOV 1→0 notification has been sent.

@@ -1380,6 +1380,71 @@ fn test_jog_finalize_clears_jog_button_when_driver_stops() {
 }
 
 #[test]
+fn test_stop_field_during_active_jog_does_not_resume_jog() {
+    // STOP field pressed while a jog is actively running: the axis must
+    // finalize to Idle, NOT replay the jog. An active jog leaves MIP=JOGF;
+    // handle_stop adds STOP. The check_completion STOP branch must only
+    // resume a *queued* request (internal.queued_motion), which is absent here.
+    let mut rec = MotorRecord::new();
+    rec.ctrl.jogf = true;
+    rec.stat.mip.insert(MipFlags::JOGF);
+    rec.stat.phase = MotionPhase::Jog;
+    rec.stat.dmov = false;
+    rec.retry.bdst = 0.0;
+
+    // STOP field write → handle_stop adds MIP_STOP (mip = JOGF | STOP).
+    rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Stop);
+    assert!(rec.stat.mip.contains(MipFlags::STOP));
+
+    // Driver reports done → check_completion must finalize, not re-jog.
+    rec.stat.msta = MstaFlags::DONE;
+    let effects = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::Idle, "must finalize, not resume jog");
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "STOP on an active jog must not re-issue MoveVelocity"
+    );
+}
+
+#[test]
+fn test_jog_command_while_moving_is_queued_and_resumes_after_stop() {
+    // A jog command issued while a move is in progress: the record stops the
+    // current motion, then resumes the queued jog once the driver is done.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    // A move is in progress.
+    rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.movn = true;
+
+    // Jog command arrives mid-move → queued, current motion stopped.
+    rec.ctrl.jogf = true;
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. }))
+    );
+
+    // Driver reports done → queued jog resumes.
+    rec.stat.msta = MstaFlags::DONE;
+    let effects = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { direction: true, .. }))
+    );
+}
+
+#[test]
 fn test_homing_finalize_clears_home_button() {
     let mut rec = MotorRecord::new();
     rec.ctrl.homf = true;

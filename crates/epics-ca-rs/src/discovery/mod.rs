@@ -65,11 +65,18 @@ pub trait Backend: Send + Sync {
 }
 
 /// Live update from a discovery backend.
+///
+/// Both variants carry an `instance` string — the service-instance
+/// name (mDNS fullname, or DNS-SD `<instance>._epics-ca._tcp.<zone>`).
+/// Consumers MUST match `Removed` events by `instance`, not by `addr`:
+/// some backends (mDNS) cannot report the resolved address on removal
+/// and emit a `0.0.0.0:0` sentinel in `addr`.
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
     /// A new IOC just came online.
     Added { instance: String, addr: SocketAddr },
-    /// An IOC is no longer reachable.
+    /// An IOC is no longer reachable. `addr` may be a `0.0.0.0:0`
+    /// sentinel — match on `instance`.
     Removed { instance: String, addr: SocketAddr },
 }
 
@@ -172,7 +179,11 @@ fn parse_token(tok: &str) -> Option<DiscoveryConfig> {
         }
     }
     if let Some(rest) = tok.strip_prefix("static:") {
-        let addrs: Vec<SocketAddr> = rest.split(',').filter_map(|s| s.parse().ok()).collect();
+        let addrs: Vec<SocketAddr> = rest
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(parse_static_addr)
+            .collect();
         if addrs.is_empty() {
             tracing::warn!(token = %tok, "EPICS_CA_DISCOVERY static: parsed no addresses");
             return None;
@@ -180,6 +191,26 @@ fn parse_token(tok: &str) -> Option<DiscoveryConfig> {
         return Some(DiscoveryConfig::Static(addrs));
     }
     tracing::warn!(token = %tok, "EPICS_CA_DISCOVERY: unrecognized token");
+    None
+}
+
+/// Parse one comma-separated entry of a `static:` token into a
+/// [`SocketAddr`].
+///
+/// An entry may be `<ip>:<port>` or a bare `<ip>`. A bare address
+/// defaults to the standard CA server port (5064) — the same way
+/// `EPICS_CA_ADDR_LIST` parsing (`server::addr_list::resolve_token`)
+/// treats port-less entries — instead of being silently dropped.
+fn parse_static_addr(entry: &str) -> Option<SocketAddr> {
+    use std::net::IpAddr;
+
+    if let Ok(addr) = entry.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    if let Ok(ip) = entry.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, crate::protocol::CA_SERVER_PORT));
+    }
+    tracing::warn!(entry = %entry, "EPICS_CA_DISCOVERY static: dropped unparseable address");
     None
 }
 
@@ -199,6 +230,21 @@ mod tests {
     #[test]
     fn parse_unknown_token_is_none() {
         assert!(parse_token("foo:bar").is_none());
+    }
+
+    #[test]
+    fn parse_static_token_defaults_bare_addr_to_ca_port() {
+        // A port-less entry must default to the standard CA server
+        // port (5064), not be silently dropped.
+        let cfg = parse_token("static:10.0.0.1,10.0.0.2:5066").unwrap();
+        match cfg {
+            DiscoveryConfig::Static(addrs) => {
+                assert_eq!(addrs.len(), 2);
+                assert_eq!(addrs[0].port(), crate::protocol::CA_SERVER_PORT);
+                assert_eq!(addrs[1].port(), 5066);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[cfg(feature = "discovery")]

@@ -395,7 +395,10 @@ impl PvaLinkResolver {
 
             // Slow path: link not yet open or first-event not arrived.
             // Open the link (idempotent) then issue an async read.
-            let cfg = default_inp_cfg(name);
+            // B4: use `inp_cfg_for` so a link registered via
+            // `open_link` keeps its options (`sevr`, `Q`, `pipeline`,
+            // `monorder`); `default_inp_cfg` would discard them.
+            let cfg = resolver.inp_cfg_for(name);
             // The Lset external resolver is invoked from inside an
             // async context (PvDatabase::resolve_external_pv runs on a
             // tokio worker). Bare Handle::block_on panics under those
@@ -561,7 +564,10 @@ impl LinkSet for PvaLinkResolver {
         }
 
         // Slow path: open the link / fall back to a fresh GET.
-        let cfg = default_inp_cfg(name);
+        // B4: use `inp_cfg_for` so a link registered via `open_link`
+        // keeps its options (`sevr`, `Q`, `pipeline`, `monorder`);
+        // `default_inp_cfg` would discard them.
+        let cfg = self.inp_cfg_for(name);
         let value = block_in_place_or_warn(|| {
             self.handle.block_on(async {
                 let link = self.registry.get_or_open(cfg).await.ok()?;

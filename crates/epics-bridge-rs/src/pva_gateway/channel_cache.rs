@@ -645,6 +645,36 @@ impl ChannelCache {
     pub async fn entry_count(&self) -> usize {
         self.entries.lock().await.len()
     }
+
+    /// B6: operator-driven cache flush. Drops every cached
+    /// `UpstreamEntry` and clears the negative-result LRU, then
+    /// returns the number of entries that were removed.
+    ///
+    /// Each removed entry's `AbortOnDrop` aborts its upstream monitor
+    /// task once the last `Arc<UpstreamEntry>` is released; any live
+    /// downstream subscriber holding a `broadcast::Receiver` simply
+    /// stops receiving events (the next downstream search re-opens a
+    /// fresh upstream monitor). This mirrors `pva2pva`'s manual
+    /// channel-cache drop.
+    pub async fn flush(&self) -> usize {
+        let mut map = self.entries.lock().await;
+        let removed = map.len();
+        map.clear();
+        self.negative_cache.lock().clear();
+        removed
+    }
+
+    /// B6: drop a single cache entry by exact PV name. Returns `true`
+    /// if an entry was present and removed, `false` if the name was
+    /// not cached. Also evicts the name from the negative-result LRU
+    /// so a subsequent search re-resolves immediately.
+    pub async fn drop_entry(&self, pv_name: &str) -> bool {
+        let removed = self.entries.lock().await.remove(pv_name).is_some();
+        self.negative_cache
+            .lock()
+            .retain(|(n, _)| n != pv_name);
+        removed
+    }
 }
 
 impl Drop for ChannelCache {

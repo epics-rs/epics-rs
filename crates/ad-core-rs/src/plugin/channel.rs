@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::ndarray::NDArray;
@@ -87,19 +87,35 @@ impl Drop for ArrayMessage {
     }
 }
 
-/// Sender held by upstream. Fully async, reliable (no drops).
+/// Outcome of a `publish` call, mirroring C++ `driverCallback` accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The array was enqueued (and, in blocking mode, processed).
+    Delivered,
+    /// `enable_callbacks` was 0 — array not sent (not a drop, not counted).
+    Disabled,
+    /// The downstream queue was full and the array was dropped. The caller
+    /// must increment `DroppedArrays`, matching C++ `trySend` semantics.
+    DroppedQueueFull,
+    /// The downstream channel was closed (receiver gone).
+    ChannelClosed,
+}
+
+/// Sender held by upstream.
 ///
-/// # `blocking_callbacks` semantics
+/// # Default: drop-on-full (C++ parity)
 ///
-/// Both modes use reliable async enqueue (`send().await`). The difference is
-/// how long the caller waits:
+/// By default `publish` uses a bounded `try_send`: when the downstream queue
+/// is full the array is **dropped** and `PublishOutcome::DroppedQueueFull` is
+/// returned, matching C++ `NDPluginDriver::driverCallback` `trySend` — a slow
+/// plugin drops frames rather than back-pressuring the detector driver.
 ///
-/// - `blocking_callbacks=0`: waits until the message is in the downstream queue
-///   (enqueue guaranteed, processing NOT awaited).
-/// - `blocking_callbacks=1`: waits until the downstream plugin has finished
-///   processing the array (enqueue + completion awaited).
+/// # `blocking_callbacks=1`: reliable opt-in
 ///
-/// Neither mode drops arrays due to back-pressure — the caller yields instead.
+/// When `blocking_callbacks` is set, `publish` instead uses a reliable
+/// `send().await` and waits for the downstream plugin to finish processing.
+/// This is the explicit opt-in for "never drop, apply back-pressure"
+/// behavior. It is NOT the default.
 #[derive(Clone)]
 pub struct NDArraySender {
     tx: tokio::sync::mpsc::Sender<ArrayMessage>,
@@ -107,45 +123,69 @@ pub struct NDArraySender {
     enabled: Arc<AtomicBool>,
     blocking_mode: Arc<AtomicBool>,
     queued_counter: Option<Arc<QueuedArrayCounter>>,
+    /// Cumulative count of arrays dropped because this sender's downstream
+    /// input queue was full. Owned by the downstream plugin (which publishes
+    /// it to its `DROPPED_ARRAYS` param), shared back to every upstream
+    /// sender that feeds this plugin — matching C++ `driverCallback` which
+    /// increments the *receiving* plugin's `NDPluginDriverDroppedArrays`.
+    dropped_arrays: Arc<AtomicI32>,
 }
 
 impl NDArraySender {
-    /// Publish an array downstream (async, reliable).
+    /// Publish an array downstream.
     ///
-    /// - `enable_callbacks=0`: returns immediately, array not sent.
-    /// - `blocking_callbacks=0`: awaits queue admission only.
-    /// - `blocking_callbacks=1`: awaits queue admission + downstream processing completion.
-    pub async fn publish(&self, array: Arc<NDArray>) {
+    /// - `enable_callbacks=0`: returns `Disabled`, array not sent.
+    /// - `blocking_callbacks=0` (default): bounded `try_send` — on a full queue
+    ///   the array is dropped and `DroppedQueueFull` is returned (C++ parity).
+    /// - `blocking_callbacks=1`: reliable `send().await` + awaits downstream
+    ///   processing completion (explicit opt-in, never drops).
+    pub async fn publish(&self, array: Arc<NDArray>) -> PublishOutcome {
         if !self.enabled.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(ref c) = self.queued_counter {
-            c.increment();
+            return PublishOutcome::Disabled;
         }
 
         let blocking = self.blocking_mode.load(Ordering::Acquire);
-        let (done_tx, done_rx) = if blocking {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
 
+        if !blocking {
+            // Drop-on-full path (C++ trySend). Build the message only on the
+            // way into try_send so a full queue does not touch the counter.
+            if let Some(ref c) = self.queued_counter {
+                c.increment();
+            }
+            let msg = ArrayMessage {
+                array,
+                counter: self.queued_counter.clone(),
+                done_tx: None,
+            };
+            return match self.tx.try_send(msg) {
+                Ok(()) => PublishOutcome::Delivered,
+                // `msg` is dropped here → counter decremented by ArrayMessage::drop.
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.dropped_arrays.fetch_add(1, Ordering::AcqRel);
+                    PublishOutcome::DroppedQueueFull
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    PublishOutcome::ChannelClosed
+                }
+            };
+        }
+
+        // Reliable blocking path: never drops, awaits completion.
+        if let Some(ref c) = self.queued_counter {
+            c.increment();
+        }
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let msg = ArrayMessage {
             array,
             counter: self.queued_counter.clone(),
-            done_tx,
+            done_tx: Some(done_tx),
         };
-
         if self.tx.send(msg).await.is_err() {
             // Channel closed — counter was decremented by ArrayMessage::drop
-            return;
+            return PublishOutcome::ChannelClosed;
         }
-
-        // blocking_callbacks=1: wait for downstream to finish processing
-        if let Some(rx) = done_rx {
-            let _ = rx.await;
-        }
+        let _ = done_rx.await;
+        PublishOutcome::Delivered
     }
 
     /// Whether this sender's plugin has callbacks enabled.
@@ -167,6 +207,27 @@ impl NDArraySender {
         self.queued_counter = Some(counter);
     }
 
+    /// Attach the downstream plugin's shared `DroppedArrays` counter so that
+    /// a full-queue drop on this sender is accounted to that plugin (C++ parity).
+    pub fn set_dropped_arrays_counter(&mut self, counter: Arc<AtomicI32>) {
+        self.dropped_arrays = counter;
+    }
+
+    /// The shared `DroppedArrays` counter for this sender's downstream queue.
+    pub fn dropped_arrays_counter(&self) -> &Arc<AtomicI32> {
+        &self.dropped_arrays
+    }
+
+    /// Current capacity (free slots) of the downstream input queue.
+    pub fn capacity(&self) -> usize {
+        self.tx.capacity()
+    }
+
+    /// Maximum capacity of the downstream input queue.
+    pub fn max_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+
     /// Set the enabled/blocking mode flags (used by plugin runtime wiring).
     pub(crate) fn set_mode_flags(
         &mut self,
@@ -184,6 +245,21 @@ pub struct NDArrayReceiver {
 }
 
 impl NDArrayReceiver {
+    /// Number of currently buffered (pending) messages in the input queue.
+    pub fn pending(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// Maximum capacity of the input queue.
+    pub fn max_capacity(&self) -> usize {
+        self.rx.max_capacity()
+    }
+
+    /// Number of free slots in the input queue (`max_capacity - pending`).
+    pub fn capacity(&self) -> usize {
+        self.rx.capacity()
+    }
+
     /// Blocking receive (for use in std::thread data processing loops).
     pub fn blocking_recv(&mut self) -> Option<Arc<NDArray>> {
         self.rx.blocking_recv().map(|msg| msg.array.clone())
@@ -211,6 +287,7 @@ pub fn ndarray_channel(port_name: &str, queue_size: usize) -> (NDArraySender, ND
             enabled: Arc::new(AtomicBool::new(true)),
             blocking_mode: Arc::new(AtomicBool::new(false)),
             queued_counter: None,
+            dropped_arrays: Arc::new(AtomicI32::new(0)),
         },
         NDArrayReceiver { rx },
     )
@@ -242,21 +319,22 @@ impl NDArrayOutput {
         Some(self.senders.swap_remove(idx))
     }
 
-    /// Publish an array to all downstream receivers (async, reliable, concurrent).
+    /// Publish an array to all downstream receivers (async, concurrent).
     ///
-    /// Each sender is awaited independently — a slow downstream does not
-    /// block enqueue to sibling downstreams. The function returns after
-    /// all senders have completed their publish (enqueue or completion,
-    /// depending on `blocking_callbacks`).
-    pub async fn publish(&self, array: Arc<NDArray>) {
+    /// Each sender publishes independently. Returns the per-sender outcomes
+    /// so the caller can count `DroppedArrays` for any downstream whose queue
+    /// was full (C++ `driverCallback` semantics).
+    pub async fn publish(&self, array: Arc<NDArray>) -> Vec<PublishOutcome> {
         let futs = self.senders.iter().map(|s| s.publish(array.clone()));
-        futures_util::future::join_all(futs).await;
+        futures_util::future::join_all(futs).await
     }
 
     /// Publish an array to a single downstream receiver by index (for scatter/round-robin).
-    pub async fn publish_to(&self, index: usize, array: Arc<NDArray>) {
+    pub async fn publish_to(&self, index: usize, array: Arc<NDArray>) -> Option<PublishOutcome> {
         if let Some(sender) = self.senders.get(index % self.senders.len().max(1)) {
-            sender.publish(array).await;
+            Some(sender.publish(array).await)
+        } else {
+            None
         }
     }
 
@@ -294,10 +372,15 @@ impl ArrayPublisher {
     }
 
     /// Publish an array to all downstream plugins (async, concurrent fan-out).
-    pub async fn publish(&self, array: Arc<NDArray>) {
+    ///
+    /// Returns the per-downstream outcomes — a `DroppedQueueFull` entry means
+    /// that downstream plugin's input queue was full and the array was dropped
+    /// (C++ `driverCallback` `trySend`). The driver should count those as
+    /// `DroppedArrays`.
+    pub async fn publish(&self, array: Arc<NDArray>) -> Vec<PublishOutcome> {
         let senders = self.output.lock().senders_clone();
         let futs = senders.iter().map(|s| s.publish(array.clone()));
-        futures_util::future::join_all(futs).await;
+        futures_util::future::join_all(futs).await
     }
 }
 
@@ -331,11 +414,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_publish_no_drop() {
-        // With reliable send().await, even a queue of 1 should not drop
+    async fn test_publish_blocking_no_drop() {
+        // In blocking_callbacks mode, reliable send().await is used: even a
+        // queue of 1 must not drop — the producer back-pressures instead.
         let (sender, mut receiver) = ndarray_channel("TEST", 1);
+        sender.blocking_mode.store(true, Ordering::Release);
 
-        // Spawn publisher that sends 3 arrays
         let s = sender.clone();
         let pub_handle = tokio::spawn(async move {
             s.publish(make_test_array(1)).await;
@@ -343,7 +427,7 @@ mod tests {
             s.publish(make_test_array(3)).await;
         });
 
-        // Receive all 3 — no drops
+        // Receive all 3 — no drops in blocking mode.
         let a1 = receiver.recv().await.unwrap();
         assert_eq!(a1.unique_id, 1);
         let a2 = receiver.recv().await.unwrap();
@@ -352,6 +436,36 @@ mod tests {
         assert_eq!(a3.unique_id, 3);
 
         pub_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_publish_drops_on_full_queue() {
+        // B1: default (non-blocking) mode drops on a full queue and reports
+        // DroppedQueueFull, matching C++ trySend.
+        let (sender, _receiver) = ndarray_channel("TEST", 1);
+
+        // First publish fills the queue.
+        assert_eq!(sender.publish(make_test_array(1)).await, PublishOutcome::Delivered);
+        // Second publish finds the queue full → dropped + counted.
+        assert_eq!(
+            sender.publish(make_test_array(2)).await,
+            PublishOutcome::DroppedQueueFull
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_on_full_does_not_leak_counter() {
+        // A dropped array must not leave the queued-array counter incremented.
+        let counter = Arc::new(QueuedArrayCounter::new());
+        let (mut sender, _receiver) = ndarray_channel("TEST", 1);
+        sender.set_queued_counter(counter.clone());
+
+        sender.publish(make_test_array(1)).await; // delivered, counter=1
+        assert_eq!(counter.get(), 1);
+        let outcome = sender.publish(make_test_array(2)).await; // dropped
+        assert_eq!(outcome, PublishOutcome::DroppedQueueFull);
+        // Counter must still be 1 — the dropped message decremented on drop.
+        assert_eq!(counter.get(), 1);
     }
 
     #[tokio::test]

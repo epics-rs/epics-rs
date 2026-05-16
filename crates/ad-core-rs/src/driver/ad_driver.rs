@@ -651,7 +651,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(ad.array_output.publish(to_publish));
+        let _ = rt.block_on(ad.array_output.publish(to_publish));
 
         let received = receiver.blocking_recv().unwrap();
         assert_eq!(received.unique_id, id);

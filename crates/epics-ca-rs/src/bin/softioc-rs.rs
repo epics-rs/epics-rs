@@ -217,35 +217,35 @@ fn parse_record_def(
     match rec_type.as_str() {
         "ai" => {
             let (n, val) = parse_or_default!(f64, 0.0);
-            return Ok((n.to_string(), Box::new(AiRecord::new(val))));
+            Ok((n.to_string(), Box::new(AiRecord::new(val))))
         }
         "ao" => {
             let (n, val) = parse_or_default!(f64, 0.0);
-            return Ok((n.to_string(), Box::new(AoRecord::new(val))));
+            Ok((n.to_string(), Box::new(AoRecord::new(val))))
         }
         "bi" => {
             let (n, val) = parse_or_default!(u16, 0);
-            return Ok((n.to_string(), Box::new(BiRecord::new(val))));
+            Ok((n.to_string(), Box::new(BiRecord::new(val))))
         }
         "bo" => {
             let (n, val) = parse_or_default!(u16, 0);
-            return Ok((n.to_string(), Box::new(BoRecord::new(val))));
+            Ok((n.to_string(), Box::new(BoRecord::new(val))))
         }
         "longin" => {
             let (n, val) = parse_or_default!(i32, 0);
-            return Ok((n.to_string(), Box::new(LonginRecord::new(val))));
+            Ok((n.to_string(), Box::new(LonginRecord::new(val))))
         }
         "longout" => {
             let (n, val) = parse_or_default!(i32, 0);
-            return Ok((n.to_string(), Box::new(LongoutRecord::new(val))));
+            Ok((n.to_string(), Box::new(LongoutRecord::new(val))))
         }
         "mbbi" => {
             let (n, val) = parse_or_default!(u16, 0);
-            return Ok((n.to_string(), Box::new(MbbiRecord::new(val))));
+            Ok((n.to_string(), Box::new(MbbiRecord::new(val))))
         }
         "mbbo" => {
             let (n, val) = parse_or_default!(u16, 0);
-            return Ok((n.to_string(), Box::new(MbboRecord::new(val))));
+            Ok((n.to_string(), Box::new(MbboRecord::new(val))))
         }
         "stringin" => {
             // Match the numeric arms: when a `:VALUE` segment is
@@ -259,7 +259,7 @@ fn parse_record_def(
             } else {
                 (name, value_str)
             };
-            return Ok((n.to_string(), Box::new(StringinRecord::new(val))));
+            Ok((n.to_string(), Box::new(StringinRecord::new(val))))
         }
         "stringout" => {
             let (n, val) = if value_str.is_empty() {
@@ -267,7 +267,7 @@ fn parse_record_def(
             } else {
                 (name, value_str)
             };
-            return Ok((n.to_string(), Box::new(StringoutRecord::new(val))));
+            Ok((n.to_string(), Box::new(StringoutRecord::new(val))))
         }
         _ => Err(epics_base_rs::error::CaError::InvalidValue(format!(
             "unknown record type '{rec_type}'"

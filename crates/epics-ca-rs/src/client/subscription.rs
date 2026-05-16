@@ -151,6 +151,7 @@ impl SubscriptionRegistry {
     /// IOC). When set, auto-derived `data_type`/`count` are reset to
     /// `None` so they re-derive from the fresh `native_type`; subscriptions
     /// created with an explicit user-chosen type keep their type.
+    #[allow(clippy::too_many_arguments)]
     pub fn restore_for_channel(
         &mut self,
         cid: u32,

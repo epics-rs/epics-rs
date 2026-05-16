@@ -1059,7 +1059,7 @@ pub(crate) fn motor_put_field(
                 rec.vel.accl = if v <= 0.0 { 0.1 } else { v };
                 // C: 36177f7b — writing ACCL switches ACCU to Accl and recalcs ACCS
                 rec.vel.accu = AccsUsed::Accl;
-                let span = rec.vel.velo - rec.vel.vbas;
+                let span = rec.vel.velo - rec.effective_vbas();
                 if rec.vel.accl > 0.0 && span > 0.0 {
                     rec.vel.accs = span / rec.vel.accl;
                 }
@@ -1073,7 +1073,7 @@ pub(crate) fn motor_put_field(
                 rec.vel.accs = if v <= 0.0 { 1.0 } else { v };
                 // C: 36177f7b — writing ACCS switches ACCU to Accs and recalcs ACCL
                 rec.vel.accu = AccsUsed::Accs;
-                let span = rec.vel.velo - rec.vel.vbas;
+                let span = rec.vel.velo - rec.effective_vbas();
                 if rec.vel.accs > 0.0 && span > 0.0 {
                     rec.vel.accl = span / rec.vel.accs;
                 }
@@ -1538,7 +1538,7 @@ pub(crate) fn motor_put_field(
 /// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
 /// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
 fn apply_accu_cascade(rec: &mut MotorRecord) {
-    let span = rec.vel.velo - rec.vel.vbas;
+    let span = rec.vel.velo - rec.effective_vbas();
     if span <= 0.0 {
         return; // C: span must be positive; otherwise leave master untouched
     }

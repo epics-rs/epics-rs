@@ -896,6 +896,50 @@ fn test_move_accel_velo_equals_vbas_fallback() {
     assert_eq!(accel, Some(2.0));
 }
 
+fn emitted_accel(effects: &motor_rs::flags::ProcessEffects) -> Option<f64> {
+    effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveAbsolute { acceleration, .. } => Some(*acceleration),
+        MotorCommand::MoveRelative { acceleration, .. } => Some(*acceleration),
+        _ => None,
+    })
+}
+
+#[test]
+fn test_move_accel_never_zero_for_unconfigured_axis() {
+    // VELO==VBAS==0 (axis not yet configured) must not yield a 0 accel.
+    let mut rec = MotorRecord::new();
+    rec.vel.velo = 0.0;
+    rec.vel.vbas = 0.0;
+    rec.vel.accl = 0.5;
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    if let Some(a) = emitted_accel(&effects) {
+        assert!(a > 0.0, "acceleration must stay positive, got {a}");
+    }
+}
+
+#[test]
+fn test_accs_cascade_consistent_with_move_accel_under_vbas_unsupported() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // VBAS_UNSUPPORTED axis: the ACCS field value and the driver-bound
+    // acceleration must agree (both treat VBAS as 0).
+    let mut rec = MotorRecord::new();
+    rec.process_motor_info(&MotorStatus {
+        vbas_supported: false,
+        ..Default::default()
+    });
+    rec.vel.vbas = 6.0; // would skew accs if used raw
+    rec.vel.accu = AccsUsed::Accl;
+    rec.vel.accl = 2.0;
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    // apply_accu_cascade derived ACCS using effective VBAS (0): (10-0)/2 = 5
+    assert!((rec.vel.accs - 5.0).abs() < 1e-12);
+    // The driver-bound acceleration (ACCU=Accl path) must yield the same.
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert_eq!(emitted_accel(&effects), Some(5.0));
+}
+
 #[test]
 fn test_move_accel_vbas_unsupported_treats_vbas_as_zero() {
     use asyn_rs::interfaces::motor::MotorStatus;

@@ -701,7 +701,7 @@ impl MotorRecord {
     /// support a base velocity advertise it via MSTA bit 15
     /// (`VBAS_UNSUPPORTED`, epics-modules/motor #76); for those VBAS is
     /// treated as 0.
-    fn effective_vbas(&self) -> f64 {
+    pub(crate) fn effective_vbas(&self) -> f64 {
         if self.stat.msta.contains(MstaFlags::VBAS_UNSUPPORTED) {
             0.0
         } else {
@@ -713,6 +713,8 @@ impl MotorRecord {
     /// C: `accEGUfromVelo()` = `(velo - vbas) / accl`; when ACCU=Accs the
     /// EGU/sec² value ACCS is used directly. When `velo == vbas` the rate
     /// would be 0, so fall back to `velo / accl` (C: `b201e40e`, PR #75).
+    /// The result is always strictly positive — a zero acceleration would be
+    /// rejected or read as "instant" by drivers.
     pub(crate) fn move_accel_egu(&self) -> f64 {
         if self.vel.accu == AccsUsed::Accs && self.vel.accs > 0.0 {
             return self.vel.accs;
@@ -723,14 +725,21 @@ impl MotorRecord {
             0.1
         };
         let span = self.vel.velo - self.effective_vbas();
-        if span > 0.0 {
+        let rate = if span > 0.0 {
             span / accl
         } else {
             self.vel.velo / accl
+        };
+        // Guard against an unconfigured axis (VELO==VBAS==0) yielding 0.
+        if rate > 0.0 {
+            rate
+        } else {
+            self.vel.velo.abs().max(1.0) / accl
         }
     }
 
     /// Acceleration for a backlash move, EGU/sec². Uses BVEL/BACC.
+    /// Always strictly positive (see `move_accel_egu`).
     pub(crate) fn backlash_accel_egu(&self) -> f64 {
         let bacc = if self.vel.bacc > 0.0 {
             self.vel.bacc
@@ -738,10 +747,15 @@ impl MotorRecord {
             0.1
         };
         let span = self.vel.bvel - self.effective_vbas();
-        if span > 0.0 {
+        let rate = if span > 0.0 {
             span / bacc
         } else {
             self.vel.bvel / bacc
+        };
+        if rate > 0.0 {
+            rate
+        } else {
+            self.vel.bvel.abs().max(1.0) / bacc
         }
     }
 

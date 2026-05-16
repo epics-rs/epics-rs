@@ -216,13 +216,21 @@ impl PvaLinkResolver {
         let pv_name = cfg.pv_name.clone();
         // B4 `local`: a `local`-flagged link must resolve a PV served
         // by *this* IOC. pvxs requires a local channel; here that
-        // means the target must be a record in the attached
-        // `PvDatabase`. Reject up-front so the operator gets a clear
-        // error instead of a silent remote resolution. Mirrors pvxs
-        // `pvaLinkConfig::local`.
+        // means the target must be served by the attached
+        // `PvDatabase`. A local PV can be a record OR a simple PV
+        // registered via `add_pv` (e.g. a QSRV single-record channel,
+        // an iocsh stats PV, a gateway shadow PV) — gating on
+        // `get_record` alone wrongly rejected those with `NotLocal`.
+        // Both lookups use the no-resolver path so the `local` check
+        // never triggers a remote search. Reject up-front so the
+        // operator gets a clear error instead of a silent remote
+        // resolution. Mirrors pvxs `pvaLinkConfig::local`.
         if cfg.local {
             let is_local = match self.db.read().clone() {
-                Some(db) => db.get_record(&pv_name).await.is_some(),
+                Some(db) => {
+                    db.get_record_no_resolve(&pv_name).await.is_some()
+                        || db.find_pv(&pv_name).await.is_some()
+                }
                 // No DB attached — a `local` link cannot be satisfied.
                 None => false,
             };
@@ -1195,5 +1203,26 @@ mod tests {
         // connect, which is fine for this assertion).
         let r = resolver.open_link("pva://SOME:REMOTE:PV").await;
         assert!(r.is_ok(), "non-local link should open");
+    }
+
+    /// B4 `local`: a `local`-flagged link to a non-record local PV —
+    /// one registered via `add_pv` (e.g. an iocsh stats PV or QSRV
+    /// single-record channel) — must NOT be rejected. The gate
+    /// previously consulted `get_record` only and wrongly returned
+    /// `NotLocal` for simple PVs.
+    #[tokio::test]
+    async fn b4_local_link_accepts_simple_pv() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("LOCAL:SIMPLE:PV", EpicsValue::Double(3.0))
+            .await
+            .unwrap();
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let r = resolver
+            .open_link("pva://LOCAL:SIMPLE:PV?local=true")
+            .await;
+        assert!(
+            r.is_ok(),
+            "local link to a simple add_pv PV must be accepted"
+        );
     }
 }

@@ -374,7 +374,7 @@ impl NDArray {
                     // C++ getInfo for 2-D: yStride = xSize, colorSize/colorStride = 0.
                     (xs, ys, 0, 0, 1, 0, 1, xs, 0)
                 }
-                _ => {
+                3 => {
                     // 3D: layout depends on ColorMode
                     match color_mode {
                         NDColorMode::RGB1 => {
@@ -413,6 +413,15 @@ impl NDArray {
                             (xs, ys, cs, 0, 1, 2, 1, xs, xs * ys)
                         }
                     }
+                }
+                // R3: C++ getInfo gates the color-dimension block on
+                // `ndims == 3` exactly. For 4-D and higher arrays it leaves
+                // colorSize/colorDim/colorStride at 0 and only fills xDim/yDim
+                // from the first two dimensions — same as the 2-D case.
+                _ => {
+                    let xs = self.dims[0].size;
+                    let ys = self.dims[1].size;
+                    (xs, ys, 0, 0, 1, 0, 1, xs, 0)
                 }
             };
 
@@ -639,6 +648,31 @@ mod tests {
         // C parity: 1-D arrays leave ySize / colorSize at 0.
         assert_eq!(info.y_size, 0);
         assert_eq!(info.color_size, 0);
+    }
+
+    #[test]
+    fn test_ndarray_info_4d_not_color() {
+        // R3: C++ getInfo gates the color block on `ndims == 3` exactly.
+        // A 4-D array must leave color_size / color_dim / color_stride at 0
+        // and only fill x/y from the first two dimensions.
+        let dims = vec![
+            NDDimension::new(8),
+            NDDimension::new(640),
+            NDDimension::new(480),
+            NDDimension::new(5),
+        ];
+        let arr = NDArray::new(dims, NDDataType::UInt8);
+        let info = arr.info();
+        assert_eq!(info.x_size, 8);
+        assert_eq!(info.y_size, 640);
+        assert_eq!(info.color_size, 0, "4-D array must not get a color size");
+        assert_eq!(info.x_dim, 0);
+        assert_eq!(info.y_dim, 1);
+        assert_eq!(info.color_dim, 0);
+        assert_eq!(info.x_stride, 1);
+        assert_eq!(info.y_stride, 8);
+        assert_eq!(info.color_stride, 0);
+        assert_eq!(info.num_elements, 8 * 640 * 480 * 5);
     }
 
     #[test]

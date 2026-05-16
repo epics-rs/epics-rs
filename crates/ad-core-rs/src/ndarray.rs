@@ -340,6 +340,26 @@ impl NDArray {
         }
     }
 
+    /// Create an NDArray wrapping an already-built data buffer.
+    ///
+    /// The array is not pool-allocated (`pool_id == 0`); `data_size` is taken
+    /// from the buffer's element count. Use this when a producer fills its own
+    /// buffer instead of allocating through an [`crate::ndarray_pool::NDArrayPool`].
+    pub fn with_data(dims: Vec<NDDimension>, data: NDDataBuffer) -> Self {
+        let data_size = data.len() * data.data_type().element_size();
+        Self {
+            unique_id: 0,
+            timestamp: EpicsTimestamp::default(),
+            time_stamp: 0.0,
+            dims,
+            data,
+            attributes: NDAttributeList::new(),
+            codec: None,
+            pool_id: 0,
+            data_size,
+        }
+    }
+
     /// Compute layout info for this array (matching C++ NDArray::getInfo).
     ///
     /// For 3D arrays, reads the `ColorMode` attribute to determine which

@@ -324,9 +324,19 @@ fn load_pem_keychain(
 /// Leaf-vs-CA pairing uses the PKCS#12 `localKeyID` attribute — the
 /// same mechanism OpenSSL's `PKCS12_parse` uses to associate a cert
 /// with its key. The cert bag whose `localKeyID` matches the key
-/// bag's is the leaf; every other cert is a CA. When no `localKeyID`
-/// is present (or no key bag exists), the first cert is taken as the
-/// leaf and the rest as CAs.
+/// bag's is the leaf; every other cert is a CA.
+///
+/// F7: when the *cert* bags carry no `localKeyID` of their own, we
+/// still pair reliably by reconstructing the OpenSSL `localKeyID`:
+/// OpenSSL sets a key bag's `localKeyID` to `SHA-1(leaf_cert_DER)`
+/// (see `p12` crate `PFX::new`), so the leaf is the cert whose DER
+/// hashes to the key bag's id. If the key bag has a `localKeyID` but
+/// no cert matches it, that is a hard error — the keychain references
+/// a leaf cert that is not present, and silently presenting some
+/// other cert (possibly a CA) would be wrong. If the key bag carries
+/// no `localKeyID` at all, the keychain is unambiguous only when it
+/// holds exactly one cert; more than one is a hard error rather than
+/// a guess.
 #[cfg(feature = "pkcs12")]
 fn load_pkcs12_keychain(
     path: &Path,
@@ -374,32 +384,35 @@ fn load_pkcs12_keychain(
         }
     }
 
-    // Collect cert bags, pairing on `localKeyID`.
+    // Collect every cert bag's DER alongside its own `localKeyID`
+    // (most cert bags carry none — OpenSSL only stamps the leaf).
+    let mut cert_bags: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    for bag in &bags {
+        if let Some(der) = bag.bag.get_x509_cert() {
+            cert_bags.push((der, bag.local_key_id()));
+        }
+    }
+    if cert_bags.is_empty() {
+        return Err(TlsConfigError::NoCert(path.to_path_buf()));
+    }
+
+    // Identify the leaf index — pure logic, see `select_leaf_index`.
+    let leaf_idx = select_leaf_index(&cert_bags, key_local_id.as_deref())
+        .map_err(|reason| TlsConfigError::Pkcs12 {
+            path: path.to_path_buf(),
+            reason,
+        })?;
+
+    // Split: the identified leaf first, every other cert is a CA.
     let mut certs: Vec<CertificateDer<'static>> = Vec::new();
     let mut ca_certs: Vec<CertificateDer<'static>> = Vec::new();
-    for bag in &bags {
-        let Some(der) = bag.bag.get_x509_cert() else {
-            continue;
-        };
+    for (idx, (der, _)) in cert_bags.into_iter().enumerate() {
         let cert = CertificateDer::from(der);
-        let is_leaf = match (&key_local_id, bag.local_key_id()) {
-            (Some(want), Some(got)) => *want == got && certs.is_empty(),
-            _ => false,
-        };
-        if is_leaf {
+        if idx == leaf_idx {
             certs.push(cert);
         } else {
             ca_certs.push(cert);
         }
-    }
-
-    // No `localKeyID` pairing (or no key): take the first cert as the
-    // leaf so the keychain is still usable.
-    if certs.is_empty() {
-        if ca_certs.is_empty() {
-            return Err(TlsConfigError::NoCert(path.to_path_buf()));
-        }
-        certs.push(ca_certs.remove(0));
     }
 
     Ok(Keychain {
@@ -407,6 +420,78 @@ fn load_pkcs12_keychain(
         key,
         ca_certs,
     })
+}
+
+/// Pick the leaf certificate's index among a PKCS#12 keychain's cert
+/// bags (F7). `cert_bags` is `(cert_DER, that bag's own localKeyID)`
+/// in bag order; `key_local_id` is the private-key bag's `localKeyID`.
+///
+/// Decision order:
+/// 1. Key bag has a `localKeyID` → the leaf is the cert whose bag
+///    `localKeyID` equals it, or failing that the cert whose
+///    `SHA-1(DER)` equals it (OpenSSL derives the id that way). On no
+///    match, `Err` — the keychain's leaf cert is missing; falling
+///    back to bag order could present a CA cert as the leaf.
+/// 2. Key bag has no `localKeyID` → unambiguous only with exactly one
+///    cert. More than one cert is `Err`: there is no signal to tell
+///    leaf from CA, and a guess can pick a CA cert.
+#[cfg(feature = "pkcs12")]
+fn select_leaf_index(
+    cert_bags: &[(Vec<u8>, Option<Vec<u8>>)],
+    key_local_id: Option<&[u8]>,
+) -> Result<usize, String> {
+    match key_local_id {
+        Some(key_id) => {
+            // (a) match a cert bag's own `localKeyID` attribute.
+            if let Some(idx) = cert_bags
+                .iter()
+                .position(|(_, id)| id.as_deref() == Some(key_id))
+            {
+                return Ok(idx);
+            }
+            // (b) match `SHA-1(cert_DER)` — the value OpenSSL hashes
+            // to build the key bag's `localKeyID`. This pairs the key
+            // to its leaf even when the cert bags carry no attribute.
+            if let Some(idx) = cert_bags
+                .iter()
+                .position(|(der, _)| sha1_digest(der) == key_id)
+            {
+                return Ok(idx);
+            }
+            Err("PKCS#12 key bag's localKeyID matches no certificate in \
+                 the keychain — the leaf certificate paired with the \
+                 private key is missing"
+                .to_string())
+        }
+        None => {
+            if cert_bags.len() == 1 {
+                Ok(0)
+            } else {
+                Err(format!(
+                    "PKCS#12 keychain has {} certificates but no \
+                     localKeyID to identify which is the leaf paired \
+                     with the private key — re-encode the keychain with \
+                     `openssl pkcs12 -export` so the key carries a \
+                     localKeyID",
+                    cert_bags.len()
+                ))
+            }
+        }
+    }
+}
+
+/// SHA-1 digest of `bytes`. Used to reconstruct a PKCS#12
+/// `localKeyID`: OpenSSL stamps a key bag's `localKeyID` with the
+/// SHA-1 of its leaf certificate's DER, so `sha1_digest(cert_der)`
+/// equals the key bag's id for the leaf and nothing else (F7). SHA-1
+/// is used here purely as an identifier, not for any security
+/// property — it mirrors OpenSSL's keychain convention exactly.
+#[cfg(feature = "pkcs12")]
+fn sha1_digest(bytes: &[u8]) -> Vec<u8> {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    hasher.finalize().to_vec()
 }
 
 /// Encode a password as a PKCS#12 BMPString (UTF-16BE + NUL terminator)
@@ -749,6 +834,58 @@ mod tests {
         assert!(kc.key.is_some());
         // Leaf and CA must be distinct certs.
         assert_ne!(kc.certs[0].as_ref(), kc.ca_certs[0].as_ref());
+    }
+
+    /// F7: `select_leaf_index` must NOT fall back to bag order when no
+    /// `localKeyID` pairs the key to a cert — that can pick a CA cert
+    /// as the leaf. Covers all three decision paths.
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    fn select_leaf_index_pairs_key_and_cert_or_hard_errors() {
+        // Two distinct cert DERs (content is opaque to the picker).
+        let ca: Vec<u8> = b"CA-CERT-DER-BYTES".to_vec();
+        let leaf: Vec<u8> = b"LEAF-CERT-DER-BYTES".to_vec();
+
+        // (1) Key bag localKeyID matches a cert bag's own attribute.
+        // CA is first in bag order — the OLD code would have picked it.
+        let attr_id = vec![0xAAu8; 20];
+        let bags = vec![
+            (ca.clone(), None),
+            (leaf.clone(), Some(attr_id.clone())),
+        ];
+        assert_eq!(
+            select_leaf_index(&bags, Some(&attr_id)).unwrap(),
+            1,
+            "must pick the cert whose localKeyID matches the key, not bag[0]"
+        );
+
+        // (2) Cert bags carry NO localKeyID; the key bag's localKeyID
+        // is SHA-1(leaf_DER). Must pair via the SHA-1 reconstruction.
+        let leaf_sha1 = sha1_digest(&leaf);
+        let bags_no_attr = vec![(ca.clone(), None), (leaf.clone(), None)];
+        assert_eq!(
+            select_leaf_index(&bags_no_attr, Some(&leaf_sha1)).unwrap(),
+            1,
+            "must pair key to leaf via SHA-1(cert_DER)"
+        );
+
+        // (3) Key bag localKeyID matches NO cert — hard error, never
+        // a silent bag-order fallback.
+        let err = select_leaf_index(&bags_no_attr, Some(&[0x99u8; 20]))
+            .expect_err("must hard-error when no cert matches the key");
+        assert!(err.contains("matches no certificate"), "got: {err}");
+
+        // (4) No key localKeyID + a single cert → unambiguous.
+        assert_eq!(
+            select_leaf_index(&[(leaf.clone(), None)], None).unwrap(),
+            0,
+        );
+
+        // (5) No key localKeyID + multiple certs → ambiguous, hard
+        // error rather than guessing (the F7 silent-CA-as-leaf bug).
+        let err = select_leaf_index(&bags_no_attr, None)
+            .expect_err("must hard-error on ambiguous multi-cert keychain");
+        assert!(err.contains("no localKeyID"), "got: {err}");
     }
 
     #[test]

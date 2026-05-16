@@ -37,6 +37,17 @@ pub struct ScalcoutRecord {
     // Previous value for transition detection
     prev_val: f64,
     prev_sval: String,
+    /// CALC_ALARM flag — set when the CALC or OCAL `sCalcPerform`
+    /// evaluation fails. synApps `sCalcoutRecord` raises `CALC_ALARM`
+    /// on a broken expression; the framework's `evaluate_alarms`
+    /// already inspects a `CALC_ALARM` field for `scalcout`, so this
+    /// flag is surfaced through `get_field("CALC_ALARM")`.
+    calc_alarm: bool,
+    /// Output decision from the last `process()`. The framework's
+    /// generic multi-output dispatch reads `multi_output_links()`
+    /// unconditionally, so this caches the OOPT decision and gates
+    /// the OUT-link write on it.
+    cached_should_output: bool,
 }
 
 impl Default for ScalcoutRecord {
@@ -62,6 +73,8 @@ impl Default for ScalcoutRecord {
             str_vals: Default::default(),
             prev_val: 0.0,
             prev_sval: String::new(),
+            calc_alarm: false,
+            cached_should_output: false,
         }
     }
 }
@@ -403,42 +416,80 @@ impl Record for ScalcoutRecord {
         self.prev_val = self.val;
         self.prev_sval = self.sval.clone();
 
-        // Evaluate CALC
-        if let Some(ref compiled) = self.compiled_calc {
+        // Evaluate CALC. A fresh cycle clears CALC_ALARM; a broken CALC
+        // (compile failure OR an sCalcPerform eval failure) re-raises
+        // it. synApps `sCalcoutRecord` raises CALC_ALARM on any broken
+        // expression; without this a failing scalcout expression
+        // silently kept the previous cycle's VAL/SVAL with no invalid
+        // indication.
+        self.calc_alarm = false;
+
+        // A non-empty CALC that did not compile is itself a broken
+        // expression — flag it (scalc_eval is never reached for None).
+        let calc_failed = if self.calc.is_empty() {
+            false
+        } else if let Some(ref compiled) = self.compiled_calc {
             let mut inputs = self.build_inputs();
             match scalc_eval(compiled, &mut inputs) {
-                Ok(result) => self.apply_result(&result),
-                Err(_) => {
-                    // Invalid calc — check IVOA
-                    match self.ivoa {
-                        1 => return Ok(ProcessOutcome::complete()), // Don't drive output
-                        2 => {
-                            self.val = self.ivov;
-                        }
-                        _ => {} // Continue
-                    }
+                Ok(result) => {
+                    self.apply_result(&result);
+                    false
                 }
+                Err(_) => true,
+            }
+        } else {
+            // calc non-empty but compile failed
+            true
+        };
+
+        if calc_failed {
+            self.calc_alarm = true;
+            // Invalid calc — check IVOA
+            match self.ivoa {
+                1 => {
+                    // Don't drive output — suppress the OUT write.
+                    self.cached_should_output = false;
+                    return Ok(ProcessOutcome::complete());
+                }
+                2 => {
+                    self.val = self.ivov;
+                }
+                _ => {} // Continue
             }
         }
 
         // Determine output
-        if self.should_output() {
+        let do_output = self.should_output();
+        self.cached_should_output = do_output;
+        if do_output {
             if self.dopt == 1 {
-                // Use OCAL
-                if let Some(ref compiled) = self.compiled_ocal {
-                    let mut inputs = self.build_inputs();
-                    match scalc_eval(compiled, &mut inputs) {
-                        Ok(result) => match &result {
-                            StackValue::Double(v) => {
-                                self.oval = *v;
-                                self.osv = format!("{}", v);
+                // Use OCAL. A broken OCAL (compile OR eval failure)
+                // raises CALC_ALARM — sibling calcout.rs does the same,
+                // and synApps `sCalcoutRecord` raises CALC_ALARM on an
+                // OCAL sCalcPerform failure. Previously an OCAL error
+                // was discarded and OVAL/OSV kept stale values with no
+                // alarm.
+                if !self.ocal.is_empty() {
+                    if let Some(ref compiled) = self.compiled_ocal {
+                        let mut inputs = self.build_inputs();
+                        match scalc_eval(compiled, &mut inputs) {
+                            Ok(result) => match &result {
+                                StackValue::Double(v) => {
+                                    self.oval = *v;
+                                    self.osv = format!("{}", v);
+                                }
+                                StackValue::Str(s) => {
+                                    self.osv = s.clone();
+                                    self.oval = s.parse::<f64>().unwrap_or(0.0);
+                                }
+                            },
+                            Err(_) => {
+                                self.calc_alarm = true;
                             }
-                            StackValue::Str(s) => {
-                                self.osv = s.clone();
-                                self.oval = s.parse::<f64>().unwrap_or(0.0);
-                            }
-                        },
-                        Err(_) => {}
+                        }
+                    } else {
+                        // OCAL non-empty but compile failed.
+                        self.calc_alarm = true;
                     }
                 }
             } else {
@@ -465,6 +516,7 @@ impl Record for ScalcoutRecord {
             "OUT" => Some(EpicsValue::String(self.out.clone())),
             "WAIT" => Some(EpicsValue::Short(self.wait)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
+            "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
@@ -615,6 +667,21 @@ impl Record for ScalcoutRecord {
             ("INPK", "K"),
             ("INPL", "L"),
         ]
+    }
+
+    /// scalcout writes its computed output to the `OUT` link. The
+    /// framework's generic multi-output dispatch reads the `OUT` field
+    /// for the link string and `OVAL` for the value. Gated on the last
+    /// cycle's OOPT decision (`cached_should_output`) so a
+    /// condition-not-met cycle does not write the OUT link. Previously
+    /// `OUT` was stored but never written — the scalcout output side
+    /// was a dead feature.
+    fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
+        if self.cached_should_output {
+            &[("OUT", "OVAL")]
+        } else {
+            &[]
+        }
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {

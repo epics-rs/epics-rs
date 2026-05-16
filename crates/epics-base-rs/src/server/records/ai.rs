@@ -32,6 +32,12 @@ pub struct AiRecord {
     pub mlst: f64,
     pub init: bool,
     skip_convert: bool,
+    /// Set by `process()` when `LINR >= 3` selects a breakpoint-table
+    /// linearisation that this port cannot resolve (no breakpoint-table
+    /// registry). C `aiRecord.c::convert` raises `SOFT_ALARM/MAJOR_ALARM`
+    /// on a BPT failure; `check_alarms` consumes this flag to do the
+    /// same so the misconfiguration is not silent.
+    bpt_error: bool,
     // Simulation
     pub simm: i16,
     pub siml: String,
@@ -65,6 +71,7 @@ impl Default for AiRecord {
             mlst: 0.0,
             init: false,
             skip_convert: false,
+            bpt_error: false,
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -258,13 +265,25 @@ impl Record for AiRecord {
             v += self.aoff;
 
             // Step 2: Apply linearization based on LINR
+            self.bpt_error = false;
             match self.linr {
                 0 => {} // NO_CONVERSION: skip linearization
                 1 | 2 => {
                     // SLOPE (1) and LINEAR (2): apply eslo/eoff
                     v = v * self.eslo + self.eoff;
                 }
-                _ => {} // breakpoint tables not yet supported
+                _ => {
+                    // LINR >= 3 selects a breakpoint-table linearisation
+                    // (a `.dbd` breakpoint-menu choice). epics-base-rs
+                    // has no breakpoint-table registry, so the table
+                    // cannot be applied — the value passes through
+                    // unconverted. C `aiRecord.c::convert` (lines
+                    // 433-436) treats a BPT failure as
+                    // `SOFT_ALARM/MAJOR_ALARM`; flag it here so
+                    // `check_alarms` raises the same alarm rather than
+                    // leaving the misconfiguration silent.
+                    self.bpt_error = true;
+                }
             }
 
             // Step 3: Smoothing filter
@@ -515,6 +534,22 @@ impl Record for AiRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELDS
+    }
+
+    /// C `aiRecord.c::convert` raises `SOFT_ALARM/MAJOR_ALARM` when the
+    /// breakpoint-table conversion fails. epics-base-rs has no
+    /// breakpoint-table registry, so any `LINR >= 3` is an unresolvable
+    /// table — `process()` flags `bpt_error` and this hook raises the
+    /// C-equivalent alarm so the misconfiguration is visible.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if self.bpt_error {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                crate::server::record::AlarmSeverity::Major,
+                "BPT Error",
+            );
+        }
     }
 
     fn set_device_did_compute(&mut self, did_compute: bool) {

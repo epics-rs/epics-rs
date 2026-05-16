@@ -190,6 +190,14 @@ impl CalcRecord {
         }
     }
 
+    /// C `calcRecord.c::monitor`: advance the `LX` previous-value field
+    /// only when the input `X` actually changed since the last post.
+    fn advance_prev(new: f64, prev: &mut f64) {
+        if new != *prev {
+            *prev = new;
+        }
+    }
+
     fn get_vars(&self) -> [f64; 21] {
         [
             self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
@@ -691,28 +699,46 @@ impl Record for CalcRecord {
                 }
             }
         }
-        // Save current values to LA-LU for next cycle
-        self.la = self.a;
-        self.lb = self.b;
-        self.lc = self.c;
-        self.ld = self.d;
-        self.le = self.e;
-        self.lf = self.f;
-        self.lg = self.g;
-        self.lh = self.h;
-        self.li = self.i;
-        self.lj = self.j;
-        self.lk = self.k;
-        self.ll = self.l;
-        self.lm = self.m;
-        self.ln = self.n;
-        self.lo = self.o;
-        self.lp = self.p;
-        self.lq = self.q;
-        self.lr = self.r;
-        self.ls = self.s;
-        self.lt = self.t;
-        self.lu = self.u;
+        // Update LA-LU. C `calcRecord.c::monitor` (lines 417-423) advances
+        // `*pprev = *pnew` only inside the per-field change test
+        // (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only
+        // for inputs that actually changed. So LA..LU means "value of the
+        // input as of the last time a monitor was posted for it" — copying
+        // unconditionally here would advance LA on a no-change cycle and
+        // diverge from C for CALC expressions that reference LA..LU.
+        Self::advance_prev(self.a, &mut self.la);
+        Self::advance_prev(self.b, &mut self.lb);
+        Self::advance_prev(self.c, &mut self.lc);
+        Self::advance_prev(self.d, &mut self.ld);
+        Self::advance_prev(self.e, &mut self.le);
+        Self::advance_prev(self.f, &mut self.lf);
+        Self::advance_prev(self.g, &mut self.lg);
+        Self::advance_prev(self.h, &mut self.lh);
+        Self::advance_prev(self.i, &mut self.li);
+        Self::advance_prev(self.j, &mut self.lj);
+        Self::advance_prev(self.k, &mut self.lk);
+        Self::advance_prev(self.l, &mut self.ll);
+        Self::advance_prev(self.m, &mut self.lm);
+        Self::advance_prev(self.n, &mut self.ln);
+        Self::advance_prev(self.o, &mut self.lo);
+        Self::advance_prev(self.p, &mut self.lp);
+        Self::advance_prev(self.q, &mut self.lq);
+        Self::advance_prev(self.r, &mut self.lr);
+        Self::advance_prev(self.s, &mut self.ls);
+        Self::advance_prev(self.t, &mut self.lt);
+        Self::advance_prev(self.u, &mut self.lu);
+
+        // AFVL housekeeping — C `calcRecord.c::checkAlarms` always drives
+        // AFVL to 0 when the alarm-range filter is inactive: on UDF
+        // (line 302 `prec->afvl = 0`) and whenever `aftc <= 0` (the
+        // local `afvl` stays 0 since the `aftc > 0` block is skipped, so
+        // line 382 `prec->afvl = afvl` stores 0). The framework's AFTC
+        // filter only *maintains* AFVL while `aftc > 0`; without this a
+        // stale non-zero accumulator survives an AFTC→0 retune and would
+        // mis-seed the filter if AFTC is later re-enabled.
+        if self.aftc <= 0.0 || self.val.is_nan() {
+            self.afvl = 0.0;
+        }
         Ok(ProcessOutcome::complete())
     }
 

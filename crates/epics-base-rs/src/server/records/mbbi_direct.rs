@@ -3,8 +3,10 @@ use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 // Multi-bit binary input direct record.
-// VAL holds the full unsigned 16-bit value; B0-BF expose individual bits as Char (0/1).
-// On process: RVAL is shifted right by SHFT, masked by MASK, stored in VAL and bit fields.
+// VAL holds the full unsigned 32-bit value; B0-B1F expose individual bits
+// as Char (0/1). C `mbbiDirectRecord.c` defines `NUM_BITS 32`, so the
+// bit-field interface spans B0..B1F (32 fields).
+// On process: RVAL is shifted right by SHFT and stored in VAL and bit fields.
 pub struct MbbiDirectRecord {
     pub val: u32,
     pub rval: i32,
@@ -13,7 +15,7 @@ pub struct MbbiDirectRecord {
     pub shft: i16,
     pub nobt: i16,
     pub mlst: u32,
-    pub bits: [u8; 16], // B0-BF
+    pub bits: [u8; 32], // B0-B1F
     pub simm: i16,
     pub siml: String,
     pub siol: String,
@@ -31,7 +33,7 @@ impl Default for MbbiDirectRecord {
             shft: 0,
             nobt: 0,
             mlst: 0,
-            bits: [0; 16],
+            bits: [0; 32],
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -43,24 +45,48 @@ impl Default for MbbiDirectRecord {
 
 impl MbbiDirectRecord {
     fn val_to_bits(&mut self) {
-        for i in 0..16 {
+        for i in 0..32 {
             self.bits[i] = ((self.val >> i) & 1) as u8;
         }
     }
 
     fn bits_to_val(&mut self) {
         self.val = 0;
-        for i in 0..16 {
+        for i in 0..32 {
             self.val |= (self.bits[i] as u32 & 1) << i;
         }
     }
 }
 
-const BIT_NAMES: [&str; 16] = [
+/// Bit field names B0..B1F — 32 entries, matching C `NUM_BITS 32`.
+pub(crate) const BIT_NAMES: [&str; 32] = [
     "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA", "BB", "BC", "BD", "BE", "BF",
+    "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18", "B19", "B1A", "B1B", "B1C",
+    "B1D", "B1E", "B1F",
 ];
 
-static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
+fn bit_field_descs() -> &'static [FieldDesc] {
+    // Const-evaluated table of the 32 bit fields.
+    macro_rules! bf {
+        ($name:literal) => {
+            FieldDesc {
+                name: $name,
+                dbf_type: DbFieldType::Char,
+                read_only: false,
+            }
+        };
+    }
+    static BITS: [FieldDesc; 32] = [
+        bf!("B0"), bf!("B1"), bf!("B2"), bf!("B3"), bf!("B4"), bf!("B5"), bf!("B6"), bf!("B7"),
+        bf!("B8"), bf!("B9"), bf!("BA"), bf!("BB"), bf!("BC"), bf!("BD"), bf!("BE"), bf!("BF"),
+        bf!("B10"), bf!("B11"), bf!("B12"), bf!("B13"), bf!("B14"), bf!("B15"), bf!("B16"),
+        bf!("B17"), bf!("B18"), bf!("B19"), bf!("B1A"), bf!("B1B"), bf!("B1C"), bf!("B1D"),
+        bf!("B1E"), bf!("B1F"),
+    ];
+    &BITS
+}
+
+static MBBI_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
@@ -97,86 +123,6 @@ static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
         read_only: true,
     },
     FieldDesc {
-        name: "B0",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B1",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B2",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B3",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B4",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B5",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B6",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B7",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B8",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B9",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BA",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BB",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BC",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BD",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BE",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BF",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Short,
         read_only: false,
@@ -198,13 +144,24 @@ static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// Full field table: the 11 scalar fields followed by the 32 bit fields.
+fn mbbi_direct_fields() -> &'static [FieldDesc] {
+    use std::sync::OnceLock;
+    static ALL: OnceLock<Vec<FieldDesc>> = OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut v: Vec<FieldDesc> = MBBI_DIRECT_HEAD_FIELDS.to_vec();
+        v.extend_from_slice(bit_field_descs());
+        v
+    })
+}
+
 impl Record for MbbiDirectRecord {
     fn record_type(&self) -> &'static str {
         "mbbiDirect"
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {
-        MBBI_DIRECT_FIELDS
+        mbbi_direct_fields()
     }
 
     fn uses_monitor_deadband(&self) -> bool {
@@ -213,7 +170,9 @@ impl Record for MbbiDirectRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            if self.mask == 0 && self.nobt > 0 && self.nobt <= 16 {
+            // C `mbbiDirectRecord.c::init_record` — MASK from NOBT,
+            // NOBT may span 1..32 (NUM_BITS 32).
+            if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as i32;
             }
             self.mlst = self.val;

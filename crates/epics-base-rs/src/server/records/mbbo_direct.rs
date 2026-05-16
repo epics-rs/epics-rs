@@ -2,10 +2,14 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
+use super::mbbi_direct::BIT_NAMES;
+
 // Multi-bit binary output direct record.
-// VAL holds the full unsigned 16-bit value; B0-BF expose individual bits as Char (0/1).
+// VAL holds the full unsigned 32-bit value; B0-B1F expose individual bits
+// as Char (0/1). C `mbboDirectRecord.c` defines `NUM_BITS 32`.
 // On process: VAL is shifted left by SHFT and written as RVAL.
-// Writing to any BX field recomputes VAL from individual bits before the next process.
+// Writing to any BX field recomputes VAL from individual bits before the
+// next process.
 pub struct MbboDirectRecord {
     pub val: u32,
     pub rval: i32,
@@ -20,7 +24,7 @@ pub struct MbboDirectRecord {
     pub ivov: u32,
     pub omsl: i16,
     pub dol: String,
-    pub bits: [u8; 16], // B0-BF
+    pub bits: [u8; 32], // B0-B1F
     pub simm: i16,
     pub siml: String,
     pub siol: String,
@@ -44,7 +48,7 @@ impl Default for MbboDirectRecord {
             ivov: 0,
             omsl: 0,
             dol: String::new(),
-            bits: [0; 16],
+            bits: [0; 32],
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -56,24 +60,40 @@ impl Default for MbboDirectRecord {
 
 impl MbboDirectRecord {
     fn val_to_bits(&mut self) {
-        for i in 0..16 {
+        for i in 0..32 {
             self.bits[i] = ((self.val >> i) & 1) as u8;
         }
     }
 
     fn bits_to_val(&mut self) {
         self.val = 0;
-        for i in 0..16 {
+        for i in 0..32 {
             self.val |= (self.bits[i] as u32 & 1) << i;
         }
     }
 }
 
-const BIT_NAMES: [&str; 16] = [
-    "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA", "BB", "BC", "BD", "BE", "BF",
-];
+fn bit_field_descs() -> &'static [FieldDesc] {
+    macro_rules! bf {
+        ($name:literal) => {
+            FieldDesc {
+                name: $name,
+                dbf_type: DbFieldType::Char,
+                read_only: false,
+            }
+        };
+    }
+    static BITS: [FieldDesc; 32] = [
+        bf!("B0"), bf!("B1"), bf!("B2"), bf!("B3"), bf!("B4"), bf!("B5"), bf!("B6"), bf!("B7"),
+        bf!("B8"), bf!("B9"), bf!("BA"), bf!("BB"), bf!("BC"), bf!("BD"), bf!("BE"), bf!("BF"),
+        bf!("B10"), bf!("B11"), bf!("B12"), bf!("B13"), bf!("B14"), bf!("B15"), bf!("B16"),
+        bf!("B17"), bf!("B18"), bf!("B19"), bf!("B1A"), bf!("B1B"), bf!("B1C"), bf!("B1D"),
+        bf!("B1E"), bf!("B1F"),
+    ];
+    &BITS
+}
 
-static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
+static MBBO_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Long,
@@ -140,86 +160,6 @@ static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
-        name: "B0",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B1",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B2",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B3",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B4",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B5",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B6",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B7",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B8",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B9",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BA",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BB",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BC",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BD",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BE",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BF",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
         name: "SIMM",
         dbf_type: DbFieldType::Short,
         read_only: false,
@@ -241,13 +181,23 @@ static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+fn mbbo_direct_fields() -> &'static [FieldDesc] {
+    use std::sync::OnceLock;
+    static ALL: OnceLock<Vec<FieldDesc>> = OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut v: Vec<FieldDesc> = MBBO_DIRECT_HEAD_FIELDS.to_vec();
+        v.extend_from_slice(bit_field_descs());
+        v
+    })
+}
+
 impl Record for MbboDirectRecord {
     fn record_type(&self) -> &'static str {
         "mbboDirect"
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {
-        MBBO_DIRECT_FIELDS
+        mbbo_direct_fields()
     }
 
     // C recMbboDirect.c IVOA=set_to_IVOV: val = ivov; rval = ivov.
@@ -263,7 +213,9 @@ impl Record for MbboDirectRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            if self.mask == 0 && self.nobt > 0 && self.nobt <= 16 {
+            // C `mbboDirectRecord.c::init_record` — MASK from NOBT,
+            // NOBT may span 1..32 (NUM_BITS 32).
+            if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as i32;
             }
             self.mlst = self.val;
@@ -279,8 +231,6 @@ impl Record for MbboDirectRecord {
     /// with no VAL set (UDF=true) but the operator populated B0..B1F
     /// bits in the .db file, fold those bits into VAL and clear UDF.
     /// Otherwise (VAL was set explicitly), derive bits from VAL.
-    /// The C code did this in init_record after `dset->init_record`.
-    /// In Rust the framework invokes us via the trait hook.
     fn post_init_finalize_undef(&mut self, common_udf: &mut bool) -> CaResult<()> {
         if !*common_udf {
             self.val_to_bits();
@@ -296,6 +246,7 @@ impl Record for MbboDirectRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if !self.skip_convert {
+            // C `mbboDirectRecord.c::convert` — RVAL = VAL << SHFT only.
             let mut raw = self.val as i32;
             if self.shft > 0 {
                 raw = (raw as u32).wrapping_shl(self.shft as u32) as i32;
@@ -306,8 +257,11 @@ impl Record for MbboDirectRecord {
             self.rval = raw;
         }
         self.skip_convert = false;
+        // C `mbboDirectRecord.c` — RBV is updated ONLY by device support
+        // (the hardware read-back); record support never assigns it.
+        // Forcing `RBV = RVAL` here would mask hardware disagreement,
+        // so we only roll `orbv` forward and leave `rbv` untouched.
         self.orbv = self.rbv;
-        self.rbv = self.rval;
         self.oraw = self.rval;
         Ok(ProcessOutcome::complete())
     }
@@ -354,6 +308,13 @@ impl Record for MbboDirectRecord {
                     self.rval = v;
                 } else {
                     return Err(CaError::TypeMismatch("RVAL".into()));
+                }
+            }
+            "RBV" => {
+                if let EpicsValue::Long(v) = value {
+                    self.rbv = v;
+                } else {
+                    return Err(CaError::TypeMismatch("RBV".into()));
                 }
             }
             "MASK" => {

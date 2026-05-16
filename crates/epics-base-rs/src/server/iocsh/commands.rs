@@ -18,6 +18,7 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_dbgrep());
     registry.register(cmd_scanppl());
     registry.register(cmd_post_event());
+    registry.register(cmd_post_event_alias());
     registry.register(cmd_ioc_stats());
     registry.register(cmd_db_load_records());
     registry.register(cmd_db_create_record());
@@ -29,6 +30,13 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     registry.register(cmd_ioc_init());
     registry.register(cmd_after_ioc_running());
     registry.register(cmd_exit());
+
+    // H-5: core iocsh commands (echo, date, cd/pwd, epicsEnv*, ...)
+    // and the access-security `as*` family. Without these a stock
+    // `st.cmd` errors on the first unknown command and access
+    // security cannot be loaded from the shell.
+    super::core_commands::register(registry);
+    super::access_commands::register(registry);
 }
 
 /// `afterIocRunning <command>` — queue an iocsh command line to run
@@ -416,11 +424,12 @@ fn cmd_dbpr() -> CommandDef {
     )
 }
 
-/// Shared handler used by `dbsr`, `dbglob`, and `dbgrep`. Mirrors
-/// epics-base PR #626 (rename `dbgrep` → `dbglob` with alias) and
-/// PR #613 (add fields argument). The `fields` argument is comma-
+/// Shared handler for the record-name glob search `dbglob` / `dbgrep`.
+/// Mirrors epics-base PR #626 (rename `dbgrep` → `dbglob` with alias)
+/// and PR #613 (add fields argument). The `fields` argument is comma-
 /// separated; when present each matching record additionally dumps
-/// the listed field values.
+/// the listed field values. (H-6: `dbsr` is the *server report* — a
+/// separate command — not this name search.)
 fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     let pattern = args
         .first()
@@ -484,24 +493,41 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     Ok(CommandOutcome::Continue)
 }
 
+/// `dbsr [interest level]` — Database Server Report.
+///
+/// H-6: C `dbIocRegister.c:142-144` registers `dbsr` as the *Database
+/// Server Report* (`dbServerReport` — prints CA/PVA server status and
+/// connected-client information). The Rust port previously aliased
+/// `dbsr` to the record-name glob search, which is the wrong command
+/// (`dbgrep`/`dbglob` is the name search — kept below).
+///
+/// This crate has no live CA-server client registry reachable from the
+/// iocsh `CommandContext` (only `PvDatabase`), so the connected-client
+/// detail a C `dbsr` prints is unavailable here. The report covers what
+/// the database server *can* expose: the channel population it serves.
 fn cmd_dbsr() -> CommandDef {
     CommandDef::new(
         "dbsr",
-        vec![
-            ArgDesc {
-                name: "pattern",
-                arg_type: ArgType::String,
-                optional: true,
-            },
-            ArgDesc {
-                name: "fields",
-                arg_type: ArgType::String,
-                optional: true,
-            },
-        ],
-        "dbsr [pattern] [fields] — Search records by name pattern; \
-         optional comma-separated fields list dumps each value",
-        dbsr_handler,
+        vec![ArgDesc {
+            name: "interest level",
+            arg_type: ArgType::Int,
+            optional: true,
+        }],
+        "dbsr [interest level] — Database Server Report (served-channel statistics)",
+        |_args: &[ArgValue], ctx: &CommandContext| {
+            let records = ctx.block_on(ctx.db().all_record_names());
+            let aliases = ctx.block_on(ctx.db().all_alias_names());
+            let simple = ctx.block_on(ctx.db().all_simple_pv_names());
+            ctx.println("Database Server Report");
+            ctx.println(&format!("  Records served:     {}", records.len()));
+            ctx.println(&format!("  Record aliases:     {}", aliases.len()));
+            ctx.println(&format!("  Simple PVs served:  {}", simple.len()));
+            ctx.println(&format!(
+                "  Total channels:     {}",
+                records.len() + aliases.len() + simple.len()
+            ));
+            Ok(CommandOutcome::Continue)
+        },
     )
 }
 
@@ -520,7 +546,8 @@ fn cmd_dbglob() -> CommandDef {
                 optional: true,
             },
         ],
-        "dbglob [pattern] [fields] — Alias of dbsr (epics-base PR #626)",
+        "dbglob [pattern] [fields] — Search records by name pattern \
+         (epics-base PR #626; `?` matches 0-or-1 chars)",
         dbsr_handler,
     )
 }
@@ -540,7 +567,8 @@ fn cmd_dbgrep() -> CommandDef {
                 optional: true,
             },
         ],
-        "dbgrep [pattern] [fields] — Legacy alias retained per epics-base PR #626",
+        "dbgrep [pattern] [fields] — Search records by name pattern \
+         (legacy spelling of dbglob, epics-base PR #626)",
         dbsr_handler,
     )
 }
@@ -733,17 +761,44 @@ fn cmd_db_create_record() -> CommandDef {
     )
 }
 
+/// `postEvent [event]` — process records scanned on a software event.
+///
+/// L-2: C `dbIocRegister.c` registers this command as `postEvent`
+/// (camelCase); the Rust port previously registered the documented
+/// name with an underscore (`post_event`), so an `st.cmd` calling the
+/// real name hit "unknown command". Both spellings are registered now
+/// — `postEvent` is the canonical C name, `post_event` is kept as a
+/// back-compat alias for any existing Rust-side scripts.
 fn cmd_post_event() -> CommandDef {
     CommandDef::new(
-        "post_event",
-        vec![],
-        "post_event — Process all records with SCAN=Event",
-        |_args: &[ArgValue], ctx: &CommandContext| {
-            ctx.block_on(ctx.db().post_event());
-            ctx.println("Event scan processed");
-            Ok(CommandOutcome::Continue)
-        },
+        "postEvent",
+        vec![ArgDesc {
+            name: "event",
+            arg_type: ArgType::Int,
+            optional: true,
+        }],
+        "postEvent [event] — Process records with SCAN=Event",
+        post_event_handler,
     )
+}
+
+fn cmd_post_event_alias() -> CommandDef {
+    CommandDef::new(
+        "post_event",
+        vec![ArgDesc {
+            name: "event",
+            arg_type: ArgType::Int,
+            optional: true,
+        }],
+        "post_event [event] — Back-compat alias of postEvent",
+        post_event_handler,
+    )
+}
+
+fn post_event_handler(_args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
+    ctx.block_on(ctx.db().post_event());
+    ctx.println("Event scan processed");
+    Ok(CommandOutcome::Continue)
 }
 
 /// Simple glob matching (* and ? wildcards).
@@ -775,7 +830,18 @@ fn glob_match(pattern: &str, text: &str) -> bool {
                     }
                 }
                 '?' => {
+                    // L-1: C `dbglob` documents `?` as matching "0 or
+                    // one characters" (dbIocRegister.c:246-248), not
+                    // exactly one. Try both the skip-zero and
+                    // consume-one branches.
                     pat.next();
+                    {
+                        let mut pat_zero = pat.clone();
+                        let mut txt_zero = txt.clone();
+                        if do_match(&mut pat_zero, &mut txt_zero) {
+                            return true;
+                        }
+                    }
                     if txt.next().is_none() {
                         return false;
                     }

@@ -177,9 +177,14 @@ impl MotorRecord {
                 });
             }
             CommandSource::Cnen => {
-                effects.commands.push(MotorCommand::SetClosedLoop {
-                    enable: self.ctrl.cnen,
-                });
+                // C: case motorRecordCNEN — only drives ENABLE/DISABL_TORQUE
+                // when the controller reports gain support (MSTA bit
+                // GAIN_SUPPORT). Drivers without it would reject the command.
+                if self.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
+                    effects.commands.push(MotorCommand::SetClosedLoop {
+                        enable: self.ctrl.cnen,
+                    });
+                }
             }
             CommandSource::PcoEnable => {
                 // C: 05b25c1d (PR #248) — push the latched PCO configuration

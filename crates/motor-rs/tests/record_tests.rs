@@ -583,8 +583,9 @@ fn test_hls_blocks_forward_jog() {
 }
 
 #[test]
-fn test_cnen_emits_set_closed_loop() {
+fn test_cnen_emits_set_closed_loop_with_gain_support() {
     let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::GAIN_SUPPORT; // controller supports gain
     rec.ctrl.cnen = true;
     let effects = rec.plan_motion(CommandSource::Cnen);
     assert_eq!(effects.commands.len(), 1);
@@ -595,8 +596,9 @@ fn test_cnen_emits_set_closed_loop() {
 }
 
 #[test]
-fn test_cnen_false_emits_disable() {
+fn test_cnen_false_emits_disable_with_gain_support() {
     let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::GAIN_SUPPORT;
     rec.ctrl.cnen = false;
     let effects = rec.plan_motion(CommandSource::Cnen);
     assert_eq!(effects.commands.len(), 1);
@@ -604,6 +606,23 @@ fn test_cnen_false_emits_disable() {
         effects.commands[0],
         MotorCommand::SetClosedLoop { enable: false }
     ));
+}
+
+#[test]
+fn test_cnen_no_command_without_gain_support() {
+    // C: case motorRecordCNEN drives the torque command only when MSTA
+    // reports gain support. A driver without it gets nothing.
+    let mut rec = MotorRecord::new();
+    assert!(!rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT));
+    rec.ctrl.cnen = true;
+    let effects = rec.plan_motion(CommandSource::Cnen);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetClosedLoop { .. })),
+        "no SetClosedLoop without GAIN_SUPPORT"
+    );
 }
 
 #[test]

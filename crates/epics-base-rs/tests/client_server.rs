@@ -50,10 +50,16 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
             None, // audit
             drain,
             None, // stats: not asserted in this test
-            #[cfg(feature = "ca-experimental-rust-tls")]
-            None, // tls
-            #[cfg(feature = "ca-cap-tokens")]
-            None, // cap_token_verifier
+            // NOTE: `run_tcp_listener`'s `tls` and `cap_token_verifier`
+            // params are `#[cfg]`-gated on `epics-ca-rs`'s own
+            // `experimental-rust-tls` / `cap-tokens` features. `epics-ca-rs`
+            // is a *dev-dependency* here (`path`, no `version`, so
+            // `cargo publish` strips it) and a real feature passthrough
+            // (`["epics-ca-rs/experimental-rust-tls"]`) is therefore not
+            // possible — dev-deps are stripped before feature resolution.
+            // Consequently those `epics-ca-rs` features are never active in
+            // any `epics-base-rs` build, so the function always exposes
+            // exactly 10 parameters from this crate's point of view.
         )
         .await;
     });

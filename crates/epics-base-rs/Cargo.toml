@@ -40,18 +40,7 @@ tempfile = "3"
 serial_test = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
-# Empty mirror features so the integration test can cfg-gate the
-# extra arguments `epics_ca_rs::server::tcp::run_tcp_listener` exposes
-# under the matching `epics-ca-rs/*` features. The features are
-# *empty* — they don't activate anything in `epics-ca-rs`, they just
-# track the workspace activation state. Under `--all-features` they
-# both flip on (alongside the dev-dep features); under default
-# features both stay off. We avoided a real dev-dep passthrough
-# (e.g. `["epics-ca-rs/experimental-rust-tls"]`) because that breaks
-# `cargo publish` — dev-deps are stripped before feature parsing.
 [features]
-ca-experimental-rust-tls = []
-ca-cap-tokens = []
 # Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::
 # PriorityInheritanceMutex` to a `pthread_mutex_t` configured with
 # `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on

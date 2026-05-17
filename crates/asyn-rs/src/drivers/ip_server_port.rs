@@ -757,7 +757,14 @@ impl DrvAsynIPServerPort {
             }
             Ok(n) => Ok(OctetReadResult {
                 nbytes_transferred: n,
-                eom_reason: EomReason::empty(),
+                // C parity: CNT only when the requested count was
+                // reached; a short read leaves the reason empty so the
+                // EOS interpose keeps reading.
+                eom_reason: if n >= buf.len() {
+                    EomReason::CNT
+                } else {
+                    EomReason::empty()
+                },
             }),
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock

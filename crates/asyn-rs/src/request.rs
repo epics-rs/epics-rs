@@ -107,6 +107,12 @@ pub enum RequestOp {
     GetBoundsInt32,
     /// Query int64 bounds (low, high).
     GetBoundsInt64,
+    /// Query whether the port is currently enabled. C parity:
+    /// `pasynManager->isEnabled` (`asynManager.c`).
+    GetEnable,
+    /// Query whether auto-connect is enabled for the port. C parity:
+    /// `pasynManager->isAutoConnect` (`asynManager.c`).
+    GetAutoConnect,
     /// Block the port: only this user's requests will be dequeued until unblocked.
     BlockProcess,
     /// Unblock the port.

@@ -732,6 +732,20 @@ impl PortHandle {
             message: "get_bounds returned no bounds".into(),
         })
     }
+
+    // --- Port-state query convenience methods ---
+
+    /// Query whether the port is currently enabled (blocking).
+    pub fn is_enabled_blocking(&self) -> AsynResult<bool> {
+        let result = self.submit_blocking(RequestOp::GetEnable, AsynUser::new(0))?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
+
+    /// Query whether auto-connect is enabled for the port (blocking).
+    pub fn is_auto_connect_blocking(&self) -> AsynResult<bool> {
+        let result = self.submit_blocking(RequestOp::GetAutoConnect, AsynUser::new(0))?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
 }
 
 #[cfg(test)]

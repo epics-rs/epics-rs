@@ -63,19 +63,39 @@ impl SyncIOHandle {
     }
 
     pub fn read_int32(&self, reason: usize) -> AsynResult<i32> {
-        self.handle.read_int32_blocking(reason, self.addr)
+        // Build the user via `self.user` so the configured timeout is
+        // honored — the `*_blocking` shortcuts hard-code the 1s default.
+        let result = self
+            .handle
+            .submit_blocking(RequestOp::Int32Read, self.user(reason))?;
+        result.int_val.ok_or_else(|| crate::error::AsynError::Status {
+            status: crate::error::AsynStatus::Error,
+            message: "int32 read returned no value".into(),
+        })
     }
 
     pub fn write_int32(&self, reason: usize, value: i32) -> AsynResult<()> {
-        self.handle.write_int32_blocking(reason, self.addr, value)
+        self.handle
+            .submit_blocking(RequestOp::Int32Write { value }, self.user(reason))?;
+        Ok(())
     }
 
     pub fn read_float64(&self, reason: usize) -> AsynResult<f64> {
-        self.handle.read_float64_blocking(reason, self.addr)
+        let result = self
+            .handle
+            .submit_blocking(RequestOp::Float64Read, self.user(reason))?;
+        result
+            .float_val
+            .ok_or_else(|| crate::error::AsynError::Status {
+                status: crate::error::AsynStatus::Error,
+                message: "float64 read returned no value".into(),
+            })
     }
 
     pub fn write_float64(&self, reason: usize, value: f64) -> AsynResult<()> {
-        self.handle.write_float64_blocking(reason, self.addr, value)
+        self.handle
+            .submit_blocking(RequestOp::Float64Write { value }, self.user(reason))?;
+        Ok(())
     }
 
     pub fn read_octet(&self, reason: usize, buf_size: usize) -> AsynResult<Vec<u8>> {

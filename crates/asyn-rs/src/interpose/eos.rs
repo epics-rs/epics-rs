@@ -93,6 +93,14 @@ impl OctetInterpose for EosInterpose {
         }
 
         let maxchars = buf.len();
+        if maxchars == 0 {
+            // A zero-length destination buffer can store nothing — return
+            // here so the scan loop never indexes `buf[0]` and panics.
+            return Ok(OctetReadResult {
+                nbytes_transferred: 0,
+                eom_reason: EomReason::CNT,
+            });
+        }
         let mut n_read: usize = 0;
         let mut eom = EomReason::empty();
 
@@ -108,9 +116,15 @@ impl OctetInterpose for EosInterpose {
                 if c == eos[self.eos_in_match] {
                     self.eos_in_match += 1;
                     if self.eos_in_match == eos.len() {
-                        // Full EOS match — remove EOS bytes from output count
+                        // Full EOS match — remove the EOS bytes from the
+                        // output count. Only the EOS bytes written into
+                        // *this* buffer can be removed: when a 2-byte EOS
+                        // straddles two read() calls, the leading byte was
+                        // already returned to the previous caller, so
+                        // `n_read` here may be smaller than `eos.len()`.
+                        // An unguarded `n_read -= eos.len()` underflows.
                         self.eos_in_match = 0;
-                        n_read -= eos.len();
+                        n_read -= eos.len().min(n_read);
                         eom |= EomReason::EOS;
                         break;
                     }
@@ -275,6 +289,30 @@ mod tests {
 
         let r = interpose.read(&user, &mut buf, &mut base).unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"cmd2");
+        assert!(r.eom_reason.contains(EomReason::EOS));
+    }
+
+    #[test]
+    fn test_two_char_eos_straddling_reads() {
+        // A 2-byte EOS split across two read() calls: the first call
+        // fills the user buffer ending on the EOS's leading byte, the
+        // second completes the match. `n_read -= eos.len()` would
+        // underflow (panic in debug) without the saturating guard.
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![b'\r', b'\n'],
+            output_eos: vec![],
+        });
+        let mut base = MockOctetBase::new(b"AB\r\n");
+        let user = AsynUser::default();
+        let mut buf = [0u8; 3];
+
+        // First read fills the 3-byte buffer with "AB\r" (partial match).
+        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"AB\r");
+
+        // Second read consumes the trailing "\n", completing the EOS.
+        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        assert_eq!(r.nbytes_transferred, 0);
         assert!(r.eom_reason.contains(EomReason::EOS));
     }
 

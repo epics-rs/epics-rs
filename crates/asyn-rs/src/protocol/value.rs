@@ -137,7 +137,10 @@ pub struct Timestamp(pub i64);
 impl From<std::time::SystemTime> for Timestamp {
     fn from(t: std::time::SystemTime) -> Self {
         let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        Self(dur.as_micros() as i64)
+        // Saturate instead of wrapping: `as i64` on an out-of-range u128
+        // would silently produce a negative value that does not round-trip
+        // through the inverse conversion (which clamps negatives to 0).
+        Self(i64::try_from(dur.as_micros()).unwrap_or(i64::MAX))
     }
 }
 

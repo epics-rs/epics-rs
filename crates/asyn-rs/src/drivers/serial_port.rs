@@ -345,7 +345,12 @@ impl OctetNext for SerialIoState {
 
         Ok(OctetReadResult {
             nbytes_transferred: n as usize,
-            eom_reason: EomReason::CNT,
+            // C parity: CNT only when the requested count was reached.
+            eom_reason: if n as usize >= buf.len() {
+                EomReason::CNT
+            } else {
+                EomReason::empty()
+            },
         })
     }
 
@@ -525,25 +530,41 @@ impl PortDriver for DrvAsynSerialPort {
         }
         self.io.fd = Some(fd);
 
-        // 2. Save original termios
-        let saved = self.get_current_termios()?;
-        self.saved_termios = Some(saved);
+        // Steps 2-4 configure the just-opened fd. Any failure here must
+        // close the fd: `base.connected` is still false, so the `Drop`
+        // impl would skip `disconnect()` and leak the descriptor.
+        let setup = (|| -> AsynResult<()> {
+            // 2. Save original termios
+            let saved = self.get_current_termios()?;
+            self.saved_termios = Some(saved);
 
-        // 3. Configure: cfmakeraw + apply config
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
-        unsafe { libc::cfmakeraw(&mut t) };
-        // Enable receiver, local mode
-        t.c_cflag |= libc::CREAD | libc::CLOCAL;
-        // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte
-        t.c_cc[libc::VMIN] = 1;
-        t.c_cc[libc::VTIME] = 0;
-        self.config.apply_to_termios(&mut t);
-        self.apply_termios(&t)?;
+            // 3. Configure: cfmakeraw + apply config
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            unsafe { libc::cfmakeraw(&mut t) };
+            // Enable receiver, local mode
+            t.c_cflag |= libc::CREAD | libc::CLOCAL;
+            // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte
+            t.c_cc[libc::VMIN] = 1;
+            t.c_cc[libc::VTIME] = 0;
+            self.config.apply_to_termios(&mut t);
+            self.apply_termios(&t)?;
 
-        // 4. Restore blocking mode
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags >= 0 {
-            unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+            // 4. Restore blocking mode
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 {
+                return Err(AsynError::Io(std::io::Error::last_os_error()));
+            }
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+                return Err(AsynError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        })();
+        if let Err(e) = setup {
+            if let Some(fd) = self.io.fd.take() {
+                unsafe { libc::close(fd) };
+            }
+            self.saved_termios = None;
+            return Err(e);
         }
 
         self.base.set_connected(true);
@@ -803,7 +824,10 @@ impl PortDriver for DrvAsynSerialPort {
                     let duration = if value.is_empty() || value == "on" {
                         0 // standard break duration
                     } else {
-                        value.parse::<i32>().unwrap_or(0)
+                        value.parse::<i32>().map_err(|_| AsynError::Status {
+                            status: AsynStatus::Error,
+                            message: format!("invalid break duration: '{value}'"),
+                        })?
                     };
                     let ret = unsafe { libc::tcsendbreak(fd, duration) };
                     if ret < 0 {

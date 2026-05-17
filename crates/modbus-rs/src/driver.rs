@@ -180,17 +180,16 @@ impl ModbusConfig {
 
     /// Validate the configuration. Mirrors the constructor's length checks.
     ///
-    /// Absolute addressing (`start_address == -1`) is rejected: see
-    /// [`ModbusEngine`] for why this port does not implement that mode.
+    /// Absolute addressing (`start_address == -1`) is accepted: in that mode
+    /// `length` sizes the per-record scratch buffer rather than a polled
+    /// block, and every record issues an individual Modbus request to its own
+    /// absolute wire address. See [`ModbusEngine`] for the I/O paths.
     pub fn validate(&self) -> ModbusResult<()> {
         if self.length == 0 {
             return Err(ModbusError::InvalidFunction(0));
         }
         if self.length > self.function.max_length() {
             return Err(ModbusError::FrameTooLarge(self.length));
-        }
-        if self.absolute_addressing() {
-            return Err(ModbusError::AbsoluteAddressingUnsupported);
         }
         Ok(())
     }
@@ -266,17 +265,19 @@ pub trait OctetTransport: Send + Sync {
 /// The Modbus driver engine: request construction, the write/read cycle,
 /// response parsing, and the in-memory register buffer.
 ///
-/// # Absolute addressing is not supported
+/// # Relative vs. absolute addressing
 ///
-/// The C `drvModbusAsyn` accepts `modbusStartAddress == -1` ("absolute
-/// addressing"), under which the poller is disabled and every record issues
-/// an individual Modbus request to its own absolute wire address with a
-/// per-record length carried in `pasynUser->drvUser`. This engine is built
-/// around a single contiguous [`data`](Self::data) buffer of `config.length`
-/// words, polled in one request — there is no per-record I/O path and no
-/// `drvUser` length struct (see the `ioc` module docs). Implementing absolute
-/// mode is a structural addition beyond a bounds fix, so it is rejected at
-/// configuration time by [`ModbusConfig::validate`].
+/// In the default *relative* mode the engine owns a single contiguous
+/// [`data`](Self::data) buffer of `config.length` words and [`poll`](Self::poll)
+/// refreshes the whole block in one Modbus request from `config.start_address`.
+///
+/// When `config.start_address == -1` the C `drvModbusAsyn` selects *absolute*
+/// addressing: the poller is disabled and every record issues an individual
+/// Modbus request to its own absolute wire address with a per-record length
+/// (drvModbusAsyn.cpp:204-206, 1121, and the per-accessor `absoluteAddressing_`
+/// branches). [`read_absolute`](Self::read_absolute) and
+/// [`write_absolute`](Self::write_absolute) are that per-record I/O path; the
+/// `data` buffer is then unused for polling and serves only as scratch sizing.
 pub struct ModbusEngine {
     config: ModbusConfig,
     framer: ModbusFramer,
@@ -319,17 +320,20 @@ impl ModbusEngine {
     }
 
     /// Validate a register/coil offset against the configured range. Port of
-    /// `checkOffset`.
+    /// `checkOffset` (drvModbusAsyn.cpp:2395-2404).
     ///
-    /// The offset must be a valid index into the [`data`](Self::data) buffer,
-    /// i.e. `0 <= offset < config.length`. Absolute addressing — where the C
-    /// `checkOffset` would instead allow any `offset <= 65535` — is rejected
-    /// at configuration time ([`ModbusConfig::validate`]), so the engine here
-    /// always indexes the contiguous `length`-word buffer. Enforcing the
-    /// buffer bound here keeps every `ioc`-layer accessor from indexing out of
-    /// bounds.
+    /// In relative mode the offset must be a valid index into the
+    /// [`data`](Self::data) buffer, i.e. `0 <= offset < config.length`. In
+    /// absolute mode (`config.start_address == -1`) the offset *is* the
+    /// absolute Modbus wire address, so the C check instead allows any
+    /// `0 <= offset <= 65535` — the addressable 16-bit Modbus range.
     pub fn check_offset(&self, offset: i32) -> ModbusResult<()> {
-        if offset >= 0 && (offset as usize) < self.config.length {
+        let ok = if self.config.absolute_addressing() {
+            (0..=0xFFFF).contains(&offset)
+        } else {
+            offset >= 0 && (offset as usize) < self.config.length
+        };
+        if ok {
             Ok(())
         } else {
             Err(ModbusError::OffsetOutOfRange {
@@ -574,7 +578,15 @@ impl ModbusEngine {
     /// configured start address into the buffer and report whether any word
     /// changed since the previous poll. Port of the data-acquisition half of
     /// `readPoller` (the interrupt fan-out lives in the `ioc` module).
+    ///
+    /// Not valid in absolute-addressing mode: the C `readPoller` thread is
+    /// never started for an absolute port (`if (absoluteAddressing_)
+    /// needReadThread = 0;`, drvModbusAsyn.cpp:1121). Use
+    /// [`read_absolute`](Self::read_absolute) for per-record I/O instead.
     pub fn poll(&mut self, transport: &mut dyn OctetTransport) -> ModbusResult<bool> {
+        if self.config.absolute_addressing() {
+            return Err(ModbusError::PollNotValidInAbsoluteMode);
+        }
         if !self.config.function.is_read() {
             return Err(ModbusError::InvalidFunction(0));
         }
@@ -585,6 +597,62 @@ impl ModbusEngine {
         let changed = self.data != self.prev_data;
         self.prev_data.copy_from_slice(&self.data);
         Ok(changed)
+    }
+
+    /// Issue one individual Modbus read at the absolute wire address `addr`
+    /// and return the `count` words read.
+    ///
+    /// This is the absolute-addressing read path: where relative-mode records
+    /// index the polled [`data`](Self::data) buffer, an absolute-mode record
+    /// reads its own wire address on every access. Port of the
+    /// `absoluteAddressing_` branch shared by `readInt32` / `readInt64` /
+    /// `readFloat64` / `readUInt32Digital` / `readOctet` / `readInt32Array` /
+    /// `readFloat64Array` (e.g. drvModbusAsyn.cpp:672-679): each does
+    /// `doModbusIO(slave, modbusFunction, offset, data_, len)` with `offset`
+    /// the absolute address.
+    ///
+    /// `function` is resolved by the caller (`ioc` layer) the way C
+    /// `checkModbusFunction` does — the read function for a read port, or the
+    /// write port's `readOnceFunction`. `count` is the per-record length,
+    /// clamped to `config.length` so it can never exceed the scratch buffer
+    /// or the protocol read limit established by [`ModbusConfig::validate`].
+    pub fn read_absolute(
+        &mut self,
+        transport: &mut dyn OctetTransport,
+        function: ModbusFunctionCode,
+        addr: i32,
+        count: usize,
+    ) -> ModbusResult<Vec<u16>> {
+        if !function.is_read() {
+            return Err(ModbusError::InvalidFunction(0));
+        }
+        self.check_offset(addr)?;
+        let len = count.min(self.config.length).max(1);
+        self.do_modbus_io(transport, function, addr as u16, &[], len)
+    }
+
+    /// Issue one individual Modbus write of `data` at the absolute wire
+    /// address `addr`.
+    ///
+    /// The absolute-addressing write path. Port of the `absoluteAddressing_`
+    /// branch shared by `writeInt32` / `writeInt64` / `writeFloat64` /
+    /// `writeUInt32Digital` / `writeOctet` / `writeInt32Array` /
+    /// `writeFloat64Array` (e.g. drvModbusAsyn.cpp:751-753): each sets
+    /// `modbusAddress = offset` and calls `doModbusIO` at that absolute
+    /// address. The configured write `function` is used directly.
+    pub fn write_absolute(
+        &mut self,
+        transport: &mut dyn OctetTransport,
+        function: ModbusFunctionCode,
+        addr: i32,
+        data: &[u16],
+    ) -> ModbusResult<()> {
+        if !function.is_write() {
+            return Err(ModbusError::InvalidFunction(0));
+        }
+        self.check_offset(addr)?;
+        self.do_modbus_io(transport, function, addr as u16, data, data.len())?;
+        Ok(())
     }
 }
 
@@ -686,33 +754,118 @@ mod tests {
     }
 
     #[test]
-    fn absolute_addressing_is_rejected_at_validation() {
+    fn absolute_addressing_config_is_accepted() {
+        // Absolute addressing (start_address == -1) is a supported mode: the
+        // config validates and the engine builds. `length` then sizes the
+        // per-record scratch buffer rather than a polled block.
         let mut cfg = read_config(ModbusFunctionCode::ReadHoldingRegisters, 10);
         cfg.start_address = -1;
         assert!(cfg.absolute_addressing());
-        assert!(matches!(
-            cfg.validate(),
-            Err(ModbusError::AbsoluteAddressingUnsupported)
-        ));
-        // The engine constructor must surface the same rejection.
-        assert!(matches!(
-            ModbusEngine::new(cfg, LinkType::Tcp),
-            Err(ModbusError::AbsoluteAddressingUnsupported)
-        ));
+        assert!(cfg.validate().is_ok());
+        let engine = ModbusEngine::new(cfg, LinkType::Tcp).expect("absolute config must build");
+        assert!(engine.config().absolute_addressing());
     }
 
     #[test]
-    fn check_offset_rejects_beyond_buffer_length() {
+    fn check_offset_rejects_beyond_buffer_length_in_relative_mode() {
         let engine = ModbusEngine::new(
             read_config(ModbusFunctionCode::ReadHoldingRegisters, 4),
             LinkType::Tcp,
         )
         .unwrap();
-        // An offset past the contiguous buffer must be a clean error, never a
-        // panic source for the ioc-layer accessors.
+        // Relative mode: an offset past the contiguous buffer must be a clean
+        // error, never a panic source for the ioc-layer accessors.
         assert!(engine.check_offset(4).is_err());
         assert!(engine.check_offset(70_000).is_err());
         assert_eq!(engine.data().len(), 4);
+    }
+
+    #[test]
+    fn check_offset_absolute_allows_full_wire_range() {
+        // Absolute mode: `checkOffset` allows any 0..=65535 wire address
+        // regardless of the scratch buffer length (drvModbusAsyn.cpp:2398).
+        let mut cfg = read_config(ModbusFunctionCode::ReadHoldingRegisters, 4);
+        cfg.start_address = -1;
+        let engine = ModbusEngine::new(cfg, LinkType::Tcp).unwrap();
+        assert!(engine.check_offset(0).is_ok());
+        assert!(engine.check_offset(4).is_ok());
+        assert!(engine.check_offset(40_000).is_ok());
+        assert!(engine.check_offset(65_535).is_ok());
+        // Outside the 16-bit wire range, and negative, still rejected.
+        assert!(engine.check_offset(65_536).is_err());
+        assert!(engine.check_offset(-1).is_err());
+    }
+
+    #[test]
+    fn read_absolute_issues_request_at_wire_address() {
+        // Absolute mode read: one individual Modbus request at the wire
+        // address, decoding `count` words from the response.
+        let mut cfg = read_config(ModbusFunctionCode::ReadHoldingRegisters, 4);
+        cfg.start_address = -1;
+        let mut engine = ModbusEngine::new(cfg, LinkType::Tcp).unwrap();
+        // Response PDU: fc 0x03, byte_count 4, two registers 0x1111 0x2222.
+        let resp_pdu = [0x01u8, 0x03, 0x04, 0x11, 0x11, 0x22, 0x22];
+        let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
+        let words = engine
+            .read_absolute(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0x4000,
+                2,
+            )
+            .unwrap();
+        assert_eq!(words, vec![0x1111, 0x2222]);
+        // The request must address the absolute wire address 0x4000, not 0.
+        // The framed TCP message is the 6-byte MBAP header followed by the
+        // bare PDU `[slave, fcode, addr_hi, addr_lo, …]`.
+        assert_eq!(
+            transport.written[0][6..10],
+            [0x01, 0x03, 0x40, 0x00],
+            "absolute read must target the wire address"
+        );
+        assert_eq!(engine.stats.read_ok, 1);
+    }
+
+    #[test]
+    fn write_absolute_issues_request_at_wire_address() {
+        // Absolute mode write: one individual Modbus request at the wire
+        // address carrying the record's data.
+        let mut cfg = read_config(ModbusFunctionCode::WriteSingleRegister, 4);
+        cfg.start_address = -1;
+        let mut engine = ModbusEngine::new(cfg, LinkType::Tcp).unwrap();
+        // Write-single response echoes the address + value.
+        let resp_pdu = [0x01u8, 0x06, 0x12, 0x34, 0xAB, 0xCD];
+        let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
+        engine
+            .write_absolute(
+                &mut transport,
+                ModbusFunctionCode::WriteSingleRegister,
+                0x1234,
+                &[0xABCD],
+            )
+            .unwrap();
+        // 6-byte MBAP header, then the bare write PDU.
+        assert_eq!(
+            transport.written[0][6..12],
+            [0x01, 0x06, 0x12, 0x34, 0xAB, 0xCD],
+            "absolute write must target the wire address"
+        );
+        assert_eq!(engine.stats.write_ok, 1);
+    }
+
+    #[test]
+    fn poll_rejected_in_absolute_mode() {
+        // The C readPoller thread is never started for an absolute port
+        // (drvModbusAsyn.cpp:1121); `poll` must refuse rather than read a
+        // block that has no meaning in absolute mode.
+        let mut cfg = read_config(ModbusFunctionCode::ReadHoldingRegisters, 4);
+        cfg.start_address = -1;
+        let mut engine = ModbusEngine::new(cfg, LinkType::Tcp).unwrap();
+        let mut transport = MockTransport::new(vec![]);
+        assert!(matches!(
+            engine.poll(&mut transport),
+            Err(ModbusError::PollNotValidInAbsoluteMode)
+        ));
     }
 
     #[test]

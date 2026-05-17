@@ -16,6 +16,18 @@
 //! `{dataType, len}` struct has no asyn-rs equivalent: the data type is
 //! encoded in the reason and the optional `=N` string length is dropped — a
 //! string record's length comes from its own record buffer (`NELM`).
+//!
+//! # Absolute addressing
+//!
+//! When the port is configured with `modbusStartAddress == -1` the driver is
+//! in *absolute* addressing mode. The C `drvModbusAsyn` then disables the
+//! read poller and every record issues an individual Modbus request to its
+//! own absolute wire address (the asyn `addr`) with a per-record length.
+//! [`ModbusPortDriver`] mirrors this: each accessor branches on
+//! [`ModbusConfig::absolute_addressing`] and, in absolute mode, calls
+//! [`ModbusEngine::read_absolute`] / [`ModbusEngine::write_absolute`] instead
+//! of indexing the polled buffer; `poll_cycle` is a no-op and the periodic
+//! poller is not spawned.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -257,10 +269,66 @@ impl ModbusPortDriver {
         (self.engine.config().start_address.max(0) + offset) as u16
     }
 
+    /// Whether the port is configured for absolute addressing.
+    fn is_absolute(&self) -> bool {
+        self.engine.config().absolute_addressing()
+    }
+
+    /// The Modbus function an absolute-mode *read* must issue. Port of
+    /// `checkModbusFunction` (drvModbusAsyn.cpp:2406-2412): a read port uses
+    /// its own function; a write port uses its `readOnceFunction`. A write
+    /// port with no poll delay has no defined readback function — C returns
+    /// `asynError`, mirrored here.
+    fn absolute_read_function(&self) -> AsynResult<ModbusFunctionCode> {
+        let cfg = self.engine.config();
+        if cfg.function.is_read() {
+            return Ok(cfg.function);
+        }
+        if cfg.poll_delay.is_zero() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "absolute-mode readback needs a non-zero poll delay".into(),
+            });
+        }
+        cfg.function
+            .readonce_function()
+            .ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "Modbus function {:?} has no readback function",
+                    cfg.function
+                ),
+            })
+    }
+
+    /// Absolute-mode per-record read: issue one Modbus request at the wire
+    /// address `addr` and return `count` words. Port of the
+    /// `absoluteAddressing_` read branch shared by every read accessor.
+    fn read_absolute_words(&mut self, addr: i32, count: usize) -> AsynResult<Vec<u16>> {
+        let function = self.absolute_read_function()?;
+        self.engine
+            .read_absolute(self.transport.as_mut(), function, addr, count)
+            .map_err(to_asyn)
+    }
+
+    /// Absolute-mode per-record write: issue one Modbus request carrying
+    /// `regs` at the wire address `addr` with the configured write function.
+    fn write_absolute_regs(&mut self, addr: i32, regs: &[u16]) -> AsynResult<()> {
+        let function = self.engine.config().function;
+        self.engine
+            .write_absolute(self.transport.as_mut(), function, addr, regs)
+            .map_err(to_asyn)
+    }
+
     /// One acquisition cycle: read all registers, refresh every touched
     /// record's parameter and fire its I/O Intr callbacks, then publish the
     /// statistics counters. Port of the data half of `readPoller`.
     fn poll_cycle(&mut self) -> AsynResult<()> {
+        // Absolute addressing has no periodic poller (drvModbusAsyn.cpp:1121):
+        // each record reads its own wire address on access. Nothing to do.
+        if self.is_absolute() {
+            return Ok(());
+        }
         if !self.engine.config().function.is_read() {
             return Ok(());
         }
@@ -329,8 +397,17 @@ impl ModbusPortDriver {
     }
 
     /// Flush a freshly-converted set of registers to the slave with the
-    /// configured write function, staging them in the engine buffer too.
+    /// configured write function.
+    ///
+    /// In relative mode the registers are also staged into the engine buffer
+    /// at `offset` so a subsequent cached read reflects the write. In absolute
+    /// mode the request targets `offset` as the wire address directly and
+    /// nothing is staged — the buffer is only `config.length` words and the
+    /// wire address can lie far outside it.
     fn flush_write(&mut self, offset: i32, regs: &[u16]) -> AsynResult<()> {
+        if self.is_absolute() {
+            return self.write_absolute_regs(offset, regs);
+        }
         let function = self.engine.config().function;
         let addr = self.modbus_address(offset);
         self.engine
@@ -343,6 +420,23 @@ impl ModbusPortDriver {
             }
         }
         Ok(())
+    }
+
+    /// After a successful write, stage the value into the parameter cache and
+    /// fan its monitor out.
+    ///
+    /// Relative mode only: the parameter library is sized to `config.length`
+    /// addresses and feeds the poller's I/O-Intr callbacks. In absolute mode
+    /// the asyn `addr` is a Modbus wire address (up to 65535) unrelated to the
+    /// parameter table, and there is no poller fan-out — C `writeInt32` in
+    /// absolute mode likewise does no parameter callback. So this is a no-op
+    /// in absolute mode.
+    fn cache_write_numeric(&mut self, user: &AsynUser, value: f64) -> AsynResult<()> {
+        if self.is_absolute() {
+            return Ok(());
+        }
+        self.base.set_float64_param(user.reason, user.addr, value)?;
+        self.base.call_param_callbacks(user.addr)
     }
 }
 
@@ -373,6 +467,12 @@ impl PortDriver for ModbusPortDriver {
             return self.base.get_int32_param(user.reason, user.addr);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        // Absolute mode: read this record's own wire address now (the C
+        // `absoluteAddressing_` branch issues an individual `doModbusIO`).
+        if self.is_absolute() {
+            let regs = self.read_absolute_words(user.addr, dt.register_count().max(1))?;
+            return Ok(datatype::read_int32(dt, &regs).map_err(to_asyn)?.0);
+        }
         self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_int32(dt, regs).map_err(to_asyn)?.0)
@@ -384,6 +484,10 @@ impl PortDriver for ModbusPortDriver {
             return self.base.get_int64_param(user.reason, user.addr);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        if self.is_absolute() {
+            let regs = self.read_absolute_words(user.addr, dt.register_count().max(1))?;
+            return Ok(datatype::read_int64(dt, &regs).map_err(to_asyn)?.0);
+        }
         self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_int64(dt, regs).map_err(to_asyn)?.0)
@@ -395,6 +499,10 @@ impl PortDriver for ModbusPortDriver {
             return self.base.get_float64_param(user.reason, user.addr);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        if self.is_absolute() {
+            let regs = self.read_absolute_words(user.addr, dt.register_count().max(1))?;
+            return Ok(datatype::read_float(dt, &regs).map_err(to_asyn)?.0);
+        }
         self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_float(dt, regs).map_err(to_asyn)?.0)
@@ -414,6 +522,12 @@ impl PortDriver for ModbusPortDriver {
             return Ok(if mask == 0 { raw } else { raw & mask });
         }
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        if self.is_absolute() {
+            // C `readUInt32Digital` reads `min(1, modbusLength_)` words.
+            let regs = self.read_absolute_words(user.addr, 1)?;
+            let raw = regs.first().copied().unwrap_or(0) as u32;
+            return Ok(if mask == 0 { raw } else { raw & mask });
+        }
         self.touch(user.reason, user.addr);
         let raw = self.engine.data()[user.addr as usize] as u32;
         Ok(if mask == 0 { raw } else { raw & mask })
@@ -422,6 +536,17 @@ impl PortDriver for ModbusPortDriver {
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         let dt = self.datatype_of(user.reason)?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        if self.is_absolute() {
+            // C `readOctet` reads `min(maxChars, modbusLength_)` words at the
+            // wire address; `read_absolute_words` clamps the count to
+            // `config.length`. Each register carries up to two string bytes.
+            let words = buf.len().div_ceil(2).max(1);
+            let regs = self.read_absolute_words(user.addr, words)?;
+            let (bytes, _) = datatype::read_string(dt, &regs, buf.len()).map_err(to_asyn)?;
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            return Ok(n);
+        }
         self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         // String length comes from the record buffer (`NELM`).
@@ -452,6 +577,20 @@ impl PortDriver for ModbusPortDriver {
         // Otherwise a Modbus data array — one element per `register_count`.
         let dt = self.datatype_of(user.reason)?;
         let rc = dt.register_count().max(1);
+        // Absolute mode: C `readInt32Array` reads `modbusLength_` words at the
+        // wire address, then decodes elements from offset 0.
+        if self.is_absolute() {
+            self.engine.check_offset(user.addr).map_err(to_asyn)?;
+            let words = self.read_absolute_words(user.addr, self.engine.config().length)?;
+            let mut n = 0;
+            while n < buf.len() && (n + 1) * rc <= words.len() {
+                buf[n] = datatype::read_int32(dt, &words[n * rc..])
+                    .map_err(to_asyn)?
+                    .0;
+                n += 1;
+            }
+            return Ok(n);
+        }
         let data = self.engine.data();
         let mut n = 0;
         while n < buf.len() && (user.addr as usize + (n + 1) * rc) <= data.len() {
@@ -465,6 +604,20 @@ impl PortDriver for ModbusPortDriver {
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
         let dt = self.datatype_of(user.reason)?;
         let rc = dt.register_count().max(1);
+        // Absolute mode: per-record read at the wire address (see
+        // `read_int32_array`).
+        if self.is_absolute() {
+            self.engine.check_offset(user.addr).map_err(to_asyn)?;
+            let words = self.read_absolute_words(user.addr, self.engine.config().length)?;
+            let mut n = 0;
+            while n < buf.len() && (n + 1) * rc <= words.len() {
+                buf[n] = datatype::read_float(dt, &words[n * rc..])
+                    .map_err(to_asyn)?
+                    .0;
+                n += 1;
+            }
+            return Ok(n);
+        }
         let data = self.engine.data();
         let mut n = 0;
         while n < buf.len() && (user.addr as usize + (n + 1) * rc) <= data.len() {
@@ -513,9 +666,7 @@ impl PortDriver for ModbusPortDriver {
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_int32(dt, value).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)?;
-        self.base
-            .set_float64_param(user.reason, user.addr, value as f64)?;
-        self.base.call_param_callbacks(user.addr)
+        self.cache_write_numeric(user, value as f64)
     }
 
     fn write_int64(&mut self, user: &mut AsynUser, value: i64) -> AsynResult<()> {
@@ -523,9 +674,7 @@ impl PortDriver for ModbusPortDriver {
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_int64(dt, value).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)?;
-        self.base
-            .set_float64_param(user.reason, user.addr, value as f64)?;
-        self.base.call_param_callbacks(user.addr)
+        self.cache_write_numeric(user, value as f64)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -533,8 +682,7 @@ impl PortDriver for ModbusPortDriver {
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_float(dt, value).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)?;
-        self.base.set_float64_param(user.reason, user.addr, value)?;
-        self.base.call_param_callbacks(user.addr)
+        self.cache_write_numeric(user, value)
     }
 
     fn write_uint32_digital(
@@ -549,8 +697,24 @@ impl PortDriver for ModbusPortDriver {
             return Ok(());
         }
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
-        // Read-modify-write the masked bits of the register.
-        let current = self.engine.data()[user.addr as usize] as u32;
+        // Read-modify-write the masked bits of the register. In relative mode
+        // the current value comes from the polled buffer; in absolute mode it
+        // is read from the slave's wire address first (C `writeUInt32Digital`
+        // does a `MODBUS_READ_HOLDING_REGISTERS` doModbusIO when the mask is
+        // partial — drvModbusAsyn.cpp:609-616).
+        let current = if mask == 0 {
+            0
+        } else if self.is_absolute() {
+            let read_fn = ModbusFunctionCode::ReadHoldingRegisters;
+            let readback = (user.addr + self.engine.config().readback_offset()).max(0);
+            let regs = self
+                .engine
+                .read_absolute(self.transport.as_mut(), read_fn, readback, 1)
+                .map_err(to_asyn)?;
+            regs.first().copied().unwrap_or(0) as u32
+        } else {
+            self.engine.data()[user.addr as usize] as u32
+        };
         let merged = if mask == 0 {
             value
         } else {
@@ -563,12 +727,27 @@ impl PortDriver for ModbusPortDriver {
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
         let dt = self.datatype_of(user.reason)?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
-        let remaining = self.engine.config().length - user.addr as usize;
-        let (regs, _) = datatype::write_string(dt, data, remaining).map_err(to_asyn)?;
+        // Word budget for the string. In relative mode the string shares the
+        // polled buffer, so it is bounded by the registers above `addr`. In
+        // absolute mode `addr` is the wire address (unrelated to the buffer);
+        // the string is bounded by the whole `config.length` scratch budget,
+        // matching C `writeOctet`'s use of the full `data_` buffer.
+        let budget = if self.is_absolute() {
+            self.engine.config().length
+        } else {
+            self.engine.config().length - user.addr as usize
+        };
+        let (regs, _) = datatype::write_string(dt, data, budget).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)?;
-        let s = String::from_utf8_lossy(data).into_owned();
-        self.base.set_string_param(user.reason, user.addr, s)?;
-        self.base.call_param_callbacks(user.addr)
+        // Relative mode caches the value and fans out its monitor (see
+        // `cache_write_numeric`); absolute mode has no parameter-table slot
+        // for a wire address and no poller, so it skips the cache.
+        if !self.is_absolute() {
+            let s = String::from_utf8_lossy(data).into_owned();
+            self.base.set_string_param(user.reason, user.addr, s)?;
+            self.base.call_param_callbacks(user.addr)?;
+        }
+        Ok(())
     }
 }
 
@@ -773,7 +952,11 @@ impl CommandHandler for ModbusConfigHandler {
             parse_configure_args(args).map_err(|e| e.to_string())?;
         let link = take_link(&octet_port);
         let poll_delay = config.poll_delay;
-        let is_read = config.function.is_read();
+        // The read poller is started only for a relative-addressing read port.
+        // An absolute-addressing port has no poller (drvModbusAsyn.cpp:1121,
+        // `if (absoluteAddressing_) needReadThread = 0;`) — each record reads
+        // its own wire address on access.
+        let needs_poller = config.function.is_read() && !config.absolute_addressing();
 
         // Find the underlying octet port and build the framed transport.
         let entry = asyn_rs::asyn_record::get_port(&octet_port)
@@ -794,7 +977,7 @@ impl CommandHandler for ModbusConfigHandler {
 
         // Spawn the read poller — periodically triggers a poll cycle by
         // writing the MODBUS_READ parameter. Port of the `readPoller` thread.
-        if is_read && !poll_delay.is_zero() {
+        if needs_poller && !poll_delay.is_zero() {
             let poller_handle = port_handle.clone();
             self.handle.spawn(async move {
                 loop {
@@ -891,25 +1074,97 @@ mod tests {
         }
     }
 
-    /// A record configured with absolute addressing must be rejected when the
-    /// port driver is built — never reach an accessor that would panic.
+    /// A read port configured with absolute addressing builds successfully —
+    /// absolute mode is supported, not rejected.
     #[test]
-    fn absolute_addressing_rejected_at_driver_construction() {
-        let result = ModbusPortDriver::new(
+    fn absolute_addressing_driver_builds() {
+        let driver = ModbusPortDriver::new(
             "MB_ABS",
             test_config(-1, 16),
             LinkType::Tcp,
             Box::new(NullTransport),
-        );
-        let err = match result {
-            Ok(_) => panic!("absolute addressing must be rejected"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
+        )
+        .expect("absolute addressing port must build");
+        assert!(driver.is_absolute());
+    }
+
+    /// Absolute-mode `read_int32`: the record's asyn `addr` is the absolute
+    /// wire address; the accessor issues an individual Modbus request there
+    /// and decodes the response — no shared polled buffer is consulted.
+    #[test]
+    fn absolute_read_int32_issues_request_at_wire_address() {
+        // ReadHoldingRegisters response for one UINT16 word = 0xBEEF.
+        let pdu = [0x01u8, 0x03, 0x02, 0xBE, 0xEF];
+        let mut driver = ModbusPortDriver::new(
+            "MB_ABS_RD",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        // Wire address far beyond the 16-word scratch buffer — legal in
+        // absolute mode (0..=65535).
+        user.addr = 0x2710;
+        let v = driver
+            .read_int32(&user)
+            .expect("absolute read must succeed");
+        assert_eq!(v, 0xBEEF);
+        // No periodic poller in absolute mode, so the read must not register
+        // the record in the `active` set.
         assert!(
-            msg.contains("absolute addressing"),
-            "error should name absolute addressing, got: {msg}"
+            driver.active.is_empty(),
+            "absolute reads must not touch the poller `active` set"
         );
+    }
+
+    /// Absolute-mode `write_int32`: the record's asyn `addr` is the wire
+    /// address; the accessor issues an individual write request there. A wire
+    /// address beyond the parameter table must not fault on a cache update.
+    #[test]
+    fn absolute_write_int32_issues_request_at_wire_address() {
+        // WriteSingleRegister echo response.
+        let pdu = [0x01u8, 0x06, 0x27, 0x10, 0x12, 0x34];
+        let mut cfg = test_config(-1, 4);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver = ModbusPortDriver::new(
+            "MB_ABS_WR",
+            cfg,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        // Wire address 0x2710 is well past the 4-word scratch buffer and past
+        // the parameter table — the write must still succeed.
+        user.addr = 0x2710;
+        driver
+            .write_int32(&mut user, 0x1234)
+            .expect("absolute write must succeed");
+    }
+
+    /// In absolute mode `poll_cycle` is a no-op: there is no polled block.
+    #[test]
+    fn absolute_poll_cycle_is_noop() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_ABS_POLL",
+            test_config(-1, 8),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("absolute config must build");
+        // No transport traffic is consumed — a no-op cannot time out.
+        driver
+            .poll_cycle()
+            .expect("absolute poll_cycle must be a no-op, not error");
     }
 
     /// An `addr` beyond `config.length` must yield a clean error from the

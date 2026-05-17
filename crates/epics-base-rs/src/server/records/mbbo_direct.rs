@@ -29,7 +29,6 @@ pub struct MbboDirectRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
-    skip_convert: bool,
 }
 
 impl Default for MbboDirectRecord {
@@ -53,7 +52,6 @@ impl Default for MbboDirectRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
-            skip_convert: false,
         }
     }
 }
@@ -271,19 +269,23 @@ impl Record for MbboDirectRecord {
         Ok(())
     }
 
+    /// C `mbboDirectRecord.c::process` (line 198) calls `convert(prec)`
+    /// UNCONDITIONALLY on every non-pact process — the VAL→RVAL output
+    /// translation. A CA put to `mbboDirect.VAL` must therefore
+    /// recompute `RVAL`/`ORAW`. `mbboDirect` is an output record, so it
+    /// does NOT override `set_device_did_compute` or
+    /// `soft_channel_skips_convert` — the soft-channel convert-skip
+    /// applies only to INPUT records.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if !self.skip_convert {
-            // C `mbboDirectRecord.c::convert` — RVAL = VAL << SHFT only.
-            let mut raw = self.val as i32;
-            if self.shft > 0 {
-                raw = (raw as u32).wrapping_shl(self.shft as u32) as i32;
-            }
-            if self.mask != 0 {
-                raw &= self.mask;
-            }
-            self.rval = raw;
+        // C `mbboDirectRecord.c::convert` — RVAL = VAL << SHFT only.
+        let mut raw = self.val as i32;
+        if self.shft > 0 {
+            raw = (raw as u32).wrapping_shl(self.shft as u32) as i32;
         }
-        self.skip_convert = false;
+        if self.mask != 0 {
+            raw &= self.mask;
+        }
+        self.rval = raw;
         // C `mbboDirectRecord.c` — RBV is updated ONLY by device support
         // (the hardware read-back); record support never assigns it.
         // Forcing `RBV = RVAL` here would mask hardware disagreement,
@@ -437,9 +439,5 @@ impl Record for MbboDirectRecord {
             }
         }
         Ok(())
-    }
-
-    fn set_device_did_compute(&mut self, did: bool) {
-        self.skip_convert = did;
     }
 }

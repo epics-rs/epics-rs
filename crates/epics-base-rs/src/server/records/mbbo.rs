@@ -73,7 +73,6 @@ pub struct MbboRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
-    skip_convert: bool,
     /// Set by `convert()` when VAL is an illegal state (`> 15` with a
     /// defined state table). C `mbboRecord.c::convert` raises
     /// `SOFT_ALARM/INVALID` for this case; the alarm is actually
@@ -154,7 +153,6 @@ impl Default for MbboRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
-            skip_convert: false,
             soft_alarm: false,
         }
     }
@@ -618,11 +616,17 @@ impl Record for MbboRecord {
         Ok(())
     }
 
+    /// C `mbboRecord.c::process` (line 217) calls `convert(prec)`
+    /// UNCONDITIONALLY on every non-pact process — the VAL→RVAL output
+    /// translation. It is never gated on whether VAL was just written
+    /// (CA put, DOL fetch, or device support). A CA put to `mbbo.VAL`
+    /// must therefore recompute `RVAL`/`ORAW`/`ORBV`. `mbbo` is an
+    /// output record, so it does NOT override `set_device_did_compute`
+    /// or `soft_channel_skips_convert` — the soft-channel convert-skip
+    /// applies only to INPUT records (ai/bi/mbbi), where VAL is the
+    /// engineering value.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if !self.skip_convert {
-            self.convert();
-        }
-        self.skip_convert = false;
+        self.convert();
         self.oraw = self.rval;
         self.orbv = self.rbv;
         Ok(ProcessOutcome::complete())
@@ -677,10 +681,6 @@ impl Record for MbboRecord {
             "TVST" => tvst: String, "TTST" => ttst: String, "FTST" => ftst: String, "FFST" => ffst: String,
         );
         Ok(())
-    }
-
-    fn set_device_did_compute(&mut self, did: bool) {
-        self.skip_convert = did;
     }
 
     fn can_device_write(&self) -> bool {

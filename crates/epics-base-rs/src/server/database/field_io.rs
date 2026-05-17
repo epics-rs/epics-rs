@@ -590,11 +590,33 @@ impl PvDatabase {
             }
         }
 
-        // When CA put writes directly to VAL, skip built-in conversion
+        // When a CA put writes directly to VAL on an INPUT record whose
+        // VAL is the engineering value, the built-in `RVAL → VAL`
+        // `convert()` must be suppressed for the put-driven process —
+        // re-deriving VAL from a stale RVAL would clobber the value the
+        // operator just wrote (the soft ai preset-NaN case, processing.rs
+        // ~line 677). The framework expresses this by calling
+        // `set_device_did_compute(true)`.
+        //
+        // This MUST be gated on `soft_channel_skips_convert()`. Output
+        // records (mbbo/mbbo_direct/bo/ao) implement
+        // `set_device_did_compute` as "skip the VAL → RVAL output
+        // convert" — the OPPOSITE direction. C `mbboRecord.c::process`
+        // (line 217), `mbboDirectRecord.c::process` (line 198) and
+        // `boRecord.c::process` (line 207) call `convert()`
+        // unconditionally on every non-pact process; a CA VAL-put on an
+        // output record MUST recompute RVAL/ORAW. Suppressing it there
+        // left RVAL/ORAW/ORBV stale. Output records return the default
+        // `false` from `soft_channel_skips_convert()`, so this gate
+        // matches the identical gates in processing.rs (line 694) and
+        // record_instance.rs (line 1381).
         if field == "VAL" {
             let recs = self.inner.records.read().await;
             if let Some(rec_arc) = recs.get(record_name) {
-                rec_arc.write().await.record.set_device_did_compute(true);
+                let mut guard = rec_arc.write().await;
+                if guard.record.soft_channel_skips_convert() {
+                    guard.record.set_device_did_compute(true);
+                }
             }
         }
 

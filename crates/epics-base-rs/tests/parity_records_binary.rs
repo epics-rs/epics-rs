@@ -66,9 +66,11 @@ fn mbbi_direct_nobt_above_16_sets_mask() {
 
 #[test]
 fn mbbo_direct_process_keeps_device_rbv() {
-    let mut rec = MbboDirectRecord::default();
     // Device support wrote a hardware read-back that disagrees with VAL.
-    rec.rbv = 999;
+    let mut rec = MbboDirectRecord {
+        rbv: 999,
+        ..Default::default()
+    };
     rec.put_field("VAL", EpicsValue::Long(5)).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.rval, 5, "RVAL is the commanded value");

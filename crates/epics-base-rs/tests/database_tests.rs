@@ -4188,3 +4188,78 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
     }
     assert_eq!(t, Some(known), "time pulled from pv_a (letter 'A')");
 }
+
+/// Regression: a CA put to `mbbo.VAL` must recompute RVAL/ORAW.
+///
+/// C `mbboRecord.c::process` (line 217) calls `convert(prec)`
+/// unconditionally on every non-pact process — the VAL→RVAL output
+/// translation. Pre-fix, `put_record_field_from_ca` called
+/// `set_device_did_compute(true)` for *any* VAL put, and `mbbo`
+/// interpreted that as "skip the output convert", so RVAL/ORAW kept
+/// their stale pre-put value while the OUT link drove the wrong raw.
+///
+/// With `shft = 4` and no state table, `convert()` yields
+/// `RVAL = VAL << 4`. A CA put of VAL=3 must produce RVAL=ORAW=48.
+#[tokio::test]
+async fn test_ca_put_mbbo_val_recomputes_rval() {
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+
+    let db = PvDatabase::new();
+    let mut rec = MbboRecord::new(0);
+    rec.shft = 4;
+    db.add_record("MBBO_CA", Box::new(rec)).await.unwrap();
+
+    db.put_record_field_from_ca("MBBO_CA", "VAL", EpicsValue::Enum(3))
+        .await
+        .unwrap();
+
+    let rec = db.get_record("MBBO_CA").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::Enum(3)),
+        "VAL holds the CA-written value"
+    );
+    assert_eq!(
+        inst.record.get_field("RVAL"),
+        Some(EpicsValue::Long(48)),
+        "RVAL must be recomputed from the new VAL (3 << 4), not left stale at 0"
+    );
+    assert_eq!(
+        inst.record.get_field("ORAW"),
+        Some(EpicsValue::Long(48)),
+        "ORAW must roll forward to the freshly converted RVAL"
+    );
+}
+
+/// Regression: a CA put to `mbboDirect.VAL` must recompute RVAL/ORAW.
+///
+/// C `mbboDirectRecord.c::process` (line 198) calls `convert(prec)`
+/// unconditionally. With `shft = 4`, `convert()` yields
+/// `RVAL = VAL << 4`. A CA put of VAL=5 must produce RVAL=ORAW=80.
+#[tokio::test]
+async fn test_ca_put_mbbo_direct_val_recomputes_rval() {
+    use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
+
+    let db = PvDatabase::new();
+    let mut rec = MbboDirectRecord::default();
+    rec.shft = 4;
+    db.add_record("MBBOD_CA", Box::new(rec)).await.unwrap();
+
+    db.put_record_field_from_ca("MBBOD_CA", "VAL", EpicsValue::Long(5))
+        .await
+        .unwrap();
+
+    let rec = db.get_record("MBBOD_CA").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.get_field("RVAL"),
+        Some(EpicsValue::Long(80)),
+        "RVAL must be recomputed from the new VAL (5 << 4), not left stale at 0"
+    );
+    assert_eq!(
+        inst.record.get_field("ORAW"),
+        Some(EpicsValue::Long(80)),
+        "ORAW must roll forward to the freshly converted RVAL"
+    );
+}

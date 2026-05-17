@@ -259,7 +259,15 @@ impl ModbusPortDriver {
             let Ok(dt) = self.datatype_of(reason) else {
                 continue;
             };
-            let regs = &self.engine.data()[addr as usize..];
+            // Defense-in-depth: an out-of-range `addr` must never index the
+            // engine buffer. Accessors check the offset before `touch`, so
+            // `self.active` should hold only valid addrs — but a bad addr
+            // here is skipped, not allowed to panic.
+            let data = self.engine.data();
+            if addr < 0 || addr as usize >= data.len() {
+                continue;
+            }
+            let regs = &data[addr as usize..];
             if dt.is_string() {
                 let (bytes, _) =
                     datatype::read_string(dt, regs, regs.len() * 2).map_err(to_asyn)?;
@@ -337,39 +345,39 @@ impl PortDriver for ModbusPortDriver {
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
         let dt = self.datatype_of(user.reason)?;
-        self.touch(user.reason, user.addr);
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_int32(dt, regs).map_err(to_asyn)?.0)
     }
 
     fn read_int64(&mut self, user: &AsynUser) -> AsynResult<i64> {
         let dt = self.datatype_of(user.reason)?;
-        self.touch(user.reason, user.addr);
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_int64(dt, regs).map_err(to_asyn)?.0)
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
         let dt = self.datatype_of(user.reason)?;
-        self.touch(user.reason, user.addr);
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_float(dt, regs).map_err(to_asyn)?.0)
     }
 
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
-        self.touch(user.reason, user.addr);
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.touch(user.reason, user.addr);
         let raw = self.engine.data()[user.addr as usize] as u32;
         Ok(if mask == 0 { raw } else { raw & mask })
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         let dt = self.datatype_of(user.reason)?;
-        self.touch(user.reason, user.addr);
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         // String length comes from the record buffer (`NELM`).
         let (bytes, _) = datatype::read_string(dt, regs, buf.len()).map_err(to_asyn)?;
@@ -786,6 +794,40 @@ mod tests {
         }
     }
 
+    /// A transport that replays a queue of canned response frames — lets a
+    /// test drive `poll_cycle` through a successful engine poll.
+    struct ReplayTransport {
+        responses: std::collections::VecDeque<crate::error::ModbusResult<Vec<u8>>>,
+    }
+
+    impl ReplayTransport {
+        fn new(responses: Vec<crate::error::ModbusResult<Vec<u8>>>) -> Self {
+            Self {
+                responses: responses.into_iter().collect(),
+            }
+        }
+    }
+
+    impl OctetTransport for ReplayTransport {
+        fn write_frame(&mut self, _data: &[u8]) -> crate::error::ModbusResult<()> {
+            Ok(())
+        }
+        fn read_frame(&mut self, _timeout: Duration) -> crate::error::ModbusResult<Vec<u8>> {
+            self.responses
+                .pop_front()
+                .unwrap_or(Err(ModbusError::Timeout))
+        }
+    }
+
+    /// Wrap a bare Modbus PDU in a Modbus/TCP MBAP frame for `txid`.
+    fn tcp_response(txid: u16, pdu: &[u8]) -> Vec<u8> {
+        let mut frame = crate::protocol::MbapHeader::new(txid, pdu.len() as u16)
+            .to_bytes()
+            .to_vec();
+        frame.extend_from_slice(pdu);
+        frame
+    }
+
     fn test_config(start_address: i32, length: usize) -> ModbusConfig {
         ModbusConfig {
             slave: 1,
@@ -853,6 +895,61 @@ mod tests {
         assert!(driver.write_float64(&mut wuser, 1.0).is_err());
         assert!(driver.write_uint32_digital(&mut wuser, 1, 0).is_err());
         assert!(driver.write_octet(&mut wuser, b"hi").is_err());
+
+        // A failed out-of-range access must never register the bad addr —
+        // otherwise the next poll cycle would index the engine buffer out of
+        // bounds and panic.
+        assert!(
+            !driver.active.iter().any(|&(_, a)| a == 100),
+            "out-of-range addr must not be registered in `active`"
+        );
+    }
+
+    /// After failed out-of-range reads and writes, `poll_cycle` must iterate
+    /// `self.active` without panicking on a stale out-of-range addr. Guards
+    /// against the touch-before-check regression where a bad addr was
+    /// inserted into `active` and later indexed the engine buffer unchecked.
+    #[test]
+    fn poll_cycle_after_failed_out_of_range_access_does_not_panic() {
+        // ReadHoldingRegisters response for the 4-word buffer: slave 1, fc 3,
+        // byte_count 8, four zero registers. The engine's first poll expects
+        // TCP transaction id 1.
+        let pdu = [0x01u8, 0x03, 0x08, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut driver = ModbusPortDriver::new(
+            "MB_POLL_OOR",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+
+        // Out-of-range read on the 4-word buffer — must fail cleanly.
+        let mut ruser = AsynUser::new(reason);
+        ruser.addr = 100;
+        assert!(driver.read_int32(&ruser).is_err());
+
+        // Out-of-range write — must fail cleanly.
+        let mut wuser = AsynUser::new(reason);
+        wuser.addr = 100;
+        assert!(driver.write_int32(&mut wuser, 1).is_err());
+
+        // The bad addr must not have leaked into `active`.
+        assert!(
+            !driver.active.iter().any(|&(_, a)| a == 100),
+            "out-of-range addr must not be registered in `active`"
+        );
+
+        // Defense-in-depth: even with a bad addr present in `active`, a full
+        // `poll_cycle` (engine poll succeeds, then the active set is iterated)
+        // must skip it instead of panicking on an out-of-bounds buffer index.
+        driver.active.insert((reason, 100));
+        driver
+            .poll_cycle()
+            .expect("poll_cycle must skip the stale out-of-range addr, not error");
     }
 
     #[test]

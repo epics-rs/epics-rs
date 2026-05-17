@@ -87,6 +87,22 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Result<(), String> {
         Err("read-only mode: PUT rejected".into())
     }
+    // A BitSet-delta PUT is still a PUT. Reject it here exactly the
+    // way `put_value_checked` does — without this override the trait
+    // default would run get_value + merge + put_value_checked, which
+    // happens to still reject (put_value_checked above), but only
+    // after a wasted read-merge and after bypassing the inner
+    // source's atomic `put_delta_checked`. Short-circuit instead.
+    async fn put_delta_checked(
+        &self,
+        _checked: epics_pva_rs::server_native::source::AccessChecked,
+        _desc: FieldDesc,
+        _changed: epics_pva_rs::proto::BitSet,
+        _delta: PvField,
+        _ctx: ChannelContext,
+    ) -> Result<(), String> {
+        Err("read-only mode: PUT rejected".into())
+    }
     async fn is_writable(&self, _name: &str) -> bool {
         false
     }
@@ -350,6 +366,28 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
         }
         self.inner.put_value_checked(checked, value, ctx).await
+    }
+    // A BitSet-delta PUT is a PUT — gate it by the same static
+    // allowlist as `put_value_checked`, then forward to the inner's
+    // `put_delta_checked`. Without this override the trait default
+    // would run get_value + merge + put_value_checked on THIS layer,
+    // bypassing the inner source's atomic `put_delta_checked`
+    // (`SharedSource` / `CompositeSource` merge under one lock) and
+    // re-opening the concurrent-partial-PUT lost-update window.
+    async fn put_delta_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        desc: FieldDesc,
+        changed: epics_pva_rs::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> Result<(), String> {
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(format!("ACL: PV '{}' denied", checked.pv_name()));
+        }
+        self.inner
+            .put_delta_checked(checked, desc, changed, delta, ctx)
+            .await
     }
     async fn is_writable(&self, name: &str) -> bool {
         self.config.allowed(name) && self.inner.is_writable(name).await
@@ -735,6 +773,33 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             .record(make_audit_event(&pv, &user, &host, &result));
         result
     }
+    // A BitSet-delta PUT records the same audit row shape as
+    // `put_value_checked` (event kind Put, peer credentials) and
+    // forwards through the inner's `put_delta_checked`. Without this
+    // override the trait default would run get_value + merge +
+    // put_value_checked on THIS layer: it would still audit (via the
+    // put_value_checked above) but bypass the inner source's atomic
+    // `put_delta_checked`, re-opening the concurrent-partial-PUT
+    // lost-update window.
+    async fn put_delta_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        desc: FieldDesc,
+        changed: epics_pva_rs::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> Result<(), String> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self
+            .inner
+            .put_delta_checked(checked, desc, changed, delta, ctx)
+            .await;
+        self.sink
+            .record(make_audit_event(&pv, &user, &host, &result));
+        result
+    }
     async fn get_value_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
@@ -1080,5 +1145,224 @@ mod tests {
         let ok = make_audit_event("MOTOR:VAL", "alice", "host1", &Ok(()));
         assert_eq!(ok.result, AuditResult::Ok);
         assert!(ok.error.is_empty());
+    }
+
+    // ── put_delta_checked forwarding through the wrappers ────────────
+
+    use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
+    use epics_pva_rs::server_native::source::{AccessChecked, AccessGate};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Minimal `ChannelSource` stub that records which PUT method
+    /// the wrapper routed a delta PUT to. `put_delta_checked` is
+    /// overridden (atomic merge stand-in); the default
+    /// `put_value_checked` chains through it. If a wrapper bypasses
+    /// `put_delta_checked` and runs the non-atomic default merge, it
+    /// lands in `put_value_checked` and `delta_reached` stays false.
+    struct RecordingSource {
+        delta_reached: Arc<AtomicBool>,
+        value_reached: Arc<AtomicBool>,
+    }
+
+    impl ChannelSource for RecordingSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["X".into()]
+        }
+        async fn has_pv(&self, _name: &str) -> bool {
+            true
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            Some(FieldDesc::Scalar(ScalarType::Double))
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(PvField::Scalar(ScalarValue::Double(0.0)))
+        }
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), String> {
+            Ok(())
+        }
+        async fn put_value_checked(
+            &self,
+            _checked: AccessChecked,
+            _value: PvField,
+            _ctx: ChannelContext,
+        ) -> Result<(), String> {
+            self.value_reached.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn put_delta_checked(
+            &self,
+            _checked: AccessChecked,
+            _desc: FieldDesc,
+            _changed: epics_pva_rs::proto::BitSet,
+            _delta: PvField,
+            _ctx: ChannelContext,
+        ) -> Result<(), String> {
+            self.delta_reached.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            true
+        }
+        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+    }
+
+    fn test_ctx() -> ChannelContext {
+        ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "alice".into(),
+            method: "anonymous".into(),
+            host: "host1".into(),
+            authority: String::new(),
+        }
+    }
+
+    async fn checked_for(name: &str) -> AccessChecked {
+        AccessGate::open()
+            .check(name, "host1", "alice", "anonymous", "")
+            .await
+    }
+
+    /// A delta PUT through the `Acl` wrapper must reach the inner
+    /// source's `put_delta_checked` — not the non-atomic
+    /// get+put_value_checked default merge.
+    #[tokio::test]
+    async fn acl_forwards_put_delta_checked_to_inner() {
+        let delta_reached = Arc::new(AtomicBool::new(false));
+        let value_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: delta_reached.clone(),
+            value_reached: value_reached.clone(),
+        };
+        let acl = AclLayer::new(AclConfig::default()).layer(inner);
+
+        let mut changed = epics_pva_rs::proto::BitSet::new();
+        changed.set(0);
+        let res = acl
+            .put_delta_checked(
+                checked_for("X").await,
+                FieldDesc::Scalar(ScalarType::Double),
+                changed,
+                PvField::Scalar(ScalarValue::Double(1.0)),
+                test_ctx(),
+            )
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            delta_reached.load(Ordering::SeqCst),
+            "Acl must route delta PUT to inner put_delta_checked"
+        );
+        assert!(
+            !value_reached.load(Ordering::SeqCst),
+            "Acl must NOT fall back to the non-atomic put_value_checked merge"
+        );
+    }
+
+    /// An `Acl`-denied delta PUT must be rejected at the layer and
+    /// never reach the inner source at all.
+    #[tokio::test]
+    async fn acl_denied_put_delta_checked_short_circuits() {
+        let delta_reached = Arc::new(AtomicBool::new(false));
+        let value_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: delta_reached.clone(),
+            value_reached: value_reached.clone(),
+        };
+        let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
+        let acl = AclLayer::new(cfg).layer(inner);
+
+        let mut changed = epics_pva_rs::proto::BitSet::new();
+        changed.set(0);
+        let err = acl
+            .put_delta_checked(
+                checked_for("SECRET:KEY").await,
+                FieldDesc::Scalar(ScalarType::Double),
+                changed,
+                PvField::Scalar(ScalarValue::Double(1.0)),
+                test_ctx(),
+            )
+            .await
+            .expect_err("ACL-denied delta PUT must fail at the layer");
+        assert!(err.contains("denied"));
+        assert!(!delta_reached.load(Ordering::SeqCst));
+        assert!(!value_reached.load(Ordering::SeqCst));
+    }
+
+    /// A delta PUT through the `Audited` wrapper must reach the
+    /// inner's `put_delta_checked` and emit one `Put` audit row
+    /// carrying the peer credentials.
+    #[tokio::test]
+    async fn audited_forwards_put_delta_checked_and_records() {
+        let delta_reached = Arc::new(AtomicBool::new(false));
+        let value_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: delta_reached.clone(),
+            value_reached: value_reached.clone(),
+        };
+        let events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_sink = events.clone();
+        let audited = AuditLayer::new(ClosureAudit(move |ev| {
+            events_sink.lock().unwrap().push(ev);
+        }))
+        .layer(inner);
+
+        let mut changed = epics_pva_rs::proto::BitSet::new();
+        changed.set(0);
+        let res = audited
+            .put_delta_checked(
+                checked_for("X").await,
+                FieldDesc::Scalar(ScalarType::Double),
+                changed,
+                PvField::Scalar(ScalarValue::Double(1.0)),
+                test_ctx(),
+            )
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            delta_reached.load(Ordering::SeqCst),
+            "Audited must route delta PUT to inner put_delta_checked"
+        );
+        assert!(
+            !value_reached.load(Ordering::SeqCst),
+            "Audited must NOT fall back to the non-atomic put_value_checked merge"
+        );
+        let recorded = events.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one audit row per delta PUT");
+        assert_eq!(recorded[0].event, AuditEventKind::Put);
+        assert_eq!(recorded[0].result, AuditResult::Ok);
+        assert_eq!(recorded[0].pv, "X");
+        assert_eq!(recorded[0].user, "alice");
+        assert_eq!(recorded[0].host, "host1");
+    }
+
+    /// A delta PUT through the `ReadOnly` wrapper must be rejected
+    /// at the layer and never reach the inner source.
+    #[tokio::test]
+    async fn read_only_rejects_put_delta_checked() {
+        let delta_reached = Arc::new(AtomicBool::new(false));
+        let value_reached = Arc::new(AtomicBool::new(false));
+        let inner = RecordingSource {
+            delta_reached: delta_reached.clone(),
+            value_reached: value_reached.clone(),
+        };
+        let ro = ReadOnlyLayer.layer(inner);
+
+        let mut changed = epics_pva_rs::proto::BitSet::new();
+        changed.set(0);
+        let err = ro
+            .put_delta_checked(
+                checked_for("X").await,
+                FieldDesc::Scalar(ScalarType::Double),
+                changed,
+                PvField::Scalar(ScalarValue::Double(1.0)),
+                test_ctx(),
+            )
+            .await
+            .expect_err("read-only delta PUT must be rejected");
+        assert!(err.contains("read-only"));
+        assert!(!delta_reached.load(Ordering::SeqCst));
+        assert!(!value_reached.load(Ordering::SeqCst));
     }
 }

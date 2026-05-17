@@ -189,6 +189,66 @@ fn rcnt_increments_and_resets() {
     assert!(!rec.retry.miss);
 }
 
+/// BUG 4 regression: the retry deadband comparison must be
+/// boundary-INCLUSIVE. C `maybeRetry` (motorRecord.cc:1049) uses
+/// `fabs(pmr->diff) >= pmr->rdbd`. At exactly `diff == rdbd` C retries;
+/// an earlier Rust version used `diff > rdbd` and finalized instead.
+#[test]
+fn retry_fires_when_diff_exactly_equals_rdbd() {
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.25;
+    rec.retry.rtry = 5;
+    rec.retry.rmod = RetryMode::Default;
+
+    // Target 0.5, motor stops at 0.25 — every value is exactly
+    // representable in binary floating point, so `diff` is precisely
+    // `0.5 - 0.25 == 0.25 == rdbd`.
+    rec.pos.dval = 0.5;
+    rec.plan_motion(CommandSource::Val);
+
+    complete_move(&mut rec, 0.25);
+    let diff = (rec.pos.dval - rec.pos.drbv).abs();
+    assert_eq!(diff, rec.retry.rdbd, "test setup: diff must equal rdbd");
+
+    let effects = rec.check_completion();
+
+    // C `>=`: at the boundary the axis retries.
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::Retry,
+        "diff == rdbd must trigger a retry (C uses >=)"
+    );
+    assert_eq!(rec.retry.rcnt, 1);
+    assert_eq!(effects.commands.len(), 1, "retry must emit a move command");
+}
+
+/// BUG 4 regression: MISS must latch when the axis finalizes (retries
+/// exhausted) with `fabs(diff) >= rdbd` — boundary-inclusive, matching
+/// C `maybeRetry`.
+#[test]
+fn miss_latches_when_diff_exactly_equals_rdbd_at_exhaustion() {
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.25;
+    rec.retry.rtry = 0; // retry disabled — finalize immediately
+    rec.retry.rmod = RetryMode::Default;
+
+    // Exactly representable: diff = 0.5 - 0.25 == 0.25 == rdbd.
+    rec.pos.dval = 0.5;
+    rec.plan_motion(CommandSource::Val);
+
+    complete_move(&mut rec, 0.25);
+    let diff = (rec.pos.dval - rec.pos.drbv).abs();
+    assert_eq!(diff, rec.retry.rdbd, "test setup: diff must equal rdbd");
+
+    let _effects = rec.check_completion();
+
+    assert!(rec.stat.dmov, "axis finalizes (retry disabled)");
+    assert!(
+        rec.retry.miss,
+        "MISS must latch at diff == rdbd on finalize (C uses >=)"
+    );
+}
+
 #[test]
 fn spdb_suppresses_small_move() {
     let mut rec = make_record();

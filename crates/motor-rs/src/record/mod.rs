@@ -105,6 +105,27 @@ impl MotorRecord {
         self.last_write = None;
     }
 
+    /// True when a position field (VAL/DVAL/RVAL/RLV) was written during
+    /// pass0 — i.e. autosave restored a saved position.
+    ///
+    /// Device support `init()` uses this to decide whether to reseed the
+    /// controller with the restored DVAL. It MUST be queried before
+    /// [`clear_last_write`](Self::clear_last_write), which device support
+    /// calls later in `init()`.
+    ///
+    /// This is the correct "was a position restored" signal: a genuine
+    /// restored position of exactly `0.0` is indistinguishable from the
+    /// field default if you only inspect the DVAL value, but the pass0
+    /// write still records `last_write`.
+    pub fn was_position_restored(&self) -> bool {
+        matches!(
+            self.last_write,
+            Some(
+                CommandSource::Val | CommandSource::Dval | CommandSource::Rval | CommandSource::Rlv
+            )
+        )
+    }
+
     /// Signal that the external URIP readback link is in error or recovered.
     /// While `urip` is true and `error` is set, new motions are refused and
     /// in-progress motion is stopped (C: `db5da2f0`, `7493d50b`).

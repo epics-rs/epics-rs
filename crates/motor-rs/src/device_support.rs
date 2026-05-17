@@ -230,15 +230,28 @@ impl DeviceSupport for MotorDeviceSupport {
 
         // Sync driver position with pass0-restored DVAL (if any).
         // C: set_position uses dval/mres (raw steps), not val (user coordinates)
+        //
+        // The reseed must be gated on whether a position was actually
+        // *restored* during pass0 — NOT on `dval != 0.0`. C `init_record`
+        // syncs the controller to the restored position regardless of its
+        // value; a genuine restored position of exactly 0.0 must still
+        // reseed the controller. An earlier Rust version used
+        // `if dval != 0.0`, which silently skipped the controller sync
+        // for a legitimate 0.0 restore. `was_position_restored()` is the
+        // proper signal: it reports whether a VAL/DVAL/RVAL/RLV field was
+        // written during pass0 (autosave restore), independent of the
+        // restored value. It is queried here, before `clear_last_write()`
+        // runs later in this `init()`.
         let user = self.make_user();
-        let dval = record
-            .get_field("DVAL")
-            .and_then(|v| match v {
-                EpicsValue::Double(d) => Some(d),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        if dval != 0.0 {
+        let restored_dval = record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
+            .filter(|rec| rec.was_position_restored())
+            .map(|rec| match rec.get_field("DVAL") {
+                Some(EpicsValue::Double(d)) => d,
+                _ => 0.0,
+            });
+        if let Some(dval) = restored_dval {
             let mut motor = self.motor.lock().map_err(|e| {
                 epics_base_rs::error::CaError::InvalidValue(format!("motor lock: {e}"))
             })?;

@@ -151,15 +151,18 @@ impl OctetInterpose for EosInterpose {
                 break;
             }
 
-            // Read more data from the lower layer into our internal buffer
-            let result = match next.read(user, &mut self.in_buf[..]) {
-                Ok(r) => r,
-                Err(_) if n_read > 0 => {
-                    // Return accumulated data; error will surface on next read
-                    break;
-                }
-                Err(e) => return Err(e),
-            };
+            // Read more data from the lower layer into our internal buffer.
+            //
+            // C parity (`asynInterposeEos.c::readIt`): the lower-layer
+            // `status` is preserved across the whole loop. When the
+            // lower read fails, C `break`s the loop and then executes
+            // `return status` — the caller sees the error/timeout
+            // regardless of how many bytes were already accumulated in
+            // `nRead`. An earlier Rust version swallowed the error into
+            // `Ok(...)` when `n_read > 0`, dropping the timeout/error
+            // indication entirely. We surface the lower-layer error
+            // even when partial data was buffered, matching C.
+            let result = next.read(user, &mut self.in_buf[..])?;
 
             if result.nbytes_transferred == 0 {
                 break;
@@ -215,6 +218,7 @@ impl OctetInterpose for EosInterpose {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{AsynError, AsynStatus};
 
     struct MockOctetBase {
         data: Vec<u8>,
@@ -461,6 +465,66 @@ mod tests {
         assert!(r.eom_reason.contains(EomReason::EOS));
         // CNT from lower layer should NOT be in the result
         assert!(!r.eom_reason.contains(EomReason::CNT));
+    }
+
+    #[test]
+    fn test_lower_layer_error_surfaces_with_partial_data() {
+        // BUG 1 regression: C `asynInterposeEos.c::readIt` preserves the
+        // lower-layer `status` and `return status` even when partial
+        // data was already accumulated. An earlier Rust version
+        // converted the timeout/error into `Ok(...)` whenever
+        // `n_read > 0`, hiding the failure from the caller.
+        //
+        // This base feeds one chunk with no EOS, then a timeout. The
+        // EOS layer has buffered "abc" (n_read > 0) and must still
+        // propagate the timeout `Err`, not return `Ok`.
+        struct PartialThenErrBase {
+            served: bool,
+        }
+        impl OctetNext for PartialThenErrBase {
+            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+                if !self.served {
+                    self.served = true;
+                    let data = b"abc";
+                    buf[..data.len()].copy_from_slice(data);
+                    Ok(OctetReadResult {
+                        nbytes_transferred: data.len(),
+                        // No CNT/EOS — short read, EOS layer keeps reading.
+                        eom_reason: EomReason::empty(),
+                    })
+                } else {
+                    Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "read timeout".into(),
+                    })
+                }
+            }
+            fn write(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
+                Ok(0)
+            }
+            fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        });
+        let mut base = PartialThenErrBase { served: false };
+        let user = AsynUser::default();
+        let mut buf = [0u8; 64];
+
+        let err = interpose
+            .read(&user, &mut buf, &mut base)
+            .expect_err("lower-layer timeout must surface even with partial data");
+        match err {
+            AsynError::Status {
+                status: AsynStatus::Timeout,
+                ..
+            } => {}
+            other => panic!("expected Timeout error, got {other:?}"),
+        }
     }
 
     #[test]

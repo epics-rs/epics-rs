@@ -316,3 +316,68 @@ async fn test_poll_loop_lifecycle() {
     let result = tokio::time::timeout(Duration::from_secs(1), poll_handle).await;
     assert!(result.is_ok(), "poll loop should terminate after Shutdown");
 }
+
+/// BUG 5 regression: device-support `init()` must reseed the controller
+/// with the pass0-restored DVAL even when that restored value is exactly
+/// `0.0`. C `init_record` always syncs the controller to the restored
+/// position. An earlier Rust version gated the sync on `dval != 0.0`, so
+/// a genuine restored position of `0.0` was treated as "no restored
+/// value" and the controller was left at its stale position.
+#[tokio::test]
+async fn init_reseeds_controller_when_restored_dval_is_zero() {
+    // Controller (SimMotor) starts at a stale position of 5.0 — as if the
+    // hardware powered up somewhere other than the saved 0.0.
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
+    let mut setup = make_builder(motor.clone()).build();
+
+    // Simulate autosave restoring a saved position of exactly 0.0 during
+    // pass0: a DVAL field write records `last_write = Some(Dval)`, which
+    // is the proper "a position was restored" signal.
+    setup
+        .record
+        .put_field("DVAL", EpicsValue::Double(0.0))
+        .unwrap();
+    assert!(
+        setup.record.was_position_restored(),
+        "DVAL write must register as a restored position"
+    );
+
+    // init() must reseed the controller to the restored 0.0.
+    setup.device_support.init(&mut setup.record).unwrap();
+
+    // The SimMotor must have been driven to 0.0 by set_position.
+    let pos = {
+        let mut m = motor.lock().unwrap();
+        m.poll(&asyn_rs::user::AsynUser::new(0)).unwrap().position
+    };
+    assert!(
+        pos.abs() < 1e-9,
+        "controller must be reseeded to restored DVAL 0.0, got {pos}"
+    );
+}
+
+/// BUG 5 companion: when NO position was restored during pass0, `init()`
+/// must NOT reseed the controller — it leaves the hardware position
+/// untouched. This proves the fix keys off the restore signal, not the
+/// DVAL value.
+#[tokio::test]
+async fn init_does_not_reseed_controller_when_nothing_restored() {
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
+    let mut setup = make_builder(motor.clone()).build();
+
+    // No put_field("DVAL", ...) — nothing was restored.
+    assert!(!setup.record.was_position_restored());
+
+    setup.device_support.init(&mut setup.record).unwrap();
+
+    // Controller position must be left at its stale 5.0 — init did not
+    // call set_position.
+    let pos = {
+        let mut m = motor.lock().unwrap();
+        m.poll(&asyn_rs::user::AsynUser::new(0)).unwrap().position
+    };
+    assert!(
+        (pos - 5.0).abs() < 1e-9,
+        "controller must be untouched when nothing was restored, got {pos}"
+    );
+}

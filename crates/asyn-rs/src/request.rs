@@ -30,6 +30,11 @@ pub enum ParamSetValue {
         addr: i32,
         value: Vec<f64>,
     },
+    Int32Array {
+        reason: usize,
+        addr: i32,
+        value: Vec<i32>,
+    },
     UInt32Digital {
         reason: usize,
         addr: i32,

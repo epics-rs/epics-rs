@@ -5,6 +5,17 @@ impl MotorRecord {
     pub fn check_completion(&mut self) -> ProcessEffects {
         let mut effects = ProcessEffects::default();
 
+        // C `do_work` (motorRecord.cc:1973) calls `enforceMinRetryDeadband`
+        // before any retry evaluation, so C's `maybeRetry`
+        // (`fabs(diff) >= rdbd`, line 1049) always compares against an
+        // RDBD that is at least |MRES|. The retry comparison here is
+        // therefore boundary-inclusive with NO `rdbd > 0` guard — but
+        // that is only correct when RDBD has actually been enforced.
+        // Enforce it here so the completion-time retry evaluation sees a
+        // C-faithful RDBD even when this is reached without an
+        // intervening field-write pass.
+        self.enforce_min_retry_deadband();
+
         // C: db5da2f0 — if the external URIP readback is in error while a
         // motion is in progress, stop the axis immediately. New moves are
         // already blocked at plan_motion.
@@ -248,11 +259,14 @@ impl MotorRecord {
         };
         let ls_blocks_retry = (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir);
 
-        if diff > self.retry.rdbd
-            && self.retry.rcnt < self.retry.rtry
-            && self.retry.rdbd > 0.0
-            && !ls_blocks_retry
-        {
+        // C `maybeRetry` (motorRecord.cc:1049): the retry comparison is
+        // `fabs(pmr->diff) >= pmr->rdbd` — inclusive of the boundary.
+        // At `diff == rdbd` C retries; an earlier Rust version used `>`
+        // and finalized instead. Retry is gated only on `rtry != 0`
+        // (`rcnt < rtry` here); C `maybeRetry` has NO `rdbd > 0`
+        // condition — RDBD is kept >= |MRES| by `enforceMinRetryDeadband`,
+        // and when RDBD is 0 `fabs(diff) >= 0` is trivially true.
+        if diff >= self.retry.rdbd && self.retry.rcnt < self.retry.rtry && !ls_blocks_retry {
             if self.retry.rmod == RetryMode::InPosition {
                 // C: InPosition mode re-delays to let servo settle
                 self.retry.rcnt += 1;
@@ -293,7 +307,10 @@ impl MotorRecord {
             effects.request_poll = true;
             effects.suppress_forward_link = true;
         } else {
-            if diff > self.retry.rdbd && self.retry.rdbd > 0.0 {
+            // C `maybeRetry`: MISS latches when the axis finalizes with
+            // `fabs(diff) >= rdbd` (retries exhausted / disabled but not
+            // in position). Boundary-inclusive, matching C line 1049.
+            if diff >= self.retry.rdbd {
                 self.retry.miss = true;
             }
             self.finalize_motion(effects);
@@ -321,11 +338,10 @@ impl MotorRecord {
         };
         let ls_blocks_retry = (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir);
 
-        if diff > self.retry.rdbd
-            && self.retry.rcnt < self.retry.rtry
-            && self.retry.rdbd > 0.0
-            && !ls_blocks_retry
-        {
+        // C `maybeRetry` (motorRecord.cc:1049): `fabs(pmr->diff) >= pmr->rdbd`
+        // — boundary-inclusive. Retry gated only on `rtry != 0`
+        // (`rcnt < rtry`); C has no `rdbd > 0` condition.
+        if diff >= self.retry.rdbd && self.retry.rcnt < self.retry.rtry && !ls_blocks_retry {
             // InPosition mode: don't reissue, just finalize
             if self.retry.rmod == RetryMode::InPosition {
                 self.finalize_or_delay(effects);
@@ -362,7 +378,9 @@ impl MotorRecord {
             effects.request_poll = true;
             effects.suppress_forward_link = true;
         } else {
-            if diff > self.retry.rdbd && self.retry.rdbd > 0.0 {
+            // C `maybeRetry`: MISS latches when finalizing with
+            // `fabs(diff) >= rdbd`. Boundary-inclusive, matching C line 1049.
+            if diff >= self.retry.rdbd {
                 self.retry.miss = true;
             }
             self.finalize_or_delay(effects);

@@ -377,6 +377,9 @@ fn test_retry_on_position_error() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
+    // MRES smaller than RDBD so enforceMinRetryDeadband (run at the top
+    // of check_completion, C parity with do_work) leaves RDBD untouched.
+    rec.conv.mres = 0.001;
     rec.retry.rdbd = 0.1;
     rec.retry.rtry = 3;
     rec.pos.dval = 10.0;
@@ -393,6 +396,8 @@ fn test_miss_when_retries_exhausted() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
+    // MRES smaller than RDBD so enforceMinRetryDeadband is a no-op here.
+    rec.conv.mres = 0.001;
     rec.retry.rdbd = 0.1;
     rec.retry.rtry = 3;
     rec.retry.rcnt = 3; // exhausted

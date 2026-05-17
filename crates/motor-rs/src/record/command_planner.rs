@@ -853,13 +853,33 @@ impl MotorRecord {
         (move_dir > 0.0) == (self.retry.bdst > 0.0)
     }
 
-    /// Handle retarget (NTM) -- new target while moving.
+    /// Handle a new target (VAL/DVAL/RVAL/RLV write) that arrives while a
+    /// motion is in progress.
+    ///
+    /// C parity (`motorRecord.cc`):
+    ///
+    /// - `do_work` (line 2241) re-issues the move block on *every*
+    ///   `dval != ldvl || !dmov` — completely INDEPENDENT of NTM. A
+    ///   VAL/DVAL/RVAL/RLV write during motion always re-dispatches a
+    ///   move. An earlier Rust version returned [`RetargetAction::Ignore`]
+    ///   whenever `ntm == No` (its `motorRecord.dbd` default, since NTM
+    ///   has no `initial()`), silently discarding the write.
+    /// - NTM gates only the *opposite-direction* stop-and-replan in the
+    ///   `process()` `movn` block (line 1327-1331): when
+    ///   `ntm == menuYesNoYES && sign_rdif != cdir &&
+    ///   fabs(diff) > ntm_deadband && move_or_retry && !MIP_STOP`, C
+    ///   sends `STOP_AXIS`. With `ntm == No` C never stops first — the
+    ///   axis retargets directly via the `do_work` re-issue.
+    ///
+    /// Therefore: a write during motion always re-issues the move
+    /// ([`RetargetAction::ExtendMove`], which routes through
+    /// `plan_absolute_move` whose own too-small/SPDB deadband checks
+    /// suppress no-op moves). NTM only promotes an opposite-direction,
+    /// beyond-deadband retarget to [`RetargetAction::StopAndReplan`].
     pub fn handle_retarget(&mut self, new_dval: f64) -> RetargetAction {
-        if !self.timing.ntm {
-            return RetargetAction::Ignore;
-        }
-
-        // Only retarget during active move or retry phases
+        // Only retarget during active move or retry phases. C's `do_work`
+        // re-issue and the `movn`-block STOP both require an in-flight
+        // move; MIP_STOP means a stop is already committed.
         let in_move = self.stat.mip.intersects(MipFlags::MOVE | MipFlags::RETRY);
         if !in_move || self.stat.mip.contains(MipFlags::STOP) {
             return RetargetAction::Ignore;
@@ -868,18 +888,17 @@ impl MotorRecord {
         let diff = new_dval - self.pos.drbv;
         let deadband = self.timing.ntmf * (self.retry.bdst.abs() + self.retry.rdbd);
 
-        // C: retarget only if direction changed AND error exceeds deadband
+        // C `movn`-block STOP_AXIS gate: opposite direction AND error
+        // beyond the NTM deadband AND NTM enabled.
         let sign_diff = diff >= 0.0;
         let direction_changed = sign_diff != self.stat.cdir;
 
-        if direction_changed && diff.abs() > deadband {
+        if self.timing.ntm && direction_changed && diff.abs() > deadband {
             RetargetAction::StopAndReplan
-        } else if !direction_changed {
-            // Same direction: extend the move without stopping
-            RetargetAction::ExtendMove
         } else {
-            // Direction changed but within deadband: ignore
-            RetargetAction::Ignore
+            // C `do_work` re-issues the move on every DVAL write during
+            // motion, regardless of NTM and regardless of direction.
+            RetargetAction::ExtendMove
         }
     }
 

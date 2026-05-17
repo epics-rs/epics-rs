@@ -482,11 +482,14 @@ impl ProcessState {
             let o_offset = fc.o_offset;
             let f_offset = fc.f_offset;
 
-            // C++: data[i] = oOffset + O1*filter[i] + O2*data[i]
-            //      filter[i] = fOffset + F1*filter[i] + F2*data[i]
+            // C++ NDPluginProcess.cpp doProcess (two sequential statements):
+            //   *pData   = oOffset + O1*(*pFilter) + O2*(*pData);
+            //   *pFilter = fOffset + F1*(*pFilter) + F2*(*pData);
+            // The second statement reads the JUST-UPDATED *pData, not the
+            // original input value.
             for i in 0..n {
                 let new_data = o_offset + o1 * filter[i] + o2 * values[i];
-                let new_filter = f_offset + f1 * filter[i] + f2 * values[i];
+                let new_filter = f_offset + f1 * filter[i] + f2 * new_data;
                 values[i] = new_data;
                 filter[i] = new_filter;
             }
@@ -988,14 +991,20 @@ mod tests {
             ..Default::default()
         });
 
+        // C++ NDPluginProcess.cpp doProcess recurrence (sequential):
+        //   *pData   = oOffset + O1*(*pFilter) + O2*(*pData);
+        //   *pFilter = fOffset + F1*(*pFilter) + F2*(*pData);   // uses new *pData
+        //
         // Frame 0: reset: filter=100
-        // N=1: F1=0.5, F2=0.5, O1=1
-        // data = 0+1*100+0*100 = 100, filter = 0+0.5*100+0.5*100 = 100
+        // N=1: F1=0.5, F2=0.5, O1=1, O2=0
+        // data = 0+1*100+0*100 = 100
+        // filter = 0+0.5*100+0.5*data(100) = 100
         let _ = state.process(&input1);
 
         // Frame 1: data=0, filter=100
-        // N=2: F1=0.5, F2=0.5, O1=1
-        // data = 0+1*100+0*0 = 100, filter = 0+0.5*100+0.5*0 = 50
+        // N=2: F1=0.5, F2=0.5, O1=1, O2=0
+        // data = 0+1*100+0*0 = 100
+        // filter = 0+0.5*100+0.5*data(100) = 100   (F2 multiplies the new data)
         let result = state.process(&input2).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             // Output is filter value BEFORE this update: data = O1*filter = 1*100 = 100
@@ -1055,14 +1064,16 @@ mod tests {
             ..Default::default()
         });
 
-        // Frame 0 (reset): filter = 0 + 0*filter + 1*data = 100
-        // N=1: F1=1*(1+0/1)=1, F2=1*(1+0/1)=1 → filter=0+1*100+1*100=200? No.
-        // Actually reset first: filter = rOffset + rc1*filter + rc2*data = 0 + 0*100 + 1*100 = 100
-        // Then N increments to 1, then normal path:
+        // C++ NDPluginProcess.cpp doProcess: filter update reads the NEW data:
+        //   *pData   = oOffset + O1*(*pFilter) + O2*(*pData);
+        //   *pFilter = fOffset + F1*(*pFilter) + F2*(*pData);
+        //
+        // Frame 0: reset first: filter = rOffset + rc1*filter + rc2*data
+        //          = 0 + 0*100 + 1*100 = 100. Then N increments to 1, normal path:
         // F1=fScale*(fc1+fc2/N)=1*(1+0/1)=1, F2=fScale*(fc3+fc4/N)=1*(1+0/1)=1
         // O1=oScale*(oc1+oc2/N)=1*(1+0/1)=1, O2=oScale*(oc3+oc4/N)=1*(0+0/1)=0
         // data = oOffset + O1*filter + O2*data = 0 + 1*100 + 0*100 = 100
-        // filter = fOffset + F1*filter + F2*data = 0 + 1*100 + 1*100 = 200
+        // filter = fOffset + F1*filter + F2*data(new) = 0 + 1*100 + 1*100 = 200
         let r0 = state.process(&make_f64_array(&[100.0])).unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
@@ -1072,7 +1083,7 @@ mod tests {
         // F1=1*(1+0/2)=1, F2=1*(1+0/2)=1
         // O1=1*(1+0/2)=1, O2=0
         // data = 0+1*200+0*100 = 200
-        // filter = 0+1*200+1*100 = 300
+        // filter = 0+1*200+1*data(new=200) = 400
         let r1 = state.process(&make_f64_array(&[100.0])).unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 200.0).abs() < 1e-9, "frame 1: got {v1}");
@@ -1095,10 +1106,13 @@ mod tests {
             ..Default::default()
         });
 
-        // Frame 0 (reset): filter=100
-        // N=1: O1=oScale*(0+1/1)=1, O2=0
+        // C++ NDPluginProcess.cpp doProcess: F2 multiplies the JUST-UPDATED data:
+        //   *pData   = oOffset + O1*(*pFilter) + O2*(*pData);
+        //   *pFilter = fOffset + F1*(*pFilter) + F2*(*pData);
+        //
+        // Frame 0 (reset): filter=100. N=1: O1=oScale*(0+1/1)=1, O2=0
         // data = 0 + 1*100 + 0 = 100
-        // filter = 0 + 1*100 + 1*100 = 200
+        // filter = 0 + 1*100 + 1*data(new=100) = 200
         let r0 = state.process(&make_f64_array(&[100.0])).unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
@@ -1106,28 +1120,18 @@ mod tests {
         // Frame 1: data=200, filter=200
         // N=2: O1=oScale*(0+1/2)=0.5, O2=0
         // data = 0 + 0.5*200 + 0 = 100
-        // filter = 0 + 1*200 + 1*200 = 400
+        // filter = 0 + 1*200 + 1*data(new=100) = 300
         let r1 = state.process(&make_f64_array(&[200.0])).unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 100.0).abs() < 1e-9, "frame 1: got {v1}");
 
-        // Frame 2: data=300, filter=400
+        // Frame 2: data=300, filter=300
         // N=3: O1=1/3, O2=0
-        // data = 0 + (1/3)*400 + 0 = 133.33...  but wait filter=400
-        // Actually filter = 0 + 1*400 + 1*300 = 700
-        // data = 0 + (1/3)*400 + 0 = 133.33
-        // Hmm, the output should be sum/N. After frame 2: sum=100+200+300=600, N=3, avg=200
-        // But filter tracks accumulated sum: after reset(100), then +200=300? No.
-        // Let me re-trace:
-        //   Reset: filter=100. N=1.
-        //   Frame 0 normal: filter = 0+1*100+1*100 = 200. data = 0+1*100 = 100.
-        //   Frame 1: filter = 0+1*200+1*200 = 400. N=2. data = 0+0.5*200 = 100.
-        //   Frame 2: filter = 0+1*400+1*300 = 700. N=3. data = 0+(1/3)*400 = 133.33
-        // The issue is the filter accumulates filter+data not just sum of inputs.
-        // This matches C++ behavior where the filter buffer interacts with data.
+        // data = 0 + (1/3)*300 + 0 = 100
+        // filter = 0 + 1*300 + 1*data(new=100) = 400
         let r2 = state.process(&make_f64_array(&[300.0])).unwrap();
         let v2 = r2.data.get_as_f64(0).unwrap();
-        let expected = 400.0 / 3.0; // ~133.33
+        let expected = 100.0;
         assert!((v2 - expected).abs() < 1e-9, "frame 2: got {v2}");
     }
 
@@ -1150,11 +1154,17 @@ mod tests {
             ..Default::default()
         });
 
+        // C++ NDPluginProcess.cpp doProcess: F2 multiplies the JUST-UPDATED data:
+        //   *pData   = oOffset + O1*(*pFilter) + O2*(*pData);
+        //   *pFilter = fOffset + F1*(*pFilter) + F2*(*pData);
+        // With O2=0, data == O1*filter == filter, so the filter update is
+        //   filter = F1*filter + F2*filter = (F1+F2)*filter = filter (since
+        //   F1+F2 = (N-1)/N + 1/N = 1). The recurrence holds filter constant.
+        //
         // Frame 0: reset filter=100, N=1
-        // F1=1*(1-1/1)=0, F2=1*(0+1/1)=1
-        // O1=1*(1+0/1)=1
+        // F1=1*(1-1/1)=0, F2=1*(0+1/1)=1, O1=1*(1+0/1)=1
         // data = 0 + 1*100 + 0*100 = 100
-        // filter = 0 + 0*100 + 1*100 = 100
+        // filter = 0 + 0*100 + 1*data(new=100) = 100
         let r0 = state.process(&make_f64_array(&[100.0])).unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
@@ -1162,18 +1172,18 @@ mod tests {
         // Frame 1: data=200, filter=100, N=2
         // F1=(2-1)/2=0.5, F2=1/2=0.5
         // data = 0 + 1*100 + 0*200 = 100
-        // filter = 0 + 0.5*100 + 0.5*200 = 150
+        // filter = 0 + 0.5*100 + 0.5*data(new=100) = 100
         let r1 = state.process(&make_f64_array(&[200.0])).unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
         assert!((v1 - 100.0).abs() < 1e-9, "frame 1: got {v1}");
 
-        // Frame 2: data=300, filter=150, N=3
+        // Frame 2: data=300, filter=100, N=3
         // F1=2/3, F2=1/3
-        // data = 1*150 = 150
-        // filter = (2/3)*150 + (1/3)*300 = 100+100 = 200
+        // data = 1*100 = 100
+        // filter = (2/3)*100 + (1/3)*data(new=100) = 100
         let r2 = state.process(&make_f64_array(&[300.0])).unwrap();
         let v2 = r2.data.get_as_f64(0).unwrap();
-        assert!((v2 - 150.0).abs() < 1e-9, "frame 2: got {v2}");
+        assert!((v2 - 100.0).abs() < 1e-9, "frame 2: got {v2}");
     }
 
     #[test]
@@ -1306,21 +1316,25 @@ mod tests {
             ..Default::default()
         });
 
+        // C++ NDPluginProcess.cpp doProcess: F2 multiplies the JUST-UPDATED data:
+        //   *pData   = oOffset + O1*(*pFilter) + O2*(*pData);
+        //   *pFilter = fOffset + F1*(*pFilter) + F2*(*pData);
+        //
         // Frame 0: reset: filter = 0 + 0*filter + 1*50 = 50
         // N=1: F1=2*(0+0/1)=0, F2=2*(1+0/1)=2, O1=3*(1+0/1)=3, O2=0
         // data = 5 + 3*50 + 0 = 155
-        // filter = 10 + 0*50 + 2*50 = 110
+        // filter = 10 + 0*50 + 2*data(new=155) = 320
         let r0 = state.process(&make_f64_array(&[50.0])).unwrap();
         let v0 = r0.data.get_as_f64(0).unwrap();
         assert!((v0 - 155.0).abs() < 1e-9, "frame 0: got {v0}");
 
-        // Frame 1: data=20, filter=110
+        // Frame 1: data=20, filter=320
         // N=2: F1=0, F2=2, O1=3, O2=0
-        // data = 5 + 3*110 = 335
-        // filter = 10 + 0 + 2*20 = 50
+        // data = 5 + 3*320 = 965
+        // filter = 10 + 0 + 2*data(new=965) = 1940
         let r1 = state.process(&make_f64_array(&[20.0])).unwrap();
         let v1 = r1.data.get_as_f64(0).unwrap();
-        assert!((v1 - 335.0).abs() < 1e-9, "frame 1: got {v1}");
+        assert!((v1 - 965.0).abs() < 1e-9, "frame 1: got {v1}");
     }
 
     #[test]
@@ -1405,5 +1419,66 @@ mod tests {
         assert!(state.process(&make_f64_array(&[100.0])).is_none());
         // Frame 3 reaches num_filter => output produced.
         assert!(state.process(&make_f64_array(&[100.0])).is_some());
+    }
+
+    #[test]
+    fn test_filter_recurrence_matches_cpp() {
+        // Regression for BUG 1: the filter-state update must read the
+        // JUST-UPDATED data, not the original input value.
+        //
+        // C++ NDPluginProcess.cpp doProcess (two sequential statements):
+        //   *pData   = oOffset + O1*(*pFilter) + O2*(*pData);
+        //   *pFilter = fOffset + F1*(*pFilter) + F2*(*pData);   // new *pData
+        //
+        // Average preset: fc=[1,0,1,0], oc=[0,1,0,0], rc=[0,1].
+        // O1=1/N, O2=0, F1=1, F2=1, all offsets/scales default (0/1).
+        // With O2=0 and oc default, data[k] = (1/N)*filter, so the C++
+        // recurrence is:
+        //   data[k]   = filter / N
+        //   filter'   = filter + data[k]   (F2 multiplies the new data)
+        //
+        // Hand-computed reference (inputs 100, 200, 300, 400):
+        //   reset: filter = 100, N = 1
+        //   k0: N=1  data = 100/1 = 100   filter = 100 + 100 = 200
+        //   k1: N=2  data = 200/2 = 100   filter = 200 + 100 = 300
+        //   k2: N=3  data = 300/3 = 100   filter = 300 + 100 = 400
+        //   k3: N=4  data = 400/4 = 100   filter = 400 + 100 = 500
+        //
+        // The STALE-input variant (BUG 1) would instead compute
+        //   filter' = filter + input
+        // giving filter = 100,300,600,1000 and data = 100,150,200,250 —
+        // diverging from C++ from frame 1 onward.
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_filter: true,
+            filter: FilterConfig {
+                num_filter: 100,
+                fc: [1.0, 0.0, 1.0, 0.0],
+                oc: [0.0, 1.0, 0.0, 0.0],
+                rc: [0.0, 1.0],
+                ..Default::default()
+            },
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        });
+
+        let inputs = [100.0, 200.0, 300.0, 400.0];
+        let expected_data = [100.0, 100.0, 100.0, 100.0];
+        let expected_filter = [200.0, 300.0, 400.0, 500.0];
+
+        for k in 0..inputs.len() {
+            let r = state.process(&make_f64_array(&[inputs[k]])).unwrap();
+            let v = r.data.get_as_f64(0).unwrap();
+            assert!(
+                (v - expected_data[k]).abs() < 1e-9,
+                "frame {k}: data got {v}, expected {}",
+                expected_data[k]
+            );
+            let fs = state.filter_state.as_ref().unwrap()[0];
+            assert!(
+                (fs - expected_filter[k]).abs() < 1e-9,
+                "frame {k}: filter got {fs}, expected {}",
+                expected_filter[k]
+            );
+        }
     }
 }

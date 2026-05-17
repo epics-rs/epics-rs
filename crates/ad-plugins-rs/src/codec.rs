@@ -853,9 +853,9 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
     let mut arr = src.clone();
     arr.attributes.add(NDAttribute::new_static(
         ATTR_ORIGINAL_DATA_TYPE,
-        String::new(),
+        "Original NDDataType ordinal before codec compression",
         NDAttrSource::Driver,
-        NDAttrValue::Int64(src.data.data_type() as u8 as i64),
+        NDAttrValue::UInt8(src.data.data_type() as u8),
     ));
     arr.data = NDDataBuffer::U8(compressed);
     arr.codec = Some(Codec {

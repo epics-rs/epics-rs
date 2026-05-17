@@ -170,9 +170,16 @@ impl BadPixelProcessor {
 
         // Convert a sensor-space coordinate to a flat array offset, or None if
         // it falls outside the readout window (C++ computePixelOffset).
+        //
+        // The division must FLOOR, not truncate toward zero: with binning > 1
+        // a sensor coordinate just left/above the readout window has a
+        // negative numerator (`sx - offset_x`). Plain `/` truncates e.g.
+        // `-1 / 2` to `0`, which would alias an out-of-window pixel onto array
+        // index 0. `div_euclid` with a positive divisor floors, so the result
+        // stays negative and is correctly rejected by the `>= 0` bounds test.
         let pixel_offset = |sx: i64, sy: i64| -> Option<usize> {
-            let x = (sx - offset_x) / binning_x.max(1);
-            let y = (sy - offset_y) / binning_y.max(1);
+            let x = (sx - offset_x).div_euclid(binning_x.max(1));
+            let y = (sy - offset_y).div_euclid(binning_y.max(1));
             if x >= 0 && y >= 0 && x < width as i64 && y < height as i64 {
                 Some(y as usize * width + x as usize)
             } else {

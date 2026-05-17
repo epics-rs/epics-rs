@@ -888,6 +888,62 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Materialise every `<hardlink>` declared in the loaded layout XML.
+    ///
+    /// A layout `<hardlink name="..." target="..."/>` inside a `<group>`
+    /// declares an HDF5 hard link: an additional name (`name`, a leaf within
+    /// the enclosing group) for the object already living at `target` (an
+    /// absolute object path). C++ `NDFileHDF5::createHardLinks` walks the
+    /// layout after the groups/datasets exist and calls `H5Lcreate_hard`.
+    ///
+    /// Called from `close_file` so that both the primary image dataset and the
+    /// per-frame NDAttribute datasets — any of which a hardlink may target —
+    /// already exist on disk. No-op when no layout is loaded.
+    fn build_layout_hardlinks(&self) -> ADResult<()> {
+        let layout = match self.layout.as_ref() {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let file = match self.handle {
+            Some(Hdf5Handle::Standard { ref file, .. }) => file,
+            _ => return Ok(()),
+        };
+        // Collect (parent_group_path, hardlink) for every group in the tree.
+        fn collect<'a>(
+            g: &'a crate::hdf5_layout::LayoutGroup,
+            prefix: &str,
+            out: &mut Vec<(String, &'a crate::hdf5_layout::LayoutHardlink)>,
+        ) {
+            let here = if prefix.is_empty() {
+                g.name.clone()
+            } else {
+                format!("{}/{}", prefix, g.name)
+            };
+            for hl in &g.hardlinks {
+                out.push((here.clone(), hl));
+            }
+            for sub in &g.groups {
+                collect(sub, &here, out);
+            }
+        }
+        let mut links = Vec::new();
+        for g in &layout.groups {
+            collect(g, "", &mut links);
+        }
+        for (parent_path, hl) in &links {
+            // The enclosing group already exists (created by
+            // `build_layout_groups`); re-open it and create the link inside it.
+            let parent = Self::open_write_group(file, parent_path)?;
+            parent.link(&hl.name, &hl.target).map_err(|e| {
+                ADError::UnsupportedConversion(format!(
+                    "HDF5 layout hardlink '{}/{}' -> '{}': {}",
+                    parent_path, hl.name, hl.target, e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Re-open an already-created group by full path in write mode. In write
     /// mode `H5Group::group` returns a handle without verification, so this is
     /// a pure handle constructor walking each path segment.
@@ -1593,6 +1649,9 @@ impl NDFileWriter for Hdf5Writer {
                 self.finalize_standard_primary()?;
                 self.flush_attribute_datasets()?;
                 self.flush_performance_dataset()?;
+                // Materialise layout `<hardlink>` elements last, once every
+                // dataset a link may target exists on disk.
+                self.build_layout_hardlinks()?;
                 self.handle = None;
             }
             Some(Hdf5Handle::Swmr { .. }) => {
@@ -3035,6 +3094,68 @@ mod tests {
         let read_arr = reader.read_file().unwrap();
         assert_eq!(read_arr.dims.len(), 3);
 
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
+    }
+
+    #[test]
+    fn test_layout_hardlink_is_materialised() {
+        // Regression for BUG 2: a `<hardlink>` declared in the layout XML must
+        // produce a real HDF5 hard link in the written file. C ADCore
+        // `NDFileHDF5::createHardLinks` walks the layout and calls
+        // `H5Lcreate_hard`; without that, files written from a layout with a
+        // `<hardlink>` silently lack the link.
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_layout_hardlink.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <group name="entry">
+                <group name="data">
+                  <dataset name="data" source="detector" det_default="true"/>
+                  <hardlink name="data_alias" target="/entry/data/data"/>
+                </group>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_layout_hardlink");
+        let mut writer = Hdf5Writer::new();
+        assert!(
+            writer.set_layout_filename(layout.to_str().unwrap()),
+            "layout XML must parse: {}",
+            writer.layout_error
+        );
+
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let names = h5.dataset_names();
+        // The primary dataset at its layout path.
+        assert!(
+            names.contains(&"entry/data/data".to_string()),
+            "image dataset must exist at the layout path; got {:?}",
+            names
+        );
+        // The hard link is an additional name resolving to the same object.
+        assert!(
+            names.contains(&"entry/data/data_alias".to_string()),
+            "layout <hardlink> must be materialised as a hard link; got {:?}",
+            names
+        );
+        // The link shares the target object: same shape, readable as a dataset.
+        let alias = h5.dataset("entry/data/data_alias").unwrap();
+        let orig = h5.dataset("entry/data/data").unwrap();
+        assert_eq!(alias.shape(), orig.shape());
+
+        drop(h5);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&layout).ok();
     }

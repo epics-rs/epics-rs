@@ -420,10 +420,20 @@ pub fn extract_roi_2d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
         // Convert via color module
         let mut temp = NDArray::new(arr.dims.clone(), src.data.data_type());
         temp.data = out_data;
-        if let Ok(converted) = ad_core_rs::color::convert_data_type(&temp, target_type) {
-            arr.data = converted.data;
-        } else {
-            arr.data = out_data_fallback(&temp.data, target_type, temp.data.len());
+        match ad_core_rs::color::convert_data_type(&temp, target_type) {
+            Ok(converted) => arr.data = converted.data,
+            Err(e) => {
+                // A data-type conversion failure must NOT publish an all-zero
+                // buffer as if it were valid ROI output. Drop the frame and
+                // log; the caller treats `None` as "no output this frame".
+                tracing::warn!(
+                    error = %e,
+                    from = ?src.data.data_type(),
+                    to = ?target_type,
+                    "ROI output data-type conversion failed; dropping frame"
+                );
+                return None;
+            }
         }
     }
 
@@ -431,10 +441,6 @@ pub fn extract_roi_2d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     arr.timestamp = src.timestamp;
     arr.attributes = src.attributes.clone();
     Some(arr)
-}
-
-fn out_data_fallback(_src: &NDDataBuffer, target: NDDataType, len: usize) -> NDDataBuffer {
-    NDDataBuffer::zeros(target, len)
 }
 
 /// Per-dimension param reasons.

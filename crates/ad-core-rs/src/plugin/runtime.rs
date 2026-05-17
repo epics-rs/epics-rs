@@ -1091,6 +1091,50 @@ where
     n
 }
 
+/// Bit-reinterpret an unsigned source element as the same-width signed
+/// destination element. C++ `NDStdArrays` serves the raw NDArray bytes to the
+/// asyn array reader unchanged; for a same-width unsigned->signed pair (e.g. a
+/// `U8` NDArray read through `readInt8Array`) that is a bitwise reinterpret,
+/// NOT a numeric clamp. Routing such a pair through `copy_convert`'s f64
+/// round-trip would saturate (255u8 -> 127i8) and diverge from C++.
+trait ReinterpretAs<D> {
+    fn reinterpret(self) -> D;
+}
+impl ReinterpretAs<i8> for u8 {
+    fn reinterpret(self) -> i8 {
+        self as i8
+    }
+}
+impl ReinterpretAs<i16> for u16 {
+    fn reinterpret(self) -> i16 {
+        self as i16
+    }
+}
+impl ReinterpretAs<i32> for u32 {
+    fn reinterpret(self) -> i32 {
+        self as i32
+    }
+}
+impl ReinterpretAs<i64> for u64 {
+    fn reinterpret(self) -> i64 {
+        self as i64
+    }
+}
+
+/// Copy a same-width unsigned source slice into a signed destination buffer by
+/// bitwise reinterpretation (see [`ReinterpretAs`]).
+fn copy_reinterpret<S, D>(src: &[S], dst: &mut [D]) -> usize
+where
+    S: ReinterpretAs<D> + Copy,
+    D: Copy,
+{
+    let n = src.len().min(dst.len());
+    for i in 0..n {
+        dst[i] = src[i].reinterpret();
+    }
+    n
+}
+
 /// Helper trait for `as f64` casts (handles lossy conversions like i64/u64).
 trait CastToF64 {
     fn cast_to_f64(self) -> f64;
@@ -1167,6 +1211,11 @@ impl CastFromF64 for i32 {
         v as i32
     }
 }
+impl CastFromF64 for i64 {
+    fn cast_from_f64(v: f64) -> Self {
+        v as i64
+    }
+}
 impl CastFromF64 for f32 {
     fn cast_from_f64(v: f64) -> Self {
         v as f32
@@ -1181,7 +1230,11 @@ impl CastFromF64 for f64 {
 /// Copy NDArray data into the output buffer with type conversion.
 /// Returns the number of elements copied, or 0 if no data is available.
 macro_rules! impl_read_array {
-    ($self:expr, $buf:expr, $direct_variant:ident, $( $variant:ident ),*) => {{
+    (
+        $self:expr, $buf:expr, $direct_variant:ident,
+        reinterpret: [ $( $reinterpret_variant:ident ),* ],
+        convert: [ $( $variant:ident ),* ]
+    ) => {{
         use crate::ndarray::NDDataBuffer;
         let handle = match &$self.array_data {
             Some(h) => h,
@@ -1194,6 +1247,7 @@ macro_rules! impl_read_array {
         };
         let n = match &array.data {
             NDDataBuffer::$direct_variant(v) => copy_direct(v, $buf),
+            $( NDDataBuffer::$reinterpret_variant(v) => copy_reinterpret(v, $buf), )*
             $( NDDataBuffer::$variant(v) => copy_convert(v, $buf), )*
         };
         Ok(n)
@@ -1245,23 +1299,53 @@ impl PortDriver for PluginPortDriver {
     }
 
     fn read_int8_array(&mut self, _user: &AsynUser, buf: &mut [i8]) -> AsynResult<usize> {
-        impl_read_array!(self, buf, I8, U8, I16, U16, I32, U32, I64, U64, F32, F64)
+        // U8 -> i8 is a bitwise reinterpret (C++ NDStdArrays serves raw bytes);
+        // every other source type is a numeric conversion.
+        impl_read_array!(
+            self, buf, I8,
+            reinterpret: [U8],
+            convert: [I16, U16, I32, U32, I64, U64, F32, F64]
+        )
     }
 
     fn read_int16_array(&mut self, _user: &AsynUser, buf: &mut [i16]) -> AsynResult<usize> {
-        impl_read_array!(self, buf, I16, I8, U8, U16, I32, U32, I64, U64, F32, F64)
+        impl_read_array!(
+            self, buf, I16,
+            reinterpret: [U16],
+            convert: [I8, U8, I32, U32, I64, U64, F32, F64]
+        )
     }
 
     fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
-        impl_read_array!(self, buf, I32, I8, U8, I16, U16, U32, I64, U64, F32, F64)
+        impl_read_array!(
+            self, buf, I32,
+            reinterpret: [U32],
+            convert: [I8, U8, I16, U16, I64, U64, F32, F64]
+        )
+    }
+
+    fn read_int64_array(&mut self, _user: &AsynUser, buf: &mut [i64]) -> AsynResult<usize> {
+        impl_read_array!(
+            self, buf, I64,
+            reinterpret: [U64],
+            convert: [I8, U8, I16, U16, I32, U32, F32, F64]
+        )
     }
 
     fn read_float32_array(&mut self, _user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
-        impl_read_array!(self, buf, F32, I8, U8, I16, U16, I32, U32, I64, U64, F64)
+        impl_read_array!(
+            self, buf, F32,
+            reinterpret: [],
+            convert: [I8, U8, I16, U16, I32, U32, I64, U64, F64]
+        )
     }
 
     fn read_float64_array(&mut self, _user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
-        impl_read_array!(self, buf, F64, I8, U8, I16, U16, I32, U32, I64, U64, F32)
+        impl_read_array!(
+            self, buf, F64,
+            reinterpret: [],
+            convert: [I8, U8, I16, U16, I32, U32, I64, U64, F32]
+        )
     }
 }
 

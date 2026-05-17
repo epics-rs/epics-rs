@@ -113,6 +113,47 @@ impl Default for ThrottleRecord {
     }
 }
 
+/// Upper bound (exclusive) on the `DLY` field, in seconds.
+///
+/// `process()` converts `self.dly` into a `std::time::Duration` via
+/// `Duration::from_secs_f64`, which panics not only on a non-finite
+/// argument but on any finite value too large for a `Duration` to
+/// represent (≈ `u64::MAX` seconds ≈ 1.8e19, message "value is either
+/// too big or NaN"). A CA put of e.g. `DLY = 1e300` is a perfectly
+/// finite f64 and would otherwise slip past an `is_finite()` guard and
+/// panic the record task.
+///
+/// A throttle delay of 24 hours is already far past any realistic
+/// device-protection interval, so this finite cap is the operational
+/// ceiling for `DLY`. It is also orders of magnitude below the
+/// `Duration` overflow point, so any `self.dly` accepted by the writer
+/// guard is guaranteed safe for `Duration::from_secs_f64`.
+const MAX_DLY: f64 = 86_400.0;
+
+/// Validate a candidate `DLY` value (seconds).
+///
+/// Returns `Ok(())` only for a value that can never make
+/// `Duration::from_secs_f64(self.dly)` panic in `process()`: it must
+/// be finite and at most [`MAX_DLY`]. A negative value is accepted
+/// here — C `special()` clamps it to 0 and `process()` treats any
+/// `dly <= 0.0` as "no delay" without constructing a `Duration` — so
+/// negativity is not a panic hazard. This is the single guard every
+/// writer of `self.dly` must pass through to hold the invariant
+/// "`self.dly` can never make `Duration::from_secs_f64` panic".
+fn validate_dly(v: f64) -> CaResult<()> {
+    if !v.is_finite() {
+        return Err(CaError::InvalidValue(format!(
+            "throttle DLY must be finite, got {v}"
+        )));
+    }
+    if v > MAX_DLY {
+        return Err(CaError::InvalidValue(format!(
+            "throttle DLY must not exceed {MAX_DLY} seconds, got {v}"
+        )));
+    }
+    Ok(())
+}
+
 impl ThrottleRecord {
     /// Check drive limits and optionally clip the value.
     ///
@@ -502,9 +543,21 @@ impl Record for ThrottleRecord {
             // the record Busy; the port re-derives the remaining delay
             // from `last_send_time` + the new DLY on the next process,
             // so a shrunk DLY takes effect on the next drain attempt.
+            //
+            // `special()` runs after the field write. `put_field("DLY")`
+            // already rejects non-finite and huge-but-finite values via
+            // `validate_dly`, so a CA/db path can never leave `self.dly`
+            // out of range here. The clamp below additionally enforces
+            // the `Duration::from_secs_f64` invariant for any other
+            // writer of `self.dly` (e.g. in-process callers), so every
+            // reader downstream of `special()` is safe.
             "DLY" => {
                 if self.dly < 0.0 {
                     self.dly = 0.0;
+                } else if validate_dly(self.dly).is_err() {
+                    // Non-finite or >= MAX_DLY: clamp to the operational
+                    // ceiling so `process()` never panics.
+                    self.dly = MAX_DLY;
                 }
             }
             // C `special()` DRVLH/DRVLL case (lines 411-440). When the
@@ -618,18 +671,18 @@ impl Record for ThrottleRecord {
                 EpicsValue::Double(v) => {
                     // C `throttleRecord.c` models the delay with
                     // `Duration::from_secs_f64(self.dly)` in `process()`,
-                    // which panics on a non-finite argument. C's
-                    // `special()` DLY handler (lines 392-409) only ever
-                    // anticipated a negative delay; a CA put of `+inf`
-                    // or `NaN` is not a value any real delay can
-                    // represent. Reject it at the single writer of
-                    // `self.dly` so the record task can never panic and
-                    // `self.dly` stays finite and >= 0 as an invariant.
-                    if !v.is_finite() {
-                        return Err(CaError::InvalidValue(format!(
-                            "throttle DLY must be finite, got {v}"
-                        )));
-                    }
+                    // which panics not only on a non-finite argument but
+                    // on any finite value too large for a `Duration`
+                    // (≈ 1.8e19; message "value is either too big or
+                    // NaN"). C's `special()` DLY handler (lines 392-409)
+                    // only ever anticipated a negative delay; a CA put of
+                    // `+inf`, `NaN`, or a huge-but-finite f64 like `1e300`
+                    // is not a value any real delay can represent. Reject
+                    // it here, at the single writer of `self.dly`, so the
+                    // record task can never panic — `validate_dly` is the
+                    // gate that holds the invariant "`self.dly` can never
+                    // make `Duration::from_secs_f64` panic".
+                    validate_dly(v)?;
                     self.dly = v;
                     Ok(())
                 }

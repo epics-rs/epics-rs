@@ -694,3 +694,71 @@ fn test_dly_infinity_does_not_panic_process() {
     // Must not panic.
     rec.process().unwrap();
 }
+
+#[test]
+fn test_dly_huge_finite_rejected() {
+    // A huge-but-finite f64 like 1e300 passes an `is_finite()` check
+    // yet is far too large for `Duration::from_secs_f64` to represent
+    // (panic: "value is either too big or NaN"). put_field must reject
+    // it so it never reaches `process()`.
+    let mut rec = ThrottleRecord::default();
+    assert!(
+        rec.put_field("DLY", EpicsValue::Double(1e300)).is_err(),
+        "a CA put of DLY = 1e300 must be rejected, not stored"
+    );
+    assert_eq!(rec.dly, 0.0, "DLY must keep its prior finite value");
+}
+
+#[test]
+fn test_dly_huge_finite_does_not_panic_process() {
+    // Regression for the round-2 review bug: a CA put of DLY = 1e300
+    // (finite, so it slipped past the old `is_finite()` guard) was
+    // stored and then panicked the record task at
+    // `Duration::from_secs_f64(self.dly)` because `self.dly > 0.0` is
+    // true for 1e300. After the fix the put is rejected, DLY keeps its
+    // prior value (0.0), and a full process() cycle that reaches the
+    // send path completes without panicking.
+    let mut rec = ThrottleRecord::default();
+    rec.out = "OUTPUT:PV".to_string();
+    assert!(
+        rec.put_field("DLY", EpicsValue::Double(1e300)).is_err(),
+        "DLY = 1e300 must be rejected"
+    );
+    assert_eq!(rec.dly, 0.0, "rejected put must leave DLY unchanged");
+
+    rec.val = 1.0;
+    // process() reaches the `self.dly > 0.0` branch decision and the
+    // immediate-send path; with DLY = 0.0 it builds no Duration and
+    // must not panic.
+    let outcome = rec.process().unwrap();
+    assert_eq!(rec.sent, 1.0, "value must have been sent");
+    assert_eq!(rec.wait, 0, "no delay armed, WAIT stays clear");
+    let _ = outcome;
+}
+
+#[test]
+fn test_dly_huge_finite_assigned_directly_does_not_panic_process() {
+    // Belt-and-braces: if a huge DLY were assigned to `self.dly` by
+    // some path other than put_field, process() must still not panic.
+    // `process()` builds `Duration::from_secs_f64(self.dly)` whenever
+    // `self.dly > 0.0`, so a guard that lived only in put_field would
+    // not cover this. The clamp lives in the writer/`special()` gate;
+    // exercise a process() cycle after a special() clamp to prove the
+    // armed-delay path is safe.
+    let mut rec = ThrottleRecord::default();
+    rec.out = "OUTPUT:PV".to_string();
+    rec.dly = 1e300;
+    rec.special("DLY", true).unwrap();
+    assert!(
+        rec.dly.is_finite() && rec.dly <= 86_400.0,
+        "special() must clamp a huge DLY to a Duration-safe ceiling, got {}",
+        rec.dly
+    );
+
+    rec.val = 1.0;
+    // self.dly > 0.0 now, so process() builds a Duration and arms the
+    // delay timer. Must not panic.
+    let outcome = rec.process().unwrap();
+    assert_eq!(rec.wait, 1, "a positive DLY arms the delay, WAIT set");
+    let _ = outcome;
+}

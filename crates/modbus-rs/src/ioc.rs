@@ -593,11 +593,17 @@ impl PortDriver for ModbusPortDriver {
         // Otherwise a Modbus data array — one element per `register_count`.
         let dt = self.datatype_of(user.reason)?;
         let rc = dt.register_count().max(1);
-        // Absolute mode: C `readInt32Array` reads `modbusLength_` words at the
-        // wire address, then decodes elements from offset 0.
+        // Absolute mode: C `readInt32Array` (drvModbusAsyn.cpp:1294-1295)
+        // issues `doModbusIO(..., std::min((int)maxChans, modbusLength_))` —
+        // it requests the smaller of the record's array length (`maxChans`,
+        // i.e. `buf.len()`) and `modbusLength_` (`config.length`). It then
+        // decodes elements from offset 0. (`readFloat64Array`,
+        // drvModbusAsyn.cpp:1125-1126, uses the bare `modbusLength_` instead,
+        // so `read_float64_array` differs deliberately.)
         if self.is_absolute() {
             self.engine.check_offset(user.addr).map_err(to_asyn)?;
-            let words = self.read_absolute_words(user.addr, self.engine.config().length)?;
+            let count = buf.len().min(self.engine.config().length);
+            let words = self.read_absolute_words(user.addr, count)?;
             let mut n = 0;
             while n < buf.len() && (n + 1) * rc <= words.len() {
                 buf[n] = datatype::read_int32(dt, &words[n * rc..])
@@ -1267,6 +1273,53 @@ mod tests {
             &frames[0][6..12],
             &[0x01, 0x03, 0x27, 0x10, 0x00, 0x04],
             "read_float64 must request a fixed 4-register count (C min(4,len))"
+        );
+    }
+
+    /// Absolute-mode `read_int32_array` with a record array length
+    /// (`buf.len()`) smaller than `config.length`: C `readInt32Array`
+    /// (drvModbusAsyn.cpp:1294-1295) issues
+    /// `doModbusIO(..., std::min((int)maxChans, modbusLength_))`, so the
+    /// on-wire request must ask for `min(buf.len(), config.length)` registers
+    /// — not the bare `config.length`, which would over-read. With a 4-element
+    /// record buffer and `config.length` 16, the request count must be 4.
+    #[test]
+    fn absolute_read_int32_array_request_clamps_to_record_array_length() {
+        // ReadHoldingRegisters response for four words: 0x0001..=0x0004.
+        let pdu = [
+            0x01u8, 0x03, 0x08, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04,
+        ];
+        let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
+        let written = transport.written_handle();
+        // `config.length` 16 is larger than the 4-element record buffer.
+        let mut driver = ModbusPortDriver::new(
+            "MB_ABS_I32ARR_LEN",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(transport),
+        )
+        .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0x2710;
+        // Record array length (`NELM` / `maxChans`) is 4, below config.length.
+        let mut buf = [0i32; 4];
+        let n = driver
+            .read_int32_array(&user, &mut buf)
+            .expect("absolute int32-array read must succeed");
+        assert_eq!(n, 4, "all 4 record-buffer elements must decode");
+        assert_eq!(buf, [1, 2, 3, 4], "decoded values from response offset 0");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 1, "exactly one absolute read request");
+        // The on-wire request must ask for 4 registers — min(buf.len()=4,
+        // config.length=16) — matching C `min(maxChans, modbusLength_)`.
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x03, 0x27, 0x10, 0x00, 0x04],
+            "request count must be min(buf.len(), config.length) = 4, not 16"
         );
     }
 

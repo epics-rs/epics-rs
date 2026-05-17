@@ -147,7 +147,7 @@ pub fn request_to_mask(
     if !any_matched {
         return Err(RequestMaskError::EmptyMask);
     }
-    mask.set(0); // root
+    mask.set(0); // root — pvxs `testpvreq.cpp` request/selection-mask parity
     Ok(mask)
 }
 

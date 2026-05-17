@@ -267,6 +267,17 @@ where
     let nbytes = n
         .checked_mul(N)
         .ok_or_else(|| decode_err!("scalar array element count × size overflows"))?;
+    // P-G22: a hostile peer can declare `n` up to u32::MAX; `get_bytes`
+    // would eagerly `vec![0u8; nbytes]` (multi-GB) before `read_exact`
+    // can fail. The frame can only ever carry `remaining` bytes, so a
+    // declared length larger than that is unsatisfiable — reject it
+    // before allocating.
+    let remaining = cur.get_ref().len().saturating_sub(cur.position() as usize);
+    if nbytes > remaining {
+        return Err(decode_err!(
+            "scalar array length {n} ({nbytes} bytes) exceeds {remaining} remaining"
+        ));
+    }
     let bytes = cur.get_bytes(nbytes)?;
     if same_endian {
         // Allocate an aligned Vec<T>, memcpy bytes in.
@@ -883,26 +894,35 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
             },
         ) => {
             // Union: selector (Size) followed by the chosen variant's value.
-            // -1 → null marker (0xFF).
-            if *selector < 0 {
-                out.put_u8(0xFF);
-            } else {
-                encode_size_into(*selector as u32, order, out);
-                if let Some((_, vdesc)) = variants.get(*selector as usize) {
+            // -1 → null marker (0xFF). An out-of-range selector would emit
+            // a size with no value bytes and desync the frame — clamp it
+            // to the null marker instead.
+            match usize::try_from(*selector)
+                .ok()
+                .and_then(|idx| variants.get(idx).map(|v| (idx, v)))
+            {
+                Some((idx, (_, vdesc))) => {
+                    encode_size_into(idx as u32, order, out);
                     encode_pv_field(value, vdesc, order, out);
                 }
+                None => out.put_u8(0xFF),
             }
         }
         (FieldDesc::UnionArray { variants, .. }, PvField::UnionArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
             for it in items {
-                if it.selector < 0 {
-                    out.put_u8(0xFF);
-                } else {
-                    encode_size_into(it.selector as u32, order, out);
-                    if let Some((_, vdesc)) = variants.get(it.selector as usize) {
+                // Out-of-range selector → null marker, mirroring the
+                // scalar Union arm; emitting a size with no value would
+                // desync the frame.
+                match usize::try_from(it.selector)
+                    .ok()
+                    .and_then(|idx| variants.get(idx).map(|v| (idx, v)))
+                {
+                    Some((idx, (_, vdesc))) => {
+                        encode_size_into(idx as u32, order, out);
                         encode_pv_field(&it.value, vdesc, order, out);
                     }
+                    None => out.put_u8(0xFF),
                 }
             }
         }
@@ -1142,14 +1162,82 @@ fn value_fits_desc(value: &PvField, desc: &FieldDesc) -> bool {
     }
 }
 
+/// Canonicalize a *selection* bitset (e.g. the output of
+/// [`crate::pv_request::request_to_mask`]) into a valid wire
+/// *changed*-bitset.
+///
+/// A selection mask freely sets a structure bit alongside a *partial*
+/// set of its descendants — that is correct for request/intersection
+/// logic but wrong as a wire changed-bitset, where (pvData §5.4 / pvxs
+/// `BitSet`) a set structure bit means "the whole subtree changed".
+/// Feeding such a mask straight to [`encode_pv_field_with_bitset`]
+/// would emit the entire structure and defeat the field filter.
+///
+/// This walks `desc` and, for every structure node, sets the node's
+/// bit **iff every descendant bit is set** in `selection`; otherwise it
+/// clears the structure bit and keeps the descendant bits. Leaf bits
+/// are copied verbatim. The result encodes and decodes symmetrically
+/// under the §5.4 semantics enforced by `*_with_bitset`.
+pub fn canonical_changed_bitset(
+    desc: &FieldDesc,
+    selection: &crate::proto::BitSet,
+) -> crate::proto::BitSet {
+    fn all_descendants_set(sel: &crate::proto::BitSet, pos: usize, desc_local: &FieldDesc) -> bool {
+        let total = desc_local.total_bits();
+        (0..total).all(|i| sel.get(pos + i))
+    }
+
+    fn walk(
+        desc: &FieldDesc,
+        bit_offset: usize,
+        selection: &crate::proto::BitSet,
+        out: &mut crate::proto::BitSet,
+    ) {
+        match desc {
+            FieldDesc::Structure { fields, .. } => {
+                if all_descendants_set(selection, bit_offset, desc) {
+                    // Whole subtree selected → a single structure bit
+                    // legitimately conveys it; descendant bits are
+                    // redundant but harmless, so set them too for an
+                    // unambiguous "all present" mask.
+                    let total = desc.total_bits();
+                    for i in 0..total {
+                        out.set(bit_offset + i);
+                    }
+                } else {
+                    // Partial → leave the structure bit clear; recurse.
+                    let mut child_bit = bit_offset + 1;
+                    for (_, child) in fields {
+                        walk(child, child_bit, selection, out);
+                        child_bit += child.total_bits();
+                    }
+                }
+            }
+            _ => {
+                if selection.get(bit_offset) {
+                    out.set(bit_offset);
+                }
+            }
+        }
+    }
+
+    let mut out = crate::proto::BitSet::new();
+    walk(desc, 0, selection, &mut out);
+    out
+}
+
 /// Encode the value bytes for `value` consulting `bitset` to know which
 /// fields to emit. Mirrors pvxs `to_wire_valid(buf, value)`.
 ///
 /// pvData spec §5.4 bit numbering: the root structure is bit 0, then
-/// nested fields are numbered depth-first in declaration order. A
-/// substructure is "present" when its own bit OR any descendant bit
-/// is set — in that case we recurse and emit each child according to
-/// its own bit. Fields whose bit is NOT set produce *no bytes*.
+/// nested fields are numbered depth-first in declaration order.
+///
+/// A COMPOUND (structure) node whose OWN bit is set means the *entire*
+/// subtree changed — pvxs `BitSet` compresses "all descendants set" into
+/// the parent bit, so when the own bit is set we emit every descendant
+/// leaf regardless of whether its individual bit is set. When only some
+/// descendant bits are set we recurse per-child. A subtree with neither
+/// the own bit nor any descendant bit set produces *no bytes*.
 pub fn encode_pv_field_with_bitset(
     value: &PvField,
     desc: &FieldDesc,
@@ -1187,6 +1275,12 @@ pub fn encode_pv_field_with_bitset(
             // else: emit no bytes
         }
         FieldDesc::Structure { fields, .. } => {
+            // Own bit set → the whole subtree changed; emit every
+            // descendant leaf unconditionally (pvxs BitSet compression).
+            if bitset.get(bit_offset) {
+                encode_pv_field(value, desc, order, out);
+                return;
+            }
             if !any_descendant_set(bitset, bit_offset, desc) {
                 return;
             }
@@ -1266,8 +1360,15 @@ pub fn decode_pv_field_with_bitset(
             }
         }
         FieldDesc::Structure { struct_id, fields } => {
-            // The root struct is "present" if its own bit OR any descendant
-            // is set. If neither, return a default-filled structure.
+            // Own bit set → the peer emitted the entire subtree (pvxs
+            // BitSet compresses "all descendants set" into the parent
+            // bit). Consume the whole subtree so the cursor stays in
+            // sync, regardless of descendant bits.
+            if bitset.get(bit_offset) {
+                return decode_pv_field(desc, cur, order);
+            }
+            // The struct is "present" only if some descendant bit is
+            // set. If none, return a default-filled structure.
             if !any_descendant_set(bitset, bit_offset, desc) {
                 return Ok(default_value_for(desc));
             }
@@ -1317,6 +1418,12 @@ pub fn fill_unmarked_from_prior(
                 // Unmarked leaf: carry over from prior.
                 prior.clone()
             }
+        }
+        FieldDesc::Structure { .. } if bitset.get(bit_offset) => {
+            // Own bit set → the decoder emitted the whole subtree fresh
+            // (pvxs BitSet compression). Every descendant leaf is
+            // freshly updated; keep the decoded value verbatim.
+            decoded
         }
         FieldDesc::Structure { struct_id, fields } => {
             // Walk each child; recurse to honour per-field marking.
@@ -2183,5 +2290,288 @@ mod tests {
             other => panic!("expected union, got {other:?}"),
         }
         assert_eq!(cur.remaining(), 0);
+    }
+
+    // ── CRITICAL 1: compressed-bitset structure delta semantics ──────────
+
+    /// `{ value: Double, alarm: Struct { severity: Int, status: Int } }`.
+    /// Bit layout (depth-first §5.4): root=0, value=1, alarm=2,
+    /// severity=3, status=4. total_bits = 5.
+    fn nested_alarm_desc() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "test:S:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        }
+    }
+
+    fn nested_alarm_value(value: f64, sev: i32, status: i32) -> PvField {
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(sev))));
+        alarm
+            .fields
+            .push(("status".into(), PvField::Scalar(ScalarValue::Int(status))));
+        let mut root = PvStructure::new("test:S:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(value))));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        PvField::Structure(root)
+    }
+
+    /// pvxs `BitSet` compresses "all descendants set" into the parent
+    /// structure bit. When that compressed parent bit is set but the
+    /// descendant leaf bits are clear, the encoder must emit the WHOLE
+    /// subtree and the decoder must consume it — otherwise the cursor
+    /// desyncs and the next field decodes garbage.
+    #[test]
+    fn compressed_bitset_struct_bit_round_trips() {
+        let desc = nested_alarm_desc();
+        let value = nested_alarm_value(42.0, 2, 5);
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            // Compressed delta: only the `alarm` struct's own bit (2) is
+            // set; its children (3, 4) are clear. value (bit 1) clear.
+            let mut bs = crate::proto::BitSet::new();
+            bs.set(2);
+
+            let mut buf = Vec::new();
+            encode_pv_field_with_bitset(&value, &desc, &bs, 0, order, &mut buf);
+
+            // The whole `alarm` subtree (2 Int = 8 bytes) must be emitted;
+            // `value` (bit 1 clear) must NOT be.
+            assert_eq!(buf.len(), 8, "alarm subtree only, order={order:?}");
+
+            // Append a sentinel Int so a desynced decode would be caught.
+            buf.put_i32(0x7EAD, order);
+
+            let mut cur = Cursor::new(buf.as_slice());
+            let decoded = decode_pv_field_with_bitset(&desc, &bs, 0, &mut cur, order).unwrap();
+            if let PvField::Structure(s) = decoded {
+                // alarm subtree decoded fresh from the wire.
+                if let Some(PvField::Structure(a)) = s.get_field("alarm") {
+                    assert!(matches!(
+                        a.get_field("severity"),
+                        Some(PvField::Scalar(ScalarValue::Int(2)))
+                    ));
+                    assert!(matches!(
+                        a.get_field("status"),
+                        Some(PvField::Scalar(ScalarValue::Int(5)))
+                    ));
+                } else {
+                    panic!("alarm must be a Structure");
+                }
+            } else {
+                panic!("decoded must be Structure");
+            }
+            // Cursor must sit exactly on the sentinel — proof the
+            // subtree was fully consumed.
+            assert_eq!(cur.get_i32(order).unwrap(), 0x7EAD, "cursor desync");
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    /// `fill_unmarked_from_prior` must honour the compressed parent bit
+    /// too: when the `alarm` struct bit is set the whole subtree was
+    /// decoded fresh, so the merged value keeps the decoded subtree
+    /// rather than carrying leaves over from `prior`.
+    #[test]
+    fn compressed_bitset_fill_unmarked_keeps_decoded_subtree() {
+        let desc = nested_alarm_desc();
+        let prior = nested_alarm_value(1.0, 9, 9);
+        let decoded = nested_alarm_value(0.0, 2, 5);
+
+        let mut bs = crate::proto::BitSet::new();
+        bs.set(2); // alarm struct bit only (children clear)
+
+        let merged = fill_unmarked_from_prior(&desc, &bs, 0, decoded, &prior);
+        if let PvField::Structure(s) = merged {
+            // value (bit 1 clear) → carried from prior.
+            assert!(matches!(
+                s.get_field("value"),
+                Some(PvField::Scalar(ScalarValue::Double(v))) if (*v - 1.0).abs() < 1e-9
+            ));
+            // alarm subtree → kept from decoded (struct bit set).
+            if let Some(PvField::Structure(a)) = s.get_field("alarm") {
+                assert!(matches!(
+                    a.get_field("severity"),
+                    Some(PvField::Scalar(ScalarValue::Int(2)))
+                ));
+                assert!(matches!(
+                    a.get_field("status"),
+                    Some(PvField::Scalar(ScalarValue::Int(5)))
+                ));
+            } else {
+                panic!("alarm must be a Structure");
+            }
+        } else {
+            panic!("merged must be Structure");
+        }
+    }
+
+    /// Single-leaf delta: only `alarm.severity` (bit 3) changed. The
+    /// encoder emits just that 4-byte Int; the decoder consumes exactly
+    /// it and default-fills the rest.
+    #[test]
+    fn single_leaf_bitset_round_trips() {
+        let desc = nested_alarm_desc();
+        let value = nested_alarm_value(42.0, 7, 5);
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut bs = crate::proto::BitSet::new();
+            bs.set(3); // alarm.severity only
+
+            let mut buf = Vec::new();
+            encode_pv_field_with_bitset(&value, &desc, &bs, 0, order, &mut buf);
+            assert_eq!(buf.len(), 4, "one Int leaf only, order={order:?}");
+
+            buf.put_i32(0x7EAD, order); // sentinel
+
+            let mut cur = Cursor::new(buf.as_slice());
+            let decoded = decode_pv_field_with_bitset(&desc, &bs, 0, &mut cur, order).unwrap();
+            if let PvField::Structure(s) = decoded {
+                if let Some(PvField::Structure(a)) = s.get_field("alarm") {
+                    assert!(matches!(
+                        a.get_field("severity"),
+                        Some(PvField::Scalar(ScalarValue::Int(7)))
+                    ));
+                    // status not marked → default 0.
+                    assert!(matches!(
+                        a.get_field("status"),
+                        Some(PvField::Scalar(ScalarValue::Int(0)))
+                    ));
+                } else {
+                    panic!("alarm must be a Structure");
+                }
+                // value not marked → default 0.0.
+                assert!(matches!(
+                    s.get_field("value"),
+                    Some(PvField::Scalar(ScalarValue::Double(v))) if v.abs() < 1e-9
+                ));
+            } else {
+                panic!("decoded must be Structure");
+            }
+            assert_eq!(cur.get_i32(order).unwrap(), 0x7EAD, "cursor desync");
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    /// Root bit set → the entire value (every leaf) is emitted and
+    /// consumed, regardless of descendant bits.
+    #[test]
+    fn root_bit_set_emits_whole_value() {
+        let desc = nested_alarm_desc();
+        let value = nested_alarm_value(3.5, 1, 2);
+        let order = ByteOrder::Little;
+        let mut bs = crate::proto::BitSet::new();
+        bs.set(0); // root only
+
+        let mut buf = Vec::new();
+        encode_pv_field_with_bitset(&value, &desc, &bs, 0, order, &mut buf);
+        // value(8) + severity(4) + status(4) = 16 bytes.
+        assert_eq!(buf.len(), 16);
+
+        let mut cur = Cursor::new(buf.as_slice());
+        let decoded = decode_pv_field_with_bitset(&desc, &bs, 0, &mut cur, order).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(cur.remaining(), 0);
+    }
+
+    // ── BUG 2: unbounded allocation from wire-supplied array length ──────
+
+    /// A frame declaring a huge scalar-array length must fail fast
+    /// instead of eagerly allocating gigabytes. The declared length far
+    /// exceeds the bytes the frame can carry, so decode rejects it.
+    #[test]
+    fn oversized_scalar_array_length_rejected() {
+        for st in [
+            ScalarType::Double,
+            ScalarType::Float,
+            ScalarType::Long,
+            ScalarType::ULong,
+            ScalarType::Int,
+            ScalarType::UInt,
+            ScalarType::Short,
+            ScalarType::UShort,
+            ScalarType::Byte,
+            ScalarType::UByte,
+            ScalarType::Boolean,
+        ] {
+            for order in [ByteOrder::Little, ByteOrder::Big] {
+                let desc = FieldDesc::ScalarArray(st);
+                // Hostile frame: Size-encoded length 0xFFFF_FFFF then a
+                // handful of payload bytes. ~9 bytes total.
+                let mut buf = Vec::new();
+                encode_size_into(u32::MAX, order, &mut buf);
+                buf.extend_from_slice(&[0u8; 4]);
+
+                let mut cur = Cursor::new(buf.as_slice());
+                let res = decode_pv_field(&desc, &mut cur, order);
+                assert!(
+                    res.is_err(),
+                    "huge length must be rejected for {st:?} order={order:?}"
+                );
+            }
+        }
+    }
+
+    /// A correctly-sized scalar array still decodes fine after the
+    /// length-bound check.
+    #[test]
+    fn well_sized_scalar_array_still_decodes() {
+        let desc = FieldDesc::ScalarArray(ScalarType::Int);
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let value = PvField::ScalarArrayTyped(TypedScalarArray::Int(vec![1, 2, 3, -4].into()));
+            let mut buf = Vec::new();
+            encode_pv_field(&value, &desc, order, &mut buf);
+            let mut cur = Cursor::new(buf.as_slice());
+            let decoded = decode_pv_field(&desc, &mut cur, order).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    // ── MINOR: union out-of-range selector clamps to null ────────────────
+
+    /// An out-of-range union selector must be emitted as the null
+    /// marker (0xFF) — emitting a Size with no value bytes would
+    /// desync the frame.
+    #[test]
+    fn union_out_of_range_selector_clamps_to_null() {
+        let desc = FieldDesc::Union {
+            struct_id: String::new(),
+            variants: vec![("d".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        // selector 7 is out of range (only variant index 0 exists).
+        let value = PvField::Union {
+            selector: 7,
+            variant_name: String::new(),
+            value: Box::new(PvField::Scalar(ScalarValue::Double(1.0))),
+        };
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut buf = Vec::new();
+            encode_pv_field(&value, &desc, order, &mut buf);
+            assert_eq!(buf, vec![0xFF], "out-of-range selector → null marker");
+
+            let mut cur = Cursor::new(buf.as_slice());
+            let decoded = decode_pv_field(&desc, &mut cur, order).unwrap();
+            if let PvField::Union { selector, .. } = decoded {
+                assert_eq!(selector, -1, "null union decodes to selector -1");
+            } else {
+                panic!("expected union");
+            }
+            assert_eq!(cur.remaining(), 0);
+        }
     }
 }

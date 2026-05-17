@@ -166,6 +166,15 @@ impl Resolver {
 #[derive(Default)]
 pub struct ConnectionPool {
     inner: parking_lot::Mutex<std::collections::HashMap<std::net::SocketAddr, Arc<ServerConn>>>,
+    /// Single-flight gate: per-address async mutex held for the duration
+    /// of a `ServerConn::connect`. Two concurrent `get_or_connect` calls
+    /// for the same `addr` serialize on this lock — the first dials, the
+    /// second waits and then reuses the cached connection. Without it,
+    /// both callers opened a real TCP connection and the race loser
+    /// dropped its `Arc<ServerConn>`; since `ServerConn` has no Drop
+    /// that cancels its tasks, the redundant socket and its
+    /// reader/writer/heartbeat tasks leaked until idle timeout.
+    connecting: parking_lot::Mutex<std::collections::HashMap<std::net::SocketAddr, Arc<Mutex<()>>>>,
     tls: parking_lot::Mutex<Option<Arc<crate::auth::TlsClientConfig>>>,
     /// Set by `PvaClient::close` (pvxs `Context::close`). Once true,
     /// reconnect attempts (especially the name-server fallback in
@@ -202,6 +211,26 @@ impl ConnectionPool {
                 }
             }
         }
+        // Single-flight: acquire (or create) the per-address gate and
+        // hold it across the dial so concurrent callers for `addr` open
+        // exactly one TCP connection. Without it both callers dialed and
+        // the race loser dropped its `Arc<ServerConn>` — but `ServerConn`
+        // has no Drop cancelling its tasks, so the redundant socket and
+        // its reader/writer/heartbeat tasks leaked until idle timeout.
+        let gate = {
+            let mut g = self.connecting.lock();
+            g.entry(addr).or_default().clone()
+        };
+        let _dialing = gate.lock().await;
+        // Re-check under the gate: a peer caller may have just connected.
+        {
+            let map = self.inner.lock();
+            if let Some(conn) = map.get(&addr).cloned() {
+                if conn.is_alive() {
+                    return Ok(conn);
+                }
+            }
+        }
         // Drop dead entry and connect fresh.
         {
             let mut map = self.inner.lock();
@@ -212,15 +241,21 @@ impl ConnectionPool {
             }
         }
         let tls = self.tls.lock().clone();
-        let fresh = match tls {
+        let connect_result = match tls {
             Some(cfg) => {
                 ServerConn::connect_tls(addr, &addr.ip().to_string(), cfg, user, host, op_timeout)
-                    .await?
+                    .await
             }
-            None => ServerConn::connect(addr, user, host, op_timeout).await?,
+            None => ServerConn::connect(addr, user, host, op_timeout).await,
         };
+        // Release the gate slot whether the dial succeeded or failed, so a
+        // later reconnect for the same addr does not pile up stale
+        // per-address mutexes in `connecting`.
+        self.connecting.lock().remove(&addr);
+        let fresh = connect_result?;
         let mut map = self.inner.lock();
-        // Race: someone else may have inserted. Prefer an alive existing one.
+        // The gate serialized dialing; still prefer an alive existing one
+        // in case a dead entry was re-inserted between the re-check and here.
         if let Some(existing) = map.get(&addr).cloned() {
             if existing.is_alive() {
                 return Ok(existing);
@@ -848,5 +883,73 @@ mod tests {
         ch.server_destroyed
             .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(!ch.is_active(), "still Idle, still not active");
+    }
+
+    /// BUG 3 regression: `ConnectionPool::get_or_connect` must
+    /// single-flight concurrent callers for the same address. Two
+    /// callers racing on the same `addr` must open exactly ONE TCP
+    /// connection — the per-address gate serializes the dial. Before
+    /// the fix both callers dialed concurrently and the race loser
+    /// dropped a `ServerConn` whose reader/writer/heartbeat tasks and
+    /// socket leaked (no Drop cancels them).
+    ///
+    /// The probe listener accepts and then stalls (never completes the
+    /// PVA handshake), so each dial blocks until `op_timeout`. With
+    /// single-flight the second `accept()` cannot happen while the
+    /// first dial is still in flight; without it both accepts land
+    /// within milliseconds of each other.
+    #[tokio::test]
+    async fn get_or_connect_single_flights_concurrent_callers() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe listener");
+        let addr = listener.local_addr().expect("probe addr");
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_srv = accepts.clone();
+        // Accept loop: count every accepted connection, then hold the
+        // socket so the client's handshake stalls until op_timeout.
+        let _srv = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                held.push(sock); // keep alive, never reply
+            }
+        });
+
+        let pool = ConnectionPool::new();
+        let op_timeout = Duration::from_millis(400);
+
+        // Two concurrent callers for the SAME addr.
+        let p1 = pool.clone();
+        let c1 = tokio::spawn(async move { p1.get_or_connect(addr, "u", "h", op_timeout).await });
+        let p2 = pool.clone();
+        let c2 = tokio::spawn(async move { p2.get_or_connect(addr, "u", "h", op_timeout).await });
+
+        // Mid-first-dial: the gate must have blocked the second caller,
+        // so only one connection has been accepted so far.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "single-flight gate must block the 2nd dial while the 1st is in flight"
+        );
+
+        // Both dials ultimately fail (handshake stalls → timeout).
+        let r1 = c1.await.expect("join c1");
+        let r2 = c2.await.expect("join c2");
+        assert!(r1.is_err(), "stalled handshake must fail");
+        assert!(r2.is_err(), "stalled handshake must fail");
+
+        // Exactly two accepts total: the gate serialized them (one
+        // after the other), it did not deduplicate failed dials.
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "serialized dials: one per caller, never concurrent"
+        );
     }
 }

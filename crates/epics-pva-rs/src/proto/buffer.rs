@@ -220,6 +220,16 @@ impl ReadExt for Cursor<&[u8]> {
         })
     }
     fn get_bytes(&mut self, n: usize) -> Result<Vec<u8>, DecodeError> {
+        // P-G22 (DoS): `n` is frequently a wire-supplied length (scalar
+        // arrays, BitSet, strings) up to u32::MAX. A `vec![0u8; n]`
+        // before `read_exact` lets a ~20-byte frame trigger a multi-GB
+        // allocation / OOM-abort. The cursor can only ever yield
+        // `remaining` bytes, so any larger `n` is unsatisfiable —
+        // reject it before allocating.
+        let remaining = self.remaining();
+        if n > remaining {
+            return Err(decode_err!("short read {n} bytes ({remaining} remaining)"));
+        }
         let mut buf = vec![0u8; n];
         self.read_exact(&mut buf)
             .map_err(|_| decode_err!("short read {n} bytes"))?;

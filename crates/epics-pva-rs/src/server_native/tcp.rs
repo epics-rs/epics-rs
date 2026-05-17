@@ -1473,11 +1473,15 @@ async fn handle_put_get(
     match source.get_value_checked(read_checked, ctx).await {
         Some(v) => {
             Status::ok().write_into(order, &mut payload);
-            mask.write_into(order, &mut payload);
+            // `mask` is a *selection* mask (request_to_mask) — convert
+            // it to a valid wire changed-bitset so a partial field
+            // filter does not get a root-bit-set "whole structure".
+            let changed = crate::pvdata::encode::canonical_changed_bitset(&intro, &mask);
+            changed.write_into(order, &mut payload);
             crate::pvdata::encode::encode_pv_field_with_bitset(
                 &v,
                 &intro,
-                &mask,
+                &changed,
                 0,
                 order,
                 &mut payload,
@@ -2191,11 +2195,15 @@ async fn handle_op(
             payload.put_u8(subcmd);
             Status::ok().write_into(order, &mut payload);
             // Emit only the fields the client's pvRequest selected.
-            mask.write_into(order, &mut payload);
+            // `mask` is a *selection* mask — canonicalize it into a wire
+            // changed-bitset so a partial filter is not widened to the
+            // whole structure by a stray root bit.
+            let changed = crate::pvdata::encode::canonical_changed_bitset(&intro, &mask);
+            changed.write_into(order, &mut payload);
             crate::pvdata::encode::encode_pv_field_with_bitset(
                 &value,
                 &intro,
-                &mask,
+                &changed,
                 0,
                 order,
                 &mut payload,
@@ -3014,10 +3022,19 @@ fn build_monitor_payload(
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
     // PVA monitor data: changed bitset + partial value + overrun bitset.
-    // The changed bitset reflects the pvRequest field mask — emit only
-    // the fields the client asked for.
-    mask.write_into(order, &mut payload);
-    crate::pvdata::encode::encode_pv_field_with_bitset(value, intro, mask, 0, order, &mut payload);
+    // `mask` is a *selection* mask (request_to_mask) — canonicalize it
+    // into a wire changed-bitset so a partial field filter is not
+    // widened to the whole structure by a stray root/structure bit.
+    let changed = crate::pvdata::encode::canonical_changed_bitset(intro, mask);
+    changed.write_into(order, &mut payload);
+    crate::pvdata::encode::encode_pv_field_with_bitset(
+        value,
+        intro,
+        &changed,
+        0,
+        order,
+        &mut payload,
+    );
     let overrun = BitSet::new(); // no overruns
     overrun.write_into(order, &mut payload);
     let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);

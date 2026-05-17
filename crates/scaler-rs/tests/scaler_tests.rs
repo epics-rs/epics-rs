@@ -566,9 +566,9 @@ fn test_asyn_device_support_clamps_nch() {
         fn write_preset(
             &mut self,
             _channel: usize,
-            _preset: u32,
-        ) -> epics_base_rs::error::CaResult<()> {
-            Ok(())
+            preset: u32,
+        ) -> epics_base_rs::error::CaResult<u32> {
+            Ok(preset)
         }
         fn read(
             &mut self,
@@ -801,4 +801,259 @@ fn test_soft_driver_arm_clears_counts() {
     driver.read(&mut counts).unwrap();
     assert_eq!(counts[0], 0, "arm() cleared the stale count");
     assert!(!driver.done(), "arm() prevented an immediate done");
+}
+
+// ============================================================
+// REQSTART driver write-back reconciliation
+// C scalerRecord.c:405-432 — a driver that owns its clock (Joerger
+// VS64) adjusts the preset and reports its own frequency; the record
+// must reconcile PR1/TP/FREQ with what the driver actually programmed.
+// ============================================================
+
+/// A hardware-like scaler driver that QUANTIZES the channel-0 preset
+/// and runs at a clock frequency it chooses itself — the Joerger VS64
+/// behaviour documented at scalerRecord.c:397-404.
+///
+/// `write_preset` for channel 0 rounds the requested preset up to the
+/// next multiple of `QUANTUM` and returns that value. `actual_frequency`
+/// reports a clock different from the record's requested 1e7.
+struct QuantizingDriver {
+    /// Number of channel-0 write_preset calls, shared so the test can
+    /// observe it after the driver is moved into device support — used
+    /// to prove the C `save_pr1 != pr1` second write happened.
+    ch0_writes: std::sync::Arc<std::sync::Mutex<u32>>,
+}
+
+impl QuantizingDriver {
+    /// Preset granularity — channel-0 presets are rounded up to a
+    /// multiple of this.
+    const QUANTUM: u32 = 4096;
+    /// The clock the driver runs at, different from the record's
+    /// default 1e7 so the FREQ reconciliation is observable.
+    const DRIVER_FREQ: f64 = 1.25e7;
+
+    fn new() -> Self {
+        Self {
+            ch0_writes: std::sync::Arc::new(std::sync::Mutex::new(0)),
+        }
+    }
+
+    /// Shared handle to the channel-0 write counter.
+    fn ch0_writes_handle(&self) -> std::sync::Arc<std::sync::Mutex<u32>> {
+        std::sync::Arc::clone(&self.ch0_writes)
+    }
+
+    fn quantize(preset: u32) -> u32 {
+        preset.div_ceil(Self::QUANTUM) * Self::QUANTUM
+    }
+}
+
+impl ScalerDriver for QuantizingDriver {
+    fn reset(&mut self) -> epics_base_rs::error::CaResult<()> {
+        *self.ch0_writes.lock().unwrap() = 0;
+        Ok(())
+    }
+    fn read(
+        &mut self,
+        _counts: &mut [u32; MAX_SCALER_CHANNELS],
+    ) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn write_preset(&mut self, channel: usize, preset: u32) -> epics_base_rs::error::CaResult<u32> {
+        if channel == 0 {
+            *self.ch0_writes.lock().unwrap() += 1;
+            Ok(Self::quantize(preset))
+        } else {
+            Ok(preset)
+        }
+    }
+    fn arm(&mut self, _start: bool) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn actual_frequency(&self) -> Option<f64> {
+        Some(Self::DRIVER_FREQ)
+    }
+    fn done(&mut self) -> bool {
+        false
+    }
+    fn num_channels(&self) -> usize {
+        8
+    }
+}
+
+/// Dispatch the actions a record's process() returned through device
+/// support, mirroring `Database::execute_process_actions`' handling of
+/// `ProcessAction::DeviceCommand` (processing.rs:1637-1643).
+fn run_device_commands(
+    support: &mut dyn epics_base_rs::server::device_support::DeviceSupport,
+    rec: &mut ScalerRecord,
+    actions: &[epics_base_rs::server::record::ProcessAction],
+) {
+    use epics_base_rs::server::record::ProcessAction;
+    for action in actions {
+        if let ProcessAction::DeviceCommand { command, args } = action {
+            support.handle_command(rec, command, args).unwrap();
+        }
+    }
+}
+
+/// C scalerRecord.c:405-432 — REQSTART: after the per-channel
+/// write_preset loop, a driver that quantized preset 0 leaves
+/// `save_pr1 != pr1`, so the record recalculates PR1 from TP/FREQ,
+/// re-writes preset 0, and recomputes TP from the effective PR1/FREQ.
+/// The driver also reports its own clock, which must land in FREQ.
+#[test]
+fn test_reqstart_reconciles_pr1_tp_freq_with_adjusting_driver() {
+    use epics_base_rs::server::device_support::DeviceSupport;
+    use scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport;
+
+    let driver = QuantizingDriver::new();
+    let ch0_writes = driver.ch0_writes_handle();
+    let mut support = ScalerAsynDeviceSupport::new(Box::new(driver));
+
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0; // requested count time 1 s
+    support.init(&mut rec).unwrap(); // nch <- 8
+    rec.init_record(1).unwrap();
+
+    // Requested PR1 from TP*FREQ at the record's default clock.
+    // 1.0 s * 1e7 Hz = 10_000_000 ticks, which is NOT a multiple of
+    // QUANTUM (4096), so the driver will quantize it.
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    assert_eq!(rec.us, 2, "CNT request -> REQSTART");
+
+    let outcome = rec.process().unwrap();
+    // process() left us/ss in COUNTING and emitted CMD_RESET + CMD_START_COUNT.
+    assert_eq!(rec.ss, 2, "COUNTING");
+    assert_eq!(rec.us, 3, "COUNTING");
+
+    // Dispatch the device commands — this runs run_start_count.
+    run_device_commands(&mut support, &mut rec, &outcome.actions);
+
+    // The driver adopted its own clock frequency.
+    assert_eq!(
+        rec.freq,
+        QuantizingDriver::DRIVER_FREQ,
+        "FREQ must reflect the driver's actual clock (C:399-403,429-430)"
+    );
+
+    // PR1 must equal what the driver actually programmed: the record
+    // recomputed PR1 = NINT(tp * driver_freq) and the driver quantized
+    // that up to the next QUANTUM multiple.
+    // tp=1.0, driver_freq=1.25e7 -> NINT = 12_500_000;
+    // quantize(12_500_000) = ceil(12_500_000/4096)*4096 = 12_500_992.
+    let expected_pr1 = QuantizingDriver::quantize(12_500_000);
+    assert_eq!(
+        rec.pr[0], expected_pr1,
+        "PR1 must equal the driver-programmed (quantized) preset (C:420-425)"
+    );
+    assert_ne!(
+        rec.pr[0], 10_000_000,
+        "PR1 must NOT remain the stale pre-write value"
+    );
+
+    // TP must be recomputed from the effective PR1 / FREQ (C:426-427).
+    let expected_tp = expected_pr1 as f64 / QuantizingDriver::DRIVER_FREQ;
+    assert!(
+        (rec.tp - expected_tp).abs() < 1e-12,
+        "TP must be recomputed from effective PR1/FREQ (C:426-427): got {}, want {}",
+        rec.tp,
+        expected_tp
+    );
+
+    // The driver's channel-0 preset must have been written twice:
+    // once in the per-channel loop, once in the C:422 re-write after
+    // the record detected the adjustment.
+    assert_eq!(
+        *ch0_writes.lock().unwrap(),
+        2,
+        "driver-adjusted preset must trigger the C:422 second write_preset"
+    );
+}
+
+/// C scalerRecord.c:508-535 — auto-count: the driver-adjustment
+/// re-write applies (C:514-522), the driver clock is adopted into FREQ
+/// (C:530), but the user's PR1 is RESTORED afterward (C:532) and TP is
+/// NOT recomputed.
+#[test]
+fn test_autocount_restores_user_pr1_after_driver_adjustment() {
+    use epics_base_rs::server::device_support::DeviceSupport;
+    use scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport;
+
+    let driver = QuantizingDriver::new();
+    let ch0_writes = driver.ch0_writes_handle();
+    let mut support = ScalerAsynDeviceSupport::new(Box::new(driver));
+
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp1 = 1.0; // auto-count time 1 s, >= 1ms threshold
+    support.init(&mut rec).unwrap();
+
+    // The user's PR1 — auto-count must NOT disturb it.
+    let user_pr1 = 777_777u32;
+    rec.pr[0] = user_pr1;
+    let user_tp = rec.tp;
+
+    rec.cont = 1; // CONT mode
+    rec.dly1 = 0.0; // start immediately
+    let outcome = rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "auto-count COUNTING");
+
+    run_device_commands(&mut support, &mut rec, &outcome.actions);
+
+    // C:532 — user's channel-1 preset is restored.
+    assert_eq!(
+        rec.pr[0], user_pr1,
+        "auto-count must restore the user's PR1 (C:532)"
+    );
+    // C auto-count does not recompute TP.
+    assert_eq!(rec.tp, user_tp, "auto-count must not recompute TP");
+    // C:530 — the driver clock is still adopted into FREQ.
+    assert_eq!(
+        rec.freq,
+        QuantizingDriver::DRIVER_FREQ,
+        "auto-count must adopt the driver clock into FREQ (C:530)"
+    );
+
+    // The driver was written twice for channel 0: the tp1*freq write
+    // plus the C:521 re-write after it detected the quantization.
+    assert_eq!(
+        *ch0_writes.lock().unwrap(),
+        2,
+        "auto-count driver adjustment must trigger the C:521 second write_preset"
+    );
+}
+
+/// A non-adjusting driver (SoftScalerDriver semantics) must leave
+/// PR1/TP/FREQ exactly as the record set them — the reconciliation is
+/// a no-op when `write_preset` returns the requested value unchanged.
+#[test]
+fn test_reqstart_no_reconciliation_when_driver_does_not_adjust() {
+    use epics_base_rs::server::device_support::DeviceSupport;
+    use scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport;
+
+    let mut support = ScalerAsynDeviceSupport::new(Box::new(SoftScalerDriver::new(8)));
+
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    support.init(&mut rec).unwrap();
+    rec.init_record(1).unwrap();
+
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    let outcome = rec.process().unwrap();
+
+    run_device_commands(&mut support, &mut rec, &outcome.actions);
+
+    // SoftScalerDriver returns the preset unchanged and reports no
+    // clock, so PR1 stays NINT(1.0 * 1e7) and FREQ/TP are untouched.
+    assert_eq!(rec.pr[0], 10_000_000, "non-adjusting driver leaves PR1");
+    assert_eq!(rec.freq, 1e7, "non-adjusting driver leaves FREQ");
+    assert!(
+        (rec.tp - 1.0).abs() < 1e-12,
+        "non-adjusting driver leaves TP"
+    );
 }

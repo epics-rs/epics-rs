@@ -31,6 +31,22 @@ const SCALER_WAIT_TIME: f64 = 10.0;
 pub const CMD_RESET: &str = "scaler_reset";
 pub const CMD_ARM: &str = "scaler_arm";
 pub const CMD_WRITE_PRESET: &str = "scaler_write_preset";
+/// Count-start command — runs the full REQSTART driver sequence
+/// (write per-channel presets, reconcile PR1/TP/FREQ with what the
+/// driver actually programmed, then arm). C `scalerRecord.c:405-432`.
+/// This sequence cannot be split into independent `DeviceCommand`s
+/// because the reconciliation must observe the driver's adjustment
+/// *between* the preset writes and the arm — exactly as the C
+/// `write_preset` calls run synchronously inside `process()`.
+pub const CMD_START_COUNT: &str = "scaler_start_count";
+/// Auto-count start command — the auto-count analogue of
+/// `CMD_START_COUNT`. C `scalerRecord.c:508-535`: writes the auto
+/// presets, applies the `save_pr1 != pr1` driver-adjustment re-write
+/// (`:514-522`), then **restores the user's PR1** (`:532` —
+/// "Don't let autocount disturb user's channel-1 preset") and arms.
+/// Unlike REQSTART it does not recompute `TP`; it only adopts a
+/// driver-changed `FREQ`.
+pub const CMD_AUTOCOUNT: &str = "scaler_autocount";
 
 /// Scaler record — up to 64-channel 32-bit counter with preset and auto-count.
 ///
@@ -216,7 +232,7 @@ impl ScalerRecord {
     /// `i16` would wrap to a huge `usize`. Every `0..nch` loop that indexes
     /// the fixed 64-element `g`/`pr`/`d`/`s` arrays must go through this so a
     /// bad `nch` cannot cause an out-of-bounds panic.
-    fn active_channels(&self) -> usize {
+    pub(crate) fn active_channels(&self) -> usize {
         if self.nch < 0 {
             0
         } else {
@@ -240,7 +256,7 @@ impl ScalerRecord {
     /// `NINT` — round-to-nearest cast used by the count-start path.
     /// C `scalerRecord.c:139`: `NINT(f) (unsigned long)((f)>0 ? (f)+0.5
     /// : (f)-0.5)`. Used at `scalerRecord.c:409-410` (REQSTART preset).
-    fn pr1_nint(tp: f64, freq: f64) -> u32 {
+    pub(crate) fn pr1_nint(tp: f64, freq: f64) -> u32 {
         let f = tp * freq;
         Self::ticks_to_u32(if f > 0.0 { f + 0.5 } else { f - 0.5 })
     }
@@ -249,7 +265,7 @@ impl ScalerRecord {
     /// `special()` TP handler. C `scalerRecord.c:328` and `:672`:
     /// `pscal->pr1 = (epicsUInt32)(pscal->tp * pscal->freq);` — a plain
     /// cast, i.e. truncation toward zero, NOT `NINT`.
-    fn pr1_trunc(tp: f64, freq: f64) -> u32 {
+    pub(crate) fn pr1_trunc(tp: f64, freq: f64) -> u32 {
         Self::ticks_to_u32(tp * freq)
     }
 
@@ -267,6 +283,41 @@ impl ScalerRecord {
         }
     }
 
+    /// First half of the REQSTART preset reconciliation — C
+    /// `scalerRecord.c:420-423`.
+    ///
+    /// After the per-channel `write_preset` loop has stored the
+    /// driver-returned channel-0 preset into `pr[0]`, this checks the
+    /// C `save_pr1 != pscal->pr1` condition: if the driver adjusted
+    /// the preset, recompute `pr[0] = NINT(tp*freq)` (the driver may
+    /// also have changed `freq`, adopted by the caller before this
+    /// call) and return that value as the count the caller must
+    /// re-write to driver channel 0 (`scalerRecord.c:422`).
+    /// `None` means the driver left the preset alone — no re-write.
+    pub(crate) fn count_start_rewrite_preset(&mut self, save_pr1: u32) -> Option<u32> {
+        if save_pr1 != self.pr[0] {
+            self.pr[0] = Self::pr1_nint(self.tp, self.freq);
+            Some(self.pr[0])
+        } else {
+            None
+        }
+    }
+
+    /// Second half of the REQSTART preset reconciliation — C
+    /// `scalerRecord.c:424-428`.
+    ///
+    /// Called after the optional `scalerRecord.c:422` re-write, with
+    /// `pr[0]` holding the *final* driver-programmed channel-0 preset.
+    /// If that differs from `old_pr1` (the value before the count
+    /// start), recompute `tp` from the effective `pr[0]`/`freq`.
+    /// `db_post_events` is the monitor layer's job once the field
+    /// changed; this only mutates `tp`.
+    pub(crate) fn count_start_finalize_tp(&mut self, old_pr1: u32) {
+        if old_pr1 != self.pr[0] && self.freq > 0.0 {
+            self.tp = self.pr[0] as f64 / self.freq;
+        }
+    }
+
     /// Whether counting has completed.
     ///
     /// C parity: `scalerRecord.c:367` `process()` calls `(*pdset->done)`
@@ -279,37 +330,31 @@ impl ScalerRecord {
         self.done_flag
     }
 
-    /// Build DeviceCommand actions for a count start sequence:
-    /// reset → write_preset for each gated channel → arm(true)
+    /// Build DeviceCommand actions for a count start sequence.
+    ///
+    /// C parity — `scalerRecord.c:392-432`: the REQSTART block runs
+    /// `reset()`, then the per-channel `write_preset` loop, then the
+    /// `save_pr1 != pr1` / `old_pr1 != pr1` / `old_freq != freq`
+    /// reconciliation, then `arm(1)` — all synchronously inside
+    /// `process()`. In the Rust port `process()` returns before any
+    /// `DeviceCommand` is dispatched, so the reconciliation cannot be
+    /// expressed as separate post-process `write_preset` actions: the
+    /// record would never see the driver's adjustment. The whole
+    /// write-presets + reconcile + arm sequence is therefore a single
+    /// `CMD_START_COUNT` executed by device support, which holds both
+    /// the driver and a `&mut ScalerRecord` and reproduces
+    /// `scalerRecord.c:408-432` in `handle_command`.
     fn build_start_actions(&self) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
-
-        // Reset
-        actions.push(ProcessAction::DeviceCommand {
-            command: CMD_RESET,
-            args: vec![],
-        });
-
-        // Write presets for gated channels
-        for i in 0..self.active_channels() {
-            if self.g[i] != 0 {
-                actions.push(ProcessAction::DeviceCommand {
-                    command: CMD_WRITE_PRESET,
-                    args: vec![
-                        EpicsValue::Long(i as i32),
-                        EpicsValue::Long(self.pr[i] as i32),
-                    ],
-                });
-            }
-        }
-
-        // Arm
-        actions.push(ProcessAction::DeviceCommand {
-            command: CMD_ARM,
-            args: vec![EpicsValue::Long(1)],
-        });
-
-        actions
+        vec![
+            ProcessAction::DeviceCommand {
+                command: CMD_RESET,
+                args: vec![],
+            },
+            ProcessAction::DeviceCommand {
+                command: CMD_START_COUNT,
+                args: vec![],
+            },
+        ]
     }
 
     /// Build DeviceCommand action to disarm.
@@ -321,38 +366,26 @@ impl ScalerRecord {
     }
 
     /// Build actions for auto-count start.
+    ///
+    /// C parity — `scalerRecord.c:508-535`: like REQSTART the
+    /// auto-count `reset()` + `write_preset` + reconcile + `arm(1)`
+    /// sequence runs synchronously inside `process()`, so it cannot be
+    /// split into post-process `write_preset` actions without losing
+    /// the `save_pr1 != pr1` driver-adjustment re-write
+    /// (`scalerRecord.c:514-522`). It is dispatched as a single
+    /// `CMD_AUTOCOUNT` whose `handle_command` reproduces
+    /// `scalerRecord.c:510-535`.
     fn build_autocount_actions(&self) -> Vec<ProcessAction> {
-        let mut actions = Vec::new();
-        actions.push(ProcessAction::DeviceCommand {
-            command: CMD_RESET,
-            args: vec![],
-        });
-        if self.tp1 >= 1.0e-3 {
-            // C scalerRecord.c:514: `(unsigned long)(pscal->tp1*pscal->freq)`
-            // — truncating cast, not NINT.
-            let auto_pr1 = Self::pr1_trunc(self.tp1, self.freq);
-            actions.push(ProcessAction::DeviceCommand {
-                command: CMD_WRITE_PRESET,
-                args: vec![EpicsValue::Long(0), EpicsValue::Long(auto_pr1 as i32)],
-            });
-        } else {
-            for i in 0..self.active_channels() {
-                if self.g[i] != 0 {
-                    actions.push(ProcessAction::DeviceCommand {
-                        command: CMD_WRITE_PRESET,
-                        args: vec![
-                            EpicsValue::Long(i as i32),
-                            EpicsValue::Long(self.pr[i] as i32),
-                        ],
-                    });
-                }
-            }
-        }
-        actions.push(ProcessAction::DeviceCommand {
-            command: CMD_ARM,
-            args: vec![EpicsValue::Long(1)],
-        });
-        actions
+        vec![
+            ProcessAction::DeviceCommand {
+                command: CMD_RESET,
+                args: vec![],
+            },
+            ProcessAction::DeviceCommand {
+                command: CMD_AUTOCOUNT,
+                args: vec![],
+            },
+        ]
     }
 }
 

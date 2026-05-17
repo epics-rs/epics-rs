@@ -95,11 +95,15 @@ impl ScalerDriver for SoftScalerDriver {
 
     /// C `drvScalerSoft.c:331-336` — `scalerPresetCommand`: store the
     /// preset for the channel. C does not derive any gate from it.
-    fn write_preset(&mut self, channel: usize, preset: u32) -> CaResult<()> {
+    ///
+    /// The soft driver has a fixed software clock and never quantizes
+    /// the preset, so it returns `preset` unchanged. Its
+    /// `actual_frequency` is left as the trait default (`None`).
+    fn write_preset(&mut self, channel: usize, preset: u32) -> CaResult<u32> {
         if channel < MAX_SCALER_CHANNELS {
             self.presets[channel] = preset;
         }
-        Ok(())
+        Ok(preset)
     }
 
     /// C `drvScalerSoft.c:315-329` — `scalerArmCommand`: on arm, the

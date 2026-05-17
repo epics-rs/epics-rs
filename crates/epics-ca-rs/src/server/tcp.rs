@@ -2549,12 +2549,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 hdr.cid = 1; // ECA_NORMAL
                                 hdr.available = sub_id;
 
+                                // Abort-safety: this monitor task can
+                                // be `task.abort()`ed mid-flight by
+                                // EVENT_CANCEL / CLEAR_CHANNEL /
+                                // disconnect cleanup. Build the whole
+                                // EVENT_ADD frame (header + padded
+                                // payload) as ONE contiguous buffer and
+                                // issue a single `write_all`, so an
+                                // abort can only land at a frame
+                                // boundary, never between header and
+                                // payload — a split there would leave
+                                // an orphan header in the shared
+                                // BufWriter and mis-frame the stream.
                                 let hdr_bytes = hdr.to_bytes_extended();
+                                let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
+                                frame.extend_from_slice(&hdr_bytes);
+                                frame.extend_from_slice(&padded);
                                 let mut w = writer_clone.lock().await;
-                                if w.write_all(&hdr_bytes).await.is_err() {
-                                    break;
-                                }
-                                if w.write_all(&padded).await.is_err() {
+                                if w.write_all(&frame).await.is_err() {
                                     break;
                                 }
                                 let _ = w.flush().await;

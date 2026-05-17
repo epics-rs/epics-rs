@@ -11,36 +11,51 @@ use crate::types::{DbFieldType, EpicsValue};
 /// run through an exponential filter so a momentary state change does
 /// not raise an alarm until the signal has been in the alarm range for
 /// roughly `aftc` seconds. Returns `(filtered_alarm, new_afvl)`.
-pub(crate) fn aftc_filter(
+///
+/// The accumulator (`AFVL`) is a *signed* low-pass value: each cycle
+/// contributes a unit `±1` sign — `-1` when the raw sample is
+/// `NO_ALARM`, `+1` otherwise — never the raw severity number. The
+/// final gate is sign-based: `afvl < 0` suppresses the alarm
+/// (returns `NO_ALARM`), `afvl >= 0` keeps the raw severity verbatim.
+///
+/// C algorithm (`biRecord.c::checkAlarms`):
+/// ```text
+/// if (afvl != 0.0) {
+///     alpha = aftc / (t + aftc);
+///     afvl = alpha*afvl + (1-alpha) * (alarm==NO_ALARM ? -1 : 1);
+/// } else {                          /* seed */
+///     afvl = (alarm==NO_ALARM ? -1 : 1);
+/// }
+/// if (afvl < 0) alarm = NO_ALARM;   /* else keep raw severity */
+/// ```
+/// The seed always produces `±1` (never `0.0`), so the seed branch
+/// runs exactly once — on the first sample after `AFVL` is zeroed.
+pub fn aftc_filter(
     raw_alarm: u16,
     aftc: f64,
     afvl_in: f64,
     time_last: SystemTime,
     time_now: SystemTime,
 ) -> (u16, f64) {
-    const THRESHOLD: f64 = 0.6321; // 1 - 1/e
     if aftc <= 0.0 {
         return (raw_alarm, 0.0);
     }
-    if afvl_in == 0.0 {
-        // Initial sample: seed the accumulator without filtering.
-        return (raw_alarm, raw_alarm as f64);
-    }
-    let dt = time_now
-        .duration_since(time_last)
-        .unwrap_or_default()
-        .as_secs_f64();
-    let alpha = aftc / (dt + aftc);
-    let mut afvl = alpha * afvl_in
-        + if afvl_in > 0.0 {
-            1.0 - alpha
-        } else {
-            alpha - 1.0
-        } * (raw_alarm as f64);
-    if afvl - afvl.floor() > THRESHOLD {
-        afvl = -afvl;
-    }
-    let alarm = afvl.floor().abs() as u16;
+    // Unit contribution: -1 for NO_ALARM, +1 for any raised severity.
+    let sign = if raw_alarm == 0 { -1.0 } else { 1.0 };
+    let afvl = if afvl_in != 0.0 {
+        let dt = time_now
+            .duration_since(time_last)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let alpha = aftc / (dt + aftc);
+        alpha * afvl_in + (1.0 - alpha) * sign
+    } else {
+        // Seed: first sample after AFVL was zeroed. Always ±1.
+        sign
+    };
+    // Sign-based gate: a negative accumulator suppresses the alarm;
+    // otherwise the raw severity passes through unchanged.
+    let alarm = if afvl < 0.0 { 0 } else { raw_alarm };
     (alarm, afvl)
 }
 

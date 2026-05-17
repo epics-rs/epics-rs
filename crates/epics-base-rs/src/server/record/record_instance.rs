@@ -1503,7 +1503,11 @@ impl RecordInstance {
         let stat_changed = self.common.stat != alarm_result.prev_stat;
         let stat_mask = {
             let mut m = EventMask::NONE;
-            if sevr_changed {
+            // C `recGblResetAlarms` carries DBE_ALARM on the STAT/AMSG
+            // posts whenever the severity OR the alarm message moved —
+            // not on a severity change alone. Aligning with the
+            // `processing.rs` link path (and `complete_async_record`).
+            if sevr_changed || alarm_result.amsg_changed {
                 m |= EventMask::ALARM;
             }
             if stat_changed {
@@ -1517,6 +1521,9 @@ impl RecordInstance {
         }
         if !stat_mask.is_empty() {
             alarm_posts.push(("STAT", stat_mask));
+            // AMSG shares STAT's mask — C posts it alongside STAT when
+            // any alarm field moved.
+            alarm_posts.push(("AMSG", stat_mask));
         }
         // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only when
         // an alarm field moved (`stat_mask != 0`) AND it was raised.

@@ -332,25 +332,38 @@ impl Record for SelRecord {
             }
             1 => {
                 // High Signal: max of non-NaN values; SELN = winning index.
+                // With zero valid inputs VAL must be NaN so UDF is set —
+                // `value_is_undefined()` checks `is_nan()`, which does
+                // NOT catch ±infinity, so the NEG_INFINITY seed must not
+                // leak into VAL. C `selRecord.c` seeds with finite
+                // `-epicsMAX_DOUBLE`; track whether any input won so a
+                // genuine ±inf input is still selectable. Mirrors the
+                // SELM=3 empty-input branch.
                 let mut val = f64::NEG_INFINITY;
+                let mut any = false;
                 for (i, &v) in vals.iter().enumerate() {
                     if !v.is_nan() && val < v {
                         val = v;
                         self.seln = i as i16;
+                        any = true;
                     }
                 }
-                self.val = val;
+                self.val = if any { val } else { f64::NAN };
             }
             2 => {
                 // Low Signal: min of non-NaN values; SELN = winning index.
+                // See SELM=1 above — an all-NaN selection must yield a
+                // NaN VAL, not the INFINITY seed.
                 let mut val = f64::INFINITY;
+                let mut any = false;
                 for (i, &v) in vals.iter().enumerate() {
                     if !v.is_nan() && val > v {
                         val = v;
                         self.seln = i as i16;
+                        any = true;
                     }
                 }
-                self.val = val;
+                self.val = if any { val } else { f64::NAN };
             }
             3 => {
                 // Median: C inserts non-NaN values into `order`, sets

@@ -269,6 +269,30 @@ impl PvDatabase {
         })
     }
 
+    /// C `dbGetLink` PP rule: if a DB input link is `ProcessPassive`
+    /// and its source record is `Passive`-scanned, process the source
+    /// record before its value is read so the reader sees a freshly
+    /// computed value. No-op for non-PP links or non-passive sources.
+    ///
+    /// Shared by `read_link_value_soft` (single-INP path) and the
+    /// multi-input fetch loop (`INPA..INPL` for calc/sel/sub/aSub) so
+    /// both paths get the identical C-correct PP-processing behavior.
+    pub(crate) async fn process_passive_db_source(&self, db: &crate::server::record::DbLink) {
+        if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive {
+            return;
+        }
+        if let Some(src) = self.get_record(&db.record).await {
+            let is_passive =
+                src.read().await.common.scan == crate::server::record::ScanType::Passive;
+            if is_passive {
+                let mut visited = std::collections::HashSet::new();
+                let _ = self
+                    .process_record_with_links(&db.record, &mut visited, 0)
+                    .await;
+            }
+        }
+    }
+
     /// Read a value from a parsed link for INP (only reads DB links when soft channel).
     pub async fn read_link_value_soft(
         &self,
@@ -279,18 +303,7 @@ impl PvDatabase {
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) if is_soft => {
                 // PP: process source record if Passive before reading
-                if db.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
-                    if let Some(src) = self.get_record(&db.record).await {
-                        let is_passive = src.read().await.common.scan
-                            == crate::server::record::ScanType::Passive;
-                        if is_passive {
-                            let mut visited = std::collections::HashSet::new();
-                            let _ = self
-                                .process_record_with_links(&db.record, &mut visited, 0)
-                                .await;
-                        }
-                    }
-                }
+                self.process_passive_db_source(db).await;
                 let pv_name = if db.field == "VAL" {
                     db.record.clone()
                 } else {

@@ -286,6 +286,37 @@ fn sel_median_empty_yields_undefined() {
     assert!(rec.value_is_undefined());
 }
 
+// --- Defect 5: sel High/Low with no valid inputs → NaN / undefined ---
+
+#[test]
+fn sel_high_empty_yields_undefined() {
+    let mut rec = SelRecord::default();
+    rec.selm = 1; // High
+    // All inputs default to NaN — the NEG_INFINITY seed must not leak
+    // into VAL. value_is_undefined() checks is_nan(), which does not
+    // catch -inf, so an all-NaN High selection must produce NaN.
+    rec.process().unwrap();
+    assert!(
+        rec.val.is_nan(),
+        "all-NaN High selection must yield NaN VAL, got {}",
+        rec.val
+    );
+    assert!(rec.value_is_undefined());
+}
+
+#[test]
+fn sel_low_empty_yields_undefined() {
+    let mut rec = SelRecord::default();
+    rec.selm = 2; // Low
+    rec.process().unwrap();
+    assert!(
+        rec.val.is_nan(),
+        "all-NaN Low selection must yield NaN VAL, got {}",
+        rec.val
+    );
+    assert!(rec.value_is_undefined());
+}
+
 // --- M-2: sel limit alarms ---
 
 #[test]

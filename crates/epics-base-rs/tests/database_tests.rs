@@ -1771,6 +1771,121 @@ async fn test_complete_async_record() {
     assert!(!inst.common.udf);
 }
 
+/// Defect 1 regression: the async-completion path
+/// (`complete_async_record_inner`) must post SEVR/STAT/AMSG with
+/// their per-field C masks — exactly like the synchronous path and
+/// `process_local` — not collapse them onto one record-wide mask.
+///
+/// C `recGblResetAlarms` posts SEVR with `DBE_VALUE` only. The pre-fix
+/// async path pushed SEVR into `changed_fields`, which `notify_from_
+/// snapshot` posts with the record-wide `event_mask` that carries
+/// `DBE_ALARM` on an alarm transition. So a `DBE_ALARM`-only SEVR
+/// subscriber was wrongly notified, and a `DBE_VALUE`-only SEVR
+/// subscriber on a stat-only transition would have been missed.
+///
+/// This test drives an alarm transition through `complete_async_record`
+/// and asserts:
+///  * a `DBE_VALUE`-only SEVR subscriber RECEIVES the event,
+///  * a `DBE_ALARM`-only SEVR subscriber does NOT (SEVR is DBE_VALUE).
+/// Async record stub that raises a MAJOR `STATE_ALARM` from its
+/// `check_alarms` hook — used to drive an alarm transition through
+/// the async-completion path.
+struct AsyncAlarmingRecord;
+impl Record for AsyncAlarmingRecord {
+    fn record_type(&self) -> &'static str {
+        "async_alarm_test"
+    }
+    fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+        Ok(ProcessOutcome::async_pending())
+    }
+    fn check_alarms(&mut self, common: &mut epics_base_rs::server::record::CommonFields) {
+        use epics_base_rs::server::recgbl::{self, alarm_status};
+        recgbl::rec_gbl_set_sevr(
+            common,
+            alarm_status::STATE_ALARM,
+            epics_base_rs::server::record::AlarmSeverity::Major,
+        );
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Double(1.0)),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        match name {
+            "VAL" => Ok(()),
+            _ => Err(CaError::FieldNotFound(name.into())),
+        }
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+#[tokio::test]
+async fn test_complete_async_posts_sevr_with_per_field_mask() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("ASYNC_SEVR", Box::new(AsyncAlarmingRecord))
+        .await
+        .unwrap();
+
+    if let Some(rec) = db.get_record("ASYNC_SEVR").await {
+        let mut inst = rec.write().await;
+        inst.common.udf = false;
+    }
+
+    // First cycle: record reports async_pending (PACT set).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASYNC_SEVR", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Subscribe to SEVR twice: one DBE_VALUE-only, one DBE_ALARM-only.
+    let (mut sevr_value_rx, mut sevr_alarm_rx) = {
+        let rec = db.get_record("ASYNC_SEVR").await.unwrap();
+        let mut inst = rec.write().await;
+        let v = inst
+            .add_subscriber("SEVR", 21, DbFieldType::Short, EventMask::VALUE.bits())
+            .expect("DBE_VALUE SEVR subscription accepted");
+        let a = inst
+            .add_subscriber("SEVR", 22, DbFieldType::Short, EventMask::ALARM.bits())
+            .expect("DBE_ALARM SEVR subscription accepted");
+        (v, a)
+    };
+
+    // Complete the async cycle — alarm transition NoAlarm -> Major.
+    db.complete_async_record("ASYNC_SEVR").await.unwrap();
+
+    {
+        let rec = db.get_record("ASYNC_SEVR").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::Major,
+            "completion must raise Major"
+        );
+    }
+
+    // DBE_VALUE SEVR subscriber MUST receive the event — SEVR posts
+    // with DBE_VALUE.
+    assert!(
+        sevr_value_rx.try_recv().is_ok(),
+        "DBE_VALUE SEVR subscriber must receive the SEVR change"
+    );
+    // DBE_ALARM-only SEVR subscriber must NOT — SEVR's C mask is
+    // DBE_VALUE only, never DBE_ALARM.
+    assert!(
+        sevr_alarm_rx.try_recv().is_err(),
+        "DBE_ALARM-only SEVR subscriber must NOT receive SEVR \
+         (per-field mask collapsed onto record-wide ALARM mask)"
+    );
+}
+
 // C parity (dbAccess.c::dbProcess:537-559): a second
 // `process_record_with_links` against a PACT-active record must NOT
 // re-enter `record.process()`. The first attempt must bail silently
@@ -2442,6 +2557,88 @@ async fn test_calc_multi_input_db_links() {
     match val {
         EpicsValue::Double(v) => assert!((v - 30.0).abs() < 1e-10),
         other => panic!("expected Double(30.0), got {:?}", other),
+    }
+}
+
+/// Defect 3 regression: a `ProcessPassive` (PP) multi-input link
+/// (`INPA..INPL` for calc/sel/sub/aSub) must process its passive
+/// source record BEFORE the value is read — C `dbGetLink` behaviour.
+/// Before the fix the multi-input fetch loop used `read_link_with_alarm`
+/// (bare `get_pv`, no PP processing), so a PP input link read a stale
+/// source value. The single-INP path already did this via
+/// `read_link_value_soft`.
+#[tokio::test]
+async fn test_calc_multi_input_pp_processes_passive_source() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+
+    // SRC: a passive calc whose VAL computes to 42 only when processed.
+    // Its stored VAL starts at the default 0.0.
+    let src = CalcRecord::new("42");
+    db.add_record("PP_SRC", Box::new(src)).await.unwrap();
+
+    // DST: INPA = "PP_SRC PP" (process-passive). CALC="A" copies INPA.
+    let mut dst = CalcRecord::new("A");
+    dst.inpa = "PP_SRC PP".to_string();
+    db.add_record("PP_DST", Box::new(dst)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PP_DST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // DST must see 42: the PP link processed PP_SRC first, computing
+    // its VAL=42 before the value was read. A stale read would yield 0.
+    let val = db.get_pv("PP_DST").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "PP multi-input link must process source first: expected 42, got {v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+    // The source itself must have been processed (VAL latched to 42).
+    let src_val = db.get_pv("PP_SRC").await.unwrap();
+    match src_val {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "PP_SRC must have been processed by the PP link, VAL={v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+}
+
+/// Defect 3 control: an `NPP` (no-process-passive) multi-input link
+/// must NOT process its passive source — it reads whatever stale
+/// value the source currently holds.
+#[tokio::test]
+async fn test_calc_multi_input_npp_does_not_process_source() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+
+    let src = CalcRecord::new("42");
+    db.add_record("NPP_SRC", Box::new(src)).await.unwrap();
+
+    let mut dst = CalcRecord::new("A");
+    dst.inpa = "NPP_SRC NPP".to_string();
+    db.add_record("NPP_DST", Box::new(dst)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("NPP_DST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // NPP_SRC was never processed, so its VAL stays at the default 0.0
+    // and DST reads 0, not 42.
+    let val = db.get_pv("NPP_DST").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            v.abs() < 1e-10,
+            "NPP multi-input link must NOT process source: expected 0, got {v}"
+        ),
+        other => panic!("expected Double(0.0), got {other:?}"),
     }
 }
 

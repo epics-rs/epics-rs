@@ -758,6 +758,17 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
         Some(EventMask::ALARM | EventMask::VALUE),
         "STAT must post with DBE_ALARM | DBE_VALUE on a sevr+stat change"
     );
+    // Defect 2: AMSG must be posted alongside STAT with the SAME mask.
+    // C `recGblResetAlarms` posts AMSG whenever any alarm field moved;
+    // `process_local` previously omitted it entirely.
+    let amsg_mask = alarm_posts
+        .iter()
+        .find(|(f, _)| *f == "AMSG")
+        .map(|(_, m)| *m);
+    assert_eq!(
+        amsg_mask, stat_mask,
+        "AMSG must be posted with the same mask as STAT"
+    );
 }
 
 #[test]
@@ -1259,11 +1270,11 @@ fn test_snapshot_alarm_state() {
 // place. These tests pin the post-PR-817 contract end-to-end.
 // ---------------------------------------------------------------------------
 
-/// (PR #817) bi record AFTC integration. After the first
-/// `evaluate_alarms` call the AFVL accumulator must be seeded to
-/// the raw-severity float (not zero) and the reported severity
-/// must equal the unfiltered ZSV severity (initial-sample
-/// pass-through is part of the upstream filter contract).
+/// (PR #817) bi record AFTC integration. C `biRecord.c::checkAlarms`
+/// seeds the AFVL accumulator with a UNIT sign (`±1`), not the raw
+/// severity number: `+1` for an alarmed sample, `-1` for NO_ALARM.
+/// On the first (seed) sample `afvl >= 0` so the raw severity passes
+/// through unfiltered.
 #[test]
 fn test_bi_aftc_seeds_afvl_on_initial_sample() {
     let mut rec = BiRecord::new(0); // val=0 → ZSV path
@@ -1280,21 +1291,81 @@ fn test_bi_aftc_seeds_afvl_on_initial_sample() {
     inst.evaluate_alarms();
     epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
 
-    // Initial sample: alarm passes through unfiltered.
+    // Initial sample: alarm passes through unfiltered (seed afvl=+1 >= 0).
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Major,
         "initial AFTC sample must pass raw severity through"
     );
-    // AFVL must have been seeded with the raw severity float (=2 for Major).
+    // AFVL is seeded with the unit sign +1.0 (alarmed sample), NOT the
+    // raw severity number — C `alarm==NO_ALARM ? -1 : 1`.
     let afvl = inst
         .record
         .get_field("AFVL")
         .and_then(|v| v.to_f64())
         .expect("AFVL readable");
     assert!(
-        (afvl - 2.0).abs() < 1e-9,
-        "AFVL must be seeded with raw severity (Major=2.0), got {afvl}"
+        (afvl - 1.0).abs() < 1e-9,
+        "AFVL seed must be the unit sign +1.0 for an alarmed sample, got {afvl}"
+    );
+}
+
+/// (Defect 4) The AFTC filter must SUPPRESS a momentary alarm: after a
+/// long NO_ALARM history the accumulator sits near -1; a single
+/// alarmed sample only nudges it slightly and it stays negative, so
+/// `checkAlarms` reports NO_ALARM until the signal has been in the
+/// alarm range for ~AFTC seconds. This pins the signed `±1`
+/// accumulator and the `afvl < 0 → suppress` gate.
+#[test]
+fn test_bi_aftc_suppresses_momentary_alarm() {
+    use std::time::Duration;
+
+    // Direct unit test of the filter primitive across cycles.
+    use epics_base_rs::server::records::bi::aftc_filter;
+    let aftc = 10.0;
+    let t0 = std::time::SystemTime::UNIX_EPOCH;
+
+    // Cycle 1: seed with a NO_ALARM sample → afvl = -1, alarm 0.
+    let (a1, afvl1) = aftc_filter(0, aftc, 0.0, t0, t0);
+    assert_eq!(a1, 0, "NO_ALARM seed must report NO_ALARM");
+    assert!(
+        (afvl1 + 1.0).abs() < 1e-9,
+        "NO_ALARM seed must set afvl=-1, got {afvl1}"
+    );
+
+    // Cycle 2: a single MAJOR (sev=2) sample 1s later. With aftc=10
+    // the accumulator only moves ~0.18 toward +1, staying negative —
+    // so the momentary alarm is SUPPRESSED (reported NO_ALARM).
+    let t1 = t0 + Duration::from_secs(1);
+    let (a2, afvl2) = aftc_filter(2, aftc, afvl1, t0, t1);
+    assert!(
+        afvl2 < 0.0,
+        "one momentary alarm sample must leave afvl negative, got {afvl2}"
+    );
+    assert_eq!(
+        a2, 0,
+        "momentary alarm must be SUPPRESSED while afvl<0 (reported NO_ALARM)"
+    );
+
+    // Sustained alarm: feed MAJOR repeatedly until afvl crosses >= 0,
+    // then the raw severity is reported verbatim.
+    let mut afvl = afvl2;
+    let mut t = t1;
+    let mut reported = 0u16;
+    for _ in 0..200 {
+        let prev = t;
+        t += Duration::from_secs(1);
+        let (a, v) = aftc_filter(2, aftc, afvl, prev, t);
+        afvl = v;
+        reported = a;
+        if reported != 0 {
+            break;
+        }
+    }
+    assert!(afvl >= 0.0, "sustained alarm must drive afvl non-negative");
+    assert_eq!(
+        reported, 2,
+        "after sustained alarm the raw MAJOR severity passes through"
     );
 }
 

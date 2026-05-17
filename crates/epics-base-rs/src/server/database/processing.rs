@@ -510,6 +510,16 @@ impl PvDatabase {
             for (link_str, val_field) in &link_info {
                 if !link_str.is_empty() {
                     let parsed = crate::server::record::parse_link_v2(link_str);
+                    // C `dbGetLink`: a `ProcessPassive` DB input link
+                    // processes its passive source record before the
+                    // value is read. `read_link_with_alarm` does a bare
+                    // `get_pv`, so process the source here first —
+                    // matching the single-INP `read_link_value_soft`
+                    // path. Without this, calc/sel/sub/aSub INPA..INPL
+                    // PP links read a stale source value.
+                    if let crate::server::record::ParsedLink::Db(ref db) = parsed {
+                        self.process_passive_db_source(db).await;
+                    }
                     let (value, alarm) = self.read_link_with_alarm(&parsed).await;
                     if let Some(value) = value {
                         results.push((val_field.clone(), value));
@@ -1592,7 +1602,7 @@ impl PvDatabase {
                 .ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?
         };
 
-        let (snapshot, out_info, flnk_name) = {
+        let (snapshot, out_info, flnk_name, alarm_posts) = {
             let mut instance = rec.write().await;
 
             // UDF update before alarm evaluation (C parity — see the
@@ -1673,39 +1683,44 @@ impl PvDatabase {
                     changed_fields.push(("VAL".to_string(), val));
                 }
             }
-            // C `recGblResetAlarms` posts SEVR only on a sevr change,
-            // STAT only on a stat change — never SEVR on a stat-only
-            // transition. AMSG is posted on any `stat_mask != 0`
-            // (sevr-, stat-, or amsg-change).
+            // C `recGblResetAlarms` (recGbl.c:201-220) posts each alarm
+            // field with its OWN per-field mask, not the record-wide
+            // `event_mask`. Mirror the synchronous link path
+            // (`process_record_with_links_inner`) and `process_local`
+            // exactly: SEVR=DBE_VALUE on a sevr change; STAT/AMSG share
+            // `stat_mask` which carries DBE_ALARM when sevr OR amsg
+            // moved and DBE_VALUE on a stat change; ACKS=DBE_VALUE only
+            // when an alarm field moved AND recGblResetAlarms raised it.
+            // Collapsing these into `changed_fields` would post them all
+            // on one record-wide mask — losing C's per-field
+            // granularity for `.SEVR`/`.STAT`-only subscribers.
             let sevr_changed = instance.common.sevr != alarm_result.prev_sevr;
             let stat_changed = instance.common.stat != alarm_result.prev_stat;
+            let stat_mask = {
+                let mut m = EventMask::NONE;
+                if sevr_changed || alarm_result.amsg_changed {
+                    m |= EventMask::ALARM;
+                }
+                if stat_changed {
+                    m |= EventMask::VALUE;
+                }
+                m
+            };
+            let mut alarm_posts: Vec<(&'static str, EventMask)> = Vec::new();
             if sevr_changed {
-                changed_fields.push((
-                    "SEVR".to_string(),
-                    EpicsValue::Short(instance.common.sevr as i16),
-                ));
+                alarm_posts.push(("SEVR", EventMask::VALUE));
             }
-            if stat_changed {
-                changed_fields.push((
-                    "STAT".to_string(),
-                    EpicsValue::Short(instance.common.stat as i16),
-                ));
+            if !stat_mask.is_empty() {
+                alarm_posts.push(("STAT", stat_mask));
+                alarm_posts.push(("AMSG", stat_mask));
+                // C `val_mask = DBE_ALARM` — the value field carries
+                // DBE_ALARM whenever any alarm field moved.
+                event_mask |= EventMask::ALARM;
             }
-            if sevr_changed || stat_changed || alarm_result.amsg_changed {
-                changed_fields.push((
-                    "AMSG".to_string(),
-                    EpicsValue::String(instance.common.amsg.clone()),
-                ));
-            }
-            // C parity (recGbl.c:216): when recGblResetAlarms raises
-            // `acks`, post it so operator screens that subscribe to
-            // ACKS see the sticky-alarm severity update.
-            if alarm_result.acks_changed {
-                changed_fields.push((
-                    "ACKS".to_string(),
-                    EpicsValue::Short(instance.common.acks as i16),
-                ));
-                event_mask |= EventMask::VALUE;
+            // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only
+            // when an alarm field moved AND recGblResetAlarms raised it.
+            if alarm_result.acks_changed && !stat_mask.is_empty() {
+                alarm_posts.push(("ACKS", EventMask::VALUE));
             }
             if !event_mask.is_empty() {
                 changed_fields.push((
@@ -1834,13 +1849,18 @@ impl PvDatabase {
                 None
             };
 
-            (snapshot, out_info, flnk_name)
+            (snapshot, out_info, flnk_name, alarm_posts)
         };
 
         // Notify subscribers
         {
             let instance = rec.read().await;
             instance.notify_from_snapshot(&snapshot);
+            // Post the alarm fields (SEVR/STAT/AMSG/ACKS) with their
+            // individual C masks — see recGblResetAlarms above.
+            for &(field, mask) in &alarm_posts {
+                instance.notify_field(field, mask);
+            }
         }
 
         // Snapshot source PUTF for processTarget propagation (see

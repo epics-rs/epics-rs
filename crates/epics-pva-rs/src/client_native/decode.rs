@@ -512,8 +512,10 @@ pub fn flatten_type_cache_markers(frame: &mut Frame, cache: &mut crate::pvdata::
     //   2 — PutGet INIT: putIF then getIF
     let desc_count: u8 = match cmd {
         Command::GetField => {
-            // ioid + status + [type-desc]
-            rewrite_after_status(frame, order, cache, 0, 1);
+            // ioid(4) + status + [type-desc] — no subcmd byte, unlike the
+            // op responses below. Mirrors `decode_get_field_response`,
+            // which reads `ioid` (u32, 4 bytes) then `Status`.
+            rewrite_after_status(frame, order, cache, 4, 1);
             return;
         }
         Command::Get | Command::Put | Command::Monitor => {
@@ -937,6 +939,146 @@ mod tests {
             frame.payload, payload,
             "marker-free frame must be unchanged"
         );
+    }
+
+    /// Build a GetField response frame whose type descriptor is encoded
+    /// against `enc_cache` — first such frame emits a `0xFD` define, later
+    /// ones a `0xFE` reference. GetField wire layout is `ioid(4) + Status
+    /// + type-desc`: no subcmd byte, unlike the op responses.
+    fn build_get_field_frame(
+        order: ByteOrder,
+        ioid: u32,
+        desc: &FieldDesc,
+        enc_cache: &mut crate::pvdata::encode::EncodeTypeCache,
+    ) -> Frame {
+        use crate::proto::WriteExt;
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order); // ioid
+        Status::ok().write_into(order, &mut payload);
+        crate::pvdata::encode::encode_type_desc_cached(desc, order, enc_cache, &mut payload);
+        let header =
+            PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    /// Regression: a GetField response carrying a `0xFE` type-cache
+    /// reference must be flattened correctly. The GetField arm of
+    /// `flatten_type_cache_markers` used `prefix_len = 0`, so
+    /// `rewrite_after_status` parsed the first byte of the `ioid` u32 as
+    /// the Status kind byte — the `0xFE` reference was never resolved and
+    /// `decode_get_field_response` hit a 0xFE slot miss. The correct
+    /// prefix is `4` (ioid only; GetField has no subcmd byte).
+    #[test]
+    fn flatten_resolves_get_field_type_cache_reference() {
+        use crate::pvdata::ScalarType;
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+
+        // Frame A (ioid 1): server's first emission — carries 0xFD define.
+        // Frame B (ioid 2): same type — carries 0xFE reference.
+        let mut enc_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let mut frame_a = build_get_field_frame(order, 1, &intro, &mut enc_cache);
+        let mut frame_b = build_get_field_frame(order, 2, &intro, &mut enc_cache);
+
+        // Sanity: the type descriptor starts right after `ioid(4) +
+        // Status`. `Status::ok()` (OkNoMsg) is a single 0xFF byte, so the
+        // descriptor's first byte is at payload offset 5.
+        assert_eq!(
+            frame_a.payload[5], 0xFD,
+            "expected 0xFD type-cache define in frame A"
+        );
+        assert_eq!(
+            frame_b.payload[5], 0xFE,
+            "expected 0xFE type-cache reference in frame B"
+        );
+
+        // Reader task flattens both frames in strict WIRE order: A then B.
+        let mut reader_cache = crate::pvdata::encode::TypeCache::new();
+        flatten_type_cache_markers(&mut frame_a, &mut reader_cache);
+        flatten_type_cache_markers(&mut frame_b, &mut reader_cache);
+
+        // After flattening neither frame carries a marker.
+        assert_ne!(frame_a.payload[5], 0xFD);
+        assert_ne!(frame_a.payload[5], 0xFE);
+        assert_ne!(frame_b.payload[5], 0xFD);
+        assert_ne!(frame_b.payload[5], 0xFE);
+        assert_eq!(
+            frame_a.header.payload_length as usize,
+            frame_a.payload.len()
+        );
+        assert_eq!(
+            frame_b.header.payload_length as usize,
+            frame_b.payload.len()
+        );
+
+        // Per-op tasks decode in REVERSE wire order (B before A): the
+        // reference-before-define race. Both must still decode.
+        for (label, f) in [("B (was 0xFE)", &frame_b), ("A (was 0xFD)", &frame_a)] {
+            let resp = decode_get_field_response(f)
+                .unwrap_or_else(|e| panic!("decode {label} failed: {e}"));
+            assert_eq!(
+                resp.ioid,
+                if label.starts_with('B') { 2 } else { 1 },
+                "{label}"
+            );
+            assert_eq!(resp.status, Status::OkNoMsg, "{label}");
+            match resp.introspection {
+                Some(FieldDesc::Structure { struct_id, fields }) => {
+                    assert_eq!(struct_id, "epics:nt/NTScalar:1.0", "{label}");
+                    assert_eq!(fields.len(), 2, "{label}");
+                }
+                other => panic!("{label}: expected structure introspection, got {other:?}"),
+            }
+        }
+    }
+
+    /// A marker-free GetField response (server with the type cache
+    /// disabled) must pass through `flatten_type_cache_markers`
+    /// byte-identically.
+    #[test]
+    fn flatten_leaves_marker_free_get_field_frame_unchanged() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::ScalarType;
+
+        let order = ByteOrder::Little;
+        let intro = FieldDesc::Structure {
+            struct_id: "s".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut payload = Vec::new();
+        payload.put_u32(7, order); // ioid
+        Status::ok().write_into(order, &mut payload);
+        crate::pvdata::encode::encode_type_desc(&intro, order, &mut payload);
+        let header =
+            PvaHeader::application(true, order, Command::GetField.code(), payload.len() as u32);
+        let mut frame = Frame {
+            header,
+            payload: payload.clone(),
+        };
+
+        let mut reader_cache = crate::pvdata::encode::TypeCache::new();
+        flatten_type_cache_markers(&mut frame, &mut reader_cache);
+        assert_eq!(
+            frame.payload, payload,
+            "marker-free GetField frame must be unchanged"
+        );
+        // And it still decodes.
+        let resp = decode_get_field_response(&frame).unwrap();
+        assert_eq!(resp.ioid, 7);
+        assert!(resp.introspection.is_some());
     }
 
     /// A failure-status INIT frame carries no descriptor; flattening must

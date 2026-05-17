@@ -16,6 +16,16 @@
 //! [`Backend`] trait works without the feature — applications can
 //! plug in custom discovery backends (Consul, etcd, site CMDB, ...)
 //! without depending on mdns-sd or hickory-resolver.
+//!
+//! # Trust model
+//!
+//! Discovery is **unauthenticated**. mDNS multicast and unicast DNS-SD
+//! have no notion of identity — a discovered address is whoever
+//! answered. A hostile mDNS responder on the LAN, or a poisoned DNS
+//! zone, can steer a client onto a rogue IOC, exactly as a spoofed
+//! `EPICS_CA_ADDR_LIST` entry could. Discovery decides *where to look*,
+//! never *who to trust*: integrity and authenticity of PV traffic must
+//! come from the mTLS + capability-token layer, not from discovery.
 
 use std::net::SocketAddr;
 
@@ -65,11 +75,22 @@ pub trait Backend: Send + Sync {
 }
 
 /// Live update from a discovery backend.
+///
+/// Each event is a precise per-`(instance, addr)` delta: a backend emits
+/// one `Added` per address an instance advertises and a matching
+/// `Removed` carrying that exact address when it goes away. A multi-homed
+/// IOC therefore yields one `Added` per interface, and an instance that
+/// re-binds to a new address yields a `Removed` for the old address plus
+/// an `Added` for the new one. `Removed.addr` is the real resolved
+/// address — consumers may key on it directly (e.g. ref-count shared
+/// addresses). The `instance` string (mDNS fullname, or DNS-SD
+/// `<instance>._epics-ca._tcp.<zone>`) is carried for diagnostics.
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
-    /// A new IOC just came online.
+    /// An IOC address just became reachable.
     Added { instance: String, addr: SocketAddr },
-    /// An IOC is no longer reachable.
+    /// An IOC address is no longer reachable. `addr` is the real
+    /// resolved address that was previously `Added`.
     Removed { instance: String, addr: SocketAddr },
 }
 
@@ -172,7 +193,11 @@ fn parse_token(tok: &str) -> Option<DiscoveryConfig> {
         }
     }
     if let Some(rest) = tok.strip_prefix("static:") {
-        let addrs: Vec<SocketAddr> = rest.split(',').filter_map(|s| s.parse().ok()).collect();
+        let addrs: Vec<SocketAddr> = rest
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(parse_static_addr)
+            .collect();
         if addrs.is_empty() {
             tracing::warn!(token = %tok, "EPICS_CA_DISCOVERY static: parsed no addresses");
             return None;
@@ -180,6 +205,31 @@ fn parse_token(tok: &str) -> Option<DiscoveryConfig> {
         return Some(DiscoveryConfig::Static(addrs));
     }
     tracing::warn!(token = %tok, "EPICS_CA_DISCOVERY: unrecognized token");
+    None
+}
+
+/// Parse one comma-separated entry of a `static:` token into a
+/// [`SocketAddr`].
+///
+/// An entry may be `<ip>:<port>` or a bare `<ip>`. A bare address
+/// defaults to the resolved CA server port (`EPICS_CA_SERVER_PORT`, or
+/// 5064) — consistent with `EPICS_CA_ADDR_LIST` parsing, which passes
+/// the same env-resolved port as `default_port` to
+/// `server::addr_list::resolve_token` — instead of being silently
+/// dropped.
+fn parse_static_addr(entry: &str) -> Option<SocketAddr> {
+    use std::net::IpAddr;
+
+    if let Ok(addr) = entry.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    if let Ok(ip) = entry.parse::<IpAddr>() {
+        let port = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(crate::protocol::CA_SERVER_PORT);
+        return Some(SocketAddr::new(ip, port));
+    }
+    tracing::warn!(entry = %entry, "EPICS_CA_DISCOVERY static: dropped unparseable address");
     None
 }
 
@@ -199,6 +249,21 @@ mod tests {
     #[test]
     fn parse_unknown_token_is_none() {
         assert!(parse_token("foo:bar").is_none());
+    }
+
+    #[test]
+    fn parse_static_token_defaults_bare_addr_to_ca_port() {
+        // A port-less entry must default to the standard CA server
+        // port (5064), not be silently dropped.
+        let cfg = parse_token("static:10.0.0.1,10.0.0.2:5066").unwrap();
+        match cfg {
+            DiscoveryConfig::Static(addrs) => {
+                assert_eq!(addrs.len(), 2);
+                assert_eq!(addrs[0].port(), crate::protocol::CA_SERVER_PORT);
+                assert_eq!(addrs[1].port(), 5066);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[cfg(feature = "discovery")]

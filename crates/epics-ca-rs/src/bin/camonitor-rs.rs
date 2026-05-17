@@ -85,6 +85,11 @@ struct Args {
     #[arg(long = "0b", conflicts_with_all = ["ix_flag", "io_flag"])]
     ib_flag: bool,
 
+    /// Alternate output field separator. Defaults to a single space.
+    /// Mirrors C `camonitor.c:342` (`case 'F'`).
+    #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
+    field_separator: Option<char>,
+
     /// PV names to monitor.
     #[arg(required_unless_present_any = ["version"])]
     pv_names: Vec<String>,
@@ -120,6 +125,9 @@ impl Args {
         fmt.enum_as_number = self.enum_as_number;
         fmt.char_array_as_string = self.char_array_as_string;
         fmt.max_elements = self.max_elements;
+        if let Some(c) = self.field_separator {
+            fmt.field_separator = c;
+        }
         fmt
     }
 }
@@ -157,6 +165,10 @@ async fn main() {
         .collect();
 
     let fmt = Arc::new(args.value_format());
+    // C `tool_lib.c:486` (`PRN_TIME_VAL_STS`) gates the array count
+    // prefix on `reqElems || nElems > 1`; `reqElems` is non-zero iff
+    // the user passed `-#`.
+    let req_elems_present = args.max_elements.is_some();
 
     let mut handles = Vec::new();
     for (i, pv_name) in args.pv_names.iter().enumerate() {
@@ -165,7 +177,7 @@ async fn main() {
         let flag = connected_flags[i].clone();
         let fmt = fmt.clone();
         handles.push(tokio::spawn(async move {
-            monitor_pv(channel, pv, flag, fmt).await;
+            monitor_pv(channel, pv, flag, fmt, req_elems_present).await;
         }));
     }
 
@@ -177,13 +189,22 @@ async fn main() {
 
     // Print "*** Not connected" for PVs that didn't connect within
     // the wait window. Mirrors `tool_lib.c::print_time_val_sts` line
-    // 521 — "*** Not connected (PV not found)".
+    // 521 — "*** Not connected (PV not found)". Honor `-F`: emit the
+    // field separator between the name and the message, and pad the
+    // name to 30 only with the default space separator. C's full rule
+    // also suppresses padding for an array PV (`nElems > 1`); a
+    // not-connected PV carries no element count here, so we gate on
+    // the separator alone — identical to C for the common scalar /
+    // no-`-#` case.
+    let sep = args.field_separator.unwrap_or(' ');
     for (i, pv_name) in args.pv_names.iter().enumerate() {
         if !connected_flags[i].load(Ordering::Acquire) {
-            println!(
-                "{pv_name:<width$} *** Not connected (PV not found)",
-                width = PV_NAME_WIDTH
-            );
+            let name_col = if sep == ' ' {
+                format!("{pv_name:<width$}", width = PV_NAME_WIDTH)
+            } else {
+                pv_name.clone()
+            };
+            println!("{name_col}{sep}*** Not connected (PV not found)");
         }
     }
 
@@ -245,10 +266,12 @@ async fn monitor_pv(
     pv_name: String,
     connected_flag: Arc<AtomicBool>,
     fmt: Arc<ValueFormat>,
+    req_elems_present: bool,
 ) {
     let mut conn_rx = channel.connection_events();
     let pv = pv_name.clone();
     let flag = connected_flag.clone();
+    let sep = fmt.field_separator;
     tokio::spawn(async move {
         while let Ok(evt) = conn_rx.recv().await {
             match evt {
@@ -258,8 +281,18 @@ async fn monitor_pv(
                 ConnectionEvent::Disconnected => {
                     let now = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
                     // C `tool_lib.c::print_time_val_sts` ECA_DISCONN
-                    // branch: `name pad ts *** disconnected`.
-                    println!("{pv:<width$} {now} *** disconnected", width = PV_NAME_WIDTH);
+                    // branch: `name <sep> ts *** disconnected`. Pad the
+                    // name to 30 only with the default space separator.
+                    // C also suppresses padding for an array PV; the
+                    // disconnect event carries no element count, so we
+                    // gate on the separator alone — identical to C for
+                    // the common scalar case.
+                    let name_col = if sep == ' ' {
+                        format!("{pv:<width$}", width = PV_NAME_WIDTH)
+                    } else {
+                        pv.clone()
+                    };
+                    println!("{name_col}{sep}{now} *** disconnected");
                 }
                 _ => {}
             }
@@ -269,14 +302,12 @@ async fn monitor_pv(
     let Ok(mut monitor) = channel.subscribe().await else {
         return;
     };
-
-    let sep = fmt.field_separator;
     while let Some(result) = monitor.recv().await {
         match result {
             Ok(snap) => {
                 let ts = format_server_timestamp(snap.timestamp);
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(&snap.value, &fmt, enum_strings);
+                let rendered = format_value(&snap.value, &fmt, enum_strings, req_elems_present);
                 let is_scalar = snap.value.count() == 1;
                 let name_col = if is_scalar && sep == ' ' {
                     format!("{pv_name:<width$}", width = PV_NAME_WIDTH)

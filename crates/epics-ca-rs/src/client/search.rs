@@ -686,6 +686,14 @@ fn handle_request_or_addr(
             }
             None
         }
+        SearchRequest::RemoveAddress(addr) => {
+            let before = addr_list.len();
+            addr_list.retain(|e| e.sock != addr);
+            if addr_list.len() != before {
+                tracing::info!(?addr, "ca-rs: addr_list -= (discovery removal)");
+            }
+            None
+        }
         SearchRequest::SetAddressList(list) => {
             tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
             *addr_list = list
@@ -821,7 +829,9 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
         // `handle_request_or_addr` before they reach this match.
         // Defensive no-op so adding new variants doesn't crash if
         // future code paths plumb them straight to handle_request.
-        SearchRequest::AddAddress(_) | SearchRequest::SetAddressList(_) => None,
+        SearchRequest::AddAddress(_)
+        | SearchRequest::RemoveAddress(_)
+        | SearchRequest::SetAddressList(_) => None,
     }
 }
 
@@ -922,12 +932,24 @@ fn handle_udp_response(
                     .map(|p| p.until > recv_time)
                     .unwrap_or(false);
 
-                // Circuit breaker OPEN → reject responses from this server
-                // entirely. allow() also performs OPEN→HALF_OPEN transition
-                // when the cooldown has elapsed, permitting one probe.
-                let breaker_blocked = !state.breakers.allow(server_addr);
-
-                if penalized || breaker_blocked {
+                // Circuit breaker hard-blocked → reject responses from this
+                // server entirely. This is a READ-ONLY check: `is_blocking()`
+                // does not perform the OPEN→HALF_OPEN transition or consume
+                // the single HALF_OPEN probe slot.
+                //
+                // `is_blocking()` (not `is_open()`) is deliberate: it returns
+                // false once an OPEN breaker's cooldown has elapsed, so a
+                // probe-ready breaker falls through to the `allow()` call
+                // below. `is_open()` here would reject probe-ready breakers
+                // too — and since `allow()` is the only code that leaves
+                // OPEN, the breaker would be stranded OPEN forever.
+                //
+                // Probe-slot consumption is still deferred until we confirm
+                // a real connect will follow (the cid is in `state.pending`);
+                // a passive SEARCH reply for an unknown cid must not burn the
+                // probe slot, which would strand the breaker in HALF_OPEN for
+                // up to `probe_timeout` (30s) with no connect to resolve it.
+                if penalized || state.breakers.is_blocking(server_addr) {
                     // Don't consume this response — let the channel keep
                     // searching for a better server.
                     offset += CaHeader::SIZE + align8(hdr.postsize as usize);
@@ -942,10 +964,30 @@ fn handle_udp_response(
                     continue;
                 }
 
-                if let Some(p) = state.pending.remove(&cid) {
-                    state.buckets[p.bucket].retain(|x| *x != cid);
+                if let Some(p) = state.pending.get(&cid) {
+                    // A connect normally follows this Found — consume the
+                    // breaker probe slot here. `allow()` performs the
+                    // OPEN→HALF_OPEN transition (a probe-ready breaker
+                    // passed the `is_blocking()` gate above) and returns
+                    // false when a probe is already in flight; in that case
+                    // leave the cid pending so a later round can retry.
+                    // Caveat: if the downstream `Found` handler drops this
+                    // event (e.g. the channel already advanced to
+                    // Connecting via another server), the probe slot is
+                    // consumed without a paired record_success/_failure —
+                    // `allow()`'s `probe_timeout` self-heal admits a fresh
+                    // probe after 30s, so the breaker is delayed, not
+                    // stranded.
+                    if !state.breakers.allow(server_addr) {
+                        offset += CaHeader::SIZE + align8(hdr.postsize as usize);
+                        continue;
+                    }
+                    let bucket = p.bucket;
+                    let pv_name = p.pv_name.clone();
+                    state.pending.remove(&cid);
+                    state.buckets[bucket].retain(|x| *x != cid);
                     tracing::debug!(
-                        pv = %p.pv_name, cid, server = %server_addr,
+                        pv = %pv_name, cid, server = %server_addr,
                         "PV search resolved"
                     );
                     let _ = response_tx.send(SearchResponse::Found { cid, server_addr });
@@ -1296,6 +1338,30 @@ mod tests {
         handle_request(&mut state, SearchRequest::Cancel { cid: 1 });
         assert!(state.pending.is_empty());
         assert!(state.buckets[bucket].is_empty());
+    }
+
+    /// `SearchRequest::RemoveAddress` must drop an entry that
+    /// `AddAddress` previously appended — this is the path a discovery
+    /// backend's `DiscoveryEvent::Removed` feeds. A removal for an
+    /// address not in the list is a silent no-op.
+    #[test]
+    fn add_then_remove_address_round_trip() {
+        let mut state = SearchEngineState::new();
+        let mut addr_list: Vec<super::super::AddrEntry> = Vec::new();
+        let a: SocketAddr = "10.0.0.7:5064".parse().unwrap();
+        let b: SocketAddr = "10.0.0.8:5064".parse().unwrap();
+
+        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::AddAddress(a));
+        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::AddAddress(b));
+        assert_eq!(addr_list.len(), 2);
+
+        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::RemoveAddress(a));
+        assert_eq!(addr_list.len(), 1);
+        assert!(addr_list.iter().all(|e| e.sock == b));
+
+        // Removing an address not present is a no-op, not a panic.
+        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::RemoveAddress(a));
+        assert_eq!(addr_list.len(), 1);
     }
 
     #[test]

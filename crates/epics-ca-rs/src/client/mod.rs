@@ -273,6 +273,16 @@ pub struct CaClient {
     _search_task: tokio::task::JoinHandle<()>,
     _transport_task: tokio::task::JoinHandle<()>,
     _beacon_task: tokio::task::JoinHandle<()>,
+    /// Discovery backends retained for their lifetime. mDNS's
+    /// `MdnsBackend` owns an `mdns-sd` `ServiceDaemon` whose browse
+    /// runs only while the backend is alive — dropping it kills live
+    /// discovery. Held here so post-startup IOCs keep being found.
+    _discovery_backends: Vec<Box<dyn crate::discovery::Backend>>,
+    /// Per-backend forwarder tasks: drain each backend's
+    /// `subscribe()` stream and feed `DiscoveryEvent`s into the
+    /// search engine as `AddAddress` / `RemoveAddress`. Aborted on
+    /// drop so they don't outlive the client.
+    _discovery_forwarders: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Internal coordinator requests from CaChannel / public API
@@ -528,6 +538,69 @@ impl CaClient {
             search_attempts.clone(),
         ));
 
+        // Wire each discovery backend's live-update stream into the
+        // search engine. `discover()` above was a one-shot scan;
+        // `subscribe()` (mDNS, watch-style DNS) pushes IOCs that come
+        // and go *after* startup. Without this, post-startup IOCs are
+        // never discovered. The `backends` Vec — and the `ServiceDaemon`
+        // an `MdnsBackend` owns — is retained on `CaClient` so the
+        // browse keeps running for the client's lifetime.
+        let mut discovery_forwarders: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for backend in &backends {
+            if let Some(mut rx) = backend.subscribe() {
+                let fwd_search_tx = search_tx.clone();
+                discovery_forwarders.push(epics_base_rs::runtime::task::spawn(async move {
+                    // Ref-count each address by how many discovery deltas
+                    // currently back it. A backend emits one `Added` per
+                    // `(instance, address)` pair and a matching `Removed`
+                    // carrying that exact address — so a multi-homed IOC
+                    // contributes one ref per interface, two IOCs sharing
+                    // an address contribute two refs, and an instance
+                    // re-bind is a `Removed` of the old plus an `Added` of
+                    // the new. `AddAddress`/`RemoveAddress` are forwarded
+                    // only on the 0↔1 edge, so a shared address is
+                    // retracted from the search engine only once the last
+                    // backer is gone.
+                    let mut addr_refs: std::collections::HashMap<SocketAddr, usize> =
+                        std::collections::HashMap::new();
+                    while let Some(evt) = rx.recv().await {
+                        match evt {
+                            crate::discovery::DiscoveryEvent::Added { addr, .. } => {
+                                let n = addr_refs.entry(addr).or_insert(0);
+                                *n += 1;
+                                if *n == 1
+                                    && fwd_search_tx
+                                        .send(SearchRequest::AddAddress(addr))
+                                        .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            crate::discovery::DiscoveryEvent::Removed { addr, .. } => {
+                                if let Some(n) = addr_refs.get_mut(&addr) {
+                                    *n -= 1;
+                                    if *n == 0 {
+                                        addr_refs.remove(&addr);
+                                        if fwd_search_tx
+                                            .send(SearchRequest::RemoveAddress(addr))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        %addr,
+                                        "discovery Removed for untracked address — ignored"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }));
+            }
+        }
+
         #[cfg(feature = "experimental-rust-tls")]
         let tls_arc = config.tls.as_ref().and_then(|t| match t {
             crate::tls::TlsConfig::Client(arc) => Some(arc.clone()),
@@ -609,6 +682,8 @@ impl CaClient {
             _search_task: search_task,
             _transport_task: transport_task,
             _beacon_task: beacon_task,
+            _discovery_backends: backends,
+            _discovery_forwarders: discovery_forwarders,
         })
     }
 
@@ -972,6 +1047,13 @@ impl Drop for CaClient {
         let transport_abort = self._transport_task.abort_handle();
         let beacon_abort = self._beacon_task.abort_handle();
 
+        // Discovery forwarders hold a `search_tx` clone — abort them
+        // so they don't outlive the client. The `_discovery_backends`
+        // Vec drops with `self`, tearing down any `ServiceDaemon`.
+        for fwd in &self._discovery_forwarders {
+            fwd.abort();
+        }
+
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {
                 let (tx, rx) = oneshot::channel();
@@ -1219,9 +1301,14 @@ impl CaChannel {
             .map_err(|_| CaError::Shutdown)
     }
 
+    /// Send a `CA_PROTO_WRITE_NOTIFY`. `data_type` is the over-the-wire
+    /// DBR type — usually the channel native type, but the typed
+    /// string-put path passes `DBR_STRING` (0) regardless of native
+    /// type so the server resolves the value (e.g. ENUM menu strings).
     fn send_write_notify_fast(
         &self,
         snap: &ChannelSnapshotPublic,
+        data_type: u16,
         count: u32,
         ioid: u32,
         payload: Vec<u8>,
@@ -1230,7 +1317,7 @@ impl CaChannel {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE_NOTIFY,
                 snap.sid,
-                snap.native_type as u16,
+                data_type,
                 count,
                 Some(ioid),
                 payload,
@@ -1240,7 +1327,7 @@ impl CaChannel {
         self.transport_tx
             .send(TransportCommand::WriteNotify {
                 sid: snap.sid,
-                data_type: snap.native_type as u16,
+                data_type,
                 count,
                 ioid,
                 payload,
@@ -1249,9 +1336,12 @@ impl CaChannel {
             .map_err(|_| CaError::Shutdown)
     }
 
+    /// Send a fire-and-forget `CA_PROTO_WRITE`. See
+    /// [`Self::send_write_notify_fast`] for the `data_type` contract.
     fn send_write_nowait_fast(
         &self,
         snap: &ChannelSnapshotPublic,
+        data_type: u16,
         count: u32,
         payload: Vec<u8>,
     ) -> CaResult<()> {
@@ -1259,7 +1349,7 @@ impl CaChannel {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
                 snap.sid,
-                snap.native_type as u16,
+                data_type,
                 count,
                 None,
                 payload,
@@ -1269,7 +1359,7 @@ impl CaChannel {
         self.transport_tx
             .send(TransportCommand::Write {
                 sid: snap.sid,
-                data_type: snap.native_type as u16,
+                data_type,
                 count,
                 payload,
                 server_addr: snap.server_addr,
@@ -1686,12 +1776,19 @@ impl CaChannel {
         };
 
         let native = DbFieldType::from_u16(snap.native_type as u16)?;
+        // `from_u16` only yields the six CA wire types (0..6), so `native`
+        // is never `Int64` on this path; every arm below is therefore
+        // correct as written. The `Sts/Time/Ctrl/Gr` helpers route
+        // through `ca_wire_type()` (which would remap an `Int64` to the
+        // `*_DOUBLE` family); the `Plain` arm's `to_dbr_type()` is an
+        // identity map and relies solely on `native` being wire-bounded.
+        // The helpers are used for consistency, not for Int64 safety.
         let request_type = match class {
             DbrClass::Time => native.time_dbr_type(),
             DbrClass::Ctrl => native.ctrl_dbr_type(),
-            DbrClass::Sts => native as u16 + 7,
-            DbrClass::Gr => native as u16 + 21,
-            DbrClass::Plain => native as u16,
+            DbrClass::Sts => native.sts_dbr_type(),
+            DbrClass::Gr => native.gr_dbr_type(),
+            DbrClass::Plain => native.to_dbr_type() as u16,
         };
 
         let ioid = alloc_ioid();
@@ -1740,7 +1837,9 @@ impl CaChannel {
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        if let Err(e) = self.send_write_notify_fast(&snap, count, ioid, payload) {
+        if let Err(e) =
+            self.send_write_notify_fast(&snap, snap.native_type as u16, count, ioid, payload)
+        {
             self.in_flight.writes.remove(&ioid);
             return Err(e);
         }
@@ -1767,7 +1866,9 @@ impl CaChannel {
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        if let Err(e) = self.send_write_notify_fast(&snap, count, ioid, payload) {
+        if let Err(e) =
+            self.send_write_notify_fast(&snap, snap.native_type as u16, count, ioid, payload)
+        {
             self.in_flight.writes.remove(&ioid);
             return Err(e);
         }
@@ -1787,7 +1888,100 @@ impl CaChannel {
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
-        self.send_write_nowait_fast(&snap, count, payload)
+        self.send_write_nowait_fast(&snap, snap.native_type as u16, count, payload)
+    }
+
+    /// Write a string value to the channel as `DBR_STRING` (DBR type 0)
+    /// regardless of the channel's native type, and wait for the
+    /// completion callback.
+    ///
+    /// This mirrors C `caput`'s ENUM handling (`caput.c:485-510`): a
+    /// `DBR_ENUM` channel is written with the value as a `DBR_STRING`
+    /// and the **server** resolves the menu string. That is the only
+    /// way to write a site-custom ENUM by name — the client has no
+    /// access to the IOC's menu definitions. Plain integer ENUM
+    /// indices should still go through [`Self::put`] with
+    /// [`EpicsValue::Enum`].
+    ///
+    /// Note: a CA `DBR_STRING` is a fixed 40-byte field, so `value` is
+    /// truncated to 39 bytes + NUL on the wire (same fixed-buffer limit
+    /// as C `caput`). ENUM menu names are well within this; callers
+    /// writing longer strings should expect silent truncation.
+    pub async fn put_string(&self, value: &str) -> CaResult<()> {
+        let snap = self.snapshot()?;
+
+        let ioid = alloc_ioid();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
+
+        let payload = EpicsValue::String(value.to_string()).to_bytes();
+        // DBR_STRING = 0; count 1. The server interprets the bytes
+        // against its own field type (e.g. ENUM menu resolution).
+        if let Err(e) = self.send_write_notify_fast(&snap, 0, 1, ioid, payload) {
+            self.in_flight.writes.remove(&ioid);
+            return Err(e);
+        }
+
+        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(30.0);
+        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
+            .map_err(|_| CaError::Timeout)?
+            .map_err(|_| CaError::Shutdown)?
+    }
+
+    /// Fire-and-forget variant of [`Self::put_string`] — sends the
+    /// value as `DBR_STRING` via `CA_PROTO_WRITE` without waiting for
+    /// server acknowledgement.
+    pub async fn put_string_nowait(&self, value: &str) -> CaResult<()> {
+        let snap = self.snapshot()?;
+        let payload = EpicsValue::String(value.to_string()).to_bytes();
+        self.send_write_nowait_fast(&snap, 0, 1, payload)
+    }
+
+    /// Array variant of [`Self::put_string`] — writes `values` as a
+    /// `DBR_STRING` array (`count = values.len()`) regardless of the
+    /// channel's native type, and waits for the completion callback.
+    ///
+    /// This is the ENUM-waveform-by-name path: C `caput -a` on a
+    /// `DBR_ENUM` waveform writes each element as a `DBR_STRING` and the
+    /// **server** resolves each menu string. Each element is subject to
+    /// the same fixed 40-byte field truncation (39 bytes + NUL) as
+    /// [`Self::put_string`].
+    pub async fn put_string_array(&self, values: &[String]) -> CaResult<()> {
+        let snap = self.snapshot()?;
+
+        let ioid = alloc_ioid();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
+
+        let payload = EpicsValue::StringArray(values.to_vec()).to_bytes();
+        let count = values.len() as u32;
+        // DBR_STRING = 0. The server interprets each 40-byte element
+        // against its own field type (e.g. ENUM menu resolution).
+        if let Err(e) = self.send_write_notify_fast(&snap, 0, count, ioid, payload) {
+            self.in_flight.writes.remove(&ioid);
+            return Err(e);
+        }
+
+        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(30.0);
+        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
+            .map_err(|_| CaError::Timeout)?
+            .map_err(|_| CaError::Shutdown)?
+    }
+
+    /// Fire-and-forget variant of [`Self::put_string_array`].
+    pub async fn put_string_array_nowait(&self, values: &[String]) -> CaResult<()> {
+        let snap = self.snapshot()?;
+        let payload = EpicsValue::StringArray(values.to_vec()).to_bytes();
+        let count = values.len() as u32;
+        self.send_write_nowait_fast(&snap, 0, count, payload)
     }
 
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {
@@ -1843,35 +2037,38 @@ impl CaChannel {
     }
 
     /// Convenience wrapper around [`Self::connection_events`] that
-    /// invokes `cb` on every `AccessRightsChanged`. Returns a
-    /// [`tokio::task::JoinHandle`] you can drop to stop watching.
-    /// Mirrors libca `ca_replace_access_rights_event` at the
-    /// callback-registration shape.
-    pub fn on_access_rights_change<F>(&self, mut cb: F) -> tokio::task::JoinHandle<()>
+    /// invokes `cb` on every `AccessRightsChanged`. Returns an
+    /// [`EventWatcher`] guard — drop it (or call `.abort()`) to stop
+    /// watching; the watcher task is aborted on drop. Mirrors libca
+    /// `ca_replace_access_rights_event` at the callback-registration
+    /// shape.
+    pub fn on_access_rights_change<F>(&self, mut cb: F) -> EventWatcher
     where
         F: FnMut(AccessRights) + Send + 'static,
     {
         let mut rx = self.conn_tx.subscribe();
-        epics_base_rs::runtime::task::spawn(async move {
+        let handle = epics_base_rs::runtime::task::spawn(async move {
             while let Ok(evt) = rx.recv().await {
                 if let ConnectionEvent::AccessRightsChanged { read, write } = evt {
                     cb(AccessRights { read, write });
                 }
             }
-        })
+        });
+        EventWatcher { handle }
     }
 
     /// Convenience wrapper around [`Self::connection_events`] that
     /// invokes `cb(true)` on `Connected` and `cb(false)` on
     /// `Disconnected`. Mirrors libca
-    /// `ca_change_connection_event(chid, callback)` (oldChannelNotify.cpp:229) —
-    /// drop the returned handle to stop watching.
-    pub fn on_connection_change<F>(&self, mut cb: F) -> tokio::task::JoinHandle<()>
+    /// `ca_change_connection_event(chid, callback)` (oldChannelNotify.cpp:229).
+    /// Returns an [`EventWatcher`] guard — drop it (or call `.abort()`)
+    /// to stop watching; the watcher task is aborted on drop.
+    pub fn on_connection_change<F>(&self, mut cb: F) -> EventWatcher
     where
         F: FnMut(bool) + Send + 'static,
     {
         let mut rx = self.conn_tx.subscribe();
-        epics_base_rs::runtime::task::spawn(async move {
+        let handle = epics_base_rs::runtime::task::spawn(async move {
             while let Ok(evt) = rx.recv().await {
                 match evt {
                     ConnectionEvent::Connected => cb(true),
@@ -1879,7 +2076,8 @@ impl CaChannel {
                     _ => {}
                 }
             }
-        })
+        });
+        EventWatcher { handle }
     }
 
     /// Server's IP address as a string (e.g. `"10.0.0.5:5064"`).
@@ -1949,6 +2147,34 @@ impl Drop for MonitorHandle {
         let _ = self
             .coord_tx
             .send(CoordRequest::Unsubscribe { subid: self.subid });
+    }
+}
+
+/// Abort-on-drop guard for a connection / access-rights watcher task.
+///
+/// A bare `tokio::task::JoinHandle` *detaches* on drop — it does not
+/// abort the spawned task. Returning one from
+/// [`CaChannel::on_connection_change`] / [`CaChannel::on_access_rights_change`]
+/// while documenting "drop to stop" would leak a running task. This
+/// guard mirrors the `ServerConnection` abort-on-drop pattern: dropping
+/// it aborts the inner watcher task.
+#[must_use = "dropping the EventWatcher immediately stops the watcher task; \
+              bind it to a variable to keep watching"]
+pub struct EventWatcher {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl EventWatcher {
+    /// Stop watching now. Equivalent to dropping the guard; provided
+    /// for callers that want an explicit, named teardown.
+    pub fn abort(self) {
+        // Drop runs `handle.abort()`.
+    }
+}
+
+impl Drop for EventWatcher {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 
@@ -2085,7 +2311,9 @@ async fn run_coordinator(
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
                             });
                             let connected = ch.state == ChannelState::Connected;
-                            let data_type = ch.native_type.map(|t| t as u16 + 14);
+                            // `time_dbr_type()` (not `as u16 + 14`) for
+                            // consistency with the rest of the codebase.
+                            let data_type = ch.native_type.map(|t| t.time_dbr_type());
                             let count = ch.native_type.map(|_| ch.element_count);
 
                             subscriptions.add(subscription::SubscriptionRecord {
@@ -2093,6 +2321,11 @@ async fn run_coordinator(
                                 cid,
                                 data_type,
                                 count,
+                                // The public subscribe API auto-derives the
+                                // DBR type from the channel's native type;
+                                // no user-chosen type path exists yet, so
+                                // these must re-derive on NativeTypeChanged.
+                                type_user_supplied: false,
                                 mask,
                                 server_addr,
                                 deadband,
@@ -2483,6 +2716,7 @@ async fn run_coordinator(
                                 sid,
                                 data_type,
                                 element_count,
+                                native_changed,
                                 server_addr,
                                 &transport_tx,
                             );
@@ -3716,5 +3950,156 @@ mod waiter_drain_tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod event_watcher_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Dropping an `EventWatcher` must abort the spawned watcher task
+    /// (a bare `JoinHandle` would only detach, leaking the task). The
+    /// task here loops forever; after the guard drops, `is_finished()`
+    /// must become true.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_aborts_watcher_task() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = ran.clone();
+        let handle = epics_base_rs::runtime::task::spawn(async move {
+            ran_in_task.store(true, Ordering::SeqCst);
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let abort_handle = handle.abort_handle();
+        let watcher = EventWatcher { handle };
+        tokio::task::yield_now().await;
+        assert!(ran.load(Ordering::SeqCst), "watcher task should have started");
+        assert!(!abort_handle.is_finished(), "task still running before drop");
+        drop(watcher);
+        for _ in 0..100 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "EventWatcher::drop must abort the watcher task"
+        );
+    }
+
+    /// `EventWatcher::abort()` is an explicit, named teardown that
+    /// behaves identically to dropping the guard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_abort_stops_watcher_task() {
+        let handle = epics_base_rs::runtime::task::spawn(async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let abort_handle = handle.abort_handle();
+        let watcher = EventWatcher { handle };
+        watcher.abort();
+        for _ in 0..100 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "EventWatcher::abort must stop the watcher task"
+        );
+    }
+}
+
+#[cfg(test)]
+mod typed_string_put_tests {
+    use super::*;
+
+    /// The typed string-put path (`CaChannel::put_string` /
+    /// `put_string_nowait`) must put the value on the wire as
+    /// `DBR_STRING` (DBR type code 0) regardless of the channel's
+    /// native type, so the server resolves it (e.g. ENUM menu
+    /// strings). This drives the shared `build_write_frame` builder
+    /// the way `put_string_nowait` does and asserts the header field.
+    #[test]
+    fn put_string_frame_uses_dbr_string_type() {
+        let payload = EpicsValue::String("Running".to_string()).to_bytes();
+        let frame = CaChannel::build_write_frame(
+            CA_PROTO_WRITE,
+            /* sid */ 77,
+            /* data_type — forced DBR_STRING */ 0,
+            /* count */ 1,
+            /* ioid */ None,
+            payload,
+        );
+        let (hdr, _consumed) =
+            CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
+        assert_eq!(hdr.cmmd, CA_PROTO_WRITE, "command must be CA_PROTO_WRITE");
+        assert_eq!(
+            hdr.data_type, 0,
+            "typed string-put must wire DBR_STRING (0), not the native type"
+        );
+        assert_eq!(hdr.cid, 77, "sid echoed in cid field");
+    }
+
+    /// Contrast: a native-typed put of a non-string channel carries
+    /// the native DBR type, NOT 0. Proves the string-put choice of 0
+    /// is a deliberate override, not the default.
+    #[test]
+    fn native_typed_put_frame_keeps_native_type() {
+        let payload = EpicsValue::Double(1.5).to_bytes();
+        let native_double = DbFieldType::Double as u16; // 6
+        let frame = CaChannel::build_write_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            /* sid */ 5,
+            native_double,
+            /* count */ 1,
+            /* ioid */ Some(42),
+            payload,
+        );
+        let (hdr, _consumed) =
+            CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
+        assert_eq!(hdr.data_type, native_double);
+        assert_ne!(
+            hdr.data_type, 0,
+            "native Double put must not collapse to DBR_STRING"
+        );
+        assert_eq!(hdr.available, 42, "ioid echoed in available field");
+    }
+
+    /// The ENUM-waveform-by-name path (`put_string_array`) must wire a
+    /// `DBR_STRING` array: data_type 0, count = element count, and a
+    /// 40-byte-per-element payload, so the server resolves each menu
+    /// string. Drives the same `build_write_frame` builder.
+    #[test]
+    fn put_string_array_frame_uses_dbr_string_type_and_count() {
+        let values = vec![
+            "Running".to_string(),
+            "Stopped".to_string(),
+            "Paused".to_string(),
+        ];
+        let payload = EpicsValue::StringArray(values.clone()).to_bytes();
+        assert_eq!(
+            payload.len(),
+            values.len() * 40,
+            "DBR_STRING array is 40 bytes per element"
+        );
+        let frame = CaChannel::build_write_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            /* sid */ 9,
+            /* data_type — forced DBR_STRING */ 0,
+            /* count */ values.len() as u32,
+            /* ioid */ Some(7),
+            payload,
+        );
+        let (hdr, _consumed) =
+            CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
+        assert_eq!(hdr.data_type, 0, "string-array put must wire DBR_STRING (0)");
+        assert_eq!(hdr.count, 3, "count must be the element count");
     }
 }

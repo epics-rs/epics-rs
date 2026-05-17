@@ -107,9 +107,8 @@ fn send_timeout() -> Duration {
 /// Cap on `TlsAcceptor::accept` duration. Round 8 C-G12: without this
 /// a peer that completes TCP but stalls during ClientHello holds a
 /// connection slot until OS-level keepalive (15s/5s probes) reaps it
-/// (~30s); coordinated peers can exhaust the listener under
-/// `EPICS_CAS_MAX_CONNECTIONS`. Default 10 s, override via
-/// `EPICS_CAS_TLS_HANDSHAKE_TMO`. Floored at 1s.
+/// (~30s); coordinated peers can tie up listener resources. Default
+/// 10 s, override via `EPICS_CAS_TLS_HANDSHAKE_TMO`. Floored at 1s.
 #[cfg(feature = "experimental-rust-tls")]
 fn tls_handshake_timeout() -> Duration {
     epics_base_rs::runtime::env::get("EPICS_CAS_TLS_HANDSHAKE_TMO")
@@ -262,6 +261,14 @@ struct ClientState {
     /// username.
     #[cfg(feature = "cap-tokens")]
     cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
+    /// TLS channel binding (SHA-256 of the peer's leaf certificate DER)
+    /// for this connection. `Some(..)` only when the peer connected
+    /// over mTLS and presented a client certificate; `None` for
+    /// plaintext circuits. A cap-token presented over a plaintext
+    /// circuit (`None`) is rejected by `TokenVerifier::verify` —
+    /// mTLS-gating, so a stolen token cannot be replayed off-channel.
+    #[cfg(feature = "cap-tokens")]
+    tls_channel_binding: Option<crate::cap_token::ChannelBinding>,
     /// Pending WRITE_NOTIFY completion tasks. Each entry is the channel
     /// `sid`-tagged AbortHandle of a task awaiting `put_notify_tx` for
     /// an async record write. Aborted on connection drop so a stuck
@@ -298,6 +305,8 @@ impl ClientState {
             rate_limit_strike_threshold: 0,
             #[cfg(feature = "cap-tokens")]
             cap_token_verifier: None,
+            #[cfg(feature = "cap-tokens")]
+            tls_channel_binding: None,
             write_notify_tasks: Vec::new(),
         }
     }
@@ -433,7 +442,10 @@ impl ClientState {
 /// (port 0) if the configured port is already in use.
 ///
 /// Notifies `beacon_reset` on each client connect/disconnect so the beacon
-/// emitter restarts its fast beacon cycle (matching C EPICS behavior).
+/// emitter restarts its fast beacon cycle. This is a Rust enhancement, NOT
+/// C parity: C `rsrv` resets the beacon interval only on `ctlPause`, never
+/// on connect/disconnect. The extra fast beacons are benign and help
+/// clients notice server state changes promptly.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tcp_listener(
     db: Arc<PvDatabase>,
@@ -643,6 +655,14 @@ async fn accept_loop(
             // starve incoming accepts.
             Some(_) = conn_tasks.join_next() => continue,
         };
+        // Reap finished connection tasks promptly. The select! arm on
+        // `conn_tasks.join_next()` only fires when `listener.accept()`
+        // is Pending, but `biased` makes the accept arm strictly
+        // preferred — so under a sustained connect storm completed
+        // `JoinHandle`s would accumulate in the set unbounded. A
+        // non-blocking `try_join_next` drain after every accept caps
+        // the set at the count of genuinely in-flight connections.
+        while conn_tasks.try_join_next().is_some() {}
         if drain.load(std::sync::atomic::Ordering::Acquire) {
             tracing::info!(peer = %peer, "drain mode: rejecting new connection");
             drop(stream);
@@ -654,6 +674,10 @@ async fn accept_loop(
         let db = db.clone();
         let acf = acf.clone();
         let beacon_reset = beacon_reset.clone();
+        // Rust enhancement (NOT C parity): C `rsrv` never resets the
+        // beacon interval on connect — only on `ctlPause`. We restart
+        // the fast beacon cycle here so clients notice the new server
+        // state quickly; the extra beacons are benign.
         beacon_reset.notify_one();
         if let Some(tx) = &conn_events {
             let _ = tx.send(ServerConnectionEvent::Connected(peer));
@@ -724,11 +748,12 @@ async fn accept_loop(
                             Ok(Ok(tls_stream)) => {
                                 // Extract verified peer identity + issuer
                                 // from the client certificate, if presented.
-                                let (identity, authority) = tls_stream
-                                    .get_ref()
-                                    .1
-                                    .peer_certificates()
-                                    .and_then(|chain| chain.first())
+                                let leaf_cert =
+                                    tls_stream.get_ref().1.peer_certificates().and_then(
+                                        |chain| chain.first().cloned(),
+                                    );
+                                let (identity, authority) = leaf_cert
+                                    .as_ref()
                                     .map(|cert| {
                                         (
                                             crate::tls::identity_from_cert(cert),
@@ -737,6 +762,17 @@ async fn accept_loop(
                                     })
                                     .map(|(id, auth)| (Some(id), auth))
                                     .unwrap_or((None, None));
+                                // TLS channel binding: SHA-256 of the
+                                // peer's leaf certificate DER. Threaded
+                                // into `handle_client` so cap-token
+                                // verification is bound to this circuit.
+                                #[cfg(feature = "cap-tokens")]
+                                let tls_channel_binding =
+                                    leaf_cert.as_ref().map(|cert| {
+                                        crate::cap_token::ChannelBinding::from_peer_cert_der(
+                                            cert.as_ref(),
+                                        )
+                                    });
                                 if let Some(ref id) = identity {
                                     tracing::info!(
                                         peer = %peer,
@@ -759,6 +795,8 @@ async fn accept_loop(
                                     stats_for_client.clone(),
                                     #[cfg(feature = "cap-tokens")]
                                     cap_token_verifier_for_client.clone(),
+                                    #[cfg(feature = "cap-tokens")]
+                                    tls_channel_binding,
                                 )
                                 .await
                             }
@@ -783,6 +821,9 @@ async fn accept_loop(
                             stats_for_client.clone(),
                             #[cfg(feature = "cap-tokens")]
                             cap_token_verifier_for_client.clone(),
+                            // Plaintext circuit: no channel binding.
+                            #[cfg(feature = "cap-tokens")]
+                            None,
                         )
                         .await
                     }
@@ -803,10 +844,17 @@ async fn accept_loop(
                         stats_for_client.clone(),
                         #[cfg(feature = "cap-tokens")]
                         cap_token_verifier_for_client.clone(),
+                        // No TLS compiled in: never a channel binding.
+                        #[cfg(feature = "cap-tokens")]
+                        None,
                     )
                     .await
                 }
             };
+            // Rust enhancement (NOT C parity): C `rsrv` never resets
+            // the beacon interval on disconnect — only on `ctlPause`.
+            // Restarting the fast beacon cycle here is a deliberate,
+            // benign addition.
             beacon_reset.notify_one();
             if let Some(tx) = &conn_events {
                 let _ = tx.send(ServerConnectionEvent::Disconnected(peer));
@@ -866,6 +914,12 @@ async fn handle_client<S>(
     // dispatch fixtures that don't spin up a full CaServer.
     stats: Option<Arc<super::ca_server::ServerStats>>,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
+    // TLS channel binding (SHA-256 of the peer's leaf cert DER),
+    // computed at the mTLS accept site. `None` for plaintext peers —
+    // a cap-token presented on a `None` circuit is rejected by
+    // `TokenVerifier::verify`, so the token is cryptographically
+    // bound to the TLS channel it was issued for.
+    #[cfg(feature = "cap-tokens")] tls_channel_binding: Option<crate::cap_token::ChannelBinding>,
 ) -> CaResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -883,6 +937,7 @@ where
     #[cfg(feature = "cap-tokens")]
     {
         state.cap_token_verifier = cap_token_verifier;
+        state.tls_channel_binding = tls_channel_binding;
     }
     // Default hostname: verified TLS identity if present, otherwise the
     // peer IP. Matches C rsrv default with EPICS_CAS_USE_HOST_NAMES=NO,
@@ -1026,6 +1081,18 @@ where
                         crate::protocol::max_payload_size()
                     )));
                 }
+            }
+            // C `rsrv/camessage.c:~2410`: when the buffer holds a
+            // partial extended-form header (16..24 bytes of a message
+            // whose `m_postsize == 0xffff`), C does `status = RSRV_OK;
+            // break;` to await the remaining bytes — it does NOT
+            // disconnect. Without this guard, `from_bytes_extended`
+            // returns `Err("extended header incomplete")` and the `?`
+            // below closes the connection on a benign TCP segment
+            // boundary. The ECA_TOLARGE pre-check above is gated on
+            // `buf.len() >= 24`, so it never masks this 16..24 window.
+            if buf.len() < 24 && buf[2] == 0xFF && buf[3] == 0xFF {
+                break;
             }
             let (hdr, hdr_size) = CaHeader::from_bytes_extended(&accumulated[offset..])?;
             let actual_post = hdr.actual_postsize();
@@ -1450,8 +1517,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // When a capability-token verifier is configured AND the
             // payload arrives in `cap:<token>` form, verify the token
             // and store the resolved subject. Unverifiable tokens are
-            // logged and replaced with an `unverified:` sentinel that
-            // ACF rules can deliberately deny. Plain (non-`cap:`)
+            // logged and replaced with a fixed `unverified` sentinel
+            // that ACF rules can deliberately deny. Plain (non-`cap:`)
             // usernames pass through unchanged for backwards compat.
             #[cfg(feature = "cap-tokens")]
             {
@@ -1461,16 +1528,27 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // every well-formed token; cap-tokens was non-
                 // functional whenever a verifier was configured.
                 state.username = match (&state.cap_token_verifier, raw.starts_with("cap:")) {
-                    (Some(v), true) => match v.verify(&raw) {
+                    (Some(v), true) => match v.verify(
+                        &raw,
+                        state.tls_channel_binding.as_ref(),
+                    ) {
                         Ok(claims) => {
                             tracing::debug!(peer = %state.peer, sub = %claims.sub,
                                 "cap-token verified");
                             claims.sub
                         }
                         Err(e) => {
+                            // Do NOT fold the raw token into the username:
+                            // it then lands in the ACF identity and the
+                            // audit log. A structurally valid but rejected
+                            // token (aud/binding/expiry mismatch) is a real
+                            // bearer credential, and a garbage token is
+                            // attacker-controlled bytes — neither belongs
+                            // there. A fixed sentinel is enough for ACF to
+                            // deny; the reason is in the warn log.
                             tracing::warn!(peer = %state.peer, error = %e,
                                 "cap-token verification failed");
-                            format!("unverified:{}", &raw)
+                            "unverified".to_string()
                         }
                     },
                     _ => raw,
@@ -3392,5 +3470,92 @@ mod multi_nic_listener_tests {
                 std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", v);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod extended_header_split_tests {
+    //! C-parity regression: a TCP segment that ends in the middle of an
+    //! extended-form header (16..24 bytes, `m_postsize == 0xffff`) must
+    //! make the framing loop *wait* for the rest of the header, not
+    //! disconnect the client. C `rsrv/camessage.c:~2410` does
+    //! `status = RSRV_OK; break;` for this partial-header case.
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Feed exactly 20 bytes of an extended-form header (a 16-byte base
+    /// header with `postsize == 0xFFFF`, plus 4 of the 8 extended
+    /// bytes) and assert `handle_client` does NOT return early with an
+    /// error: it must block awaiting the remaining 4 bytes. Pre-fix,
+    /// `from_bytes_extended` returned `Err("extended header
+    /// incomplete")` and the `?` closed the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_extended_header_waits_not_disconnects() {
+        let db = Arc::new(PvDatabase::new());
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+
+        let (client_io, server_io) = tokio::io::duplex(256);
+        let peer: SocketAddr = "127.0.0.1:55123".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        // Build a CA_PROTO_READ_NOTIFY header in extended form:
+        // postsize=0xFFFF marks extended; write only 20 of the 24
+        // header bytes so the framing loop sees a partial ext header.
+        let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        hdr.postsize = 0xFFFF;
+        let base = hdr.to_bytes();
+        let mut prefix = base.to_vec();
+        // 4 of the 8 extended bytes (extended postsize = 0).
+        prefix.extend_from_slice(&[0u8, 0, 0, 0]);
+        assert_eq!(prefix.len(), 20);
+
+        let mut client = client_io;
+        client.write_all(&prefix).await.expect("write prefix");
+        client.flush().await.expect("flush prefix");
+
+        // The handler must still be running — it is waiting for the
+        // remaining 4 bytes, not disconnected with an error.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handle.is_finished(),
+            "handle_client returned on a partial extended header — \
+             must wait for more bytes (C camessage.c RSRV_OK; break)"
+        );
+
+        // Close the write half: a clean EOF on a partial frame must
+        // resolve to Ok(()), never an Err.
+        drop(client);
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_client completes after EOF")
+            .expect("join ok");
+        assert!(
+            res.is_ok(),
+            "clean EOF after partial extended header must be Ok, got {res:?}"
+        );
     }
 }

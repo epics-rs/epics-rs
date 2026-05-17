@@ -126,7 +126,18 @@ impl Default for ValueFormat {
 /// the integer index is used (matches `-n` flag default when no enum
 /// metadata is available). `format_value` does not emit a trailing
 /// newline.
-pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[String]>) -> String {
+///
+/// `req_elems_present` mirrors C `caget.c:286` / the `PRN_TIME_VAL_STS`
+/// macro (`tool_lib.c:486`): the array element-count prefix is emitted
+/// only when `reqElems || pv->nElems > 1`. Pass `true` when the user
+/// supplied `-#` on the command line; a genuine 1-element waveform read
+/// without `-#` then prints just the value with no count prefix.
+pub fn format_value(
+    v: &EpicsValue,
+    fmt: &ValueFormat,
+    enum_strings: Option<&[String]>,
+    req_elems_present: bool,
+) -> String {
     let sep = fmt.field_separator;
     match v {
         EpicsValue::String(s) => s.clone(),
@@ -137,16 +148,32 @@ pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[St
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         EpicsValue::Float(x) => format_float(*x as f64, fmt),
         EpicsValue::Double(x) => format_float(*x, fmt),
-        EpicsValue::ShortArray(arr) => {
-            render_array_int(arr.iter().map(|&n| n as i64), arr.len(), fmt, sep)
-        }
-        EpicsValue::LongArray(arr) => {
-            render_array_int(arr.iter().map(|&n| n as i64), arr.len(), fmt, sep)
-        }
-        EpicsValue::Int64Array(arr) => render_array_int(arr.iter().copied(), arr.len(), fmt, sep),
+        EpicsValue::ShortArray(arr) => render_array_int(
+            arr.iter().map(|&n| n as i64),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
+        EpicsValue::LongArray(arr) => render_array_int(
+            arr.iter().map(|&n| n as i64),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
+        EpicsValue::Int64Array(arr) => render_array_int(
+            arr.iter().copied(),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
         EpicsValue::EnumArray(arr) => {
             let mut parts = Vec::with_capacity(arr.len() + 1);
-            parts.push(arr.len().to_string());
+            if req_elems_present || arr.len() > 1 {
+                parts.push(arr.len().to_string());
+            }
             let take = fmt.max_elements.unwrap_or(arr.len()).min(arr.len());
             for &idx in &arr[..take] {
                 parts.push(format_enum(idx as i64, fmt, enum_strings));
@@ -158,25 +185,38 @@ pub fn format_value(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[St
             arr.len(),
             fmt,
             sep,
+            req_elems_present,
         ),
         EpicsValue::DoubleArray(arr) => render_array_iter(
             arr.iter().map(|&x| format_float(x, fmt)),
             arr.len(),
             fmt,
             sep,
+            req_elems_present,
         ),
         EpicsValue::CharArray(arr) => {
-            if fmt.char_array_as_string {
+            // C `caget.c` renders a CHAR array as a long-string only when
+            // `charArrAsStr && (reqElems || nElems > 1)` — a 1-element
+            // CHAR array with `-S` but no `-#` falls through to numeric.
+            if fmt.char_array_as_string && (req_elems_present || arr.len() > 1) {
                 // Long-string convention: bytes up to first NUL.
                 let end = arr.iter().position(|&b| b == 0).unwrap_or(arr.len());
                 String::from_utf8_lossy(&arr[..end]).into_owned()
             } else {
-                render_array_int(arr.iter().map(|&b| (b as i8) as i64), arr.len(), fmt, sep)
+                render_array_int(
+                    arr.iter().map(|&b| (b as i8) as i64),
+                    arr.len(),
+                    fmt,
+                    sep,
+                    req_elems_present,
+                )
             }
         }
         EpicsValue::StringArray(arr) => {
             let mut parts = Vec::with_capacity(arr.len() + 1);
-            parts.push(arr.len().to_string());
+            if req_elems_present || arr.len() > 1 {
+                parts.push(arr.len().to_string());
+            }
             let take = fmt.max_elements.unwrap_or(arr.len()).min(arr.len());
             parts.extend(arr[..take].iter().cloned());
             parts.join(&sep.to_string())
@@ -189,10 +229,13 @@ fn render_array_int<I: Iterator<Item = i64>>(
     total: usize,
     fmt: &ValueFormat,
     sep: char,
+    req_elems_present: bool,
 ) -> String {
     let take = fmt.max_elements.unwrap_or(total).min(total);
     let mut parts = Vec::with_capacity(take + 1);
-    parts.push(total.to_string());
+    if req_elems_present || total > 1 {
+        parts.push(total.to_string());
+    }
     for n in iter.take(take) {
         parts.push(format_int_i64(n, fmt.int_style));
     }
@@ -204,10 +247,13 @@ fn render_array_iter<I: Iterator<Item = String>>(
     total: usize,
     fmt: &ValueFormat,
     sep: char,
+    req_elems_present: bool,
 ) -> String {
     let take = fmt.max_elements.unwrap_or(total).min(total);
     let mut parts = Vec::with_capacity(take + 1);
-    parts.push(total.to_string());
+    if req_elems_present || total > 1 {
+        parts.push(total.to_string());
+    }
     parts.extend(iter.take(take));
     parts.join(&sep.to_string())
 }
@@ -254,6 +300,37 @@ fn format_float(x: f64, fmt: &ValueFormat) -> String {
     }
 }
 
+/// Decimal exponent of `abs` after rounding to `precision` significant
+/// digits — i.e. `floor(log10(round_to_sig_digits(abs, precision)))`.
+///
+/// C `%g` rounds to `precision` significant digits FIRST and only then
+/// decides between `%e` and `%f`. At a rounding boundary the rounded
+/// magnitude can tick up by a power of ten (e.g. `999999.5` at
+/// precision 6 rounds to `1000000`, exponent 5 → 6), which flips the
+/// fixed-vs-scientific choice. Computing the decision exponent from the
+/// UNROUNDED value misses that — see the regression test
+/// `g_rounding_boundary_picks_scientific`.
+fn decision_exponent(abs: f64, precision: usize) -> i32 {
+    let raw_exp = abs.log10().floor() as i32;
+    // Scale so the value has `precision` digits before the decimal
+    // point, round half-to-even, and read back the magnitude. If the
+    // round carries into a new decade the exponent increments.
+    let scale = 10f64.powi(precision as i32 - 1 - raw_exp);
+    // For magnitudes near the f64 range limits the scale factor can
+    // overflow to ±inf (or underflow to 0); `abs * scale` then yields a
+    // non-finite product whose `log10` saturates to a garbage exponent.
+    // The rounded magnitude cannot meaningfully differ from the raw one
+    // at those scales, so fall back to `raw_exp`.
+    if !scale.is_finite() || scale == 0.0 {
+        return raw_exp;
+    }
+    let rounded_scaled = (abs * scale).round();
+    if !rounded_scaled.is_finite() || rounded_scaled <= 0.0 {
+        return raw_exp;
+    }
+    raw_exp + (rounded_scaled.log10().floor() as i32 - (precision as i32 - 1))
+}
+
 /// `%g`-equivalent formatter. C semantics: choose `%e` or `%f`
 /// depending on the exponent, drop trailing zeros and the trailing
 /// decimal point. Precision is the *significant-digit* count.
@@ -262,7 +339,10 @@ fn format_g(x: f64, precision: usize) -> String {
         return "0".to_string();
     }
     let abs = x.abs();
-    let exp = abs.log10().floor() as i32;
+    // C `%g` rounds to `precision` significant digits before choosing
+    // the format, so the decision exponent must come from the rounded
+    // magnitude, not the raw value.
+    let exp = decision_exponent(abs, precision);
     // C `%g` uses fixed-point when `precision > exp >= -4`. Compare as
     // i32 to avoid the silent `i32 → usize` wrap for negative `exp`.
     if exp >= -4 && exp < precision as i32 {
@@ -352,6 +432,37 @@ mod tests {
         assert_eq!(format_g(1234567.0, 6), "1.23457e+06");
     }
 
+    /// C `%g` rounds to `precision` significant digits BEFORE deciding
+    /// between `%e` and `%f`. At a rounding boundary the rounded
+    /// magnitude can carry into a new decade and flip the choice:
+    /// `printf("%g", 999999.5)` → "1e+06" (not "1000000"), because the
+    /// rounded value `1000000` has exponent 6 >= precision 6.
+    #[test]
+    fn g_rounding_boundary_picks_scientific() {
+        // 999999.5 rounds up to 1000000 → exponent ticks 5 → 6 → %e.
+        assert_eq!(format_g(999999.5, 6), "1e+06");
+        // Just below the boundary stays fixed-point.
+        assert_eq!(format_g(999998.0, 6), "999998");
+        // 9.999995 rounds to 10 (exponent 0 → 1, still fixed range).
+        assert_eq!(format_g(9.999995, 6), "10");
+        // Negative value at the same boundary keeps the sign.
+        assert_eq!(format_g(-999999.5, 6), "-1e+06");
+    }
+
+    #[test]
+    fn g_extreme_magnitudes_do_not_produce_garbage() {
+        // Magnitudes near the f64 range limits make the internal scale
+        // factor overflow/underflow; decision_exponent must fall back
+        // to the raw exponent instead of saturating to a garbage value.
+        // Tiny: classifies as scientific (exp < -4).
+        assert_eq!(format_g(1e-308, 6), "1e-308");
+        assert_eq!(format_g(5e-300, 6), "5e-300");
+        // Huge: classifies as scientific (exp >= precision).
+        assert_eq!(format_g(1e308, 6), "1e+308");
+        // Smallest normal f64 — no panic, scientific form.
+        assert!(format_g(f64::MIN_POSITIVE, 6).contains("e-"));
+    }
+
     #[test]
     fn e_format_matches_c() {
         // C `printf("%e", 1.5)` → "1.500000e+00"
@@ -369,16 +480,31 @@ mod tests {
     #[test]
     fn array_renders_count_then_values() {
         let v = EpicsValue::DoubleArray(vec![1.0, 2.5, 3.0]);
-        let s = format_value(&v, &fmt_default(), None);
+        let s = format_value(&v, &fmt_default(), None, false);
         // C: `3 1 2.5 3` (count + space-separated %g values)
         assert_eq!(s, "3 1 2.5 3");
+    }
+
+    /// C `caget.c:286` gates the count prefix on `reqElems || nElems > 1`.
+    /// A genuine 1-element waveform read WITHOUT `-#` prints just the
+    /// value, no `1 ` prefix.
+    #[test]
+    fn single_element_array_omits_count_without_req_elems() {
+        let v = EpicsValue::DoubleArray(vec![2.5]);
+        // No `-#` on the command line → no count prefix.
+        assert_eq!(format_value(&v, &fmt_default(), None, false), "2.5");
+        // `-#` supplied → count prefix returns even for 1 element.
+        assert_eq!(format_value(&v, &fmt_default(), None, true), "1 2.5");
+        // Multi-element always carries the count prefix.
+        let v2 = EpicsValue::DoubleArray(vec![1.0, 2.5]);
+        assert_eq!(format_value(&v2, &fmt_default(), None, false), "2 1 2.5");
     }
 
     #[test]
     fn enum_with_strings_renders_string() {
         let strs = vec!["off".to_string(), "on".to_string()];
         let v = EpicsValue::Enum(1);
-        let s = format_value(&v, &fmt_default(), Some(&strs));
+        let s = format_value(&v, &fmt_default(), Some(&strs), false);
         assert_eq!(s, "on");
     }
 
@@ -388,7 +514,7 @@ mod tests {
         let v = EpicsValue::Enum(1);
         let mut fmt = fmt_default();
         fmt.enum_as_number = true;
-        let s = format_value(&v, &fmt, Some(&strs));
+        let s = format_value(&v, &fmt, Some(&strs), false);
         assert_eq!(s, "1");
     }
 
@@ -397,7 +523,7 @@ mod tests {
         let v = EpicsValue::CharArray(b"hello\0xxxx".to_vec());
         let mut fmt = fmt_default();
         fmt.char_array_as_string = true;
-        assert_eq!(format_value(&v, &fmt, None), "hello");
+        assert_eq!(format_value(&v, &fmt, None, false), "hello");
     }
 
     #[test]
@@ -407,7 +533,7 @@ mod tests {
         fmt.float_as_int = true;
         fmt.int_style = IntStyle::Hex;
         // 1235 = 0x4d3
-        assert_eq!(format_value(&v, &fmt, None), "0x4d3");
+        assert_eq!(format_value(&v, &fmt, None, false), "0x4d3");
     }
 
     #[test]
@@ -465,7 +591,8 @@ mod tests {
         let v = EpicsValue::LongArray((0..10).collect());
         let mut fmt = fmt_default();
         fmt.max_elements = Some(3);
-        let s = format_value(&v, &fmt, None);
+        // `-#` implies `req_elems_present` so the count prefix is present.
+        let s = format_value(&v, &fmt, None, true);
         // Total count is full (10) per C `caget -# 3` behaviour:
         //   "10 0 1 2"
         assert_eq!(s, "10 0 1 2");

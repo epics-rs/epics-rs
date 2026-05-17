@@ -495,7 +495,7 @@ impl ChannelSource for CompositeSource {
                 if src.has_pv(&name).await {
                     let inner_checked = src
                         .access_gate()
-                        .check(&name, &ctx.host, &ctx.account, &ctx.method, "")
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
                         .await;
                     return src.process_checked(inner_checked, ctx).await;
                 }

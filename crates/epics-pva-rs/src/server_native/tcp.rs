@@ -29,8 +29,8 @@ use crate::proto::{
     Status, WriteExt, encode_size_into, encode_string_into,
 };
 use crate::pvdata::encode::{
-    EncodeTypeCache, decode_pv_field, decode_type_desc, encode_pv_field, encode_type_desc,
-    encode_type_desc_cached,
+    EncodeTypeCache, decode_pv_field, decode_pv_field_with_bitset, decode_type_desc,
+    encode_pv_field, encode_type_desc, encode_type_desc_cached, fill_unmarked_from_prior,
 };
 use crate::pvdata::{FieldDesc, PvField};
 
@@ -1406,9 +1406,20 @@ async fn handle_put_get(
 
     // The data frame carries the put bitset + put value, exactly like
     // a PUT EXEC. pvxs clientget.cpp PUT_GET state sends `0x00`.
-    let _changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
-    let put_value = decode_pv_field(&intro, &mut cur, order)
+    // The value is a BitSet delta (`changed | partial value`): only
+    // the marked fields are present on the wire, so decode with the
+    // changed-BitSet (pvData spec §5.4 bit numbering) — a full
+    // `decode_pv_field` desyncs the stream for multi-field structures.
+    let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let put_delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)
         .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
+    // Merge the delta over the PV's current value so unmarked fields
+    // keep their existing state instead of being clobbered with
+    // type defaults (`put_value` replaces the whole PvField).
+    let put_value = match source.get_value(&pv_name).await {
+        Some(prior) => fill_unmarked_from_prior(&intro, &changed, 0, put_delta, &prior),
+        None => put_delta,
+    };
 
     let ctx = crate::server_native::source::ChannelContext {
         peer,
@@ -1426,7 +1437,13 @@ async fn handle_put_get(
     let put_result = {
         let checked = source
             .access_gate()
-            .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+            .check(
+                &pv_name,
+                &ctx.host,
+                &ctx.account,
+                &ctx.method,
+                &ctx.authority,
+            )
             .await;
         source
             .put_value_checked(checked, put_value, ctx.clone())
@@ -2181,7 +2198,17 @@ async fn handle_op(
         }
         OpKind::Put => {
             // Read bitset (which fields client is putting) + value.
-            let _changed =
+            // The PVA client encodes the data phase as a BitSet delta
+            // (`changed | partial value`, see
+            // `client_native::ops_v2::op_put*` and pvxs
+            // `serverput.cpp` `from_wire`): only the fields whose bit
+            // is set are present on the wire. Decoding the value as a
+            // full structure (`decode_pv_field`) desyncs the stream
+            // for any multi-field structure where not every field is
+            // marked. Decode with the changed-BitSet so exactly the
+            // present fields are consumed (pvData spec §5.4 bit
+            // numbering).
+            let changed =
                 BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
             // pvxs `serverget.cpp:488-492` calls `onPut` immediately
             // on every CMD_PUT !init — the client's autoExec setting
@@ -2189,9 +2216,18 @@ async fn handle_op(
             // for whether the PUT EXEC fires automatically after INIT
             // or waits for `reExec()`. Each EXEC frame still carries
             // exactly one value and triggers exactly one write.
-            let value = decode_pv_field(&intro, &mut cur, order)
+            let delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)
                 .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
             let pv_name = ch.name.clone();
+            // The wire delta only carries marked fields; unmarked
+            // fields decoded as type defaults. `put_value` replaces
+            // the whole PvField, so merge the delta over the PV's
+            // current value — unmarked fields keep their existing
+            // state instead of being clobbered with defaults.
+            let value = match source.get_value(&pv_name).await {
+                Some(prior) => fill_unmarked_from_prior(&intro, &changed, 0, delta, &prior),
+                None => delta,
+            };
             // Round 42: type-state PUT gate. The token's
             // `allows_write()` is checked by `put_value_checked`;
             // adding a new PUT-equivalent handler without taking a
@@ -3561,6 +3597,322 @@ mod tests {
         assert_eq!(
             resp_subcmd, 0x00,
             "plain PUT EXEC reply subcmd must echo 0x00"
+        );
+    }
+
+    /// Build a flat 3-field NTScalar-like structure descriptor with
+    /// children `a`, `b`, `c` (all `Int`). Bit numbering (pvData §5.4
+    /// depth-first): root=0, a=1, b=2, c=3.
+    #[cfg(test)]
+    fn three_field_intro() -> FieldDesc {
+        use crate::pvdata::FieldDesc;
+        FieldDesc::Structure {
+            struct_id: "test:nt/Triple:1.0".into(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("c".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        }
+    }
+
+    /// Build a `PvField::Structure` with the three `Int` children set
+    /// to the given values.
+    #[cfg(test)]
+    fn three_field_value(a: i32, b: i32, c: i32) -> PvField {
+        let mut s = PvStructure::new("test:nt/Triple:1.0");
+        s.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Int(a))));
+        s.fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Int(b))));
+        s.fields
+            .push(("c".into(), PvField::Scalar(ScalarValue::Int(c))));
+        PvField::Structure(s)
+    }
+
+    /// Extract the three `Int` children of a `PvField::Structure`.
+    #[cfg(test)]
+    fn three_field_extract(v: &PvField) -> (i32, i32, i32) {
+        let s = match v {
+            PvField::Structure(s) => s,
+            other => panic!("expected Structure, got {other:?}"),
+        };
+        let get = |name: &str| match s.get_field(name) {
+            Some(PvField::Scalar(ScalarValue::Int(n))) => *n,
+            other => panic!("field '{name}' not Int: {other:?}"),
+        };
+        (get("a"), get("b"), get("c"))
+    }
+
+    /// Regression (Defect 1): the PVA client encodes the PUT data
+    /// phase as a BitSet delta — only the marked fields are present
+    /// on the wire. A 3-field structure where only field `b` (bit 2)
+    /// changed carries `changed | <b's 4 bytes>`, NOT all three
+    /// fields. Decoding the value as a full structure
+    /// (`decode_pv_field`) reads `a`'s slot from `b`'s bytes and then
+    /// runs off the end — the data phase desyncs. The fix decodes
+    /// with the changed-BitSet and merges over the PV's prior value.
+    ///
+    /// Before the fix this test fails: a full-structure decode of a
+    /// single-field-wide payload either errors (short read) or
+    /// misreads `b`'s bytes as `a` and clobbers `b`/`c` with garbage.
+    #[tokio::test]
+    async fn put_delta_multi_field_applies_only_changed_field() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+        use crate::server_native::tcp::ClientCredentials;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 300;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(10, 20, 30));
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // PUT INIT.
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let req_val = PvField::Structure(PvStructure::new(""));
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Put, order, init_payload);
+        handle_op(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT INIT ok");
+        let _ = rx.try_recv().expect("INIT resp");
+
+        // PUT EXEC — delta with only field `b` (bit 2) changed to 99.
+        // This is exactly what the client encoder emits: a changed
+        // BitSet with bit 2 set, followed by `encode_pv_field_with_bitset`
+        // which writes ONLY `b`'s 4 bytes.
+        let bit_b = intro.bit_for_path("b").expect("b has a bit");
+        assert_eq!(bit_b, 2, "field b must occupy bit 2 (pvData §5.4)");
+        let mut changed = BitSet::new();
+        changed.set(bit_b);
+        let delta = three_field_value(0, 99, 0);
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x00);
+        changed.write_into(order, &mut exec_payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &delta,
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut exec_payload,
+        );
+        let exec_frame = synth_frame(Command::Put, order, exec_payload);
+        handle_op(
+            &source,
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT EXEC ok");
+        let _ = rx.try_recv().expect("PUT EXEC response emitted");
+
+        // The server must apply ONLY field `b`; `a` and `c` keep
+        // their prior values.
+        let stored = source.get_value("dut").await.expect("PV value present");
+        assert_eq!(
+            three_field_extract(&stored),
+            (10, 99, 30),
+            "PUT delta must change only field b; a and c must be untouched"
+        );
+    }
+
+    /// Regression (Defect 1, PUT_GET path): same as the PUT delta
+    /// test but via the dedicated `handle_put_get` (Command::PutGet,
+    /// cmd 12). A 3-field structure PUT_GET where only field `c`
+    /// (bit 3) changed must apply exactly `c` and leave `a`/`b`
+    /// intact, and the readback must reflect the merged value.
+    #[tokio::test]
+    async fn put_get_delta_multi_field_applies_only_changed_field() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+        use crate::server_native::tcp::ClientCredentials;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 400;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(10, 20, 30));
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // PUT_GET INIT (subcmd 0x08).
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let req_val = PvField::Structure(PvStructure::new(""));
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::PutGet, order, init_payload);
+        handle_put_get(
+            &source,
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT_GET INIT ok");
+        let _ = rx.try_recv().expect("INIT resp");
+
+        // PUT_GET data phase — delta with only field `c` (bit 3).
+        let bit_c = intro.bit_for_path("c").expect("c has a bit");
+        assert_eq!(bit_c, 3, "field c must occupy bit 3 (pvData §5.4)");
+        let mut changed = BitSet::new();
+        changed.set(bit_c);
+        let delta = three_field_value(0, 0, 77);
+        let mut data_payload = Vec::new();
+        data_payload.put_u32(sid, order);
+        data_payload.put_u32(ioid, order);
+        data_payload.put_u8(0x00);
+        changed.write_into(order, &mut data_payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &delta,
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut data_payload,
+        );
+        let data_frame = synth_frame(Command::PutGet, order, data_payload);
+        handle_put_get(
+            &source,
+            &data_frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+        )
+        .await
+        .expect("PUT_GET data ok");
+        let resp = rx.try_recv().expect("PUT_GET data response emitted");
+
+        // Server-side state: only `c` changed.
+        let stored = source.get_value("dut").await.expect("PV value present");
+        assert_eq!(
+            three_field_extract(&stored),
+            (10, 20, 77),
+            "PUT_GET delta must change only field c; a and b must be untouched"
+        );
+
+        // Readback: decode the PUT_GET response payload directly
+        // (`decode_op_response` rejects Command::PutGet — cmd 12 is
+        // not in its Get/Put/Monitor/Rpc set). The GET-leg success
+        // path emits `ioid + subcmd + status + mask + value`.
+        let (frame, _consumed) = try_parse_frame(&resp)
+            .expect("readback frame parses")
+            .expect("complete frame");
+        assert_eq!(
+            frame.header.command,
+            Command::PutGet.code(),
+            "readback is a PUT_GET reply"
+        );
+        let mut cur = frame.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        let _subcmd = cur.get_u8().expect("subcmd");
+        let status = Status::decode(&mut cur, order).expect("status");
+        assert!(status.is_success(), "PUT_GET readback status ok");
+        let mask = BitSet::decode(&mut cur, order).expect("readback bitset");
+        let readback =
+            crate::pvdata::encode::decode_pv_field_with_bitset(&intro, &mask, 0, &mut cur, order)
+                .expect("readback value");
+        // The readback mask is the op's field mask (all fields here),
+        // so every field is present and reflects the merged state.
+        assert_eq!(
+            three_field_extract(&readback),
+            (10, 20, 77),
+            "PUT_GET readback must carry the merged value"
         );
     }
 

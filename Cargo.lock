@@ -26,6 +26,7 @@ dependencies = [
  "epics-bridge-rs",
  "epics-ca-rs",
  "epics-pva-rs",
+ "flate2",
  "image",
  "jpeg-decoder",
  "jpeg-encoder",
@@ -3205,9 +3206,9 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.2.0"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61030759bb80fe015555d9a7326b18fafbc6025b0d54c94380fab968d21f4247"
+checksum = "cdf25873323aba4c8324787e72b8730b13c1be4da148e48bf1bfbc18fe0b2b77"
 dependencies = [
  "bzip2",
  "flate2",

@@ -90,10 +90,28 @@ impl NDPluginFileBase {
             let mut s_count = 0;
             while let Some(c) = chars.next() {
                 if c == '%' {
-                    // Collect format spec
+                    // Collect printf flags and the width/precision spec:
+                    // optional `-` (left-justify) / `0` (zero-pad) flags,
+                    // digits (width), `.digits` (precision). C++ uses real
+                    // epicsSnprintf.
+                    let mut left_justify = false;
+                    let mut zero_pad = false;
+                    loop {
+                        match chars.peek() {
+                            Some('-') => {
+                                left_justify = true;
+                                chars.next();
+                            }
+                            Some('0') => {
+                                zero_pad = true;
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
                     let mut spec = String::new();
                     while let Some(&nc) = chars.peek() {
-                        if nc.is_ascii_digit() || nc == '.' || nc == '-' {
+                        if nc.is_ascii_digit() || nc == '.' {
                             spec.push(nc);
                             chars.next();
                         } else {
@@ -101,45 +119,59 @@ impl NDPluginFileBase {
                         }
                     }
                     match chars.next() {
+                        // `%%` → literal percent.
+                        Some('%') if spec.is_empty() && !left_justify => result.push('%'),
                         Some('s') => {
                             s_count += 1;
                             match s_count {
                                 1 => result.push_str(&self.file_path),
                                 2 => result.push_str(&self.file_name),
-                                _ => result.push_str(""),
+                                _ => {}
                             }
                         }
                         Some('d') => {
-                            // Parse width and precision from spec (e.g. "3.3" → width=3, precision=3)
-                            let width: usize = if spec.contains('.') {
-                                spec.split('.')
-                                    .next()
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0)
-                            } else {
-                                spec.parse().unwrap_or(0)
+                            // `width.precision`: precision = minimum digits
+                            // (zero-pad), width = minimum field width
+                            // (space-pad unless precision provided).
+                            let (width, precision) = match spec.split_once('.') {
+                                Some((w, p)) => (
+                                    w.parse::<usize>().unwrap_or(0),
+                                    p.parse::<usize>().unwrap_or(0),
+                                ),
+                                None => (spec.parse::<usize>().unwrap_or(0), 0),
                             };
-                            let precision: usize = if spec.contains('.') {
-                                spec.split('.')
-                                    .nth(1)
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            let pad = width.max(precision);
-                            if pad > 0 {
+                            // Apply precision first (zero-pad the number).
+                            let digits = format!("{:0>prec$}", self.file_number, prec = precision);
+                            // Then pad to the field width. The `0` flag
+                            // zero-pads (ignored when left-justified or when an
+                            // explicit precision is given, per C printf).
+                            if digits.len() >= width {
+                                result.push_str(&digits);
+                            } else if zero_pad && !left_justify && precision == 0 {
                                 result.push_str(&format!(
                                     "{:0>width$}",
                                     self.file_number,
-                                    width = pad
+                                    width = width
                                 ));
                             } else {
-                                result.push_str(&self.file_number.to_string());
+                                let pad = " ".repeat(width - digits.len());
+                                if left_justify {
+                                    result.push_str(&digits);
+                                    result.push_str(&pad);
+                                } else {
+                                    result.push_str(&pad);
+                                    result.push_str(&digits);
+                                }
                             }
                         }
                         Some(other) => {
                             result.push('%');
+                            if left_justify {
+                                result.push('-');
+                            }
+                            if zero_pad {
+                                result.push('0');
+                            }
                             result.push_str(&spec);
                             result.push(other);
                         }
@@ -196,6 +228,21 @@ impl NDPluginFileBase {
         Ok(())
     }
 
+    /// Delete the driver's original file for `array` when `delete_driver_file`
+    /// is set. C++ NDPluginFile deletes the driver file in every write mode
+    /// (Single, Stream, and Capture), keyed off the `DriverFileName` attribute.
+    fn maybe_delete_driver_file(&self, array: &NDArray) {
+        if !self.delete_driver_file {
+            return;
+        }
+        if let Some(attr) = array.attributes.get("DriverFileName") {
+            let driver_file = attr.value.as_string();
+            if !driver_file.is_empty() {
+                let _ = std::fs::remove_file(&driver_file);
+            }
+        }
+    }
+
     /// Process an incoming array according to the current file mode.
     pub fn process_array(
         &mut self,
@@ -212,14 +259,7 @@ impl NDPluginFileBase {
                 if let Some(final_path) = final_path {
                     Self::rename_temp(&write_path, &final_path)?;
                 }
-                if self.delete_driver_file {
-                    if let Some(attr) = array.attributes.get("DriverFileName") {
-                        let driver_file = attr.value.as_string();
-                        if !driver_file.is_empty() {
-                            let _ = std::fs::remove_file(&driver_file);
-                        }
-                    }
-                }
+                self.maybe_delete_driver_file(&array);
                 if self.auto_increment {
                     self.file_number += 1;
                 }
@@ -227,7 +267,8 @@ impl NDPluginFileBase {
             NDFileMode::Capture => {
                 self.capture_buffer.push(array);
                 self.num_captured = self.capture_buffer.len();
-                if self.num_captured >= self.num_capture {
+                // B7: num_capture==0 → buffer forever, never auto-flush.
+                if self.num_capture > 0 && self.num_captured >= self.num_capture {
                     self.flush_capture(writer)?;
                 }
             }
@@ -245,14 +286,7 @@ impl NDPluginFileBase {
                     self.is_open = true;
                 }
                 writer.write_file(&array)?;
-                if self.delete_driver_file {
-                    if let Some(attr) = array.attributes.get("DriverFileName") {
-                        let driver_file = attr.value.as_string();
-                        if !driver_file.is_empty() {
-                            let _ = std::fs::remove_file(&driver_file);
-                        }
-                    }
-                }
+                self.maybe_delete_driver_file(&array);
                 self.num_captured += 1;
             }
         }
@@ -282,6 +316,12 @@ impl NDPluginFileBase {
             if let Some(final_path) = final_path {
                 Self::rename_temp(&write_path, &final_path)?;
             }
+            // C++ deletes the driver file per frame in Capture mode too.
+            let buffer = std::mem::take(&mut self.capture_buffer);
+            for arr in &buffer {
+                self.maybe_delete_driver_file(arr);
+            }
+            self.capture_buffer = buffer;
             if self.auto_increment {
                 self.file_number += 1;
             }
@@ -297,6 +337,7 @@ impl NDPluginFileBase {
                 if let Some(final_path) = final_path {
                     Self::rename_temp(&write_path, &final_path)?;
                 }
+                self.maybe_delete_driver_file(arr);
                 if self.auto_increment {
                     self.file_number += 1;
                 }
@@ -306,6 +347,36 @@ impl NDPluginFileBase {
 
         self.capture_buffer.clear();
         self.num_captured = 0;
+        Ok(())
+    }
+
+    /// Eagerly open a stream file before the first frame arrives.
+    ///
+    /// C++ `doCapture` opens the file at capture-start for non-lazy stream
+    /// plugins (NDPluginFile.cpp:478-479) so a bad path is reported then,
+    /// not on the first frame (B9). `array` supplies the layout the writer
+    /// needs at open time.
+    pub fn open_stream_eager(
+        &mut self,
+        writer: &mut dyn NDFileWriter,
+        array: &NDArray,
+    ) -> ADResult<()> {
+        if self.is_open {
+            return Ok(());
+        }
+        self.last_written_name = self.create_file_name();
+        let (write_path, _) = self.write_path();
+        writer.open_file(&write_path, NDFileMode::Stream, array)?;
+        self.is_open = true;
+        Ok(())
+    }
+
+    /// Force a file close (used by the FilePluginClose attribute, G9).
+    /// Safe to call when no file is open.
+    pub fn force_close(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
+        if self.is_open {
+            self.close_stream(writer)?;
+        }
         Ok(())
     }
 
@@ -518,6 +589,34 @@ mod tests {
     }
 
     #[test]
+    fn test_create_file_name_printf_specs() {
+        // B10: %-, width-only space pad, %0Nd zero pad, %%.
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = "/d/".into();
+        fb.file_name = "f".into();
+        fb.file_number = 7;
+
+        fb.file_template = "%s%s_%3.3d.dat".into();
+        assert_eq!(fb.create_file_name(), "/d/f_007.dat");
+
+        // Width-only → space pad, right-justified.
+        fb.file_template = "%s%s_%5d".into();
+        assert_eq!(fb.create_file_name(), "/d/f_    7");
+
+        // Left-justify.
+        fb.file_template = "%s%s_%-5d".into();
+        assert_eq!(fb.create_file_name(), "/d/f_7    ");
+
+        // Zero-pad flag.
+        fb.file_template = "%s%s_%05d".into();
+        assert_eq!(fb.create_file_name(), "/d/f_00007");
+
+        // Literal percent.
+        fb.file_template = "%s%s_%d%%".into();
+        assert_eq!(fb.create_file_name(), "/d/f_7%");
+    }
+
+    #[test]
     fn test_auto_increment() {
         let mut fb = NDPluginFileBase::new();
         fb.file_path = "/tmp/".into();
@@ -543,6 +642,85 @@ mod tests {
 
         let temp = fb.temp_file_path().unwrap();
         assert_eq!(temp.to_str().unwrap(), "/data/img_0001.tmp");
+    }
+
+    fn make_array_with_driver_file(id: i32, driver_file: &str) -> Arc<NDArray> {
+        use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.unique_id = id;
+        arr.attributes.add(NDAttribute::new_static(
+            "DriverFileName",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String(driver_file.to_string()),
+        ));
+        Arc::new(arr)
+    }
+
+    #[test]
+    fn test_delete_driver_file_in_capture_mode() {
+        // C++ NDPluginFile deletes the driver file per frame in Capture mode
+        // too, not only Single/Stream.
+        let dir = std::env::temp_dir();
+        let f1 = dir.join("adcore_capture_driver_1.raw");
+        let f2 = dir.join("adcore_capture_driver_2.raw");
+        std::fs::write(&f1, b"x").unwrap();
+        std::fs::write(&f2, b"y").unwrap();
+
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = format!("{}/", dir.display());
+        fb.file_name = "capdel_".into();
+        fb.delete_driver_file = true;
+        fb.set_mode(NDFileMode::Capture);
+        fb.set_num_capture(2);
+
+        let mut writer = MockWriter::new(true);
+        fb.process_array(
+            make_array_with_driver_file(1, f1.to_str().unwrap()),
+            &mut writer,
+        )
+        .unwrap();
+        fb.process_array(
+            make_array_with_driver_file(2, f2.to_str().unwrap()),
+            &mut writer,
+        )
+        .unwrap();
+
+        // Capture buffer flushed at num_capture=2; both driver files deleted.
+        assert!(
+            !f1.exists(),
+            "driver file 1 should be deleted in capture mode"
+        );
+        assert!(
+            !f2.exists(),
+            "driver file 2 should be deleted in capture mode"
+        );
+    }
+
+    #[test]
+    fn test_delete_driver_file_capture_single_image_format() {
+        let dir = std::env::temp_dir();
+        let f1 = dir.join("adcore_capture_si_driver_1.raw");
+        std::fs::write(&f1, b"x").unwrap();
+
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = format!("{}/", dir.display());
+        fb.file_name = "capdelsi_".into();
+        fb.delete_driver_file = true;
+        fb.set_mode(NDFileMode::Capture);
+        fb.set_num_capture(1);
+
+        let mut writer = MockWriter::new(false); // single-image format
+        fb.process_array(
+            make_array_with_driver_file(1, f1.to_str().unwrap()),
+            &mut writer,
+        )
+        .unwrap();
+
+        assert!(
+            !f1.exists(),
+            "driver file should be deleted in capture mode"
+        );
     }
 
     #[test]

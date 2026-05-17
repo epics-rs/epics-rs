@@ -116,7 +116,8 @@ mod tests {
         let info = arr.info();
         assert_eq!(info.x_size, 640);
         assert_eq!(info.y_size, 480);
-        assert_eq!(info.color_size, 1);
+        // C parity: 2-D mono arrays leave colorSize at 0.
+        assert_eq!(info.color_size, 0);
         assert_eq!(info.num_elements, layout.num_elements());
     }
 
@@ -138,6 +139,7 @@ mod tests {
             description: "Color Mode".into(),
             source: NDAttrSource::Driver,
             value: NDAttrValue::Int32(ColorMode::RGB1 as i32),
+            source_impl: None,
         });
         let info = arr.info();
         assert_eq!(info.x_size, 320);

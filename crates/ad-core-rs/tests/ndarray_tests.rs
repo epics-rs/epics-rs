@@ -89,8 +89,9 @@ fn dimension_1d() {
     let arr = NDArray::new(dims, NDDataType::UInt8);
     let info = arr.info();
     assert_eq!(info.x_size, 1024);
-    assert_eq!(info.y_size, 1);
-    assert_eq!(info.color_size, 1);
+    // C parity: 1-D arrays leave ySize / colorSize at 0.
+    assert_eq!(info.y_size, 0);
+    assert_eq!(info.color_size, 0);
     assert_eq!(info.num_elements, 1024);
     assert_eq!(info.bytes_per_element, 1);
 }
@@ -102,7 +103,8 @@ fn dimension_2d_mono() {
     let info = arr.info();
     assert_eq!(info.x_size, 640);
     assert_eq!(info.y_size, 480);
-    assert_eq!(info.color_size, 1);
+    // C parity: 2-D arrays leave colorSize at 0 (no color dimension).
+    assert_eq!(info.color_size, 0);
     assert_eq!(info.num_elements, 640 * 480);
     assert_eq!(info.bytes_per_element, 2);
     assert_eq!(info.total_bytes, 640 * 480 * 2);
@@ -124,6 +126,7 @@ fn dimension_3d_rgb() {
         description: "Color Mode".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(2), // RGB1
+        source_impl: None,
     });
     let info = arr.info();
     assert_eq!(info.color_size, 3);
@@ -189,17 +192,23 @@ fn pool_free_list_reuse() {
     let arr = pool
         .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
         .unwrap();
-    let alloc_after_first = pool.allocated_bytes();
+    // Accounting tracks the exact requested data_size (C parity), not Vec capacity.
+    assert_eq!(pool.allocated_bytes(), 100);
     pool.release(arr);
     assert_eq!(pool.num_free_buffers(), 1);
 
-    // Allocate again — use size within THRESHOLD_SIZE_RATIO (1.5x) for reuse
+    // Allocate again — use size within THRESHOLD_SIZE_RATIO (1.5x) for reuse.
     let arr2 = pool
         .alloc(vec![NDDimension::new(80)], NDDataType::UInt8)
         .unwrap();
     assert_eq!(pool.num_free_buffers(), 0);
-    assert_eq!(pool.allocated_bytes(), alloc_after_first);
+    // C parity: NDArrayPool::alloc skips the realloc block when the existing
+    // buffer is already large enough, so `dataSize` and `memorySize_` stay at
+    // the buffer's original size. Reusing a 100-byte buffer for 80 bytes keeps
+    // the tracked data_size at 100; only the live element count is 80.
+    assert_eq!(pool.allocated_bytes(), 100);
     assert_eq!(arr2.data.len(), 80);
+    assert_eq!(arr2.data_size, 100);
     // unique_id keeps incrementing even on reuse
     assert_eq!(arr2.unique_id, 2);
 }
@@ -396,6 +405,7 @@ fn attribute_list_add_and_find() {
         description: "Color mode of the image".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(0),
+        source_impl: None,
     });
 
     assert_eq!(list.len(), 1);
@@ -412,12 +422,14 @@ fn attribute_list_replace_existing() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Float64(1.0),
+        source_impl: None,
     });
     list.add(NDAttribute {
         name: "Gain".into(),
         description: "Updated".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Float64(2.5),
+        source_impl: None,
     });
     // Should not duplicate
     assert_eq!(list.len(), 1);
@@ -439,6 +451,7 @@ fn attribute_list_remove() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Float64(25.0),
+        source_impl: None,
     });
     assert!(list.remove("Temp"));
     assert!(list.is_empty());
@@ -454,6 +467,7 @@ fn attribute_list_clear() {
             description: "".into(),
             source: NDAttrSource::Constant,
             value: NDAttrValue::Int32(i),
+            source_impl: None,
         });
     }
     assert_eq!(list.len(), 5);
@@ -469,12 +483,14 @@ fn attribute_list_iter() {
         description: "".into(),
         source: NDAttrSource::Constant,
         value: NDAttrValue::Int32(1),
+        source_impl: None,
     });
     list.add(NDAttribute {
         name: "B".into(),
         description: "".into(),
         source: NDAttrSource::Constant,
         value: NDAttrValue::String("hello".into()),
+        source_impl: None,
     });
     let names: Vec<_> = list.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(names, vec!["A", "B"]);
@@ -500,6 +516,7 @@ fn attribute_source_types() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(1),
+        source_impl: None,
     };
     assert_eq!(driver_attr.source, NDAttrSource::Driver);
 
@@ -511,6 +528,7 @@ fn attribute_source_types() {
             param_name: "TEMPERATURE".into(),
         },
         value: NDAttrValue::Float64(25.0),
+        source_impl: None,
     };
     match &param_attr.source {
         NDAttrSource::Param {
@@ -528,6 +546,7 @@ fn attribute_source_types() {
         description: "".into(),
         source: NDAttrSource::Constant,
         value: NDAttrValue::UInt8(255),
+        source_impl: None,
     };
     assert_eq!(const_attr.source, NDAttrSource::Constant);
 }
@@ -687,6 +706,7 @@ fn pool_reuse_clears_attributes() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(1),
+        source_impl: None,
     });
     assert_eq!(arr.attributes.len(), 1);
 
@@ -740,12 +760,14 @@ fn ndarray_attributes_on_instance() {
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Int32(0),
+        source_impl: None,
     });
     arr.attributes.add(NDAttribute {
         name: "Gain".into(),
         description: "".into(),
         source: NDAttrSource::Driver,
         value: NDAttrValue::Float64(1.5),
+        source_impl: None,
     });
 
     assert_eq!(arr.attributes.len(), 2);

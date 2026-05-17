@@ -1,10 +1,20 @@
 use std::sync::Arc;
 
+use ad_core_rs::color::NDColorMode;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 
-/// Transform types matching C++ NDPluginTransform.
+/// Transform types matching C++ `NDPluginTransformType_t`.
+///
+/// The numeric ordering is the C++ enum order:
+/// `None=0, Rotate90=1, Rotate180=2, Rotate270=3, Mirror=4,
+/// Rotate90Mirror=5, Rotate180Mirror=6, Rotate270Mirror=7`.
+///
+/// - `Mirror` is a horizontal flip.
+/// - `Rotate90Mirror` is the transpose (main-diagonal flip).
+/// - `Rotate180Mirror` is a vertical flip.
+/// - `Rotate270Mirror` is the anti-diagonal flip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransformType {
@@ -13,8 +23,11 @@ pub enum TransformType {
     Rot180 = 2,
     Rot90CCW = 3,
     FlipHoriz = 4,
-    FlipVert = 5,
-    FlipDiag = 6,
+    /// C++ `Rotate90Mirror`: transpose / main-diagonal flip.
+    FlipDiag = 5,
+    /// C++ `Rotate180Mirror`: vertical flip.
+    FlipVert = 6,
+    /// C++ `Rotate270Mirror`: anti-diagonal flip.
     FlipAntiDiag = 7,
 }
 
@@ -25,8 +38,10 @@ impl TransformType {
             2 => Self::Rot180,
             3 => Self::Rot90CCW,
             4 => Self::FlipHoriz,
-            5 => Self::FlipVert,
-            6 => Self::FlipDiag,
+            // C++ TransformRotate90Mirror == transpose.
+            5 => Self::FlipDiag,
+            // C++ TransformRotate180Mirror == vertical flip.
+            6 => Self::FlipVert,
             7 => Self::FlipAntiDiag,
             _ => Self::None,
         }
@@ -61,27 +76,93 @@ fn map_coords(
     }
 }
 
-/// Apply a 2D transform to an NDArray.
+/// Per-color-mode element strides for a 2-D or 3-D image of the given
+/// X/Y/color sizes. Mirrors C++ `NDArray::getInfo` stride layout: returns
+/// `(x_stride, y_stride, color_stride)` and the destination dimension order.
+fn strides_for(color_mode: NDColorMode, xs: usize, ys: usize, cs: usize) -> (usize, usize, usize) {
+    match color_mode {
+        NDColorMode::RGB1 => (cs, xs * cs, 1),
+        NDColorMode::RGB2 => (1, xs * cs, xs),
+        // RGB3 / Mono / others: planar X-fastest layout.
+        _ => (1, xs, xs * ys),
+    }
+}
+
+/// Build the destination dimension vector for `color_mode` with the given
+/// X/Y/color sizes, matching the C++ dimension order per color mode.
+fn dims_for(
+    color_mode: NDColorMode,
+    xs: usize,
+    ys: usize,
+    cs: usize,
+    ndims: usize,
+) -> Vec<NDDimension> {
+    if ndims < 3 {
+        return vec![NDDimension::new(xs), NDDimension::new(ys)];
+    }
+    match color_mode {
+        NDColorMode::RGB1 => vec![
+            NDDimension::new(cs),
+            NDDimension::new(xs),
+            NDDimension::new(ys),
+        ],
+        NDColorMode::RGB2 => vec![
+            NDDimension::new(xs),
+            NDDimension::new(cs),
+            NDDimension::new(ys),
+        ],
+        _ => vec![
+            NDDimension::new(xs),
+            NDDimension::new(ys),
+            NDDimension::new(cs),
+        ],
+    }
+}
+
+/// Apply a transform to an NDArray.
+///
+/// Handles 2-D mono images and 3-D RGB1/RGB2/RGB3 color images. The per-color
+/// reindexing mirrors C++ `transformNDArray`: source `(x, y)` is geometrically
+/// mapped to destination `(x, y)` and every color component is copied with the
+/// destination strides recomputed for the (possibly swapped) X/Y sizes.
 pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
     if transform == TransformType::None || src.dims.len() < 2 {
         return src.clone();
     }
 
-    let src_w = src.dims[0].size;
-    let src_h = src.dims[1].size;
+    let info = src.info();
+    let src_w = info.x_size;
+    let src_h = info.y_size;
+    let color = info.color_size.max(1);
+    if src_w == 0 || src_h == 0 {
+        return src.clone();
+    }
+
     let (dst_w, dst_h) = if transform.swaps_dims() {
         (src_h, src_w)
     } else {
         (src_w, src_h)
     };
 
+    let (sxs, sys, scs) = (
+        info.x_stride,
+        info.y_stride.max(1),
+        info.color_stride.max(1),
+    );
+    let (dxs, dys, dcs) = strides_for(info.color_mode, dst_w, dst_h, color);
+    let total = dst_w * dst_h * color;
+
     macro_rules! transform_buf {
-        ($vec:expr, $T:ty, $zero:expr) => {{
-            let mut out = vec![$zero; dst_w * dst_h];
+        ($vec:expr, $zero:expr) => {{
+            let mut out = vec![$zero; total];
             for sy in 0..src_h {
                 for sx in 0..src_w {
                     let (dx, dy) = map_coords(sx, sy, src_w, src_h, transform);
-                    out[dy * dst_w + dx] = $vec[sy * src_w + sx];
+                    let s_base = sy * sys + sx * sxs;
+                    let d_base = dy * dys + dx * dxs;
+                    for c in 0..color {
+                        out[d_base + c * dcs] = $vec[s_base + c * scs];
+                    }
                 }
             }
             out
@@ -89,23 +170,24 @@ pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
     }
 
     let out_data = match &src.data {
-        NDDataBuffer::U8(v) => NDDataBuffer::U8(transform_buf!(v, u8, 0)),
-        NDDataBuffer::U16(v) => NDDataBuffer::U16(transform_buf!(v, u16, 0)),
-        NDDataBuffer::I8(v) => NDDataBuffer::I8(transform_buf!(v, i8, 0)),
-        NDDataBuffer::I16(v) => NDDataBuffer::I16(transform_buf!(v, i16, 0)),
-        NDDataBuffer::I32(v) => NDDataBuffer::I32(transform_buf!(v, i32, 0)),
-        NDDataBuffer::U32(v) => NDDataBuffer::U32(transform_buf!(v, u32, 0)),
-        NDDataBuffer::I64(v) => NDDataBuffer::I64(transform_buf!(v, i64, 0)),
-        NDDataBuffer::U64(v) => NDDataBuffer::U64(transform_buf!(v, u64, 0)),
-        NDDataBuffer::F32(v) => NDDataBuffer::F32(transform_buf!(v, f32, 0.0)),
-        NDDataBuffer::F64(v) => NDDataBuffer::F64(transform_buf!(v, f64, 0.0)),
+        NDDataBuffer::U8(v) => NDDataBuffer::U8(transform_buf!(v, 0)),
+        NDDataBuffer::U16(v) => NDDataBuffer::U16(transform_buf!(v, 0)),
+        NDDataBuffer::I8(v) => NDDataBuffer::I8(transform_buf!(v, 0)),
+        NDDataBuffer::I16(v) => NDDataBuffer::I16(transform_buf!(v, 0)),
+        NDDataBuffer::I32(v) => NDDataBuffer::I32(transform_buf!(v, 0)),
+        NDDataBuffer::U32(v) => NDDataBuffer::U32(transform_buf!(v, 0)),
+        NDDataBuffer::I64(v) => NDDataBuffer::I64(transform_buf!(v, 0)),
+        NDDataBuffer::U64(v) => NDDataBuffer::U64(transform_buf!(v, 0)),
+        NDDataBuffer::F32(v) => NDDataBuffer::F32(transform_buf!(v, 0.0)),
+        NDDataBuffer::F64(v) => NDDataBuffer::F64(transform_buf!(v, 0.0)),
     };
 
-    let dims = vec![NDDimension::new(dst_w), NDDimension::new(dst_h)];
+    let dims = dims_for(info.color_mode, dst_w, dst_h, color, src.dims.len());
     let mut arr = NDArray::new(dims, src.data.data_type());
     arr.data = out_data;
     arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
+    arr.time_stamp = src.time_stamp;
     arr.attributes = src.attributes.clone();
     arr
 }
@@ -277,6 +359,111 @@ mod tests {
         assert_eq!(get_u8(&r4), get_u8(&arr));
         assert_eq!(r4.dims[0].size, arr.dims[0].size);
         assert_eq!(r4.dims[1].size, arr.dims[1].size);
+    }
+
+    #[test]
+    fn test_from_u8_cpp_enum_order() {
+        // C++ NDPluginTransformType_t order: value 5 is Rotate90Mirror
+        // (transpose), value 6 is Rotate180Mirror (vertical flip).
+        assert_eq!(TransformType::from_u8(0), TransformType::None);
+        assert_eq!(TransformType::from_u8(1), TransformType::Rot90CW);
+        assert_eq!(TransformType::from_u8(2), TransformType::Rot180);
+        assert_eq!(TransformType::from_u8(3), TransformType::Rot90CCW);
+        assert_eq!(TransformType::from_u8(4), TransformType::FlipHoriz);
+        assert_eq!(TransformType::from_u8(5), TransformType::FlipDiag);
+        assert_eq!(TransformType::from_u8(6), TransformType::FlipVert);
+        assert_eq!(TransformType::from_u8(7), TransformType::FlipAntiDiag);
+    }
+
+    #[test]
+    fn test_transform_5_is_transpose() {
+        // Selecting transform 5 from EPICS must produce a transpose.
+        let arr = make_3x2();
+        let out = apply_transform(&arr, TransformType::from_u8(5));
+        assert_eq!(out.dims[0].size, 2);
+        assert_eq!(out.dims[1].size, 3);
+        assert_eq!(get_u8(&out), &[1, 4, 2, 5, 3, 6]); // transpose
+    }
+
+    #[test]
+    fn test_transform_6_is_vertical_flip() {
+        // Selecting transform 6 from EPICS must produce a vertical flip.
+        let arr = make_3x2();
+        let out = apply_transform(&arr, TransformType::from_u8(6));
+        assert_eq!(out.dims[0].size, 3);
+        assert_eq!(out.dims[1].size, 2);
+        assert_eq!(get_u8(&out), &[4, 5, 6, 1, 2, 3]); // vertical flip
+    }
+
+    /// Build a 2x2 RGB1 image (color-interleaved): pixel (x,y) channel c.
+    /// dims = [color=3, x=2, y=2]. Pixel value encodes 100*y + 10*x + c.
+    fn make_rgb1_2x2() -> NDArray {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let mut arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(2),
+                NDDimension::new(2),
+            ],
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+        ));
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            // layout: index = y*(x*c) + x*c + c, with x_stride=3, y_stride=6
+            for y in 0..2 {
+                for x in 0..2 {
+                    for c in 0..3 {
+                        v[y * 6 + x * 3 + c] = (100 * y + 10 * x + c) as u8;
+                    }
+                }
+            }
+        }
+        arr
+    }
+
+    #[test]
+    fn test_rgb1_flip_horiz_keeps_color_grouping() {
+        // Horizontal flip of an RGB1 image: each pixel's 3 channels stay
+        // together; only the x coordinate is mirrored.
+        let arr = make_rgb1_2x2();
+        let out = apply_transform(&arr, TransformType::FlipHoriz);
+        // dims unchanged for a non-swapping transform
+        assert_eq!(out.dims[0].size, 3);
+        assert_eq!(out.dims[1].size, 2);
+        assert_eq!(out.dims[2].size, 2);
+        if let NDDataBuffer::U8(v) = &out.data {
+            // pixel (x=0,y=0) should now hold source (x=1,y=0): 10,11,12
+            assert_eq!(&v[0..3], &[10, 11, 12]);
+            // pixel (x=1,y=0) holds source (x=0,y=0): 0,1,2
+            assert_eq!(&v[3..6], &[0, 1, 2]);
+            // pixel (x=0,y=1) holds source (x=1,y=1): 110,111,112
+            assert_eq!(&v[6..9], &[110, 111, 112]);
+        } else {
+            panic!("not u8");
+        }
+    }
+
+    #[test]
+    fn test_rgb1_rot90cw_swaps_dims_and_keeps_color() {
+        let arr = make_rgb1_2x2();
+        let out = apply_transform(&arr, TransformType::Rot90CW);
+        // x/y swapped (both 2 here), color dim preserved
+        assert_eq!(out.dims[0].size, 3);
+        assert_eq!(out.dims[1].size, 2);
+        assert_eq!(out.dims[2].size, 2);
+        if let NDDataBuffer::U8(v) = &out.data {
+            // Rot90CW maps src (sx,sy) -> (src_h-1-sy, sx).
+            // dest (0,0) <- src (sx,sy) with src_h-1-sy=0, sx=0 => sy=1,sx=0
+            // src (0,1) = 100,101,102
+            assert_eq!(&v[0..3], &[100, 101, 102]);
+        } else {
+            panic!("not u8");
+        }
     }
 
     // --- New TransformProcessor tests ---

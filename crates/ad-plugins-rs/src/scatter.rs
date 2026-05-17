@@ -16,7 +16,16 @@ impl ScatterMethod {
     }
 }
 
-/// Scatter processor: distributes arrays to downstream plugins in round-robin order.
+/// Scatter processor: distributes arrays to downstream plugins in round-robin
+/// order.
+///
+/// The actual number of downstream consumers is discovered by the plugin
+/// runtime, which publishes a scatter result to `scatter_index % senders.len()`.
+/// `num_outputs == 0` (the default) means "use the live downstream count": the
+/// processor emits a raw incrementing index and the runtime maps it onto the
+/// connected consumers — equivalent to C++ NDPluginScatter advancing
+/// `nextScatter` over its registered clients. A non-zero `num_outputs` caps the
+/// round-robin span for tests / fixed fan-out.
 pub struct ScatterProcessor {
     method: ScatterMethod,
     current_index: usize,
@@ -29,9 +38,15 @@ impl ScatterProcessor {
         Self {
             method: ScatterMethod::RoundRobin,
             current_index: 0,
-            num_outputs: 1,
+            num_outputs: 0,
             method_idx: None,
         }
+    }
+
+    /// Override the round-robin span. `0` means "use the live downstream
+    /// consumer count" (the default).
+    pub fn set_num_outputs(&mut self, n: usize) {
+        self.num_outputs = n;
     }
 }
 
@@ -86,7 +101,7 @@ mod tests {
     #[test]
     fn test_scatter_processor_round_robin() {
         let mut proc = ScatterProcessor::new();
-        proc.num_outputs = 3;
+        proc.set_num_outputs(3);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -105,5 +120,22 @@ mod tests {
         // Should wrap around
         let r3 = proc.process_array(&arr, &pool);
         assert_eq!(r3.scatter_index, Some(0));
+    }
+
+    #[test]
+    fn test_scatter_default_emits_raw_index() {
+        // With the default num_outputs == 0 the processor emits a raw
+        // incrementing index; the runtime maps it onto the actual downstream
+        // consumer count (idx % senders.len()), so scatter does NOT degenerate
+        // to a passthrough on consumer 0.
+        let mut proc = ScatterProcessor::new();
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+
+        let indices: Vec<_> = (0..4)
+            .map(|_| proc.process_array(&arr, &pool).scatter_index.unwrap())
+            .collect();
+        // Raw monotonically increasing indices — not all 0.
+        assert_eq!(indices, vec![0, 1, 2, 3]);
     }
 }

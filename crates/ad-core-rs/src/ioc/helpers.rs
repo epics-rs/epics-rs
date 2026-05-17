@@ -110,7 +110,19 @@ pub fn register_noop_commands(mut app: IocApplication) -> IocApplication {
                 },
             ],
             format!("{name} [args...] - no-op (not implemented)"),
-            move |_args: &[ArgValue], _ctx: &CommandContext| Ok(CommandOutcome::Continue),
+            move |_args: &[ArgValue], _ctx: &CommandContext| {
+                // B16: callbackSetQueueSize sizes the asyn callback queue in C.
+                // The Rust plugin model uses a per-plugin bounded channel sized
+                // at plugin construction, so this is a genuine no-op — warn so
+                // a cmd file tuning it is not silently ineffective.
+                if name == "callbackSetQueueSize" {
+                    eprintln!(
+                        "warning: callbackSetQueueSize is a no-op in epics-rs; \
+                         plugin queue size is set per-plugin at construction"
+                    );
+                }
+                Ok(CommandOutcome::Continue)
+            },
         ));
     }
     app

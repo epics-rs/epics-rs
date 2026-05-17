@@ -31,13 +31,31 @@ impl NDColorMode {
     }
 }
 
-/// Bayer pattern for raw sensor data.
+/// Bayer pattern for raw sensor data (matching C++ `NDBayerPattern_t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
 pub enum NDBayerPattern {
-    RGGB,
-    GBRG,
-    GRBG,
-    BGGR,
+    RGGB = 0,
+    GBRG = 1,
+    GRBG = 2,
+    BGGR = 3,
+}
+
+impl NDBayerPattern {
+    /// Map an integer code to a Bayer pattern. Unknown codes default to `RGGB`.
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Self::GBRG,
+            2 => Self::GRBG,
+            3 => Self::BGGR,
+            _ => Self::RGGB,
+        }
+    }
+
+    /// Numeric code for the EPICS `BAYER_PATTERN` parameter.
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
 }
 
 /// Convert a mono 2D array to RGB1 (3-channel interleaved) by replicating the value.

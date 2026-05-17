@@ -1,71 +1,100 @@
-//! NDPluginAttrPlot: tracks numeric attribute values over time in circular buffers.
+//! NDPluginAttrPlot: caches numeric NDArray attribute values over an
+//! acquisition and exposes selected ones as waveform records.
 //!
-//! On the first frame, the plugin scans the array's attribute list and auto-detects
-//! all numeric attributes (those where `as_f64()` returns `Some`). The attribute names
-//! are sorted alphabetically for deterministic ordering. On subsequent frames, each
-//! tracked attribute's value is pushed into a per-attribute circular buffer (VecDeque).
+//! Port of ADCore `NDPluginAttrPlot`. The C++ model separates two counts:
 //!
-//! If the array's `unique_id` decreases relative to the previous frame, all buffers
-//! are reset (indicating a new acquisition).
+//! * `n_attributes` — the maximum number of *tracked* numeric attributes.
+//!   Attribute names are discovered from the first frame of an acquisition
+//!   (and re-discovered after a reset), sorted, and capped to `n_attributes`.
+//!   One circular buffer per tracked attribute.
+//! * `n_data_blocks` — the number of *waveform outputs* (asyn addresses).
+//!   Each data block has an independent `DataSelect` value that maps it to a
+//!   tracked attribute index, or to the special UID buffer (`-1`), or to
+//!   nothing (`-2`).
+//!
+//! `DataLabel` is the human-readable name of the attribute a block is bound
+//! to; `NPts` is the current number of cached points. The waveform emitted
+//! for a block is padded out to `cache_size` with the last valid point to
+//! avoid plot artifacts (C++ `callback_data`).
 
 use std::collections::VecDeque;
 
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
+use ad_core_rs::plugin::runtime::{
+    NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot, ProcessResult,
+};
+
+/// `DataSelect` value meaning "this block plots the UID buffer".
+pub const ATTRPLOT_UID_INDEX: i32 = -1;
+/// `DataSelect` value meaning "this block plots nothing".
+pub const ATTRPLOT_NONE_INDEX: i32 = -2;
+/// `DataLabel` text for the UID buffer.
+pub const ATTRPLOT_UID_LABEL: &str = "UID";
+/// `DataLabel` text for an unbound block.
+pub const ATTRPLOT_NONE_LABEL: &str = "None";
 
 /// Processor that tracks attribute values over time in circular buffers.
 pub struct AttrPlotProcessor {
-    /// Tracked attribute names (sorted alphabetically).
+    /// Maximum number of tracked attributes (C++ `n_attributes_`).
+    n_attributes: usize,
+    /// Number of waveform output blocks (C++ `n_data_blocks_`).
+    n_data_blocks: usize,
+    /// Cache size per buffer; `0` means unlimited.
+    cache_size: usize,
+    /// Tracked attribute names (sorted, length <= `n_attributes`).
     attributes: Vec<String>,
-    /// Per-attribute circular buffer of values.
+    /// One circular buffer per tracked attribute.
     buffers: Vec<VecDeque<f64>>,
     /// Circular buffer of unique_id values.
     uid_buffer: VecDeque<f64>,
-    /// Maximum number of points per buffer. 0 = unlimited.
-    max_points: usize,
-    /// Whether we have initialized from the first frame.
+    /// Per-block attribute selection: index into `attributes`, or one of the
+    /// `ATTRPLOT_UID_INDEX` / `ATTRPLOT_NONE_INDEX` sentinels.
+    data_selections: Vec<i32>,
+    /// Whether attributes have been discovered for the current acquisition.
     initialized: bool,
     /// The unique_id from the last processed frame.
     last_uid: i32,
-    /// Parameter indices for per-attribute waveform output.
-    /// Set by `set_param_indices` after plugin registration.
-    attr_param_indices: Vec<usize>,
-    /// Parameter index for the UID waveform.
-    uid_param_index: Option<usize>,
-    /// Parameter index for the number of data points.
-    n_data_param_index: Option<usize>,
+    /// Param indices (set after registration).
+    params: AttrPlotParams,
+}
+
+/// Param reasons resolved after `register_params`.
+#[derive(Default)]
+struct AttrPlotParams {
+    /// `AP_Data` — Float64Array, addressed by data block.
+    data: Option<usize>,
+    /// `AP_DataLabel` — Octet, addressed by data block.
+    data_label: Option<usize>,
+    /// `AP_DataSelect` — Int32, addressed by data block.
+    data_select: Option<usize>,
+    /// `AP_Attribute` — Octet, addressed by attribute index.
+    attribute: Option<usize>,
+    /// `AP_Reset` — Int32.
+    reset: Option<usize>,
+    /// `AP_NPts` — Int32.
+    npts: Option<usize>,
 }
 
 impl AttrPlotProcessor {
-    /// Create a new processor with the given maximum buffer size.
-    pub fn new(max_points: usize) -> Self {
+    /// Create a processor.
+    ///
+    /// * `n_attributes` — maximum tracked attributes.
+    /// * `cache_size` — per-buffer cache size (`0` = unlimited).
+    /// * `n_data_blocks` — number of waveform output blocks.
+    pub fn new(n_attributes: usize, cache_size: usize, n_data_blocks: usize) -> Self {
         Self {
+            n_attributes,
+            n_data_blocks,
+            cache_size,
             attributes: Vec::new(),
             buffers: Vec::new(),
             uid_buffer: VecDeque::new(),
-            max_points,
+            data_selections: vec![ATTRPLOT_NONE_INDEX; n_data_blocks],
             initialized: false,
             last_uid: -1,
-            attr_param_indices: Vec::new(),
-            uid_param_index: None,
-            n_data_param_index: None,
+            params: AttrPlotParams::default(),
         }
-    }
-
-    /// Set param indices for waveform output after plugin registration.
-    /// `attr_indices`: one Float64Array param per attribute slot.
-    /// `uid_index`: Float64Array param for UID buffer.
-    /// `n_data_index`: Int32 param for number of data points.
-    pub fn set_param_indices(
-        &mut self,
-        attr_indices: Vec<usize>,
-        uid_index: usize,
-        n_data_index: usize,
-    ) {
-        self.attr_param_indices = attr_indices;
-        self.uid_param_index = Some(uid_index);
-        self.n_data_param_index = Some(n_data_index);
     }
 
     /// Get the list of tracked attribute names.
@@ -88,30 +117,84 @@ impl AttrPlotProcessor {
         self.attributes.len()
     }
 
-    /// Find the index of a named attribute. Returns None if not tracked.
+    /// Get the number of waveform output blocks.
+    pub fn num_data_blocks(&self) -> usize {
+        self.n_data_blocks
+    }
+
+    /// Find the index of a named attribute. Returns `None` if not tracked.
     pub fn find_attribute(&self, name: &str) -> Option<usize> {
         self.attributes.iter().position(|n| n == name)
     }
 
-    /// Reset all buffers and re-initialize on the next frame.
+    /// Current `DataSelect` value for a block.
+    pub fn data_select(&self, block: usize) -> Option<i32> {
+        self.data_selections.get(block).copied()
+    }
+
+    /// Bind a data block to an attribute index (or a UID/NONE sentinel).
+    ///
+    /// Mirrors C++ `writeInt32(NDAttrPlotDataSelect)`: rejects out-of-range
+    /// blocks and selections that point past the tracked attributes.
+    pub fn set_data_select(&mut self, block: usize, value: i32) -> Result<(), &'static str> {
+        if block >= self.n_data_blocks {
+            return Err("data block index out of range");
+        }
+        if value >= 0 && (value as usize) >= self.attributes.len() {
+            return Err("attribute selection out of range");
+        }
+        self.data_selections[block] = value;
+        Ok(())
+    }
+
+    /// The `DataLabel` text for a block, derived from its `DataSelect`.
+    pub fn data_label(&self, block: usize) -> String {
+        match self.data_selections.get(block).copied() {
+            Some(ATTRPLOT_UID_INDEX) => ATTRPLOT_UID_LABEL.to_string(),
+            Some(sel) if sel >= 0 && (sel as usize) < self.attributes.len() => {
+                self.attributes[sel as usize].clone()
+            }
+            _ => ATTRPLOT_NONE_LABEL.to_string(),
+        }
+    }
+
+    /// Reset all buffers; the next frame re-discovers attributes.
     pub fn reset(&mut self) {
-        self.attributes.clear();
-        self.buffers.clear();
-        self.uid_buffer.clear();
         self.initialized = false;
+        self.uid_buffer.clear();
+        for buf in &mut self.buffers {
+            buf.clear();
+        }
         self.last_uid = -1;
     }
 
-    /// Push a value to a VecDeque, enforcing max_points as a ring buffer.
-    fn push_capped(buf: &mut VecDeque<f64>, value: f64, max_points: usize) {
-        if max_points > 0 && buf.len() >= max_points {
+    /// Push a value into a ring buffer, enforcing `cache_size`.
+    fn push_capped(buf: &mut VecDeque<f64>, value: f64, cache_size: usize) {
+        if cache_size > 0 && buf.len() >= cache_size {
             buf.pop_front();
         }
         buf.push_back(value);
     }
 
-    /// Initialize tracked attributes from the first frame.
-    fn initialize_from_array(&mut self, array: &NDArray) {
+    /// Discover the tracked attributes from a frame (C++ `rebuild_attributes`).
+    ///
+    /// Existing block selections are preserved by attribute *name*: a block
+    /// that pointed at "Temp" before the rebuild still points at "Temp"
+    /// afterwards (or `NONE` if "Temp" is no longer present).
+    fn rebuild_attributes(&mut self, array: &NDArray) {
+        // Remember each block's current selection by name.
+        let prior: Vec<Option<String>> = self
+            .data_selections
+            .iter()
+            .map(|&sel| match sel {
+                ATTRPLOT_UID_INDEX => Some(ATTRPLOT_UID_LABEL.to_string()),
+                s if s >= 0 && (s as usize) < self.attributes.len() => {
+                    Some(self.attributes[s as usize].clone())
+                }
+                _ => None,
+            })
+            .collect();
+
         let mut names: Vec<String> = Vec::new();
         for attr in array.attributes.iter() {
             if attr.value.as_f64().is_some() {
@@ -119,80 +202,185 @@ impl AttrPlotProcessor {
             }
         }
         names.sort();
+        names.truncate(self.n_attributes);
 
         self.buffers = vec![VecDeque::new(); names.len()];
         self.attributes = names;
-        self.uid_buffer.clear();
+
+        // Re-resolve each block selection against the new attribute list.
+        for (i, want) in prior.into_iter().enumerate() {
+            self.data_selections[i] = match want {
+                Some(ref n) if n == ATTRPLOT_UID_LABEL => ATTRPLOT_UID_INDEX,
+                Some(n) => self
+                    .attributes
+                    .iter()
+                    .position(|a| a == &n)
+                    .map(|p| p as i32)
+                    .unwrap_or(ATTRPLOT_NONE_INDEX),
+                None => ATTRPLOT_NONE_INDEX,
+            };
+        }
         self.initialized = true;
     }
 
-    /// Clear all data buffers but keep tracked attributes.
-    fn clear_buffers(&mut self) {
-        for buf in &mut self.buffers {
-            buf.clear();
-        }
-        self.uid_buffer.clear();
-    }
-}
-
-impl NDPluginProcess for AttrPlotProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        // Detect UID decrease (re-acquisition)
-        if self.initialized && array.unique_id < self.last_uid {
-            self.clear_buffers();
-        }
-        self.last_uid = array.unique_id;
-
-        // Initialize on first frame
-        if !self.initialized {
-            self.initialize_from_array(array);
-        }
-
-        // Push unique_id
+    /// Push the current frame's attribute values into the buffers.
+    fn push_data(&mut self, array: &NDArray) {
         Self::push_capped(
             &mut self.uid_buffer,
             array.unique_id as f64,
-            self.max_points,
+            self.cache_size,
         );
-
-        // Push each tracked attribute's value
         for (i, name) in self.attributes.iter().enumerate() {
             let value = array
                 .attributes
                 .get(name)
                 .and_then(|attr| attr.value.as_f64())
                 .unwrap_or(f64::NAN);
-            Self::push_capped(&mut self.buffers[i], value, self.max_points);
+            Self::push_capped(&mut self.buffers[i], value, self.cache_size);
         }
+    }
 
-        // Write buffers to params for waveform readback
+    /// Build the padded waveform for one data block (C++ `callback_data`).
+    ///
+    /// Returns the values padded to `cache_size` (or to the current point
+    /// count when `cache_size` is unlimited) with the last valid point.
+    fn block_waveform(&self, block: usize) -> Vec<f64> {
+        let selected = self
+            .data_selections
+            .get(block)
+            .copied()
+            .unwrap_or(ATTRPLOT_NONE_INDEX);
+        let src: Option<&VecDeque<f64>> = match selected {
+            ATTRPLOT_UID_INDEX => Some(&self.uid_buffer),
+            s if s >= 0 && (s as usize) < self.buffers.len() => Some(&self.buffers[s as usize]),
+            _ => None,
+        };
+        let size = self.uid_buffer.len();
+        // Target length: the fixed cache size, or the live count if unlimited.
+        let target = if self.cache_size > 0 {
+            self.cache_size
+        } else {
+            size
+        };
+        let mut out: Vec<f64> = match src {
+            Some(buf) => buf.iter().copied().collect(),
+            None => vec![f64::NAN; size],
+        };
+        // Pad the tail with the last valid point to suppress plot artifacts.
+        let pad = out.last().copied().unwrap_or(f64::NAN);
+        if out.len() < target {
+            out.resize(target, pad);
+        } else {
+            out.truncate(target);
+        }
+        out
+    }
+
+    /// Build all param updates emitted after a frame.
+    fn build_updates(&self) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
-        for (i, buf) in self.buffers.iter().enumerate() {
-            if let Some(&param) = self.attr_param_indices.get(i) {
-                updates.push(ParamUpdate::float64_array(
-                    param,
-                    buf.iter().copied().collect(),
+        // Per-block waveform + label.
+        if let Some(data) = self.params.data {
+            for block in 0..self.n_data_blocks {
+                updates.push(ParamUpdate::float64_array_addr(
+                    data,
+                    block as i32,
+                    self.block_waveform(block),
                 ));
             }
         }
-        if let Some(uid_param) = self.uid_param_index {
-            updates.push(ParamUpdate::float64_array(
-                uid_param,
-                self.uid_buffer.iter().copied().collect(),
-            ));
+        if let Some(label) = self.params.data_label {
+            for block in 0..self.n_data_blocks {
+                updates.push(ParamUpdate::octet_addr(
+                    label,
+                    block as i32,
+                    self.data_label(block),
+                ));
+            }
         }
-        if let Some(n_data_param) = self.n_data_param_index {
-            updates.push(ParamUpdate::int32(
-                n_data_param,
-                self.uid_buffer.len() as i32,
-            ));
+        if let Some(select) = self.params.data_select {
+            for block in 0..self.n_data_blocks {
+                updates.push(ParamUpdate::int32_addr(
+                    select,
+                    block as i32,
+                    self.data_selections[block],
+                ));
+            }
         }
+        // Per-attribute name.
+        if let Some(attribute) = self.params.attribute {
+            for i in 0..self.n_attributes {
+                let name = self.attributes.get(i).cloned().unwrap_or_default();
+                updates.push(ParamUpdate::octet_addr(attribute, i as i32, name));
+            }
+        }
+        if let Some(npts) = self.params.npts {
+            updates.push(ParamUpdate::int32(npts, self.uid_buffer.len() as i32));
+        }
+        updates
+    }
+}
 
-        ProcessResult::sink(updates)
+impl NDPluginProcess for AttrPlotProcessor {
+    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        // Re-acquisition: a UID at or below the last cached one resets.
+        if !self.uid_buffer.is_empty() && array.unique_id <= self.last_uid {
+            self.reset();
+        }
+        self.last_uid = array.unique_id;
+
+        if !self.initialized {
+            self.rebuild_attributes(array);
+        }
+        self.push_data(array);
+
+        ProcessResult::sink(self.build_updates())
     }
 
     fn plugin_type(&self) -> &str {
         "NDPluginAttrPlot"
+    }
+
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
+        use asyn_rs::param::ParamType;
+        base.create_param("AP_Data", ParamType::Float64Array)?;
+        base.create_param("AP_DataLabel", ParamType::Octet)?;
+        base.create_param("AP_DataSelect", ParamType::Int32)?;
+        base.create_param("AP_Attribute", ParamType::Octet)?;
+        base.create_param("AP_Reset", ParamType::Int32)?;
+        base.create_param("AP_NPts", ParamType::Int32)?;
+
+        self.params.data = base.find_param("AP_Data");
+        self.params.data_label = base.find_param("AP_DataLabel");
+        self.params.data_select = base.find_param("AP_DataSelect");
+        self.params.attribute = base.find_param("AP_Attribute");
+        self.params.reset = base.find_param("AP_Reset");
+        self.params.npts = base.find_param("AP_NPts");
+        Ok(())
+    }
+
+    fn on_param_change(
+        &mut self,
+        reason: usize,
+        params: &PluginParamSnapshot,
+    ) -> ParamChangeResult {
+        if Some(reason) == self.params.data_select {
+            let block = params.addr as usize;
+            let value = params.value.as_i32();
+            if self.set_data_select(block, value).is_ok() {
+                // Re-emit label + waveform for the rebound block.
+                return ParamChangeResult::updates(self.build_updates());
+            }
+        } else if Some(reason) == self.params.reset {
+            if params.value.as_i32() != 0 {
+                self.reset();
+                return ParamChangeResult::updates(self.build_updates());
+            }
+        }
+        ParamChangeResult::updates(vec![])
     }
 }
 
@@ -206,113 +394,186 @@ mod tests {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.unique_id = uid;
         for (name, value) in attrs {
-            arr.attributes.add(NDAttribute {
-                name: name.to_string(),
-                description: String::new(),
-                source: NDAttrSource::Driver,
-                value: NDAttrValue::Float64(*value),
-            });
+            arr.attributes.add(NDAttribute::new_static(
+                *name,
+                String::new(),
+                NDAttrSource::Driver,
+                NDAttrValue::Float64(*value),
+            ));
         }
         arr
     }
 
     #[test]
     fn test_attribute_auto_detection() {
-        let mut proc = AttrPlotProcessor::new(100);
+        let mut proc = AttrPlotProcessor::new(8, 100, 4);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = make_array_with_attrs(1, &[("Temp", 25.0), ("Gain", 1.5)]);
-        // Add a string attribute that should be excluded
-        arr.attributes.add(NDAttribute {
-            name: "Label".to_string(),
-            description: String::new(),
-            source: NDAttrSource::Driver,
-            value: NDAttrValue::String("test".to_string()),
-        });
-
+        arr.attributes.add(NDAttribute::new_static(
+            "Label",
+            String::new(),
+            NDAttrSource::Driver,
+            NDAttrValue::String("test".to_string()),
+        ));
         proc.process_array(&arr, &pool);
 
-        // Should detect 2 numeric attributes, sorted
         assert_eq!(proc.num_attributes(), 2);
         assert_eq!(proc.attributes()[0], "Gain");
         assert_eq!(proc.attributes()[1], "Temp");
     }
 
     #[test]
-    fn test_value_tracking() {
-        let mut proc = AttrPlotProcessor::new(100);
+    fn test_n_attributes_caps_tracked_count() {
+        // n_attributes = 2: only the first 2 (sorted) attributes are tracked.
+        let mut proc = AttrPlotProcessor::new(2, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
+        let arr = make_array_with_attrs(1, &[("D", 4.0), ("A", 1.0), ("C", 3.0), ("B", 2.0)]);
+        proc.process_array(&arr, &pool);
+        assert_eq!(proc.num_attributes(), 2);
+        assert_eq!(proc.attributes(), &["A", "B"]);
+    }
 
-        for i in 0..5 {
+    #[test]
+    fn test_data_select_maps_block_to_attribute() {
+        // 3 attributes, 2 data blocks. Block 0 -> "B" (idx 1), block 1 -> UID.
+        let mut proc = AttrPlotProcessor::new(8, 100, 2);
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = make_array_with_attrs(1, &[("A", 10.0), ("B", 20.0), ("C", 30.0)]);
+        proc.process_array(&arr, &pool);
+
+        proc.set_data_select(0, 1).unwrap(); // "B"
+        proc.set_data_select(1, ATTRPLOT_UID_INDEX).unwrap();
+
+        assert_eq!(proc.data_label(0), "B");
+        assert_eq!(proc.data_label(1), ATTRPLOT_UID_LABEL);
+
+        let wf0 = proc.block_waveform(0);
+        assert!((wf0[0] - 20.0).abs() < 1e-10, "block 0 plots attribute B");
+        let wf1 = proc.block_waveform(1);
+        assert!((wf1[0] - 1.0).abs() < 1e-10, "block 1 plots UID");
+    }
+
+    #[test]
+    fn test_data_select_rejects_out_of_range() {
+        let mut proc = AttrPlotProcessor::new(8, 100, 2);
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = make_array_with_attrs(1, &[("A", 1.0)]);
+        proc.process_array(&arr, &pool);
+
+        // Only 1 attribute -> selection 1 is out of range.
+        assert!(proc.set_data_select(0, 1).is_err());
+        // Block 5 does not exist.
+        assert!(proc.set_data_select(5, 0).is_err());
+        // Valid: attribute 0 and the UID sentinel.
+        assert!(proc.set_data_select(0, 0).is_ok());
+        assert!(proc.set_data_select(1, ATTRPLOT_UID_INDEX).is_ok());
+    }
+
+    #[test]
+    fn test_unbound_block_label_is_none() {
+        let mut proc = AttrPlotProcessor::new(8, 100, 3);
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = make_array_with_attrs(1, &[("A", 1.0)]);
+        proc.process_array(&arr, &pool);
+        // Block 2 was never selected.
+        assert_eq!(proc.data_label(2), ATTRPLOT_NONE_LABEL);
+        assert_eq!(proc.data_select(2), Some(ATTRPLOT_NONE_INDEX));
+    }
+
+    #[test]
+    fn test_npts_tracks_point_count() {
+        let mut proc = AttrPlotProcessor::new(8, 100, 1);
+        let pool = NDArrayPool::new(1_000_000);
+        for i in 1..=4 {
+            let arr = make_array_with_attrs(i, &[("X", i as f64)]);
+            proc.process_array(&arr, &pool);
+        }
+        assert_eq!(proc.uid_buffer().len(), 4);
+    }
+
+    #[test]
+    fn test_waveform_padded_to_cache_size() {
+        // cache_size = 6, only 3 points pushed -> waveform padded to 6 with
+        // the last point.
+        let mut proc = AttrPlotProcessor::new(8, 6, 1);
+        let pool = NDArrayPool::new(1_000_000);
+        for i in 1..=3 {
+            let arr = make_array_with_attrs(i, &[("X", i as f64 * 10.0)]);
+            proc.process_array(&arr, &pool);
+        }
+        proc.set_data_select(0, 0).unwrap();
+        let wf = proc.block_waveform(0);
+        assert_eq!(wf.len(), 6);
+        assert!((wf[0] - 10.0).abs() < 1e-10);
+        assert!((wf[2] - 30.0).abs() < 1e-10);
+        // Tail padded with the last point (30.0).
+        assert!((wf[3] - 30.0).abs() < 1e-10);
+        assert!((wf[5] - 30.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_data_select_preserved_across_rebuild() {
+        // Bind block 0 to "Temp", then re-acquire (UID resets). After the
+        // rebuild block 0 must still point at "Temp".
+        let mut proc = AttrPlotProcessor::new(8, 100, 1);
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = make_array_with_attrs(5, &[("Gain", 1.0), ("Temp", 25.0)]);
+        proc.process_array(&arr, &pool);
+        let temp_idx = proc.find_attribute("Temp").unwrap() as i32;
+        proc.set_data_select(0, temp_idx).unwrap();
+
+        // Re-acquisition (UID drops); same attributes.
+        let arr2 = make_array_with_attrs(1, &[("Gain", 2.0), ("Temp", 99.0)]);
+        proc.process_array(&arr2, &pool);
+        assert_eq!(proc.data_label(0), "Temp");
+        let wf = proc.block_waveform(0);
+        assert!((wf[0] - 99.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_value_tracking() {
+        let mut proc = AttrPlotProcessor::new(8, 100, 1);
+        let pool = NDArrayPool::new(1_000_000);
+        for i in 1..=5 {
             let arr = make_array_with_attrs(i, &[("Value", i as f64 * 10.0)]);
             proc.process_array(&arr, &pool);
         }
-
         let idx = proc.find_attribute("Value").unwrap();
         let buf = proc.buffer(idx).unwrap();
         assert_eq!(buf.len(), 5);
-        assert!((buf[0] - 0.0).abs() < 1e-10);
-        assert!((buf[4] - 40.0).abs() < 1e-10);
+        assert!((buf[0] - 10.0).abs() < 1e-10);
+        assert!((buf[4] - 50.0).abs() < 1e-10);
     }
 
     #[test]
-    fn test_uid_buffer() {
-        let mut proc = AttrPlotProcessor::new(100);
+    fn test_circular_buffer_cache_size() {
+        let mut proc = AttrPlotProcessor::new(8, 3, 1);
         let pool = NDArrayPool::new(1_000_000);
-
-        for i in 1..=3 {
-            let arr = make_array_with_attrs(i, &[("X", 1.0)]);
-            proc.process_array(&arr, &pool);
-        }
-
-        let uid_buf = proc.uid_buffer();
-        assert_eq!(uid_buf.len(), 3);
-        assert!((uid_buf[0] - 1.0).abs() < 1e-10);
-        assert!((uid_buf[1] - 2.0).abs() < 1e-10);
-        assert!((uid_buf[2] - 3.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_circular_buffer_max_points() {
-        let mut proc = AttrPlotProcessor::new(3);
-        let pool = NDArrayPool::new(1_000_000);
-
-        for i in 0..5 {
+        for i in 1..=5 {
             let arr = make_array_with_attrs(i, &[("Val", i as f64)]);
             proc.process_array(&arr, &pool);
         }
-
         let idx = proc.find_attribute("Val").unwrap();
         let buf = proc.buffer(idx).unwrap();
-        // Only last 3 values should remain
         assert_eq!(buf.len(), 3);
-        assert!((buf[0] - 2.0).abs() < 1e-10);
-        assert!((buf[1] - 3.0).abs() < 1e-10);
-        assert!((buf[2] - 4.0).abs() < 1e-10);
-
-        // UID buffer also limited
-        assert_eq!(proc.uid_buffer().len(), 3);
+        assert!((buf[0] - 3.0).abs() < 1e-10);
+        assert!((buf[2] - 5.0).abs() < 1e-10);
     }
 
     #[test]
     fn test_uid_decrease_resets_buffers() {
-        let mut proc = AttrPlotProcessor::new(100);
+        let mut proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
-
-        // First acquisition
         for i in 1..=5 {
             let arr = make_array_with_attrs(i, &[("X", i as f64)]);
             proc.process_array(&arr, &pool);
         }
-
         let idx = proc.find_attribute("X").unwrap();
         assert_eq!(proc.buffer(idx).unwrap().len(), 5);
 
-        // New acquisition: UID resets to 1
         let arr = make_array_with_attrs(1, &[("X", 100.0)]);
         proc.process_array(&arr, &pool);
-
-        // Buffers should be cleared and have just the new point
         let buf = proc.buffer(idx).unwrap();
         assert_eq!(buf.len(), 1);
         assert!((buf[0] - 100.0).abs() < 1e-10);
@@ -320,16 +581,12 @@ mod tests {
 
     #[test]
     fn test_missing_attribute_uses_nan() {
-        let mut proc = AttrPlotProcessor::new(100);
+        let mut proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
-
-        // Frame 1: has attribute
         let arr1 = make_array_with_attrs(1, &[("Temp", 25.0)]);
         proc.process_array(&arr1, &pool);
 
-        // Frame 2: attribute missing
-        let arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        let mut arr2 = arr2;
+        let mut arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr2.unique_id = 2;
         proc.process_array(&arr2, &pool);
 
@@ -342,18 +599,14 @@ mod tests {
 
     #[test]
     fn test_manual_reset() {
-        let mut proc = AttrPlotProcessor::new(100);
+        let mut proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
-
-        let arr = make_array_with_attrs(1, &[("A", 1.0), ("B", 2.0)]);
+        let arr = make_array_with_attrs(5, &[("A", 1.0), ("B", 2.0)]);
         proc.process_array(&arr, &pool);
         assert_eq!(proc.num_attributes(), 2);
 
         proc.reset();
-        assert_eq!(proc.num_attributes(), 0);
-        assert!(proc.uid_buffer().is_empty());
-
-        // Re-initializes from next frame
+        // Re-initializes from the next frame.
         let arr2 = make_array_with_attrs(1, &[("C", 3.0)]);
         proc.process_array(&arr2, &pool);
         assert_eq!(proc.num_attributes(), 1);
@@ -362,45 +615,19 @@ mod tests {
 
     #[test]
     fn test_unlimited_buffer() {
-        let mut proc = AttrPlotProcessor::new(0);
+        let mut proc = AttrPlotProcessor::new(8, 0, 1);
         let pool = NDArrayPool::new(1_000_000);
-
-        for i in 0..100 {
+        for i in 1..=100 {
             let arr = make_array_with_attrs(i, &[("X", i as f64)]);
             proc.process_array(&arr, &pool);
         }
-
         let idx = proc.find_attribute("X").unwrap();
         assert_eq!(proc.buffer(idx).unwrap().len(), 100);
     }
 
     #[test]
-    fn test_multiple_attributes_sorted() {
-        let mut proc = AttrPlotProcessor::new(100);
-        let pool = NDArrayPool::new(1_000_000);
-
-        let arr = make_array_with_attrs(1, &[("Zebra", 1.0), ("Alpha", 2.0), ("Mid", 3.0)]);
-        proc.process_array(&arr, &pool);
-
-        assert_eq!(proc.attributes(), &["Alpha", "Mid", "Zebra"]);
-    }
-
-    #[test]
-    fn test_find_attribute() {
-        let mut proc = AttrPlotProcessor::new(100);
-        let pool = NDArrayPool::new(1_000_000);
-
-        let arr = make_array_with_attrs(1, &[("X", 1.0), ("Y", 2.0)]);
-        proc.process_array(&arr, &pool);
-
-        assert_eq!(proc.find_attribute("X"), Some(0));
-        assert_eq!(proc.find_attribute("Y"), Some(1));
-        assert_eq!(proc.find_attribute("Z"), None);
-    }
-
-    #[test]
     fn test_plugin_type() {
-        let proc = AttrPlotProcessor::new(100);
+        let proc = AttrPlotProcessor::new(8, 100, 1);
         assert_eq!(proc.plugin_type(), "NDPluginAttrPlot");
     }
 }

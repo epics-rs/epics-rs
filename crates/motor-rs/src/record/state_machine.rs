@@ -50,42 +50,37 @@ impl MotorRecord {
                 self.plan_absolute_move(&mut effects);
                 return effects;
             }
-            // Check for queued home command (stop-then-home pattern)
-            if self.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
-                let forward = self.stat.mip.contains(MipFlags::HOMF);
+            // Resume a jog/home command that was queued behind this motion.
+            // Only an explicit queued request (internal.queued_motion) is
+            // replayed — an active jog/home that a plain STOP just halted is
+            // NOT, even though its JOGF/HOMF MIP bit is still set.
+            if let Some(queued) = self.internal.queued_motion.take() {
                 self.stat.mip.remove(MipFlags::STOP);
-                // Resume homing
-                self.set_phase(MotionPhase::Homing);
-                let hw_forward = if self.conv.mres >= 0.0 {
-                    forward
-                } else {
-                    !forward
-                };
-                self.stat.cdir = if self.conv.mres >= 0.0 {
-                    forward
-                } else {
-                    !forward
-                };
-                effects.commands.push(MotorCommand::Home {
-                    forward: hw_forward,
-                    velocity: self.vel.hvel,
-                    acceleration: self.move_accel_egu(),
-                });
-                effects.request_poll = true;
-                effects.suppress_forward_link = true;
-                return effects;
-            }
-            // Check for queued jog command (stop-then-jog pattern)
-            if self.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
-                let forward = self.stat.mip.contains(MipFlags::JOGF);
-                self.stat.mip.remove(MipFlags::STOP);
-                self.set_phase(MotionPhase::Jog);
-                self.internal.jog_was_forward = forward;
-                effects.commands.push(MotorCommand::MoveVelocity {
-                    direction: forward,
-                    velocity: self.vel.jvel,
-                    acceleration: self.jog_accel_egu(),
-                });
+                match queued {
+                    QueuedMotion::Home { forward } => {
+                        self.set_phase(MotionPhase::Homing);
+                        let hw_forward = if self.conv.mres >= 0.0 {
+                            forward
+                        } else {
+                            !forward
+                        };
+                        self.stat.cdir = hw_forward;
+                        effects.commands.push(MotorCommand::Home {
+                            forward: hw_forward,
+                            velocity: self.vel.hvel,
+                            acceleration: self.move_accel_egu(),
+                        });
+                    }
+                    QueuedMotion::Jog { forward } => {
+                        self.set_phase(MotionPhase::Jog);
+                        self.internal.jog_was_forward = forward;
+                        effects.commands.push(MotorCommand::MoveVelocity {
+                            direction: forward,
+                            velocity: self.vel.jvel,
+                            acceleration: self.jog_accel_egu(),
+                        });
+                    }
+                }
                 effects.request_poll = true;
                 effects.suppress_forward_link = true;
                 return effects;
@@ -176,10 +171,10 @@ impl MotorRecord {
         self.stat.mip = MipFlags::empty();
         self.stat.dmov = true;
         self.stat.movn = false;
-        self.suppress_flnk = false;
         self.retry.rcnt = 0;
         self.internal.backlash_pending = false;
         self.internal.pending_retarget = None;
+        self.internal.queued_motion = None;
         self.internal.verify_retarget_on_completion = false;
         // C: 9c8a8e8c (PR #56) — clear motion buttons. When the controller
         // stops on its own (internal limit, fault, host-issued stop) the
@@ -272,9 +267,11 @@ impl MotorRecord {
             self.set_phase(MotionPhase::Retry);
             self.stat.mip = MipFlags::RETRY;
 
-            let retry_target = self.compute_retry_target();
             let frac = self.retry.frac;
             if self.use_relative_moves() {
+                // C use_rel retry: position = relpos * frac, where relpos is
+                // the RMOD-scaled remaining distance (compute_retry_target).
+                let retry_target = self.compute_retry_target();
                 let rel_distance = (retry_target - self.pos.drbv) * frac;
                 effects.commands.push(MotorCommand::MoveRelative {
                     distance: rel_distance,
@@ -282,9 +279,13 @@ impl MotorRecord {
                     acceleration: self.move_accel_egu(),
                 });
             } else {
-                let position = self.pos.dval + frac * (retry_target - self.pos.dval);
+                // C absolute retry: position = currpos + frac*(newpos-currpos)
+                // with currpos = ldvl/mres and newpos = dval/mres. The prior
+                // move's load_pos set ldvl = dval, so currpos == newpos and
+                // position collapses to dval. RMOD scaling never reaches the
+                // absolute path in C — it only scales relpos (use_rel).
                 effects.commands.push(MotorCommand::MoveAbsolute {
-                    position,
+                    position: self.pos.dval,
                     velocity: self.vel.velo,
                     acceleration: self.move_accel_egu(),
                 });
@@ -337,10 +338,11 @@ impl MotorRecord {
             self.set_phase(MotionPhase::Retry);
             self.stat.mip = MipFlags::RETRY;
 
-            let retry_target = self.compute_retry_target();
             let frac = self.retry.frac;
             if self.use_relative_moves() {
-                // C: FRAC applied to relative distance
+                // C use_rel retry: position = relpos * frac, where relpos is
+                // the RMOD-scaled remaining distance (compute_retry_target).
+                let retry_target = self.compute_retry_target();
                 let rel_distance = (retry_target - self.pos.drbv) * frac;
                 effects.commands.push(MotorCommand::MoveRelative {
                     distance: rel_distance,
@@ -348,11 +350,11 @@ impl MotorRecord {
                     acceleration: self.move_accel_egu(),
                 });
             } else {
-                // C: absolute retry uses dval as base, FRAC interpolates
-                // position = dval + frac * (retry_target - dval)
-                let position = self.pos.dval + frac * (retry_target - self.pos.dval);
+                // C absolute retry: currpos == newpos == dval (the prior
+                // move's load_pos set ldvl = dval), so position is dval.
+                // RMOD scaling applies only to the use_rel path.
                 effects.commands.push(MotorCommand::MoveAbsolute {
-                    position,
+                    position: self.pos.dval,
                     velocity: self.vel.velo,
                     acceleration: self.move_accel_egu(),
                 });

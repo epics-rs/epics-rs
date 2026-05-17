@@ -404,7 +404,7 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "RVEL",
-        dbf_type: DbFieldType::Double,
+        dbf_type: DbFieldType::Int64,
         read_only: true,
     },
     // PID
@@ -584,7 +584,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "TDIR" => Some(EpicsValue::Short(if rec.stat.tdir { 1 } else { 0 })),
         "ATHM" => Some(EpicsValue::Short(if rec.stat.athm { 1 } else { 0 })),
         "STUP" => Some(EpicsValue::Short(rec.stat.stup)),
-        "RVEL" => Some(EpicsValue::Double(rec.stat.rvel)),
+        "RVEL" => Some(EpicsValue::Int64(rec.stat.rvel)),
         // PID
         "PCOF" => Some(EpicsValue::Double(rec.pid.pcof)),
         "ICOF" => Some(EpicsValue::Double(rec.pid.icof)),
@@ -1059,7 +1059,7 @@ pub(crate) fn motor_put_field(
                 rec.vel.accl = if v <= 0.0 { 0.1 } else { v };
                 // C: 36177f7b — writing ACCL switches ACCU to Accl and recalcs ACCS
                 rec.vel.accu = AccsUsed::Accl;
-                let span = rec.vel.velo - rec.vel.vbas;
+                let span = rec.vel.velo - rec.effective_vbas();
                 if rec.vel.accl > 0.0 && span > 0.0 {
                     rec.vel.accs = span / rec.vel.accl;
                 }
@@ -1073,7 +1073,7 @@ pub(crate) fn motor_put_field(
                 rec.vel.accs = if v <= 0.0 { 1.0 } else { v };
                 // C: 36177f7b — writing ACCS switches ACCU to Accs and recalcs ACCL
                 rec.vel.accu = AccsUsed::Accs;
-                let span = rec.vel.velo - rec.vel.vbas;
+                let span = rec.vel.velo - rec.effective_vbas();
                 if rec.vel.accs > 0.0 && span > 0.0 {
                     rec.vel.accl = span / rec.vel.accs;
                 }
@@ -1158,9 +1158,9 @@ pub(crate) fn motor_put_field(
         },
         "RDBD" => match value {
             EpicsValue::Double(v) => {
-                // C: enforceMinRetryDeadband - RDBD must be >= |MRES|
-                let min_rdbd = rec.conv.mres.abs();
-                rec.retry.rdbd = if v < min_rdbd { min_rdbd } else { v };
+                rec.retry.rdbd = v;
+                // C: enforceMinRetryDeadband — RDBD must be >= |MRES|.
+                rec.enforce_min_retry_deadband();
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1203,7 +1203,7 @@ pub(crate) fn motor_put_field(
                     rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
                     rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
                 }
-                detect_inverted_limits(&mut rec.limits);
+                detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1223,7 +1223,7 @@ pub(crate) fn motor_put_field(
                     rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
                     rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
                 }
-                detect_inverted_limits(&mut rec.limits);
+                detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1243,7 +1243,7 @@ pub(crate) fn motor_put_field(
                 );
                 rec.limits.hlm = hlm;
                 rec.limits.llm = llm;
-                detect_inverted_limits(&mut rec.limits);
+                detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1262,7 +1262,7 @@ pub(crate) fn motor_put_field(
                 );
                 rec.limits.hlm = hlm;
                 rec.limits.llm = llm;
-                detect_inverted_limits(&mut rec.limits);
+                detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1538,7 +1538,7 @@ pub(crate) fn motor_put_field(
 /// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
 /// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
 fn apply_accu_cascade(rec: &mut MotorRecord) {
-    let span = rec.vel.velo - rec.vel.vbas;
+    let span = rec.vel.velo - rec.effective_vbas();
     if span <= 0.0 {
         return; // C: span must be positive; otherwise leave master untouched
     }
@@ -1574,9 +1574,15 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
     if rec.conv.mres == 0.0 {
         return;
     }
-    // Seed raw limits from dial on first call (init): when RHLM/RLLM start at
-    // their default 0, treat the existing dial limits as the source. From then
-    // on, raw limits stay invariant under MRES change.
+    // Seed raw limits from the dial limits the first time MRES changes after
+    // init: RHLM/RLLM default to 0. Once any HLM/LLM/DHLM/DLLM/RHLM/RLLM put
+    // has run, rhlm/rllm hold a meaningful value and seeding is skipped.
+    //
+    // Invariant: every put that can leave rhlm==rllm==0 also leaves
+    // dhlm==dllm==0 (HLM/LLM/DHLM/DLLM/RHLM/RLLM handlers always update the
+    // raw/dial pair together). So when raw_unset is true, dhlm/dllm are 0 too
+    // and the seed below is a 0->0 no-op. 0/0 is the "limits disabled"
+    // convention (see check_soft_limits), never an active limit pair.
     let raw_unset = rec.limits.rhlm == 0.0 && rec.limits.rllm == 0.0;
     if raw_unset && old_mres != 0.0 {
         rec.limits.rhlm = rec.limits.dhlm / old_mres;
@@ -1594,15 +1600,21 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
     );
     rec.limits.hlm = hlm;
     rec.limits.llm = llm;
+    // C: special() calls enforceMinRetryDeadband on MRES change.
+    rec.enforce_min_retry_deadband();
 }
 
-/// Detect inverted soft-limit configurations and mark LVIO immediately.
-/// C: `270347df` (PR #108) — if the user/dial high/low pair is inverted
-/// (LLM > HLM or DLLM > DHLM), set LVIO without waiting for the next poll
-/// so clients see the error state on the same put cycle.
-fn detect_inverted_limits(limits: &mut LimitFields) {
+/// Re-evaluate LVIO after a soft-limit put.
+/// C: `270347df` (PR #108) — an inverted high/low pair (LLM > HLM or
+/// DLLM > DHLM) sets LVIO immediately, without waiting for the next poll.
+/// When the pair is valid again, LVIO is recomputed from the current DVAL
+/// so a corrected limit clears the latched violation even on an idle axis
+/// that is not being polled.
+fn detect_inverted_limits(limits: &mut LimitFields, dval: f64) {
     if limits.dllm > limits.dhlm || limits.llm > limits.hlm {
         limits.lvio = true;
+    } else {
+        limits.lvio = coordinate::check_soft_limits(dval, limits.dhlm, limits.dllm);
     }
 }
 

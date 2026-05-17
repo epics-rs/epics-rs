@@ -147,16 +147,6 @@ impl MotorDeviceSupport {
                     tracing::info!("motor command: ProfileReadback");
                     motor.readback_profile(&user).map(|_| ())
                 }
-                MotorCommand::MoveToHome {
-                    position,
-                    velocity,
-                    acceleration,
-                } => {
-                    tracing::info!(
-                        "motor command: MoveToHome position={position} velocity={velocity} accel={acceleration}"
-                    );
-                    motor.move_to_home(&user, *position, *velocity, *acceleration)
-                }
                 MotorCommand::EnablePco { enable } => {
                     tracing::info!("motor command: EnablePco({enable})");
                     motor.enable_pco(&user, *enable)
@@ -183,25 +173,38 @@ impl MotorDeviceSupport {
 
         // Manage poll loop — only send StartPolling when transitioning
         // idle → active to avoid redundant messages while already polling.
+        // The polling_active tracking flag is updated only when the command
+        // is actually delivered; otherwise record state and poller state
+        // would diverge (record thinks it polls, poller is idle). A failed
+        // send leaves the flag unchanged so the next process() retries.
         match actions.poll {
             PollDirective::Start => {
                 if !self.polling_active {
-                    let _ = self.poll_cmd_tx.try_send(PollCommand::StartPolling);
-                    self.polling_active = true;
+                    match self.poll_cmd_tx.try_send(PollCommand::StartPolling) {
+                        Ok(()) => self.polling_active = true,
+                        Err(e) => {
+                            tracing::error!("motor: failed to send StartPolling: {e}")
+                        }
+                    }
                 }
             }
             PollDirective::Stop => {
-                let _ = self.poll_cmd_tx.try_send(PollCommand::StopPolling);
-                self.polling_active = false;
+                match self.poll_cmd_tx.try_send(PollCommand::StopPolling) {
+                    Ok(()) => self.polling_active = false,
+                    Err(e) => tracing::error!("motor: failed to send StopPolling: {e}"),
+                }
             }
             PollDirective::None => {}
         }
         if let Some(ref delay) = actions.schedule_delay {
-            let _ = self
+            match self
                 .poll_cmd_tx
-                .try_send(PollCommand::ScheduleDelay(delay.id, delay.duration));
-            // Poll loop goes idle during delay — sync our tracking flag
-            self.polling_active = false;
+                .try_send(PollCommand::ScheduleDelay(delay.id, delay.duration))
+            {
+                // Poll loop goes idle during the delay — sync the flag.
+                Ok(()) => self.polling_active = false,
+                Err(e) => tracing::error!("motor: failed to schedule settle delay: {e}"),
+            }
         }
     }
 }

@@ -20,7 +20,15 @@ pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i64, MotorError> {
     if mres == 0.0 {
         return Err(MotorError::InvalidFieldValue("MRES cannot be zero".into()));
     }
-    Ok((dial / mres).round() as i64)
+    let raw = dial / mres;
+    // A non-finite result (NaN dial, infinite ratio) would silently cast to
+    // 0 or i64::MIN/MAX. Reject it so the caller does not corrupt RVAL.
+    if !raw.is_finite() {
+        return Err(MotorError::InvalidFieldValue(format!(
+            "dial/mres is not finite (dial={dial}, mres={mres})"
+        )));
+    }
+    Ok(raw.round() as i64)
 }
 
 /// Convert raw steps to dial position.
@@ -190,6 +198,14 @@ mod tests {
     #[test]
     fn test_dial_to_raw_zero_mres() {
         assert!(dial_to_raw(10.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn test_dial_to_raw_rejects_non_finite() {
+        // NaN/Inf must error, not silently cast to 0 or i64 saturation.
+        assert!(dial_to_raw(f64::NAN, 0.01).is_err());
+        assert!(dial_to_raw(f64::INFINITY, 0.01).is_err());
+        assert!(dial_to_raw(f64::NEG_INFINITY, 0.01).is_err());
     }
 
     #[test]

@@ -30,7 +30,7 @@ impl SimMotorHolder {
     /// Start polling on all registered motors.
     /// Call after PINI processing to avoid queue buildup.
     pub fn start_all_polling(&self) {
-        for tx in self.poll_senders.lock().unwrap().iter() {
+        for tx in self.poll_senders.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             let _ = tx.try_send(crate::poll_loop::PollCommand::StartPolling);
         }
     }
@@ -83,7 +83,8 @@ impl SimMotorHolder {
                     _ => return Err("highLimit must be a number".into()),
                 };
                 let poll_ms = match &args[3] {
-                    ArgValue::Int(v) => *v as u64,
+                    ArgValue::Int(v) if *v > 0 => *v as u64,
+                    ArgValue::Int(_) => return Err("pollMs must be positive".into()),
                     ArgValue::Missing => 100,
                     _ => return Err("pollMs must be an integer".into()),
                 };
@@ -110,11 +111,11 @@ impl SimMotorHolder {
                 // Spawn poll loop on the tokio runtime (starts idle)
                 ctx.runtime_handle().spawn(poll_loop.run());
 
-                holder.poll_senders.lock().unwrap().push(poll_cmd_tx);
+                holder.poll_senders.lock().unwrap_or_else(|e| e.into_inner()).push(poll_cmd_tx);
                 holder
                     .motors
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .insert(dtyp_key.clone(), Some(device_support));
                 println!(
                     "simMotorCreate: port={port} limits=[{low_limit}, {high_limit}] poll={poll_ms}ms (DTYP={dtyp_key})"
@@ -137,7 +138,7 @@ impl SimMotorHolder {
     + 'static {
         let holder = self.clone();
         move |ctx: &epics_ca_rs::server::ioc_app::DeviceSupportContext| {
-            let mut motors = holder.motors.lock().unwrap();
+            let mut motors = holder.motors.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(slot) = motors.get_mut(ctx.dtyp) {
                 if let Some(ds) = slot.take() {
                     return Some(Box::new(ds)

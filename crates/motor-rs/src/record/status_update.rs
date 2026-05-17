@@ -152,8 +152,8 @@ impl MotorRecord {
         // C: ea063f5f (2008) — when the driver is moving but the record had no
         // pending motion, this is an externally initiated move (someone called
         // the controller directly, or another record drove the same axis).
-        // Mark MIP_EXTERNAL, clear DMOV, and queue a post-process so the next
-        // process() resynchronizes once movement completes.
+        // Mark MIP_EXTERNAL and clear DMOV; do_process() routes the next
+        // process() into check_completion via the MIP_EXTERNAL bit.
         if self.stat.movn
             && self.stat.dmov
             && self.stat.phase == MotionPhase::Idle
@@ -161,7 +161,6 @@ impl MotorRecord {
         {
             self.stat.dmov = false;
             self.stat.mip |= MipFlags::EXTERNAL;
-            self.internal.pp = true;
         }
 
         // Limit switches: map raw -> user based on DIR and MRES sign
@@ -231,10 +230,10 @@ impl MotorRecord {
         // C: tdir = msta.RA_DIRECTION (from driver on every poll)
         self.stat.tdir = status.direction;
 
-        // C: 314ef89a (PR #238) — RVEL is the actual velocity reported by
-        // the driver (asyn `motorActVelocity_`), kept separate from the
-        // setpoint VELO.
-        self.stat.rvel = status.velocity;
+        // C: devMotorAsyn.c — RVEL is the raw velocity reported by the
+        // driver, stored as floor(status.velocity) (motorRecord.dbd RVEL is
+        // DBF_LONG "Raw Velocity").
+        self.stat.rvel = status.velocity.floor() as i64;
 
         // Recompute LVIO from current position and soft limits
         self.limits.lvio =
@@ -274,10 +273,15 @@ impl MotorRecord {
         // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when
         // the autosaved DVAL is meaningful but the driver currently sits near
         // zero (i.e. the controller lost its position across the IOC restart).
+        //
+        // C compares `fabs(status.position * mres)` — the *motor* position
+        // dial value, always via MRES. Use the motor raw position (RMP), not
+        // DRBV, since DRBV follows the encoder (ERES) when UEIP=Yes.
         let rdbd = self.retry.rdbd.abs().max(self.conv.mres.abs());
+        let motor_dial = coordinate::raw_to_dial(self.pos.rmp, self.conv.mres);
         let dval_non_zero_pos_near_zero = autosaved_dval.abs() > rdbd
             && self.conv.mres != 0.0
-            && self.pos.drbv.abs() < rdbd;
+            && motor_dial.abs() < rdbd;
         let mut restore = self
             .conv
             .rstm

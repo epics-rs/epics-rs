@@ -240,10 +240,11 @@ pub struct StatusFields {
     pub tdir: bool,
     pub athm: bool,
     pub stup: i16,
-    /// Raw (actual) velocity reported by the driver, EGU/sec.
-    /// C: `314ef89a` (PR #238) — sourced from `motorActVelocity_`, separate
-    /// from the setpoint `motorVelocity_`.
-    pub rvel: f64,
+    /// Raw velocity reported by the driver, in motor steps/sec.
+    /// C: `motorRecord.dbd` `field(RVEL,DBF_LONG)` "Raw Velocity"; devMotorAsyn
+    /// fills it with `floor(status.velocity)`. 64-bit here for consistency
+    /// with the other raw fields (epics-modules/motor #192).
+    pub rvel: i64,
 }
 
 impl Default for StatusFields {
@@ -258,7 +259,7 @@ impl Default for StatusFields {
             tdir: false,
             athm: false,
             stup: 0,
-            rvel: 0.0,
+            rvel: 0,
         }
     }
 }
@@ -331,12 +332,17 @@ pub struct InternalFields {
     pub ldvl: f64,
     pub lrvl: i64,
     pub lspg: SpmgMode,
-    pub pp: bool,
     pub sync: bool,
     /// Backlash final move pending after MainMove completes
     pub backlash_pending: bool,
     /// Pending retarget value (for NTM stop-and-replan)
     pub pending_retarget: Option<f64>,
+    /// A jog/home command that arrived while the axis was already moving.
+    /// The record stops the current motion first and re-issues this once the
+    /// driver reports done. Kept separate from the MIP JOGF/JOGR/HOMF/HOMR
+    /// bits so a plain STOP on an *active* jog/home is not mistaken for a
+    /// queued request.
+    pub queued_motion: Option<QueuedMotion>,
     /// Remember jog direction for backlash (cleared by stop_jog)
     pub jog_was_forward: bool,
     /// True after the initial DMOV 1→0 notification has been sent.

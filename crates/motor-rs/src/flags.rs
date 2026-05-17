@@ -128,6 +128,15 @@ impl FreezeOffset {
     }
 }
 
+/// A jog or home command queued behind an in-progress motion (stop-then-X).
+/// Tracked outside the MIP bitflags so it cannot be confused with an active
+/// jog/home that a plain STOP has just halted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedMotion {
+    Jog { forward: bool },
+    Home { forward: bool },
+}
+
 /// Restore mode for autosaved position at IOC startup.
 /// C: `2906f3d8` (2020-06) / PR #160 — `menu(motorRSTM)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

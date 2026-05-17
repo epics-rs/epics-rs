@@ -7,12 +7,15 @@ use chrono::Local;
 /// EPICS epoch: 1990-01-01 00:00:00 UTC
 const EPICS_EPOCH_OFFSET: i64 = 631152000;
 
-/// Maximum length of the VAL/OVAL string fields.
+/// Maximum number of visible (non-NUL) bytes in the VAL/OVAL fields.
 ///
-/// `timestampRecord.dbd` declares `VAL`/`OVAL` with `size(40)`, and C
-/// `timestampRecord.c:140` calls `epicsTimeToStrftime(val, sizeof(val), ...)`
-/// which truncates to that buffer (39 chars + NUL).
-const VAL_SIZE: usize = 40;
+/// `timestampRecord.dbd` declares `VAL`/`OVAL` as `char val[40]`, and C
+/// `timestampRecord.c:140` calls `epicsTimeToStrftime(val, sizeof(val), ...)`.
+/// `epicsTimeToStrftime` wraps `strftime`, which writes at most
+/// `sizeof(val)` bytes *including* the terminating NUL — so the buffer
+/// holds at most 39 visible characters. A Rust `String` carries no NUL
+/// terminator, so the visible-byte bound is 39, not 40.
+const VAL_VISIBLE_MAX: usize = 39;
 
 /// Timestamp format strings indexed by TST field value.
 ///
@@ -124,18 +127,19 @@ impl TimestampRecord {
             _ => now.format(TIMESTAMP_FORMATS[0]).to_string(),
         };
 
-        // C `epicsTimeToStrftime(val, sizeof(val), ...)` bounds the
-        // result to the 40-byte VAL buffer (`timestampRecord.dbd`
-        // `size(40)`).
-        (truncate_to(formatted, VAL_SIZE), sec_past_epoch)
+        // C `timestampRecord.c:140` `epicsTimeToStrftime(val, sizeof(val), ...)`
+        // bounds the result to the `char val[40]` buffer; `strftime` keeps
+        // one byte for the NUL terminator, so at most 39 visible chars.
+        (truncate_to(formatted, VAL_VISIBLE_MAX), sec_past_epoch)
     }
 }
 
 /// Truncate `s` to at most `max` bytes, respecting UTF-8 char boundaries.
 ///
-/// C stores VAL/OVAL in a fixed `char[40]` buffer; the formatted output
-/// must never exceed it. Timestamp format strings only ever emit ASCII,
-/// so this is a plain byte truncation in practice.
+/// C stores VAL/OVAL in a fixed `char[40]` buffer whose last byte is the
+/// NUL terminator, so at most 39 visible bytes survive. Timestamp format
+/// strings only ever emit ASCII, so this is a plain byte truncation in
+/// practice.
 fn truncate_to(mut s: String, max: usize) -> String {
     if s.len() > max {
         let mut cut = max;
@@ -173,8 +177,9 @@ impl Record for TimestampRecord {
         match name {
             "VAL" => match value {
                 EpicsValue::String(v) => {
-                    // VAL is a `char[40]` field in C; truncate to match.
-                    self.val = truncate_to(v, VAL_SIZE);
+                    // VAL is a `char[40]` field in C; the last byte is the
+                    // NUL terminator, so 39 visible bytes at most.
+                    self.val = truncate_to(v, VAL_VISIBLE_MAX);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

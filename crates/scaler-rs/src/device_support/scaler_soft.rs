@@ -123,8 +123,13 @@ impl ScalerDriver for SoftScalerDriver {
         Ok(())
     }
 
-    fn done(&self) -> bool {
-        self.done_flag
+    /// C `devScalerAsyn.c:292-301` `scaler_done()` — read-and-clear: a
+    /// completed count is reported exactly once, then the flag is
+    /// cleared so the next poll returns `false`.
+    fn done(&mut self) -> bool {
+        let was_done = self.done_flag;
+        self.done_flag = false;
+        was_done
     }
 
     fn num_channels(&self) -> usize {

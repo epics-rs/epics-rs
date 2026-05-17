@@ -204,14 +204,20 @@ fn test_out_of_range_tst_uses_format_0() {
     );
 }
 
-/// C `timestampRecord.c:140`: `epicsTimeToStrftime(val, sizeof(val), ...)`
-/// bounds the result to the 40-byte VAL buffer (`size(40)` in the dbd).
+/// C `timestampRecord.c:140`: `epicsTimeToStrftime(val, sizeof(val), ...)`.
+/// VAL is `char val[40]`; `strftime` reserves the last byte for the NUL
+/// terminator, so the field holds at most 39 visible characters. A Rust
+/// `String` carries no NUL, so the visible-byte bound is exactly 39.
 #[test]
-fn test_val_truncated_to_40_bytes() {
+fn test_val_truncated_to_39_visible_bytes() {
     let mut rec = TimestampRecord::default();
     let long = "x".repeat(100);
     rec.put_field("VAL", EpicsValue::String(long)).unwrap();
-    assert!(rec.val.len() <= 40, "VAL must be capped at 40 bytes");
+    assert_eq!(
+        rec.val.len(),
+        39,
+        "VAL must be capped at 39 visible bytes (char[40] minus NUL)"
+    );
 }
 
 #[test]

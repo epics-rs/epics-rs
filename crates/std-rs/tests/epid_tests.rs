@@ -852,3 +852,47 @@ fn test_fast_do_pid_averaging() {
     // e = 100 - 25 = 75, P = KP*e = 75.
     assert!((pvt.p - 75.0).abs() < 1e-9, "P must be 75.0, got {}", pvt.p);
 }
+
+/// C `devEpidFast.c::do_PID` (devEpidFast.c:400-482) runs the PID
+/// algorithm UNCONDITIONALLY — `epidFastPvt` (devEpidFast.c:35-72) has
+/// no `fmod` field and `do_PID` never branches on FMOD. FMOD/MaxMin is
+/// honoured only by the Soft device supports (`devEpidSoft.c:137`,
+/// `devEpidSoftCallback.c:173` have `switch (pepid->fmod)`).
+///
+/// Two `EpidFastPvt` instances with identical PID inputs must produce
+/// identical output — the Fast support has no FMOD knob to diverge on.
+#[test]
+fn test_fast_do_pid_ignores_fmod() {
+    let make = || {
+        let mut pvt = EpidFastPvt::default();
+        pvt.callback_interval = 0.5;
+        pvt.num_average = 1;
+        pvt.kp = 1.0;
+        pvt.ki = 0.0;
+        pvt.kd = 2.0;
+        pvt.drvh = 1000.0;
+        pvt.drvl = -1000.0;
+        pvt.val = 100.0;
+        pvt.fbon = true;
+        pvt.fbop = true;
+        pvt
+    };
+
+    let mut a = make();
+    let mut b = make();
+    a.do_pid(90.0);
+    b.do_pid(90.0);
+
+    // PID output: P = KP*e = 10, I = 0 (KI=0), D = KP*KD*de/dt = 40.
+    assert!(
+        (a.oval - 50.0).abs() < 1e-9,
+        "Fast do_pid must run PID unconditionally -> oval 50.0, got {}",
+        a.oval
+    );
+    assert_eq!(
+        a.oval, b.oval,
+        "Fast support has no FMOD branch; output must be deterministic"
+    );
+    assert_eq!(a.p, b.p);
+    assert_eq!(a.d, b.d);
+}

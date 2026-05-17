@@ -371,7 +371,7 @@ fn test_val_set_on_completion() {
 
 #[test]
 fn test_soft_driver_basics() {
-    let driver = SoftScalerDriver::new(8);
+    let mut driver = SoftScalerDriver::new(8);
     assert_eq!(driver.num_channels(), 8);
     assert!(!driver.done());
 }
@@ -432,6 +432,34 @@ fn test_soft_driver_preset_done() {
     let mut counts = [0u32; MAX_SCALER_CHANNELS];
     driver.read(&mut counts).unwrap();
     assert!(driver.done());
+}
+
+/// C `devScalerAsyn.c:292-301` `scaler_done()` is read-and-clear: it
+/// returns 1 exactly once per completed count, then `pPvt->done` is 0
+/// so the next poll returns 0. `ScalerDriver::done` must consume the
+/// flag the same way.
+#[test]
+fn test_soft_driver_done_is_read_and_clear() {
+    let mut driver = SoftScalerDriver::new(8);
+    driver.write_preset(0, 1000).unwrap();
+    driver.arm(true).unwrap();
+
+    let shared = driver.shared_counts();
+    {
+        let mut guard = shared.lock().unwrap();
+        guard[0] = 1000;
+    }
+
+    let mut counts = [0u32; MAX_SCALER_CHANNELS];
+    driver.read(&mut counts).unwrap();
+
+    // First poll reports the completed count.
+    assert!(driver.done(), "first done() poll must report completion");
+    // The flag is cleared — a second poll without a new count is false.
+    assert!(
+        !driver.done(),
+        "done() must clear the flag (C scaler_done read-and-clear)"
+    );
 }
 
 #[test]
@@ -548,7 +576,7 @@ fn test_asyn_device_support_clamps_nch() {
         ) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
-        fn done(&self) -> bool {
+        fn done(&mut self) -> bool {
             false
         }
         fn num_channels(&self) -> usize {

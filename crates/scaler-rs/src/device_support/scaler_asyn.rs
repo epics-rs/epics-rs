@@ -24,7 +24,14 @@ pub trait ScalerDriver: Send + Sync + 'static {
     fn read(&mut self, counts: &mut [u32; MAX_SCALER_CHANNELS]) -> CaResult<()>;
     fn write_preset(&mut self, channel: usize, preset: u32) -> CaResult<()>;
     fn arm(&mut self, start: bool) -> CaResult<()>;
-    fn done(&self) -> bool;
+    /// Read-and-clear the "counting done" flag.
+    ///
+    /// C `devScalerAsyn.c:292-301` `scaler_done()` is the dset entry the
+    /// record polls each process cycle; it returns 1 exactly once per
+    /// completed count and clears `pPvt->done` on that read so the next
+    /// poll returns 0. This signature takes `&mut self` so the flag can
+    /// be consumed — a `&self` version cannot replicate the clear.
+    fn done(&mut self) -> bool;
     fn num_channels(&self) -> usize;
 }
 
@@ -77,8 +84,9 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
 
         // Check if counting completed. C devScalerAsyn.c:292-301
         // `scaler_done()` is the dset entry the record polls every
-        // process cycle (scalerRecord.c:367); here device support
-        // marks the record done before process() runs.
+        // process cycle (scalerRecord.c:367); it is read-and-clear, so
+        // it reports a completed count exactly once. Here device
+        // support marks the record done before process() runs.
         if driver.done() {
             scaler.set_done();
         }

@@ -49,7 +49,6 @@ pub struct EpidFastPvt {
     pub drvl: f64,
     pub val: f64, // setpoint
     pub fbon: bool,
-    pub fmod: i16,
 
     // PID state (updated by callback, read by record process)
     pub cval: f64,
@@ -95,7 +94,6 @@ impl Default for EpidFastPvt {
             drvl: 1.0,
             val: 0.0,
             fbon: false,
-            fmod: 0,
             cval: 0.0,
             oval: 0.0,
             err: 0.0,
@@ -165,7 +163,6 @@ impl EpidFastPvt {
             avg
         };
 
-        let pcval = self.cval;
         self.cval = cval;
 
         // C `do_PID` (devEpidFast.c:430) uses `dt = pPvt->callbackInterval`
@@ -178,71 +175,53 @@ impl EpidFastPvt {
         let ep = self.err;
         let mut oval = self.oval;
 
-        match self.fmod {
-            0 => {
-                // PID mode
-                let e = self.val - cval;
-                let de = e - ep;
-                self.p = self.kp * e;
-                let di = self.kp * self.ki * e * dt;
+        // C `do_PID` (devEpidFast.c:400-482) runs the PID algorithm
+        // UNCONDITIONALLY — `epidFastPvt` has no `fmod` field and
+        // `do_PID` never branches on FMOD. FMOD/MaxMin is honoured only
+        // by the Soft device supports (`devEpidSoft.c:137`,
+        // `devEpidSoftCallback.c:173` have `switch (pepid->fmod)`); the
+        // Fast support ignores FMOD entirely.
+        let e = self.val - cval;
+        let de = e - ep;
+        self.p = self.kp * e;
+        let di = self.kp * self.ki * e * dt;
 
-                if self.fbon {
-                    if !self.fbop {
-                        // Bumpless OFF->ON: C reads the actual DAC output
-                        // value (`pfloat64Output->read`, devEpidFast.c:446).
-                        // The framework has no read-back on the output
-                        // port here, so the last commanded OVAL is the
-                        // closest available approximation.
-                        self.i = self.oval;
-                    } else if (oval > self.drvl && oval < self.drvh)
-                        || (oval >= self.drvh && di < 0.0)
-                        || (oval <= self.drvl && di > 0.0)
-                    {
-                        self.i += di;
-                        // C `devEpidFast.c:455-456` does two sequential
-                        // `if` clamps (low then high). `f64::clamp`
-                        // panics when min > max, which happens before
-                        // `update_params` seeds the limits — replicate
-                        // the panic-free sequential form.
-                        if self.i < self.drvl {
-                            self.i = self.drvl;
-                        }
-                        if self.i > self.drvh {
-                            self.i = self.drvh;
-                        }
-                    }
+        if self.fbon {
+            if !self.fbop {
+                // Bumpless OFF->ON: C reads the actual DAC output
+                // value (`pfloat64Output->read`, devEpidFast.c:446).
+                // The framework has no read-back on the output
+                // port here, so the last commanded OVAL is the
+                // closest available approximation.
+                self.i = self.oval;
+            } else if (oval > self.drvl && oval < self.drvh)
+                || (oval >= self.drvh && di < 0.0)
+                || (oval <= self.drvl && di > 0.0)
+            {
+                self.i += di;
+                // C `devEpidFast.c:455-456` does two sequential
+                // `if` clamps (low then high). `f64::clamp`
+                // panics when min > max, which happens before
+                // `update_params` seeds the limits — replicate
+                // the panic-free sequential form.
+                if self.i < self.drvl {
+                    self.i = self.drvl;
                 }
-                if self.ki == 0.0 {
-                    self.i = 0.0;
-                }
-                self.d = if dt > 0.0 {
-                    self.kp * self.kd * (de / dt)
-                } else {
-                    0.0
-                };
-                self.err = e;
-                oval = self.p + self.i + self.d;
-            }
-            1 => {
-                // MaxMin mode
-                if self.fbon {
-                    if !self.fbop {
-                        oval = self.oval;
-                    } else {
-                        let e = cval - pcval;
-                        let sign = if self.d > 0.0 { 1.0 } else { -1.0 };
-                        let sign = if (self.kp > 0.0 && e < 0.0) || (self.kp < 0.0 && e > 0.0) {
-                            -sign
-                        } else {
-                            sign
-                        };
-                        self.d = self.kp * sign;
-                        oval = self.oval + self.d;
-                    }
+                if self.i > self.drvh {
+                    self.i = self.drvh;
                 }
             }
-            _ => {}
         }
+        if self.ki == 0.0 {
+            self.i = 0.0;
+        }
+        self.d = if dt > 0.0 {
+            self.kp * self.kd * (de / dt)
+        } else {
+            0.0
+        };
+        self.err = e;
+        oval = self.p + self.i + self.d;
 
         // Clamp output — C `devEpidFast.c:464-465` sequential `if`
         // clamps (panic-free vs `f64::clamp` when drvl > drvh).
@@ -376,7 +355,9 @@ impl EpidFastDeviceSupport {
         pvt.drvl = epid.drvl;
         pvt.val = epid.val;
         pvt.fbon = epid.fbon != 0;
-        pvt.fmod = epid.fmod;
+        // C `devEpidFast.c::update_params` (devEpidFast.c:332-339) copies
+        // FBON/DRVH/DRVL/KP/KI/KD/VAL only — `epidFastPvt` has no `fmod`
+        // field and the Fast support never reads FMOD.
     }
 
     /// Copy computed results from fast PID state back to record.

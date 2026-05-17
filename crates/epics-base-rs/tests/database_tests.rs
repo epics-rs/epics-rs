@@ -428,6 +428,68 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
     );
 }
 
+// BUG 2 regression — `process_record` (the foreign-process / QSRV-group
+// path) calls `process_local`. A recent fix excluded UDF from the
+// `process_local` `sub_updates` snapshot loop, citing "UDF via the
+// explicit UDF push above" — but `process_local` had NO such push (the
+// two `database/processing.rs` paths exclude UDF AND pair it with an
+// explicit push at `:1327` and `:1948`). Without the push a UDF change
+// driven through `process_record` was never delivered to `.UDF`
+// subscribers. The fix adds the `if !event_mask.is_empty()` UDF push to
+// `process_local`, mirroring `processing.rs`.
+#[tokio::test]
+async fn test_process_record_delivers_udf_monitor_event() {
+    use epics_base_rs::server::recgbl::{EventMask, alarm_status};
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    // Soft-Channel ai with a defined VAL — `process_local`'s
+    // `value_is_undefined()` returns false, so processing clears UDF.
+    db.add_record("UDF_REC", Box::new(AiRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    // Seed the prior UDF state: UDF=true with INVALID/UDF_ALARM, as a
+    // freshly-initialised record reads before its first process. The
+    // first `process_record` clears UDF (true→false) and the alarm
+    // (INVALID→NO_ALARM), so `event_mask` carries DBE_ALARM and the UDF
+    // push fires.
+    {
+        let rec = db.get_record("UDF_REC").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.udf = true;
+        inst.common.sevr = AlarmSeverity::Invalid;
+        inst.common.stat = alarm_status::UDF_ALARM;
+    }
+
+    // Subscribe to UDF before processing.
+    let mut udf_rx = {
+        let rec = db.get_record("UDF_REC").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.add_subscriber("UDF", 31, DbFieldType::Char, EventMask::ALARM.bits())
+    }
+    .expect("UDF subscription must be accepted");
+
+    // Foreign-process path — `process_record` → `process_local`.
+    db.process_record("UDF_REC").await.unwrap();
+
+    {
+        let rec = db.get_record("UDF_REC").await.unwrap();
+        let inst = rec.read().await;
+        assert!(!inst.common.udf, "process must have cleared UDF");
+    }
+
+    let event = udf_rx
+        .try_recv()
+        .expect("a UDF change via process_record must deliver a UDF monitor event");
+    assert!(
+        matches!(event.snapshot.value, EpicsValue::Char(0)),
+        "UDF event payload should be the cleared value 0, got {:?}",
+        event.snapshot.value
+    );
+}
+
 /// C `dbAccess.c::dbPutField:1276` sets `precord->putf = TRUE`
 /// IMMEDIATELY before calling `dbProcess`. The flag stays TRUE
 /// throughout the entire process cycle and is cleared in
@@ -3066,6 +3128,146 @@ async fn test_seq_dol_lnk_dispatch() {
         EpicsValue::Double(v) => assert!((v - 200.0).abs() < 1e-10),
         other => panic!("expected Double(200.0), got {:?}", other),
     }
+}
+
+// A process-counting target. `process()` bumps the shared counter so a
+// test can prove whether a link DID or DID NOT process its target.
+struct CountingTarget {
+    process_count: Arc<AtomicU32>,
+}
+
+impl Record for CountingTarget {
+    fn record_type(&self) -> &'static str {
+        "counting_target"
+    }
+    fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+        self.process_count.fetch_add(1, Ordering::SeqCst);
+        Ok(ProcessOutcome::complete())
+    }
+    fn get_field(&self, _name: &str) -> Option<EpicsValue> {
+        None
+    }
+    fn put_field(&mut self, _name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+// BUG 1 regression — seq `LNKn` is `DBF_OUTLINK` (`seqRecord.dbd.pod:316`)
+// driven via `dbPutLink` (`seqRecord.c:264`). `dbDbPutValue`
+// (`dbDbLink.c:388`) processes the target only when the link carries an
+// explicit `PP` modifier. A bare (modifier-less) seq LNKn is NPP — the
+// target value is written but the target is NOT processed. Before the
+// fix the `MultiOut::Seq` arm passed the bare link straight through
+// (`parse_link_v2` defaults bare → ProcessPassive), wrongly processing
+// the Passive target.
+#[tokio::test]
+async fn test_seq_bare_lnk_does_not_process_passive_target() {
+    use epics_base_rs::server::records::seq::SeqRecord;
+    let db = PvDatabase::new();
+
+    let bare_count = Arc::new(AtomicU32::new(0));
+    let pp_count = Arc::new(AtomicU32::new(0));
+    db.add_record(
+        "SEQ_BARE_TGT",
+        Box::new(CountingTarget {
+            process_count: bare_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    db.add_record(
+        "SEQ_PP_TGT",
+        Box::new(CountingTarget {
+            process_count: pp_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut seq = SeqRecord::new();
+    seq.selm = 0;
+    // Group 1: bare LNK — must NOT process the Passive target.
+    seq.do1 = 11.0;
+    seq.lnk1 = "SEQ_BARE_TGT".to_string();
+    // Group 2: explicit PP LNK — must process the Passive target.
+    seq.do2 = 22.0;
+    seq.lnk2 = "SEQ_PP_TGT PP".to_string();
+    db.add_record("SEQ_NPP_REC", Box::new(seq)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SEQ_NPP_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bare_count.load(Ordering::SeqCst),
+        0,
+        "bare seq LNKn (NPP) must NOT process its Passive target"
+    );
+    assert_eq!(
+        pp_count.load(Ordering::SeqCst),
+        1,
+        "explicit-PP seq LNKn must process its Passive target"
+    );
+}
+
+// BUG 1 regression — sseq `LNKn` is `DBF_OUTLINK` driven via `dbPutLink`
+// → `dbDbPutValue` (`dbDbLink.c:388`). A bare sseq LNKn is NPP and must
+// not process its target; an explicit-PP LNKn must.
+#[tokio::test]
+async fn test_sseq_bare_lnk_does_not_process_passive_target() {
+    use epics_base_rs::server::records::sseq::SseqRecord;
+    let db = PvDatabase::new();
+
+    let bare_count = Arc::new(AtomicU32::new(0));
+    let pp_count = Arc::new(AtomicU32::new(0));
+    db.add_record(
+        "SSEQ_BARE_TGT",
+        Box::new(CountingTarget {
+            process_count: bare_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    db.add_record(
+        "SSEQ_PP_TGT",
+        Box::new(CountingTarget {
+            process_count: pp_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0;
+    // Step 1: bare LNK — must NOT process the Passive target.
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_BARE_TGT".to_string()))
+        .unwrap();
+    // Step 2: explicit PP LNK — must process the Passive target.
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_PP_TGT PP".to_string()))
+        .unwrap();
+    db.add_record("SSEQ_NPP_REC", Box::new(sseq)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SSEQ_NPP_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bare_count.load(Ordering::SeqCst),
+        0,
+        "bare sseq LNKn (NPP) must NOT process its Passive target"
+    );
+    assert_eq!(
+        pp_count.load(Ordering::SeqCst),
+        1,
+        "explicit-PP sseq LNKn must process its Passive target"
+    );
 }
 
 #[tokio::test]

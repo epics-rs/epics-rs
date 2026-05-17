@@ -1522,7 +1522,16 @@ impl PvDatabase {
             };
             if let Some(pairs) = multi_out {
                 for (link_str, val) in pairs {
-                    let parsed = crate::server::record::parse_link_v2(&link_str);
+                    // `multi_output_links` carries record OUT links
+                    // (sseq `LNKn`, scalcout `OUTn` — all `DBF_OUTLINK`)
+                    // driven via `dbPutLink` → `dbDbPutValue`
+                    // (`dbDbLink.c:388`): a bare link is NPP, the value
+                    // is written but the target is NOT processed.
+                    // `parse_output_link_v2` applies the
+                    // OUT-link-correct NPP default; `parse_link_v2` would
+                    // wrongly default a bare link to ProcessPassive and
+                    // re-process the target.
+                    let parsed = crate::server::record::parse_output_link_v2(&link_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
                         self.write_db_link_value(db, val, src_putf, visited, depth)
                             .await;
@@ -2137,7 +2146,12 @@ impl PvDatabase {
             };
             if let Some(pairs) = multi_out {
                 for (link_str, val) in pairs {
-                    let parsed = crate::server::record::parse_link_v2(&link_str);
+                    // `multi_output_links` carries record OUT links
+                    // (sseq `LNKn`, scalcout `OUTn` — all `DBF_OUTLINK`):
+                    // a bare link is NPP (`dbDbLink.c:388`).
+                    // `parse_output_link_v2` applies the OUT-link-correct
+                    // NPP default — see the sync-path twin above.
+                    let parsed = crate::server::record::parse_output_link_v2(&link_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
                         self.write_db_link_value(db, val, src_putf, visited, depth)
                             .await;

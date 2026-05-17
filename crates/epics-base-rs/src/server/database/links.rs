@@ -809,7 +809,16 @@ impl PvDatabase {
                         Some(EpicsValue::Double(grp.dov))
                     };
                     if let Some(value) = value {
-                        let lnk_parsed = crate::server::record::parse_link_v2(&grp.lnk);
+                        // C `seqRecord.c:264` drives each LNKn via
+                        // `dbPutLink`, whose `DBF_OUTLINK` target is
+                        // processed by `dbDbPutValue` (`dbDbLink.c:388`)
+                        // only when the link carries an explicit `PP`
+                        // modifier. A bare `LNKn` is NPP — the value is
+                        // written but the target is NOT processed.
+                        // `parse_output_link_v2` applies that
+                        // OUT-link-correct NPP default (the dfanout arm
+                        // above open-codes the same downgrade).
+                        let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
                         if let crate::server::record::ParsedLink::Db(ref db) = lnk_parsed {
                             self.write_db_link_value(db, value, src_putf, visited, depth)
                                 .await;
@@ -833,7 +842,11 @@ impl PvDatabase {
                         Some(EpicsValue::Double(grp.do_val))
                     };
                     if let Some(value) = value {
-                        let lnk_parsed = crate::server::record::parse_link_v2(&grp.lnk);
+                        // sseq `LNKn` is `DBF_OUTLINK` driven via
+                        // `dbPutLink` → `dbDbPutValue` (`dbDbLink.c:388`):
+                        // a bare `LNKn` is NPP. `parse_output_link_v2`
+                        // applies the OUT-link-correct NPP default.
+                        let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
                         if let crate::server::record::ParsedLink::Db(ref db) = lnk_parsed {
                             self.write_db_link_value(db, value, src_putf, visited, depth)
                                 .await;

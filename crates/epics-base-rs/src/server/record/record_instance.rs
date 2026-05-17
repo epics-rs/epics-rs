@@ -1602,6 +1602,24 @@ impl RecordInstance {
             alarm_posts.push(("ACKS", EventMask::VALUE));
         }
 
+        // Post UDF on the snapshot whenever any monitor event fires this
+        // cycle — mirrors the two `processing.rs` UDF pushes
+        // (`database/processing.rs:1327` and `:1948`,
+        // `if !event_mask.is_empty()`). C `recGblResetAlarms` /
+        // `recGblCheckUDF` (recGbl.c) keep UDF current every process
+        // cycle, and `db_post_events` delivers `.UDF` alongside the
+        // record-wide post. `process_local` is the foreign-process path
+        // (`db.process_record`, e.g. QSRV group-process members); without
+        // this push a UDF change here is never delivered to `.UDF`
+        // subscribers — the `sub_updates` loop below deliberately excludes
+        // UDF to avoid a double-post, so the push must be here.
+        if !event_mask.is_empty() {
+            changed_fields.push((
+                "UDF".to_string(),
+                EpicsValue::Char(if self.common.udf { 1 } else { 0 }),
+            ));
+        }
+
         // Add subscribed fields that actually changed since last notification.
         // Exclude VAL/SEVR/STAT/AMSG/UDF — all five are already emitted by
         // this path (VAL in `changed_fields`, SEVR/STAT/AMSG via

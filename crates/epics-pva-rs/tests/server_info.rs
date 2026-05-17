@@ -67,7 +67,7 @@ fn server_with_two_pvs() -> (PvaServer, epics_pva_rs::client_native::context::Pv
     source.add("test:alpha", pv_a);
     source.add("test:beta", pv_b);
 
-    let server = PvaServer::isolated(Arc::new(source));
+    let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
     (server, client)
 }
@@ -219,7 +219,7 @@ async fn user_server_pv_overrides_builtin() {
     let source = SharedSource::new();
     source.add("server", user_server);
 
-    let server = PvaServer::isolated(Arc::new(source));
+    let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
 
     // The user's NTScalar<f64> `server` PV must answer GET — not the

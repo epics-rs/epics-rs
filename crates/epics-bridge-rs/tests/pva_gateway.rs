@@ -60,7 +60,7 @@ fn spawn_upstream(pv_name: &str, initial: f64) -> (PvaServer, SocketAddr, Shared
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         cfg.tcp_port,
     );
-    let server = PvaServer::start(Arc::new(source), cfg);
+    let server = PvaServer::start(Arc::new(source), cfg).expect("test server must start");
     (server, bound, pv)
 }
 

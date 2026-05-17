@@ -164,7 +164,7 @@ async fn put_get_round_trip() {
         ..Default::default()
     };
     let src = DoublingSource::new();
-    let server = PvaServer::start(Arc::new(src.clone()), cfg);
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -201,7 +201,7 @@ async fn put_get_then_get_consistent() {
         ..Default::default()
     };
     let src = DoublingSource::new();
-    let server = PvaServer::start(Arc::new(src.clone()), cfg);
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -237,7 +237,7 @@ async fn process_triggers_hook() {
         ..Default::default()
     };
     let src = DoublingSource::new();
-    let server = PvaServer::start(Arc::new(src.clone()), cfg);
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
@@ -384,7 +384,7 @@ async fn put_get_denied_for_read_only_peer() {
         ..Default::default()
     };
     let src = DenySource::new();
-    let server = PvaServer::start(Arc::new(src.clone()), cfg);
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let server_addr =
@@ -431,7 +431,7 @@ async fn process_denied_for_read_only_peer() {
         ..Default::default()
     };
     let src = DenySource::new();
-    let server = PvaServer::start(Arc::new(src.clone()), cfg);
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let server_addr =

@@ -555,6 +555,31 @@ pub async fn run_ca_pva_qsrv_ioc(
             .await;
     }
 
+    // ── CA links (`calink` feature) ──
+    // Install the `"ca"` link set so a loaded database with
+    // `INP="somepv CA"` (or `ca://somepv`) links resolves through the
+    // monitor-backed CA cache, and register the `caxr` / `dbcaxr`
+    // iocsh commands. This is the CA-side counterpart of the `"pva"`
+    // link set installed by `install_pvalink_resolver`.
+    #[cfg(feature = "calink")]
+    let mut shell_commands = config.shell_commands;
+    #[cfg(not(feature = "calink"))]
+    let shell_commands = config.shell_commands;
+    #[cfg(feature = "calink")]
+    {
+        match crate::calink::install_calink_resolver(&db, tokio::runtime::Handle::current()).await {
+            Ok(resolver) => {
+                shell_commands.extend(crate::calink::register_calink_commands(resolver));
+                tracing::info!("calink: `ca` link set installed");
+            }
+            Err(e) => {
+                // A CA-client init failure must not abort the IOC: a
+                // database with no CA links is still fully serviceable.
+                tracing::warn!("calink: CA link set NOT installed: {e}");
+            }
+        }
+    }
+
     // ── CA server (background) ──
     let ca_server = epics_ca_rs::server::CaServer::from_parts(
         db.clone(),
@@ -579,7 +604,6 @@ pub async fn run_ca_pva_qsrv_ioc(
         config.autosave_manager,
     );
 
-    let shell_commands = config.shell_commands;
     pva_server
         .run_with_source_and_shell(store, move |shell| {
             for cmd in shell_commands {
@@ -1000,7 +1024,8 @@ mod tests {
             )
             .await;
 
-        let server = PvaServer::start(store, PvaServerConfig::isolated());
+        let server =
+            PvaServer::start(store, PvaServerConfig::isolated()).expect("test server must start");
         let client = server.client_config();
 
         let got = tokio::time::timeout(Duration::from_secs(5), client.pvinfo("TEST:WIRE:UARR"))

@@ -31,6 +31,8 @@
 //! // now resolve through the monitor-backed cache.
 //! ```
 
+mod iocsh;
 mod resolver;
 
+pub use iocsh::{ca_caxr_command, db_dbcaxr_command, register_calink_commands};
 pub use resolver::{CaLink, CaLinkError, CaLinkResolver, install_calink_resolver};

@@ -88,7 +88,7 @@ async fn pva_service_dispatch_round_trip() {
     assert!(registered.contains(&"counter:reset".to_string()));
     assert!(registered.contains(&"counter:square".to_string()));
 
-    let server = PvaServer::isolated(Arc::new(source));
+    let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
 
     // counter:square — pure compute, easy parity check.
@@ -177,7 +177,7 @@ fn direct_struct_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
 async fn pva_service_accepts_direct_struct_request() {
     let source = SharedSource::new();
     let _ = epics_pva_rs::service::add_rpc_service(&source, "calc", Counter::default());
-    let server = PvaServer::isolated(Arc::new(source));
+    let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
 
     // square(9.0) without NTURI wrapper.

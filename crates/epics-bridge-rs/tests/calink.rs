@@ -178,6 +178,116 @@ async fn record_with_ca_inp_link_reads_remote_value() {
     );
 }
 
+/// Gap 2 OUT write — a CA-type OUT link writes the remote PV.
+/// `CaLinkResolver::put_value` (the `LinkSet` OUT-write path) must
+/// push a value through the CA channel into the upstream CA server's
+/// PV. This mirrors the C `dbCaPutLink` path for a `DBF_OUTLINK`
+/// carrying a ` CA` modifier. Verified two ways: the resolver's own
+/// monitor-backed cache reflects the new value, and a fresh
+/// independent CA client GET against the upstream server reads it
+/// back — proving the write reached the server, not just the cache.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn ca_link_out_write_updates_remote_pv() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .pv("CALINK:OUT:DST", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("CA server");
+    let _server = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let client = Arc::new(pinned_client(port).await);
+    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+
+    // Open the link + wait for the first monitor event so the channel
+    // is connected and the OUT write has a live circuit to push on.
+    let connected = resolver
+        .wait_for_link_connected("CALINK:OUT:DST", Duration::from_secs(5))
+        .await;
+    assert!(connected, "CA link must connect before the OUT write");
+
+    use epics_base_rs::server::database::LinkSet;
+    // Bare ` CA`-modified OUT link form: `epics-base-rs` strips the
+    // modifier and hands the resolver the bare PV name.
+    LinkSet::put_value(&resolver, "CALINK:OUT:DST", EpicsValue::Double(88.0))
+        .expect("CA-link OUT write must succeed");
+
+    // The resolver's monitor sees the server-side change — poll the
+    // monitor-backed cache until the write propagates back.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if LinkSet::get_value(&resolver, "CALINK:OUT:DST").and_then(|v| v.to_f64()) == Some(88.0) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CA-link OUT write did not propagate to the resolver cache"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Independent confirmation: a fresh CA client GET against the
+    // upstream server reads the written value — the write reached the
+    // server, not merely the resolver's local cache.
+    let verify_client = pinned_client(port).await;
+    let ch = verify_client.create_channel("CALINK:OUT:DST");
+    ch.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("verify channel connects");
+    let (_dbf, read_back) = ch.get().await.expect("verify GET");
+    assert_eq!(
+        read_back.to_f64(),
+        Some(88.0),
+        "upstream CA server PV must reflect the OUT-link write"
+    );
+}
+
+/// Gap 2 OUT write — the `ca://` scheme-prefixed form of an OUT link
+/// is accepted by `put_value` (the resolver strips the prefix), same
+/// as the INP-side `ca_link_resolves_with_scheme_prefix` test.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn ca_link_out_write_accepts_scheme_prefix() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .pv("CALINK:OUT:SCHEME", EpicsValue::Long(7))
+        .build()
+        .await
+        .expect("CA server");
+    let _server = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let client = Arc::new(pinned_client(port).await);
+    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+
+    let connected = resolver
+        .wait_for_link_connected("ca://CALINK:OUT:SCHEME", Duration::from_secs(5))
+        .await;
+    assert!(connected, "scheme-prefixed CA OUT link must connect");
+
+    use epics_base_rs::server::database::LinkSet;
+    LinkSet::put_value(&resolver, "ca://CALINK:OUT:SCHEME", EpicsValue::Long(123))
+        .expect("scheme-prefixed CA-link OUT write must succeed");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if LinkSet::get_value(&resolver, "ca://CALINK:OUT:SCHEME").and_then(|v| v.to_f64())
+            == Some(123.0)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scheme-prefixed CA OUT write did not propagate"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// `install_calink_resolver` registers under the `ca` scheme so the
 /// database's `registered_link_schemes` reports it.
 #[tokio::test(flavor = "multi_thread")]

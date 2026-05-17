@@ -2214,7 +2214,7 @@ mod tests {
             enable_ipv6_udp: true,
             ..Default::default()
         };
-        let server = PvaServer::start(source, config);
+        let server = PvaServer::start(source, config).expect("test server must start");
         let server_tcp_port = server.report().tcp_port;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(

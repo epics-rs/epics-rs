@@ -83,7 +83,7 @@ async fn pvget_typed_against_local_server() {
     });
     let source = SharedSource::new();
     source.add("MOTOR:VAL", pv);
-    let _server = PvaServer::isolated(Arc::new(source));
+    let _server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = _server.client_config();
     let _ = &_server;
 
@@ -173,7 +173,7 @@ async fn pvget_typed_primitive_f64() {
     pv.open(f64::descriptor(), f64::to_pv_field(&7.5));
     let source = SharedSource::new();
     source.add("OVEN:TEMP", pv);
-    let _server = PvaServer::isolated(Arc::new(source));
+    let _server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = _server.client_config();
 
     let temp: f64 = tokio::time::timeout(

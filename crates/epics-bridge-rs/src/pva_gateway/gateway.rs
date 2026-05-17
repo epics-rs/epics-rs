@@ -287,9 +287,9 @@ impl PvaGateway {
                 composite
                     .add_source("gateway", Arc::new(layered) as DynSource, 0)
                     .map_err(|e| GwError::Other(format!("gateway source registration: {e}")))?;
-                Ok(PvaServer::start(composite, server_config))
+                Ok(PvaServer::start(composite, server_config)?)
             }
-            _ => Ok(PvaServer::start(Arc::new(layered), server_config)),
+            _ => Ok(PvaServer::start(Arc::new(layered), server_config)?),
         }
     }
 
@@ -297,15 +297,15 @@ impl PvaGateway {
     /// ports. Mirrors `PvaServer::isolated` semantics — useful for
     /// in-process tests where the gateway should not interact with
     /// the real network.
-    pub fn isolated(client: Arc<PvaClient>) -> Self {
+    pub fn isolated(client: Arc<PvaClient>) -> GwResult<Self> {
         let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
         let source = GatewayChannelSource::new(cache.clone());
-        let server = PvaServer::isolated(Arc::new(source.clone()));
-        Self {
+        let server = PvaServer::isolated(Arc::new(source.clone()))?;
+        Ok(Self {
             cache,
             server,
             source,
-        }
+        })
     }
 
     /// Cache handle for diagnostics / iocsh `gwstats`.

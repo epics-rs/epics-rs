@@ -89,7 +89,7 @@ async fn pva_server_stop_ends_listener() {
         udp_port: udp,
         ..Default::default()
     };
-    let server = PvaServer::start(Arc::new(ConstSource), cfg);
+    let server = PvaServer::start(Arc::new(ConstSource), cfg).expect("test server must start");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Healthy server: pvget succeeds.
@@ -130,7 +130,7 @@ async fn pva_client_close_then_reuse_succeeds() {
         udp_port: udp,
         ..Default::default()
     };
-    let server = PvaServer::start(Arc::new(ConstSource), cfg);
+    let server = PvaServer::start(Arc::new(ConstSource), cfg).expect("test server must start");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);

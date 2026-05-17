@@ -659,16 +659,18 @@ impl PortDriver for ModbusPortDriver {
         let limit = self.engine.config().length;
         let rc = dt.register_count().max(1);
         let mut regs = Vec::new();
-        let mut out_index = 0usize;
+        // C `writeInt32Array` (drvModbusAsyn.cpp:1373-1417) converts inside
+        // `for (i=0; i<maxChans && outIndex<modbusLength_; i++)`. The loop
+        // guard `outIndex < modbusLength_` is tested at element start, so an
+        // element is emitted whole (full `register_count` registers) only
+        // while `outIndex < modbusLength_`; once `outIndex` reaches
+        // `modbusLength_` the conversion stops, truncating the record array
+        // on the wire. `outIndex` is initialized to `0` in absolute mode and
+        // to the record's register `offset` in relative mode
+        // (drvModbusAsyn.cpp:1388-1396) — so the clamp applies in BOTH modes.
+        let mut out_index = if absolute { 0usize } else { user.addr as usize };
         for &v in data {
-            // Absolute mode: C `writeInt32Array` (drvModbusAsyn.cpp:1412-1417)
-            // converts inside `for (i=0; i<maxChans && outIndex<modbusLength_;
-            // i++)`. The loop guard is tested at element start, so an element
-            // is emitted whole (full `register_count` registers) only while
-            // `outIndex < modbusLength_`; once `outIndex` reaches
-            // `modbusLength_` the conversion stops, truncating the record
-            // array on the wire. Relative mode keeps the full array.
-            if absolute && out_index >= limit {
+            if out_index >= limit {
                 break;
             }
             regs.extend(datatype::write_int32(dt, v).map_err(to_asyn)?);
@@ -686,13 +688,16 @@ impl PortDriver for ModbusPortDriver {
         let limit = self.engine.config().length;
         let rc = dt.register_count().max(1);
         let mut regs = Vec::new();
-        let mut out_index = 0usize;
+        // C `writeFloat64Array` (drvModbusAsyn.cpp:1203-1247) converts inside
+        // `for (i=0; i<maxChans && outIndex<modbusLength_; i++)` — same
+        // `outIndex < modbusLength_` cap as `writeInt32Array`; whole elements
+        // only, truncated at `modbusLength_`. `outIndex` starts at `0` in
+        // absolute mode and at the record's register `offset` in relative
+        // mode (drvModbusAsyn.cpp:1218-1226), so the clamp applies in BOTH
+        // modes.
+        let mut out_index = if absolute { 0usize } else { user.addr as usize };
         for &v in data {
-            // Absolute mode: C `writeFloat64Array` (drvModbusAsyn.cpp:1242-1247)
-            // converts inside `for (i=0; i<maxChans && outIndex<modbusLength_;
-            // i++)` — same `outIndex < modbusLength_` cap as `writeInt32Array`
-            // above; whole elements only, truncated at `modbusLength_`.
-            if absolute && out_index >= limit {
+            if out_index >= limit {
                 break;
             }
             regs.extend(datatype::write_float(dt, v).map_err(to_asyn)?);
@@ -1494,6 +1499,107 @@ mod tests {
         // so the frame ends at 13 + 16 = 29 bytes.
         assert_eq!(frames[0][12], 0x10, "byte count must be 16 (8 registers)");
         assert_eq!(frames[0].len(), 29, "frame carries only 8 registers");
+    }
+
+    /// Relative-mode `write_int32_array` with `offset + total_registers >
+    /// config.length`: C `writeInt32Array` (drvModbusAsyn.cpp:1392-1396)
+    /// initializes `outIndex = offset` in relative mode, then the conversion
+    /// loop `for (i=0; i<maxChans && outIndex<modbusLength_; i++)`
+    /// (drvModbusAsyn.cpp:1412-1417) caps the on-wire write at
+    /// `modbusLength_`. With INT32 (2 registers per element),
+    /// `config.length` 6 and record `addr` 3, `outIndex` starts at 3:
+    /// element 0 starts at 3 (< 6) -> whole, outIndex 5; element 1 starts at
+    /// 5 (< 6) -> whole, outIndex 7; element 2 starts at 7 (>= 6) -> loop
+    /// stops. A 5-element record array writes exactly 2 whole elements =
+    /// 4 registers, not all 10.
+    #[test]
+    fn relative_write_int32_array_request_clamps_to_modbus_length() {
+        // WriteMultipleRegisters echo response: slave, fc 0x10, address 3,
+        // quantity (4 registers).
+        let pdu = [0x01u8, 0x10, 0x00, 0x03, 0x00, 0x04];
+        let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
+        let written = transport.written_handle();
+        // Relative mode (start_address >= 0), config.length 6 registers.
+        let mut cfg = test_config(0, 6);
+        cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
+        let mut driver = ModbusPortDriver::new(
+            "MB_REL_WI32ARR_LEN",
+            cfg,
+            LinkType::Tcp,
+            Box::new(transport),
+        )
+        .expect("relative config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Be.as_str())
+            .expect("INT32_BE parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 3;
+        // 5 INT32 elements = 10 registers; from outIndex 3 only 2 whole
+        // elements (4 registers) fit before outIndex reaches config.length 6.
+        let data = [1i32, 2, 3, 4, 5];
+        driver
+            .write_int32_array(&user, &data)
+            .expect("relative int32-array write must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 1, "exactly one relative write request");
+        // TCP frame: 7-byte MBAP, then PDU [unit, fc=0x10, addr_hi, addr_lo,
+        // qty_hi, qty_lo, byte_count, data...]. Wire address = start_address
+        // (0) + offset (3) = 3; quantity must be 4 registers.
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x10, 0x00, 0x03, 0x00, 0x04],
+            "on-wire register count must be capped at config.length - offset"
+        );
+        assert_eq!(frames[0][12], 0x08, "byte count must be 8 (4 registers)");
+        assert_eq!(frames[0].len(), 21, "frame carries only 4 registers");
+    }
+
+    /// Relative-mode `write_float64_array` with `offset + total_registers >
+    /// config.length`: C `writeFloat64Array` (drvModbusAsyn.cpp:1222-1226)
+    /// initializes `outIndex = offset` in relative mode; the loop
+    /// `for (i=0; i<maxChans && outIndex<modbusLength_; i++)`
+    /// (drvModbusAsyn.cpp:1242-1247) caps the wire write. FLOAT64 is 4
+    /// registers per element. With `config.length` 6 and record `addr` 3,
+    /// `outIndex` starts at 3: element 0 starts at 3 (< 6) -> whole, outIndex
+    /// 7; element 1 starts at 7 (>= 6) -> loop stops. A 3-element record
+    /// array writes exactly 1 whole element = 4 registers.
+    #[test]
+    fn relative_write_float64_array_request_clamps_to_modbus_length() {
+        // WriteMultipleRegisters echo response: 4 registers at address 3.
+        let pdu = [0x01u8, 0x10, 0x00, 0x03, 0x00, 0x04];
+        let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(0, 6);
+        cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
+        let mut driver = ModbusPortDriver::new(
+            "MB_REL_WF64ARR_LEN",
+            cfg,
+            LinkType::Tcp,
+            Box::new(transport),
+        )
+        .expect("relative config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Float64Le.as_str())
+            .expect("FLOAT64_LE parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 3;
+        // 3 FLOAT64 elements = 12 registers; from outIndex 3 only 1 whole
+        // element (4 registers) fits before outIndex reaches config.length 6.
+        let data = [1.0f64, 2.0, 3.0];
+        driver
+            .write_float64_array(&user, &data)
+            .expect("relative float64-array write must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 1, "exactly one relative write request");
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x10, 0x00, 0x03, 0x00, 0x04],
+            "on-wire register count must be 1 whole FLOAT64 element = 4"
+        );
+        assert_eq!(frames[0][12], 0x08, "byte count must be 8 (4 registers)");
+        assert_eq!(frames[0].len(), 21, "frame carries only 4 registers");
     }
 
     /// An `addr` beyond `config.length` must yield a clean error from the

@@ -238,6 +238,81 @@ fn test_no_limits_when_equal() {
     assert_eq!(rec.drvls, 0); // Normal
 }
 
+/// Regression for BUG 2 — throttle queued values bypassed drive-limit
+/// checking. A value arriving DURING the delay window was stored RAW in
+/// `pending_value` and the drain path sent it directly via `send_value`,
+/// so DRVLH/DRVLL clipping (DRVLC) and DRVLS were never applied — an
+/// out-of-range value reached OUT unclamped. The drain path must route
+/// `pending_value` through `check_limits` like the normal path.
+#[test]
+fn test_pending_value_clamped_to_drive_limit_on_drain() {
+    let mut rec = ThrottleRecord::default();
+    rec.drvlh = 100.0;
+    rec.drvll = 0.0;
+    rec.drvlc = 1; // Clipping ON
+    rec.dly = 0.05; // short delay so the drain is observable in-test
+    rec.init_record(1).unwrap();
+
+    // First (in-range) value: sent immediately, delay window opens.
+    rec.val = 50.0;
+    rec.process().unwrap();
+    assert_eq!(rec.sent, 50.0);
+    assert_eq!(rec.wait, 1);
+
+    // Out-of-range value arrives DURING the delay window — queued RAW.
+    rec.val = 150.0;
+    rec.process().unwrap();
+    assert_eq!(rec.sent, 50.0, "queued value must not be sent yet");
+
+    // Wait past the delay, then reprocess to drain the queued value.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let outcome = rec.process().unwrap();
+
+    // The drained value must be CLAMPED to DRVLH, not the raw 150.0.
+    assert_eq!(rec.sent, 100.0, "drained value must be clamped to DRVLH");
+    assert_eq!(rec.drvls, 2, "DRVLS must report High limit");
+    let written = outcome.actions.iter().find_map(|a| match a {
+        ProcessAction::WriteDbLink { value, .. } => Some(value),
+        _ => None,
+    });
+    assert_eq!(
+        written,
+        Some(&EpicsValue::Double(100.0)),
+        "value written to OUT must be the clamped 100.0, not raw 150.0"
+    );
+}
+
+/// Regression for BUG 2 — drain-path rejection. With clipping OFF, an
+/// out-of-range value queued during the delay window must be rejected
+/// (STS=Error, nothing sent), matching the normal-path rejection branch.
+#[test]
+fn test_pending_value_rejected_on_drain_when_clipping_off() {
+    let mut rec = ThrottleRecord::default();
+    rec.drvlh = 100.0;
+    rec.drvll = 0.0;
+    rec.drvlc = 0; // Clipping OFF → reject out-of-range
+    rec.dly = 0.05;
+    rec.init_record(1).unwrap();
+
+    rec.val = 50.0;
+    rec.process().unwrap();
+    assert_eq!(rec.sent, 50.0);
+
+    rec.val = 150.0; // out of range, queued during delay
+    rec.process().unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let outcome = rec.process().unwrap();
+
+    assert_eq!(rec.sent, 50.0, "rejected value must not reach OUT");
+    assert_eq!(rec.sts, 1, "STS must report Error for a rejected drain");
+    let has_write = outcome
+        .actions
+        .iter()
+        .any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
+    assert!(!has_write, "rejected drain must not write to OUT");
+}
+
 // ============================================================
 // special() handler
 // ============================================================

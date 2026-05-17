@@ -287,22 +287,36 @@ impl Record for ThrottleRecord {
                 self.delay_active = false;
                 self.wait = 0;
                 if let Some(pv) = self.pending_value.take() {
-                    self.send_value(pv);
-                    actions.push(ProcessAction::WriteDbLink {
-                        link_field: "OUT",
-                        value: EpicsValue::Double(self.sent),
-                    });
-                    // More values may have queued; start a new delay cycle
-                    if self.dly > 0.0 {
-                        self.delay_active = true;
-                        self.wait = 1;
-                        let delay = std::time::Duration::from_secs_f64(self.dly);
-                        actions.push(ProcessAction::ReprocessAfter(delay));
-                        return Ok(ProcessOutcome {
-                            result: RecordProcessResult::Complete,
-                            actions,
-                            device_did_compute: false,
-                        });
+                    // A value queued during the delay window was stored RAW;
+                    // it must pass the same DRVLH/DRVLL/DRVLC/DRVLS drive-limit
+                    // checking the normal path applies before `send_value`,
+                    // otherwise an out-of-range value reaches OUT unclamped.
+                    match self.check_limits(pv) {
+                        Ok(clamped) => {
+                            self.send_value(clamped);
+                            actions.push(ProcessAction::WriteDbLink {
+                                link_field: "OUT",
+                                value: EpicsValue::Double(self.sent),
+                            });
+                            // More values may have queued; start a new delay cycle
+                            if self.dly > 0.0 {
+                                self.delay_active = true;
+                                self.wait = 1;
+                                let delay = std::time::Duration::from_secs_f64(self.dly);
+                                actions.push(ProcessAction::ReprocessAfter(delay));
+                                return Ok(ProcessOutcome {
+                                    result: RecordProcessResult::Complete,
+                                    actions,
+                                    device_did_compute: false,
+                                });
+                            }
+                        }
+                        Err(()) => {
+                            // Out-of-range with clipping off — reject the queued
+                            // value, mark error, send nothing. Same as the
+                            // normal-path rejection branch.
+                            self.sts = 1; // Error
+                        }
                     }
                 }
                 return Ok(ProcessOutcome::complete_with(actions));

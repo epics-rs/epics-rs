@@ -137,9 +137,10 @@ fn test_check_alarms_hihi() {
     rec.val = 105.0;
     let alarm = rec.check_alarms();
     assert!(alarm.is_some());
-    let (status, severity) = alarm.unwrap();
+    let (status, severity, alev) = alarm.unwrap();
     assert_eq!(status, alarm_status::HIHI_ALARM);
     assert_eq!(severity, AlarmSeverity::Major);
+    assert_eq!(alev, 100.0);
 }
 
 #[test]
@@ -150,9 +151,10 @@ fn test_check_alarms_lolo() {
     rec.val = 5.0;
     let alarm = rec.check_alarms();
     assert!(alarm.is_some());
-    let (status, severity) = alarm.unwrap();
+    let (status, severity, alev) = alarm.unwrap();
     assert_eq!(status, alarm_status::LOLO_ALARM);
     assert_eq!(severity, AlarmSeverity::Major);
+    assert_eq!(alev, 10.0);
 }
 
 #[test]
@@ -178,9 +180,11 @@ fn test_check_alarms_hysteresis() {
     rec.hhsv = 2;
     rec.hyst = 5.0;
 
-    // First alarm triggers at 100
+    // First alarm triggers at 100. The trait hook commits LALM to the
+    // alarmed threshold only after `recGblSetSevr` raises the severity.
     rec.val = 100.0;
-    rec.check_alarms();
+    let mut common = CommonFields::default();
+    Record::check_alarms(&mut rec, &mut common);
     assert_eq!(rec.lalm, 100.0);
 
     // Value drops but still within hysteresis band
@@ -192,6 +196,47 @@ fn test_check_alarms_hysteresis() {
     rec.val = 94.0;
     let alarm = rec.check_alarms();
     assert!(alarm.is_none(), "Should clear alarm below hysteresis band");
+}
+
+/// Regression: C `aiRecord.c:403-406` gates `prec->lalm = alev` on
+/// `recGblSetSevr` actually raising the severity. A lower-severity epid
+/// alarm that loses to an already-higher pending severity must NOT
+/// advance LALM — otherwise the hysteresis band silently re-bases.
+#[test]
+fn test_check_alarms_lalm_gated_on_severity_raise() {
+    let mut rec = EpidRecord::default();
+    rec.high = 80.0;
+    rec.hsv = 1; // MINOR
+    rec.val = 85.0;
+    let lalm_before = rec.lalm;
+
+    let mut common = CommonFields::default();
+    // Pre-seed a higher pending severity, as an upstream MS link would.
+    common.nsev = AlarmSeverity::Invalid;
+    common.nsta = alarm_status::COMM_ALARM;
+
+    Record::check_alarms(&mut rec, &mut common);
+
+    // The HIGH alarm lost the maximize-severity race, so it raised
+    // nothing — LALM must stay where it was.
+    assert_eq!(common.nsev, AlarmSeverity::Invalid);
+    assert_eq!(
+        rec.lalm, lalm_before,
+        "LALM must not advance when the alarm did not raise the severity"
+    );
+
+    // A HIGH alarm that DOES raise the severity advances LALM to HIGH.
+    let mut rec = EpidRecord::default();
+    rec.high = 80.0;
+    rec.hsv = 1; // MINOR
+    rec.val = 85.0;
+    let mut common = CommonFields::default();
+    Record::check_alarms(&mut rec, &mut common);
+    assert_eq!(common.nsev, AlarmSeverity::Minor);
+    assert_eq!(
+        rec.lalm, 80.0,
+        "LALM must advance to the alarmed threshold when the severity was raised"
+    );
 }
 
 /// Regression: the `Record::check_alarms` trait hook (the one the
@@ -491,6 +536,57 @@ fn test_pid_bumpless_turn_on() {
         (rec.i - 42.0).abs() < 1e-6,
         "I should be set to OVAL on bumpless turn-on, got {}",
         rec.i
+    );
+}
+
+/// Regression for BUG 1 — epid_soft.rs MaxMin-mode error.
+///
+/// `do_pid` captured the previous controlled value from `epid.cval`, the
+/// SAME field as the current `cval`, so `e = cval - pcval` was identically
+/// 0.0 and the sign-detection block degenerated: the output step had a
+/// fixed sign regardless of which way CVAL actually moved. The previous
+/// controlled value is `epid.cvlp` (maintained by `update_monitors`).
+///
+/// With the fix, a CVAL that moved UP vs a CVAL that moved DOWN must
+/// produce output steps of OPPOSITE sign.
+#[test]
+fn test_maxmin_error_uses_cvlp_previous_value() {
+    // Helper: one MaxMin cycle. cvlp = previous CVAL, cval = current.
+    fn one_cycle(cvlp: f64, cval: f64) -> f64 {
+        let mut rec = EpidRecord::default();
+        rec.fmod = 1; // MaxMin
+        rec.kp = 1.0;
+        rec.fbon = 1;
+        rec.fbop = 1; // already on — exercises the e = cval - pcval path
+        rec.d = 1.0; // previous d > 0 → base sign +1
+        rec.drvh = 1000.0;
+        rec.drvl = -1000.0;
+        rec.mdt = 0.0;
+        rec.oval = 0.0;
+        rec.cvlp = cvlp; // previous controlled value
+        rec.cval = cval; // current controlled value
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        EpidSoftDeviceSupport::do_pid(&mut rec);
+        rec.oval
+    }
+
+    // CVAL moved UP (e = +10 > 0, kp > 0): sign stays +1 → output step +kp.
+    let oval_up = one_cycle(100.0, 110.0);
+    // CVAL moved DOWN (e = -10 < 0, kp > 0): sign flips → output step -kp.
+    let oval_down = one_cycle(100.0, 90.0);
+
+    assert!(
+        oval_up > 0.0,
+        "CVAL rising should drive output step positive, got {oval_up}"
+    );
+    assert!(
+        oval_down < 0.0,
+        "CVAL falling should drive output step negative, got {oval_down}"
+    );
+    assert_ne!(
+        oval_up.signum(),
+        oval_down.signum(),
+        "output step sign must depend on CVAL movement direction (non-zero error)"
     );
 }
 

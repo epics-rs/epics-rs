@@ -35,7 +35,14 @@ impl EpidSoftDeviceSupport {
     /// Execute the PID algorithm on the epid record.
     /// This is the core computation, equivalent to `do_pid()` in devEpidSoft.c.
     pub fn do_pid(epid: &mut EpidRecord) {
-        let pcval = epid.cval;
+        // Previous controlled value: CVLP, maintained by
+        // `EpidRecord::update_monitors()` (`epid.rs` — `self.cvlp = self.cval`).
+        // The MaxMin sign-detection in `fmod==1` needs the value from the
+        // *previous* cycle, not the current CVAL. Reading `epid.cval` for
+        // both would make `e = cval - pcval` identically 0.0. This matches
+        // the in-tree fast path `epid_fast.rs` which uses `pcval = self.cval`
+        // captured before `self.cval = cval`.
+        let pcval = epid.cvlp;
         let setp = epid.val;
         let cval = epid.cval;
 
@@ -57,12 +64,19 @@ impl EpidSoftDeviceSupport {
         let mut p = epid.p;
         let mut i = epid.i;
         let mut d = epid.d;
-        let mut e = 0.0;
+        // ERR (deviation error) is a PID-mode concept. `None` means "leave
+        // the record's ERR field untouched"; it is only `Some` in PID mode.
+        // In MaxMin mode the algorithm derives the output-step sign from the
+        // CVAL delta but does not produce a deviation error, so ERR must not
+        // be clobbered to 0.0. This mirrors `epid_fast.rs`, whose MaxMin path
+        // never assigns `self.err`.
+        let mut err_update: Option<f64> = None;
 
         match epid.fmod {
             0 => {
                 // PID mode
-                e = setp - cval;
+                let e = setp - cval;
+                err_update = Some(e);
                 let de = e - ep;
                 p = kp * e;
 
@@ -108,7 +122,7 @@ impl EpidSoftDeviceSupport {
                         // Set output to current value (bumpless).
                         oval = epid.oval;
                     } else {
-                        e = cval - pcval;
+                        let e = cval - pcval;
                         let sign = if d > 0.0 { 1.0 } else { -1.0 };
                         let sign = if (kp > 0.0 && e < 0.0) || (kp < 0.0 && e > 0.0) {
                             -sign
@@ -136,7 +150,11 @@ impl EpidSoftDeviceSupport {
         // Update record fields
         epid.ct = ct;
         epid.dt = dt;
-        epid.err = e;
+        // Only PID mode produces a deviation error; MaxMin and invalid modes
+        // leave ERR as it was so a read-back is not clobbered to 0.0.
+        if let Some(e) = err_update {
+            epid.err = e;
+        }
         epid.cval = cval;
 
         // Apply output deadband

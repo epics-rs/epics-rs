@@ -236,60 +236,64 @@ impl EpidRecord {
     /// which mirrors `aiRecord.c::checkAlarms` — per-level hysteresis
     /// against VAL with `lalm` tracking the last-alarmed threshold.
     ///
-    /// Returns `Some((stat, sevr))` where `stat` is the canonical
+    /// Returns `Some((stat, sevr, alev))` where `stat` is the canonical
     /// `epicsAlarmCondition` status code (`HIHI_ALARM`, `HIGH_ALARM`,
-    /// `LOLO_ALARM`, `LOW_ALARM`) and `sevr` the configured severity.
-    /// Returns `None` when VAL is inside the (hysteresis-adjusted)
-    /// limits. Updates `lalm` to the alarmed threshold (or to VAL when
-    /// no alarm is active) so a held value does not re-fire and so the
-    /// hysteresis band is honoured on the next cycle.
+    /// `LOLO_ALARM`, `LOW_ALARM`), `sevr` the configured severity, and
+    /// `alev` the threshold that fired (the candidate `lalm` value).
+    /// Returns `None` when VAL is inside the (hysteresis-adjusted) limits.
     ///
-    /// The framework applies the result to the record's SEVR/STAT via
-    /// the [`Record::check_alarms`] trait hook below; this inherent
-    /// method only computes the decision so it can also be unit-tested
-    /// in isolation.
-    pub fn check_alarms(&mut self) -> Option<(u16, AlarmSeverity)> {
+    /// `lalm` (last-alarmed threshold) is committed by the caller, NOT
+    /// here, for the alarm case. C `aiRecord.c:403-406` gates the `lalm`
+    /// update on `recGblSetSevr` actually raising the severity:
+    /// `if (recGblSetSevr(...)) prec->lalm = alev;`. A lower-severity
+    /// alarm that loses to an already-higher pending severity must NOT
+    /// advance `lalm`, or the hysteresis band would be silently re-based.
+    /// The [`Record::check_alarms`] trait hook below performs that gate.
+    ///
+    /// The no-alarm case writes `lalm = val` here unconditionally,
+    /// matching C `aiRecord.c:409` (`prec->lalm = val;` — not gated).
+    pub fn check_alarms(&mut self) -> Option<(u16, AlarmSeverity, f64)> {
         let val = self.val;
         let hyst = self.hyst;
         let lalm = self.lalm;
 
         // HIHI alarm
         if self.hhsv != 0 && (val >= self.hihi || (lalm == self.hihi && val >= self.hihi - hyst)) {
-            self.lalm = self.hihi;
             return Some((
                 alarm_status::HIHI_ALARM,
                 AlarmSeverity::from_u16(self.hhsv as u16),
+                self.hihi,
             ));
         }
 
         // LOLO alarm
         if self.llsv != 0 && (val <= self.lolo || (lalm == self.lolo && val <= self.lolo + hyst)) {
-            self.lalm = self.lolo;
             return Some((
                 alarm_status::LOLO_ALARM,
                 AlarmSeverity::from_u16(self.llsv as u16),
+                self.lolo,
             ));
         }
 
         // HIGH alarm
         if self.hsv != 0 && (val >= self.high || (lalm == self.high && val >= self.high - hyst)) {
-            self.lalm = self.high;
             return Some((
                 alarm_status::HIGH_ALARM,
                 AlarmSeverity::from_u16(self.hsv as u16),
+                self.high,
             ));
         }
 
         // LOW alarm
         if self.lsv != 0 && (val <= self.low || (lalm == self.low && val <= self.low + hyst)) {
-            self.lalm = self.low;
             return Some((
                 alarm_status::LOW_ALARM,
                 AlarmSeverity::from_u16(self.lsv as u16),
+                self.low,
             ));
         }
 
-        // No alarm
+        // No alarm — C `aiRecord.c:409` resets LALM to VAL unconditionally.
         self.lalm = val;
         None
     }
@@ -616,8 +620,17 @@ impl Record for EpidRecord {
     /// that stays inside the limits leaves the record un-alarmed and a
     /// held value does not re-fire.
     fn check_alarms(&mut self, common: &mut CommonFields) {
-        if let Some((stat, sevr)) = EpidRecord::check_alarms(self) {
+        if let Some((stat, sevr, alev)) = EpidRecord::check_alarms(self) {
+            // C `aiRecord.c:403-406`: `if (recGblSetSevr(...)) prec->lalm = alev;`
+            // — the LALM update is gated on `recGblSetSevr` returning TRUE,
+            // i.e. on the alarm actually raising the pending severity.
+            // `rec_gbl_set_sevr` is raise-only and returns nothing, so detect
+            // the raise by observing whether `nsev` increased across the call.
+            let before = common.nsev;
             recgbl::rec_gbl_set_sevr(common, stat, sevr);
+            if common.nsev != before {
+                self.lalm = alev;
+            }
         }
     }
 

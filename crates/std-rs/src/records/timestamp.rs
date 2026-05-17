@@ -138,7 +138,10 @@ impl Record for TimestampRecord {
             },
             "TST" => match value {
                 EpicsValue::Short(v) => {
-                    self.tst = v;
+                    // TST selects a format index 0..=10; clamp on write so a
+                    // read-back reflects the value actually used by
+                    // `format_timestamp` (which clamps locally).
+                    self.tst = v.clamp(0, 10);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

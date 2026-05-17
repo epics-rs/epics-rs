@@ -387,6 +387,40 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    /// Resolve the matched inner source, re-check WRITE through its
+    /// gate, then forward to its `put_delta_checked` — so a composite
+    /// over a `SharedSource` still gets the atomic read-merge-write
+    /// (no TOCTOU lost update). Without this override the default
+    /// trait impl would merge against `CompositeSource::get_value`
+    /// and forward through `CompositeSource::put_value_checked` as
+    /// two un-serialized ops, defeating the inner source's atomic
+    /// `put_delta` primitive.
+    fn put_delta_checked(
+        &self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv(&name).await {
+                    let inner_checked = src
+                        .access_gate()
+                        .check(&name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
+                        .await;
+                    return src
+                        .put_delta_checked(inner_checked, desc, changed, delta, ctx)
+                        .await;
+                }
+            }
+            Err(format!("no source serves '{name}'"))
+        }
+    }
+
     fn subscribe_checked(
         &self,
         checked: AccessChecked,

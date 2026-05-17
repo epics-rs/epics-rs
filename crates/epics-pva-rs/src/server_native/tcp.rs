@@ -30,7 +30,7 @@ use crate::proto::{
 };
 use crate::pvdata::encode::{
     EncodeTypeCache, decode_pv_field, decode_pv_field_with_bitset, decode_type_desc,
-    encode_pv_field, encode_type_desc, encode_type_desc_cached, fill_unmarked_from_prior,
+    encode_pv_field, encode_type_desc, encode_type_desc_cached,
 };
 use crate::pvdata::{FieldDesc, PvField};
 
@@ -1413,13 +1413,6 @@ async fn handle_put_get(
     let changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
     let put_delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)
         .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
-    // Merge the delta over the PV's current value so unmarked fields
-    // keep their existing state instead of being clobbered with
-    // type defaults (`put_value` replaces the whole PvField).
-    let put_value = match source.get_value(&pv_name).await {
-        Some(prior) => fill_unmarked_from_prior(&intro, &changed, 0, put_delta, &prior),
-        None => put_delta,
-    };
 
     let ctx = crate::server_native::source::ChannelContext {
         peer,
@@ -1433,7 +1426,12 @@ async fn handle_put_get(
     payload.put_u32(ioid, order);
     payload.put_u8(subcmd);
 
-    // PUT leg — WRITE-gated.
+    // PUT leg — WRITE-gated. The wire delta carries only the marked
+    // fields; applying it is a read-merge-write against the PV's
+    // current value. `put_delta_checked` performs the merge
+    // atomically under the source's lock so two concurrent partial
+    // PUT_GETs with disjoint changed-fields cannot both read the
+    // same prior and lose the first writer's fields.
     let put_result = {
         let checked = source
             .access_gate()
@@ -1446,7 +1444,7 @@ async fn handle_put_get(
             )
             .await;
         source
-            .put_value_checked(checked, put_value, ctx.clone())
+            .put_delta_checked(checked, intro.clone(), changed, put_delta, ctx.clone())
             .await
     };
     if let Err(msg) = put_result {
@@ -1464,7 +1462,13 @@ async fn handle_put_get(
     // gets an OK status, just an empty (zero-field) readback bitset.
     let read_checked = source
         .access_gate()
-        .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+        .check(
+            &pv_name,
+            &ctx.host,
+            &ctx.account,
+            &ctx.method,
+            &ctx.authority,
+        )
         .await;
     match source.get_value_checked(read_checked, ctx).await {
         Some(v) => {
@@ -1601,7 +1605,13 @@ async fn handle_process(
     let result = {
         let checked = source
             .access_gate()
-            .check(&pv_name, &ctx.host, &ctx.account, &ctx.method, "")
+            .check(
+                &pv_name,
+                &ctx.host,
+                &ctx.account,
+                &ctx.method,
+                &ctx.authority,
+            )
             .await;
         source.process_checked(checked, ctx).await
     };
@@ -2219,17 +2229,8 @@ async fn handle_op(
             let delta = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order)
                 .map_err(|e| PvaError::Decode(format!("PUT requires a value payload: {e}")))?;
             let pv_name = ch.name.clone();
-            // The wire delta only carries marked fields; unmarked
-            // fields decoded as type defaults. `put_value` replaces
-            // the whole PvField, so merge the delta over the PV's
-            // current value — unmarked fields keep their existing
-            // state instead of being clobbered with defaults.
-            let value = match source.get_value(&pv_name).await {
-                Some(prior) => fill_unmarked_from_prior(&intro, &changed, 0, delta, &prior),
-                None => delta,
-            };
             // Round 42: type-state PUT gate. The token's
-            // `allows_write()` is checked by `put_value_checked`;
+            // `allows_write()` is checked by `put_delta_checked`;
             // adding a new PUT-equivalent handler without taking a
             // token through `source.access().check(...)` is a compile
             // error on the trait method signature.
@@ -2241,6 +2242,15 @@ async fn handle_op(
                 authority: cred.authority.clone(),
             };
 
+            // The wire delta carries only marked fields; unmarked
+            // fields decoded as type defaults. Applying it is a
+            // read-merge-write against the PV's current value.
+            // `put_delta_checked` performs that merge atomically
+            // under the source's lock — doing `get_value` then
+            // `put_value` as two ops opens a TOCTOU lost-update
+            // window where two concurrent partial PUTs with disjoint
+            // changed-fields both read the same prior and the second
+            // write drops the first's fields.
             let result = {
                 let checked = source
                     .access_gate()
@@ -2252,7 +2262,9 @@ async fn handle_op(
                         &ctx.authority,
                     )
                     .await;
-                source.put_value_checked(checked, value, ctx.clone()).await
+                source
+                    .put_delta_checked(checked, intro.clone(), changed.clone(), delta, ctx.clone())
+                    .await
             };
 
             let mut payload = Vec::new();
@@ -3914,6 +3926,444 @@ mod tests {
             (10, 20, 77),
             "PUT_GET readback must carry the merged value"
         );
+    }
+
+    /// Regression (Defect 2): concurrent BitSet-delta PUTs with
+    /// DISJOINT changed-fields must not lose updates.
+    ///
+    /// The server PUT path is a read-merge-write: read the PV's
+    /// prior complete value, overlay the marked fields from the wire
+    /// delta, store the merged result. Done as separate `get_value`
+    /// + `put_value` ops, two concurrent partial PUTs from different
+    /// connections to the same PV can both read the same `prior`;
+    /// the second write then overwrites the first writer's fields
+    /// with the prior's (unchanged) value — a silent lost update.
+    ///
+    /// `put_delta_checked` (→ `SharedPV::put_delta`) closes the
+    /// window by performing read + merge + store under a single
+    /// mutex acquisition. Here writer A changes field `a`, writer B
+    /// changes field `c`; with the atomic merge BOTH must survive
+    /// regardless of interleaving. Before the fix the second writer
+    /// to commit clobbers the first's field.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_disjoint_delta_puts_do_not_lose_updates() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::shared_pv::SharedPV;
+        use crate::server_native::source::{ChannelContext, ChannelSource};
+        use std::sync::Arc;
+
+        let intro = three_field_intro();
+
+        // Run many trials to give the scheduler a chance to surface
+        // any residual interleaving race.
+        for trial in 0..200 {
+            let pv = SharedPV::new();
+            pv.open(intro.clone(), three_field_value(0, 0, 0));
+            let shared = SharedSource::new();
+            shared.add("dut", pv);
+            let source = Arc::new(shared);
+
+            let bit_a = intro.bit_for_path("a").expect("a has a bit");
+            let bit_c = intro.bit_for_path("c").expect("c has a bit");
+
+            // Writer A: only field `a` (bit 1) → 111.
+            let mut changed_a = BitSet::new();
+            changed_a.set(bit_a);
+            let delta_a = three_field_value(111, 0, 0);
+
+            // Writer B: only field `c` (bit 3) → 333.
+            let mut changed_c = BitSet::new();
+            changed_c.set(bit_c);
+            let delta_c = three_field_value(0, 0, 333);
+
+            let ctx = ChannelContext {
+                peer: "127.0.0.1:5075".parse().unwrap(),
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "127.0.0.1".into(),
+                authority: String::new(),
+            };
+
+            let src_a = Arc::clone(&source);
+            let src_c = Arc::clone(&source);
+            let intro_a = intro.clone();
+            let intro_c = intro.clone();
+            let ctx_a = ctx.clone();
+            let ctx_c = ctx.clone();
+
+            let task_a = tokio::spawn(async move {
+                let checked = src_a
+                    .access()
+                    .check("dut", &ctx_a.host, &ctx_a.account, &ctx_a.method, "")
+                    .await;
+                src_a
+                    .put_delta_checked(checked, intro_a, changed_a, delta_a, ctx_a)
+                    .await
+            });
+            let task_c = tokio::spawn(async move {
+                let checked = src_c
+                    .access()
+                    .check("dut", &ctx_c.host, &ctx_c.account, &ctx_c.method, "")
+                    .await;
+                src_c
+                    .put_delta_checked(checked, intro_c, changed_c, delta_c, ctx_c)
+                    .await
+            });
+
+            task_a.await.unwrap().expect("PUT A ok");
+            task_c.await.unwrap().expect("PUT C ok");
+
+            let stored = source.get_value("dut").await.expect("PV value present");
+            let (a, b, c) = three_field_extract(&stored);
+            assert_eq!(
+                (a, c),
+                (111, 333),
+                "trial {trial}: both disjoint delta PUTs must survive — \
+                 got a={a}, c={c} (a lost update means one is still 0)"
+            );
+            assert_eq!(b, 0, "trial {trial}: field b was never written");
+        }
+    }
+
+    /// Test source for the Defect-1 AUTHORITY-gating regression.
+    ///
+    /// Carries a `Required` AccessGate whose ASG has:
+    /// `RULE(0, READ)` — unconditional read; and
+    /// `RULE(1, WRITE) { AUTHORITY("MyCA") }` — WRITE only for a
+    /// peer whose `authority` (x509 root-CA CommonName) is `"MyCA"`.
+    ///
+    /// `process_hits` counts whether the WRITE-class `process` hook
+    /// ran — it must run only when the gate granted WRITE. The bug:
+    /// `handle_process` / `handle_put_get` GET-leg passed a literal
+    /// `""` as the authority to `AccessGate::check`, so even a peer
+    /// presenting `authority="MyCA"` failed `authority_match` and
+    /// was wrongly denied.
+    struct AuthorityGatedSource {
+        gate: epics_base_rs::server::access_security::AccessGate,
+        value: std::sync::Arc<parking_lot::Mutex<i32>>,
+        process_hits: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl AuthorityGatedSource {
+        fn new() -> Self {
+            use epics_base_rs::server::access_security::{AsgAslResolver, parse_acf};
+            let acf = parse_acf(
+                "ASG(DEFAULT) {\n\
+                 \x20   RULE(0, READ)\n\
+                 \x20   RULE(1, WRITE) { AUTHORITY(\"MyCA\") }\n\
+                 }\n",
+            )
+            .expect("acf parse");
+            let cell = std::sync::Arc::new(tokio::sync::RwLock::new(Some(acf)));
+            // Resolve every PV to ASG DEFAULT, ASL 1 — so the
+            // ASL-1-scoped WRITE rule applies.
+            let resolver: AsgAslResolver =
+                std::sync::Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 1u8) }));
+            Self {
+                gate: epics_base_rs::server::access_security::AccessGate::required(cell, resolver),
+                value: std::sync::Arc::new(parking_lot::Mutex::new(7)),
+                process_hits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            }
+        }
+    }
+
+    impl crate::server_native::source::ChannelSource for AuthorityGatedSource {
+        fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
+            &self.gate
+        }
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+            let n = n.to_string();
+            async move { n == "dut" }
+        }
+        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+            Some(three_field_intro())
+        }
+        fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+            let v = *self.value.lock();
+            async move { Some(three_field_value(v, v, v)) }
+        }
+        fn put_value(
+            &self,
+            _: &str,
+            value: PvField,
+        ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            let (a, _, _) = three_field_extract(&value);
+            *self.value.lock() = a;
+            async { Ok(()) }
+        }
+        async fn is_writable(&self, _: &str) -> bool {
+            true
+        }
+        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+        fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            self.process_hits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(()) }
+        }
+    }
+
+    /// Build the (sid → ChannelState) map plus a primed PROCESS op
+    /// for `ioid`, so a PROCESS data-phase frame dispatches straight
+    /// into the WRITE-gate check.
+    #[cfg(test)]
+    fn primed_process_channels(sid: u32, ioid: u32) -> HashMap<u32, ChannelState> {
+        let intro = three_field_intro();
+        let mut ops = HashMap::new();
+        let mask = BitSet::all_set(intro.total_bits());
+        ops.insert(
+            ioid,
+            non_monitor_op_state(intro.clone(), OpKind::Process, mask),
+        );
+        let mut channels = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro),
+                ops,
+            },
+        );
+        channels
+    }
+
+    /// Credentials for the `x509` method carrying a chosen root-CA
+    /// authority. `ClientCredentials` fields are all `pub`.
+    #[cfg(test)]
+    fn x509_cred(authority: &str) -> ClientCredentials {
+        ClientCredentials {
+            method: "x509".into(),
+            account: "operator".into(),
+            host: "h.example".into(),
+            authority: authority.into(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// Regression (Defect 1, native PROCESS handler): a peer whose
+    /// x509 `authority` matches an `AUTHORITY(...)`-scoped WRITE rule
+    /// MUST be granted PROCESS. `handle_process` passed a literal
+    /// `""` as the authority to `AccessGate::check`, so the
+    /// matching-CA peer failed `authority_match` and was wrongly
+    /// denied — its `process` hook never ran.
+    #[tokio::test]
+    async fn process_honors_authority_scoped_write_rule() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 500;
+        let src = AuthorityGatedSource::new();
+        let process_hits = std::sync::Arc::clone(&src.process_hits);
+        let source: DynSource = std::sync::Arc::new(src);
+
+        let mut channels = primed_process_channels(sid, ioid);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        // PROCESS data-phase frame: sid + ioid + subcmd(0x00).
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        let frame = synth_frame(Command::Process, order, payload);
+
+        // Peer presents the matching root CA — WRITE must be granted.
+        handle_process(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await
+        .expect("handle_process ok");
+
+        let resp = rx.try_recv().expect("PROCESS response emitted");
+        let (rframe, _) = try_parse_frame(&resp)
+            .expect("frame parses")
+            .expect("complete frame");
+        let mut cur = rframe.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        let _subcmd = cur.get_u8().expect("subcmd");
+        let status = Status::decode(&mut cur, order).expect("status");
+        assert!(
+            status.is_success(),
+            "PROCESS from a peer with matching AUTHORITY must succeed, \
+             got non-success status"
+        );
+        assert_eq!(
+            process_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "process hook must run when AUTHORITY-scoped WRITE rule matches"
+        );
+    }
+
+    /// Negative control for the test above: a peer whose `authority`
+    /// does NOT match the `AUTHORITY("MyCA")` rule gets PROCESS
+    /// denied and the `process` hook never runs. Confirms the fix
+    /// forwards the real authority rather than blanket-granting.
+    #[tokio::test]
+    async fn process_denied_for_wrong_authority() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 501;
+        let src = AuthorityGatedSource::new();
+        let process_hits = std::sync::Arc::clone(&src.process_hits);
+        let source: DynSource = std::sync::Arc::new(src);
+
+        let mut channels = primed_process_channels(sid, ioid);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        let frame = synth_frame(Command::Process, order, payload);
+
+        handle_process(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            peer,
+            &x509_cred("OtherCA"),
+        )
+        .await
+        .expect("handle_process ok");
+
+        let resp = rx.try_recv().expect("PROCESS response emitted");
+        let (rframe, _) = try_parse_frame(&resp)
+            .expect("frame parses")
+            .expect("complete frame");
+        let mut cur = rframe.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        let _subcmd = cur.get_u8().expect("subcmd");
+        let status = Status::decode(&mut cur, order).expect("status");
+        assert!(
+            !status.is_success(),
+            "PROCESS from a peer with the wrong AUTHORITY must be denied"
+        );
+        assert_eq!(
+            process_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "process hook must NOT run when AUTHORITY does not match"
+        );
+    }
+
+    /// Regression (Defect 1, PUT_GET GET-leg readback): the PUT_GET
+    /// GET-leg re-check passed a literal `""` as the authority. With
+    /// a READ rule scoped by `AUTHORITY("MyCA")`, a peer presenting
+    /// the matching CA would have its readback wrongly suppressed
+    /// (empty zero-field bitset instead of the value). Here the READ
+    /// rule is unconditional and only WRITE is AUTHORITY-scoped, so
+    /// the peer with the matching CA gets BOTH a successful PUT leg
+    /// and a non-empty readback — exercising the fixed GET-leg
+    /// `&ctx.authority` forwarding.
+    #[tokio::test]
+    async fn put_get_readback_honors_authority() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 502;
+        let src = AuthorityGatedSource::new();
+        let source: DynSource = std::sync::Arc::new(src);
+
+        let intro = three_field_intro();
+        let mut channels = HashMap::new();
+        let mask = BitSet::all_set(intro.total_bits());
+        let mut ops = HashMap::new();
+        ops.insert(
+            ioid,
+            non_monitor_op_state(intro.clone(), OpKind::PutGet, mask),
+        );
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                ops,
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        // PUT_GET data-phase frame (subcmd 0x40 = readback wanted):
+        // sid + ioid + subcmd + changed-bitset + delta(field a → 55).
+        let bit_a = intro.bit_for_path("a").expect("a has a bit");
+        let mut changed = BitSet::new();
+        changed.set(bit_a);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x40);
+        changed.write_into(order, &mut payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &three_field_value(55, 0, 0),
+            &intro,
+            &changed,
+            0,
+            order,
+            &mut payload,
+        );
+        let frame = synth_frame(Command::PutGet, order, payload);
+
+        handle_put_get(
+            &source,
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &x509_cred("MyCA"),
+        )
+        .await
+        .expect("handle_put_get ok");
+
+        let resp = rx.try_recv().expect("PUT_GET response emitted");
+        let (rframe, _) = try_parse_frame(&resp)
+            .expect("frame parses")
+            .expect("complete frame");
+        let mut cur = rframe.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        let _subcmd = cur.get_u8().expect("subcmd");
+        let status = Status::decode(&mut cur, order).expect("status");
+        assert!(status.is_success(), "PUT_GET status must be success");
+        let readback_mask = BitSet::decode(&mut cur, order).expect("readback bitset");
+        assert!(
+            readback_mask.count() > 0,
+            "PUT_GET GET-leg readback must carry fields for a peer with \
+             READ access — an empty bitset means the authority check \
+             wrongly suppressed the readback"
+        );
+        let readback = crate::pvdata::encode::decode_pv_field_with_bitset(
+            &intro,
+            &readback_mask,
+            0,
+            &mut cur,
+            order,
+        )
+        .expect("readback value");
+        let (a, _, _) = three_field_extract(&readback);
+        assert_eq!(a, 55, "readback must reflect the merged PUT (field a=55)");
     }
 
     /// pvxs `serverintrospect.cpp:159`: GET_FIELD's guard is the

@@ -181,6 +181,59 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
+    /// Type-state-enforced **BitSet-delta PUT**.
+    ///
+    /// PVA PUT/PUT_GET data frames carry only the changed fields plus
+    /// a changed-BitSet. Applying the delta is a read-merge-write:
+    /// read the PV's current complete value, overlay the marked
+    /// fields, store the result. The default impl below does that as
+    /// `get_value` + `fill_unmarked_from_prior` + `put_value_checked`,
+    /// which is correct for a single client but has a TOCTOU
+    /// lost-update window under concurrent partial PUTs to the same
+    /// PV (two writers read the same prior; the second write drops
+    /// the first's disjoint fields).
+    ///
+    /// The default impl forwards to [`Self::put_value_checked`] (not
+    /// the ctx-less `put_value`) so credential-aware sources — the
+    /// pva-gateway routes PUTs through a per-`(account, method)`
+    /// upstream client — keep their identity propagation. The
+    /// `put_value_checked` call performs the `allows_write()` gate.
+    ///
+    /// Sources whose backing store can merge under a single lock
+    /// override this to close the TOCTOU window —
+    /// [`crate::server_native::shared_pv::SharedSource`] forwards to
+    /// [`crate::server_native::shared_pv::SharedPV::put_delta`], which
+    /// reads + merges + stores under one mutex acquisition.
+    ///
+    /// `desc` is the PV introspection (per-field bit numbering);
+    /// `changed` is the wire changed-BitSet; `delta` is the decoded
+    /// sparse value (unmarked leaves hold type defaults).
+    fn put_delta_checked(
+        &self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async move {
+            // Default (non-atomic) merge for sources without a
+            // contained merge primitive. Single-client correct.
+            // `put_value_checked` enforces the WRITE gate, so a
+            // denied token never reaches the merge below as a write —
+            // but read the prior unconditionally (READ is implied by
+            // a ReadWrite token; for a denied token put_value_checked
+            // rejects before the merged value is stored).
+            let merged = match self.get_value(checked.pv_name()).await {
+                Some(prior) => crate::pvdata::encode::fill_unmarked_from_prior(
+                    &desc, &changed, 0, delta, &prior,
+                ),
+                None => delta,
+            };
+            self.put_value_checked(checked, merged, ctx).await
+        }
+    }
+
     /// True iff PUT is allowed against this PV (for ACL gating).
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
 
@@ -425,6 +478,15 @@ pub trait ChannelSourceObj: Send + Sync {
         value: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Dyn forwarder for type-state atomic BitSet-delta PUT.
+    fn put_delta_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
     fn is_writable<'a>(
         &'a self,
         name: &'a str,
@@ -554,6 +616,18 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::put_value_checked(
             self, checked, value, ctx,
+        ))
+    }
+    fn put_delta_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::put_delta_checked(
+            self, checked, desc, changed, delta, ctx,
         ))
     }
     fn is_writable<'a>(

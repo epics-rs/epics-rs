@@ -22,6 +22,13 @@ use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
 
+/// Server-side hook invoked once a peer's credentials are resolved.
+type AuthCompleteHook = Arc<
+    dyn Fn(std::net::SocketAddr, &epics_pva_rs::server_native::tcp::ClientCredentials)
+        + Send
+        + Sync,
+>;
+
 // Generate a self-signed cert + matching key pair for tests.
 fn generate_self_signed() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
@@ -271,11 +278,7 @@ async fn mtls_client_cert_populates_x509_credentials() {
     // for the connecting peer.
     let captured: Arc<Mutex<Option<(String, String, String)>>> = Arc::new(Mutex::new(None));
     let captured_hook = captured.clone();
-    let auth_complete: Arc<
-        dyn Fn(std::net::SocketAddr, &epics_pva_rs::server_native::tcp::ClientCredentials)
-            + Send
-            + Sync,
-    > = Arc::new(move |_peer, cred| {
+    let auth_complete: AuthCompleteHook = Arc::new(move |_peer, cred| {
         if let Ok(mut g) = captured_hook.try_lock() {
             *g = Some((
                 cred.method.clone(),

@@ -24,6 +24,7 @@ const SUFFIX: [char; NUM_ARGS] = [
 ///   * `FTx` / `FTVx` — `menuFtype` element type (H-5);
 ///   * `NOx` / `NOVx` — maximum element count;
 ///   * `NEx` / `NEVx` — elements actually used;
+///
 /// so a channel can carry CHAR/SHORT/LONG/FLOAT/DOUBLE/STRING data,
 /// not only `DOUBLE`. The per-channel value is stored as an
 /// [`EpicsValue`], which represents any scalar or array type — the

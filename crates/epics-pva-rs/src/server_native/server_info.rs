@@ -229,8 +229,8 @@ impl ChannelSource for ServerInfoSource {
     /// Returning `false` here keeps a broadcast SEARCH for the literal
     /// name `server` unanswered while `has_pv("server") == true` still
     /// lets the direct-connect GET / RPC path resolve it.
-    fn searchable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
-        async { false }
+    async fn searchable(&self, _name: &str) -> bool {
+        false
     }
 
     fn get_introspection(

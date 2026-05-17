@@ -71,29 +71,24 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
     let mut head = s;
     let mut ttl: Option<u32> = None;
     let mut iface: Option<String> = None;
-    loop {
-        match head.rfind(['@', ',']) {
-            Some(idx) => {
-                let sep = &head[idx..idx + 1];
-                let suffix = &head[idx + 1..];
-                if sep == "@" {
-                    if suffix.is_empty() {
-                        return Err("empty @iface override".into());
-                    }
-                    iface = Some(suffix.to_string());
-                } else {
-                    let v: u32 = suffix
-                        .parse()
-                        .map_err(|e| format!("ttl {suffix:?} invalid: {e}"))?;
-                    if v == 0 || v > 255 {
-                        return Err(format!("ttl {v} out of range 1..=255"));
-                    }
-                    ttl = Some(v);
-                }
-                head = &head[..idx];
+    while let Some(idx) = head.rfind(['@', ',']) {
+        let sep = &head[idx..idx + 1];
+        let suffix = &head[idx + 1..];
+        if sep == "@" {
+            if suffix.is_empty() {
+                return Err("empty @iface override".into());
             }
-            None => break,
+            iface = Some(suffix.to_string());
+        } else {
+            let v: u32 = suffix
+                .parse()
+                .map_err(|e| format!("ttl {suffix:?} invalid: {e}"))?;
+            if v == 0 || v > 255 {
+                return Err(format!("ttl {v} out of range 1..=255"));
+            }
+            ttl = Some(v);
         }
+        head = &head[..idx];
     }
     let (ip_str, port) = if let Some((a, b)) = head.rsplit_once(':') {
         let port: u16 = b.parse().map_err(|e| format!("port {b:?} invalid: {e}"))?;

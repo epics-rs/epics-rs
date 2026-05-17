@@ -543,11 +543,7 @@ fn build_nested(paths: &[String]) -> Vec<(String, FieldDesc)> {
 /// tree. Each option is emitted as a `string` member carrying its
 /// (possibly non-identifier) value verbatim. An empty option list is
 /// a no-op.
-fn attach_field_options(
-    tree: &mut Vec<(String, FieldDesc)>,
-    path: &str,
-    opts: &[(String, String)],
-) {
+fn attach_field_options(tree: &mut [(String, FieldDesc)], path: &str, opts: &[(String, String)]) {
     if opts.is_empty() {
         return;
     }

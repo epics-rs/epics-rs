@@ -469,8 +469,11 @@ impl PortDriver for ModbusPortDriver {
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         // Absolute mode: read this record's own wire address now (the C
         // `absoluteAddressing_` branch issues an individual `doModbusIO`).
+        // C `readInt32` (drvModbusAsyn.cpp:675-676) uses a FIXED request
+        // length of `min(2, modbusLength_)` registers, not the data-type
+        // width. `read_absolute_words` clamps to `config.length`.
         if self.is_absolute() {
-            let regs = self.read_absolute_words(user.addr, dt.register_count().max(1))?;
+            let regs = self.read_absolute_words(user.addr, 2)?;
             return Ok(datatype::read_int32(dt, &regs).map_err(to_asyn)?.0);
         }
         self.touch(user.reason, user.addr);
@@ -484,8 +487,10 @@ impl PortDriver for ModbusPortDriver {
             return self.base.get_int64_param(user.reason, user.addr);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        // C `readInt64` (drvModbusAsyn.cpp:836-837) uses a FIXED request
+        // length of `min(4, modbusLength_)` registers.
         if self.is_absolute() {
-            let regs = self.read_absolute_words(user.addr, dt.register_count().max(1))?;
+            let regs = self.read_absolute_words(user.addr, 4)?;
             return Ok(datatype::read_int64(dt, &regs).map_err(to_asyn)?.0);
         }
         self.touch(user.reason, user.addr);
@@ -499,8 +504,10 @@ impl PortDriver for ModbusPortDriver {
             return self.base.get_float64_param(user.reason, user.addr);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        // C `readFloat64` (drvModbusAsyn.cpp:982-983) uses a FIXED request
+        // length of `min(4, modbusLength_)` registers.
         if self.is_absolute() {
-            let regs = self.read_absolute_words(user.addr, dt.register_count().max(1))?;
+            let regs = self.read_absolute_words(user.addr, 4)?;
             return Ok(datatype::read_float(dt, &regs).map_err(to_asyn)?.0);
         }
         self.touch(user.reason, user.addr);
@@ -537,10 +544,19 @@ impl PortDriver for ModbusPortDriver {
         let dt = self.datatype_of(user.reason)?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         if self.is_absolute() {
-            // C `readOctet` reads `min(maxChars, modbusLength_)` words at the
-            // wire address; `read_absolute_words` clamps the count to
-            // `config.length`. Each register carries up to two string bytes.
-            let words = buf.len().div_ceil(2).max(1);
+            // C `readOctet` (drvModbusAsyn.cpp:1464-1465) issues
+            // `doModbusIO(..., min((int)maxChars, modbusLength_))`: the request
+            // length in REGISTERS equals the string CHAR count, because
+            // `readPlcString` (drvModbusAsyn.cpp:3001-3052) advances `offset`
+            // by exactly one register per loop iteration regardless of
+            // encoding. The single-byte encodings (`StringHigh`/`StringLow`/
+            // `ZStringHigh`/`ZStringLow`) therefore need one register per char,
+            // so the word count must be `buf.len()` (the char count) — not
+            // `div_ceil(2)`, which would under-read them by half. The two-byte
+            // encodings are over-read harmlessly, exactly as C over-reads them.
+            // `read_absolute_words` clamps the count to `config.length`,
+            // matching C's `min(maxChars, modbusLength_)`.
+            let words = buf.len().max(1);
             let regs = self.read_absolute_words(user.addr, words)?;
             let (bytes, _) = datatype::read_string(dt, &regs, buf.len()).map_err(to_asyn)?;
             let n = bytes.len().min(buf.len());
@@ -1029,21 +1045,34 @@ mod tests {
     }
 
     /// A transport that replays a queue of canned response frames — lets a
-    /// test drive `poll_cycle` through a successful engine poll.
+    /// test drive `poll_cycle` through a successful engine poll. Every written
+    /// frame is appended to `written`, a shared buffer the test can inspect
+    /// after the driver call to assert the on-wire request shape.
+    type WriteLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
     struct ReplayTransport {
         responses: std::collections::VecDeque<crate::error::ModbusResult<Vec<u8>>>,
+        written: WriteLog,
     }
 
     impl ReplayTransport {
         fn new(responses: Vec<crate::error::ModbusResult<Vec<u8>>>) -> Self {
             Self {
                 responses: responses.into_iter().collect(),
+                written: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
+        }
+
+        /// A handle onto the shared write log, cloned before the transport is
+        /// moved into the driver so the test can read it back afterwards.
+        fn written_handle(&self) -> WriteLog {
+            std::sync::Arc::clone(&self.written)
         }
     }
 
     impl OctetTransport for ReplayTransport {
-        fn write_frame(&mut self, _data: &[u8]) -> crate::error::ModbusResult<()> {
+        fn write_frame(&mut self, data: &[u8]) -> crate::error::ModbusResult<()> {
+            self.written.lock().unwrap().push(data.to_vec());
             Ok(())
         }
         fn read_frame(&mut self, _timeout: Duration) -> crate::error::ModbusResult<Vec<u8>> {
@@ -1093,8 +1122,10 @@ mod tests {
     /// and decodes the response — no shared polled buffer is consulted.
     #[test]
     fn absolute_read_int32_issues_request_at_wire_address() {
-        // ReadHoldingRegisters response for one UINT16 word = 0xBEEF.
-        let pdu = [0x01u8, 0x03, 0x02, 0xBE, 0xEF];
+        // ReadHoldingRegisters response. `read_int32` now issues a fixed
+        // 2-register request (C `readInt32`, drvModbusAsyn.cpp:675-676), so the
+        // response carries two words; the UINT16 value decodes from the first.
+        let pdu = [0x01u8, 0x03, 0x04, 0xBE, 0xEF, 0x00, 0x00];
         let mut driver = ModbusPortDriver::new(
             "MB_ABS_RD",
             test_config(-1, 16),
@@ -1119,6 +1150,123 @@ mod tests {
         assert!(
             driver.active.is_empty(),
             "absolute reads must not touch the poller `active` set"
+        );
+    }
+
+    /// Absolute-mode `read_octet` for a single-byte string encoding
+    /// (`StringHigh`): C `readPlcString` (drvModbusAsyn.cpp:3001-3052) consumes
+    /// exactly one register per character for `dataTypeStringHigh`, so
+    /// `readOctet` (drvModbusAsyn.cpp:1464-1465) requests `min(maxChars,
+    /// modbusLength_)` registers — one per char. A 10-char read must request
+    /// 10 registers and return the full 10-char string, not a half-length one.
+    #[test]
+    fn absolute_read_octet_single_byte_string_reads_full_length() {
+        // 10 ReadHoldingRegisters words, each high byte one ASCII char of
+        // "ABCDEFGHIJ". Response PDU: fc 0x03, byte_count 20, then 10 words.
+        let chars = b"ABCDEFGHIJ";
+        let mut pdu = vec![0x01u8, 0x03, (chars.len() * 2) as u8];
+        for &c in chars {
+            pdu.push(c); // high byte = char (StringHigh)
+            pdu.push(0x00); // low byte unused
+        }
+        let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(-1, 64);
+        cfg.data_type = ModbusDataType::StringHigh;
+        let mut driver =
+            ModbusPortDriver::new("MB_ABS_STR", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::StringHigh.as_str())
+            .expect("STRING_HIGH parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0x3000;
+        // The record buffer (`NELM`) holds 10 chars.
+        let mut buf = [0u8; 10];
+        let n = driver
+            .read_octet(&user, &mut buf)
+            .expect("absolute octet read must succeed");
+        // Full 10-char string, not truncated to 5 by a `div_ceil(2)` request.
+        assert_eq!(n, 10, "single-byte string must read all 10 chars");
+        assert_eq!(&buf, b"ABCDEFGHIJ");
+        // The on-wire request must ask for 10 registers (one per char),
+        // matching C `min(maxChars, modbusLength_)` — not 5.
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 1, "exactly one absolute read request");
+        // TCP frame: 6-byte MBAP header, then PDU
+        // [slave, fcode, addr_hi, addr_lo, count_hi, count_lo].
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x03, 0x30, 0x00, 0x00, 0x0A],
+            "request must target wire addr 0x3000 with a 10-register count"
+        );
+    }
+
+    /// Absolute-mode `read_int32` issues a fixed-length request of
+    /// `min(2, modbusLength_)` = 2 registers, matching C `readInt32`
+    /// (drvModbusAsyn.cpp:675-676) — independent of the record's data type
+    /// width (here `UInt16`, whose `register_count()` is 1).
+    #[test]
+    fn absolute_read_int32_issues_fixed_two_register_request() {
+        // ReadHoldingRegisters response for two words.
+        let pdu = [0x01u8, 0x03, 0x04, 0xBE, 0xEF, 0x00, 0x00];
+        let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
+        let written = transport.written_handle();
+        let mut driver = ModbusPortDriver::new(
+            "MB_ABS_I32_LEN",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(transport),
+        )
+        .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0x2710;
+        driver
+            .read_int32(&user)
+            .expect("absolute read must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 1, "exactly one absolute read request");
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x03, 0x27, 0x10, 0x00, 0x02],
+            "read_int32 must request a fixed 2-register count (C min(2,len))"
+        );
+    }
+
+    /// Absolute-mode `read_float64` issues a fixed-length request of
+    /// `min(4, modbusLength_)` = 4 registers, matching C `readFloat64`
+    /// (drvModbusAsyn.cpp:982-983).
+    #[test]
+    fn absolute_read_float64_issues_fixed_four_register_request() {
+        // ReadHoldingRegisters response for four words.
+        let pdu = [0x01u8, 0x03, 0x08, 0, 0, 0, 0, 0, 0, 0, 0];
+        let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(-1, 16);
+        cfg.data_type = ModbusDataType::Float64Le;
+        let mut driver =
+            ModbusPortDriver::new("MB_ABS_F64_LEN", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Float64Le.as_str())
+            .expect("FLOAT64_LE parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0x2710;
+        driver
+            .read_float64(&user)
+            .expect("absolute read must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 1, "exactly one absolute read request");
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x03, 0x27, 0x10, 0x00, 0x04],
+            "read_float64 must request a fixed 4-register count (C min(4,len))"
         );
     }
 

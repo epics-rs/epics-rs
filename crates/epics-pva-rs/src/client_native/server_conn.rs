@@ -310,6 +310,13 @@ impl ServerConn {
             let mut seg_cmd: u8 = 0;
             let mut seg_flags: crate::proto::HeaderFlags = crate::proto::HeaderFlags(0);
             let mut expect_seg = false;
+            // Reader-task-owned type cache. Type-cache markers (0xFD
+            // define / 0xFE reference) are resolved here, in strict wire
+            // order, before frames are routed to per-op tasks — see
+            // `flatten_type_cache_markers`. The per-op tasks then decode
+            // self-contained frames, so a 0xFE reference can never be
+            // decoded before the 0xFD define that fills its slot.
+            let mut reader_type_cache = crate::pvdata::encode::TypeCache::new();
             loop {
                 tokio::select! {
                     _ = cancel_reader.cancelled() => break,
@@ -412,7 +419,7 @@ impl ServerConn {
                                     continue;
                                 }
                                 expect_seg = false;
-                                let dispatch_frame = if raw_seg == 0 {
+                                let mut dispatch_frame = if raw_seg == 0 {
                                     frame
                                 } else {
                                     Frame {
@@ -431,6 +438,15 @@ impl ServerConn {
                                         payload: std::mem::take(&mut seg_buf),
                                     }
                                 };
+                                // Flatten type-cache markers in wire
+                                // order before routing, so per-op tasks
+                                // never decode a 0xFE reference ahead of
+                                // its 0xFD define (cross-op decode order
+                                // is not guaranteed).
+                                crate::client_native::decode::flatten_type_cache_markers(
+                                    &mut dispatch_frame,
+                                    &mut reader_type_cache,
+                                );
                                 route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, order_reader);
                             }
                         }

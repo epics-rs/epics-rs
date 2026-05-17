@@ -670,6 +670,32 @@ pub fn decode_type_desc_cached(
     decode_type_desc_cached_at_depth(cur, order, cache, 0)
 }
 
+/// Resolve a single type descriptor at the cursor against `cache`,
+/// appending its **inline** (marker-free) wire form to `out`.
+///
+/// This is the rewrite primitive used by the connection reader task to
+/// flatten 0xFD/0xFE type-cache markers out of inbound op-response frames
+/// before they are routed to per-op tasks. The reader task processes
+/// frames strictly in wire order, so a 0xFD define is always observed
+/// (and folded into `cache`) before any later 0xFE reference to the same
+/// slot. After rewriting, the routed frame carries a self-contained
+/// descriptor and per-op tasks can decode it with an empty cache — there
+/// is no cross-op decode-order dependency.
+///
+/// The cursor is advanced past exactly one type descriptor (including any
+/// nested markers). A `0xFD` define updates `cache`; a `0xFE` reference
+/// reads from it (and errors on a miss).
+pub fn rewrite_type_desc_inline(
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+    out: &mut Vec<u8>,
+) -> Result<(), DecodeError> {
+    let desc = decode_type_desc_cached_at_depth(cur, order, cache, 0)?;
+    encode_type_desc(&desc, order, out);
+    Ok(())
+}
+
 fn decode_type_desc_cached_at_depth(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,

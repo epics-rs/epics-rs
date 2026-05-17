@@ -64,19 +64,20 @@ impl EpidSoftDeviceSupport {
         let mut p = epid.p;
         let mut i = epid.i;
         let mut d = epid.d;
-        // ERR (deviation error) is a PID-mode concept. `None` means "leave
-        // the record's ERR field untouched"; it is only `Some` in PID mode.
-        // In MaxMin mode the algorithm derives the output-step sign from the
-        // CVAL delta but does not produce a deviation error, so ERR must not
-        // be clobbered to 0.0. This mirrors `epid_fast.rs`, whose MaxMin path
-        // never assigns `self.err`.
-        let mut err_update: Option<f64> = None;
+        // C `devEpidSoft.c:98` declares `double e = 0.;` at function scope.
+        // `devEpidSoft.c:208` writes `pepid->err = e;` *unconditionally*,
+        // regardless of feedback mode. So ERR must always be assigned:
+        //   - PID mode      → e = setp - cval (devEpidSoft.c:139)
+        //   - MaxMin, FB on after the OFF->ON edge → e = cval - pcval
+        //     (devEpidSoft.c:186)
+        //   - MaxMin bumpless edge / MaxMin FB off / invalid mode → e = 0.0
+        //     (the initial value from devEpidSoft.c:98 is never overwritten)
+        let mut e = 0.0_f64;
 
         match epid.fmod {
             0 => {
                 // PID mode
-                let e = setp - cval;
-                err_update = Some(e);
+                e = setp - cval;
                 let de = e - ep;
                 p = kp * e;
 
@@ -122,7 +123,7 @@ impl EpidSoftDeviceSupport {
                         // Set output to current value (bumpless).
                         oval = epid.oval;
                     } else {
-                        let e = cval - pcval;
+                        e = cval - pcval;
                         let sign = if d > 0.0 { 1.0 } else { -1.0 };
                         let sign = if (kp > 0.0 && e < 0.0) || (kp < 0.0 && e > 0.0) {
                             -sign
@@ -147,14 +148,11 @@ impl EpidSoftDeviceSupport {
             oval = epid.drvl;
         }
 
-        // Update record fields
+        // Update record fields — C `devEpidSoft.c:206-209`.
         epid.ct = ct;
         epid.dt = dt;
-        // Only PID mode produces a deviation error; MaxMin and invalid modes
-        // leave ERR as it was so a read-back is not clobbered to 0.0.
-        if let Some(e) = err_update {
-            epid.err = e;
-        }
+        // C `devEpidSoft.c:208` writes ERR unconditionally for every mode.
+        epid.err = e;
         epid.cval = cval;
 
         // Apply output deadband

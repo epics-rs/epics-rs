@@ -660,3 +660,195 @@ fn test_multi_output_links() {
     assert_eq!(links.len(), 1);
     assert_eq!(links[0], ("OUTL", "OVAL"));
 }
+
+// ============================================================
+// ERR field — C devEpidSoft.c:208 writes ERR for EVERY mode
+// ============================================================
+
+/// Regression: C `devEpidSoft.c:98` declares `double e = 0.;` and
+/// `devEpidSoft.c:208` writes `pepid->err = e;` unconditionally,
+/// regardless of feedback mode. The port previously suppressed the
+/// ERR write entirely in MaxMin mode. In MaxMin mode with feedback
+/// already on, C sets `e = cval - pcval` (devEpidSoft.c:186), so ERR
+/// must hold the CVAL delta.
+#[test]
+fn test_maxmin_err_is_cval_delta() {
+    let mut rec = EpidRecord::default();
+    rec.fmod = 1; // MaxMin
+    rec.kp = 1.0;
+    rec.fbon = 1;
+    rec.fbop = 1; // already on — exercises the e = cval - pcval path
+    rec.d = 1.0;
+    rec.drvh = 1000.0;
+    rec.drvl = -1000.0;
+    rec.mdt = 0.0;
+    rec.cvlp = 100.0; // previous controlled value
+    rec.cval = 130.0; // current controlled value
+    rec.err = -999.0; // stale value that must be overwritten
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    EpidSoftDeviceSupport::do_pid(&mut rec);
+
+    // C devEpidSoft.c:186 + :208 — ERR = cval - pcval = 130 - 100 = 30.
+    assert!(
+        (rec.err - 30.0).abs() < 1e-9,
+        "MaxMin ERR must be cval - pcval = 30.0, got {}",
+        rec.err
+    );
+}
+
+/// Regression: MaxMin bumpless OFF->ON edge. C `e` keeps its initial
+/// value 0.0 (devEpidSoft.c:98) because the `cval - pcval` assignment
+/// is in the else-branch; `pepid->err = e;` then writes 0.0.
+#[test]
+fn test_maxmin_err_zero_on_bumpless_edge() {
+    let mut rec = EpidRecord::default();
+    rec.fmod = 1; // MaxMin
+    rec.kp = 1.0;
+    rec.fbon = 1;
+    rec.fbop = 0; // OFF -> ON bumpless edge
+    rec.drvh = 1000.0;
+    rec.drvl = -1000.0;
+    rec.mdt = 0.0;
+    rec.cvlp = 100.0;
+    rec.cval = 130.0;
+    rec.err = -999.0; // stale
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    EpidSoftDeviceSupport::do_pid(&mut rec);
+
+    // C devEpidSoft.c:98 initial e=0.0 survives the bumpless edge.
+    assert_eq!(
+        rec.err, 0.0,
+        "MaxMin bumpless-edge ERR must be 0.0, got {}",
+        rec.err
+    );
+}
+
+// ============================================================
+// Fast device support — C devEpidFast.c
+// ============================================================
+
+use std_rs::device_support::epid_fast::EpidFastPvt;
+
+/// C `devEpidFast.c::computeNumAverage` (devEpidFast.c:356-362):
+/// `numAverage = 0.5 + timePerPointRequested/callbackInterval`,
+/// clamped to `>= 1`; `timePerPointActual = numAverage *
+/// callbackInterval`.
+#[test]
+fn test_fast_compute_num_average() {
+    let mut pvt = EpidFastPvt::default();
+    pvt.callback_interval = 0.001; // 1 ms driver callback
+    pvt.time_per_point_requested = 0.010; // 10 ms requested
+
+    pvt.compute_num_average();
+
+    // 0.5 + 10/1 = 10.5 -> 10
+    assert_eq!(pvt.num_average, 10);
+    assert!((pvt.time_per_point_actual - 0.010).abs() < 1e-12);
+
+    // Requested shorter than one callback -> clamp to 1.
+    pvt.time_per_point_requested = 0.0;
+    pvt.compute_num_average();
+    assert_eq!(pvt.num_average, 1);
+    assert!((pvt.time_per_point_actual - 0.001).abs() < 1e-12);
+}
+
+/// C `devEpidFast.c::intervalCallback` (devEpidFast.c:367-375):
+/// updates `callbackInterval` and recomputes `numAverage`.
+#[test]
+fn test_fast_interval_callback_recomputes_average() {
+    let mut pvt = EpidFastPvt::default();
+    pvt.time_per_point_requested = 0.010;
+    pvt.interval_callback(0.002); // 2 ms callback interval
+
+    // 0.5 + 10/2 = 5.5 -> 5
+    assert_eq!(pvt.num_average, 5);
+    assert!((pvt.callback_interval - 0.002).abs() < 1e-12);
+    assert!((pvt.time_per_point_actual - 0.010).abs() < 1e-12);
+}
+
+/// C `do_PID` (devEpidFast.c:430) uses `dt = pPvt->callbackInterval`,
+/// the configured interval — not a measured wall-clock difference.
+/// The derivative term D = KP*KD*(dError/dt) must use that interval.
+#[test]
+fn test_fast_do_pid_uses_callback_interval_as_dt() {
+    let mut pvt = EpidFastPvt::default();
+    pvt.callback_interval = 0.5; // dt
+    pvt.num_average = 1;
+    pvt.kp = 1.0;
+    pvt.ki = 0.0;
+    pvt.kd = 2.0;
+    pvt.drvh = 1000.0;
+    pvt.drvl = -1000.0;
+    pvt.val = 100.0;
+    pvt.fbon = true;
+    pvt.fbop = true;
+    pvt.err = 0.0; // previous error
+
+    pvt.do_pid(90.0); // cval = 90 -> e = 10, de = 10 - 0 = 10
+
+    // D = KP*KD*(de/dt) = 1*2*(10/0.5) = 40
+    assert!(
+        (pvt.d - 40.0).abs() < 1e-9,
+        "D must use callback_interval (0.5s) as dt -> 40.0, got {}",
+        pvt.d
+    );
+    // P = KP*e = 10
+    assert!((pvt.p - 10.0).abs() < 1e-9, "P must be 10.0, got {}", pvt.p);
+}
+
+/// Regression: the anti-windup clamp and the output clamp must be
+/// panic-free even when the drive limits are inverted (drvl > drvh) —
+/// which is exactly the state C `devEpidFast.c:121-123` seeds before
+/// `update_params` runs (`lowLimit=1, highLimit=-1`). `f64::clamp`
+/// panics when min > max; C uses sequential `if` clamps.
+#[test]
+fn test_fast_do_pid_inverted_limits_no_panic() {
+    // Default EpidFastPvt seeds the inverted C init limits.
+    let mut pvt = EpidFastPvt::default();
+    assert!(pvt.drvl > pvt.drvh, "default must seed inverted C limits");
+    pvt.callback_interval = 0.001;
+    pvt.num_average = 1;
+    pvt.ki = 1.0;
+    pvt.val = 100.0;
+    pvt.fbon = true;
+    pvt.fbop = true;
+
+    // Must not panic despite drvl=1.0 > drvh=-1.0.
+    pvt.do_pid(50.0);
+}
+
+/// C `dataCallback` (devEpidFast.c:384-395): when numAverage > 1 the
+/// driver accumulates points and only runs `do_PID` once the count is
+/// reached, on the averaged value.
+#[test]
+fn test_fast_do_pid_averaging() {
+    let mut pvt = EpidFastPvt::default();
+    pvt.callback_interval = 0.001;
+    pvt.num_average = 4;
+    pvt.kp = 1.0;
+    pvt.ki = 0.0;
+    pvt.kd = 0.0;
+    pvt.drvh = 1000.0;
+    pvt.drvl = -1000.0;
+    pvt.val = 100.0;
+    pvt.fbon = true;
+    pvt.fbop = true;
+
+    // First 3 points accumulate, no compute yet.
+    pvt.do_pid(10.0);
+    pvt.do_pid(20.0);
+    pvt.do_pid(30.0);
+    assert_eq!(pvt.p, 0.0, "no compute before num_average points");
+
+    // 4th point triggers compute on the average (10+20+30+40)/4 = 25.
+    pvt.do_pid(40.0);
+    assert!(
+        (pvt.cval - 25.0).abs() < 1e-9,
+        "averaged cval must be 25.0, got {}",
+        pvt.cval
+    );
+    // e = 100 - 25 = 75, P = KP*e = 75.
+    assert!((pvt.p - 75.0).abs() < 1e-9, "P must be 75.0, got {}", pvt.p);
+}

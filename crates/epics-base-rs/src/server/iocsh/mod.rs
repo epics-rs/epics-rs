@@ -120,9 +120,7 @@ impl IocShell {
                             continue;
                         }
                         match self.execute_line(one) {
-                            Ok(CommandOutcome::Exit) => {
-                                return Ok(CommandOutcome::Exit)
-                            }
+                            Ok(CommandOutcome::Exit) => return Ok(CommandOutcome::Exit),
                             Ok(CommandOutcome::Continue) => {}
                             Err(e) => last = Err(e),
                         }
@@ -1183,10 +1181,7 @@ mod tests {
             tokenize("dbpf REC:VAL 'hello world'"),
             vec!["dbpf", "REC:VAL", "hello world"]
         );
-        assert_eq!(
-            tokenize("cmd('a, b', c)"),
-            vec!["cmd", "a, b", "c"]
-        );
+        assert_eq!(tokenize("cmd('a, b', c)"), vec!["cmd", "a, b", "c"]);
     }
 
     /// L-5: an unbalanced quote / trailing backslash is flagged.

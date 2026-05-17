@@ -8,8 +8,8 @@
 
 #![allow(clippy::approx_constant)]
 
-use epics_base_rs::server::record::{AlarmSeverity, CommonFields, Record};
 use epics_base_rs::server::recgbl::alarm_status;
+use epics_base_rs::server::record::{AlarmSeverity, CommonFields, Record};
 use epics_base_rs::server::records::bi::BiRecord;
 use epics_base_rs::server::records::bo::BoRecord;
 use epics_base_rs::server::records::dfanout::DfanoutRecord;
@@ -27,10 +27,7 @@ fn mbbi_direct_exposes_upper_16_bits() {
     let mut rec = MbbiDirectRecord::default();
     // Bit B1A is bit 26 — must exist and round-trip.
     rec.put_field("B1A", EpicsValue::Char(1)).unwrap();
-    assert!(matches!(
-        rec.get_field("B1A"),
-        Some(EpicsValue::Char(1))
-    ));
+    assert!(matches!(rec.get_field("B1A"), Some(EpicsValue::Char(1))));
     assert!(matches!(
         rec.get_field("VAL"),
         Some(EpicsValue::Long(v)) if v == (1 << 26)

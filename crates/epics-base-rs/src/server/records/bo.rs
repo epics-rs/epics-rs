@@ -108,10 +108,7 @@ fn dol_as_constant(dol: &str) -> Option<u16> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         return u32::from_str_radix(hex, 16).ok().map(|v| v as u16);
     }
-    if let Some(hex) = s
-        .strip_prefix("-0x")
-        .or_else(|| s.strip_prefix("-0X"))
-    {
+    if let Some(hex) = s.strip_prefix("-0x").or_else(|| s.strip_prefix("-0X")) {
         return u32::from_str_radix(hex, 16)
             .ok()
             .map(|v| (v as i32).wrapping_neg() as u16);
@@ -323,8 +320,8 @@ impl Record for BoRecord {
     /// `bi`, C `boRecord.c::checkAlarms` evaluates STATE/COS even
     /// when UDF is set, so this method does not early-return on UDF.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        use crate::server::record::AlarmSeverity;
         use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
 
         let val = self.val;
         let state_sev = if val == 0 { self.zsv } else { self.osv };

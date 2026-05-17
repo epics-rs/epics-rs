@@ -140,11 +140,9 @@ fn func_arity(func: &FuncName) -> u8 {
         //   Cat    -> ArrayOp::Cat       (array.rs:553 — pop b, pop a)
         //   FitPoly-> ArrayOp::FitPoly   (array.rs:592 — pop y, pop x)
         //   FitQ   -> ArrayOp::FitQ      (array.rs:611 — pop y, pop x)
-        FuncName::NSmoo
-        | FuncName::NDeriv
-        | FuncName::Cat
-        | FuncName::FitPoly
-        | FuncName::FitQ => 2,
+        FuncName::NSmoo | FuncName::NDeriv | FuncName::Cat | FuncName::FitPoly | FuncName::FitQ => {
+            2
+        }
 
         // 3-arg array ops.
         //   FitMPoly -> ArrayOp::FitMPoly (array.rs:601 — pop mask, y, x)
@@ -716,8 +714,7 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
     // a deliberate Rust special case and is exempt.
     let ends_with_store = matches!(
         output.last(),
-        Some(Opcode::Core(CoreOp::StoreVar(_)))
-            | Some(Opcode::Core(CoreOp::StoreDoubleVar(_)))
+        Some(Opcode::Core(CoreOp::StoreVar(_))) | Some(Opcode::Core(CoreOp::StoreDoubleVar(_)))
     );
     let depth_ok = runtime_depth == 1 || (runtime_depth == 0 && ends_with_store);
     if !output.is_empty() && (operand_needed || !depth_ok) {

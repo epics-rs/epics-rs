@@ -544,15 +544,14 @@ async fn run_notify_forwarder(
 
         // Snapshot the fan-out, then order it: atomic group first,
         // then non-atomic; `monorder` within each group.
-        let mut targets: Vec<(String, bool, i32, bool)> =
-            match scan_targets.read().get(&pv_name) {
-                Some(fanout) => fanout
-                    .records
-                    .iter()
-                    .map(|t| (t.record.clone(), t.always, t.monorder, t.atomic))
-                    .collect(),
-                None => Vec::new(),
-            };
+        let mut targets: Vec<(String, bool, i32, bool)> = match scan_targets.read().get(&pv_name) {
+            Some(fanout) => fanout
+                .records
+                .iter()
+                .map(|t| (t.record.clone(), t.always, t.monorder, t.atomic))
+                .collect(),
+            None => Vec::new(),
+        };
         // Sort key: (!atomic, monorder) → atomic (false sorts first),
         // then ascending monorder.
         targets.sort_by_key(|(_, _, order, atomic)| (!*atomic, *order));
@@ -881,8 +880,7 @@ mod tests {
         fn process(
             &mut self,
         ) -> epics_base_rs::error::CaResult<epics_base_rs::server::record::ProcessOutcome> {
-            self.count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(epics_base_rs::server::record::ProcessOutcome::complete())
         }
         fn get_field(&self, _name: &str) -> Option<EpicsValue> {
@@ -923,9 +921,10 @@ mod tests {
             monorder: 0,
             atomic: false,
         });
-        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
-            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
-        ));
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                ("SRC".to_string(), fanout),
+            ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
@@ -968,9 +967,10 @@ mod tests {
             monorder: 0,
             atomic: false,
         });
-        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
-            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
-        ));
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                ("SRC".to_string(), fanout),
+            ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
@@ -1035,9 +1035,10 @@ mod tests {
             monorder: 0,
             atomic: false,
         });
-        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
-            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
-        ));
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                ("SRC".to_string(), fanout),
+            ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(8);
@@ -1101,15 +1102,10 @@ mod tests {
     async fn b2_open_link_retains_sevr_mode() {
         let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
         let _ = resolver.open_link("pva://A:PV?sevr=MSI").await;
-        let cfg = resolver
-            .inp_cfg_for("A:PV")
-            .clone();
+        let cfg = resolver.inp_cfg_for("A:PV").clone();
         assert_eq!(cfg.sevr, SevrMode::Msi);
         // A PV never opened falls back to NMS default.
-        assert_eq!(
-            resolver.inp_cfg_for("UNSEEN").sevr,
-            SevrMode::Nms
-        );
+        assert_eq!(resolver.inp_cfg_for("UNSEEN").sevr, SevrMode::Nms);
     }
 
     #[test]
@@ -1148,11 +1144,7 @@ mod tests {
         fn get_field(&self, _n: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(0.0))
         }
-        fn put_field(
-            &mut self,
-            _n: &str,
-            _v: EpicsValue,
-        ) -> epics_base_rs::error::CaResult<()> {
+        fn put_field(&mut self, _n: &str, _v: EpicsValue) -> epics_base_rs::error::CaResult<()> {
             Ok(())
         }
         fn field_list(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
@@ -1205,9 +1197,10 @@ mod tests {
             monorder: 0,
             atomic: true,
         });
-        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
-            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
-        ));
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                ("SRC".to_string(), fanout),
+            ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
@@ -1248,9 +1241,10 @@ mod tests {
             monorder: 0,
             atomic: true, // but atomic → scans anyway
         });
-        let scan_targets: ScanTargetMap = Arc::new(parking_lot::RwLock::new(
-            std::collections::HashMap::from([("SRC".to_string(), fanout)]),
-        ));
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                ("SRC".to_string(), fanout),
+            ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
         let (tx, rx) = tokio::sync::mpsc::channel::<PvField>(4);
         let forwarder = tokio::spawn(run_notify_forwarder(
@@ -1306,9 +1300,7 @@ mod tests {
             .await
             .unwrap();
         let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
-        let r = resolver
-            .open_link("pva://LOCAL:SIMPLE:PV?local=true")
-            .await;
+        let r = resolver.open_link("pva://LOCAL:SIMPLE:PV?local=true").await;
         assert!(
             r.is_ok(),
             "local link to a simple add_pv PV must be accepted"

@@ -800,12 +800,14 @@ mod tests {
             .fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.0))));
         let mut nturi = PvStructure::new("epics:nt/NTURI:1.0");
-        nturi
-            .fields
-            .push(("scheme".into(), PvField::Scalar(ScalarValue::String("pva".into()))));
-        nturi
-            .fields
-            .push(("path".into(), PvField::Scalar(ScalarValue::String("RPC:AO".into()))));
+        nturi.fields.push((
+            "scheme".into(),
+            PvField::Scalar(ScalarValue::String("pva".into())),
+        ));
+        nturi.fields.push((
+            "path".into(),
+            PvField::Scalar(ScalarValue::String("RPC:AO".into())),
+        ));
         nturi
             .fields
             .push(("query".into(), PvField::Structure(query)));
@@ -822,7 +824,10 @@ mod tests {
         };
         match s.get_field("value") {
             Some(PvField::Scalar(ScalarValue::Double(v))) => {
-                assert_eq!(*v, 7.0, "RPC query arg must have been written to the record")
+                assert_eq!(
+                    *v, 7.0,
+                    "RPC query arg must have been written to the record"
+                )
             }
             other => panic!("expected scalar value field, got {other:?}"),
         }

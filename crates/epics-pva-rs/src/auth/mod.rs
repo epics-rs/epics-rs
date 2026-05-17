@@ -15,5 +15,5 @@ pub mod tls;
 
 pub use plain::{authnz_default_host, authnz_default_user, posix_groups};
 pub use tls::{
-    x509_credentials_from_chain, TlsClientConfig, TlsConfigError, TlsServerConfig, X509Credentials,
+    TlsClientConfig, TlsConfigError, TlsServerConfig, X509Credentials, x509_credentials_from_chain,
 };

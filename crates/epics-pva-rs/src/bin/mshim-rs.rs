@@ -305,7 +305,8 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = send_socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into()) {
+    if let Err(e) = send_socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into())
+    {
         eprintln!("mshim-rs: bind send socket: {e}");
         std::process::exit(1);
     }
@@ -358,12 +359,7 @@ async fn main() {
         if extras.is_empty() {
             eprintln!("  forward → {}:{}", ep.ip, ep.port);
         } else {
-            eprintln!(
-                "  forward → {}:{} [{}]",
-                ep.ip,
-                ep.port,
-                extras.join(" ")
-            );
+            eprintln!("  forward → {}:{} [{}]", ep.ip, ep.port, extras.join(" "));
         }
     }
 
@@ -407,10 +403,7 @@ async fn main() {
                                 // (notably `IP_MULTICAST_IF`).
                                 let sref = SockRef::from(send_sock.as_ref());
                                 if let Err(e) = sref.set_multicast_ttl_v4(ttl) {
-                                    eprintln!(
-                                        "mshim-rs: set multicast ttl for {}: {e}",
-                                        tgt.addr
-                                    );
+                                    eprintln!("mshim-rs: set multicast ttl for {}: {e}", tgt.addr);
                                 }
                                 if let Err(e) = sref.set_multicast_if_v4(&iface) {
                                     eprintln!(
@@ -554,7 +547,10 @@ mod tests {
         // macOS/BSD; one of them must resolve to 127.0.0.1.
         let lo = resolve_iface_v4("lo").or_else(|_| resolve_iface_v4("lo0"));
         if let Ok(v4) = lo {
-            assert!(v4.is_loopback(), "loopback iface should map to a loopback addr");
+            assert!(
+                v4.is_loopback(),
+                "loopback iface should map to a loopback addr"
+            );
         }
     }
 

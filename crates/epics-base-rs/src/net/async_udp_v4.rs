@@ -533,9 +533,7 @@ impl AsyncUdpV4 {
         // netmask matches every destination. `subnet_contains` rejects
         // it in pass (1) so it never shadows a specific subnet; here it
         // is the explicit fallback for an otherwise-unrouted dest.
-        if let Some(nic) =
-            send_eligible().find(|n| !n.is_loopback && is_default_route(n.netmask))
-        {
+        if let Some(nic) = send_eligible().find(|n| !n.is_loopback && is_default_route(n.netmask)) {
             return Ok(nic);
         }
         // (5) First non-loopback NIC.

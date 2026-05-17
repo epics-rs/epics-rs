@@ -9,10 +9,10 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+use modbus_rs::ModbusDataType;
 use modbus_rs::driver::{ModbusConfig, ModbusEngine, ModbusFunctionCode, OctetTransport};
 use modbus_rs::error::{ModbusError, ModbusResult};
 use modbus_rs::interpose::LinkType;
-use modbus_rs::ModbusDataType;
 
 /// A Modbus/TCP `OctetTransport` over a blocking [`TcpStream`].
 struct TcpTransport {
@@ -119,12 +119,20 @@ fn connect(port: u16) -> TcpTransport {
 fn read_holding_registers_over_tcp() {
     let port = spawn_slave(vec![10, 20, 30, 40]);
     let mut transport = connect(port);
-    let mut engine =
-        ModbusEngine::new(config(ModbusFunctionCode::ReadHoldingRegisters, 0, 4), LinkType::Tcp)
-            .unwrap();
+    let mut engine = ModbusEngine::new(
+        config(ModbusFunctionCode::ReadHoldingRegisters, 0, 4),
+        LinkType::Tcp,
+    )
+    .unwrap();
 
     let words = engine
-        .do_modbus_io(&mut transport, ModbusFunctionCode::ReadHoldingRegisters, 0, &[], 4)
+        .do_modbus_io(
+            &mut transport,
+            ModbusFunctionCode::ReadHoldingRegisters,
+            0,
+            &[],
+            4,
+        )
         .expect("read");
     assert_eq!(words, vec![10, 20, 30, 40]);
     assert_eq!(engine.stats.read_ok, 1);
@@ -135,9 +143,11 @@ fn read_holding_registers_over_tcp() {
 fn poll_refreshes_register_buffer_over_tcp() {
     let port = spawn_slave(vec![100, 200]);
     let mut transport = connect(port);
-    let mut engine =
-        ModbusEngine::new(config(ModbusFunctionCode::ReadHoldingRegisters, 0, 2), LinkType::Tcp)
-            .unwrap();
+    let mut engine = ModbusEngine::new(
+        config(ModbusFunctionCode::ReadHoldingRegisters, 0, 2),
+        LinkType::Tcp,
+    )
+    .unwrap();
 
     assert!(engine.poll(&mut transport).expect("first poll")); // changed from zero
     assert_eq!(engine.data(), &[100, 200]);
@@ -150,20 +160,36 @@ fn write_single_register_round_trip_over_tcp() {
     let mut transport = connect(port);
 
     // Write 0xABCD to register 5.
-    let mut writer =
-        ModbusEngine::new(config(ModbusFunctionCode::WriteSingleRegister, 0, 8), LinkType::Tcp)
-            .unwrap();
+    let mut writer = ModbusEngine::new(
+        config(ModbusFunctionCode::WriteSingleRegister, 0, 8),
+        LinkType::Tcp,
+    )
+    .unwrap();
     writer
-        .do_modbus_io(&mut transport, ModbusFunctionCode::WriteSingleRegister, 5, &[0xABCD], 1)
+        .do_modbus_io(
+            &mut transport,
+            ModbusFunctionCode::WriteSingleRegister,
+            5,
+            &[0xABCD],
+            1,
+        )
         .expect("write");
     assert_eq!(writer.stats.write_ok, 1);
 
     // Read it back through the same connection.
-    let mut reader =
-        ModbusEngine::new(config(ModbusFunctionCode::ReadHoldingRegisters, 0, 8), LinkType::Tcp)
-            .unwrap();
+    let mut reader = ModbusEngine::new(
+        config(ModbusFunctionCode::ReadHoldingRegisters, 0, 8),
+        LinkType::Tcp,
+    )
+    .unwrap();
     let words = reader
-        .do_modbus_io(&mut transport, ModbusFunctionCode::ReadHoldingRegisters, 0, &[], 8)
+        .do_modbus_io(
+            &mut transport,
+            ModbusFunctionCode::ReadHoldingRegisters,
+            0,
+            &[],
+            8,
+        )
         .expect("read back");
     assert_eq!(words[5], 0xABCD);
 }
@@ -173,11 +199,19 @@ fn modbus_exception_surfaces_over_tcp() {
     let port = spawn_slave(vec![]);
     let mut transport = connect(port);
     // The slave answers function 4 (read input registers) with an exception.
-    let mut engine =
-        ModbusEngine::new(config(ModbusFunctionCode::ReadInputRegisters, 0, 2), LinkType::Tcp)
-            .unwrap();
+    let mut engine = ModbusEngine::new(
+        config(ModbusFunctionCode::ReadInputRegisters, 0, 2),
+        LinkType::Tcp,
+    )
+    .unwrap();
     let err = engine
-        .do_modbus_io(&mut transport, ModbusFunctionCode::ReadInputRegisters, 0, &[], 2)
+        .do_modbus_io(
+            &mut transport,
+            ModbusFunctionCode::ReadInputRegisters,
+            0,
+            &[],
+            2,
+        )
         .unwrap_err();
     assert!(matches!(err, ModbusError::Exception(_)));
     assert_eq!(engine.stats.io_errors, 1);

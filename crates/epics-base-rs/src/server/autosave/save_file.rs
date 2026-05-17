@@ -344,9 +344,7 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
         EpicsValue::Enum(v) => v.to_string(),
         EpicsValue::Char(v) => v.to_string(),
         // Arrays: C `@array@ { "v" "v" }` form.
-        EpicsValue::DoubleArray(arr) => {
-            c_array(arr.iter().map(|v| format!("{:.14e}", v)))
-        }
+        EpicsValue::DoubleArray(arr) => c_array(arr.iter().map(|v| format!("{:.14e}", v))),
         EpicsValue::FloatArray(arr) => c_array(arr.iter().map(|v| format!("{:.7e}", v))),
         EpicsValue::LongArray(arr) => c_array(arr.iter()),
         EpicsValue::CharArray(arr) => c_array(arr.iter()),
@@ -493,8 +491,7 @@ mod tests {
         assert_eq!(read.len(), 2);
         let arr = read.iter().find(|e| e.pv_name == "PV:ARRAY").unwrap();
         assert_eq!(arr.value, "[10,20]");
-        let parsed =
-            parse_save_value(&arr.value, &EpicsValue::LongArray(vec![])).unwrap();
+        let parsed = parse_save_value(&arr.value, &EpicsValue::LongArray(vec![])).unwrap();
         assert_eq!(parsed, EpicsValue::LongArray(vec![10, 20]));
     }
 

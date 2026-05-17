@@ -33,7 +33,9 @@ fn sscanf_long(text: &str) -> Option<i64> {
     let start = i;
     let mut value: i64 = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value.saturating_mul(10).saturating_add((bytes[i] - b'0') as i64);
+        value = value
+            .saturating_mul(10)
+            .saturating_add((bytes[i] - b'0') as i64);
         i += 1;
     }
     if i == start {
@@ -242,7 +244,9 @@ mod tests {
             );
         }
         // Everything else is false — including values the old impl accepted.
-        for falsy in &["1", "true", "TRUE", "on", "yes ", " yes", "yes\n", "no", "0", ""] {
+        for falsy in &[
+            "1", "true", "TRUE", "on", "yes ", " yes", "yes\n", "no", "0", "",
+        ] {
             unsafe { std::env::set_var("_EPICS_RT_TEST_BOOL", falsy) };
             assert!(
                 !get_bool("_EPICS_RT_TEST_BOOL", true),

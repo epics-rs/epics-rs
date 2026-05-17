@@ -409,7 +409,8 @@ mod tests {
     #[test]
     fn put_get_val_roundtrip() {
         let mut r = Int64outRecord::new(0);
-        r.put_field("VAL", EpicsValue::Int64(1234567890123)).unwrap();
+        r.put_field("VAL", EpicsValue::Int64(1234567890123))
+            .unwrap();
         assert_eq!(r.get_field("VAL"), Some(EpicsValue::Int64(1234567890123)));
     }
 }

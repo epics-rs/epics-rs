@@ -73,7 +73,10 @@ impl FunctionCode {
     pub fn is_bit_function(self) -> bool {
         matches!(
             self,
-            Self::ReadCoils | Self::ReadDiscreteInputs | Self::WriteSingleCoil | Self::WriteMultipleCoils
+            Self::ReadCoils
+                | Self::ReadDiscreteInputs
+                | Self::WriteSingleCoil
+                | Self::WriteMultipleCoils
         )
     }
 
@@ -317,7 +320,10 @@ impl ResponsePdu {
         let fcode = buf[0];
         if fcode & MODBUS_EXCEPTION_FCN != 0 {
             if buf.len() < 2 {
-                return Err(ModbusError::FrameTooShort { got: buf.len(), need: 2 });
+                return Err(ModbusError::FrameTooShort {
+                    got: buf.len(),
+                    need: 2,
+                });
             }
             return Err(ModbusError::Exception(ExceptionCode::from_u8(buf[1])));
         }
@@ -332,10 +338,7 @@ impl ResponsePdu {
     /// the byte count against the actual payload length.
     pub fn read_data(&self) -> ModbusResult<&[u8]> {
         if self.data.is_empty() {
-            return Err(ModbusError::FrameTooShort {
-                got: 1,
-                need: 2,
-            });
+            return Err(ModbusError::FrameTooShort { got: 1, need: 2 });
         }
         let byte_count = self.data[0] as usize;
         let payload = &self.data[1..];
@@ -388,7 +391,9 @@ mod tests {
         let pdu = RequestPdu::write_multiple_registers(1, 0x0000, &[0x000A, 0x0102]);
         assert_eq!(
             pdu.as_bytes(),
-            &[0x01, 0x10, 0x00, 0x00, 0x00, 0x02, 0x04, 0x00, 0x0A, 0x01, 0x02]
+            &[
+                0x01, 0x10, 0x00, 0x00, 0x00, 0x02, 0x04, 0x00, 0x0A, 0x01, 0x02
+            ]
         );
     }
 
@@ -409,7 +414,13 @@ mod tests {
 
     #[test]
     fn read_write_multiple_layout() {
-        let pdu = RequestPdu::read_write_multiple_registers(1, 0x03, 0x06, 0x0E, &[0x00FF, 0x00FF, 0x00FF]);
+        let pdu = RequestPdu::read_write_multiple_registers(
+            1,
+            0x03,
+            0x06,
+            0x0E,
+            &[0x00FF, 0x00FF, 0x00FF],
+        );
         assert_eq!(
             pdu.as_bytes(),
             &[

@@ -252,11 +252,7 @@ pub fn get_current() -> SystemTime {
 
     // C `useOsdGetCurrent` short-circuit: no ratchet, no error count.
     if inner.use_osd_get_current {
-        if let Some(idx) = inner
-            .current_providers
-            .iter()
-            .position(|p| p.is_os_default)
-        {
+        if let Some(idx) = inner.current_providers.iter().position(|p| p.is_os_default) {
             if let Some(t) = (inner.current_providers[idx].get_time)() {
                 let name = inner.current_providers[idx].name.clone();
                 inner.last_provided_time = t;
@@ -500,10 +496,9 @@ pub fn report(level: i32) -> String {
             out.push_str(&format!("    \"{}\", priority = {}\n", p.name, p.priority));
             if level != 0 {
                 match (p.get_time)() {
-                    Some(t) => out.push_str(&format!(
-                        "\tCurrent Time is {}.\n",
-                        format_time_sample(t)
-                    )),
+                    Some(t) => {
+                        out.push_str(&format!("\tCurrent Time is {}.\n", format_time_sample(t)))
+                    }
                     None => out.push_str("\tCurrent Time not available\n"),
                 }
             }

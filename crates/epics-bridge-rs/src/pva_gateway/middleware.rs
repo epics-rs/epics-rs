@@ -930,9 +930,7 @@ mod tests {
     /// matches the same names a `BL10C:*` glob would.
     #[test]
     fn acl_regex_deny_anchored() {
-        let cfg = AclConfig::default()
-            .deny_regex(r"BL10C:.*:HV")
-            .unwrap();
+        let cfg = AclConfig::default().deny_regex(r"BL10C:.*:HV").unwrap();
         assert!(!cfg.allowed("BL10C:RFP:HV"));
         assert!(!cfg.allowed("BL10C::HV"));
         // Anchored: the regex must match the WHOLE name.
@@ -945,9 +943,7 @@ mod tests {
     /// exactly like a glob allow-only entry.
     #[test]
     fn acl_regex_allow_only_default_denies() {
-        let cfg = AclConfig::default()
-            .allow_regex(r"(SR|BL)\d+:.*")
-            .unwrap();
+        let cfg = AclConfig::default().allow_regex(r"(SR|BL)\d+:.*").unwrap();
         assert!(cfg.allowed("SR01:CURRENT"));
         assert!(cfg.allowed("BL10:SHUTTER"));
         assert!(!cfg.allowed("RFP:HV"));
@@ -1034,9 +1030,7 @@ mod tests {
         let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
         let inner = GatewayChannelSource::new(cache);
 
-        let cfg = AclConfig::default()
-            .deny_regex(r"SECRET:.*")
-            .unwrap();
+        let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
         let acl = AclLayer::new(cfg).layer(inner);
 
         // Denied name short-circuits at the layer — has_pv is false

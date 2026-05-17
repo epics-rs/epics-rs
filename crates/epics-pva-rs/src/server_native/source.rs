@@ -643,9 +643,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(<Self as ChannelSource>::process_checked(
-            self, checked, ctx,
-        ))
+        Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
     }
     fn notify_watermark_high(&self, name: &str) {
         <Self as ChannelSource>::notify_watermark_high(self, name);

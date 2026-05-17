@@ -438,14 +438,13 @@ impl DrvAsynIPPort {
             // code used `SocketAddr::parse`, which only accepts literal
             // IPs, so a hostname target (valid per the config parser)
             // failed, as did any IPv6 target (domain was forced to IPV4).
-            let addrs: Vec<std::net::SocketAddr> =
-                addr_str
-                    .to_socket_addrs()
-                    .map_err(|e| AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("failed to resolve '{addr_str}': {e}"),
-                    })?
-                    .collect();
+            let addrs: Vec<std::net::SocketAddr> = addr_str
+                .to_socket_addrs()
+                .map_err(|e| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("failed to resolve '{addr_str}': {e}"),
+                })?
+                .collect();
 
             let mut last_err: Option<AsynError> = None;
             for remote_addr in &addrs {
@@ -483,8 +482,7 @@ impl DrvAsynIPPort {
                     last_err = Some(AsynError::Io(e));
                     continue;
                 }
-                match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout)
-                {
+                match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
                     Ok(()) => return Ok(TcpStream::from(socket)),
                     Err(e) => last_err = Some(AsynError::Io(e)),
                 }

@@ -693,8 +693,8 @@ impl Record for MbboRecord {
     /// and `SOFT_ALARM/INVALID` when `VAL > 15` with a defined state
     /// table. The framework's `rec_gbl_check_udf` raises UDF.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        use crate::server::record::AlarmSeverity;
         use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
 
         // SOFT_ALARM for an illegal VAL — C convert() path.
         if self.soft_alarm {

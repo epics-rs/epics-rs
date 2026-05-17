@@ -34,8 +34,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{CaError, CaResult};
 
-use super::include::{DbLoadConfig, parse_db_file};
 use super::DbRecordDef;
+use super::include::{DbLoadConfig, parse_db_file};
 
 /// Token from the substitutions-file lexer (`dbLoadTemplate_lex.l`).
 #[derive(Debug, Clone, PartialEq)]
@@ -250,9 +250,7 @@ impl Parser {
                 Tok::Global => self.parse_global()?,
                 Tok::File => self.parse_file()?,
                 other => {
-                    return Err(self.err(format!(
-                        "expected 'global' or 'file', got {other:?}"
-                    )))
+                    return Err(self.err(format!("expected 'global' or 'file', got {other:?}")));
                 }
             }
         }
@@ -303,7 +301,7 @@ impl Parser {
                 }
                 Some(Tok::Str(_)) => names.push(self.expect_str()?),
                 Some(other) => {
-                    return Err(self.err(format!("expected pattern name, got {other:?}")))
+                    return Err(self.err(format!("expected pattern name, got {other:?}")));
                 }
                 None => return Err(self.err("unterminated pattern name list")),
             }
@@ -326,11 +324,7 @@ impl Parser {
                     self.emit_load(filename, self.pattern_macros(&names, &row));
                 }
                 Tok::CBrace => break,
-                other => {
-                    return Err(self.err(format!(
-                        "expected substitution row, got {other:?}"
-                    )))
-                }
+                other => return Err(self.err(format!("expected substitution row, got {other:?}"))),
             }
         }
         Ok(())
@@ -347,7 +341,7 @@ impl Parser {
                 }
                 Some(Tok::Str(_)) => values.push(self.expect_str()?),
                 Some(other) => {
-                    return Err(self.err(format!("expected substitution value, got {other:?}")))
+                    return Err(self.err(format!("expected substitution value, got {other:?}")));
                 }
                 None => return Err(self.err("unterminated substitution row")),
             }
@@ -387,11 +381,7 @@ impl Parser {
                     self.emit_load(filename, defs);
                 }
                 Tok::CBrace => break,
-                other => {
-                    return Err(self.err(format!(
-                        "expected substitution row, got {other:?}"
-                    )))
-                }
+                other => return Err(self.err(format!("expected substitution row, got {other:?}"))),
             }
         }
         Ok(())
@@ -413,9 +403,7 @@ impl Parser {
                     defs.push((name, value));
                 }
                 Some(other) => {
-                    return Err(self.err(format!(
-                        "expected 'name=value', got {other:?}"
-                    )))
+                    return Err(self.err(format!("expected 'name=value', got {other:?}")));
                 }
                 None => return Err(self.err("unterminated definition block")),
             }

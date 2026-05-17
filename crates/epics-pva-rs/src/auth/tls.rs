@@ -98,7 +98,9 @@ pub enum TlsConfigError {
     Pkcs12 { path: PathBuf, reason: String },
     /// The crate was built without the `pkcs12` feature but the keychain
     /// content is not PEM (no `-----BEGIN` marker).
-    #[error("{0:?} is not a PEM bundle and PKCS#12 support is disabled (enable the `pkcs12` feature)")]
+    #[error(
+        "{0:?} is not a PEM bundle and PKCS#12 support is disabled (enable the `pkcs12` feature)"
+    )]
     Pkcs12Disabled(PathBuf),
 }
 
@@ -232,8 +234,7 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
         } = load_keychain(&path, password.as_deref())?;
         let key = key.ok_or_else(|| TlsConfigError::NoKey(path.to_path_buf()))?;
         // Present leaf + carried CA chain (see server-side rationale).
-        let chain: Vec<CertificateDer<'static>> =
-            certs.into_iter().chain(ca_certs).collect();
+        let chain: Vec<CertificateDer<'static>> = certs.into_iter().chain(ca_certs).collect();
         builder
             .with_client_auth_cert(chain, key)
             .map_err(TlsConfigError::Rustls)?
@@ -269,10 +270,7 @@ struct Keychain {
 /// containing a `-----BEGIN` marker is treated as PEM, anything else
 /// is handed to the PKCS#12 parser. `password` is only consulted for
 /// PKCS#12 input.
-fn load_keychain(
-    path: &Path,
-    password: Option<&str>,
-) -> Result<Keychain, TlsConfigError> {
+fn load_keychain(path: &Path, password: Option<&str>) -> Result<Keychain, TlsConfigError> {
     let mut file = File::open(path).map_err(|source| TlsConfigError::Io {
         path: path.to_path_buf(),
         source,
@@ -296,15 +294,10 @@ fn load_keychain(
 fn is_pem(bytes: &[u8]) -> bool {
     // Scan for the literal marker; a PEM file may be prefixed with
     // comments or blank lines before the first block.
-    bytes
-        .windows(11)
-        .any(|w| w == b"-----BEGIN ")
+    bytes.windows(11).any(|w| w == b"-----BEGIN ")
 }
 
-fn load_pem_keychain(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<Keychain, TlsConfigError> {
+fn load_pem_keychain(path: &Path, bytes: &[u8]) -> Result<Keychain, TlsConfigError> {
     let mut reader = BufReader::new(bytes);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
@@ -317,11 +310,9 @@ fn load_pem_keychain(
     }
 
     let mut reader = BufReader::new(bytes);
-    let key = rustls_pemfile::private_key(&mut reader).map_err(|source| {
-        TlsConfigError::Pem {
-            path: path.to_path_buf(),
-            source,
-        }
+    let key = rustls_pemfile::private_key(&mut reader).map_err(|source| TlsConfigError::Pem {
+        path: path.to_path_buf(),
+        source,
     })?;
 
     Ok(Keychain {
@@ -378,8 +369,7 @@ fn load_pkcs12_keychain(
     if !pfx.verify_mac(password) {
         return Err(TlsConfigError::Pkcs12 {
             path: path.to_path_buf(),
-            reason: "MAC verification failed (wrong EPICS_PVA*_TLS_KEYCHAIN_PASSWORD?)"
-                .to_string(),
+            reason: "MAC verification failed (wrong EPICS_PVA*_TLS_KEYCHAIN_PASSWORD?)".to_string(),
         });
     }
 
@@ -436,11 +426,12 @@ fn load_pkcs12_keychain(
     }
 
     // Identify the leaf index — pure logic, see `select_leaf_index`.
-    let leaf_idx = select_leaf_index(&cert_bags, key_local_id.as_deref())
-        .map_err(|reason| TlsConfigError::Pkcs12 {
+    let leaf_idx = select_leaf_index(&cert_bags, key_local_id.as_deref()).map_err(|reason| {
+        TlsConfigError::Pkcs12 {
             path: path.to_path_buf(),
             reason,
-        })?;
+        }
+    })?;
 
     // Split: the identified leaf first, every other cert is a CA.
     let mut certs: Vec<CertificateDer<'static>> = Vec::new();
@@ -592,8 +583,7 @@ mod load_pkcs12_pbes2 {
     /// `id-sha1` digest algorithm OID (OIW).
     const OID_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
     /// `id-sha256` digest algorithm OID (NIST).
-    const OID_SHA256: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+    const OID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 
     /// `keyBag` — an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 7292 §4.2.1).
     const OID_KEY_BAG: ObjectIdentifier =
@@ -866,8 +856,7 @@ mod load_pkcs12_pbes2 {
         // RFC 7292 MAC purpose byte is 3 (MAC key material).
         let ok = if digest_oid == OID_SHA256 {
             // SHA-256: 32-byte output, 64-byte block.
-            let key =
-                pkcs12_kdf::<rc_sha2::Sha256>(3, &password_bmp, salt, rounds, 64, 32);
+            let key = pkcs12_kdf::<rc_sha2::Sha256>(3, &password_bmp, salt, rounds, 64, 32);
             let mut mac = <rc_hmac::Hmac<rc_sha2::Sha256>>::new_from_slice(&key)
                 .map_err(|e| err(path, format!("HMAC init failed: {e}")))?;
             mac.update(auth_safe_content);
@@ -949,9 +938,7 @@ mod load_pkcs12_pbes2 {
             let epki = bag
                 .bag_value
                 .decode_as::<EncryptedPrivateKeyInfo>()
-                .map_err(|e| {
-                    err(path, format!("EncryptedPrivateKeyInfo decode failed: {e}"))
-                })?;
+                .map_err(|e| err(path, format!("EncryptedPrivateKeyInfo decode failed: {e}")))?;
             let pkcs8 = pbes2_decrypt(
                 path,
                 &epki.encryption_algorithm,
@@ -1047,9 +1034,10 @@ mod load_pkcs12_pbes2 {
                     .decode_as::<EncryptedData>()
                     .map_err(|e| err(path, format!("EncryptedData decode failed: {e}")))?;
                 let eci = &enc.enc_content_info;
-                let ciphertext = eci.encrypted_content.as_ref().ok_or_else(|| {
-                    err(path, "EncryptedData has no encryptedContent")
-                })?;
+                let ciphertext = eci
+                    .encrypted_content
+                    .as_ref()
+                    .ok_or_else(|| err(path, "EncryptedData has no encryptedContent"))?;
                 pbes2_decrypt(path, &eci.content_enc_alg, ciphertext.as_bytes(), password)?
             } else {
                 // Enveloped (public-key) SafeContents — not supported.
@@ -1461,9 +1449,7 @@ mod tests {
             .distinguished_name
             .push(rcgen::DnType::CommonName, "epics-leaf");
         let leaf_key = rcgen::KeyPair::generate().unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
 
         let pem = Pem {
             cert: leaf_cert.pem(),
@@ -1580,10 +1566,7 @@ mod tests {
         // (1) Key bag localKeyID matches a cert bag's own attribute.
         // CA is first in bag order — the OLD code would have picked it.
         let attr_id = vec![0xAAu8; 20];
-        let bags = vec![
-            (ca.clone(), None),
-            (leaf.clone(), Some(attr_id.clone())),
-        ];
+        let bags = vec![(ca.clone(), None), (leaf.clone(), Some(attr_id.clone()))];
         assert_eq!(
             select_leaf_index(&bags, Some(&attr_id)).unwrap(),
             1,
@@ -1607,10 +1590,7 @@ mod tests {
         assert!(err.contains("matches no certificate"), "got: {err}");
 
         // (4) No key localKeyID + a single cert → unambiguous.
-        assert_eq!(
-            select_leaf_index(&[(leaf.clone(), None)], None).unwrap(),
-            0,
-        );
+        assert_eq!(select_leaf_index(&[(leaf.clone(), None)], None).unwrap(), 0,);
 
         // (5) No key localKeyID + multiple certs → ambiguous, hard
         // error rather than guessing (the F7 silent-CA-as-leaf bug).
@@ -1725,8 +1705,8 @@ mod tests {
         ca: &rcgen::Certificate,
         ca_key: &rcgen::KeyPair,
     ) -> CertificateDer<'static> {
-        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
-            .expect("leaf params");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("leaf params");
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name

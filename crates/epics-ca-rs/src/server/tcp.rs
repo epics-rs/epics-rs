@@ -748,10 +748,11 @@ async fn accept_loop(
                             Ok(Ok(tls_stream)) => {
                                 // Extract verified peer identity + issuer
                                 // from the client certificate, if presented.
-                                let leaf_cert =
-                                    tls_stream.get_ref().1.peer_certificates().and_then(
-                                        |chain| chain.first().cloned(),
-                                    );
+                                let leaf_cert = tls_stream
+                                    .get_ref()
+                                    .1
+                                    .peer_certificates()
+                                    .and_then(|chain| chain.first().cloned());
                                 let (identity, authority) = leaf_cert
                                     .as_ref()
                                     .map(|cert| {
@@ -767,12 +768,11 @@ async fn accept_loop(
                                 // into `handle_client` so cap-token
                                 // verification is bound to this circuit.
                                 #[cfg(feature = "cap-tokens")]
-                                let tls_channel_binding =
-                                    leaf_cert.as_ref().map(|cert| {
-                                        crate::cap_token::ChannelBinding::from_peer_cert_der(
-                                            cert.as_ref(),
-                                        )
-                                    });
+                                let tls_channel_binding = leaf_cert.as_ref().map(|cert| {
+                                    crate::cap_token::ChannelBinding::from_peer_cert_der(
+                                        cert.as_ref(),
+                                    )
+                                });
                                 if let Some(ref id) = identity {
                                     tracing::info!(
                                         peer = %peer,
@@ -1528,10 +1528,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // every well-formed token; cap-tokens was non-
                 // functional whenever a verifier was configured.
                 state.username = match (&state.cap_token_verifier, raw.starts_with("cap:")) {
-                    (Some(v), true) => match v.verify(
-                        &raw,
-                        state.tls_channel_binding.as_ref(),
-                    ) {
+                    (Some(v), true) => match v.verify(&raw, state.tls_channel_binding.as_ref()) {
                         Ok(claims) => {
                             tracing::debug!(peer = %state.peer, sub = %claims.sub,
                                 "cap-token verified");

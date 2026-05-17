@@ -450,7 +450,8 @@ impl PvRequestExpr {
                             } else {
                                 format!("{path}.{name}")
                             };
-                            s.fields.push((name.clone(), fill_field(sub, &child_path, expr)));
+                            s.fields
+                                .push((name.clone(), fill_field(sub, &child_path, expr)));
                         }
                     }
                     PvField::Structure(s)
@@ -869,11 +870,7 @@ impl<'a> Parser<'a> {
         }
         // Merge into any existing option set for the same field path
         // (`field(value[a=1],value[b=2])` is equivalent to one bracket).
-        if let Some((_, existing)) = out
-            .field_options
-            .iter_mut()
-            .find(|(p, _)| p == field_path)
-        {
+        if let Some((_, existing)) = out.field_options.iter_mut().find(|(p, _)| p == field_path) {
             existing.extend(opts);
         } else if !opts.is_empty() {
             out.field_options.push((field_path.to_string(), opts));
@@ -1047,7 +1044,10 @@ mod tests {
 
     #[test]
     fn parses_dotted_dialect() {
-        assert_eq!(fields("field(value,alarm.severity)"), ["value", "alarm.severity"]);
+        assert_eq!(
+            fields("field(value,alarm.severity)"),
+            ["value", "alarm.severity"]
+        );
     }
 
     #[test]
@@ -1072,10 +1072,7 @@ mod tests {
     #[test]
     fn nested_brace_groups() {
         // `a{b{c,d},e}` == `a.b.c, a.b.d, a.e`.
-        assert_eq!(
-            fields("field(a{b{c,d},e})"),
-            ["a.b.c", "a.b.d", "a.e"]
-        );
+        assert_eq!(fields("field(a{b{c,d},e})"), ["a.b.c", "a.b.d", "a.e"]);
     }
 
     #[test]
@@ -1089,10 +1086,7 @@ mod tests {
     #[test]
     fn dotted_name_with_trailing_brace_group() {
         // A dotted prefix segment may itself carry a brace group.
-        assert_eq!(
-            fields("field(a.b{c,d})"),
-            ["a.b.c", "a.b.d"]
-        );
+        assert_eq!(fields("field(a.b{c,d})"), ["a.b.c", "a.b.d"]);
         // …and that equals the fully-dotted spelling.
         assert_eq!(
             PvRequestExpr::parse("field(a.b{c,d})").unwrap(),
@@ -1130,8 +1124,7 @@ mod tests {
 
     #[test]
     fn brace_groups_coexist_with_record_options() {
-        let expr =
-            PvRequestExpr::parse("field(value{a,b})record[pipeline=true]").unwrap();
+        let expr = PvRequestExpr::parse("field(value{a,b})record[pipeline=true]").unwrap();
         assert_eq!(expr.fields, ["value.a", "value.b"]);
         assert_eq!(
             expr.record_options,
@@ -1141,10 +1134,7 @@ mod tests {
 
     #[test]
     fn whitespace_inside_brace_group() {
-        assert_eq!(
-            fields("field( value { a , b } )"),
-            ["value.a", "value.b"]
-        );
+        assert_eq!(fields("field( value { a , b } )"), ["value.a", "value.b"]);
     }
 
     #[test]
@@ -1222,8 +1212,7 @@ mod tests {
 
     #[test]
     fn per_field_multiple_options_in_one_bracket() {
-        let expr =
-            PvRequestExpr::parse("field(value[deadband=abs:1.0,array=1:3])").unwrap();
+        let expr = PvRequestExpr::parse("field(value[deadband=abs:1.0,array=1:3])").unwrap();
         assert_eq!(
             expr.field_options[0].1,
             [
@@ -1265,7 +1254,10 @@ mod tests {
         };
         assert_eq!(ofields.len(), 1);
         assert_eq!(ofields[0].0, "deadband");
-        assert!(matches!(ofields[0].1, FieldDesc::Scalar(ScalarType::String)));
+        assert!(matches!(
+            ofields[0].1,
+            FieldDesc::Scalar(ScalarType::String)
+        ));
     }
 
     #[test]
@@ -1345,10 +1337,9 @@ mod tests {
 
     #[test]
     fn per_field_options_coexist_with_other_fields_and_record() {
-        let expr = PvRequestExpr::parse(
-            "field(value[deadband=abs:1.0],timeStamp)record[pipeline=true]",
-        )
-        .unwrap();
+        let expr =
+            PvRequestExpr::parse("field(value[deadband=abs:1.0],timeStamp)record[pipeline=true]")
+                .unwrap();
         assert_eq!(expr.fields, ["value", "timeStamp"]);
         assert_eq!(
             expr.field_options,

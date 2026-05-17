@@ -896,7 +896,11 @@ mod wire_format_tests {
             SystemTime::UNIX_EPOCH,
         )
         .unwrap();
-        assert_eq!(buf.len(), 16, "STS_DOUBLE must be 16 bytes (4 meta + 4 pad + 8 value)");
+        assert_eq!(
+            buf.len(),
+            16,
+            "STS_DOUBLE must be 16 bytes (4 meta + 4 pad + 8 value)"
+        );
         // status(2) + severity(2)
         assert_eq!(&buf[0..2], &1u16.to_be_bytes());
         assert_eq!(&buf[2..4], &2u16.to_be_bytes());
@@ -931,7 +935,11 @@ mod wire_format_tests {
         let v = EpicsValue::Char(0x41);
         let buf =
             serialize_dbr(super::super::DBR_STS_CHAR, &v, 0, 0, SystemTime::UNIX_EPOCH).unwrap();
-        assert_eq!(buf.len(), 6, "STS_CHAR must be 6 bytes (4 meta + 1 pad + 1 value)");
+        assert_eq!(
+            buf.len(),
+            6,
+            "STS_CHAR must be 6 bytes (4 meta + 1 pad + 1 value)"
+        );
         assert_eq!(buf[4], 0, "RISC_pad");
         assert_eq!(buf[5], 0x41, "value at offset 5");
     }

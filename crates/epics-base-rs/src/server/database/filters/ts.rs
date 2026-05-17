@@ -292,8 +292,7 @@ mod tests {
     fn sec_mode_unix_epoch_no_post_2038_truncation() {
         // 2^31 + 1000 seconds past the Unix epoch — beyond i32::MAX.
         let big = i32::MAX as u64 + 1000;
-        let ts = SystemTime::UNIX_EPOCH
-            + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + big);
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + big);
         let f = TimestampFilter::with_mode_epoch(TsMode::Seconds, TsEpoch::Unix);
         let out = f.apply(make_event(ts)).unwrap();
         match out.event.snapshot.value {

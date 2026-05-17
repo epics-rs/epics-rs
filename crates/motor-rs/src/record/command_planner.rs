@@ -199,19 +199,6 @@ impl MotorRecord {
                     enable: self.pco.enable,
                 });
             }
-            CommandSource::PcoEnable => {
-                // C: 05b25c1d (PR #248) — push the latched PCO configuration
-                // first, then enable/disable so the driver uses fresh params.
-                effects.commands.push(MotorCommand::SetPcoConfig {
-                    start: self.pco.start,
-                    end: self.pco.end,
-                    increment: self.pco.increment,
-                    pulse_width_us: self.pco.pulse_width_us,
-                });
-                effects.commands.push(MotorCommand::EnablePco {
-                    enable: self.pco.enable,
-                });
-            }
         }
 
         effects
@@ -415,8 +402,8 @@ impl MotorRecord {
         self.ctrl.stop = false; // pulse field
         // Record-side state changes (MIP_STOP, target sync) apply only when
         // the record believes motion is in flight.
-        let in_motion = self.stat.phase != MotionPhase::Idle
-            || self.stat.mip.contains(MipFlags::EXTERNAL);
+        let in_motion =
+            self.stat.phase != MotionPhase::Idle || self.stat.mip.contains(MipFlags::EXTERNAL);
         if in_motion {
             self.stat.mip.insert(MipFlags::STOP);
             self.internal.backlash_pending = false;
@@ -710,9 +697,7 @@ impl MotorRecord {
                     if self.ctrl.jogf || self.ctrl.jogr {
                         let forward = self.ctrl.jogf;
                         self.start_jog(forward, effects);
-                    } else if (self.pos.dval - self.pos.drbv).abs()
-                        > self.retry.rdbd.max(1e-12)
-                    {
+                    } else if (self.pos.dval - self.pos.drbv).abs() > self.retry.rdbd.max(1e-12) {
                         self.plan_absolute_move(effects);
                     }
                 }

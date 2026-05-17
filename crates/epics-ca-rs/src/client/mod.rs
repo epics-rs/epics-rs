@@ -569,9 +569,7 @@ impl CaClient {
                                 let n = addr_refs.entry(addr).or_insert(0);
                                 *n += 1;
                                 if *n == 1
-                                    && fwd_search_tx
-                                        .send(SearchRequest::AddAddress(addr))
-                                        .is_err()
+                                    && fwd_search_tx.send(SearchRequest::AddAddress(addr)).is_err()
                                 {
                                     break;
                                 }
@@ -3976,8 +3974,14 @@ mod event_watcher_tests {
         let abort_handle = handle.abort_handle();
         let watcher = EventWatcher { handle };
         tokio::task::yield_now().await;
-        assert!(ran.load(Ordering::SeqCst), "watcher task should have started");
-        assert!(!abort_handle.is_finished(), "task still running before drop");
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "watcher task should have started"
+        );
+        assert!(
+            !abort_handle.is_finished(),
+            "task still running before drop"
+        );
         drop(watcher);
         for _ in 0..100 {
             if abort_handle.is_finished() {
@@ -4099,7 +4103,10 @@ mod typed_string_put_tests {
         );
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
-        assert_eq!(hdr.data_type, 0, "string-array put must wire DBR_STRING (0)");
+        assert_eq!(
+            hdr.data_type, 0,
+            "string-array put must wire DBR_STRING (0)"
+        );
         assert_eq!(hdr.count, 3, "count must be the element count");
     }
 }

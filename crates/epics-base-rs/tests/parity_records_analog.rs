@@ -128,7 +128,8 @@ fn m3_ao_ivoa_set_to_ivov_reconverts_rval() {
     r.ivov = 50.0;
     // IVOA=Set_output_to_IVOV must run the full convert(), so RVAL
     // reflects the converted IVOV — not a stale pre-IVOA value.
-    r.apply_invalid_output_value(EpicsValue::Double(50.0)).unwrap();
+    r.apply_invalid_output_value(EpicsValue::Double(50.0))
+        .unwrap();
     assert_eq!(r.val, 50.0, "VAL set to IVOV");
     assert_eq!(r.oval, 50.0, "OVAL set to IVOV");
     assert_eq!(r.rval, 25, "RVAL re-converted from IVOV (50/2)");
@@ -182,7 +183,12 @@ fn l1_calc_afvl_cleared_on_udf_nan() {
     r.put_field("AFVL", EpicsValue::Double(2.5)).unwrap();
     r.aftc = 10.0; // filter enabled, but VAL is NaN
     r.process().unwrap();
-    assert!(r.get_field("VAL").and_then(|v| v.to_f64()).unwrap().is_nan());
+    assert!(
+        r.get_field("VAL")
+            .and_then(|v| v.to_f64())
+            .unwrap()
+            .is_nan()
+    );
     assert_eq!(
         r.get_field("AFVL"),
         Some(EpicsValue::Double(0.0)),
@@ -316,8 +322,10 @@ fn s4_transform_conditional_skips_channels_without_calc() {
     r.put_field("COPT", EpicsValue::Short(0)).unwrap(); // Conditional
     // Channel A: has a calc. Channel B: no calc, but an OUT link.
     r.put_field("CLCA", EpicsValue::String("3".into())).unwrap();
-    r.put_field("OUTA", EpicsValue::String("a.VAL".into())).unwrap();
-    r.put_field("OUTB", EpicsValue::String("b.VAL".into())).unwrap();
+    r.put_field("OUTA", EpicsValue::String("a.VAL".into()))
+        .unwrap();
+    r.put_field("OUTB", EpicsValue::String("b.VAL".into()))
+        .unwrap();
     let outcome = r.process().unwrap();
     let written: Vec<&str> = outcome
         .actions
@@ -341,7 +349,8 @@ fn s4_transform_conditional_skips_channels_without_calc() {
 fn s4_transform_always_writes_all_linked_channels() {
     let mut r = TransformRecord::new();
     r.put_field("COPT", EpicsValue::Short(1)).unwrap(); // Always
-    r.put_field("OUTB", EpicsValue::String("b.VAL".into())).unwrap();
+    r.put_field("OUTB", EpicsValue::String("b.VAL".into()))
+        .unwrap();
     let outcome = r.process().unwrap();
     let written: Vec<&str> = outcome
         .actions
@@ -362,7 +371,8 @@ fn s4_transform_always_writes_all_linked_channels() {
 #[test]
 fn s5_transform_fresh_put_survives_one_cycle() {
     let mut r = TransformRecord::new();
-    r.put_field("CLCA", EpicsValue::String("99".into())).unwrap();
+    r.put_field("CLCA", EpicsValue::String("99".into()))
+        .unwrap();
     // External put to A (channel value field) followed by special().
     r.put_field("A", EpicsValue::Double(7.0)).unwrap();
     r.special("A", true).unwrap();
@@ -400,7 +410,8 @@ fn s6_transform_broken_calc_does_not_abort_sibling_channels() {
     r.put_field("B", EpicsValue::Double(2.0)).unwrap();
     // CLCA is syntactically broken (fails to compile); CLCC is valid.
     r.put_field("CLCA", EpicsValue::String("+".into())).unwrap();
-    r.put_field("CLCC", EpicsValue::String("B*5".into())).unwrap();
+    r.put_field("CLCC", EpicsValue::String("B*5".into()))
+        .unwrap();
     r.process().unwrap();
     assert_eq!(
         r.get_field("A"),

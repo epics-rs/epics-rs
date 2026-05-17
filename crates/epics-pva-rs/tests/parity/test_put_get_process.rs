@@ -168,10 +168,11 @@ async fn put_get_round_trip() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = client_to(port);
-    let (_intro, value) = tokio::time::timeout(Duration::from_secs(3), client.pvput_get("dut", "21"))
-        .await
-        .expect("pvput_get timed out")
-        .expect("pvput_get failed");
+    let (_intro, value) =
+        tokio::time::timeout(Duration::from_secs(3), client.pvput_get("dut", "21"))
+            .await
+            .expect("pvput_get timed out")
+            .expect("pvput_get failed");
 
     assert_eq!(
         int_value(&value),
@@ -179,7 +180,11 @@ async fn put_get_round_trip() {
         "PUT_GET readback should be the doubled (post-put) value"
     );
     // The source's stored value confirms the PUT leg ran.
-    assert_eq!(*src.value.lock(), 42, "source should hold the doubled value");
+    assert_eq!(
+        *src.value.lock(),
+        42,
+        "source should hold the doubled value"
+    );
 
     server.stop();
     let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
@@ -303,8 +308,7 @@ struct DenySource {
 impl DenySource {
     fn new() -> Self {
         // READ-only ASG: every peer reads, none writes.
-        let cfg = parse_acf("ASG(DEFAULT) {\n    RULE(1, READ)\n}\n")
-            .expect("acf parse");
+        let cfg = parse_acf("ASG(DEFAULT) {\n    RULE(1, READ)\n}\n").expect("acf parse");
         let cell = Arc::new(tokio::sync::RwLock::new(Some(cfg)));
         let resolver: AsgAslResolver =
             Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));

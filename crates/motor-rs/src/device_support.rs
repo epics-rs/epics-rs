@@ -147,6 +147,16 @@ impl MotorDeviceSupport {
                     tracing::info!("motor command: ProfileReadback");
                     motor.readback_profile(&user).map(|_| ())
                 }
+                MotorCommand::MoveToHome {
+                    position,
+                    velocity,
+                    acceleration,
+                } => {
+                    tracing::info!(
+                        "motor command: MoveToHome position={position} velocity={velocity} accel={acceleration}"
+                    );
+                    motor.move_to_home(&user, *position, *velocity, *acceleration)
+                }
                 MotorCommand::EnablePco { enable } => {
                     tracing::info!("motor command: EnablePco({enable})");
                     motor.enable_pco(&user, *enable)
@@ -188,12 +198,10 @@ impl MotorDeviceSupport {
                     }
                 }
             }
-            PollDirective::Stop => {
-                match self.poll_cmd_tx.try_send(PollCommand::StopPolling) {
-                    Ok(()) => self.polling_active = false,
-                    Err(e) => tracing::error!("motor: failed to send StopPolling: {e}"),
-                }
-            }
+            PollDirective::Stop => match self.poll_cmd_tx.try_send(PollCommand::StopPolling) {
+                Ok(()) => self.polling_active = false,
+                Err(e) => tracing::error!("motor: failed to send StopPolling: {e}"),
+            },
             PollDirective::None => {}
         }
         if let Some(ref delay) = actions.schedule_delay {

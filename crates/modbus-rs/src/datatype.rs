@@ -96,11 +96,43 @@ pub enum ModbusDataType {
 pub const ALL_DATA_TYPES: [ModbusDataType; 37] = {
     use ModbusDataType::*;
     [
-        Int16, Int16Sm, BcdUnsigned, BcdSigned, UInt16, Int32Le, Int32LeBs, Int32Be, Int32BeBs,
-        UInt32Le, UInt32LeBs, UInt32Be, UInt32BeBs, Int64Le, Int64LeBs, Int64Be, Int64BeBs,
-        UInt64Le, UInt64LeBs, UInt64Be, UInt64BeBs, Float32Le, Float32LeBs, Float32Be, Float32BeBs,
-        Float64Le, Float64LeBs, Float64Be, Float64BeBs, StringHigh, StringLow, StringHighLow,
-        StringLowHigh, ZStringHigh, ZStringLow, ZStringHighLow, ZStringLowHigh,
+        Int16,
+        Int16Sm,
+        BcdUnsigned,
+        BcdSigned,
+        UInt16,
+        Int32Le,
+        Int32LeBs,
+        Int32Be,
+        Int32BeBs,
+        UInt32Le,
+        UInt32LeBs,
+        UInt32Be,
+        UInt32BeBs,
+        Int64Le,
+        Int64LeBs,
+        Int64Be,
+        Int64BeBs,
+        UInt64Le,
+        UInt64LeBs,
+        UInt64Be,
+        UInt64BeBs,
+        Float32Le,
+        Float32LeBs,
+        Float32Be,
+        Float32BeBs,
+        Float64Le,
+        Float64LeBs,
+        Float64Be,
+        Float64BeBs,
+        StringHigh,
+        StringLow,
+        StringHighLow,
+        StringLowHigh,
+        ZStringHigh,
+        ZStringLow,
+        ZStringHighLow,
+        ZStringLowHigh,
     ]
 };
 
@@ -183,8 +215,14 @@ impl ModbusDataType {
         use ModbusDataType::*;
         matches!(
             self,
-            StringHigh | StringLow | StringHighLow | StringLowHigh | ZStringHigh | ZStringLow
-                | ZStringHighLow | ZStringLowHigh
+            StringHigh
+                | StringLow
+                | StringHighLow
+                | StringLowHigh
+                | ZStringHigh
+                | ZStringLow
+                | ZStringHighLow
+                | ZStringLowHigh
         )
     }
 
@@ -192,7 +230,10 @@ impl ModbusDataType {
     /// `drvModbusAsyn::isZeroTerminatedString`.
     pub fn is_zero_terminated_string(self) -> bool {
         use ModbusDataType::*;
-        matches!(self, ZStringHigh | ZStringLow | ZStringHighLow | ZStringLowHigh)
+        matches!(
+            self,
+            ZStringHigh | ZStringLow | ZStringHighLow | ZStringLowHigh
+        )
     }
 }
 
@@ -239,7 +280,9 @@ fn split(value: u64, n: usize, order: WordOrder, byte_swap: bool) -> Vec<u16> {
 fn order_of(dt: ModbusDataType) -> Option<(WordOrder, bool)> {
     use ModbusDataType::*;
     Some(match dt {
-        Int32Le | UInt32Le | Int64Le | UInt64Le | Float32Le | Float64Le => (WordOrder::Little, false),
+        Int32Le | UInt32Le | Int64Le | UInt64Le | Float32Le | Float64Le => {
+            (WordOrder::Little, false)
+        }
         Int32LeBs | UInt32LeBs | Int64LeBs | UInt64LeBs | Float32LeBs | Float64LeBs => {
             (WordOrder::Little, true)
         }
@@ -477,7 +520,11 @@ pub fn write_float(dt: ModbusDataType, value: f64) -> ModbusResult<Vec<u16>> {
 /// Returns `(bytes, registers_consumed)`. The bytes stop at the first NUL
 /// (`strlen` semantics, as in `readPlcString`). The number of registers
 /// consumed equals the number of loop iterations the C code performs.
-pub fn read_string(dt: ModbusDataType, regs: &[u16], max_chars: usize) -> ModbusResult<(Vec<u8>, usize)> {
+pub fn read_string(
+    dt: ModbusDataType,
+    regs: &[u16],
+    max_chars: usize,
+) -> ModbusResult<(Vec<u8>, usize)> {
     use ModbusDataType::*;
     if !dt.is_string() {
         return Err(ModbusError::InvalidFunction(0));
@@ -570,50 +617,103 @@ mod tests {
             assert_eq!(ModbusDataType::from_type_string(dt.as_str()), Some(dt));
         }
         assert_eq!(ALL_DATA_TYPES.len(), 37);
-        assert_eq!(ModbusDataType::from_type_string("int32_le_bs"), Some(ModbusDataType::Int32LeBs));
+        assert_eq!(
+            ModbusDataType::from_type_string("int32_le_bs"),
+            Some(ModbusDataType::Int32LeBs)
+        );
         assert_eq!(ModbusDataType::from_i32(37), None);
     }
 
     #[test]
     fn int16_signed_and_unsigned() {
-        assert_eq!(read_int64(ModbusDataType::Int16, &[0xFFFF]).unwrap(), (-1, 1));
-        assert_eq!(read_int64(ModbusDataType::UInt16, &[0xFFFF]).unwrap(), (65535, 1));
-        assert_eq!(read_int64(ModbusDataType::Int16, &[0x7FFF]).unwrap(), (32767, 1));
+        assert_eq!(
+            read_int64(ModbusDataType::Int16, &[0xFFFF]).unwrap(),
+            (-1, 1)
+        );
+        assert_eq!(
+            read_int64(ModbusDataType::UInt16, &[0xFFFF]).unwrap(),
+            (65535, 1)
+        );
+        assert_eq!(
+            read_int64(ModbusDataType::Int16, &[0x7FFF]).unwrap(),
+            (32767, 1)
+        );
     }
 
     #[test]
     fn int16_sign_magnitude() {
         // 0x8005 = sign + magnitude 5 → -5.
-        assert_eq!(read_int64(ModbusDataType::Int16Sm, &[0x8005]).unwrap().0, -5);
+        assert_eq!(
+            read_int64(ModbusDataType::Int16Sm, &[0x8005]).unwrap().0,
+            -5
+        );
         assert_eq!(read_int64(ModbusDataType::Int16Sm, &[0x0005]).unwrap().0, 5);
         // write -5 → 0x8005, write 5 → 0x0005.
-        assert_eq!(write_int64(ModbusDataType::Int16Sm, -5).unwrap(), vec![0x8005]);
-        assert_eq!(write_int64(ModbusDataType::Int16Sm, 5).unwrap(), vec![0x0005]);
+        assert_eq!(
+            write_int64(ModbusDataType::Int16Sm, -5).unwrap(),
+            vec![0x8005]
+        );
+        assert_eq!(
+            write_int64(ModbusDataType::Int16Sm, 5).unwrap(),
+            vec![0x0005]
+        );
     }
 
     #[test]
     fn bcd_unsigned_round_trip() {
         // 0x1234 BCD = decimal 1234.
-        assert_eq!(read_int64(ModbusDataType::BcdUnsigned, &[0x1234]).unwrap().0, 1234);
-        assert_eq!(write_int64(ModbusDataType::BcdUnsigned, 1234).unwrap(), vec![0x1234]);
-        assert_eq!(write_int64(ModbusDataType::BcdUnsigned, 9999).unwrap(), vec![0x9999]);
+        assert_eq!(
+            read_int64(ModbusDataType::BcdUnsigned, &[0x1234])
+                .unwrap()
+                .0,
+            1234
+        );
+        assert_eq!(
+            write_int64(ModbusDataType::BcdUnsigned, 1234).unwrap(),
+            vec![0x1234]
+        );
+        assert_eq!(
+            write_int64(ModbusDataType::BcdUnsigned, 9999).unwrap(),
+            vec![0x9999]
+        );
     }
 
     #[test]
     fn bcd_signed_negative() {
         // -42 → magnitude 0042 BCD with sign bit = 0x8042.
-        assert_eq!(write_int64(ModbusDataType::BcdSigned, -42).unwrap(), vec![0x8042]);
-        assert_eq!(read_int64(ModbusDataType::BcdSigned, &[0x8042]).unwrap().0, -42);
-        assert_eq!(read_int64(ModbusDataType::BcdSigned, &[0x0042]).unwrap().0, 42);
+        assert_eq!(
+            write_int64(ModbusDataType::BcdSigned, -42).unwrap(),
+            vec![0x8042]
+        );
+        assert_eq!(
+            read_int64(ModbusDataType::BcdSigned, &[0x8042]).unwrap().0,
+            -42
+        );
+        assert_eq!(
+            read_int64(ModbusDataType::BcdSigned, &[0x0042]).unwrap().0,
+            42
+        );
     }
 
     #[test]
     fn int32_le_be_word_order() {
         // value 0x12345678: LE → [0x5678, 0x1234], BE → [0x1234, 0x5678].
-        assert_eq!(write_int32(ModbusDataType::Int32Le, 0x12345678).unwrap(), vec![0x5678, 0x1234]);
-        assert_eq!(write_int32(ModbusDataType::Int32Be, 0x12345678).unwrap(), vec![0x1234, 0x5678]);
-        assert_eq!(read_int32(ModbusDataType::Int32Le, &[0x5678, 0x1234]).unwrap(), (0x12345678, 2));
-        assert_eq!(read_int32(ModbusDataType::Int32Be, &[0x1234, 0x5678]).unwrap(), (0x12345678, 2));
+        assert_eq!(
+            write_int32(ModbusDataType::Int32Le, 0x12345678).unwrap(),
+            vec![0x5678, 0x1234]
+        );
+        assert_eq!(
+            write_int32(ModbusDataType::Int32Be, 0x12345678).unwrap(),
+            vec![0x1234, 0x5678]
+        );
+        assert_eq!(
+            read_int32(ModbusDataType::Int32Le, &[0x5678, 0x1234]).unwrap(),
+            (0x12345678, 2)
+        );
+        assert_eq!(
+            read_int32(ModbusDataType::Int32Be, &[0x1234, 0x5678]).unwrap(),
+            (0x12345678, 2)
+        );
     }
 
     #[test]
@@ -622,17 +722,27 @@ mod tests {
         let le = write_int32(ModbusDataType::Int32Le, 0x12345678).unwrap();
         let le_bs = write_int32(ModbusDataType::Int32LeBs, 0x12345678).unwrap();
         assert_eq!(le_bs, vec![le[0].swap_bytes(), le[1].swap_bytes()]);
-        assert_eq!(read_int32(ModbusDataType::Int32LeBs, &le_bs).unwrap().0, 0x12345678);
+        assert_eq!(
+            read_int32(ModbusDataType::Int32LeBs, &le_bs).unwrap().0,
+            0x12345678
+        );
     }
 
     #[test]
     fn uint32_full_range() {
         assert_eq!(
-            read_int64(ModbusDataType::UInt32Le, &[0xFFFF, 0xFFFF]).unwrap().0,
+            read_int64(ModbusDataType::UInt32Le, &[0xFFFF, 0xFFFF])
+                .unwrap()
+                .0,
             0xFFFF_FFFF_i64
         );
         // Same bits read as signed Int32 is -1.
-        assert_eq!(read_int64(ModbusDataType::Int32Le, &[0xFFFF, 0xFFFF]).unwrap().0, -1);
+        assert_eq!(
+            read_int64(ModbusDataType::Int32Le, &[0xFFFF, 0xFFFF])
+                .unwrap()
+                .0,
+            -1
+        );
     }
 
     #[test]
@@ -701,7 +811,9 @@ mod tests {
     #[test]
     fn string_high_byte_round_trip() {
         // "Hi" packed one char per register, high byte.
-        let regs = write_string(ModbusDataType::StringHigh, b"Hi", 8).unwrap().0;
+        let regs = write_string(ModbusDataType::StringHigh, b"Hi", 8)
+            .unwrap()
+            .0;
         assert_eq!(regs, vec![(b'H' as u16) << 8, (b'i' as u16) << 8]);
         let (s, words) = read_string(ModbusDataType::StringHigh, &regs, 8).unwrap();
         assert_eq!(s, b"Hi");
@@ -733,18 +845,19 @@ mod tests {
 
     #[test]
     fn read_string_stops_at_nul() {
-        let regs = [(b'O' as u16) << 8, (b'K' as u16) << 8, 0x0000, (b'X' as u16) << 8];
+        let regs = [
+            (b'O' as u16) << 8,
+            (b'K' as u16) << 8,
+            0x0000,
+            (b'X' as u16) << 8,
+        ];
         let (s, _) = read_string(ModbusDataType::ZStringHigh, &regs, 16).unwrap();
         assert_eq!(s, b"OK");
     }
 
     #[test]
     fn read_string_honours_max_chars() {
-        let regs = [
-            (b'A' as u16) << 8,
-            (b'B' as u16) << 8,
-            (b'C' as u16) << 8,
-        ];
+        let regs = [(b'A' as u16) << 8, (b'B' as u16) << 8, (b'C' as u16) << 8];
         let (s, words) = read_string(ModbusDataType::StringHigh, &regs, 2).unwrap();
         assert_eq!(s, b"AB");
         assert_eq!(words, 2);

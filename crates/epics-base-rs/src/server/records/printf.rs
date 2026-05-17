@@ -239,7 +239,11 @@ impl PrintfRecord {
             };
 
             let arg = take(&mut inp_idx);
-            let conv_prec = if precision == usize::MAX { 6 } else { precision };
+            let conv_prec = if precision == usize::MAX {
+                6
+            } else {
+                precision
+            };
 
             let substituted = match d.conv {
                 b'd' | b'i' => {
@@ -248,7 +252,12 @@ impl PrintfRecord {
                 }
                 b'u' => {
                     let v = arg.map(Self::val_as_f64).unwrap_or(0.0);
-                    pad_string(format!("{}", v as i64 as u64), width, left_align, d.zero_pad)
+                    pad_string(
+                        format!("{}", v as i64 as u64),
+                        width,
+                        left_align,
+                        d.zero_pad,
+                    )
                 }
                 b'o' => {
                     let v = arg.map(Self::val_as_f64).unwrap_or(0.0) as i64 as u64;

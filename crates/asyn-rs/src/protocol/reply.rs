@@ -17,9 +17,17 @@ pub enum ReplyPayload {
         eom_reason: u32,
     },
     /// Result of `GetBoundsInt32` / `GetBoundsInt64`.
-    Bounds { low: i64, high: i64 },
-    Subscribed { subscription_id: u64 },
-    Error { code: ReplyStatus, detail: String },
+    Bounds {
+        low: i64,
+        high: i64,
+    },
+    Subscribed {
+        subscription_id: u64,
+    },
+    Error {
+        code: ReplyStatus,
+        detail: String,
+    },
 }
 
 /// Reply envelope.

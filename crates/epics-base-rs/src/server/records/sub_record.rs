@@ -229,7 +229,8 @@ mod tests {
             assert_eq!(rec.get_field(name), Some(EpicsValue::Double(2.5)));
         }
         for name in ["INPM", "INPR", "INPU"] {
-            rec.put_field(name, EpicsValue::String("src".into())).unwrap();
+            rec.put_field(name, EpicsValue::String("src".into()))
+                .unwrap();
             assert_eq!(rec.get_field(name), Some(EpicsValue::String("src".into())));
         }
     }

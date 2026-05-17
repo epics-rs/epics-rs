@@ -84,9 +84,7 @@ impl MdnsBackend {
                         // An update to an already-tracked instance is
                         // always allowed; only brand-new names past the
                         // cap are dropped.
-                        if !known.contains_key(&fullname)
-                            && known.len() >= MAX_MDNS_INSTANCES
-                        {
+                        if !known.contains_key(&fullname) && known.len() >= MAX_MDNS_INSTANCES {
                             tracing::warn!(instance = %fullname,
                                 cap = MAX_MDNS_INSTANCES,
                                 "mDNS: instance cap reached; ignoring new instance");

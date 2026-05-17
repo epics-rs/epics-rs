@@ -24,10 +24,9 @@ use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 /// exactly what `pvxlist` / a `pvlist`-style client sends.
 fn nturi_op(op: &str) -> (FieldDesc, PvField) {
     let mut query = PvStructure::new("");
-    query.fields.push((
-        "op".into(),
-        PvField::Scalar(ScalarValue::String(op.into())),
-    ));
+    query
+        .fields
+        .push(("op".into(), PvField::Scalar(ScalarValue::String(op.into()))));
     let mut root = PvStructure::new("epics:nt/NTURI:1.0");
     root.fields.push((
         "scheme".into(),
@@ -225,13 +224,11 @@ async fn user_server_pv_overrides_builtin() {
 
     // The user's NTScalar<f64> `server` PV must answer GET — not the
     // built-in info structure.
-    let got: f64 = tokio::time::timeout(
-        Duration::from_secs(5),
-        client.pvget_typed::<f64>("server"),
-    )
-    .await
-    .expect("GET user server timed out")
-    .expect("GET user server failed");
+    let got: f64 =
+        tokio::time::timeout(Duration::from_secs(5), client.pvget_typed::<f64>("server"))
+            .await
+            .expect("GET user server timed out")
+            .expect("GET user server failed");
     assert_eq!(
         got, sentinel,
         "user 'server' PV must win over the built-in source"

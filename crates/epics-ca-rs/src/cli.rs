@@ -162,13 +162,9 @@ pub fn format_value(
             sep,
             req_elems_present,
         ),
-        EpicsValue::Int64Array(arr) => render_array_int(
-            arr.iter().copied(),
-            arr.len(),
-            fmt,
-            sep,
-            req_elems_present,
-        ),
+        EpicsValue::Int64Array(arr) => {
+            render_array_int(arr.iter().copied(), arr.len(), fmt, sep, req_elems_present)
+        }
         EpicsValue::EnumArray(arr) => {
             let mut parts = Vec::with_capacity(arr.len() + 1);
             if req_elems_present || arr.len() > 1 {

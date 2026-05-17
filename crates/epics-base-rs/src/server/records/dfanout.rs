@@ -161,44 +161,196 @@ impl DfanoutRecord {
 }
 
 static DFANOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc { name: "VAL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "SELM", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SELN", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "OUTA", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTB", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTC", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTD", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTE", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTF", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTG", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTH", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTI", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTJ", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTK", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTM", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTN", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTO", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OUTP", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "DOL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "OMSL", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "SELL", dbf_type: DbFieldType::String, read_only: false },
-    FieldDesc { name: "IVOA", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "IVOV", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "HIHI", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "HIGH", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LOW", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LOLO", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "HHSV", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "HSV", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "LSV", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "LLSV", dbf_type: DbFieldType::Short, read_only: false },
-    FieldDesc { name: "HYST", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "LALM", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "MDEL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "ADEL", dbf_type: DbFieldType::Double, read_only: false },
-    FieldDesc { name: "MLST", dbf_type: DbFieldType::Double, read_only: true },
-    FieldDesc { name: "ALST", dbf_type: DbFieldType::Double, read_only: true },
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SELM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SELN",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTB",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTC",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTD",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTE",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTF",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTG",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTH",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTI",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTJ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTK",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTM",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTN",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTO",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OUTP",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OMSL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SELL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IVOA",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "IVOV",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HIHI",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HIGH",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOW",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOLO",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HHSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LLSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HYST",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LALM",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MDEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ADEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MLST",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ALST",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
 ];
 
 impl Record for DfanoutRecord {
@@ -232,8 +384,8 @@ impl Record for DfanoutRecord {
     /// C `dfanoutRecord.c::checkAlarms` — UDF alarm plus analog limit
     /// alarms (HIHI/HIGH/LOW/LOLO) with per-level hysteresis.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        use crate::server::record::AlarmSeverity;
         use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
 
         if common.udf {
             recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);

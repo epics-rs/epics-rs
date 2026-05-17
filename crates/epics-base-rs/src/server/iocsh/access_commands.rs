@@ -14,9 +14,7 @@
 use std::sync::Mutex;
 
 use super::registry::*;
-use crate::server::access_security::{
-    parse_acf, AccessLevel, AccessSecurityConfig, RuleAccess,
-};
+use crate::server::access_security::{AccessLevel, AccessSecurityConfig, RuleAccess, parse_acf};
 
 /// Process-global access-security shell state. Mirrors the
 /// `asDbLib.c` file-scope globals (`acf`, `substitutions`).
@@ -113,9 +111,7 @@ fn cmd_as_init() -> CommandDef {
                 // C `asInit` with no filename disables access security
                 // (asInitialize(NULL)); report it rather than silently
                 // succeeding.
-                return Err(
-                    "asInit: no ACF file set — call asSetFilename first".into()
-                );
+                return Err("asInit: no ACF file set — call asSetFilename first".into());
             };
             let raw = std::fs::read_to_string(&filename)
                 .map_err(|e| format!("asInit: cannot read '{filename}': {e}"))?;
@@ -209,10 +205,7 @@ fn print_asg(ctx: &CommandContext, cfg: &AccessSecurityConfig, name: &str) {
             RuleAccess::Write => "WRITE",
         };
         let disabled = if rule.ignore { " [DISABLED]" } else { "" };
-        ctx.println(&format!(
-            "\tRULE({},{access}){disabled}",
-            rule.level
-        ));
+        ctx.println(&format!("\tRULE({},{access}){disabled}", rule.level));
         for u in &rule.uag {
             ctx.println(&format!("\t\tUAG({u})"));
         }
@@ -357,9 +350,7 @@ fn cmd_aspmem() -> CommandDef {
                 _ => None,
             };
             if matches!(&args[1], ArgValue::Int(n) if *n != 0) {
-                ctx.println(
-                    "aspmem: per-member CA-client listing is not available in this IOC",
-                );
+                ctx.println("aspmem: per-member CA-client listing is not available in this IOC");
             }
             // Group every record by its ASG field.
             let names = ctx.block_on(ctx.db().all_record_names());

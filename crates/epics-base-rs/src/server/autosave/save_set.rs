@@ -123,10 +123,7 @@ impl SaveSet {
     ///
     /// Use [`CompatMode::CRead`] when the produced `.sav` files must
     /// be readable by a C IOC (mixed Rust + C IOC site).
-    pub async fn new_with_mode(
-        config: SaveSetConfig,
-        compat: CompatMode,
-    ) -> AutosaveResult<Self> {
+    pub async fn new_with_mode(config: SaveSetConfig, compat: CompatMode) -> AutosaveResult<Self> {
         let entries = Self::load_entries(&config).await?;
         Ok(Self {
             config,

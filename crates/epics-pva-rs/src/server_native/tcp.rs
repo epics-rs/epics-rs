@@ -1204,8 +1204,17 @@ async fn handle_connection_io(
                 // lifecycle — routed through the source's typed
                 // `process_checked` (WRITE-class ACF gate).
                 peer_entry.op_init();
-                handle_process(&source, &frame, &tx, &mut channels, order, &config, peer, &cred)
-                    .await?;
+                handle_process(
+                    &source,
+                    &frame,
+                    &tx,
+                    &mut channels,
+                    order,
+                    &config,
+                    peer,
+                    &cred,
+                )
+                .await?;
             }
             Some(Command::OriginTag) => {
                 // I-5: pvxs origin-tag is an optional payload for
@@ -1376,8 +1385,7 @@ async fn handle_put_get(
             encode_type_desc(&intro, order, &mut payload);
             encode_type_desc(&intro, order, &mut payload);
         }
-        let h =
-            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
+        let h = PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
@@ -1398,8 +1406,7 @@ async fn handle_put_get(
 
     // The data frame carries the put bitset + put value, exactly like
     // a PUT EXEC. pvxs clientget.cpp PUT_GET state sends `0x00`.
-    let _changed =
-        BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let _changed = BitSet::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
     let put_value = decode_pv_field(&intro, &mut cur, order)
         .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
 
@@ -1427,8 +1434,7 @@ async fn handle_put_get(
     };
     if let Err(msg) = put_result {
         Status::error(msg).write_into(order, &mut payload);
-        let h =
-            PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
+        let h = PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
@@ -1546,8 +1552,7 @@ async fn handle_process(
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);
         Status::ok().write_into(order, &mut payload);
-        let h =
-            PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
+        let h = PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
@@ -1557,7 +1562,14 @@ async fn handle_process(
 
     // PROCESS data phase — no payload to decode.
     if !ch.ops.contains_key(&ioid) {
-        send_op_error(tx, OpKind::Process, ioid, "operation not initialised", order).await?;
+        send_op_error(
+            tx,
+            OpKind::Process,
+            ioid,
+            "operation not initialised",
+            order,
+        )
+        .await?;
         return Ok(());
     }
     let pv_name = ch.name.clone();
@@ -2844,9 +2856,9 @@ async fn handle_op(
         }
         // PUT_GET / PROCESS have dedicated handlers (`handle_put_get`,
         // `handle_process`) and are never dispatched into `handle_op`.
-        OpKind::PutGet | OpKind::Process => unreachable!(
-            "PUT_GET / PROCESS are routed to their own handlers, not handle_op"
-        ),
+        OpKind::PutGet | OpKind::Process => {
+            unreachable!("PUT_GET / PROCESS are routed to their own handlers, not handle_op")
+        }
     }
     Ok(())
 }

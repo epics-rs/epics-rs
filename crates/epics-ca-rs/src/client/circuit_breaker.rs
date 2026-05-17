@@ -384,7 +384,10 @@ mod tests {
             reg.record_failure(addr());
         }
         std::thread::sleep(Duration::from_millis(60));
-        assert!(!reg.is_blocking(addr()), "probe-ready breaker must not block");
+        assert!(
+            !reg.is_blocking(addr()),
+            "probe-ready breaker must not block"
+        );
         assert!(reg.allow(addr()), "allow() must admit the probe");
         reg.record_success(addr());
         assert!(reg.allow(addr()), "breaker recovered to CLOSED");
@@ -404,7 +407,10 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(60)); // cooldown elapses
         assert!(reg.allow(addr()), "first probe admitted (now HALF_OPEN)");
-        assert!(!reg.allow(addr()), "probe in flight — further traffic denied");
+        assert!(
+            !reg.allow(addr()),
+            "probe in flight — further traffic denied"
+        );
         // Do NOT resolve the probe; let it age past probe_timeout (500ms).
         std::thread::sleep(Duration::from_millis(550));
         assert!(

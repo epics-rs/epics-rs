@@ -387,11 +387,7 @@ impl Record for WaveformRecord {
                         // to MALM; the buffer is re-derived from the
                         // source on `set_val`, so a fresh zeroed
                         // allocation here is correct.
-                        self.nelm = if self.malm > 0 {
-                            n.min(self.malm)
-                        } else {
-                            n
-                        };
+                        self.nelm = if self.malm > 0 { n.min(self.malm) } else { n };
                         self.reallocate_val();
                     } else {
                         // waveform/aai/aao: M-6 — preserve the existing

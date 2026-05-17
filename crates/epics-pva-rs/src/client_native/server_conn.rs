@@ -150,8 +150,7 @@ impl ServerConn {
         let reader: DynRead = Box::new(reader);
         let writer: DynWrite = Box::new(writer);
         // Plain `pva://` TCP — no TLS, so no server X.509 identity.
-        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, op_timeout)
-            .await
+        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, op_timeout).await
     }
 
     /// Open a TLS-wrapped connection (`pvas://`).

@@ -25,13 +25,13 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::{create_port_runtime, PortRuntimeHandle};
+use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::sync_io::SyncIOHandle;
 use asyn_rs::trace::TraceManager;
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::iocsh::registry::*;
 
-use crate::datatype::{self, ModbusDataType, ALL_DATA_TYPES};
+use crate::datatype::{self, ALL_DATA_TYPES, ModbusDataType};
 use crate::driver::{ModbusConfig, ModbusEngine, ModbusFunctionCode, OctetTransport};
 use crate::error::ModbusError;
 use crate::interpose::LinkType;
@@ -198,8 +198,7 @@ impl ModbusPortDriver {
             base.create_param(PARAM_ENABLE_HISTOGRAM, ParamType::UInt32Digital)?;
         let read_histogram_reason =
             base.create_param(PARAM_READ_HISTOGRAM, ParamType::Int32Array)?;
-        let histogram_bin_reason =
-            base.create_param(PARAM_HISTOGRAM_BIN_TIME, ParamType::Int32)?;
+        let histogram_bin_reason = base.create_param(PARAM_HISTOGRAM_BIN_TIME, ParamType::Int32)?;
         let histogram_axis_reason =
             base.create_param(PARAM_HISTOGRAM_TIME_AXIS, ParamType::Int32Array)?;
 
@@ -252,9 +251,7 @@ impl ModbusPortDriver {
         if !self.engine.config().function.is_read() {
             return Ok(());
         }
-        self.engine
-            .poll(self.transport.as_mut())
-            .map_err(to_asyn)?;
+        self.engine.poll(self.transport.as_mut()).map_err(to_asyn)?;
 
         let active: Vec<(usize, i32)> = self.active.iter().copied().collect();
         let mut addrs: HashSet<i32> = HashSet::new();
@@ -264,7 +261,8 @@ impl ModbusPortDriver {
             };
             let regs = &self.engine.data()[addr as usize..];
             if dt.is_string() {
-                let (bytes, _) = datatype::read_string(dt, regs, regs.len() * 2).map_err(to_asyn)?;
+                let (bytes, _) =
+                    datatype::read_string(dt, regs, regs.len() * 2).map_err(to_asyn)?;
                 let s = String::from_utf8_lossy(&bytes).into_owned();
                 self.base.set_string_param(reason, addr, s)?;
             } else {
@@ -292,8 +290,10 @@ impl ModbusPortDriver {
             s.max_io_msec as i32,
         );
         self.base.set_int32_param(self.read_ok_reason, 0, read_ok)?;
-        self.base.set_int32_param(self.write_ok_reason, 0, write_ok)?;
-        self.base.set_int32_param(self.io_errors_reason, 0, io_errors)?;
+        self.base
+            .set_int32_param(self.write_ok_reason, 0, write_ok)?;
+        self.base
+            .set_int32_param(self.io_errors_reason, 0, io_errors)?;
         self.base.set_int32_param(self.last_io_reason, 0, last)?;
         self.base.set_int32_param(self.max_io_reason, 0, max)?;
         Ok(())
@@ -454,7 +454,8 @@ impl PortDriver for ModbusPortDriver {
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_int32(dt, value).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)?;
-        self.base.set_float64_param(user.reason, user.addr, value as f64)?;
+        self.base
+            .set_float64_param(user.reason, user.addr, value as f64)?;
         self.base.call_param_callbacks(user.addr)
     }
 
@@ -463,7 +464,8 @@ impl PortDriver for ModbusPortDriver {
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_int64(dt, value).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)?;
-        self.base.set_float64_param(user.reason, user.addr, value as f64)?;
+        self.base
+            .set_float64_param(user.reason, user.addr, value as f64)?;
         self.base.call_param_callbacks(user.addr)
     }
 
@@ -549,10 +551,26 @@ pub fn modbus_interpose_config_command() -> CommandDef {
     CommandDef::new(
         "modbusInterposeConfig",
         vec![
-            ArgDesc { name: "portName", arg_type: ArgType::String, optional: false },
-            ArgDesc { name: "linkType", arg_type: ArgType::Int, optional: false },
-            ArgDesc { name: "timeoutMsec", arg_type: ArgType::Int, optional: true },
-            ArgDesc { name: "writeDelayMsec", arg_type: ArgType::Int, optional: true },
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "linkType",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "timeoutMsec",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "writeDelayMsec",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
         ],
         "modbusInterposeConfig portName linkType timeoutMsec writeDelayMsec",
         |args: &[ArgValue], _ctx: &CommandContext| -> CommandResult {
@@ -561,8 +579,9 @@ pub fn modbus_interpose_config_command() -> CommandDef {
                 _ => return Err("portName required".into()),
             };
             let link = match &args[1] {
-                ArgValue::Int(v) => LinkType::from_i32(*v as i32)
-                    .ok_or_else(|| format!("invalid link type {v}"))?,
+                ArgValue::Int(v) => {
+                    LinkType::from_i32(*v as i32).ok_or_else(|| format!("invalid link type {v}"))?
+                }
                 _ => return Err("linkType required".into()),
             };
             record_link(&port, link);
@@ -581,15 +600,51 @@ pub fn drv_modbus_asyn_configure_command(
     CommandDef::new(
         "drvModbusAsynConfigure",
         vec![
-            ArgDesc { name: "portName", arg_type: ArgType::String, optional: false },
-            ArgDesc { name: "octetPortName", arg_type: ArgType::String, optional: false },
-            ArgDesc { name: "modbusSlave", arg_type: ArgType::Int, optional: false },
-            ArgDesc { name: "modbusFunction", arg_type: ArgType::Int, optional: false },
-            ArgDesc { name: "modbusStartAddress", arg_type: ArgType::Int, optional: false },
-            ArgDesc { name: "modbusLength", arg_type: ArgType::Int, optional: false },
-            ArgDesc { name: "dataType", arg_type: ArgType::String, optional: false },
-            ArgDesc { name: "pollMsec", arg_type: ArgType::Int, optional: false },
-            ArgDesc { name: "plcType", arg_type: ArgType::String, optional: true },
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "octetPortName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "modbusSlave",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "modbusFunction",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "modbusStartAddress",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "modbusLength",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "dataType",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "pollMsec",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "plcType",
+                arg_type: ArgType::String,
+                optional: true,
+            },
         ],
         "drvModbusAsynConfigure portName octetPort slave function startAddr length dataType pollMsec plcType",
         ModbusConfigHandler { handle, trace },
@@ -676,9 +731,7 @@ impl CommandHandler for ModbusConfigHandler {
         asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone());
         keep_runtime(runtime);
 
-        println!(
-            "drvModbusAsynConfigure: port='{port_name}' octet='{octet_port}' link={link:?}"
-        );
+        println!("drvModbusAsynConfigure: port='{port_name}' octet='{octet_port}' link={link:?}");
 
         // Spawn the read poller — periodically triggers a poll cycle by
         // writing the MODBUS_READ parameter. Port of the `readPoller` thread.
@@ -687,11 +740,7 @@ impl CommandHandler for ModbusConfigHandler {
             self.handle.spawn(async move {
                 loop {
                     tokio::time::sleep(poll_delay).await;
-                    if poller_handle
-                        .write_int32(read_reason, 0, 1)
-                        .await
-                        .is_err()
-                    {
+                    if poller_handle.write_int32(read_reason, 0, 1).await.is_err() {
                         break;
                     }
                 }

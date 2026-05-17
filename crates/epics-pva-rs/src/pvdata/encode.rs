@@ -961,12 +961,7 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
 ///   it fits; if none fits the union is encoded as null.
 /// - Mismatched scalar / scalar-array variants — re-encoded under the
 ///   descriptor's scalar type so the wire width is always correct.
-fn encode_pv_field_generic(
-    value: &PvField,
-    desc: &FieldDesc,
-    order: ByteOrder,
-    out: &mut Vec<u8>,
-) {
+fn encode_pv_field_generic(value: &PvField, desc: &FieldDesc, order: ByteOrder, out: &mut Vec<u8>) {
     match desc {
         FieldDesc::Scalar(st) => {
             // Coerce whatever scalar the value carries into the

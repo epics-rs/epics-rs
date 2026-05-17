@@ -1407,8 +1407,8 @@ mod tests {
     /// returns the server-info structure.
     #[tokio::test]
     async fn server_pv_not_answered_to_udp_search_but_direct_get_works() {
-        use crate::server_native::server_info::{SERVER_PV_NAME, ServerInfoSource};
         use crate::server_native::peers::PeerRegistry;
+        use crate::server_native::server_info::{SERVER_PV_NAME, ServerInfoSource};
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;

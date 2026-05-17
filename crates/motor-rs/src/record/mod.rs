@@ -161,9 +161,7 @@ impl Record for MotorRecord {
             match state.lock() {
                 Ok(mut ds) => match ds.pending_actions.take() {
                     Some(mut prev) => {
-                        tracing::warn!(
-                            "motor: pending_actions not yet consumed — merging batches"
-                        );
+                        tracing::warn!("motor: pending_actions not yet consumed — merging batches");
                         prev.merge_newer(actions);
                         ds.pending_actions = Some(prev);
                     }

@@ -188,9 +188,8 @@ impl TokenIssuer {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let cnf = binding.map(|b| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b.as_bytes())
-        });
+        let cnf =
+            binding.map(|b| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b.as_bytes()));
         let claims = TokenClaims {
             sub: sub.to_string(),
             groups: groups.to_vec(),

@@ -178,7 +178,10 @@ fn build_upstream_tls(args: &Args) -> Result<Option<epics_ca_rs::tls::TlsConfig>
     };
     let roots = load_root_store(roots_path.to_str().unwrap_or_default())
         .map_err(|e| format!("loading upstream TLS roots: {e}"))?;
-    let cfg = match (&args.upstream_tls_client_cert, &args.upstream_tls_client_key) {
+    let cfg = match (
+        &args.upstream_tls_client_cert,
+        &args.upstream_tls_client_key,
+    ) {
         (None, None) => TlsConfig::client_from_roots(roots),
         (Some(cert), Some(key)) => {
             let chain = load_certs(cert.to_str().unwrap_or_default())

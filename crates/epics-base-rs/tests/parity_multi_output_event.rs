@@ -7,11 +7,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::dfanout::DfanoutRecord;
 use epics_base_rs::server::records::event::EventRecord;
 use epics_base_rs::server::records::fanout::FanoutRecord;
-use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 
 /// 04-H-1 — the fanout record has a `LNK0` field (C `NLINKS = 16`).
@@ -128,8 +128,7 @@ async fn dfanout_specified_out_of_range_raises_invalid() {
         "out-of-range SELN must raise INVALID alarm"
     );
     assert_eq!(
-        inst.common.stat,
-        15, /* SOFT_ALARM */
+        inst.common.stat, 15, /* SOFT_ALARM */
         "out-of-range SELN must raise SOFT_ALARM status"
     );
 }

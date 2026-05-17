@@ -22,7 +22,7 @@ use crate::drivers::ip_port::DrvAsynIPPort;
 use crate::manager::PortManager;
 use crate::port::PortDriver;
 use crate::runtime::config::RuntimeConfig;
-use crate::runtime::port::{create_port_runtime, PortRuntimeHandle};
+use crate::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
 
 /// Register the standard asyn iocsh commands on the supplied
@@ -751,10 +751,9 @@ mod tests {
     fn drv_asyn_ip_port_configure_rejects_missing_host() {
         let cmd = drv_asyn_ip_port_configure_command(Arc::new(TraceManager::new()));
         let ctx = make_ctx();
-        let result = cmd.handler.call(
-            &[ArgValue::String("iocsh_ip_cfg_nohost".into())],
-            &ctx,
-        );
+        let result = cmd
+            .handler
+            .call(&[ArgValue::String("iocsh_ip_cfg_nohost".into())], &ctx);
         assert!(result.is_err());
         assert!(crate::asyn_record::get_port("iocsh_ip_cfg_nohost").is_none());
     }

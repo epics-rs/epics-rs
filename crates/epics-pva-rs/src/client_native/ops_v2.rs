@@ -1886,8 +1886,8 @@ fn decode_put_get_init(
             "expected PUT_GET INIT subcmd, got 0x{subcmd:02x}"
         )));
     }
-    let status =
-        crate::proto::Status::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let status = crate::proto::Status::decode(&mut cur, order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
     if !status.is_success() {
         return Err(PvaError::Protocol(format!(
             "PUT_GET INIT failed: {status:?}"
@@ -1896,9 +1896,8 @@ fn decode_put_get_init(
     // putIF then getIF. The put structure is decoded (advancing the
     // cursor + populating the type cache) but the get structure is
     // what the data legs use.
-    let _put_if =
-        crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
-            .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let _put_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
     let get_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     Ok(get_if)
@@ -1906,10 +1905,7 @@ fn decode_put_get_init(
 
 /// Decode a `PUT_GET` data response: `ioid + subcmd + status + get
 /// bitset + get value`.
-fn decode_put_get_data(
-    frame: &super::decode::Frame,
-    intro: &FieldDesc,
-) -> PvaResult<PvField> {
+fn decode_put_get_data(frame: &super::decode::Frame, intro: &FieldDesc) -> PvaResult<PvField> {
     if frame.header.command != Command::PutGet.code() {
         return Err(PvaError::Protocol(format!(
             "expected PUT_GET data, got command {}",
@@ -1922,8 +1918,8 @@ fn decode_put_get_data(
         .get_u32(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-    let status =
-        crate::proto::Status::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let status = crate::proto::Status::decode(&mut cur, order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
     if !status.is_success() {
         return Err(PvaError::Protocol(format!("PUT_GET: {status:?}")));
     }
@@ -1996,10 +1992,7 @@ pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResu
 /// Decode a `PROCESS` response: `ioid + subcmd + status`.
 /// `expected_init` is `QosFlags::INIT` when an INIT reply is expected,
 /// `0x00` for the PROCESS-done reply — only used to label errors.
-fn decode_process_status(
-    frame: &super::decode::Frame,
-    expected_init: u8,
-) -> PvaResult<()> {
+fn decode_process_status(frame: &super::decode::Frame, expected_init: u8) -> PvaResult<()> {
     if frame.header.command != Command::Process.code() {
         return Err(PvaError::Protocol(format!(
             "expected PROCESS response, got command {}",
@@ -2012,8 +2005,8 @@ fn decode_process_status(
         .get_u32(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-    let status =
-        crate::proto::Status::decode(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))?;
+    let status = crate::proto::Status::decode(&mut cur, order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
     if !status.is_success() {
         let phase = if expected_init & QosFlags::INIT != 0 {
             "PROCESS INIT"
@@ -2228,9 +2221,9 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
             }
             Ok(PvField::StructureArray(items))
         }
-        FieldDesc::BoundedString(_) => Ok(PvField::Scalar(ScalarValue::String(
-            value_str.to_string(),
-        ))),
+        FieldDesc::BoundedString(_) => {
+            Ok(PvField::Scalar(ScalarValue::String(value_str.to_string())))
+        }
     }
 }
 
@@ -2327,18 +2320,16 @@ fn build_put_struct_element(desc: &FieldDesc, value_str: &str) -> PvaResult<PvFi
     };
     // Prefer a field literally named "value"; else the first scalar or
     // scalar-array leaf.
-    let target = fields
-        .iter()
-        .position(|(n, _)| n == "value")
-        .or_else(|| {
-            fields.iter().position(|(_, d)| {
-                matches!(d, FieldDesc::Scalar(_) | FieldDesc::ScalarArray(_))
-            })
-        });
+    let target = fields.iter().position(|(n, _)| n == "value").or_else(|| {
+        fields
+            .iter()
+            .position(|(_, d)| matches!(d, FieldDesc::Scalar(_) | FieldDesc::ScalarArray(_)))
+    });
     let mut s = PvStructure::new(struct_id);
     for (idx, (name, child)) in fields.iter().enumerate() {
         if Some(idx) == target {
-            s.fields.push((name.clone(), build_put_value(child, value_str)?));
+            s.fields
+                .push((name.clone(), build_put_value(child, value_str)?));
         } else {
             s.fields.push((
                 name.clone(),
@@ -2417,7 +2408,10 @@ mod tests {
                 selector, value, ..
             } => {
                 assert_eq!(*selector, 2);
-                assert_eq!(**value, PvField::Scalar(ScalarValue::String("hello world".into())));
+                assert_eq!(
+                    **value,
+                    PvField::Scalar(ScalarValue::String("hello world".into()))
+                );
             }
             other => panic!("expected union, got {other:?}"),
         }
@@ -2455,7 +2449,10 @@ mod tests {
                 selector, value, ..
             } => {
                 assert_eq!(*selector, 2, "string variant");
-                assert_eq!(**value, PvField::Scalar(ScalarValue::String("1:2:3".into())));
+                assert_eq!(
+                    **value,
+                    PvField::Scalar(ScalarValue::String("1:2:3".into()))
+                );
             }
             other => panic!("expected union, got {other:?}"),
         }
@@ -2468,7 +2465,11 @@ mod tests {
             ("true", ScalarType::Boolean, ScalarValue::Boolean(true)),
             ("-42", ScalarType::Long, ScalarValue::Long(-42)),
             ("3.5", ScalarType::Double, ScalarValue::Double(3.5)),
-            ("text", ScalarType::String, ScalarValue::String("text".into())),
+            (
+                "text",
+                ScalarType::String,
+                ScalarValue::String("text".into()),
+            ),
         ] {
             let v = build_put_value(&FieldDesc::Variant, input).unwrap();
             match &v {
@@ -2672,7 +2673,10 @@ mod tests {
                     FieldDesc::Structure {
                         struct_id: "time_t".into(),
                         fields: vec![
-                            ("secondsPastEpoch".into(), FieldDesc::Scalar(ScalarType::Long)),
+                            (
+                                "secondsPastEpoch".into(),
+                                FieldDesc::Scalar(ScalarType::Long),
+                            ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ],
                     },

@@ -524,11 +524,7 @@ impl AccessSecurityConfig {
                 || rule.hag.iter().any(|g| {
                     self.hag
                         .get(g)
-                        .map(|members| {
-                            members
-                                .iter()
-                                .any(|m| m.eq_ignore_ascii_case(&host_lc))
-                        })
+                        .map(|members| members.iter().any(|m| m.eq_ignore_ascii_case(&host_lc)))
                         .unwrap_or(false)
                 });
             if !host_match {
@@ -618,8 +614,7 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
                 // `asHagAddHost` (asLibRoutines.c:1218-1256)
                 // `tolower()`s each host char so host matching is
                 // case-insensitive.
-                let lowered: Vec<String> =
-                    members.iter().map(|m| m.to_ascii_lowercase()).collect();
+                let lowered: Vec<String> = members.iter().map(|m| m.to_ascii_lowercase()).collect();
                 let expanded = expand_hag_members(&lowered);
                 config.hag.insert(name, expanded);
             }
@@ -797,9 +792,7 @@ fn read_paren_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
             name.push(c);
         }
         if !closed {
-            return Err(CaError::Protocol(
-                "ACF: unterminated quoted name".into(),
-            ));
+            return Err(CaError::Protocol("ACF: unterminated quoted name".into()));
         }
         skip_ws_comments(chars);
         if chars.next() != Some(')') {
@@ -992,9 +985,8 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
             "ACF: RULE LEVEL must be positive: {level_num}"
         )));
     }
-    let level: u8 = u8::try_from(level_num).map_err(|_| {
-        CaError::Protocol(format!("ACF: RULE level out of range: {level_num}"))
-    })?;
+    let level: u8 = u8::try_from(level_num)
+        .map_err(|_| CaError::Protocol(format!("ACF: RULE level out of range: {level_num}")))?;
 
     skip_ws_comments(chars);
     if chars.peek() == Some(&',') {
@@ -1678,8 +1670,7 @@ ASG(MIXED_CASE) {
 VENDOR(extension) { whatever }
 ASG(DEFAULT) { RULE(1, READ) }
 "#;
-        let config =
-            parse_acf(acf).expect("unknown top-level block must not abort the parse");
+        let config = parse_acf(acf).expect("unknown top-level block must not abort the parse");
         assert_eq!(
             config.check_access("DEFAULT", "host", "user"),
             AccessLevel::Read,
@@ -1721,8 +1712,7 @@ ASG(C) {
     #[test]
     fn rule_trapwrite_log_option_parses() {
         let config =
-            parse_acf("ASG(T) { RULE(1, WRITE, TRAPWRITE) RULE(1, READ, NOTRAPWRITE) }")
-                .unwrap();
+            parse_acf("ASG(T) { RULE(1, WRITE, TRAPWRITE) RULE(1, READ, NOTRAPWRITE) }").unwrap();
         assert_eq!(config.asg["T"].rules.len(), 2);
         assert_eq!(config.asg["T"].rules[0].access, RuleAccess::Write);
         assert!(
@@ -1748,8 +1738,7 @@ ASG(C) {
     /// disabled (fail closed) — it grants nothing.
     #[test]
     fn calc_rule_is_disabled_when_unevaluable() {
-        let config =
-            parse_acf(r#"ASG(G) { INPA("ref") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
+        let config = parse_acf(r#"ASG(G) { INPA("ref") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
         let rule = &config.asg["G"].rules[0];
         assert!(rule.calc.is_some(), "CALC clause must be parsed and stored");
         assert!(
@@ -1820,8 +1809,7 @@ ASG(G) {
     /// a high-ASL record. C `RULE(N,…)` applies only when ASL ≤ N.
     #[test]
     fn asl_gate_still_honoured_after_fail_closed_rewrite() {
-        let config =
-            parse_acf("ASG(A) { RULE(0, READ) RULE(1, WRITE) }").unwrap();
+        let config = parse_acf("ASG(A) { RULE(0, READ) RULE(1, WRITE) }").unwrap();
         // ASL-0 record: READ rule applies, WRITE rule applies.
         assert_eq!(
             config.check_access_method("A", "h", "u", 0, "", ""),

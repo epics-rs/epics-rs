@@ -350,10 +350,7 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
         serde_json::Value::Array(arr) => {
             // Decode every element first, then pick the tightest
             // container that holds all of them.
-            let elems: Vec<PvField> = arr
-                .iter()
-                .map(json_to_pv_field)
-                .collect::<Result<_, _>>()?;
+            let elems: Vec<PvField> = arr.iter().map(json_to_pv_field).collect::<Result<_, _>>()?;
 
             if elems.iter().all(|e| matches!(e, PvField::Scalar(_))) {
                 let scalars = elems
@@ -364,8 +361,7 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
                     })
                     .collect();
                 Ok(PvField::ScalarArray(scalars))
-            } else if !elems.is_empty()
-                && elems.iter().all(|e| matches!(e, PvField::Structure(_)))
+            } else if !elems.is_empty() && elems.iter().all(|e| matches!(e, PvField::Structure(_)))
             {
                 let structs = elems
                     .into_iter()

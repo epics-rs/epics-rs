@@ -507,14 +507,8 @@ impl PvDatabase {
                     .collect();
                     // dfanout Specified is 1-based; Mask has no SHFT
                     // (dfanoutRecord.c:307-339).
-                    let sel = select_link_indices_ex(
-                        SelmKind::Dfanout,
-                        selm,
-                        seln,
-                        0,
-                        0,
-                        links.len(),
-                    );
+                    let sel =
+                        select_link_indices_ex(SelmKind::Dfanout, selm, seln, 0, 0, links.len());
                     Some((sel, MultiOut::Dfanout(links), val))
                 }
                 "seq" => {

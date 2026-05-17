@@ -560,9 +560,7 @@ impl EpicsValue {
                 DbFieldType::Int64 => {
                     EpicsValue::Int64Array(nums.iter().map(|&v| v as i64).collect())
                 }
-                DbFieldType::Char => {
-                    EpicsValue::CharArray(nums.iter().map(|&v| v as u8).collect())
-                }
+                DbFieldType::Char => EpicsValue::CharArray(nums.iter().map(|&v| v as u8).collect()),
                 DbFieldType::String => {
                     EpicsValue::StringArray(nums.iter().map(|v| v.to_string()).collect())
                 }

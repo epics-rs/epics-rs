@@ -617,16 +617,20 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..N {
             match recv.recv().await {
-                ConnEventRecv::Event(ServerConnectionEvent::ChannelCreated {
-                    cid, ..
-                }) => seen.push(cid),
+                ConnEventRecv::Event(ServerConnectionEvent::ChannelCreated { cid, .. }) => {
+                    seen.push(cid)
+                }
                 ConnEventRecv::GapTruncated { missed } => {
                     panic!("unexpected truncation, missed={missed}")
                 }
                 other => panic!("unexpected recv outcome: {other:?}"),
             }
         }
-        assert_eq!(seen, (1..=N).collect::<Vec<_>>(), "lagged events not fully replayed");
+        assert_eq!(
+            seen,
+            (1..=N).collect::<Vec<_>>(),
+            "lagged events not fully replayed"
+        );
         drop(tx);
         assert!(matches!(recv.recv().await, ConnEventRecv::Closed));
     }
@@ -681,7 +685,10 @@ mod tests {
                     pv_name,
                     ..
                 }) => {
-                    assert_eq!(pv_name, "NEW", "must not replay pre-subscription `OLD` events");
+                    assert_eq!(
+                        pv_name, "NEW",
+                        "must not replay pre-subscription `OLD` events"
+                    );
                     seen.push(cid);
                 }
                 ConnEventRecv::GapTruncated { missed } => {
@@ -727,10 +734,7 @@ mod tests {
 
         // A receiver created now must start at the high-water mark (7),
         // not 0 — otherwise a later lag replays the 1..7 backlog.
-        let late = downstream
-            .connection_events()
-            .await
-            .expect("late receiver");
+        let late = downstream.connection_events().await.expect("late receiver");
         assert_eq!(
             late.last_seq, 7,
             "late subscriber must be seeded from the forwarder high-water mark"
@@ -777,9 +781,9 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..N {
             match recv.recv().await {
-                ConnEventRecv::Event(ServerConnectionEvent::ChannelCreated {
-                    cid, ..
-                }) => seen.push(cid),
+                ConnEventRecv::Event(ServerConnectionEvent::ChannelCreated { cid, .. }) => {
+                    seen.push(cid)
+                }
                 other => panic!("unexpected recv outcome: {other:?}"),
             }
         }

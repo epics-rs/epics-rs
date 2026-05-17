@@ -648,8 +648,8 @@ impl Record for MbbiRecord {
     /// and returns early when `udf` is set; we mirror that (raising
     /// UDF is idempotent with the framework's `rec_gbl_check_udf`).
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        use crate::server::record::AlarmSeverity;
         use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
 
         if common.udf {
             recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);

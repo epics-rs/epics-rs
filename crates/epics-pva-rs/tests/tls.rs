@@ -61,8 +61,7 @@ fn make_leaf(
     let key = rcgen::KeyPair::generate().expect("leaf key");
     let cert = params.signed_by(&key, ca, ca_key).expect("leaf signed");
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der: PrivateKeyDer<'static> =
-        PrivatePkcs8KeyDer::from(key.serialize_der()).into();
+    let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key.serialize_der()).into();
     (cert_der, key_der)
 }
 
@@ -242,10 +241,9 @@ async fn mtls_client_cert_populates_x509_credentials() {
     // client cert verified against the CA.
     let mut client_ca_roots = RootCertStore::empty();
     client_ca_roots.add(ca_der.clone()).unwrap();
-    let client_verifier =
-        rustls::server::WebPkiClientVerifier::builder(Arc::new(client_ca_roots))
-            .build()
-            .expect("client verifier");
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_ca_roots))
+        .build()
+        .expect("client verifier");
     let server_cfg = ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![server_cert.clone(), ca_der.clone()], server_key)

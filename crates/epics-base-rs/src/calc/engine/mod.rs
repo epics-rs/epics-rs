@@ -44,14 +44,12 @@ impl CompiledExpr {
         for op in &self.code {
             match op {
                 Opcode::Core(CoreOp::End) => break,
-                Opcode::Core(CoreOp::PushVar(idx))
-                | Opcode::Core(CoreOp::PushDoubleVar(idx)) => {
+                Opcode::Core(CoreOp::PushVar(idx)) | Opcode::Core(CoreOp::PushDoubleVar(idx)) => {
                     if (*idx as usize) < CALC_NARGS {
                         inputs |= (1u32 << *idx) & !stores;
                     }
                 }
-                Opcode::Core(CoreOp::StoreVar(idx))
-                | Opcode::Core(CoreOp::StoreDoubleVar(idx)) => {
+                Opcode::Core(CoreOp::StoreVar(idx)) | Opcode::Core(CoreOp::StoreDoubleVar(idx)) => {
                     if (*idx as usize) < CALC_NARGS {
                         stores |= 1u32 << *idx;
                     }

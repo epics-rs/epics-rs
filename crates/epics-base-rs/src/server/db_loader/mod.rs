@@ -322,7 +322,14 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
 pub(crate) fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
-    trans(&chars, 0, macros, &mut Vec::new(), &mut Vec::new(), &mut out);
+    trans(
+        &chars,
+        0,
+        macros,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut out,
+    );
     out
 }
 
@@ -366,9 +373,8 @@ fn trans(
 
         // Macro reference: `$` followed by `(` or `{`, and NOT inside
         // single quotes (C `macRef && quote != '\''`).
-        let mac_ref = c == '$'
-            && i + 1 < chars.len()
-            && (chars[i + 1] == '(' || chars[i + 1] == '{');
+        let mac_ref =
+            c == '$' && i + 1 < chars.len() && (chars[i + 1] == '(' || chars[i + 1] == '{');
         if mac_ref && quote != Some('\'') {
             if let Some(next) = refer(chars, i, level, macros, scopes, visiting, out) {
                 i = next;
@@ -399,17 +405,12 @@ fn refer(
     let mut depth = 1usize;
     let mut j = body_start;
     while j < chars.len() && depth > 0 {
-        if j + 1 < chars.len()
-            && chars[j] == '$'
-            && (chars[j + 1] == '(' || chars[j + 1] == '{')
-        {
+        if j + 1 < chars.len() && chars[j] == '$' && (chars[j + 1] == '(' || chars[j + 1] == '{') {
             depth += 1;
             j += 2;
             continue;
         }
-        if depth == 1 && chars[j] == close
-            || depth > 1 && (chars[j] == ')' || chars[j] == '}')
-        {
+        if depth == 1 && chars[j] == close || depth > 1 && (chars[j] == ')' || chars[j] == '}') {
             depth -= 1;
             if depth == 0 {
                 break;
@@ -724,10 +725,7 @@ fn read_field_value(
     // than C.
     let is_bareword = |c: char| {
         c.is_ascii_alphanumeric()
-            || matches!(
-                c,
-                '_' | '-' | '+' | ':' | '.' | '[' | ']' | '<' | '>' | ';'
-            )
+            || matches!(c, '_' | '-' | '+' | ':' | '.' | '[' | ']' | '<' | '>' | ';')
     };
 
     let mut s = String::new();
@@ -1951,10 +1949,7 @@ record(ai, "REC") {
         // duration of this reference.
         let mut macros = HashMap::new();
         macros.insert("INNER".to_string(), "$(A)-$(B)".to_string());
-        assert_eq!(
-            substitute_macros("$(INNER,A=1,B=2)", &macros),
-            "1-2"
-        );
+        assert_eq!(substitute_macros("$(INNER,A=1,B=2)", &macros), "1-2");
     }
 
     #[test]

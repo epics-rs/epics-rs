@@ -260,9 +260,7 @@ impl CompressRecord {
         // C: skip leading out-of-limit data.
         let mut start = 0usize;
         if self.ilil < self.ihil {
-            while start < input.len()
-                && (input[start] < self.ilil || input[start] > self.ihil)
-            {
+            while start < input.len() && (input[start] < self.ilil || input[start] > self.ihil) {
                 start += 1;
             }
         }
@@ -289,9 +287,7 @@ impl CompressRecord {
                 // N_to_1_Median: middle element after sort (C `psource[n/2]`).
                 _ => {
                     let mut sorted = chunk.to_vec();
-                    sorted.sort_by(|a, b| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     sorted[sorted.len() / 2]
                 }
             };

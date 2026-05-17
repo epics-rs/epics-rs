@@ -101,7 +101,10 @@ impl ModbusFunctionCode {
     pub fn is_bit(self) -> bool {
         matches!(
             self,
-            Self::ReadCoils | Self::ReadDiscreteInputs | Self::WriteSingleCoil | Self::WriteMultipleCoils
+            Self::ReadCoils
+                | Self::ReadDiscreteInputs
+                | Self::WriteSingleCoil
+                | Self::WriteMultipleCoils
         )
     }
 
@@ -415,7 +418,10 @@ impl ModbusEngine {
                 }
                 Ok(payload.iter().map(|&b| b as u16).collect())
             }
-            WriteSingleCoil | WriteSingleRegister | WriteMultipleCoils | WriteMultipleRegisters
+            WriteSingleCoil
+            | WriteSingleRegister
+            | WriteMultipleCoils
+            | WriteMultipleRegisters
             | WriteMultipleRegistersF23 => Ok(Vec::new()),
         }
     }
@@ -593,13 +599,25 @@ mod tests {
 
     #[test]
     fn function_code_decoding() {
-        assert_eq!(ModbusFunctionCode::from_i32(3), Some(ModbusFunctionCode::ReadHoldingRegisters));
-        assert_eq!(ModbusFunctionCode::from_i32(123), Some(ModbusFunctionCode::ReadInputRegistersF23));
-        assert_eq!(ModbusFunctionCode::from_i32(223), Some(ModbusFunctionCode::WriteMultipleRegistersF23));
+        assert_eq!(
+            ModbusFunctionCode::from_i32(3),
+            Some(ModbusFunctionCode::ReadHoldingRegisters)
+        );
+        assert_eq!(
+            ModbusFunctionCode::from_i32(123),
+            Some(ModbusFunctionCode::ReadInputRegistersF23)
+        );
+        assert_eq!(
+            ModbusFunctionCode::from_i32(223),
+            Some(ModbusFunctionCode::WriteMultipleRegistersF23)
+        );
         assert_eq!(ModbusFunctionCode::from_i32(99), None);
         assert!(ModbusFunctionCode::ReadCoils.is_read());
         assert!(ModbusFunctionCode::WriteSingleCoil.is_write());
-        assert_eq!(ModbusFunctionCode::ReadCoils.max_length(), MAX_READ_WORDS * 16);
+        assert_eq!(
+            ModbusFunctionCode::ReadCoils.max_length(),
+            MAX_READ_WORDS * 16
+        );
         assert_eq!(
             ModbusFunctionCode::WriteMultipleRegisters.readonce_function(),
             Some(ModbusFunctionCode::ReadHoldingRegisters)
@@ -626,9 +644,11 @@ mod tests {
 
     #[test]
     fn build_read_holding_registers_request() {
-        let engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::ReadHoldingRegisters, 10), LinkType::Tcp)
-                .unwrap();
+        let engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 10),
+            LinkType::Tcp,
+        )
+        .unwrap();
         let pdu = engine
             .build_request(ModbusFunctionCode::ReadHoldingRegisters, 100, &[], 10)
             .unwrap();
@@ -637,9 +657,11 @@ mod tests {
 
     #[test]
     fn build_write_single_coil_request() {
-        let engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::WriteSingleCoil, 16), LinkType::Tcp)
-                .unwrap();
+        let engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::WriteSingleCoil, 16),
+            LinkType::Tcp,
+        )
+        .unwrap();
         // Non-zero data → 0xFF00 (coil on).
         let on = engine
             .build_request(ModbusFunctionCode::WriteSingleCoil, 5, &[1], 1)
@@ -654,30 +676,42 @@ mod tests {
 
     #[test]
     fn f23_read_request_has_no_data_field() {
-        let engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::ReadInputRegistersF23, 4), LinkType::Tcp)
-                .unwrap();
+        let engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadInputRegistersF23, 4),
+            LinkType::Tcp,
+        )
+        .unwrap();
         let pdu = engine
             .build_request(ModbusFunctionCode::ReadInputRegistersF23, 0x10, &[], 4)
             .unwrap();
         // slave, 0x17, readStart, readCount, writeStart, numOutput=1, byteCount=2.
         assert_eq!(
             pdu.as_bytes(),
-            &[0x01, 0x17, 0x00, 0x10, 0x00, 0x04, 0x00, 0x10, 0x00, 0x01, 0x02]
+            &[
+                0x01, 0x17, 0x00, 0x10, 0x00, 0x04, 0x00, 0x10, 0x00, 0x01, 0x02
+            ]
         );
     }
 
     #[test]
     fn do_modbus_io_read_holding_registers() {
-        let mut engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::ReadHoldingRegisters, 3), LinkType::Tcp)
-                .unwrap();
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 3),
+            LinkType::Tcp,
+        )
+        .unwrap();
         // Response PDU: fcode 0x03, byte_count 6, three registers.
         let resp_pdu = [0x01u8, 0x03, 0x06, 0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
 
         let words = engine
-            .do_modbus_io(&mut transport, ModbusFunctionCode::ReadHoldingRegisters, 0, &[], 3)
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                3,
+            )
             .unwrap();
         assert_eq!(words, vec![10, 20, 30]);
         assert_eq!(engine.stats.read_ok, 1);
@@ -686,8 +720,11 @@ mod tests {
 
     #[test]
     fn do_modbus_io_read_coils_unpacks_bits() {
-        let mut engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::ReadCoils, 10), LinkType::Tcp).unwrap();
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadCoils, 10),
+            LinkType::Tcp,
+        )
+        .unwrap();
         // 10 coils: on at 0,1,9 → byte0 = 0x03, byte1 = 0x02.
         let resp_pdu = [0x01u8, 0x01, 0x02, 0x03, 0x02];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
@@ -700,15 +737,23 @@ mod tests {
 
     #[test]
     fn do_modbus_io_write_increments_write_ok() {
-        let mut engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::WriteSingleRegister, 1), LinkType::Tcp)
-                .unwrap();
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::WriteSingleRegister, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
         // Write-single response echoes address + value.
         let resp_pdu = [0x01u8, 0x06, 0x00, 0x00, 0xAB, 0xCD];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
 
         let words = engine
-            .do_modbus_io(&mut transport, ModbusFunctionCode::WriteSingleRegister, 0, &[0xABCD], 1)
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::WriteSingleRegister,
+                0,
+                &[0xABCD],
+                1,
+            )
             .unwrap();
         assert!(words.is_empty());
         assert_eq!(engine.stats.write_ok, 1);
@@ -716,9 +761,11 @@ mod tests {
 
     #[test]
     fn do_modbus_io_skips_stale_tcp_transaction_id() {
-        let mut engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::ReadHoldingRegisters, 1), LinkType::Tcp)
-                .unwrap();
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
         let resp_pdu = [0x01u8, 0x03, 0x02, 0x12, 0x34];
         // First reply carries a stale transaction ID (0) — must be skipped;
         // the request's ID is 1.
@@ -727,36 +774,61 @@ mod tests {
             Ok(tcp_response(1, &resp_pdu)),
         ]);
         let words = engine
-            .do_modbus_io(&mut transport, ModbusFunctionCode::ReadHoldingRegisters, 0, &[], 1)
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
             .unwrap();
         assert_eq!(words, vec![0x1234]);
     }
 
     #[test]
     fn do_modbus_io_modbus_exception_is_error() {
-        let mut engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::ReadHoldingRegisters, 1), LinkType::Tcp)
-                .unwrap();
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
         // slave 0x01, fcode 0x83 = exception, code 0x02 (illegal data address).
         let resp_pdu = [0x01u8, 0x83, 0x02];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
         let err = engine
-            .do_modbus_io(&mut transport, ModbusFunctionCode::ReadHoldingRegisters, 0, &[], 1)
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
             .unwrap_err();
-        assert!(matches!(err, ModbusError::Exception(ExceptionCode::IllegalDataAddress)));
+        assert!(matches!(
+            err,
+            ModbusError::Exception(ExceptionCode::IllegalDataAddress)
+        ));
         assert_eq!(engine.stats.io_errors, 1);
     }
 
     #[test]
     fn do_modbus_io_acknowledge_exception_is_not_fatal() {
-        let mut engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::WriteSingleRegister, 1), LinkType::Tcp)
-                .unwrap();
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::WriteSingleRegister, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
         // slave 0x01, fcode 0x86 = exception, code 0x05 (Acknowledge).
         let resp_pdu = [0x01u8, 0x86, 0x05];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
         let words = engine
-            .do_modbus_io(&mut transport, ModbusFunctionCode::WriteSingleRegister, 0, &[1], 1)
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::WriteSingleRegister,
+                0,
+                &[1],
+                1,
+            )
             .unwrap();
         assert!(words.is_empty());
         assert_eq!(engine.stats.write_ok, 1);
@@ -765,12 +837,20 @@ mod tests {
 
     #[test]
     fn do_modbus_io_timeout_counts_io_error() {
-        let mut engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::ReadHoldingRegisters, 1), LinkType::Tcp)
-                .unwrap();
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
         let mut transport = MockTransport::new(vec![Err(ModbusError::Timeout)]);
         let err = engine
-            .do_modbus_io(&mut transport, ModbusFunctionCode::ReadHoldingRegisters, 0, &[], 1)
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
             .unwrap_err();
         assert!(matches!(err, ModbusError::Timeout));
         assert_eq!(engine.stats.io_errors, 1);
@@ -779,9 +859,11 @@ mod tests {
 
     #[test]
     fn poll_detects_change() {
-        let mut engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::ReadHoldingRegisters, 2), LinkType::Tcp)
-                .unwrap();
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 2),
+            LinkType::Tcp,
+        )
+        .unwrap();
         let r1 = [0x01u8, 0x03, 0x04, 0x00, 0x0A, 0x00, 0x14];
         let r2 = [0x01u8, 0x03, 0x04, 0x00, 0x0A, 0x00, 0x14];
         let r3 = [0x01u8, 0x03, 0x04, 0x00, 0x0A, 0x00, 0x63];
@@ -801,9 +883,11 @@ mod tests {
 
     #[test]
     fn check_offset_enforces_range() {
-        let engine =
-            ModbusEngine::new(read_config(ModbusFunctionCode::ReadHoldingRegisters, 10), LinkType::Tcp)
-                .unwrap();
+        let engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 10),
+            LinkType::Tcp,
+        )
+        .unwrap();
         assert!(engine.check_offset(0).is_ok());
         assert!(engine.check_offset(9).is_ok());
         assert!(engine.check_offset(10).is_err());

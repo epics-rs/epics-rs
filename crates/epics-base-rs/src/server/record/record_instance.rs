@@ -1347,8 +1347,7 @@ impl RecordInstance {
         // needs the same skip. "Raw Soft Channel" has a distinct DTYP
         // so it is excluded by `is_soft` and still runs convert.
         {
-            let is_soft =
-                self.common.dtyp.is_empty() || self.common.dtyp == "Soft Channel";
+            let is_soft = self.common.dtyp.is_empty() || self.common.dtyp == "Soft Channel";
             let is_output = self.record.can_device_write();
             if is_soft && !is_output {
                 self.record.set_device_did_compute(true);

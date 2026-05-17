@@ -15,7 +15,7 @@
 //! 8-bit two's-complement LRC).
 
 use crate::error::{ModbusError, ModbusResult};
-use crate::protocol::{MbapHeader, MAX_MODBUS_FRAME_SIZE, MBAP_HEADER_SIZE};
+use crate::protocol::{MAX_MODBUS_FRAME_SIZE, MBAP_HEADER_SIZE, MbapHeader};
 
 /// Default response timeout when none is configured (matches the C
 /// `DEFAULT_TIMEOUT` of 2.0 s).
@@ -306,7 +306,10 @@ mod tests {
     fn lrc_property_sum_with_lrc_is_zero() {
         let body = [0x01u8, 0x03, 0x00, 0x6B, 0x00, 0x03];
         let lrc = compute_lrc(&body);
-        let total: u8 = body.iter().chain(std::iter::once(&lrc)).fold(0u8, |a, &b| a.wrapping_add(b));
+        let total: u8 = body
+            .iter()
+            .chain(std::iter::once(&lrc))
+            .fold(0u8, |a, &b| a.wrapping_add(b));
         assert_eq!(total, 0);
     }
 

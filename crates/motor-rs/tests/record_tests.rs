@@ -308,10 +308,10 @@ fn test_tweak_in_set_mode_redefines_coordinates_without_moving() {
     assert_eq!(rec.pos.off, 5.0);
     // No move command — only SetPosition (coordinate redefinition).
     assert!(
-        !effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. })),
+        !effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+        )),
         "SET-mode tweak must not move the motor"
     );
     assert!(
@@ -1091,8 +1091,7 @@ fn test_move_accel_never_zero_for_unconfigured_axis() {
     rec.vel.accl = 0.5;
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
-    let a = emitted_accel(&effects)
-        .expect("a move command must be emitted for a 50-unit move");
+    let a = emitted_accel(&effects).expect("a move command must be emitted for a 50-unit move");
     assert!(a > 0.0, "acceleration must stay positive, got {a}");
 }
 
@@ -1184,7 +1183,8 @@ fn test_move_to_home_defaults_to_move_absolute() {
 #[test]
 fn test_pco_config_fields_roundtrip() {
     let mut rec = MotorRecord::new();
-    rec.put_field("PCO_START", EpicsValue::Double(-5.0)).unwrap();
+    rec.put_field("PCO_START", EpicsValue::Double(-5.0))
+        .unwrap();
     rec.put_field("PCO_END", EpicsValue::Double(5.0)).unwrap();
     rec.put_field("PCO_INC", EpicsValue::Double(0.25)).unwrap();
     rec.put_field("PCO_PW", EpicsValue::Double(3.0)).unwrap();
@@ -1197,7 +1197,8 @@ fn test_pco_config_fields_roundtrip() {
 #[test]
 fn test_pco_enable_emits_config_then_enable() {
     let mut rec = MotorRecord::new();
-    rec.put_field("PCO_START", EpicsValue::Double(-5.0)).unwrap();
+    rec.put_field("PCO_START", EpicsValue::Double(-5.0))
+        .unwrap();
     rec.put_field("PCO_END", EpicsValue::Double(5.0)).unwrap();
     rec.put_field("PCO_INC", EpicsValue::Double(0.25)).unwrap();
     rec.put_field("PCO_PW", EpicsValue::Double(3.0)).unwrap();
@@ -1276,22 +1277,13 @@ fn test_default_asyn_motor_enable_pco_is_noop() {
         ) -> asyn_rs::error::AsynResult<()> {
             Ok(())
         }
-        fn home(
-            &mut self,
-            _: &AsynUser,
-            _: f64,
-            _: bool,
-        ) -> asyn_rs::error::AsynResult<()> {
+        fn home(&mut self, _: &AsynUser, _: f64, _: bool) -> asyn_rs::error::AsynResult<()> {
             Ok(())
         }
         fn stop(&mut self, _: &AsynUser, _: f64) -> asyn_rs::error::AsynResult<()> {
             Ok(())
         }
-        fn set_position(
-            &mut self,
-            _: &AsynUser,
-            _: f64,
-        ) -> asyn_rs::error::AsynResult<()> {
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> asyn_rs::error::AsynResult<()> {
             Ok(())
         }
         fn poll(
@@ -1425,7 +1417,10 @@ fn test_spmg_go_resumes_latched_jog() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity { direction: true, .. }
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
         )),
         "SPMG=Go must resume the latched forward jog"
     );
@@ -1443,12 +1438,10 @@ fn test_spmg_go_without_jog_replans_to_dval() {
     rec.ctrl.spmg = SpmgMode::Go;
     let effects = rec.plan_motion(CommandSource::Spmg);
     // No jog latched → replan toward DVAL.
-    assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }))
-    );
+    assert!(effects.commands.iter().any(|c| matches!(
+        c,
+        MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+    )));
 }
 
 // --- JOGF + JOGR simultaneous: latest-wins (epics-modules/motor #170) ---
@@ -1467,7 +1460,10 @@ fn test_jogr_command_clears_latched_jogf() {
     // Reverse jog issued
     assert!(effects.commands.iter().any(|c| matches!(
         c,
-        MotorCommand::MoveVelocity { direction: false, .. }
+        MotorCommand::MoveVelocity {
+            direction: false,
+            ..
+        }
     )));
 }
 
@@ -1482,7 +1478,10 @@ fn test_jogf_command_clears_latched_jogr() {
     assert!(!rec.ctrl.jogr, "JOGF command must clear latched JOGR");
     assert!(effects.commands.iter().any(|c| matches!(
         c,
-        MotorCommand::MoveVelocity { direction: true, .. }
+        MotorCommand::MoveVelocity {
+            direction: true,
+            ..
+        }
     )));
 }
 
@@ -1534,7 +1533,10 @@ fn test_jog_soft_limit_uses_user_frame_with_dir_neg() {
     rec.pos.val = 10.0; // at user high limit
     rec.ctrl.jogf = true;
     rec.plan_motion(CommandSource::Jogf);
-    assert!(!rec.ctrl.jogf, "forward jog at user HLM rejected under DIR=Neg");
+    assert!(
+        !rec.ctrl.jogf,
+        "forward jog at user HLM rejected under DIR=Neg"
+    );
     assert!(rec.limits.lvio);
 }
 
@@ -1598,7 +1600,11 @@ fn test_stop_field_during_active_jog_does_not_resume_jog() {
     // Driver reports done → check_completion must finalize, not re-jog.
     rec.stat.msta = MstaFlags::DONE;
     let effects = rec.check_completion();
-    assert_eq!(rec.stat.phase, MotionPhase::Idle, "must finalize, not resume jog");
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::Idle,
+        "must finalize, not resume jog"
+    );
     assert!(
         !effects
             .commands
@@ -1634,12 +1640,13 @@ fn test_jog_command_while_moving_is_queued_and_resumes_after_stop() {
     rec.stat.msta = MstaFlags::DONE;
     let effects = rec.check_completion();
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
-    assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::MoveVelocity { direction: true, .. }))
-    );
+    assert!(effects.commands.iter().any(|c| matches!(
+        c,
+        MotorCommand::MoveVelocity {
+            direction: true,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -2083,12 +2090,9 @@ fn test_rstm_always_restores_autosaved_dval() {
     let effects = rec.initial_readback(&status);
     // Always → keep autosaved DVAL, push SetPosition(7.0)
     assert_eq!(rec.pos.dval, 7.0);
-    assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { position } if (*position - 7.0).abs() < 1e-9))
-    );
+    assert!(effects.commands.iter().any(
+        |c| matches!(c, MotorCommand::SetPosition { position } if (*position - 7.0).abs() < 1e-9)
+    ));
 }
 
 #[test]
@@ -2133,7 +2137,10 @@ fn test_rstm_near_zero_no_restore_when_driver_already_positioned() {
     };
     let effects = rec.initial_readback(&status);
     // Driver position is meaningful → no restore → adopt driver readback (8.0).
-    assert_eq!(rec.pos.dval, 8.0, "should sync to driver position, not restore");
+    assert_eq!(
+        rec.pos.dval, 8.0,
+        "should sync to driver position, not restore"
+    );
     assert!(
         !effects
             .commands
@@ -2228,7 +2235,8 @@ fn test_loadpos_block_skips_rstm_restore() {
 #[test]
 fn test_loadpos_block_field_roundtrip() {
     let mut rec = MotorRecord::new();
-    rec.put_field("LOADPOS_BLOCK", EpicsValue::Short(1)).unwrap();
+    rec.put_field("LOADPOS_BLOCK", EpicsValue::Short(1))
+        .unwrap();
     assert_eq!(rec.get_field("LOADPOS_BLOCK"), Some(EpicsValue::Short(1)));
     assert!(rec.conv.loadpos_blocked);
 }
@@ -2296,7 +2304,8 @@ fn test_rhlm_rllm_roundtrip_via_pv() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
     rec.put_field("RHLM", EpicsValue::Double(10_000.0)).unwrap();
-    rec.put_field("RLLM", EpicsValue::Double(-10_000.0)).unwrap();
+    rec.put_field("RLLM", EpicsValue::Double(-10_000.0))
+        .unwrap();
     assert_eq!(rec.get_field("RHLM"), Some(EpicsValue::Double(10_000.0)));
     assert_eq!(rec.get_field("RLLM"), Some(EpicsValue::Double(-10_000.0)));
     // Dial limits derived from raw * mres
@@ -2389,8 +2398,5 @@ fn test_monitor_deadband_value_is_rbv_not_val() {
     let mut rec = MotorRecord::new();
     rec.pos.rbv = 42.0;
     rec.pos.val = 10.0; // setpoint differs from readback
-    assert_eq!(
-        rec.monitor_deadband_value(),
-        Some(EpicsValue::Double(42.0))
-    );
+    assert_eq!(rec.monitor_deadband_value(), Some(EpicsValue::Double(42.0)));
 }

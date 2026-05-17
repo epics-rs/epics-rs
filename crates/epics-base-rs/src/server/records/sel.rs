@@ -390,8 +390,8 @@ impl Record for SelRecord {
     /// alarms (HIHI/HIGH/LOW/LOLO) with per-level hysteresis, and the
     /// SOFT/CALC alarm raised by `do_sel` for a bad SELM/SELN.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        use crate::server::record::AlarmSeverity;
         use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
 
         // SOFT_ALARM / CALC_ALARM raised by do_sel — C raises this and
         // returns from do_sel; checkAlarms still runs but with UDF

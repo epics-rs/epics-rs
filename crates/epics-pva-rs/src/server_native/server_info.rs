@@ -67,9 +67,8 @@ pub struct ServerInfoSource {
 }
 
 /// Async closure type for [`ServerInfoSource`]'s channel enumeration.
-type ChannelLister = dyn Fn() -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Vec<String>> + Send>,
-    > + Send
+type ChannelLister = dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>
+    + Send
     + Sync;
 
 impl ServerInfoSource {
@@ -277,10 +276,7 @@ impl ChannelSource for ServerInfoSource {
     /// The `server` PV is queried with one-shot GET/RPC, not MONITOR
     /// — pvxs's `ServerSource` installs no `onSubscribe`. Returning
     /// `None` makes a MONITOR INIT against `server` fail cleanly.
-    async fn subscribe(
-        &self,
-        _name: &str,
-    ) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
         None
     }
 
@@ -304,17 +300,11 @@ impl ChannelSource for ServerInfoSource {
                     let mut names = (this.channel_lister)().await;
                     names.sort();
                     names.dedup();
-                    Ok((
-                        Self::channels_descriptor(),
-                        Self::channels_value(names),
-                    ))
+                    Ok((Self::channels_descriptor(), Self::channels_value(names)))
                 }
                 "info" => {
                     let (peers, channels) = this.live_counts().await;
-                    Ok((
-                        Self::info_descriptor(),
-                        this.info_value(peers, channels),
-                    ))
+                    Ok((Self::info_descriptor(), this.info_value(peers, channels)))
                 }
                 other => Err(format!(
                     "unknown op '{other}' (expected 'channels' or 'info')"
@@ -330,10 +320,9 @@ mod tests {
 
     fn nturi_op(op: &str) -> (FieldDesc, PvField) {
         let mut query = PvStructure::new("");
-        query.fields.push((
-            "op".into(),
-            PvField::Scalar(ScalarValue::String(op.into())),
-        ));
+        query
+            .fields
+            .push(("op".into(), PvField::Scalar(ScalarValue::String(op.into()))));
         let mut root = PvStructure::new("epics:nt/NTURI:1.0");
         root.fields.push((
             "scheme".into(),
@@ -409,11 +398,7 @@ mod tests {
         };
         assert_eq!(
             names,
-            vec![
-                "a:pv".to_string(),
-                "m:pv".to_string(),
-                "z:pv".to_string()
-            ]
+            vec!["a:pv".to_string(), "m:pv".to_string(), "z:pv".to_string()]
         );
     }
 
@@ -514,10 +499,7 @@ mod tests {
     #[tokio::test]
     async fn put_is_rejected_read_only() {
         let src = source_with(vec![]);
-        let err = src
-            .put_value("server", PvField::Null)
-            .await
-            .unwrap_err();
+        let err = src.put_value("server", PvField::Null).await.unwrap_err();
         assert!(err.contains("read-only"), "put rejected: {err}");
     }
 }

@@ -49,10 +49,7 @@ async fn main() {
                             } else {
                                 format!(":{}", c.authority)
                             };
-                            println!(
-                                "# TLS x509{authority}/{}@{server_addr}",
-                                c.account
-                            );
+                            println!("# TLS x509{authority}/{}@{server_addr}", c.account);
                         }
                         None => {
                             // Plain `pva://` TCP — no peer certificate,

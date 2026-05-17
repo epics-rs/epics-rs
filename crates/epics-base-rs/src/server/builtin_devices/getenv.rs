@@ -96,7 +96,10 @@ impl DeviceSupport for GetenvDeviceSupport {
         // Perform the initial read so PINI / first monitor sees the
         // resolved value rather than the empty default. Mirrors C
         // getenvDevSup's `init_record` behaviour.
-        let value = self.cached_var.as_ref().and_then(|var| std::env::var(var).ok());
+        let value = self
+            .cached_var
+            .as_ref()
+            .and_then(|var| std::env::var(var).ok());
         match value {
             Some(s) => {
                 record.put_field("VAL", EpicsValue::String(s))?;

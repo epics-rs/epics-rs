@@ -867,9 +867,7 @@ ASG(DEFAULT) {
         // test), so the error is a lookup/timeout — NOT the gateway
         // ACL denial. We assert the denial string is gone.
         let allow_token = check(&src, "any:pv", &ctx).await;
-        let result = src
-            .put_value_checked(allow_token, dummy_value, ctx)
-            .await;
+        let result = src.put_value_checked(allow_token, dummy_value, ctx).await;
         if let Err(msg) = result {
             assert!(
                 !msg.contains("denied by gateway access security"),

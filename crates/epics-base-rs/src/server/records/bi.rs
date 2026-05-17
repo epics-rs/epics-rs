@@ -241,8 +241,8 @@ impl Record for BiRecord {
     /// idempotent with the framework's own `rec_gbl_check_udf`, which
     /// also runs on the process path).
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        use crate::server::record::AlarmSeverity;
         use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
 
         if common.udf {
             recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);

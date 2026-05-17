@@ -279,9 +279,8 @@ impl MotorRecord {
         // DRBV, since DRBV follows the encoder (ERES) when UEIP=Yes.
         let rdbd = self.retry.rdbd.abs().max(self.conv.mres.abs());
         let motor_dial = coordinate::raw_to_dial(self.pos.rmp, self.conv.mres);
-        let dval_non_zero_pos_near_zero = autosaved_dval.abs() > rdbd
-            && self.conv.mres != 0.0
-            && motor_dial.abs() < rdbd;
+        let dval_non_zero_pos_near_zero =
+            autosaved_dval.abs() > rdbd && self.conv.mres != 0.0 && motor_dial.abs() < rdbd;
         let mut restore = self
             .conv
             .rstm
@@ -317,8 +316,7 @@ impl MotorRecord {
             // Adopt the autosaved DVAL: keep record coordinates and tell the
             // driver to redefine its current position to that value.
             self.pos.dval = autosaved_dval;
-            self.pos.val =
-                coordinate::dial_to_user(autosaved_dval, self.conv.dir, self.pos.off);
+            self.pos.val = coordinate::dial_to_user(autosaved_dval, self.conv.dir, self.pos.off);
             if let Ok(rval) = coordinate::dial_to_raw(autosaved_dval, self.conv.mres) {
                 self.pos.rval = rval;
             }

@@ -342,9 +342,7 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::String(s)) => s.clone(),
                         _ => String::new(),
                     };
-                    eprintln!(
-                        "create_triggered_set: {filename}, trigger={trigger_channel}"
-                    );
+                    eprintln!("create_triggered_set: {filename}, trigger={trigger_channel}");
                     h.lock().unwrap().triggered_sets.push(MonitorSetDef {
                         filename,
                         // Trigger-watcher poll interval (debounce).
@@ -454,13 +452,12 @@ impl AutosaveStartupConfig {
                         ArgValue::String(s) => s.clone(),
                         _ => return Err("mode argument required".into()),
                     };
-                    let compat = if mode.eq_ignore_ascii_case("c")
-                        || mode.eq_ignore_ascii_case("cread")
-                    {
-                        CompatMode::CRead
-                    } else {
-                        CompatMode::Native
-                    };
+                    let compat =
+                        if mode.eq_ignore_ascii_case("c") || mode.eq_ignore_ascii_case("cread") {
+                            CompatMode::CRead
+                        } else {
+                            CompatMode::Native
+                        };
                     eprintln!("save_restoreSet_CompatMode: {compat:?}");
                     h.lock().unwrap().compat = compat;
                     Ok(CommandOutcome::Continue)

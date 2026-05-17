@@ -264,8 +264,8 @@ pub(crate) fn select_link_indices_ex(
     shft: i16,
     count: usize,
 ) -> SelmResult {
-    use crate::server::record::AlarmSeverity;
     use crate::server::recgbl::alarm_status::SOFT_ALARM;
+    use crate::server::record::AlarmSeverity;
 
     let invalid = || SelmResult {
         indices: Vec::new(),

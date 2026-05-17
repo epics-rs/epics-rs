@@ -266,8 +266,7 @@ async fn main() {
         // index (the same documented divergence as the scalar path).
         let enum_by_name = native_type == epics_ca_rs::DbFieldType::Enum
             && !args.force_numeric
-            && (args.force_string
-                || tokens.iter().any(|t| parse_plain_integer(t).is_none()));
+            && (args.force_string || tokens.iter().any(|t| parse_plain_integer(t).is_none()));
         if enum_by_name {
             WriteValue::EnumStringArray(tokens.to_vec())
         } else {
@@ -436,9 +435,7 @@ impl WriteValue {
         match self {
             WriteValue::Typed(v) => v.clone(),
             WriteValue::EnumString(s) => epics_ca_rs::EpicsValue::String(s.clone()),
-            WriteValue::EnumStringArray(v) => {
-                epics_ca_rs::EpicsValue::StringArray(v.clone())
-            }
+            WriteValue::EnumStringArray(v) => epics_ca_rs::EpicsValue::StringArray(v.clone()),
         }
     }
 }

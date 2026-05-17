@@ -12,10 +12,10 @@ use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::types::DbFieldType;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType};
 
-use crate::convert::{dbf_to_scalar_type, epics_to_pv_field};
 use super::group_config::{GroupMember, GroupPvDef, TriggerDef};
 use super::monitor::BridgeMonitor;
 use super::pvif::{self, FieldMapping, NtType};
+use crate::convert::{dbf_to_scalar_type, epics_to_pv_field};
 use crate::error::{BridgeError, BridgeResult};
 
 // ---------------------------------------------------------------------------

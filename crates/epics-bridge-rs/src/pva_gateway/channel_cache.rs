@@ -670,9 +670,7 @@ impl ChannelCache {
     /// so a subsequent search re-resolves immediately.
     pub async fn drop_entry(&self, pv_name: &str) -> bool {
         let removed = self.entries.lock().await.remove(pv_name).is_some();
-        self.negative_cache
-            .lock()
-            .retain(|(n, _)| n != pv_name);
+        self.negative_cache.lock().retain(|(n, _)| n != pv_name);
         removed
     }
 }

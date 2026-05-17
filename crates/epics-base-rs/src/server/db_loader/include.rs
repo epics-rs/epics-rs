@@ -121,8 +121,7 @@ fn expand_includes_inner(
             local_paths.extend(split_path_list(&expanded));
         } else if let Some(filename) = parse_include_directive(line) {
             let expanded_filename = substitute_macros(&filename, &local_macros);
-            let include_path =
-                resolve_include_path(&expanded_filename, parent_dir, &local_paths)?;
+            let include_path = resolve_include_path(&expanded_filename, parent_dir, &local_paths)?;
             let canonical = include_path
                 .canonicalize()
                 .map_err(|e| CaError::DbParseError {
@@ -252,7 +251,10 @@ pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, String)> {
     let mut has_eq = false;
     let mut i = 0;
 
-    let flush = |name: &mut String, value: &mut String, has_eq: &mut bool, pairs: &mut Vec<(String, String)>| {
+    let flush = |name: &mut String,
+                 value: &mut String,
+                 has_eq: &mut bool,
+                 pairs: &mut Vec<(String, String)>| {
         let k = name.trim();
         if *has_eq && !k.is_empty() {
             pairs.push((k.to_string(), value.trim().to_string()));

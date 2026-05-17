@@ -914,7 +914,10 @@ mod tests {
         // INVALID state severity propagates into common — the
         // framework's IVOA "Don't drive" then suppresses the OUT write.
         assert_eq!(common.nsev, AlarmSeverity::Invalid);
-        assert_eq!(common.nsta, crate::server::recgbl::alarm_status::STATE_ALARM);
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::STATE_ALARM
+        );
     }
 
     #[test]

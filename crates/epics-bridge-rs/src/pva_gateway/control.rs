@@ -214,8 +214,7 @@ impl ControlSource {
             return None;
         };
         // NTURI: look inside `query` first.
-        if let Some((_, PvField::Structure(query))) =
-            root.fields.iter().find(|(n, _)| n == "query")
+        if let Some((_, PvField::Structure(query))) = root.fields.iter().find(|(n, _)| n == "query")
         {
             if let Some((_, f)) = query.fields.iter().find(|(n, _)| n == arg) {
                 if let Some(s) = scalar_string(f) {
@@ -566,7 +565,10 @@ mod tests {
             )
             .await;
         assert!(res.is_err(), "deny-all default must reject control RPC");
-        assert!(res.unwrap_err().contains("not an authorised gateway operator"));
+        assert!(
+            res.unwrap_err()
+                .contains("not an authorised gateway operator")
+        );
     }
 
     #[tokio::test]
@@ -574,8 +576,7 @@ mod tests {
         let (cache, gw) = make_source();
         // Even with an allow-all predicate the ctx-less `rpc` path
         // must refuse — it carries no credentials.
-        let ctrl = ControlSource::new("gw", cache, gw)
-            .with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
         let res = ctrl
             .rpc(
                 "gw:flush",
@@ -587,7 +588,10 @@ mod tests {
             )
             .await;
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("requires an authenticated request"));
+        assert!(
+            res.unwrap_err()
+                .contains("requires an authenticated request")
+        );
     }
 
     #[tokio::test]
@@ -635,8 +639,7 @@ mod tests {
     #[tokio::test]
     async fn drop_rpc_requires_pv_argument() {
         let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw)
-            .with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
         let res = ctrl
             .rpc_checked(
                 checked("gw:drop").await,
@@ -655,8 +658,7 @@ mod tests {
     #[tokio::test]
     async fn drop_rpc_reports_missing_entry() {
         let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw)
-            .with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
         let (_desc, reply) = ctrl
             .rpc_checked(
                 checked("gw:drop").await,
@@ -677,8 +679,7 @@ mod tests {
     #[tokio::test]
     async fn reload_rpc_without_path_or_default_fails() {
         let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw)
-            .with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
         let res = ctrl
             .rpc_checked(
                 checked("gw:reload").await,
@@ -697,8 +698,8 @@ mod tests {
     #[tokio::test]
     async fn reload_rpc_parses_acf_from_explicit_path() {
         let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache.clone(), gw)
-            .with_credential_check(Arc::new(|_| true));
+        let ctrl =
+            ControlSource::new("gw", cache.clone(), gw).with_credential_check(Arc::new(|_| true));
         // Write a minimal valid ACF file.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("pva_gw_b6_reload_{}.acf", std::process::id()));
@@ -750,8 +751,7 @@ mod tests {
     #[tokio::test]
     async fn reload_rpc_rejects_unparseable_acf() {
         let (cache, gw) = make_source();
-        let ctrl = ControlSource::new("gw", cache, gw)
-            .with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", cache, gw).with_credential_check(Arc::new(|_| true));
         let dir = std::env::temp_dir();
         let path = dir.join(format!("pva_gw_b6_bad_{}.acf", std::process::id()));
         std::fs::write(&path, "this is not valid ACF (((").unwrap();

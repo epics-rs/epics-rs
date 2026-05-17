@@ -68,10 +68,12 @@ impl SyncIOHandle {
         let result = self
             .handle
             .submit_blocking(RequestOp::Int32Read, self.user(reason))?;
-        result.int_val.ok_or_else(|| crate::error::AsynError::Status {
-            status: crate::error::AsynStatus::Error,
-            message: "int32 read returned no value".into(),
-        })
+        result
+            .int_val
+            .ok_or_else(|| crate::error::AsynError::Status {
+                status: crate::error::AsynStatus::Error,
+                message: "int32 read returned no value".into(),
+            })
     }
 
     pub fn write_int32(&self, reason: usize, value: i32) -> AsynResult<()> {

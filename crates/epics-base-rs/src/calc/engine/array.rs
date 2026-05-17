@@ -208,9 +208,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::ShrLogical => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| {
-                        (d2ui(x) >> (d2ui(y) & 31)) as f64
-                    })?);
+                    stack.push(zip_map(a, b, |x, y| (d2ui(x) >> (d2ui(y) & 31)) as f64)?);
                 }
 
                 // Conditional

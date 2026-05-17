@@ -356,10 +356,7 @@ mod tests {
             );
         }
         for name in ["NOM", "NOVU", "INPR", "OUTT"] {
-            assert!(
-                rec.get_field(name).is_some(),
-                "channel field must exist"
-            );
+            assert!(rec.get_field(name).is_some(), "channel field must exist");
         }
     }
 

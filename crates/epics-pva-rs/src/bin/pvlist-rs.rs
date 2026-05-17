@@ -26,7 +26,11 @@ use epics_pva_rs::client_native::search_engine::{Discovered, SearchEngine};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
 #[derive(Parser)]
-#[command(name = "pvlist-rs", version, about = "Discover PVA servers / list hosted channels")]
+#[command(
+    name = "pvlist-rs",
+    version,
+    about = "Discover PVA servers / list hosted channels"
+)]
 struct Args {
     /// Wait time in seconds before exiting (0 = forever)
     #[arg(short = 'w', default_value = "5.0")]
@@ -119,10 +123,9 @@ fn build_server_query(op: &str) -> (FieldDesc, PvField) {
         PvField::Scalar(ScalarValue::String("server".into())),
     ));
     let mut query = PvStructure::new("");
-    query.fields.push((
-        "op".into(),
-        PvField::Scalar(ScalarValue::String(op.into())),
-    ));
+    query
+        .fields
+        .push(("op".into(), PvField::Scalar(ScalarValue::String(op.into()))));
     top.fields.push(("query".into(), PvField::Structure(query)));
     (desc, PvField::Structure(top))
 }

@@ -246,10 +246,7 @@ mod buffer_size_tests {
     #[test]
     fn sts_double_meta_is_8() {
         // scalar: 8 (meta) + 8 (value) = 16
-        assert_eq!(
-            dbr_buffer_size(DBR_STS_DOUBLE, DbFieldType::Double, 1),
-            16
-        );
+        assert_eq!(dbr_buffer_size(DBR_STS_DOUBLE, DbFieldType::Double, 1), 16);
         // n elements: 8 + 8*n
         assert_eq!(
             dbr_buffer_size(DBR_STS_DOUBLE, DbFieldType::Double, 5),
@@ -262,10 +259,7 @@ mod buffer_size_tests {
     #[test]
     fn sts_char_meta_is_5() {
         assert_eq!(dbr_buffer_size(DBR_STS_CHAR, DbFieldType::Char, 1), 6);
-        assert_eq!(
-            dbr_buffer_size(DBR_STS_CHAR, DbFieldType::Char, 10),
-            5 + 10
-        );
+        assert_eq!(dbr_buffer_size(DBR_STS_CHAR, DbFieldType::Char, 10), 5 + 10);
     }
 
     /// H-1: types with no STS RISC pad keep the flat 4-byte meta.

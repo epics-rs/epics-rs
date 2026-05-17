@@ -357,7 +357,9 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
     // The empty-expression program ([End] only) is a deliberate Rust
     // special case (`compile("")`) and yields 0.0; every other program
     // must leave exactly one residual value.
-    let is_empty_program = code.iter().all(|op| matches!(op, Opcode::Core(CoreOp::End)));
+    let is_empty_program = code
+        .iter()
+        .all(|op| matches!(op, Opcode::Core(CoreOp::End)));
     if is_empty_program {
         return Ok(stack.first().copied().unwrap_or(0.0));
     }
@@ -595,10 +597,7 @@ mod parity_tests {
     #[test]
     fn h1_array_extension_arity_mismatch_rejected() {
         // CAT needs 2 operands; one operand -> net depth 0 -> Incomplete.
-        assert!(matches!(
-            compile("CAT(AA)"),
-            Err(CalcError::Incomplete)
-        ));
+        assert!(matches!(compile("CAT(AA)"), Err(CalcError::Incomplete)));
     }
 
     // H-2: max/min NaN propagation matches C.
@@ -703,7 +702,10 @@ mod parity_tests {
         assert_eq!(CalcError::Incomplete.code(), 8);
         assert_eq!(CalcError::Syntax.code(), 11);
         assert_eq!(calc_error_str(0), Some("No error"));
-        assert_eq!(calc_error_str(8), Some("Incomplete expression, operand missing"));
+        assert_eq!(
+            calc_error_str(8),
+            Some("Incomplete expression, operand missing")
+        );
         assert_eq!(calc_error_str(14), None);
         assert_eq!(calc_error_str(-1), None);
     }

@@ -493,9 +493,7 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
 /// request is built it carries `record[pipeline=...,queueSize=N]`,
 /// which `epics-pva-rs` re-sends on every reconnect, mirroring pvxs
 /// `pvaLink::makeRequest` (pvalink_link.cpp:47).
-fn monitor_request(
-    config: &PvaLinkConfig,
-) -> Option<epics_pva_rs::pv_request::PvRequestExpr> {
+fn monitor_request(config: &PvaLinkConfig) -> Option<epics_pva_rs::pv_request::PvRequestExpr> {
     use super::config::DEFAULT_QUEUE_SIZE;
     let needs_pipeline = config.pipeline;
     let needs_queue = config.queue_size != DEFAULT_QUEUE_SIZE;
@@ -604,16 +602,17 @@ mod tests {
         assert!(matches!(v, PvField::Null));
     }
 
-    use super::super::config::{PvaLinkConfig, SevrMode};
     use super::super::config::LinkDirection;
+    use super::super::config::{PvaLinkConfig, SevrMode};
 
     /// Build an NTScalar-shaped structure with an `alarm.severity`
     /// (and optional `alarm.message`).
     fn nt_with_alarm(severity: i32, message: Option<&str>) -> PvField {
         let mut alarm = PvStructure::new("alarm_t");
-        alarm
-            .fields
-            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(severity))));
+        alarm.fields.push((
+            "severity".into(),
+            PvField::Scalar(ScalarValue::Int(severity)),
+        ));
         if let Some(m) = message {
             alarm.fields.push((
                 "message".into(),
@@ -641,7 +640,10 @@ mod tests {
     #[test]
     fn b2_nms_drops_all_severities() {
         for sev in 1..=3 {
-            let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), Some(nt_with_alarm(sev, Some("bad"))));
+            let link = PvaLink::for_test(
+                inp_cfg(SevrMode::Nms),
+                Some(nt_with_alarm(sev, Some("bad"))),
+            );
             assert_eq!(link.link_alarm_severity(), None, "sev={sev}");
             assert_eq!(link.alarm_message(), None, "sev={sev}");
         }
@@ -655,7 +657,10 @@ mod tests {
         assert_eq!(ok.alarm_message(), None);
         // MINOR / MAJOR / INVALID all propagate.
         for sev in 1..=3 {
-            let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), Some(nt_with_alarm(sev, Some("oops"))));
+            let link = PvaLink::for_test(
+                inp_cfg(SevrMode::Ms),
+                Some(nt_with_alarm(sev, Some("oops"))),
+            );
             assert_eq!(link.link_alarm_severity(), Some(sev), "sev={sev}");
             assert_eq!(link.alarm_message(), Some("oops".to_string()), "sev={sev}");
         }
@@ -667,7 +672,8 @@ mod tests {
         assert_eq!(minor.link_alarm_severity(), None);
         let major = PvaLink::for_test(inp_cfg(SevrMode::Msi), Some(nt_with_alarm(2, Some("m"))));
         assert_eq!(major.link_alarm_severity(), None);
-        let invalid = PvaLink::for_test(inp_cfg(SevrMode::Msi), Some(nt_with_alarm(3, Some("dead"))));
+        let invalid =
+            PvaLink::for_test(inp_cfg(SevrMode::Msi), Some(nt_with_alarm(3, Some("dead"))));
         assert_eq!(invalid.link_alarm_severity(), Some(3));
         assert_eq!(invalid.alarm_message(), Some("dead".to_string()));
     }
@@ -840,4 +846,3 @@ mod tests {
         assert!(!is_disconnect(&PvaError::Decode("x".into())));
     }
 }
-

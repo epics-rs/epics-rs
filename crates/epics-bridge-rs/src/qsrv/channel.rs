@@ -8,12 +8,12 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
 
-use crate::convert::{dbf_to_scalar_type, scalar_to_epics_typed};
 use super::monitor::BridgeMonitor;
 use super::provider::Channel;
 use super::pvif::{
     self, NtType, build_field_desc_for_nt, pv_structure_to_epics, snapshot_to_pv_structure,
 };
+use crate::convert::{dbf_to_scalar_type, scalar_to_epics_typed};
 use crate::error::{BridgeError, BridgeResult};
 
 // ---------------------------------------------------------------------------

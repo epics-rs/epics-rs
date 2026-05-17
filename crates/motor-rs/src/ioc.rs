@@ -30,7 +30,12 @@ impl SimMotorHolder {
     /// Start polling on all registered motors.
     /// Call after PINI processing to avoid queue buildup.
     pub fn start_all_polling(&self) {
-        for tx in self.poll_senders.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for tx in self
+            .poll_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
             let _ = tx.try_send(crate::poll_loop::PollCommand::StartPolling);
         }
     }
@@ -111,7 +116,11 @@ impl SimMotorHolder {
                 // Spawn poll loop on the tokio runtime (starts idle)
                 ctx.runtime_handle().spawn(poll_loop.run());
 
-                holder.poll_senders.lock().unwrap_or_else(|e| e.into_inner()).push(poll_cmd_tx);
+                holder
+                    .poll_senders
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(poll_cmd_tx);
                 holder
                     .motors
                     .lock()

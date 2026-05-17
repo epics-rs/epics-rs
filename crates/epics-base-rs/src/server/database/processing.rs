@@ -664,7 +664,17 @@ impl PvDatabase {
             // and wrongly clear UDF (06-H-2 regression). `is_raw_soft`
             // (Raw Soft Channel, `devAiSoftRaw` returns 0) is excluded —
             // it deliberately wants the RVAL→VAL convert.
-            let soft_input_skips_convert = is_soft && !is_output && !is_raw_soft;
+            //
+            // Gated on `soft_channel_skips_convert()` so this only
+            // suppresses an `RVAL → VAL` convert step. Records such as
+            // `epid` also override `set_device_did_compute` but treat it
+            // as "skip the whole built-in compute" (the PID loop); they
+            // return `false` here so a Soft-Channel `epid` still runs
+            // `do_pid()` in `process()`.
+            let soft_input_skips_convert = is_soft
+                && !is_output
+                && !is_raw_soft
+                && instance.record.soft_channel_skips_convert();
             let mut device_did_compute = (soft_inp_applied && is_soft) || soft_input_skips_convert;
             if !is_soft && !is_output {
                 if let Some(mut dev) = instance.device.take() {

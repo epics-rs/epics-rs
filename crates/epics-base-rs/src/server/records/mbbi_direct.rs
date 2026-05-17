@@ -334,4 +334,11 @@ impl Record for MbbiDirectRecord {
     fn set_device_did_compute(&mut self, did: bool) {
         self.skip_convert = did;
     }
+
+    /// `mbbiDirect` has an `RVAL → VAL` `convert()` step. A `Soft
+    /// Channel` `mbbiDirect` must skip it — C `devMbbiDirectSoft.c`
+    /// `read_mbbiDirect` returns 2.
+    fn soft_channel_skips_convert(&self) -> bool {
+        true
+    }
 }

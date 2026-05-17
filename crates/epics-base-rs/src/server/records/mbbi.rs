@@ -641,6 +641,12 @@ impl Record for MbbiRecord {
         self.skip_convert = did;
     }
 
+    /// `mbbi` has an `RVAL → VAL` `convert()` step. A `Soft Channel`
+    /// `mbbi` must skip it — C `devMbbiSoft.c` `read_mbbi` returns 2.
+    fn soft_channel_skips_convert(&self) -> bool {
+        true
+    }
+
     /// C `mbbiRecord.c::checkAlarms` — UDF alarm, STATE alarm from the
     /// per-state severity (ZRSV..FFSV, or UNSV for an unknown state)
     /// with the AFTC low-pass filter (PR #817), and COS alarm (COSV).

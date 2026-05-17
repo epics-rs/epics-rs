@@ -555,6 +555,13 @@ impl Record for AiRecord {
     fn set_device_did_compute(&mut self, did_compute: bool) {
         self.skip_convert = did_compute;
     }
+
+    /// `ai` has an `RVAL → VAL` `convert()` step (raw → engineering
+    /// units). A `Soft Channel` `ai` must skip it — C `devAiSoft.c`
+    /// `read_ai` returns 2 ("don't convert").
+    fn soft_channel_skips_convert(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

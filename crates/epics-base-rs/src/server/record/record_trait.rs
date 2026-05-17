@@ -461,6 +461,29 @@ pub trait Record: Send + Sync + 'static {
     /// to skip it when device support already ran it.
     /// Default: ignore.
     fn set_device_did_compute(&mut self, _did_compute: bool) {}
+
+    /// Whether this record has a raw-to-engineering (`RVAL → VAL`)
+    /// `convert()` step that must be skipped on a `Soft Channel` input.
+    ///
+    /// C `devAiSoft.c:65` `read_ai` (and the other soft-channel input
+    /// `read_xxx`) always returns 2 ("don't convert"), so `aiRecord.c`'s
+    /// `if (status==0) convert(prec)` is bypassed for a `Soft Channel`
+    /// input record. The framework expresses this by calling
+    /// [`Record::set_device_did_compute(true)`] on the record before
+    /// `process()`.
+    ///
+    /// This hook exists so the framework only suppresses `convert()` —
+    /// NOT a record's entire built-in compute. Records like `epid` also
+    /// override `set_device_did_compute` but interpret it as "skip the
+    /// whole compute step" (the PID loop); those records have no
+    /// `RVAL → VAL` convert and MUST keep the default `false` so a
+    /// `Soft Channel` `epid` still runs `do_pid()` in `process()`.
+    ///
+    /// Default `false`: a record is only opted into the soft-channel
+    /// convert-skip when it explicitly returns `true`.
+    fn soft_channel_skips_convert(&self) -> bool {
+        false
+    }
 }
 
 /// Subroutine function type for sub records.

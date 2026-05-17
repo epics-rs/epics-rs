@@ -234,6 +234,12 @@ impl Record for BiRecord {
         self.skip_convert = did_compute;
     }
 
+    /// `bi` has an `RVAL → VAL` `convert()` step. A `Soft Channel` `bi`
+    /// must skip it — C `devBiSoft.c` `read_bi` returns 2.
+    fn soft_channel_skips_convert(&self) -> bool {
+        true
+    }
+
     /// C `biRecord.c::checkAlarms` — UDF alarm, STATE alarm (ZSV/OSV
     /// with the AFTC low-pass filter) and COS alarm (COSV). C
     /// `checkAlarms:232-235` raises `UDF_ALARM/udfs` and returns early

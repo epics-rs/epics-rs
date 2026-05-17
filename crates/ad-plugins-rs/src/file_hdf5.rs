@@ -2362,6 +2362,57 @@ mod tests {
     }
 
     #[test]
+    fn test_frames_chunks_with_sub_frame_tiles() {
+        // Full chunk geometry: nFramesChunks AND sub-frame row/col tiling at
+        // once — exercises the complete flush_band [fc, rc, cc] tile grid
+        // with a partial final band.
+        let path = temp_path("hdf5_full_chunk");
+        let mut writer = Hdf5Writer::new();
+        writer.set_chunk_size_auto(false);
+        writer.set_n_frames_chunks(2); // 2 frames per band
+        writer.set_n_row_chunks(4); // Y = 8 → 2 row tiles
+        writer.set_n_col_chunks(4); // X = 8 → 2 col tiles
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        // 3 frames → band [0,1] full, band [2] partial; 2x2 tiles each.
+        for f in 0..3u16 {
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = f * 1000 + i as u16;
+                }
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&arr).unwrap();
+        }
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![3, 8, 8], "exact frame count");
+        assert_eq!(ds.chunk_dims(), Some(vec![2, 4, 4]));
+        let raw: Vec<u16> = ds.read_raw().unwrap();
+        assert_eq!(raw.len(), 3 * 64);
+        for f in 0..3u16 {
+            for i in 0..64usize {
+                assert_eq!(
+                    raw[f as usize * 64 + i],
+                    f * 1000 + i as u16,
+                    "frame {} elem {}",
+                    f,
+                    i
+                );
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn test_attribute_datasets() {
         let path = temp_path("hdf5_attr_ds");
         let mut writer = Hdf5Writer::new();

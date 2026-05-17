@@ -608,7 +608,12 @@ impl Record for MbbiRecord {
         if !self.skip_convert {
             let mut rval = self.rval;
             if self.shft > 0 {
-                rval = ((rval as u32) >> (self.shft as u32)) as i32;
+                // C `mbbiRecord.c:175-176` does `rval >>= prec->shft`
+                // on a 32-bit `epicsUInt32`. A CA-written SHFT >= 32
+                // makes that shift UB in C (no crash). Rust `>>`
+                // panics in debug builds; `checked_shr` mapped to 0
+                // matches the defined fully-shifted-out result.
+                rval = (rval as u32).checked_shr(self.shft as u32).unwrap_or(0) as i32;
             }
             self.val = self.raw_to_val(rval);
         }
@@ -762,7 +767,9 @@ impl Record for MbbiRecord {
         };
         self.rval = raw;
         let shifted = if self.shft > 0 {
-            ((raw as u32) >> (self.shft as u32)) as i32
+            // See `process` — `checked_shr` so a CA-written SHFT >= 32
+            // yields 0 instead of panicking in debug builds.
+            (raw as u32).checked_shr(self.shft as u32).unwrap_or(0) as i32
         } else {
             raw
         };

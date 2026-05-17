@@ -240,3 +240,52 @@ async fn udf_cleared_on_defined_value() {
         "UDF must clear when VAL is a defined value"
     );
 }
+
+/// BUG 3 regression — a fanout `LNKn` pointing at a non-Passive
+/// (Periodic / Event / I/O-Intr) target must NOT be processed by the
+/// fanout. C `fanoutRecord.c:110` dispatches each LNKn via
+/// `dbScanFwdLink` → `dbScanPassive` (`dbDbLink.c:425-432`), which
+/// returns early when `pto->scan != 0`. The Rust fanout path
+/// previously called `process_record_with_links` unconditionally.
+#[tokio::test]
+async fn fanout_lnk_skips_non_passive_target() {
+    use epics_base_rs::server::record::ScanType;
+
+    let db = Arc::new(PvDatabase::new());
+    // PASS_TGT is Passive — must be processed.
+    db.add_record("PASS_TGT", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    // PERIODIC_TGT is Periodic — its own scan owns it; the fanout
+    // must NOT re-process it.
+    db.add_record("PERIODIC_TGT", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    {
+        let r = db.get_record("PERIODIC_TGT").await.unwrap();
+        let mut inst = r.write().await;
+        inst.common.scan = ScanType::Sec1;
+    }
+
+    let mut fan = FanoutRecord::new();
+    fan.put_field("SELM", EpicsValue::Short(0)).unwrap(); // All
+    fan.put_field("LNK0", EpicsValue::String("PASS_TGT".into()))
+        .unwrap();
+    fan.put_field("LNK1", EpicsValue::String("PERIODIC_TGT".into()))
+        .unwrap();
+    db.add_record("FAN_B3", Box::new(fan)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("FAN_B3", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        visited.contains("PASS_TGT"),
+        "fanout LNK0 Passive target must be processed: {visited:?}"
+    );
+    assert!(
+        !visited.contains("PERIODIC_TGT"),
+        "fanout LNK1 Periodic target must NOT be processed by the fanout: {visited:?}"
+    );
+}

@@ -2140,13 +2140,43 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
     // Continuation fired: process() ran a second time despite
-    // pact=true, and on Complete the AsyncPending tail in
-    // complete_async_record cleared pact.
+    // pact=true.
     assert_eq!(
         process_count.load(Ordering::SeqCst),
         2,
         "ReprocessAfter timer must call process() again — owner-driven \
          continuation bypasses the PACT entry guard"
+    );
+
+    // BUG 1 regression — when the continuation's `process()` returns
+    // `Complete` (not async-pending again), the `processing` flag set
+    // on the original `AsyncPending` MUST be cleared. The continuation
+    // path does NOT go through `complete_async_record`, so without an
+    // explicit clear in `process_record_with_links_inner` the flag
+    // stayed `true` forever. C parity: an async record's completion
+    // re-entry clears `pact` inside `process()` (`aiRecord.c` second
+    // pass). A leaked `processing=true` would make every later foreign
+    // `process_record_with_links` trip the PACT entry guard.
+    {
+        let rec = db.get_record("CONT_REC").await.unwrap();
+        assert!(
+            !rec.read().await.is_processing(),
+            "BUG 1: completed ReprocessAfter continuation must clear PACT"
+        );
+    }
+
+    // A foreign caller after the continuation completed must actually
+    // run `process()` again — proving the PACT entry guard no longer
+    // fires (it would if `processing` had leaked true).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CONT_REC", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        process_count.load(Ordering::SeqCst),
+        3,
+        "BUG 1: after the continuation cleared PACT, a foreign process \
+         must run process() again instead of bailing at the entry guard"
     );
 }
 
@@ -3667,7 +3697,11 @@ async fn test_output_link_cascade_uses_post_process_source_timestamp() {
         .unwrap();
     if let Some(rec) = db.get_record("TS_SRC").await {
         let mut inst = rec.write().await;
-        inst.put_common_field("OUT", EpicsValue::String("TS_DST".into()))
+        // Explicit `PP` — C `dbDbPutValue` processes the OUT-link
+        // target only on an explicit PP flag (a bare OUT link is NPP
+        // and would only write the value). This test exercises the
+        // cascade, so the PP modifier is required.
+        inst.put_common_field("OUT", EpicsValue::String("TS_DST PP".into()))
             .unwrap();
     }
 
@@ -3820,7 +3854,10 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
         .unwrap();
     if let Some(rec) = db.get_record("LO_SRC").await {
         let mut inst = rec.write().await;
-        inst.put_common_field("OUT", EpicsValue::String("LO_DST".into()))
+        // Explicit `PP` — a bare OUT link is NPP (C `dbDbPutValue`);
+        // this test observes the cascade via the target's timestamp,
+        // so the OUT link must process the target.
+        inst.put_common_field("OUT", EpicsValue::String("LO_DST PP".into()))
             .unwrap();
         inst.record.put_field("OOPT", EpicsValue::Short(1)).unwrap();
     }
@@ -3916,9 +3953,11 @@ async fn test_self_link_out_does_not_loop() {
         .unwrap();
     if let Some(rec) = db.get_record("SELF_LO").await {
         let mut inst = rec.write().await;
-        // OUT="SELF_LO" → defaults to .VAL with PP, writes back to
-        // self and would normally re-trigger processing.
-        inst.put_common_field("OUT", EpicsValue::String("SELF_LO".into()))
+        // OUT="SELF_LO.VAL PP" → explicit PP so write_db_link_value
+        // attempts to re-process self; this is the case the visited
+        // HashSet recursion guard must catch. A bare OUT link is NPP
+        // (C `dbDbPutValue`) and would not exercise the guard at all.
+        inst.put_common_field("OUT", EpicsValue::String("SELF_LO PP".into()))
             .unwrap();
     }
 
@@ -4507,4 +4546,74 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
              (C dbAccess.c:1294-1297)"
         );
     }
+}
+
+/// BUG 2 regression — a bare (modifier-less) OUT link is NPP: the
+/// value is written to the target but the target is NOT processed.
+/// C `dbDbPutValue` (dbDbLink.c:386-389) calls `processTarget` only
+/// when the link carries an explicit `PP` flag (or writes `.PROC`).
+#[tokio::test]
+async fn test_bare_out_link_does_not_process_target() {
+    let db = PvDatabase::new();
+    db.add_record("SRC_OUT", Box::new(AoRecord::new(33.0)))
+        .await
+        .unwrap();
+    db.add_record("TGT_OUT", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Bare OUT link — no PP modifier.
+    if let Some(rec) = db.get_record("SRC_OUT").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("TGT_OUT.VAL".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC_OUT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // The value must have landed on the target.
+    let tgt_val = db.get_pv("TGT_OUT").await.unwrap();
+    assert_eq!(
+        tgt_val.to_f64().unwrap(),
+        33.0,
+        "bare OUT link must still write the value to the target"
+    );
+    // ...but the target must NOT have been processed.
+    assert!(
+        !visited.contains("TGT_OUT"),
+        "bare OUT link (NPP) must NOT process its target: {visited:?}"
+    );
+}
+
+/// BUG 2 regression (positive case) — an OUT link with an explicit
+/// `PP` token DOES process a Passive target, mirroring C
+/// `dbDbPutValue` `pvlOptPP` branch.
+#[tokio::test]
+async fn test_pp_out_link_processes_passive_target() {
+    let db = PvDatabase::new();
+    db.add_record("SRC_PP", Box::new(AoRecord::new(44.0)))
+        .await
+        .unwrap();
+    db.add_record("TGT_PP", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    if let Some(rec) = db.get_record("SRC_PP").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("TGT_PP.VAL PP".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC_PP", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        visited.contains("TGT_PP"),
+        "explicit PP OUT link must process its Passive target: {visited:?}"
+    );
 }

@@ -483,6 +483,51 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     })
 }
 
+/// True when a link string carries an explicit `PP` (or `CP`/`CPP`)
+/// process modifier as a whitespace-separated token.
+///
+/// C `dbStaticLib.c::dbParseLink` sets the link's `pvlOptPP` flag only
+/// when the modifier string contains an explicit `PP` token. For a
+/// `DBF_OUTLINK` the absence of `PP` means NPP — `dbDbPutValue`
+/// (`dbDbLink.c:386-389`) writes the value but does **not** call
+/// `processTarget`.
+fn link_has_explicit_pp(raw: &str) -> bool {
+    raw.split_whitespace()
+        .any(|tok| tok == "PP" || tok == "CP" || tok == "CPP")
+}
+
+/// Parse an **output** link.
+///
+/// Identical to [`parse_link_v2`] except for the process-policy
+/// default: C `dbDbPutValue` (`dbDbLink.c:386-389`) processes the
+/// target only when the destination field is `.PROC` **or** the link
+/// carries an explicit `pvlOptPP` flag (an explicit ` PP` token). A
+/// bare OUT link is NPP — the value is written but the target is not
+/// processed.
+///
+/// `parse_link_v2` defaults *every* modifier-less link to
+/// `ProcessPassive`, which is the right default for INPUT links (so a
+/// PP source is processed before its value is read) but wrong for
+/// OUTPUT links. This wrapper downgrades a bare `Db` OUT link's policy
+/// to `NoProcess` so the OUT-link write path does not spuriously
+/// process the target. Writing the destination's `.PROC` field is
+/// handled separately by the write path (C's `dbChannelField ==
+/// &pdest->proc` branch), so `.PROC` is left at `ProcessPassive`.
+pub fn parse_output_link_v2(s: &str) -> ParsedLink {
+    let parsed = parse_link_v2(s);
+    if let ParsedLink::Db(ref db) = parsed {
+        if db.policy == LinkProcessPolicy::ProcessPassive
+            && db.field != "PROC"
+            && !link_has_explicit_pp(s)
+        {
+            let mut db = db.clone();
+            db.policy = LinkProcessPolicy::NoProcess;
+            return ParsedLink::Db(db);
+        }
+    }
+    parsed
+}
+
 /// Determine the [`LinkType`] of a record's string link field directly
 /// from its raw text — the convenience API a record's `process()` or
 /// its device support uses to discriminate one of its `INP` / `OUTL` /
@@ -723,5 +768,57 @@ mod json_link_tests {
             result,
             ParsedLink::None | ParsedLink::Db(_) | ParsedLink::Constant(_)
         ));
+    }
+
+    /// BUG 2 — a bare OUT link defaults to NPP (`NoProcess`). C
+    /// `dbDbPutValue` (dbDbLink.c:386-389) processes the target only
+    /// on an explicit `PP` flag.
+    #[test]
+    fn parse_output_link_bare_is_noprocess() {
+        match parse_output_link_v2("TARGET.VAL") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.policy, LinkProcessPolicy::NoProcess);
+                assert_eq!(db.record, "TARGET");
+                assert_eq!(db.field, "VAL");
+            }
+            other => panic!("expected Db link, got {other:?}"),
+        }
+    }
+
+    /// BUG 2 — an explicit ` PP` on an OUT link keeps `ProcessPassive`.
+    #[test]
+    fn parse_output_link_explicit_pp_processes() {
+        match parse_output_link_v2("TARGET.VAL PP") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.policy, LinkProcessPolicy::ProcessPassive);
+            }
+            other => panic!("expected Db link, got {other:?}"),
+        }
+    }
+
+    /// BUG 2 — an OUT link whose destination field is `.PROC` keeps
+    /// `ProcessPassive` even with no `PP` token: C processes the
+    /// target whenever the destination field is `&pdest->proc`.
+    #[test]
+    fn parse_output_link_proc_field_keeps_process_passive() {
+        match parse_output_link_v2("TARGET.PROC") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.field, "PROC");
+                assert_eq!(db.policy, LinkProcessPolicy::ProcessPassive);
+            }
+            other => panic!("expected Db link, got {other:?}"),
+        }
+    }
+
+    /// BUG 2 — an explicit ` NPP` OUT link is `NoProcess` (unchanged
+    /// from `parse_link_v2`, but pinned here for completeness).
+    #[test]
+    fn parse_output_link_explicit_npp_is_noprocess() {
+        match parse_output_link_v2("TARGET.VAL NPP") {
+            ParsedLink::Db(db) => {
+                assert_eq!(db.policy, LinkProcessPolicy::NoProcess);
+            }
+            other => panic!("expected Db link, got {other:?}"),
+        }
     }
 }

@@ -216,7 +216,10 @@ impl Record for MbbiDirectRecord {
                 raw &= self.mask;
             }
             if self.shft > 0 {
-                raw = ((raw as u32) >> (self.shft as u32)) as i32;
+                // Same defect family as mbbi/mbbo: a CA-written SHFT
+                // >= 32 panics a bare `>>` in debug builds. `checked_shr`
+                // mapped to 0 matches the C UB-but-no-crash result.
+                raw = (raw as u32).checked_shr(self.shft as u32).unwrap_or(0) as i32;
             }
             self.val = raw as u32;
             self.val_to_bits();

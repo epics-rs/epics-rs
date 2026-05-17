@@ -13,7 +13,7 @@ use crate::types::{DbFieldType, EpicsValue};
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::CommonFields;
-use super::link::{ParsedLink, parse_link_v2};
+use super::link::{ParsedLink, parse_link_v2, parse_output_link_v2};
 use super::record_trait::{
     CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
@@ -878,7 +878,14 @@ impl RecordInstance {
                         );
                     }
                     self.common.out = s;
-                    self.parsed_out = parse_link_v2(&self.common.out);
+                    // C `dbDbPutValue` (dbDbLink.c:386-389): an OUT
+                    // link processes its target only on an explicit
+                    // ` PP` token (or a `.PROC` destination). A bare
+                    // OUT link is NPP — `parse_output_link_v2`
+                    // downgrades the modifier-less `ProcessPassive`
+                    // default that `parse_link_v2` would otherwise
+                    // apply.
+                    self.parsed_out = parse_output_link_v2(&self.common.out);
                     // C `longoutRecord.c::special` (PR #6c573b4 part 2)
                     // and similar OOCH-style hooks need `after=true`
                     // to fire after the link has actually moved. The
@@ -1105,7 +1112,8 @@ impl RecordInstance {
                 if self.record.record_type() == "swait" {
                     if let EpicsValue::String(s) = value {
                         self.common.out = s;
-                        self.parsed_out = parse_link_v2(&self.common.out);
+                        // Bare OUT link is NPP — see the "OUT" arm.
+                        self.parsed_out = parse_output_link_v2(&self.common.out);
                     }
                 }
             }
@@ -1595,9 +1603,20 @@ impl RecordInstance {
         }
 
         // Add subscribed fields that actually changed since last notification.
+        // Exclude VAL/SEVR/STAT/AMSG/UDF — all five are already emitted by
+        // this path (VAL in `changed_fields`, SEVR/STAT/AMSG via
+        // `alarm_posts`, UDF via the explicit UDF push above). Mirrors the
+        // two `processing.rs` snapshot gates, which exclude the same five;
+        // excluding only the first three would double-post AMSG and UDF.
         let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
         for (field, subs) in &self.subscribers {
-            if !subs.is_empty() && field != "VAL" && field != "SEVR" && field != "STAT" {
+            if !subs.is_empty()
+                && field != "VAL"
+                && field != "SEVR"
+                && field != "STAT"
+                && field != "AMSG"
+                && field != "UDF"
+            {
                 if let Some(val) = self.resolve_field(field) {
                     let changed = match self.last_posted.get(field) {
                         Some(prev) => prev != &val,

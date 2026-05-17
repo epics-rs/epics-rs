@@ -208,7 +208,17 @@ impl MbboRecord {
             self.rval = self.val as i32;
         }
         if self.shft > 0 {
-            self.rval = ((self.rval as u32) << (self.shft as u32)) as i32;
+            // C `mbboRecord.c:433-434` does `prec->rval <<= prec->shft`
+            // on a 32-bit `epicsUInt32`. A CA-written SHFT >= 32 makes
+            // that shift UB in C (it does not crash — the value just
+            // becomes 0 / implementation-defined). The Rust `<<`
+            // panics in debug builds for the same shift count, so use
+            // `checked_shl` and treat an out-of-range shift as a
+            // fully-shifted-out 0 — defined, non-panicking, and the
+            // value any sane 32-bit shift-out yields.
+            self.rval = (self.rval as u32)
+                .checked_shl(self.shft as u32)
+                .unwrap_or(0) as i32;
         }
     }
 

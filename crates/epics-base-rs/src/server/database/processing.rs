@@ -941,6 +941,35 @@ impl PvDatabase {
                 return Ok(());
             }
 
+            // Async-completion PACT clear for the `ReprocessAfter`
+            // continuation path. C parity `dbAccess.c:583` —
+            // `prset->process(precord)` for a record whose first cycle
+            // returned async-pending is the *completion* re-entry; the
+            // record support clears `pact` itself inside `process()`
+            // (e.g. `aiRecord.c` second pass sets `prec->pact = FALSE`).
+            //
+            // A record that returns `AsyncPending` AND emits a
+            // `ProcessAction::ReprocessAfter` is re-entered here via
+            // `process_record_continuation` (`is_continuation == true`,
+            // PACT entry guard skipped). Reaching this point means the
+            // continuation's `process()` did NOT return async-pending
+            // again (both async branches above return early), so the
+            // async cycle is genuinely complete. The non-continuation
+            // async-device path clears `processing` in
+            // `complete_async_record_inner`; the continuation path has
+            // no such callback, so without this clear `processing`
+            // stays `true` forever — every later foreign
+            // `process_record_with_links` then trips the PACT entry
+            // guard, counts to MAX_LOCK, and raises a spurious
+            // SCAN_ALARM. Clearing here (record still write-locked,
+            // before the OUT/FLNK tail) mirrors the C ordering where
+            // `pact` is already `FALSE` when `recGblFwdLink` runs.
+            if is_continuation {
+                instance
+                    .processing
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+
             // MS-class alarm propagation from input links. Mirrors C
             // `recGblInheritSevrMsg` (recGbl.c::260):
             //

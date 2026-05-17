@@ -713,9 +713,39 @@ impl PvDatabase {
                     }
                     let parsed = crate::server::record::parse_link_v2(link_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        let _ = self
-                            .process_record_with_links(&db.record, visited, depth + 1)
-                            .await;
+                        // C `fanoutRecord.c:110/121/138` dispatches each
+                        // selected LNKn via `dbScanFwdLink` →
+                        // `dbDbScanFwdLink` → `dbScanPassive`
+                        // (`dbDbLink.c:425-432`), which processes the
+                        // target ONLY when its SCAN is Passive
+                        // (`if (pto->scan != 0) return 0;`). A LNKn
+                        // pointing at a Periodic/Event/I/O-Intr record
+                        // must NOT be re-processed by the fanout — that
+                        // record runs on its own scan. `dbScanPassive`
+                        // then calls `processTarget`, which propagates
+                        // PUTF (and sets RPRO on a busy target) exactly
+                        // like the explicit FLNK path — so mirror that
+                        // gate here instead of the previous
+                        // unconditional `process_record_with_links`.
+                        if let Some(target_rec) = self.get_record(&db.record).await {
+                            let (target_scan, should_process) = {
+                                let mut tg = target_rec.write().await;
+                                let pact = tg.is_processing();
+                                let on_chain = visited.contains(&db.record);
+                                if !pact {
+                                    tg.common.putf = src_putf;
+                                } else if src_putf && !on_chain {
+                                    tg.common.rpro = true;
+                                    tg.common.putf = false;
+                                }
+                                (tg.common.scan, !pact)
+                            };
+                            if should_process && target_scan == ScanType::Passive {
+                                let _ = self
+                                    .process_record_with_links(&db.record, visited, depth + 1)
+                                    .await;
+                            }
+                        }
                     }
                 }
             }

@@ -185,6 +185,35 @@ pub struct ConnectionPool {
     shutdown: std::sync::atomic::AtomicBool,
 }
 
+/// RAII guard for the single-flight gate slot in
+/// [`ConnectionPool::connecting`]. Created by the dialer that owns the
+/// per-address gate; on drop it removes the `addr` entry from
+/// `connecting` — but only if the entry is still the exact gate this
+/// guard owns (`Arc::ptr_eq`), so it never evicts a slot a later
+/// dialer installed.
+///
+/// The guard runs on every exit path of the dialing block: normal
+/// return, `?` early return, and a panic inside `ServerConn::connect`.
+/// That panic-safety is the point — without it a panicking dial leaked
+/// the `Arc<Mutex<()>>` entry permanently and every future caller for
+/// `addr` serialized on a dead gate.
+struct RemoveSlotOnDrop<'a> {
+    pool: &'a ConnectionPool,
+    addr: std::net::SocketAddr,
+    gate: &'a Arc<Mutex<()>>,
+}
+
+impl Drop for RemoveSlotOnDrop<'_> {
+    fn drop(&mut self) {
+        let mut g = self.pool.connecting.lock();
+        if let Some(current) = g.get(&self.addr) {
+            if Arc::ptr_eq(current, self.gate) {
+                g.remove(&self.addr);
+            }
+        }
+    }
+}
+
 impl ConnectionPool {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -217,52 +246,115 @@ impl ConnectionPool {
         // the race loser dropped its `Arc<ServerConn>` — but `ServerConn`
         // has no Drop cancelling its tasks, so the redundant socket and
         // its reader/writer/heartbeat tasks leaked until idle timeout.
-        let gate = {
-            let mut g = self.connecting.lock();
-            g.entry(addr).or_default().clone()
-        };
-        let _dialing = gate.lock().await;
-        // Re-check under the gate: a peer caller may have just connected.
-        {
-            let map = self.inner.lock();
-            if let Some(conn) = map.get(&addr).cloned() {
-                if conn.is_alive() {
-                    return Ok(conn);
+        //
+        // The slot must be re-resolved on EVERY iteration: a peer dialer
+        // that owns the slot removes it from `connecting` only after it
+        // has published its result to `inner` (or failed). A late caller
+        // arriving in that window must observe either the freshly cached
+        // connection or the still-present gate — never a removed slot
+        // that lets it start a second concurrent dial. Looping closes
+        // that churn window: each pass re-checks `inner`, then takes
+        // whatever gate is current.
+        loop {
+            // Acquire (or create) the per-address gate slot. We clone the
+            // `Arc<Mutex<()>>` while holding the `connecting` lock, then
+            // release `connecting` before awaiting the async gate mutex —
+            // a parking_lot guard must never be held across `.await`.
+            let gate = {
+                let mut g = self.connecting.lock();
+                g.entry(addr).or_default().clone()
+            };
+            let dialing = gate.lock().await;
+
+            // Re-check under the gate: a peer caller may have just
+            // connected and published to `inner`.
+            {
+                let map = self.inner.lock();
+                if let Some(conn) = map.get(&addr).cloned() {
+                    if conn.is_alive() {
+                        // A peer dialer owns this gate slot; it will
+                        // remove it from `connecting`. We must not.
+                        return Ok(conn);
+                    }
                 }
             }
-        }
-        // Drop dead entry and connect fresh.
-        {
-            let mut map = self.inner.lock();
-            if let Some(conn) = map.get(&addr) {
-                if !conn.is_alive() {
-                    map.remove(&addr);
+
+            // The slot we acquired may be a stale gate that a previous
+            // owning dialer has already removed from `connecting`
+            // (it removes after publishing/failing). If so, a NEW slot
+            // now lives under `addr` and a fresh dial is in flight on it
+            // — loop and contend on that one instead of dialing on a
+            // detached gate, which would double-dial.
+            {
+                let g = self.connecting.lock();
+                match g.get(&addr) {
+                    Some(current) if Arc::ptr_eq(current, &gate) => {
+                        // We own the live slot for `addr`. Fall through
+                        // and dial; `RemoveSlotOnDrop` guarantees the
+                        // slot is removed even on panic / early return.
+                    }
+                    _ => {
+                        // Stale gate (removed, or replaced by a newer
+                        // dialer's slot). Release and retry.
+                        drop(g);
+                        drop(dialing);
+                        continue;
+                    }
                 }
             }
-        }
-        let tls = self.tls.lock().clone();
-        let connect_result = match tls {
-            Some(cfg) => {
-                ServerConn::connect_tls(addr, &addr.ip().to_string(), cfg, user, host, op_timeout)
+
+            // RAII guard: removes our owned slot from `connecting` on
+            // any exit path — normal return, `?` early return, or a
+            // panic inside `ServerConn::connect`. Without it a panicking
+            // dial leaked the `Arc<Mutex<()>>` entry permanently and
+            // every future caller for `addr` serialized on a dead gate.
+            let _slot_guard = RemoveSlotOnDrop {
+                pool: self,
+                addr,
+                gate: &gate,
+            };
+
+            // Drop dead entry and connect fresh.
+            {
+                let mut map = self.inner.lock();
+                if let Some(conn) = map.get(&addr) {
+                    if !conn.is_alive() {
+                        map.remove(&addr);
+                    }
+                }
+            }
+            let tls = self.tls.lock().clone();
+            let connect_result = match tls {
+                Some(cfg) => {
+                    ServerConn::connect_tls(
+                        addr,
+                        &addr.ip().to_string(),
+                        cfg,
+                        user,
+                        host,
+                        op_timeout,
+                    )
                     .await
+                }
+                None => ServerConn::connect(addr, user, host, op_timeout).await,
+            };
+            let fresh = connect_result?;
+            let mut map = self.inner.lock();
+            // The gate serialized dialing; still prefer an alive existing
+            // one in case a dead entry was re-inserted between the
+            // re-check and here.
+            if let Some(existing) = map.get(&addr).cloned() {
+                if existing.is_alive() {
+                    return Ok(existing);
+                }
             }
-            None => ServerConn::connect(addr, user, host, op_timeout).await,
-        };
-        // Release the gate slot whether the dial succeeded or failed, so a
-        // later reconnect for the same addr does not pile up stale
-        // per-address mutexes in `connecting`.
-        self.connecting.lock().remove(&addr);
-        let fresh = connect_result?;
-        let mut map = self.inner.lock();
-        // The gate serialized dialing; still prefer an alive existing one
-        // in case a dead entry was re-inserted between the re-check and here.
-        if let Some(existing) = map.get(&addr).cloned() {
-            if existing.is_alive() {
-                return Ok(existing);
-            }
+            map.insert(addr, fresh.clone());
+            // `_slot_guard` removes the gate slot from `connecting` here,
+            // after the connection is visible in `inner`, so a caller
+            // arriving next either finds the cached conn or — if it
+            // already cloned this gate — loops and sees the slot gone.
+            return Ok(fresh);
         }
-        map.insert(addr, fresh.clone());
-        Ok(fresh)
     }
 
     pub fn close_dead(&self) {
@@ -950,6 +1042,85 @@ mod tests {
             accepts.load(Ordering::SeqCst),
             2,
             "serialized dials: one per caller, never concurrent"
+        );
+    }
+
+    /// Panic-safety + no-double-dial-under-churn regression.
+    ///
+    /// 1. Panic-safety: if `ServerConn::connect` panics, the
+    ///    `RemoveSlotOnDrop` RAII guard must still remove the gate slot
+    ///    from `connecting` — otherwise the `Arc<Mutex<()>>` entry leaks
+    ///    and every future caller for that addr serializes on a dead
+    ///    gate. We can't make the real `connect` panic, so we drive the
+    ///    gate-slot lifecycle directly: install a slot via the same
+    ///    `entry().or_default()` path, then run a closure that panics
+    ///    while a `RemoveSlotOnDrop` for that slot is live, and assert
+    ///    the slot is gone afterwards.
+    ///
+    /// 2. No double-dial under churn: a late caller arriving after the
+    ///    owning dialer removed its slot must observe the cached
+    ///    connection on the re-check (or loop onto the current slot) —
+    ///    never start a second concurrent dial. The serialization test
+    ///    above already exercises the happy path; here we assert the
+    ///    `connecting` map is empty once `get_or_connect` has returned,
+    ///    i.e. the owning dialer's slot was removed (not leaked) after
+    ///    publishing its failure.
+    #[tokio::test]
+    async fn gate_slot_removed_on_panic_and_after_dial() {
+        use std::time::Duration;
+
+        let pool = ConnectionPool::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5075".parse().unwrap();
+
+        // --- (1) panic-safety ---------------------------------------
+        // Install a gate slot exactly as `get_or_connect` does.
+        let gate = {
+            let mut g = pool.connecting.lock();
+            g.entry(addr).or_default().clone()
+        };
+        assert!(
+            pool.connecting.lock().contains_key(&addr),
+            "slot must be present before the (panicking) dial"
+        );
+        // Run a closure that panics while a `RemoveSlotOnDrop` is live.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot_guard = RemoveSlotOnDrop {
+                pool: &pool,
+                addr,
+                gate: &gate,
+            };
+            panic!("simulated ServerConn::connect panic");
+        }));
+        assert!(panicked.is_err(), "closure must have panicked");
+        assert!(
+            !pool.connecting.lock().contains_key(&addr),
+            "RAII guard must remove the gate slot even when the dial panics — \
+             otherwise the slot leaks and future callers serialize on a dead gate"
+        );
+
+        // --- (2) no slot leak after a real (failed) dial ------------
+        // A listener that accepts then stalls: the dial fails on
+        // op_timeout. After `get_or_connect` returns, the `connecting`
+        // map must be empty — the owning dialer removed its slot.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe listener");
+        let probe_addr = listener.local_addr().expect("probe addr");
+        let _srv = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // keep alive, never reply
+            }
+        });
+
+        let res = pool
+            .get_or_connect(probe_addr, "u", "h", Duration::from_millis(300))
+            .await;
+        assert!(res.is_err(), "stalled handshake must fail");
+        assert!(
+            !pool.connecting.lock().contains_key(&probe_addr),
+            "the owning dialer must remove its gate slot after the dial \
+             completes (success OR failure) — no churn-window leak"
         );
     }
 }

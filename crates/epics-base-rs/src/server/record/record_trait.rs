@@ -178,6 +178,12 @@ pub struct ProcessContext {
     pub tse: i16,
     /// `dbCommon.tsel` — time-stamp event link string.
     pub tsel: String,
+    /// `dbCommon.dtyp` — device-support type name. A record's
+    /// `process()` / pre-process hooks can branch on the DTYP to mirror
+    /// C device support that lives in a separate DSET (e.g. the epid
+    /// record's `devEpidSoftCallback` callback DSET drives the TRIG
+    /// readback link, whereas `devEpidSoft` does not).
+    pub dtyp: String,
 }
 
 /// C `epicsTime.h`: `epicsTimeEventDeviceTime` — the `TSE` sentinel
@@ -512,6 +518,30 @@ pub trait Record: Send + Sync + 'static {
     /// Default returns empty. Override in records that need link reads
     /// to be available during process().
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+        Vec::new()
+    }
+
+    /// Return actions the framework must execute BEFORE the input-link
+    /// (`multi_input_links`, INP -> value-field) fetch for this cycle.
+    ///
+    /// This is strictly earlier than [`Self::pre_process_actions`]: the
+    /// framework resolves input links *before* it calls
+    /// `pre_process_actions`, so an action that must affect what an
+    /// input link reads cannot be expressed there.
+    ///
+    /// The motivating case is the epid record's `devEpidSoftCallback`
+    /// DB-type TRIG link: C `devEpidSoftCallback.c:120-132` writes the
+    /// readback-trigger link with `dbPutLink` — which synchronously
+    /// processes the triggered source chain — and only *then*
+    /// (`devEpidSoftCallback.c:151`) does `dbGetLink(&pepid->inp, ...)`
+    /// read `CVAL`. The trigger write therefore has to land before the
+    /// `INP -> CVAL` fetch, in the same process pass.
+    ///
+    /// Called once per cycle, while a record write lock is held; the
+    /// framework executes the returned actions (currently `WriteDbLink`
+    /// and `ReadDbLink`) and then performs the input-link fetch.
+    /// Default returns empty.
+    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
         Vec::new()
     }
 

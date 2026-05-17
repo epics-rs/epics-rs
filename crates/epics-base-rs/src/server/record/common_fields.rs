@@ -100,6 +100,7 @@ impl CommonFields {
             phas: self.phas,
             tse: self.tse,
             tsel: self.tsel.clone(),
+            dtyp: self.dtyp.clone(),
         }
     }
 }

@@ -200,6 +200,15 @@ pub struct EpidRecord {
     /// only on this success — a STPL that is empty, or a DB/CA link
     /// whose fetch failed, leaves `udf` set.
     stpl_resolved: bool,
+    /// Framework-owned `dbCommon.dtyp`, pushed by the framework via
+    /// [`Record::set_process_context`] before the input-link fetch.
+    /// C device support for the epid record lives in two distinct
+    /// DSETs — `devEpidSoft` (`devEpidSoft.c`, no TRIG handling) and
+    /// `devEpidSoftCallback` (`devEpidSoftCallback.c`, which drives the
+    /// TRIG readback link). [`Record::pre_input_link_actions`] checks
+    /// this to emit the TRIG write only when the callback DSET (DTYP
+    /// `"Epid Async Soft"`) is selected.
+    dtyp: String,
     /// Epid-owned `dbCommon.udf` projection, returned by
     /// [`Record::value_is_undefined`]. C `epidRecord.c` has
     /// `special = NULL` (line 105) — there is no operator UDF clear,
@@ -276,6 +285,7 @@ impl Default for EpidRecord {
             ctp: now,
             device_did_compute: false,
             inp_constant: false,
+            dtyp: String::new(),
             udf: true,
             compute_skipped: false,
             stpl_resolved: false,
@@ -1147,6 +1157,49 @@ impl Record for EpidRecord {
     /// captures it so `process()` can gate `do_pid` on it.
     fn set_process_context(&mut self, ctx: &ProcessContext) {
         self.udf = ctx.udf;
+        self.dtyp.clear();
+        self.dtyp.push_str(&ctx.dtyp);
+    }
+
+    /// C `devEpidSoftCallback.c:120-132` — the DB-type TRIG readback
+    /// link write.
+    ///
+    /// `devEpidSoftCallback.c::do_pid`, within ONE process pass, does:
+    ///   1. `if (ptriglink->type != CA_LINK)` →
+    ///      `dbPutLink(ptriglink, DBR_DOUBLE, &pepid->tval, 1)`
+    ///      (`devEpidSoftCallback.c:121-127`) — a synchronous write that
+    ///      processes the triggered source chain;
+    ///   2. `dbGetLink(&pepid->inp, DBR_DOUBLE, &pepid->cval, ...)`
+    ///      (`devEpidSoftCallback.c:151`) — read CVAL from INP;
+    ///   3. run the PID.
+    ///
+    /// So for a DB-type TRIG link the trigger write must land BEFORE
+    /// this cycle's `INP -> CVAL` fetch. The framework resolves input
+    /// links before `pre_process_actions`, so the TRIG write is emitted
+    /// here, from `pre_input_link_actions`, which the framework runs
+    /// strictly before the input-link fetch.
+    ///
+    /// Only the `devEpidSoftCallback` DSET (DTYP `"Epid Async Soft"`)
+    /// drives the TRIG link — `devEpidSoft` (`devEpidSoft.c`) has no
+    /// TRIG handling at all. The action is therefore gated on `dtyp`.
+    ///
+    /// The CA-type TRIG link is deliberately NOT emitted here: C
+    /// `devEpidSoftCallback.c:133-147` cannot wait synchronously on a
+    /// CA link, so it uses `dbCaPutLinkCallback` + `pact=TRUE` and
+    /// re-processes on the callback. That two-pass path stays in
+    /// `EpidSoftCallbackDeviceSupport::read` (`WriteDbLink` +
+    /// `ReprocessAfter`).
+    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+        if self.dtyp != "Epid Async Soft" {
+            return Vec::new();
+        }
+        if link_field_type(&self.trig) == LinkType::Db {
+            return vec![ProcessAction::WriteDbLink {
+                link_field: "TRIG",
+                value: EpicsValue::Double(self.tval),
+            }];
+        }
+        Vec::new()
     }
 
     /// Framework report of which `multi_input_links` fetches produced a

@@ -906,6 +906,159 @@ fn test_fast_do_pid_ignores_fmod() {
     assert_eq!(a.d, b.d);
 }
 
+/// C `do_PID` (devEpidFast.c:445-448): on the feedback OFF->ON edge
+/// (`feedbackOn && !prevFeedbackOn`) the integral term is seeded from
+/// the output port's *present value* via `pPvt->pfloat64Output->read`,
+/// not from the last value the loop commanded. When an `output_reader`
+/// is wired, the bumpless edge must use the reader's value.
+#[test]
+fn test_fast_bumpless_edge_seeds_i_from_output_reader() {
+    use std::sync::{Arc, Mutex};
+
+    let mut pvt = EpidFastPvt::default();
+    pvt.callback_interval = 0.001;
+    pvt.num_average = 1;
+    pvt.kp = 1.0;
+    pvt.ki = 1.0; // KI != 0 so the seeded I survives (I=0 only when KI==0)
+    pvt.kd = 0.0;
+    pvt.drvh = 1000.0;
+    pvt.drvl = -1000.0;
+    pvt.val = 100.0;
+
+    // Stale last-commanded output — the `oval` fallback value.
+    pvt.oval = 7.0;
+    // The output port's actual present value, distinct from oval.
+    let reader_value = 42.0;
+    pvt.output_reader = Some(Arc::new(Mutex::new(move || Some(reader_value))));
+
+    // OFF -> ON edge: feedback turns on, previous state was off.
+    pvt.fbon = true;
+    pvt.fbop = false;
+
+    pvt.do_pid(90.0); // e = 100 - 90 = 10
+
+    // Bumpless: I seeded from the reader (42.0), NOT the stale oval (7.0).
+    assert!(
+        (pvt.i - 42.0).abs() < 1e-9,
+        "bumpless edge must seed I from output_reader value 42.0, got {}",
+        pvt.i
+    );
+    // oval = P + I + D = (1*10) + 42 + 0 = 52.
+    assert!(
+        (pvt.oval - 52.0).abs() < 1e-9,
+        "oval must reflect reader-seeded I -> 52.0, got {}",
+        pvt.oval
+    );
+}
+
+/// Safety net: when no `output_reader` is wired, the bumpless OFF->ON
+/// edge falls back to the last commanded `OVAL`. C `devEpidFast.c`
+/// always has a real `pfloat64Output->read`; the Rust port keeps the
+/// `oval` fallback for records whose output is not a readable asyn
+/// port. (devEpidFast.c:445-448 reference.)
+#[test]
+fn test_fast_bumpless_edge_falls_back_to_oval_without_reader() {
+    let mut pvt = EpidFastPvt::default();
+    pvt.callback_interval = 0.001;
+    pvt.num_average = 1;
+    pvt.kp = 1.0;
+    pvt.ki = 1.0;
+    pvt.kd = 0.0;
+    pvt.drvh = 1000.0;
+    pvt.drvl = -1000.0;
+    pvt.val = 100.0;
+    pvt.oval = 7.0; // last commanded output — the fallback
+    assert!(pvt.output_reader.is_none(), "no reader wired");
+
+    pvt.fbon = true;
+    pvt.fbop = false;
+
+    pvt.do_pid(90.0); // e = 10
+
+    // No reader -> I seeded from the oval fallback (7.0).
+    assert!(
+        (pvt.i - 7.0).abs() < 1e-9,
+        "bumpless edge without reader must fall back to oval 7.0, got {}",
+        pvt.i
+    );
+}
+
+/// `set_output_port` wires both the output writer and the bumpless
+/// reader from a single asyn Float64 port handle — mirroring C
+/// `devEpidFast.c` `init_record`, which captures one
+/// `pPvt->pfloat64Output` interface used for both `read`
+/// (devEpidFast.c:446-448) and `write` (devEpidFast.c:471-473).
+#[test]
+fn test_fast_set_output_port_wires_reader_from_asyn_port() {
+    use asyn_rs::manager::PortManager;
+    use asyn_rs::param::ParamType;
+    use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+    use asyn_rs::sync_io::SyncIOHandle;
+    use std::time::Duration;
+    use std_rs::device_support::epid_fast::EpidFastDeviceSupport;
+
+    // Minimal parameter-library port acting as the asyn Float64
+    // output port (the DAC the PID loop drives).
+    struct OutputPort {
+        base: PortDriverBase,
+    }
+    impl PortDriver for OutputPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+    }
+
+    let mut base = PortDriverBase::new("EPID_OUT_PORT", 1, PortFlags::default());
+    let reason = base.create_param("OUTPUT", ParamType::Float64).unwrap();
+    // Preload the output port's present value (the real DAC output).
+    base.set_float64_param(reason, 0, 33.0).unwrap();
+
+    let manager = PortManager::new();
+    manager.register_port(OutputPort { base }).unwrap();
+
+    let sync_io = SyncIOHandle::connect(&manager, "EPID_OUT_PORT", 0, Duration::from_secs(1))
+        .expect("connect to output port");
+    // Sanity: the port reports the value we seeded.
+    assert!((sync_io.read_float64(reason).unwrap() - 33.0).abs() < 1e-9);
+
+    let dev = EpidFastDeviceSupport::new();
+    dev.set_output_port(sync_io, reason);
+
+    // Configure for a bumpless OFF->ON edge.
+    let pvt_arc = dev.pvt();
+    let mut pvt = pvt_arc.lock().unwrap();
+    pvt.callback_interval = 0.001;
+    pvt.num_average = 1;
+    pvt.kp = 1.0;
+    pvt.ki = 1.0;
+    pvt.kd = 0.0;
+    pvt.drvh = 1000.0;
+    pvt.drvl = -1000.0;
+    pvt.val = 100.0;
+    pvt.oval = 7.0; // stale fallback — must NOT be used
+    pvt.fbon = true;
+    pvt.fbop = false;
+    // Reader and writer installed by set_output_port.
+    assert!(
+        pvt.output_reader.is_some(),
+        "set_output_port must wire reader"
+    );
+    assert!(
+        pvt.output_writer.is_some(),
+        "set_output_port must wire writer"
+    );
+    pvt.do_pid(90.0);
+    // I seeded from the asyn port's present value (33.0), not oval.
+    assert!(
+        (pvt.i - 33.0).abs() < 1e-9,
+        "bumpless edge must seed I from asyn output port value 33.0, got {}",
+        pvt.i
+    );
+}
+
 // ============================================================
 // Link-type discrimination — C `link.h` CONSTANT / DB_LINK /
 // CA_LINK; epid consumers `devEpidSoft.c` / `devEpidSoftCallback.c`.
@@ -965,9 +1118,18 @@ fn test_db_inp_does_not_raise_soft_alarm() {
     assert!(!rec.inp_constant, "DB INP must not set inp_constant");
 }
 
-/// C `devEpidSoftCallback.c:117-130`: a DB (`type != CA_LINK`) TRIG
+/// C `devEpidSoftCallback.c:120-151`: a DB (`type != CA_LINK`) TRIG
 /// link is written synchronously and the record falls through to PID
 /// in the SAME pass — no second-pass deferral.
+///
+/// The trigger write must land BEFORE this cycle's `INP -> CVAL` fetch
+/// (C `dbPutLink` at `:121-127` precedes `dbGetLink(&pepid->inp)` at
+/// `:151`). The framework resolves input links before device-support
+/// `read()` runs, so the TRIG write is NOT a device-support action —
+/// it is emitted by `EpidRecord::pre_input_link_actions`, which the
+/// framework executes strictly before the input-link fetch. The
+/// device-support `read()` therefore runs PID with no actions of its
+/// own and no second-pass deferral.
 #[test]
 fn test_db_trig_link_synchronous_fallthrough() {
     let mut rec = EpidRecord::default();
@@ -977,21 +1139,31 @@ fn test_db_trig_link_synchronous_fallthrough() {
     rec.fbon = 1;
     rec.fbop = 1;
 
-    let mut dev = EpidSoftCallbackDeviceSupport::new();
-    let outcome = dev.read(&mut rec).expect("read ok");
-
-    // DB link: a WriteDbLink for TRIG, but NO ReprocessAfter — PID ran
-    // synchronously this pass (did_compute is true).
-    assert!(outcome.did_compute, "DB TRIG: PID runs this pass");
+    // The TRIG write is a pre-input-link action emitted by the record,
+    // gated on the callback DSET (DTYP "Epid Async Soft").
+    rec.set_process_context(&ctx_with_dtyp("Epid Async Soft"));
+    let pre = rec.pre_input_link_actions();
     assert!(
-        outcome.actions.iter().any(|a| matches!(
+        pre.iter().any(|a| matches!(
             a,
             ProcessAction::WriteDbLink {
                 link_field: "TRIG",
                 ..
             }
         )),
-        "DB TRIG must emit a WriteDbLink"
+        "DB TRIG must emit a WriteDbLink as a pre-input-link action"
+    );
+
+    let mut dev = EpidSoftCallbackDeviceSupport::new();
+    let outcome = dev.read(&mut rec).expect("read ok");
+
+    // DB link: PID ran synchronously this pass (did_compute is true),
+    // and `read()` emits no actions and no ReprocessAfter — the TRIG
+    // write already happened in the pre-input phase.
+    assert!(outcome.did_compute, "DB TRIG: PID runs this pass");
+    assert!(
+        outcome.actions.is_empty(),
+        "DB TRIG: read() emits no actions — TRIG write is pre-input"
     );
     assert!(
         !outcome
@@ -999,6 +1171,22 @@ fn test_db_trig_link_synchronous_fallthrough() {
             .iter()
             .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
         "DB TRIG must NOT defer to a second pass"
+    );
+}
+
+/// A non-callback DSET (`devEpidSoft`, DTYP "Soft Channel") has no
+/// TRIG handling — `pre_input_link_actions` must emit nothing even
+/// when a DB TRIG link is configured.
+#[test]
+fn test_non_callback_dtyp_emits_no_trig_write() {
+    let mut rec = EpidRecord::default();
+    rec.trig = "READBACK:REC.VAL".to_string();
+    assert_eq!(link_field_type(&rec.trig), LinkType::Db);
+
+    rec.set_process_context(&ctx_with_dtyp("Soft Channel"));
+    assert!(
+        rec.pre_input_link_actions().is_empty(),
+        "non-callback DSET must not drive the TRIG link"
     );
 }
 
@@ -1115,6 +1303,18 @@ fn ctx_with_udf(udf: bool) -> ProcessContext {
         phas: 0,
         tse: 0,
         tsel: String::new(),
+        dtyp: String::new(),
+    }
+}
+
+fn ctx_with_dtyp(dtyp: &str) -> ProcessContext {
+    ProcessContext {
+        udf: false,
+        udfs: AlarmSeverity::Invalid,
+        phas: 0,
+        tse: 0,
+        tsel: String::new(),
+        dtyp: dtyp.to_string(),
     }
 }
 

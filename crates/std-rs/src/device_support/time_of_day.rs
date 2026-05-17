@@ -137,6 +137,7 @@ mod tests {
             phas,
             tse: 0,
             tsel: String::new(),
+            dtyp: String::new(),
         }
     }
 

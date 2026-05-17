@@ -82,14 +82,24 @@ impl DeviceSupport for EpidSoftCallbackDeviceSupport {
                     return Ok(DeviceReadOutcome::computed_with(actions));
                 }
                 LinkType::Db => {
-                    // DB TRIG link: write the trigger synchronously and
-                    // fall through to PID in this same pass (no pact).
-                    let actions = vec![ProcessAction::WriteDbLink {
-                        link_field: "TRIG",
-                        value: EpicsValue::Double(epid.tval),
-                    }];
+                    // DB TRIG link: the trigger write is C's
+                    // `dbPutLink(ptriglink, ...)` (`devEpidSoftCallback
+                    // .c:121-127`) — a *synchronous* write that
+                    // processes the triggered source, and it must land
+                    // BEFORE C's `dbGetLink(&pepid->inp, ...)` reads
+                    // CVAL (`devEpidSoftCallback.c:151`).
+                    //
+                    // `read()` runs after the framework's `INP -> CVAL`
+                    // input-link fetch, so emitting the TRIG write here
+                    // would land a cycle late. Instead `EpidRecord::
+                    // pre_input_link_actions` emits it as a pre-input
+                    // action — the framework executes that strictly
+                    // before the input-link fetch. By the time this
+                    // `read()` runs, the trigger has already fired and
+                    // CVAL already holds the freshly-triggered value;
+                    // just run the PID, in this same pass (no `pact`).
                     super::epid_soft::EpidSoftDeviceSupport::do_pid(epid);
-                    return Ok(DeviceReadOutcome::computed_with(actions));
+                    return Ok(DeviceReadOutcome::computed());
                 }
                 // CONSTANT / empty / Other TRIG link — `type != CA_LINK`,
                 // so still synchronous: nothing to trigger, run PID now.

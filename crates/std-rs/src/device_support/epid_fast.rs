@@ -296,6 +296,43 @@ impl EpidFastDeviceSupport {
         }
     }
 
+    /// Wire the asyn output port: install both the output writer and
+    /// the bumpless-transfer output reader from a single asyn Float64
+    /// port handle.
+    ///
+    /// This mirrors C `devEpidFast.c` exactly. `init_record`
+    /// (devEpidFast.c:264-303) connects to *one* output asyn port and
+    /// captures `pPvt->pfloat64Output` / `float64OutputPvt`. `do_PID`
+    /// then uses that same interface for both directions:
+    ///
+    /// * the bumpless OFF->ON edge reads the output port's present
+    ///   value — `pPvt->pfloat64Output->read(...)` (devEpidFast.c:446-448);
+    /// * the feedback write — `pPvt->pfloat64Output->write(...)`
+    ///   (devEpidFast.c:471-473).
+    ///
+    /// `sync_io` is the asyn Float64 output port handle and `reason`
+    /// the parameter index (asyn `drvUser` "outputDataString" channel,
+    /// devEpidFast.c:296-303). The reader calls `read_float64(reason)`
+    /// on it; a failed read yields `None`, so `do_pid` falls back to
+    /// the last commanded `OVAL` safety net.
+    pub fn set_output_port(&self, sync_io: asyn_rs::sync_io::SyncIOHandle, reason: usize) {
+        let sync_io = Arc::new(sync_io);
+        let writer_io = Arc::clone(&sync_io);
+        let reader_io = Arc::clone(&sync_io);
+
+        let writer: Arc<Mutex<dyn FnMut(f64) + Send>> = Arc::new(Mutex::new(move |v: f64| {
+            // C `devEpidFast.c:471-478` — write the output, log on error.
+            let _ = writer_io.write_float64(reason, v);
+        }));
+        let reader: Arc<Mutex<dyn FnMut() -> Option<f64> + Send>> =
+            Arc::new(Mutex::new(move || reader_io.read_float64(reason).ok()));
+
+        if let Ok(mut p) = self.pvt.lock() {
+            p.output_writer = Some(writer);
+            p.output_reader = Some(reader);
+        }
+    }
+
     /// Start the interrupt-driven PID callback loop.
     ///
     /// Spawns a tokio task that receives new readback values from `input_rx`
@@ -304,6 +341,18 @@ impl EpidFastDeviceSupport {
     ///
     /// `input_rx`: receives new controlled-variable values from the input driver
     /// `output_fn`: called with each new output value (writes to output driver)
+    ///
+    /// This bare-closure form leaves the bumpless-transfer `output_reader`
+    /// untouched — wire it separately with [`set_output_reader`] or
+    /// [`set_output_port`], otherwise the OFF->ON edge falls back to the
+    /// last commanded `OVAL`. When the output is a real asyn Float64
+    /// port, prefer [`start_callback_loop_with_port`], which installs
+    /// both writer and reader from the same port handle (mirroring C
+    /// `devEpidFast.c` `pPvt->pfloat64Output`).
+    ///
+    /// [`set_output_reader`]: Self::set_output_reader
+    /// [`set_output_port`]: Self::set_output_port
+    /// [`start_callback_loop_with_port`]: Self::start_callback_loop_with_port
     pub fn start_callback_loop(
         &self,
         mut input_rx: tokio::sync::mpsc::Receiver<f64>,
@@ -325,23 +374,97 @@ impl EpidFastDeviceSupport {
         });
     }
 
+    /// Start the PID callback loop driven by an asyn Float64 output port.
+    ///
+    /// Identical to [`start_callback_loop`] but takes the output asyn
+    /// port handle directly and installs *both* the output writer and
+    /// the bumpless-transfer output reader from it via
+    /// [`set_output_port`] — mirroring C `devEpidFast.c` `init_record`,
+    /// which captures a single `pPvt->pfloat64Output` interface and uses
+    /// it for both `read` (devEpidFast.c:446-448) and `write`
+    /// (devEpidFast.c:471-473).
+    ///
+    /// `output_sync_io` is the asyn Float64 output port handle and
+    /// `output_reason` the parameter index for the output channel.
+    ///
+    /// [`start_callback_loop`]: Self::start_callback_loop
+    /// [`set_output_port`]: Self::set_output_port
+    pub fn start_callback_loop_with_port(
+        &self,
+        input_rx: tokio::sync::mpsc::Receiver<f64>,
+        output_sync_io: asyn_rs::sync_io::SyncIOHandle,
+        output_reason: usize,
+    ) {
+        self.set_output_port(output_sync_io, output_reason);
+
+        let pvt = Arc::clone(&self.pvt);
+        let mut input_rx = input_rx;
+        tokio::spawn(async move {
+            while let Some(new_cval) = input_rx.recv().await {
+                let mut p = pvt.lock().unwrap();
+                p.do_pid(new_cval);
+            }
+        });
+    }
+
     /// Start from an asyn interrupt subscription.
     ///
     /// Subscribes to Float64 interrupts from the given broadcast sender
     /// and feeds them into the PID callback loop.
+    ///
+    /// This bare-closure form leaves the bumpless-transfer `output_reader`
+    /// untouched — wire it separately with [`set_output_reader`] or
+    /// [`set_output_port`], or use [`start_from_asyn_interrupts_with_port`]
+    /// to install both writer and reader from one asyn output port.
+    ///
+    /// [`set_output_reader`]: Self::set_output_reader
+    /// [`set_output_port`]: Self::set_output_port
+    /// [`start_from_asyn_interrupts_with_port`]: Self::start_from_asyn_interrupts_with_port
     pub fn start_from_asyn_interrupts(
         &self,
-        mut interrupt_rx: tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
+        interrupt_rx: tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
         input_reason: usize,
         output_fn: Arc<Mutex<dyn FnMut(f64) + Send>>,
     ) {
-        let pvt = Arc::clone(&self.pvt);
-
         {
-            let mut p = pvt.lock().unwrap();
+            let mut p = self.pvt.lock().unwrap();
             p.output_writer = Some(output_fn);
         }
+        self.spawn_interrupt_loop(interrupt_rx, input_reason);
+    }
 
+    /// Start from an asyn interrupt subscription, driven by an asyn
+    /// Float64 output port.
+    ///
+    /// Identical to [`start_from_asyn_interrupts`] but takes the output
+    /// asyn port handle directly and installs *both* the output writer
+    /// and the bumpless-transfer output reader from it via
+    /// [`set_output_port`] — mirroring C `devEpidFast.c` `init_record`,
+    /// which captures a single `pPvt->pfloat64Output` interface and uses
+    /// it for both `read` (devEpidFast.c:446-448) and `write`
+    /// (devEpidFast.c:471-473).
+    ///
+    /// [`start_from_asyn_interrupts`]: Self::start_from_asyn_interrupts
+    /// [`set_output_port`]: Self::set_output_port
+    pub fn start_from_asyn_interrupts_with_port(
+        &self,
+        interrupt_rx: tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
+        input_reason: usize,
+        output_sync_io: asyn_rs::sync_io::SyncIOHandle,
+        output_reason: usize,
+    ) {
+        self.set_output_port(output_sync_io, output_reason);
+        self.spawn_interrupt_loop(interrupt_rx, input_reason);
+    }
+
+    /// Spawn the tokio task that feeds asyn Float64 interrupts into
+    /// `do_pid`. Shared by both `start_from_asyn_interrupts` variants.
+    fn spawn_interrupt_loop(
+        &self,
+        mut interrupt_rx: tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
+        input_reason: usize,
+    ) {
+        let pvt = Arc::clone(&self.pvt);
         tokio::spawn(async move {
             loop {
                 match interrupt_rx.recv().await {

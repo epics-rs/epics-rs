@@ -267,6 +267,7 @@ fn ctx_with_tse(tse: i16) -> ProcessContext {
         phas: 0,
         tse,
         tsel: String::new(),
+        dtyp: String::new(),
     }
 }
 

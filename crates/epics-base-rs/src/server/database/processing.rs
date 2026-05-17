@@ -457,6 +457,31 @@ impl PvDatabase {
             (inp, is_soft, dol)
         };
 
+        // 1.1. Pre-input-link actions: actions a record needs the
+        // framework to execute BEFORE any input-link fetch this cycle.
+        //
+        // C `devEpidSoftCallback.c:120-151`: a DB-type readback-trigger
+        // (TRIG) link is written with `dbPutLink` — which synchronously
+        // processes the triggered source — and only then does
+        // `dbGetLink(&pepid->inp, ...)` read CVAL. The trigger write
+        // must land before the `INP -> CVAL` fetch, in the same pass.
+        // `pre_process_actions` runs too late (after the input-link
+        // fetch below), so `pre_input_link_actions` is a strictly
+        // earlier hook. The record needs `dtyp` to decide whether the
+        // callback DSET is active, so push the process context first.
+        {
+            let pre_input_actions = {
+                let mut instance = rec.write().await;
+                let ctx = instance.common.process_context();
+                instance.record.set_process_context(&ctx);
+                instance.record.pre_input_link_actions()
+            };
+            if !pre_input_actions.is_empty() {
+                self.execute_process_actions(name, &rec, pre_input_actions, visited, depth)
+                    .await;
+            }
+        }
+
         // Read INP value
         let inp_value = self
             .read_link_value_soft(&inp_parsed, is_soft, visited, depth)
@@ -682,10 +707,24 @@ impl PvDatabase {
                 );
             }
 
-            // Apply multi-input values (INPA..INPL -> A..L)
+            // Apply multi-input values (INPA..INPL -> A..L).
+            //
+            // Uses `put_field_internal`, not `put_field`: this is the
+            // framework writing a resolved input-link value into a
+            // record field, exactly like the `ReadDbLink` apply
+            // (`execute_read_db_links` / `execute_process_actions`),
+            // which already routes through `put_field_internal`. Some
+            // records map an input link to a normally read-only field
+            // — e.g. the epid record's `INP -> CVAL` — and `put_field`
+            // rejects those with `ReadOnlyField`, silently dropping the
+            // value. `put_field_internal` defaults to `put_field`, so
+            // records with writable targets (calc/sub `A..L`) are
+            // unaffected.
             for (val_field, value) in &multi_input_values {
                 if let Some(f) = value.to_f64() {
-                    let _ = instance.record.put_field(val_field, EpicsValue::Double(f));
+                    let _ = instance
+                        .record
+                        .put_field_internal(val_field, EpicsValue::Double(f));
                 }
             }
 

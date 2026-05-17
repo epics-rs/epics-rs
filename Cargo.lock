@@ -3206,9 +3206,9 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.2.15"
+version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdf25873323aba4c8324787e72b8730b13c1be4da148e48bf1bfbc18fe0b2b77"
+checksum = "f6217d269b7f13ff65ffd62ed7211c519a5ddbecbf4f5e2039c8ce4744a19224"
 dependencies = [
  "bzip2",
  "flate2",

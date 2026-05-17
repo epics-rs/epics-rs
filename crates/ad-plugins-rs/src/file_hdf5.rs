@@ -702,6 +702,17 @@ impl Hdf5Writer {
     }
 
     /// Open file in SWMR streaming mode.
+    ///
+    /// Ordering mirrors C `NDFileHDF5::openFile` (`NDFileHDF5.cpp:264`-`335`):
+    /// the file layout tree and datasets are created, then `createHardLinks`
+    /// (`NDFileHDF5.cpp:320`-`321`) runs, and only then `startSWMR`
+    /// (`NDFileHDF5.cpp:324`-`326`). The new rust-hdf5 0.2.17 `SwmrFileWriter`
+    /// exposes `create_group` / `assign_dataset_to_group` / `create_hard_link`
+    /// callable before `start_swmr()`; a group or link created before
+    /// `start_swmr()` is visible to SWMR readers for the whole streaming
+    /// window. So here the image dataset is placed at the layout's nested
+    /// `resolved_dataset_path` and the layout `<hardlink>` elements are
+    /// materialised before SWMR mode is entered — not on the close path.
     fn open_swmr(&mut self, path: &Path, array: &NDArray) -> ADResult<()> {
         let mut swmr = SwmrFileWriter::create(path)
             .map_err(|e| ADError::UnsupportedConversion(format!("SWMR create error: {}", e)))?;
@@ -721,12 +732,25 @@ impl Hdf5Writer {
             c.iter().map(|&v| v as u64).collect()
         };
 
+        // The streaming dataset is created with its full nested layout path
+        // as the dataset name (default flat `data` without a layout). The
+        // `SwmrFileWriter` emits a path-named dataset that is also assigned to
+        // a group under that group with just the leaf, while keeping the full
+        // name addressable so a layout `<hardlink target="/entry/.../data">`
+        // resolves against it. `ds_group_path` is the parent group the
+        // dataset is re-parented into via `assign_dataset_to_group` below.
+        let ds_group_path: Option<String> = self
+            .resolved_dataset_path
+            .rsplit_once('/')
+            .map(|(group_path, _leaf)| group_path.to_string());
+        let ds_name = self.resolved_dataset_path.clone();
+
         macro_rules! create_ds {
             ($t:ty) => {
                 match pipeline.clone() {
                     Some(pl) => swmr
                         .create_streaming_dataset_chunked_compressed::<$t>(
-                            &self.dataset_name,
+                            &ds_name,
                             &frame_dims,
                             &chunk,
                             pl,
@@ -738,11 +762,7 @@ impl Hdf5Writer {
                             ))
                         }),
                     None => swmr
-                        .create_streaming_dataset_chunked::<$t>(
-                            &self.dataset_name,
-                            &frame_dims,
-                            &chunk,
-                        )
+                        .create_streaming_dataset_chunked::<$t>(&ds_name, &frame_dims, &chunk)
                         .map_err(|e| {
                             ADError::UnsupportedConversion(format!(
                                 "SWMR create dataset error: {}",
@@ -765,6 +785,28 @@ impl Hdf5Writer {
             NDDataType::Float32 => create_ds!(f32)?,
             NDDataType::Float64 => create_ds!(f64)?,
         };
+
+        // Build the layout group tree, place the image dataset inside its
+        // nested layout group, materialise its constant attributes and the
+        // layout `<hardlink>` elements — all BEFORE `start_swmr()` so SWMR
+        // readers see the nested paths and aliases for the whole streaming
+        // window. C `NDFileHDF5.cpp:320`-`326`: `createHardLinks` then
+        // `startSWMR`.
+        self.build_swmr_layout_groups(&mut swmr)?;
+        if let Some(ref group_path) = ds_group_path {
+            // `SwmrFileWriter` keys groups by their absolute path (leading
+            // `/`); `resolved_dataset_path` is stored stripped, so re-add it.
+            let abs_group = format!("/{}", group_path);
+            swmr.assign_dataset_to_group(&abs_group, ds_index)
+                .map_err(|e| {
+                    ADError::UnsupportedConversion(format!(
+                        "SWMR assign dataset to group '{}': {}",
+                        abs_group, e
+                    ))
+                })?;
+        }
+        self.write_swmr_layout_dataset_attrs(&mut swmr, ds_index)?;
+        self.build_swmr_layout_hardlinks(&mut swmr)?;
 
         swmr.start_swmr()
             .map_err(|e| ADError::UnsupportedConversion(format!("SWMR start error: {}", e)))?;
@@ -790,6 +832,152 @@ impl Hdf5Writer {
         });
         self.open_data_type = Some(array.data.data_type());
         self.open_frame_dims = Some(array.dims.iter().rev().map(|d| d.size).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// Build every group node declared in the loaded layout XML against a
+    /// `SwmrFileWriter`, the SWMR counterpart of [`build_layout_groups`].
+    ///
+    /// Paths are created parent-first (shortest path-depth first) via the
+    /// rust-hdf5 0.2.17 `SwmrFileWriter::create_group` API, which takes the
+    /// parent group path and a leaf name. Called from `open_swmr` before
+    /// `start_swmr()` so the groups are visible to SWMR readers for the whole
+    /// streaming window. No-op when no layout is loaded.
+    fn build_swmr_layout_groups(&self, swmr: &mut SwmrFileWriter) -> ADResult<()> {
+        let layout = match self.layout.as_ref() {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        fn collect(g: &crate::hdf5_layout::LayoutGroup, prefix: &str, out: &mut Vec<String>) {
+            let here = if prefix.is_empty() {
+                g.name.clone()
+            } else {
+                format!("{}/{}", prefix, g.name)
+            };
+            out.push(here.clone());
+            for sub in &g.groups {
+                collect(sub, &here, out);
+            }
+        }
+        let mut paths = Vec::new();
+        for g in &layout.groups {
+            collect(g, "", &mut paths);
+        }
+        paths.sort_by_key(|p| p.matches('/').count());
+        paths.dedup();
+        let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for path in &paths {
+            if created.contains(path) {
+                continue;
+            }
+            let (parent, leaf) = match path.rsplit_once('/') {
+                Some((p, l)) => (format!("/{}", p), l),
+                None => ("/".to_string(), path.as_str()),
+            };
+            swmr.create_group(&parent, leaf).map_err(|e| {
+                ADError::UnsupportedConversion(format!("SWMR layout group '{}': {}", path, e))
+            })?;
+            created.insert(path.clone());
+        }
+        Ok(())
+    }
+
+    /// Materialise every `<hardlink>` declared in the loaded layout XML against
+    /// a `SwmrFileWriter`, the SWMR counterpart of [`build_layout_hardlinks`].
+    ///
+    /// Uses the rust-hdf5 0.2.17 `SwmrFileWriter::create_hard_link` API. Called
+    /// from `open_swmr` after the layout groups and image dataset exist and
+    /// before `start_swmr()` — matching C `NDFileHDF5.cpp:320`-`321`
+    /// `createHardLinks`, which runs before `startSWMR`. A link created before
+    /// `start_swmr()` is visible to SWMR readers for the whole streaming
+    /// window. No-op when no layout is loaded.
+    fn build_swmr_layout_hardlinks(&self, swmr: &mut SwmrFileWriter) -> ADResult<()> {
+        let layout = match self.layout.as_ref() {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        fn collect<'a>(
+            g: &'a crate::hdf5_layout::LayoutGroup,
+            prefix: &str,
+            out: &mut Vec<(String, &'a crate::hdf5_layout::LayoutHardlink)>,
+        ) {
+            let here = if prefix.is_empty() {
+                g.name.clone()
+            } else {
+                format!("{}/{}", prefix, g.name)
+            };
+            for hl in &g.hardlinks {
+                out.push((here.clone(), hl));
+            }
+            for sub in &g.groups {
+                collect(sub, &here, out);
+            }
+        }
+        let mut links = Vec::new();
+        for g in &layout.groups {
+            collect(g, "", &mut links);
+        }
+        for (parent_path, hl) in &links {
+            let parent = format!("/{}", parent_path);
+            swmr.create_hard_link(&parent, &hl.name, &hl.target)
+                .map_err(|e| {
+                    ADError::UnsupportedConversion(format!(
+                        "SWMR layout hardlink '{}/{}' -> '{}': {}",
+                        parent_path, hl.name, hl.target, e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Materialise the loaded layout XML's `constant` HDF5 attributes attached
+    /// to the primary image dataset against a `SwmrFileWriter`. This mirrors
+    /// the standard close path's `layout_ds_attrs` block in
+    /// `create_primary_dataset` (e.g. the NeXus `signal=1` marker). Only
+    /// `constant`-sourced attributes are materialised; `ndattribute`-sourced
+    /// nodes carry per-frame values and are out of scope here. No-op when no
+    /// layout is loaded.
+    fn write_swmr_layout_dataset_attrs(
+        &self,
+        swmr: &mut SwmrFileWriter,
+        ds_index: usize,
+    ) -> ADResult<()> {
+        use crate::hdf5_layout::{LayoutDataType, LayoutSource};
+        let layout = match self.layout.as_ref() {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let resolved_ds = self.resolved_dataset_path.as_str();
+        let mut attrs: Vec<(String, LayoutDataType, String)> = Vec::new();
+        layout.for_each_dataset(|path, d| {
+            let full = format!("{}/{}", path, d.name);
+            if full.trim_start_matches('/') == resolved_ds {
+                for a in &d.attributes {
+                    if a.source == LayoutSource::Constant {
+                        attrs.push((a.name.clone(), a.data_type, a.value.clone()));
+                    }
+                }
+            }
+        });
+        for (name, dtype, value) in &attrs {
+            match dtype {
+                LayoutDataType::Int => {
+                    let v: i64 = value.trim().parse().unwrap_or(0);
+                    swmr.set_dataset_attr_numeric(ds_index, name, &v)
+                }
+                LayoutDataType::Float => {
+                    let v: f64 = value.trim().parse().unwrap_or(0.0);
+                    swmr.set_dataset_attr_numeric(ds_index, name, &v)
+                }
+                LayoutDataType::String => swmr.set_dataset_attr_string(ds_index, name, value),
+            }
+            .map_err(|e| {
+                ADError::UnsupportedConversion(format!(
+                    "SWMR layout dataset attribute '{}': {}",
+                    name, e
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -892,16 +1080,15 @@ impl Hdf5Writer {
     /// absolute object path). C++ `NDFileHDF5::createHardLinks` walks the
     /// layout after the groups/datasets exist and calls `H5Lcreate_hard`.
     ///
-    /// Called from `close_file` so that both the primary image dataset and the
-    /// per-frame NDAttribute datasets — any of which a hardlink may target —
-    /// already exist on disk. No-op when no layout is loaded.
+    /// Called from `close_file` for the standard (non-SWMR) close path so that
+    /// both the primary image dataset and the per-frame NDAttribute datasets —
+    /// any of which a hardlink may target — already exist on disk. No-op when
+    /// no layout is loaded.
     ///
-    /// `file` is the write-mode HDF5 handle into which the links are created:
-    /// the live `Standard` handle for the standard close path, or a freshly
-    /// `open_rw`-reopened handle for the SWMR close path (the `SwmrFileWriter`
-    /// exposes no link API of its own, so SWMR hardlinks are materialised
-    /// after `close()` against the finished file — C++ `NDFileHDF5.cpp:320`
-    /// `createHardLinks` likewise runs for SWMR files).
+    /// `file` is the live `Standard` write-mode HDF5 handle. The SWMR path has
+    /// its own counterpart, [`build_swmr_layout_hardlinks`], which runs before
+    /// `start_swmr()` (C++ `NDFileHDF5.cpp:320`-`326`: `createHardLinks` then
+    /// `startSWMR`) so SWMR readers see the links during streaming.
     fn build_layout_hardlinks(&self, file: &H5File) -> ADResult<()> {
         let layout = match self.layout.as_ref() {
             Some(l) => l,
@@ -1491,16 +1678,6 @@ fn nd_buffer_to_le_bytes(buf: &NDDataBuffer) -> Vec<u8> {
     }
 }
 
-/// Whether the loaded layout declares at least one `<hardlink>` anywhere in
-/// its group tree. Used by the SWMR close path to skip the re-open-for-append
-/// round-trip entirely when there is nothing to materialise.
-fn layout_has_hardlinks(layout: &Hdf5Layout) -> bool {
-    fn group_has(g: &crate::hdf5_layout::LayoutGroup) -> bool {
-        !g.hardlinks.is_empty() || g.groups.iter().any(group_has)
-    }
-    layout.groups.iter().any(group_has)
-}
-
 /// Write `buffer` into a chunked dataset, one `chunk_bytes`-sized chunk at a
 /// time at consecutive linear indices. The trailing partial chunk is
 /// zero-padded to a full chunk, which `rust-hdf5`'s `write_chunk` requires.
@@ -1672,35 +1849,16 @@ impl NDFileWriter for Hdf5Writer {
                 self.handle = None;
             }
             Some(Hdf5Handle::Swmr { .. }) => {
+                // The layout group tree, the nested dataset placement and the
+                // layout `<hardlink>` elements were all materialised in
+                // `open_swmr` before `start_swmr()` (C `NDFileHDF5.cpp:320`-
+                // `326`: `createHardLinks` then `startSWMR`), so SWMR readers
+                // see them for the whole streaming window. Closing the writer
+                // only finalises the streamed frames.
                 if let Some(Hdf5Handle::Swmr { writer, .. }) = self.handle.take() {
                     writer.close().map_err(|e| {
                         ADError::UnsupportedConversion(format!("SWMR close error: {}", e))
                     })?;
-                }
-                // The `SwmrFileWriter` exposes no hard-link API and is now
-                // consumed by `close()`. C++ `NDFileHDF5.cpp:320`
-                // `createHardLinks` runs for SWMR files too, so re-open the
-                // finished file in append mode and materialise the layout
-                // `<hardlink>` elements against it. No-op when no layout (or
-                // no hardlinks) is loaded.
-                if self.layout.as_ref().is_some_and(layout_has_hardlinks) {
-                    if let Some(path) = self.current_path.clone() {
-                        let file = H5File::open_rw(&path).map_err(|e| {
-                            ADError::UnsupportedConversion(format!(
-                                "SWMR hardlink: re-open '{}' for append failed: {}",
-                                path.display(),
-                                e
-                            ))
-                        })?;
-                        self.build_layout_groups(&file)?;
-                        self.build_layout_hardlinks(&file)?;
-                        file.close().map_err(|e| {
-                            ADError::UnsupportedConversion(format!(
-                                "SWMR hardlink: close re-opened file failed: {}",
-                                e
-                            ))
-                        })?;
-                    }
                 }
             }
             None => {}
@@ -3205,22 +3363,26 @@ mod tests {
     #[test]
     fn test_swmr_layout_hardlink_is_materialised() {
         // A `<hardlink>` declared in the layout XML must also be materialised
-        // for SWMR-mode files. C ADCore `NDFileHDF5.cpp:320` calls
-        // `createHardLinks` before `startSWMR()`, so SWMR files get the link
-        // too. The `SwmrFileWriter` exposes no link API, so the Rust port
-        // re-opens the finished file in append mode after `close()` and
-        // materialises the layout `<hardlink>` elements then.
+        // for SWMR-mode files. C ADCore `NDFileHDF5.cpp:320`-`326` calls
+        // `createHardLinks` before `startSWMR()`, so the link is committed by
+        // `start_swmr()` and visible to SWMR readers for the whole streaming
+        // window. The rust-hdf5 0.2.17 `SwmrFileWriter::create_hard_link` API
+        // is called from `open_swmr` before `start_swmr()` — no close-path
+        // re-open pass.
         //
-        // SWMR mode writes the image dataset at the flat default name
-        // `data`; the layout hardlink here targets `/data` (where the SWMR
-        // dataset actually lands) and lives inside a non-colliding group.
+        // SWMR mode now places the image dataset at the layout's nested
+        // `det_default` path (`/entry/data/data`), exactly like standard mode;
+        // the layout hardlink targets that nested path.
         let dir = std::env::temp_dir();
         let layout = dir.join("adcore_swmr_layout_hardlink.xml");
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
-              <group name="links">
-                <hardlink name="data_alias" target="/data"/>
+              <group name="entry">
+                <group name="data">
+                  <dataset name="data" source="detector" det_default="true"/>
+                  <hardlink name="data_alias" target="/entry/data/data"/>
+                </group>
               </group>
             </hdf5_layout>"#,
         )
@@ -3255,25 +3417,137 @@ mod tests {
 
         let h5 = H5File::open(&path).unwrap();
         let names = h5.dataset_names();
-        // The primary SWMR dataset at the flat root.
+        // The primary SWMR dataset at its nested layout path.
         assert!(
-            names.contains(&"data".to_string()),
-            "SWMR image dataset must exist at flat `data`; got {:?}",
+            names.contains(&"entry/data/data".to_string()),
+            "SWMR image dataset must exist at the nested layout path; got {:?}",
             names
         );
-        // The hard link materialised under the layout `links` group.
+        // The hard link materialised under the layout group.
         assert!(
-            names.contains(&"links/data_alias".to_string()),
+            names.contains(&"entry/data/data_alias".to_string()),
             "SWMR layout <hardlink> must be materialised as a hard link; got {:?}",
             names
         );
         // The link shares the target object: same shape, readable as a dataset.
-        let alias = h5.dataset("links/data_alias").unwrap();
-        let orig = h5.dataset("data").unwrap();
+        let alias = h5.dataset("entry/data/data_alias").unwrap();
+        let orig = h5.dataset("entry/data/data").unwrap();
         assert_eq!(alias.shape(), orig.shape());
         assert_eq!(orig.shape(), vec![2, 4, 4]);
 
         drop(h5);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
+    }
+
+    #[test]
+    fn test_swmr_layout_nested_dataset_placement() {
+        // SWMR mode must place the image dataset at the layout's nested
+        // `det_default` path — mirroring C `NDFileHDF5` createTree
+        // (`NDFileHDF5.cpp:638`) which builds the group tree and creates the
+        // detector dataset inside it. The nested dataset, the layout
+        // `<hardlink>`, and a constant dataset attribute must all be visible
+        // to a `SwmrFileReader` reading the file back.
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_swmr_layout_nested.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <group name="entry">
+                <group name="instrument">
+                  <group name="detector">
+                    <dataset name="data" source="detector" det_default="true">
+                      <attribute name="signal" source="constant" value="1" type="int"/>
+                    </dataset>
+                    <hardlink name="data_alias" target="/entry/instrument/detector/data"/>
+                  </group>
+                </group>
+                <group name="empty_placeholder"/>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_swmr_layout_nested");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        assert!(
+            writer.set_layout_filename(layout.to_str().unwrap()),
+            "layout XML must parse: {}",
+            writer.layout_error
+        );
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i * 3) as u16;
+            }
+        }
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        assert!(
+            writer.is_swmr_active(),
+            "writer must be in SWMR mode for this test"
+        );
+        writer.write_file(&arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        // Read back via the SWMR reader — these are the exact paths a live
+        // reader attaching during the streaming window would resolve.
+        let mut reader = rust_hdf5::swmr::SwmrFileReader::open(&path).unwrap();
+        let names = reader.dataset_names();
+        // Image dataset at the nested layout path, NOT flat `data`.
+        assert!(
+            names.contains(&"entry/instrument/detector/data".to_string()),
+            "SWMR image dataset must live at the nested layout path; got {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"data".to_string()),
+            "SWMR image dataset must NOT remain at the flat root; got {:?}",
+            names
+        );
+        // The empty placeholder group exists.
+        assert!(
+            reader.has_group("entry/empty_placeholder"),
+            "empty layout group must be materialised; groups {:?}",
+            reader.group_paths()
+        );
+        // The layout `<hardlink>` resolves to the nested dataset.
+        assert!(
+            names.contains(&"entry/instrument/detector/data_alias".to_string()),
+            "SWMR layout <hardlink> must resolve to the nested dataset; got {:?}",
+            names
+        );
+        let nested = reader
+            .dataset_shape("entry/instrument/detector/data")
+            .unwrap();
+        let alias = reader
+            .dataset_shape("entry/instrument/detector/data_alias")
+            .unwrap();
+        assert_eq!(nested, vec![2, 4, 4]);
+        assert_eq!(alias, nested, "hardlink alias must share the target shape");
+        // The data round-trips through both names.
+        let via_nested: Vec<u16> = reader
+            .read_dataset("entry/instrument/detector/data")
+            .unwrap();
+        let via_alias: Vec<u16> = reader
+            .read_dataset("entry/instrument/detector/data_alias")
+            .unwrap();
+        assert_eq!(via_nested, via_alias);
+        assert_eq!(via_nested.len(), 2 * 4 * 4);
+        // The constant dataset attribute materialised before start_swmr().
+        assert_eq!(
+            reader
+                .dataset_attr_names("entry/instrument/detector/data")
+                .unwrap(),
+            vec!["signal".to_string()],
+        );
+
+        drop(reader);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&layout).ok();
     }

@@ -761,17 +761,38 @@ impl RecordInstance {
             "ACKS" => {
                 if let EpicsValue::Short(v) = value {
                     let sev = AlarmSeverity::from_u16(v as u16);
-                    // Writing ACKS clears alarm acknowledge if written severity >= current
-                    if sev >= self.common.sevr {
+                    // C `dbAccess.c:1309` putAcks:
+                    //   `if (*psev >= precord->acks) precord->acks = 0;`
+                    // The written severity is compared against the
+                    // STORED unacknowledged severity `acks` — NOT the
+                    // current `sevr`. An operator acknowledging an
+                    // alarm at the severity that was latched into ACKS
+                    // must clear it even after `sevr` has since
+                    // dropped; comparing against `sevr` instead would
+                    // leave a stale unacknowledged alarm stuck.
+                    if sev >= self.common.acks {
                         self.common.acks = AlarmSeverity::NoAlarm;
                     }
                 }
             }
-            "ACKT" => match value {
-                EpicsValue::Char(v) => self.common.ackt = v != 0,
-                EpicsValue::Short(v) => self.common.ackt = v != 0,
-                _ => {}
-            },
+            "ACKT" => {
+                let new_ackt = match value {
+                    EpicsValue::Char(v) => v != 0,
+                    EpicsValue::Short(v) => v != 0,
+                    _ => return Ok(CommonFieldPutResult::NoChange),
+                };
+                self.common.ackt = new_ackt;
+                // C `dbAccess.c:1294-1297` putAckt: when ACKT is set
+                // false (transient acknowledgement disabled) and the
+                // stored unacknowledged severity is higher than the
+                // current `sevr`, lower `acks` down to `sevr` — a
+                // transient alarm that has already cleared should not
+                // keep a sticky higher-severity ACKS once transient
+                // acknowledgement is turned off.
+                if !new_ackt && self.common.acks > self.common.sevr {
+                    self.common.acks = self.common.sevr;
+                }
+            }
             "UDF" => {
                 if let EpicsValue::Char(v) = value {
                     self.common.udf = v != 0;
@@ -1312,6 +1333,33 @@ impl RecordInstance {
             if self.common.lcnt >= LCNT_ALARM_THRESHOLD {
                 self.common.sevr = AlarmSeverity::Invalid;
                 self.common.stat = recgbl::alarm_status::SCAN_ALARM;
+                // Post the SCAN_ALARM transition so subscribers see it.
+                // The synchronous link path (`process_record_with_links_inner`,
+                // mirroring C `dbAccess.c:559-583`) posts VAL with
+                // DBE_VALUE|DBE_LOG|DBE_ALARM when the LCNT guard raises
+                // SCAN_ALARM/INVALID. The pre-fix branch here flipped
+                // sevr/stat but returned an empty snapshot, so a
+                // `process_local`-driven reentrant record went INVALID
+                // silently — no monitor ever reached the operator.
+                let mut changed_fields = Vec::new();
+                if let Some(val) = self.record.val() {
+                    changed_fields.push(("VAL".to_string(), val));
+                }
+                changed_fields.push((
+                    "SEVR".to_string(),
+                    EpicsValue::Short(self.common.sevr as i16),
+                ));
+                changed_fields.push((
+                    "STAT".to_string(),
+                    EpicsValue::Short(self.common.stat as i16),
+                ));
+                return Ok((
+                    ProcessSnapshot {
+                        changed_fields,
+                        event_mask: EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+                    },
+                    Vec::new(),
+                ));
             }
             return Ok((
                 ProcessSnapshot {
@@ -1476,7 +1524,13 @@ impl RecordInstance {
         if include_archive {
             event_mask |= EventMask::LOG;
         }
-        if alarm_result.alarm_changed {
+        // Carry DBE_ALARM on the record-wide event mask whenever the
+        // severity/status OR the alarm message moved — aligning with
+        // the `processing.rs` link path (`event_mask |= ALARM` on
+        // `alarm_changed || amsg_changed`). The pre-fix branch checked
+        // only `alarm_changed`, so a put that changed AMSG without
+        // moving SEVR/STAT posted VAL without the DBE_ALARM bit.
+        if alarm_result.alarm_changed || alarm_result.amsg_changed {
             event_mask |= EventMask::ALARM;
         }
 

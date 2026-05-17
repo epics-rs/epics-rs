@@ -8,6 +8,23 @@ use crate::types::EpicsValue;
 
 use super::{PvDatabase, apply_timestamp};
 
+/// Result of the simulation-mode check.
+///
+/// C `aiRecord.c:151-168` handles simulation entirely inside
+/// `readValue()`; `process()` then ALWAYS runs `convert`/`checkAlarms`/
+/// `monitor`/`recGblFwdLink(prec)`. A simulated record therefore must
+/// NOT skip the forward-link / CP / RPRO tail — only the device read
+/// and record-support body are replaced by the SIOL round-trip.
+enum SimOutcome {
+    /// SIMM disabled / no simulation link configured: run the record
+    /// body normally.
+    NotSimulated,
+    /// Simulation handled the record value (SIOL read/write done).
+    /// The caller must still run the forward-link / CP / RPRO tail
+    /// exactly as `recGblFwdLink` does for a real process cycle.
+    Simulated,
+}
+
 impl PvDatabase {
     /// Process a record by name (process_local + notify).
     /// Alias-aware (epics-base PR #336).
@@ -347,10 +364,22 @@ impl PvDatabase {
             }
         }
 
-        // 0.5. Simulation mode check
-        let sim_result = self.check_simulation_mode(&rec).await;
-        if let Some(sim_handled) = sim_result {
-            return sim_handled;
+        // 0.5. Simulation mode check.
+        //
+        // C `aiRecord.c:151-168`: simulation is handled inside
+        // `readValue()`, then `process()` ALWAYS runs `convert` /
+        // `checkAlarms` / `monitor` / `recGblFwdLink(prec)`. A
+        // simulated record therefore must still run the forward-link /
+        // CP / RPRO tail — only the device read and record-support
+        // body are replaced by the SIOL round-trip. Returning early
+        // here would silently break every FLNK / CP chain downstream
+        // of any record in SIMM mode.
+        match self.check_simulation_mode(&rec).await {
+            SimOutcome::NotSimulated => {}
+            SimOutcome::Simulated => {
+                self.run_forward_link_tail(name, &rec, visited, depth).await;
+                return Ok(());
+            }
         }
 
         // 1. Read INP link value and DOL link (outside lock)
@@ -1259,11 +1288,110 @@ impl PvDatabase {
             }
         }
 
+        // 4.5 - 7. Multi-output / event / generic-multi-out / FLNK /
+        // CP / RPRO tail. Shared with the simulation-mode path so a
+        // simulated record runs the exact same `recGblFwdLink`
+        // equivalent (C `aiRecord.c:168`).
+        self.run_forward_link_tail_with_putf(
+            name,
+            &rec,
+            flnk_name.as_deref(),
+            src_putf,
+            visited,
+            depth,
+        )
+        .await;
+
+        // 8. Execute ProcessActions from the record's process() outcome.
+        // This handles WriteDbLink, ReadDbLink, and ReprocessAfter actions.
+        self.execute_process_actions(name, &rec, process_actions, visited, depth)
+            .await;
+
+        // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the
+        // tail of every synchronous process cycle, NOT just on the
+        // foreign-entry path. When this record was driven through an
+        // OUT-link propagation (write_db_link_value set our putf), the
+        // target record's own process cycle must clear it before
+        // returning — same lifecycle as the source record's PUTF
+        // (which `put_record_field_from_ca` separately clears at the
+        // foreign-entry boundary, and the async branch clears in
+        // `complete_async_record_inner`). Async-pending records skip
+        // this clear: their FLNK / putf-clear happens later in
+        // `complete_async_record_inner` once the device round-trip
+        // completes.
+        {
+            let guard = rec.read().await;
+            if !guard.is_processing() {
+                drop(guard);
+                let mut guard = rec.write().await;
+                guard.common.putf = false;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Forward-link / CP / RPRO tail for the simulation-mode path.
+    ///
+    /// C `aiRecord.c:151-168`: a record in SIMM mode handles the value
+    /// inside `readValue()`, then `process()` still runs `monitor` +
+    /// `recGblFwdLink(prec)`. The simulation path in
+    /// `process_record_with_links_inner` does its own monitor posting,
+    /// so this drives the forward-link / CP / RPRO tail that
+    /// `recGblFwdLink` would. `flnk_name` and `src_putf` are derived
+    /// fresh from the record (a simulated cycle does not change FLNK,
+    /// and SIOL reads/writes do not carry a foreign PUTF into the
+    /// chain).
+    async fn run_forward_link_tail(
+        &self,
+        name: &str,
+        rec: &Arc<RwLock<RecordInstance>>,
+        visited: &mut std::collections::HashSet<String>,
+        depth: usize,
+    ) {
+        let (flnk_name, src_putf) = {
+            let instance = rec.read().await;
+            let flnk = if instance.record.should_fire_forward_link() {
+                if let crate::server::record::ParsedLink::Db(ref l) = instance.parsed_flnk {
+                    Some(l.record.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (flnk, instance.common.putf)
+        };
+        self.run_forward_link_tail_with_putf(
+            name,
+            rec,
+            flnk_name.as_deref(),
+            src_putf,
+            visited,
+            depth,
+        )
+        .await;
+    }
+
+    /// Steps 4.5 - 7 of the process chain: multi-output dispatch,
+    /// event-record posting, generic OUTA..OUTP links, FLNK forward
+    /// link, CP-target dispatch, and RPRO reprocess. Shared by the
+    /// main process path and the simulation-mode path so both run the
+    /// identical `recGblFwdLink` equivalent.
+    async fn run_forward_link_tail_with_putf(
+        &self,
+        name: &str,
+        rec: &Arc<RwLock<RecordInstance>>,
+        flnk_name: Option<&str>,
+        src_putf: bool,
+        visited: &mut std::collections::HashSet<String>,
+        depth: usize,
+    ) {
         // 4.5. Multi-output dispatch (fanout/dfanout/seq)
-        self.dispatch_multi_output(&rec, visited, depth).await;
+        self.dispatch_multi_output(rec, visited, depth).await;
 
         // 4.55. event record: post the named software event.
-        self.dispatch_event_record(&rec).await;
+        self.dispatch_event_record(rec).await;
 
         // 4.6. Generic multi-output links (transform OUTA..OUTP -> A..P)
         {
@@ -1310,7 +1438,7 @@ impl PvDatabase {
         // 5. FLNK -- only process if target is Passive (like C dbScanFwdLink).
         // FLNK goes through C `dbScanPassive` -> `processTarget`, which
         // propagates `src_putf` to the target the same way OUT links do.
-        if let Some(ref flnk) = flnk_name {
+        if let Some(flnk) = flnk_name {
             if let Some(target_rec) = self.get_record(flnk).await {
                 let (target_scan, should_process) = {
                     let mut tg = target_rec.write().await;
@@ -1371,34 +1499,6 @@ impl PvDatabase {
                 });
             }
         }
-
-        // 8. Execute ProcessActions from the record's process() outcome.
-        // This handles WriteDbLink, ReadDbLink, and ReprocessAfter actions.
-        self.execute_process_actions(name, &rec, process_actions, visited, depth)
-            .await;
-
-        // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the
-        // tail of every synchronous process cycle, NOT just on the
-        // foreign-entry path. When this record was driven through an
-        // OUT-link propagation (write_db_link_value set our putf), the
-        // target record's own process cycle must clear it before
-        // returning — same lifecycle as the source record's PUTF
-        // (which `put_record_field_from_ca` separately clears at the
-        // foreign-entry boundary, and the async branch clears in
-        // `complete_async_record_inner`). Async-pending records skip
-        // this clear: their FLNK / putf-clear happens later in
-        // `complete_async_record_inner` once the device round-trip
-        // completes.
-        {
-            let guard = rec.read().await;
-            if !guard.is_processing() {
-                drop(guard);
-                let mut guard = rec.write().await;
-                guard.common.putf = false;
-            }
-        }
-
-        Ok(())
     }
 
     /// Execute ReadDbLink actions before process().
@@ -1605,6 +1705,18 @@ impl PvDatabase {
                 .cloned()
                 .ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?
         };
+
+        // Seed the cycle guard with this record's own name — mirrors
+        // the synchronous main path (`process_record_with_links_inner`
+        // does `visited.insert(name)` before the body). Without this
+        // the async-completion FLNK / OUT / CP dispatch can re-enter
+        // the just-completed record: an async FLNK chain that loops
+        // back (A async -> completes -> FLNK -> B -> FLNK -> A) would
+        // re-process A unbounded, because PACT is cleared below before
+        // the FLNK dispatch and nothing else blocks the re-entry.
+        if !visited.insert(name.to_string()) {
+            return Ok(()); // Cycle detected, skip
+        }
 
         let (snapshot, out_info, flnk_name, alarm_posts) = {
             let mut instance = rec.write().await;
@@ -2049,19 +2161,33 @@ impl PvDatabase {
         }
     }
 
-    /// Check simulation mode for a record. Returns Some(Ok(())) if simulation handled processing,
-    /// None if normal processing should proceed.
-    async fn check_simulation_mode(
-        &self,
-        rec: &Arc<RwLock<RecordInstance>>,
-    ) -> Option<CaResult<()>> {
+    /// Check simulation mode for a record. Returns
+    /// `SimOutcome::Simulated` when simulation handled the value (the
+    /// caller must still run the forward-link tail), or
+    /// `SimOutcome::NotSimulated` when normal processing should proceed.
+    async fn check_simulation_mode(&self, rec: &Arc<RwLock<RecordInstance>>) -> SimOutcome {
         // Read SIML, SIMM, SIOL, SIMS from the record
         let (siml_link, siol_link, sims, _rtype, is_input) = {
             let instance = rec.read().await;
             let rtype = instance.record.record_type().to_string();
+            // Every input record whose DBD declares SIML/SIOL/SIMM/SIMS.
+            // `mbbi`/`mbbiDirect` are input records: `mbbiRecord.c:125-126`
+            // (and mbbiDirectRecord.c) declare SIML+SIOL, and
+            // `mbbiRecord.c:388-394` reads `dbGetLink(&prec->siol,
+            // DBR_ULONG, &prec->sval)` then `rval = sval` — input
+            // semantics. Omitting them sent a simulated mbbi down the
+            // OUTPUT branch, which writes VAL out to SIOL instead of
+            // reading the value in from it.
             let is_input = matches!(
                 rtype.as_str(),
-                "ai" | "bi" | "longin" | "int64in" | "stringin" | "lsi" | "event"
+                "ai" | "bi"
+                    | "mbbi"
+                    | "mbbiDirect"
+                    | "longin"
+                    | "int64in"
+                    | "stringin"
+                    | "lsi"
+                    | "event"
             );
 
             let siml = instance
@@ -2099,7 +2225,7 @@ impl PvDatabase {
                 .unwrap_or(0);
 
             if siml.is_empty() && siol.is_empty() {
-                return None; // No simulation configured
+                return SimOutcome::NotSimulated; // No simulation configured
             }
 
             let siml_parsed = crate::server::record::parse_link_v2(&siml);
@@ -2141,7 +2267,7 @@ impl PvDatabase {
         };
 
         if simm == 0 {
-            return None; // NO simulation, proceed normally
+            return SimOutcome::NotSimulated; // NO simulation, proceed normally
         }
 
         // epics-base 7.0.7 (SIMM menu):
@@ -2310,6 +2436,6 @@ impl PvDatabase {
             }
         }
 
-        Some(Ok(()))
+        SimOutcome::Simulated
     }
 }

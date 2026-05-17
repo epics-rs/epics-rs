@@ -479,6 +479,50 @@ impl PvDatabase {
         // call below can propagate it to its target — C `dbDbLink.c::
         // processTarget` invariant (see write_db_link_value doc).
         let src_putf = rec.read().await.common.putf;
+
+        // Resolve the SELL link into SELN before SELN is read below.
+        // C `fanoutRecord.c:103`, `dfanoutRecord.c:126`,
+        // `seqRecord.c:152` all call
+        // `dbGetLink(&prec->sell, DBR_USHORT, &prec->seln, 0, 0)` at
+        // the top of `process()`, every cycle. Only the `sel` record's
+        // NVL->SELN binding was previously wired; fanout/dfanout/seq/
+        // sseq never read the SELL link, so a SELL pointing at another
+        // record's value field never updated SELN — the selection was
+        // frozen at whatever SELN was initialised to.
+        {
+            let sell = {
+                let instance = rec.read().await;
+                match instance.record.record_type() {
+                    "fanout" | "dfanout" | "seq" | "sseq" => {
+                        Some(Self::field_str(&instance, "SELL"))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(sell) = sell {
+                if !sell.is_empty() {
+                    if let crate::server::record::ParsedLink::Db(ref link) =
+                        crate::server::record::parse_link_v2(&sell)
+                    {
+                        let pv_name = if link.field == "VAL" {
+                            link.record.clone()
+                        } else {
+                            format!("{}.{}", link.record, link.field)
+                        };
+                        if let Ok(val) = self.get_pv(&pv_name).await {
+                            // DBR_USHORT — clamp to the unsigned 16-bit
+                            // range the C `epicsUInt16 seln` field holds,
+                            // then store into the record's SELN field.
+                            let seln = val.to_f64().unwrap_or(0.0);
+                            let seln = seln.clamp(0.0, 65535.0) as u16 as i16;
+                            let mut instance = rec.write().await;
+                            let _ = instance.record.put_field("SELN", EpicsValue::Short(seln));
+                        }
+                    }
+                }
+            }
+        }
+
         let dispatch_info: Option<(SelmResult, MultiOut, Option<EpicsValue>)> = {
             let instance = rec.read().await;
             match instance.record.record_type() {

@@ -84,8 +84,14 @@ impl Default for CompressRecord {
 
 impl CompressRecord {
     pub fn new(nsam: i32, alg: i16) -> Self {
+        // Clamp the allocation length to >= 1: a negative or zero
+        // `nsam` would make `nsam as usize` wrap to a huge value and
+        // panic the `vec![0.0; ..]` allocation. Mirrors `histogram::new`
+        // (`let n = nelm.max(1)`) and the `put_one` `self.nsam.max(1)`
+        // guard already in this record.
+        let n = nsam.max(1) as usize;
         Self {
-            val: vec![0.0; nsam as usize],
+            val: vec![0.0; n],
             nsam,
             alg,
             ..Default::default()

@@ -4263,3 +4263,248 @@ async fn test_ca_put_mbbo_direct_val_recomputes_rval() {
         "ORAW must roll forward to the freshly converted RVAL"
     );
 }
+
+/// CRITICAL 1 — a record in SIMM (simulation) mode must still run its
+/// forward link. C `aiRecord.c:151-168`: simulation is handled inside
+/// `readValue()`, then `process()` ALWAYS runs `recGblFwdLink(prec)`
+/// (`aiRecord.c:168`). The pre-fix Rust port returned early from
+/// `check_simulation_mode`, so FLNK / CP / RPRO were skipped — every
+/// link chain downstream of a SIMM-mode record silently broke.
+#[tokio::test]
+async fn test_simulation_mode_still_fires_forward_link() {
+    let db = PvDatabase::new();
+    db.add_record("SIM:SRC", Box::new(AoRecord::new(11.0)))
+        .await
+        .unwrap();
+    db.add_record("SIM:FLNK_TARGET", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut ai = AiRecord::new(0.0);
+    // SIMM=1 (YES) with SIOL pointing at SIM:SRC — enters simulation.
+    ai.simm = 1;
+    ai.siol = "SIM:SRC".into();
+    db.add_record("SIM:AI", Box::new(ai)).await.unwrap();
+    if let Some(rec) = db.get_record("SIM:AI").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("SIM:FLNK_TARGET".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM:AI", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        visited.contains("SIM:AI"),
+        "the simulated record itself must be in the visited set"
+    );
+    assert!(
+        visited.contains("SIM:FLNK_TARGET"),
+        "a SIMM-mode record must still dispatch its FLNK forward link \
+         (C aiRecord.c:168 recGblFwdLink runs unconditionally): {visited:?}"
+    );
+}
+
+/// BUG 2 — a simulated `mbbi` is an INPUT record: it must READ the
+/// value in from SIOL, not write VAL out to SIOL. `mbbiRecord.c:125-126`
+/// declares SIML/SIOL and `mbbiRecord.c:388-394` reads
+/// `dbGetLink(&prec->siol, DBR_ULONG, &prec->sval)`. Pre-fix the Rust
+/// `is_input` set omitted `mbbi`, so a simulated mbbi fell into the
+/// OUTPUT branch and wrote its own VAL out to the SIOL target.
+#[tokio::test]
+async fn test_simulated_mbbi_reads_siol_not_writes_it() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+
+    let db = PvDatabase::new();
+    // SIOL source holds the simulated input value (index 3).
+    db.add_record("MBBISIM:SRC", Box::new(LonginRecord::new(3)))
+        .await
+        .unwrap();
+
+    // mbbi starts at index 0; SIMM=1 (YES), SIOL -> the source.
+    let mut mbbi = MbbiRecord::new(0);
+    mbbi.simm = 1;
+    mbbi.siol = "MBBISIM:SRC".into();
+    db.add_record("MBBISIM:IN", Box::new(mbbi)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("MBBISIM:IN", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // The SIOL source must be UNCHANGED — a simulated mbbi must not
+    // write its VAL out to SIOL.
+    let src = db.get_record("MBBISIM:SRC").await.unwrap();
+    let src_val = src.read().await.record.get_field("VAL").unwrap();
+    assert_eq!(
+        src_val.to_f64().unwrap() as i64,
+        3,
+        "simulated mbbi must NOT write VAL out to its SIOL target"
+    );
+
+    // The mbbi must have READ the value in from SIOL.
+    let mbbi_rec = db.get_record("MBBISIM:IN").await.unwrap();
+    let mbbi_val = mbbi_rec.read().await.record.get_field("VAL").unwrap();
+    assert_eq!(
+        mbbi_val.to_f64().unwrap() as i64,
+        3,
+        "simulated mbbi must read VAL in from SIOL (got {mbbi_val:?})"
+    );
+}
+
+/// BUG 3 — async-completion FLNK must not recurse into the
+/// just-completed record. `complete_async_record_inner` seeds the
+/// cycle-guard `visited` set with the record's own name (mirroring the
+/// synchronous `process_record_with_links_inner`). An FLNK chain that
+/// loops back (A -> FLNK -> B -> FLNK -> A) must terminate, not
+/// re-enter A unbounded.
+#[tokio::test]
+async fn test_async_completion_flnk_cycle_terminates() {
+    let db = PvDatabase::new();
+    db.add_record("ACYC:A", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("ACYC:B", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    // A -> FLNK -> B -> FLNK -> A : a closed forward-link loop.
+    if let Some(rec) = db.get_record("ACYC:A").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("ACYC:B".into()))
+            .unwrap();
+    }
+    if let Some(rec) = db.get_record("ACYC:B").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("ACYC:A".into()))
+            .unwrap();
+    }
+
+    // Driving the async-completion path on A must terminate — pre-fix
+    // it re-entered A through B's FLNK because `visited` was never
+    // seeded with A's own name. A hung/overflowed run fails the test
+    // by timeout/panic; a clean return proves the cycle guard closed.
+    db.complete_async_record("ACYC:A").await.unwrap();
+}
+
+/// BUG 4 — fanout/seq/sseq must resolve the SELL input link into SELN
+/// before SELN is used. C `fanoutRecord.c:103` calls
+/// `dbGetLink(&prec->sell, DBR_USHORT, &prec->seln, 0, 0)` at the top
+/// of every `process()`. Pre-fix `dispatch_multi_output` read SELN
+/// directly from the field and never followed SELL, so a SELL link
+/// pointing at another record never updated the selection.
+#[tokio::test]
+async fn test_fanout_resolves_sell_link_into_seln() {
+    use epics_base_rs::server::records::fanout::FanoutRecord;
+
+    let db = PvDatabase::new();
+    // SELL source: selects link index 2.
+    db.add_record("FANSELL:SRC", Box::new(LonginRecord::new(2)))
+        .await
+        .unwrap();
+    db.add_record("FANSELL:T2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("FANSELL:T0", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut fan = FanoutRecord::new();
+    fan.put_field("SELM", EpicsValue::Short(1)).unwrap(); // Specified
+    fan.put_field("SELN", EpicsValue::Short(0)).unwrap(); // stale init value
+    // SELL points at the source — must resolve to SELN=2 at process.
+    fan.put_field("SELL", EpicsValue::String("FANSELL:SRC".into()))
+        .unwrap();
+    fan.put_field("LNK0", EpicsValue::String("FANSELL:T0 PP".into()))
+        .unwrap();
+    fan.put_field("LNK2", EpicsValue::String("FANSELL:T2 PP".into()))
+        .unwrap();
+    db.add_record("FANSELL:FAN", Box::new(fan)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("FANSELL:FAN", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // SELL resolved SELN to 2 -> SELM=Specified fans out LNK2 only.
+    assert!(
+        visited.contains("FANSELL:T2"),
+        "SELL must resolve SELN=2 so LNK2 is dispatched: {visited:?}"
+    );
+    assert!(
+        !visited.contains("FANSELL:T0"),
+        "with SELL-resolved SELN=2, the stale SELN=0 (LNK0) must NOT \
+         be dispatched: {visited:?}"
+    );
+    // SELN must now hold the SELL-resolved value.
+    let fan_rec = db.get_record("FANSELL:FAN").await.unwrap();
+    let seln = fan_rec.read().await.record.get_field("SELN").unwrap();
+    assert_eq!(
+        seln,
+        EpicsValue::Short(2),
+        "SELN must be updated from the SELL link"
+    );
+}
+
+/// BUG 5 — `putAcks` (C `dbAccess.c:1303-1315`) compares the written
+/// severity against the STORED unacknowledged severity `acks`, not
+/// against the current `sevr`; `putAckt` (C `dbAccess.c:1285-1301`)
+/// lowers `acks` down to `sevr` when ACKT is set false and
+/// `acks > sevr`.
+#[tokio::test]
+async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
+    // putAcks: acks must be cleared when the written severity is >=
+    // the STORED acks, even after sevr has dropped below it.
+    {
+        let rec = AoRecord::new(0.0);
+        let mut inst = RecordInstance::new("ACKTEST1".into(), rec);
+        // Latched sticky alarm: acks=MAJOR(2); current sevr has since
+        // dropped to MINOR(1).
+        inst.common.acks = AlarmSeverity::Major;
+        inst.common.sevr = AlarmSeverity::Minor;
+        // Acknowledge at MAJOR — written sev (2) >= acks (2) -> clear.
+        inst.put_common_field("ACKS", EpicsValue::Short(2)).unwrap();
+        assert_eq!(
+            inst.common.acks,
+            AlarmSeverity::NoAlarm,
+            "ACKS write at sev>=stored acks must clear acks \
+             (C dbAccess.c:1309 compares *psev >= precord->acks)"
+        );
+
+        // A second case: written sev BELOW the stored acks must NOT
+        // clear it — proving the comparison is against `acks`, not
+        // `sevr`. Were it compared against sevr (Minor), a MINOR write
+        // would wrongly clear.
+        let rec2 = AoRecord::new(0.0);
+        let mut inst2 = RecordInstance::new("ACKTEST2".into(), rec2);
+        inst2.common.acks = AlarmSeverity::Major;
+        inst2.common.sevr = AlarmSeverity::Minor;
+        inst2
+            .put_common_field("ACKS", EpicsValue::Short(1))
+            .unwrap();
+        assert_eq!(
+            inst2.common.acks,
+            AlarmSeverity::Major,
+            "ACKS write at sev BELOW stored acks must NOT clear acks; \
+             comparing against sevr (Minor) instead would wrongly clear"
+        );
+    }
+
+    // putAckt: ACKT set false with acks > sevr must lower acks to sevr.
+    {
+        let rec = AoRecord::new(0.0);
+        let mut inst = RecordInstance::new("ACKTEST3".into(), rec);
+        inst.common.ackt = true;
+        inst.common.acks = AlarmSeverity::Major;
+        inst.common.sevr = AlarmSeverity::Minor;
+        inst.put_common_field("ACKT", EpicsValue::Short(0)).unwrap();
+        assert!(!inst.common.ackt, "ACKT must be cleared");
+        assert_eq!(
+            inst.common.acks,
+            AlarmSeverity::Minor,
+            "ACKT=false with acks>sevr must lower acks down to sevr \
+             (C dbAccess.c:1294-1297)"
+        );
+    }
+}

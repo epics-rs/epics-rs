@@ -227,6 +227,31 @@ static MBBI_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // Simulation-mode fields. `mbbiRecord.c:125-126` declares SIML/SIOL
+    // and `mbbiRecord.c:379-396` reads SIOL when SIMM != NO. These were
+    // missing from the field table / get_field / put_field, so the
+    // database simulation path (`check_simulation_mode`) could never
+    // observe SIMM on an mbbi.
+    FieldDesc {
+        name: "SIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIML",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMS",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
     FieldDesc {
         name: "MLST",
         dbf_type: DbFieldType::Enum,
@@ -597,6 +622,8 @@ impl Record for MbbiRecord {
             "RVAL" => rval: Long, "ORAW" => oraw: Long, "MASK" => mask: Long,
             "SHFT" => shft: Short, "MLST" => mlst: Enum, "LALM" => lalm: Enum,
             "NOBT" => nobt: Short,
+            "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
+            "SIMS" => sims: Short,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
             "FRSV" => frsv: Short, "FVSV" => fvsv: Short, "SXSV" => sxsv: Short, "SVSV" => svsv: Short,
             "EISV" => eisv: Short, "NISV" => nisv: Short, "TESV" => tesv: Short, "ELSV" => elsv: Short,
@@ -619,6 +646,8 @@ impl Record for MbbiRecord {
             "RVAL" => rval: Long, "ORAW" => oraw: Long, "MASK" => mask: Long,
             "SHFT" => shft: Short, "MLST" => mlst: Enum, "LALM" => lalm: Enum,
             "NOBT" => nobt: Short,
+            "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
+            "SIMS" => sims: Short,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
             "FRSV" => frsv: Short, "FVSV" => fvsv: Short, "SXSV" => sxsv: Short, "SVSV" => svsv: Short,
             "EISV" => eisv: Short, "NISV" => nisv: Short, "TESV" => tesv: Short, "ELSV" => elsv: Short,

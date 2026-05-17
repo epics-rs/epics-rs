@@ -623,23 +623,53 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
                 let asg = parse_asg_body(&mut chars)?;
                 config.asg.insert(name, asg);
             }
-            "" => break,
+            "" => {
+                // `read_word` only consumes `[A-Za-z0-9_]`, and
+                // `skip_ws_comments` already ran above. So an empty
+                // word means one of two things:
+                //
+                //   * genuine EOF / whitespace-only / comment-only
+                //     input — `chars.peek()` is `None` ⇒ break, `Ok`
+                //     (the pre-existing, deliberate empty-file
+                //     divergence from C; see `empty_acf_denies_all_access`);
+                //   * a stray top-level punctuation token where a
+                //     block keyword is expected (`(`, `)`, `{`, `}`,
+                //     `,`) — C's grammar has no production starting
+                //     with bare punctuation at top level ⇒ `yyerror`.
+                //     A file of only `(((` or only `}` is genuine
+                //     garbage and must fail closed.
+                match chars.peek() {
+                    Some(&c) if matches!(c, '(' | ')' | '{' | '}' | ',') => {
+                        return Err(CaError::Protocol(format!(
+                            "ACF: unexpected '{c}' where a top-level block keyword is expected"
+                        )));
+                    }
+                    // EOF, or any other stray character — preserve the
+                    // pre-existing break-and-`Ok` behaviour; only the
+                    // stray block-punctuation case is in scope here.
+                    _ => break,
+                }
+            }
             other => {
-                // M-4: C `asLib.y:88-103` treats an unrecognised
-                // top-level block as a *warning*
-                // (`yywarn "Ignoring unsupported TOP LEVEL block"`)
-                // and parsing continues — forward-compat with
-                // future/vendor ACF extensions. Skip the unknown
-                // keyword's `(...)` head and `{...}` body if present
-                // so the rest of the file still parses, instead of
-                // aborting the whole load (which, per C-3, would
-                // otherwise leave the IOC with no security layer).
-                tracing::warn!(
-                    target: "epics_base_rs::access_security",
-                    keyword = %other,
-                    "ACF: ignoring unsupported top-level block"
-                );
-                skip_unknown_top_level_block(&mut chars);
+                // M-4: C `asLib.y:88-103` (`generic_item`) treats an
+                // unrecognised top-level *block* as a *warning*
+                // (`yywarn "Ignoring unsupported TOP LEVEL block"`) and
+                // parsing continues — forward-compat with future/vendor
+                // ACF extensions.
+                //
+                // The leniency is bounded by the grammar: every
+                // `generic_item` alternative is `tokenSTRING
+                // generic_head [...]`, and `generic_head`
+                // (asLib.y:105-108) is `'(' ... ')'` — a *mandatory*
+                // balanced parenthesised head. There is no
+                // `generic_item: tokenSTRING` alone. So C only warns
+                // when the unknown keyword is immediately followed by
+                // `(`; a bare keyword (followed by another word, or at
+                // EOF) matches no rule ⇒ `yyerror` ⇒ `asInitialize`
+                // fails. `skip_unknown_top_level_block` enforces exactly
+                // that: it returns `Err` for genuine garbage and `Ok`
+                // (after warning) for a well-formed unknown block.
+                skip_unknown_top_level_block(other, &mut chars)?;
             }
         }
     }
@@ -647,31 +677,64 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
     Ok(config)
 }
 
-/// Skip an unrecognised top-level block: an optional `(...)` head and
-/// an optional `{...}` body. Mirrors C's recover-and-continue posture
-/// for `yywarn "Ignoring unsupported TOP LEVEL block"` (M-4).
-fn skip_unknown_top_level_block(chars: &mut std::iter::Peekable<std::str::Chars>) {
+/// Skip an unrecognised top-level block: a *mandatory* `(...)` head and
+/// an optional `{...}` body. Mirrors C `asLib.y` `generic_item`
+/// (asLib.y:88-103) + `generic_head` (asLib.y:105-108) — the only
+/// recover-and-continue posture C allows for an unknown keyword.
+///
+/// C's grammar makes the parenthesised head mandatory: every
+/// `generic_item` alternative is `tokenSTRING generic_head [...]`, and
+/// `generic_head` is `'(' ')'` | `'(' generic_element ')'` |
+/// `'(' generic_list ')'`. So:
+///
+/// * unknown keyword **followed by `(`** with a balanced head ⇒ warn
+///   and continue (`yywarn "Ignoring unsupported TOP LEVEL block"`);
+/// * unknown keyword **not** followed by `(` (another bare word, or
+///   EOF) ⇒ no grammar rule matches ⇒ C `yyerror` ⇒ `asInitialize`
+///   fails. Return `Err`;
+/// * unbalanced parens/braces (depth never returns to 0 before EOF) ⇒
+///   the C lexer/parser raises `yyerror` ⇒ return `Err`.
+fn skip_unknown_top_level_block(
+    keyword: &str,
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> CaResult<()> {
     skip_ws_comments(chars);
-    if chars.peek() == Some(&'(') {
-        // Consume balanced parens.
-        let mut depth = 0;
-        while let Some(&c) = chars.peek() {
-            chars.next();
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
+    // C `generic_head` requires a `(` here. A bare keyword with another
+    // word or EOF after it matches no production ⇒ hard parse error.
+    if chars.peek() != Some(&'(') {
+        return Err(CaError::Protocol(format!(
+            "ACF: unexpected token '{keyword}' — expected a top-level \
+             UAG/HAG/ASG block or an unknown keyword followed by '('"
+        )));
+    }
+    // Consume the balanced `(...)` head. Unbalanced ⇒ error.
+    let mut depth = 0;
+    let mut closed = false;
+    while let Some(&c) = chars.peek() {
+        chars.next();
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    closed = true;
+                    break;
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
+    if !closed {
+        return Err(CaError::Protocol(format!(
+            "ACF: unbalanced '(' in unsupported top-level block '{keyword}'"
+        )));
+    }
     skip_ws_comments(chars);
+    // The `{...}` body is optional (the `tokenSTRING generic_head` bare
+    // form). If present it must be balanced.
     if chars.peek() == Some(&'{') {
         let mut depth = 0;
+        let mut closed = false;
         while let Some(&c) = chars.peek() {
             chars.next();
             match c {
@@ -679,13 +742,26 @@ fn skip_unknown_top_level_block(chars: &mut std::iter::Peekable<std::str::Chars>
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
+                        closed = true;
                         break;
                     }
                 }
                 _ => {}
             }
         }
+        if !closed {
+            return Err(CaError::Protocol(format!(
+                "ACF: unbalanced '{{' in unsupported top-level block '{keyword}'"
+            )));
+        }
     }
+    // Well-formed unknown block: warn and continue (M-4 parity).
+    tracing::warn!(
+        target: "epics_base_rs::access_security",
+        keyword = %keyword,
+        "ACF: ignoring unsupported top-level block"
+    );
+    Ok(())
 }
 
 /// Expand HAG members with their resolved IP addresses for soft
@@ -1676,6 +1752,107 @@ ASG(DEFAULT) { RULE(1, READ) }
             AccessLevel::Read,
             "the ASG after the unknown block must still parse"
         );
+    }
+
+    /// A well-formed unknown top-level block — keyword + balanced
+    /// `(...)` head + balanced `{...}` body — must parse to `Ok` with a
+    /// warning. Mirrors C `asLib.y` `generic_item`
+    /// (`tokenSTRING generic_head generic_block`, asLib.y:93-97).
+    #[test]
+    fn unknown_well_formed_block_parses_ok_with_warning() {
+        let acf = r#"
+VENDOR(x) { FOO(1) }
+ASG(DEFAULT) { RULE(1, READ) }
+"#;
+        let config = parse_acf(acf)
+            .expect("a well-formed unknown top-level block must warn-and-continue, not fail");
+        assert_eq!(
+            config.check_access("DEFAULT", "host", "user"),
+            AccessLevel::Read
+        );
+    }
+
+    /// The `tokenSTRING generic_head` bare form (asLib.y:98-102): an
+    /// unknown keyword followed only by a balanced `(...)` head, no
+    /// `{...}` body, still parses.
+    #[test]
+    fn unknown_block_bare_head_parses_ok() {
+        let acf = "VENDOR(x) ASG(DEFAULT) { RULE(1, READ) }";
+        let config = parse_acf(acf).expect("bare unknown-block head must warn-and-continue");
+        assert!(config.asg.contains_key("DEFAULT"));
+    }
+
+    /// Genuine garbage — a bare token where a top-level block keyword
+    /// is expected, with unbalanced parens — must return `Err`. C's
+    /// grammar has no `generic_item: tokenSTRING` alone; an unknown
+    /// keyword *not* followed by `(` matches no production ⇒ `yyerror`
+    /// ⇒ `asInitialize` fails. This is the `reload_rpc` regression.
+    #[test]
+    fn genuine_garbage_acf_is_rejected() {
+        assert!(
+            parse_acf("this is not valid ACF (((").is_err(),
+            "unparseable ACF must fail, not silently skip to EOF"
+        );
+    }
+
+    /// A file containing only stray block punctuation where a
+    /// top-level keyword is expected (`(`, `)`, `{`, `}`, `,`) is
+    /// genuine garbage — C's grammar has no production starting with
+    /// bare punctuation at top level ⇒ `yyerror`. It must fail, not
+    /// silently break to a successful empty config.
+    #[test]
+    fn stray_top_level_punctuation_is_rejected() {
+        assert!(
+            parse_acf("(((").is_err(),
+            "a file of only '(((' must fail, not silently skip to EOF"
+        );
+        assert!(
+            parse_acf("}").is_err(),
+            "a file of only '}}' must fail, not silently skip to EOF"
+        );
+    }
+
+    /// A genuinely empty file and a whitespace/comment-only file must
+    /// still parse `Ok` — the stray-punctuation fix above must not
+    /// touch the pre-existing empty-file divergence from C.
+    #[test]
+    fn empty_and_comment_only_acf_still_parses_ok() {
+        assert!(parse_acf("").is_ok(), "empty file must parse Ok");
+        assert!(
+            parse_acf("   \n\t  \n").is_ok(),
+            "whitespace-only file must parse Ok"
+        );
+        assert!(
+            parse_acf("# just a comment\n# another\n").is_ok(),
+            "comment-only file must parse Ok"
+        );
+    }
+
+    /// An unknown top-level keyword followed by another bare word (no
+    /// `(`) is a syntax error, not a skippable block.
+    #[test]
+    fn unknown_keyword_without_paren_head_is_rejected() {
+        assert!(parse_acf("VENDOR something").is_err());
+    }
+
+    /// An unknown top-level keyword alone at EOF is a syntax error —
+    /// C's `generic_head` is mandatory.
+    #[test]
+    fn unknown_keyword_at_eof_is_rejected() {
+        assert!(parse_acf("VENDOR").is_err());
+    }
+
+    /// An unknown block with an unbalanced `(...)` head must fail
+    /// rather than consume to EOF.
+    #[test]
+    fn unknown_block_unbalanced_paren_is_rejected() {
+        assert!(parse_acf("VENDOR(((").is_err());
+    }
+
+    /// An unknown block with an unbalanced `{...}` body must fail.
+    #[test]
+    fn unknown_block_unbalanced_brace_is_rejected() {
+        assert!(parse_acf("VENDOR(x) { unterminated").is_err());
     }
 
     // ----- H-1: HAG host matching is case-insensitive -----

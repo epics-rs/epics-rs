@@ -347,7 +347,11 @@ impl PvaLinkResolver {
     /// no-resolver path so the `local` check never triggers a remote
     /// search. Returns `false` when no database is attached.
     async fn is_local_in_db(&self, pv_name: &str) -> bool {
-        match self.db.read().clone() {
+        // Clone the Option out and drop the RwLock guard before any
+        // await — holding a parking_lot guard across an await point
+        // can stall or deadlock the executor.
+        let db = self.db.read().clone();
+        match db {
             Some(db) => {
                 db.get_record_no_resolve(pv_name).await.is_some()
                     || db.find_pv(pv_name).await.is_some()

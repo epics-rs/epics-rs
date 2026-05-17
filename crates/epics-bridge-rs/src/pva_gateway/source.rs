@@ -17,7 +17,11 @@ use parking_lot::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
-use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
+use epics_base_rs::server::access_security::AccessSecurityConfig;
+// `AccessLevel` is referenced only by the `#[cfg(test)]` `acl_level`
+// introspection helper, so the import is gated to match.
+#[cfg(test)]
+use epics_base_rs::server::access_security::AccessLevel;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server::native_source::AcfCell;

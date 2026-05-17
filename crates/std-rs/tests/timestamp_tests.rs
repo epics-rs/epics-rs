@@ -172,6 +172,48 @@ fn test_put_tst() {
     assert_eq!(rec.tst, 7);
 }
 
+/// C `timestampRecord.dbd` declares TST as a plain DBF_MENU with no
+/// field range; `timestampRecord.c:100-138` handles any out-of-range
+/// value via the `switch` `default:` branch. The port must store the
+/// raw value on write — NOT clamp it — so a read-back is faithful.
+#[test]
+fn test_put_tst_out_of_range_not_clamped() {
+    let mut rec = TimestampRecord::default();
+    rec.put_field("TST", EpicsValue::Short(99)).unwrap();
+    assert_eq!(rec.tst, 99, "TST stores the raw value, no clamping");
+    assert_eq!(rec.get_field("TST"), Some(EpicsValue::Short(99)));
+}
+
+/// An out-of-range TST renders with format 0 (`YY/MM/DD HH:MM:SS`) —
+/// C `switch` `default:` branch (`timestampRecord.c:135-137`).
+#[test]
+fn test_out_of_range_tst_uses_format_0() {
+    let mut rec0 = TimestampRecord::default();
+    rec0.tst = 0;
+    rec0.process().unwrap();
+
+    let mut rec_oob = TimestampRecord::default();
+    rec_oob.tst = 99;
+    rec_oob.process().unwrap();
+
+    // Format 0 contains two '/' separators in the date part.
+    assert_eq!(
+        rec_oob.val.matches('/').count(),
+        rec0.val.matches('/').count(),
+        "out-of-range TST must render like format 0"
+    );
+}
+
+/// C `timestampRecord.c:140`: `epicsTimeToStrftime(val, sizeof(val), ...)`
+/// bounds the result to the 40-byte VAL buffer (`size(40)` in the dbd).
+#[test]
+fn test_val_truncated_to_40_bytes() {
+    let mut rec = TimestampRecord::default();
+    let long = "x".repeat(100);
+    rec.put_field("VAL", EpicsValue::String(long)).unwrap();
+    assert!(rec.val.len() <= 40, "VAL must be capped at 40 bytes");
+}
+
 #[test]
 fn test_oval_is_read_only() {
     let mut rec = TimestampRecord::default();

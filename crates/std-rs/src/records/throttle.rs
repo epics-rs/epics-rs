@@ -1,9 +1,7 @@
 use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
-};
+use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// Throttle record — rate-limits value changes to prevent device damage.
@@ -84,7 +82,9 @@ impl Default for ThrottleRecord {
             drvll: 0.0,
             drvls: 0, // Normal
             drvlc: 0, // Off
-            ver: "1.0.0".to_string(),
+            // C `throttleRecord.c:51` `#define VERSION "0-2-1"`,
+            // copied into VER by `init_record` pass 0 (line 149).
+            ver: "0-2-1".to_string(),
             sts: 0, // Unknown
             prec: 0,
             dprec: 0,
@@ -104,30 +104,42 @@ impl Default for ThrottleRecord {
 
 impl ThrottleRecord {
     /// Check drive limits and optionally clip the value.
-    /// Returns Ok(value) if the value is acceptable, Err if rejected.
+    ///
+    /// Mirrors the limit block of C `throttleRecord.c:242-283`. When
+    /// `limit_flag` is set the value is tested against the low limit
+    /// first, then the high limit (same order as C lines 246/260).
+    /// `DRVLS` is updated to the resulting limit status; when limits
+    /// are inactive it is forced to Normal (C line 275 sets
+    /// `throttleDRVLS_NORM`).
+    ///
+    /// Returns `Ok(value)` when the value is acceptable (clipped to the
+    /// limit when `DRVLC` is On), or `Err(())` when it is out of range
+    /// and clipping is Off — C's `proc_flag = 0` rejection path. C does
+    /// **not** touch `STS` on a rejection (lines 254-257, 268-271); the
+    /// caller must not set it either.
     fn check_limits(&mut self, val: f64) -> Result<f64, ()> {
         if !self.limit_flag {
-            self.drvls = 0; // Normal
+            self.drvls = 0; // throttleDRVLS_NORM
             return Ok(val);
         }
 
-        if val > self.drvlh {
-            self.drvls = 2; // High
-            if self.drvlc != 0 {
-                return Ok(self.drvlh);
-            }
-            return Err(());
-        }
-
         if val < self.drvll {
-            self.drvls = 1; // Low
-            if self.drvlc != 0 {
+            self.drvls = 1; // throttleDRVLS_LOW
+            if self.drvlc == 1 {
                 return Ok(self.drvll);
             }
             return Err(());
         }
 
-        self.drvls = 0; // Normal
+        if val > self.drvlh {
+            self.drvls = 2; // throttleDRVLS_HIGH
+            if self.drvlc == 1 {
+                return Ok(self.drvlh);
+            }
+            return Err(());
+        }
+
+        self.drvls = 0; // throttleDRVLS_NORM
         Ok(val)
     }
 
@@ -278,110 +290,112 @@ impl Record for ThrottleRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // C `throttleRecord.c:231-312`. The control flow here mirrors C's
+        // `process()`:
+        //
+        //   1. The drive-limit block (C lines 242-283) runs on EVERY
+        //      process() call, regardless of whether a delay is pending.
+        //      It updates DRVLS and, on a clip-off out-of-range value,
+        //      sets `proc_flag = 0` (reject: restore `val = oval`, skip
+        //      the send).
+        //   2. If `proc_flag` (C lines 285-296): the value is "entered".
+        //      C `enterValue()` sets `wait_flag = 1`; if no delay is in
+        //      progress (`!delay_flag`) it calls `valuePut()` to write
+        //      OUT immediately and arm the delay timer. If a delay IS in
+        //      progress the value just waits — the running delay timer
+        //      will pick up the latest `prec->val` when it fires.
+        //
+        // The Rust port has no `callbackRequestDelayed` handle, so the
+        // delay timer is modelled by `ReprocessAfter`: the current cycle
+        // writes OUT, then the framework re-invokes `process()` after
+        // DLY. `delay_active` is C's `delay_flag`; `pending_value` plus
+        // re-entry through this same limit block reproduces C taking the
+        // latest limit-checked `prec->val` at timer-fire time.
         let mut actions = Vec::new();
 
-        // If we're being called after a delay to drain a pending value
-        if self.delay_active {
-            if self.delay_elapsed() {
-                // Delay expired — send pending value if any
-                self.delay_active = false;
-                self.wait = 0;
-                if let Some(pv) = self.pending_value.take() {
-                    // A value queued during the delay window was stored RAW;
-                    // it must pass the same DRVLH/DRVLL/DRVLC/DRVLS drive-limit
-                    // checking the normal path applies before `send_value`,
-                    // otherwise an out-of-range value reaches OUT unclamped.
-                    match self.check_limits(pv) {
-                        Ok(clamped) => {
-                            self.send_value(clamped);
-                            actions.push(ProcessAction::WriteDbLink {
-                                link_field: "OUT",
-                                value: EpicsValue::Double(self.sent),
-                            });
-                            // More values may have queued; start a new delay cycle
-                            if self.dly > 0.0 {
-                                self.delay_active = true;
-                                self.wait = 1;
-                                let delay = std::time::Duration::from_secs_f64(self.dly);
-                                actions.push(ProcessAction::ReprocessAfter(delay));
-                                return Ok(ProcessOutcome {
-                                    result: RecordProcessResult::Complete,
-                                    actions,
-                                    device_did_compute: false,
-                                });
-                            }
-                        }
-                        Err(()) => {
-                            // Out-of-range with clipping off — reject the queued
-                            // value, mark error, send nothing. Same as the
-                            // normal-path rejection branch.
-                            self.sts = 1; // Error
-                        }
+        // --- Drain path: the post-delay timer callback (C `valuePut()`
+        //     reached via `delayFuncCallback`, lines 530-538/540-594) ---
+        //
+        // C runs the drain in `valuePut()`, a code path SEPARATE from
+        // `process()`: it does NOT re-run the drive-limit block and does
+        // NOT touch the OVAL end-of-process update. The port models the
+        // timer with `ReprocessAfter`, so the drain arrives as a
+        // re-entrant `process()` call — identified here by an armed
+        // delay whose window has elapsed. It must therefore short-circuit
+        // BEFORE the limit block so a previously limit-checked queued
+        // value is sent as-is and DRVLS (set by the queuing process()) is
+        // left intact.
+        if self.delay_active && self.delay_elapsed() {
+            self.delay_active = false;
+            self.wait = 0;
+            match self.pending_value.take() {
+                // C `valuePut`: `wait_flag` set -> a value arrived during
+                // the delay; send the (already limit-checked) queued
+                // value, set SENT/OSENT/STS, and re-arm the timer.
+                Some(pv) => {
+                    self.send_value(pv);
+                    actions.push(ProcessAction::WriteDbLink {
+                        link_field: "OUT",
+                        value: EpicsValue::Double(self.sent),
+                    });
+                    if self.dly > 0.0 {
+                        self.delay_active = true;
+                        self.wait = 1;
+                        let delay = std::time::Duration::from_secs_f64(self.dly);
+                        actions.push(ProcessAction::ReprocessAfter(delay));
                     }
+                    return Ok(ProcessOutcome::complete_with(actions));
                 }
-                return Ok(ProcessOutcome::complete_with(actions));
-            } else {
-                // Still waiting — queue the current value, reschedule
-                self.pending_value = Some(self.val);
-                let remaining = self.dly
-                    - self
-                        .last_send_time
-                        .map(|t| t.elapsed().as_secs_f64())
-                        .unwrap_or(0.0);
-                let delay = std::time::Duration::from_secs_f64(remaining.max(0.001));
-                actions.push(ProcessAction::ReprocessAfter(delay));
-                return Ok(ProcessOutcome {
-                    result: RecordProcessResult::Complete,
-                    actions,
-                    device_did_compute: false,
-                });
+                // C `valuePut`: `wait_flag` clear -> nothing queued; the
+                // callback merely clears `delay_flag` (line 597).
+                None => {
+                    return Ok(ProcessOutcome::complete_with(actions));
+                }
             }
         }
 
-        // Normal processing: check limits
-        match self.check_limits(self.val) {
+        // --- Step 1: drive-limit block (C lines 242-283), runs on every
+        //     fresh process() call ---
+        //
+        // C restores `prec->val = prec->oval` and sets `proc_flag = 0` on
+        // a rejected (out-of-range, clipping Off) value; it does NOT set
+        // STS and does NOT touch WAIT. STS is only ever written after a
+        // real link operation (valuePut / valueSync).
+        let proc_flag = match self.check_limits(self.val) {
             Ok(clamped) => {
-                self.oval = self.val;
                 self.val = clamped;
+                true
             }
             Err(()) => {
                 self.val = self.oval;
-                self.sts = 1; // Error
-                return Ok(ProcessOutcome::complete_with(actions));
+                false
             }
+        };
+
+        if !proc_flag {
+            // Rejected: skip enterValue entirely (C `proc_flag == 0`).
+            // A delay already in progress is left running — its
+            // ReprocessAfter still fires and drains whatever value was
+            // queued. C's end-of-process OVAL block is a no-op here
+            // because `val` was just restored to `oval`.
+            return Ok(ProcessOutcome::complete_with(actions));
         }
 
-        // Check if we can send immediately
-        if self.delay_elapsed() {
-            // Send immediately
-            self.send_value(self.val);
-            actions.push(ProcessAction::WriteDbLink {
-                link_field: "OUT",
-                value: EpicsValue::Double(self.sent),
-            });
+        // OVAL end-of-process update (C lines 299-303): on a fresh,
+        // accepted process() OVAL tracks the just-checked VAL.
+        self.oval = self.val;
 
-            // Start delay period if DLY > 0
-            if self.dly > 0.0 {
-                self.delay_active = true;
-                self.wait = 1;
-                // ReprocessAfter: current cycle's OUT write proceeds (SENT is output),
-                // then framework schedules re-process after DLY to drain pending values.
-                let delay = std::time::Duration::from_secs_f64(self.dly);
-                actions.push(ProcessAction::ReprocessAfter(delay));
-                return Ok(ProcessOutcome {
-                    result: RecordProcessResult::Complete,
-                    actions,
-                    device_did_compute: false,
-                });
-            }
-
-            self.wait = 0;
-            Ok(ProcessOutcome::complete_with(actions))
-        } else {
-            // Still in delay from previous send — queue value
+        // --- Step 2: enterValue() (C lines 518-528) ---
+        //
+        // A delay timer is in progress. C `enterValue()` sets
+        // `wait_flag = 1` and returns; the running `delayFuncCb` will
+        // call `valuePut()` and send whatever `prec->val` is when it
+        // fires. The port stashes the latest limit-checked value (last
+        // value wins, as in C) so the drain re-process sends it. WAIT
+        // stays True; the in-flight ReprocessAfter is left to fire.
+        if self.delay_active {
             self.pending_value = Some(self.val);
             self.wait = 1;
-            self.delay_active = true;
             let remaining = self.dly
                 - self
                     .last_send_time
@@ -389,12 +403,37 @@ impl Record for ThrottleRecord {
                     .unwrap_or(0.0);
             let delay = std::time::Duration::from_secs_f64(remaining.max(0.001));
             actions.push(ProcessAction::ReprocessAfter(delay));
-            Ok(ProcessOutcome {
-                result: RecordProcessResult::Complete,
-                actions,
-                device_did_compute: false,
-            })
+            return Ok(ProcessOutcome::complete_with(actions));
         }
+
+        // No delay in progress: send immediately (C `enterValue` calls
+        // `valuePut` directly when `!delay_flag`). `valuePut` writes the
+        // OUT link and sets SENT/OSENT and STS=Success.
+        self.send_value(self.val);
+        actions.push(ProcessAction::WriteDbLink {
+            link_field: "OUT",
+            value: EpicsValue::Double(self.sent),
+        });
+
+        // Arm the delay timer (C `callbackRequestDelayed`, lines 592-593)
+        // when DLY > 0. WAIT is True for the duration of the delay: C
+        // sets `prec->wait = TRUE` before enterValue, and although
+        // `valuePut` clears it after the OUT write, the freshly-armed
+        // timer means the operator-visible post-cycle state is Busy
+        // until the drain completes.
+        if self.dly > 0.0 {
+            self.delay_active = true;
+            self.wait = 1;
+            let delay = std::time::Duration::from_secs_f64(self.dly);
+            actions.push(ProcessAction::ReprocessAfter(delay));
+            return Ok(ProcessOutcome::complete_with(actions));
+        }
+
+        // No delay: C `valuePut` sets WAIT=False after the immediate
+        // write (lines 575/587).
+        self.delay_active = false;
+        self.wait = 0;
+        Ok(ProcessOutcome::complete_with(actions))
     }
 
     fn can_device_write(&self) -> bool {
@@ -406,15 +445,32 @@ impl Record for ThrottleRecord {
             return Ok(());
         }
         match field {
+            // C `special()` DLY case (lines 392-409). A negative delay
+            // is clamped to 0. C also cancels/restarts the in-flight
+            // `delayFuncCb` so a previously-set huge delay does not keep
+            // the record Busy; the port re-derives the remaining delay
+            // from `last_send_time` + the new DLY on the next process,
+            // so a shrunk DLY takes effect on the next drain attempt.
             "DLY" => {
                 if self.dly < 0.0 {
                     self.dly = 0.0;
                 }
             }
+            // C `special()` DRVLH/DRVLL case (lines 411-440). When the
+            // new limits disable limiting (`drvlh <= drvll`) DRVLS goes
+            // Normal. When limiting is (re)enabled DRVLS is recomputed
+            // immediately against the *current* VAL — Low if below the
+            // low limit, High if above the high limit, else Normal.
             "DRVLH" | "DRVLL" => {
                 self.limit_flag = self.drvlh > self.drvll;
                 if !self.limit_flag {
-                    self.drvls = 0; // Normal
+                    self.drvls = 0; // throttleDRVLS_NORM
+                } else if self.val < self.drvll {
+                    self.drvls = 1; // throttleDRVLS_LOW
+                } else if self.val > self.drvlh {
+                    self.drvls = 2; // throttleDRVLS_HIGH
+                } else {
+                    self.drvls = 0; // throttleDRVLS_NORM
                 }
             }
             _ => {}
@@ -548,8 +604,21 @@ impl Record for ThrottleRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        // C `init_record` (throttleRecord.c:133-228). Pass 0 copies the
+        // VERSION string into VER; the Rust port sets VER in `Default`
+        // instead (the framework constructs the record before init).
+        //
+        // Pass 1 (C lines 156-167): STS is reset to Unknown and VAL to
+        // 0, and `limit_flag` is derived from `drvlh > drvll`. C also
+        // resets the private delay/wait/sync flags to 0 — mirrored by
+        // the runtime-state fields below.
         if pass == 1 {
+            self.sts = 0; // throttleSTS_UNK
+            self.val = 0.0;
             self.limit_flag = self.drvlh > self.drvll;
+            self.delay_active = false;
+            self.last_send_time = None;
+            self.pending_value = None;
         }
         Ok(())
     }

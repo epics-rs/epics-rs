@@ -116,6 +116,21 @@ pub trait DeviceSupport: Send + Sync + 'static {
         None
     }
 
+    /// Called by the framework immediately before [`read()`](DeviceSupport::read)
+    /// to push a read-only snapshot of framework-owned `CommonFields`
+    /// state ([`crate::server::record::ProcessContext`]) that the device
+    /// support needs.
+    ///
+    /// `read()` receives only `&mut dyn Record`; it cannot reach
+    /// `RecordInstance.common`. C device support reads `dbCommon`
+    /// directly — `devTimeOfDay.c:122` selects its time format from
+    /// `psi->phas`. A driver that needs `phas`/`udf`/`tse`/`tsel`
+    /// overrides this to stash the values before `read()` runs.
+    ///
+    /// Additive framework-set-hook (same shape as
+    /// [`DeviceSupport::set_record_info`]). Default: ignore.
+    fn set_process_context(&mut self, _ctx: &crate::server::record::ProcessContext) {}
+
     /// Called after init() with the record name and scan type.
     fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
 

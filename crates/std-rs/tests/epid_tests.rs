@@ -1100,3 +1100,135 @@ fn test_no_bumpless_readback_when_no_edge() {
 
     assert!(rec.pre_process_actions().is_empty());
 }
+
+// ============================================================
+// UDF gate — C `epidRecord.c:195-202`. While `udf==TRUE`, process()
+// skips `do_pid` entirely and returns; the framework pushes
+// `dbCommon.udf` into the record via `set_process_context`.
+// ============================================================
+use epics_base_rs::server::record::ProcessContext;
+
+fn ctx_with_udf(udf: bool) -> ProcessContext {
+    ProcessContext {
+        udf,
+        udfs: AlarmSeverity::Invalid,
+        phas: 0,
+        tse: 0,
+        tsel: String::new(),
+    }
+}
+
+/// C `epidRecord.c:195-202`: with `udf==TRUE`, `process()` must not run
+/// `do_pid` — it returns 0 after `recGblSetSevr(UDF_ALARM, udfs)`. The
+/// Rust framework pushes `udf` via `set_process_context`; with it set,
+/// `process()` leaves OVAL/P/ERR untouched.
+#[test]
+fn test_process_skips_do_pid_while_udf_set() {
+    let mut rec = EpidRecord::default();
+    rec.kp = 2.0;
+    rec.val = 100.0; // setpoint
+    rec.cval = 10.0; // controlled value -> non-zero error
+    rec.fbon = 1;
+    rec.fbop = 1;
+    rec.mdt = 0.0;
+    let oval_before = rec.oval;
+    let p_before = rec.p;
+
+    // Framework pushes udf=TRUE before process() (record uninitialized).
+    rec.set_process_context(&ctx_with_udf(true));
+    rec.process().unwrap();
+
+    assert_eq!(
+        rec.oval, oval_before,
+        "do_pid must be skipped while UDF is set -> OVAL unchanged"
+    );
+    assert_eq!(
+        rec.p, p_before,
+        "do_pid must be skipped while UDF is set -> P unchanged"
+    );
+}
+
+/// Once the framework clears UDF (value became defined), the next
+/// `process()` runs `do_pid` normally — the C "one cycle later"
+/// behaviour. epidRecord.c runs do_pid as soon as `udf==FALSE`.
+#[test]
+fn test_process_runs_do_pid_once_udf_cleared() {
+    let mut rec = EpidRecord::default();
+    rec.kp = 2.0;
+    rec.val = 100.0;
+    rec.cval = 10.0; // error = 90
+    rec.fbon = 1;
+    rec.fbop = 1;
+    rec.mdt = 0.0;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    // Framework pushes udf=FALSE — record now has a defined value.
+    rec.set_process_context(&ctx_with_udf(false));
+    rec.process().unwrap();
+
+    // P = KP * (VAL - CVAL) = 2.0 * 90.0 = 180.0 — proves do_pid ran.
+    assert!(
+        (rec.p - 180.0).abs() < 1e-6,
+        "do_pid must run once UDF is clear; P should be ~180.0, got {}",
+        rec.p
+    );
+}
+
+/// C `epidRecord.c:191-193`: in closed-loop mode (SMSL=1) a successful
+/// `dbGetLink(stpl)` clears `udf` *before* the `if (udf==TRUE)` check.
+/// The framework fetches STPL->VAL before process() but recomputes
+/// `common.udf` only after it, so the pushed `udf` is stale-TRUE on the
+/// first cycle. A closed-loop epid with a now-defined VAL must still run
+/// do_pid that cycle.
+#[test]
+fn test_process_closed_loop_runs_do_pid_when_stpl_gave_value() {
+    let mut rec = EpidRecord::default();
+    rec.kp = 2.0;
+    rec.smsl = 1; // closed-loop
+    rec.val = 100.0; // STPL already fetched a defined setpoint
+    rec.cval = 10.0;
+    rec.fbon = 1;
+    rec.fbop = 1;
+    rec.mdt = 0.0;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    // Framework still pushes the stale udf=TRUE.
+    rec.set_process_context(&ctx_with_udf(true));
+    rec.process().unwrap();
+
+    assert!(
+        (rec.p - 180.0).abs() < 1e-6,
+        "closed-loop epid with a defined VAL must run do_pid even when \
+         the pushed udf is stale-TRUE; P should be ~180.0, got {}",
+        rec.p
+    );
+}
+
+/// The UDF gate applies only on the non-callback pass. When device
+/// support already ran the PID (`set_device_did_compute(true)`),
+/// `process()` must NOT re-run `do_pid` and must NOT consult UDF —
+/// matching C `epidRecord.c`'s `if (!pact)` guard around the UDF check.
+#[test]
+fn test_process_with_device_did_compute_ignores_udf_gate() {
+    let mut rec = EpidRecord::default();
+    rec.kp = 2.0;
+    rec.val = 100.0;
+    rec.cval = 10.0;
+    rec.fbon = 1;
+    rec.fbop = 1;
+    let oval_before = rec.oval;
+    let p_before = rec.p;
+
+    rec.set_process_context(&ctx_with_udf(true));
+    rec.set_device_did_compute(true); // device support already ran do_pid
+    rec.process().unwrap();
+
+    assert_eq!(
+        rec.oval, oval_before,
+        "device-computed pass must not re-run do_pid"
+    );
+    assert_eq!(
+        rec.p, p_before,
+        "device-computed pass must not run the built-in PID"
+    );
+}

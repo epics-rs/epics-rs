@@ -724,6 +724,11 @@ impl PvDatabase {
             let mut device_did_compute = (soft_inp_applied && is_soft) || soft_input_skips_convert;
             if !is_soft && !is_output {
                 if let Some(mut dev) = instance.device.take() {
+                    // Push framework-owned common state (PHAS/TSE/TSEL/
+                    // UDF) so device support's read() can see it — C
+                    // device support reads `dbCommon` directly
+                    // (`devTimeOfDay.c:122` uses `psi->phas`).
+                    dev.set_process_context(&instance.common.process_context());
                     match dev.read(&mut *instance.record) {
                         Ok(read_outcome) => {
                             device_did_compute = read_outcome.did_compute;
@@ -793,6 +798,15 @@ impl PvDatabase {
                         .processing
                         .load(std::sync::atomic::Ordering::Relaxed)
                 );
+            }
+
+            // Push framework-owned common state (UDF/PHAS/TSE/TSEL) so
+            // the record's process() can see it — C records read
+            // `dbCommon` directly (`epidRecord.c:195` checks
+            // `pepid->udf`, `timestampRecord.c:90` checks `tse`).
+            {
+                let ctx = instance.common.process_context();
+                instance.record.set_process_context(&ctx);
             }
 
             // Process
@@ -2347,6 +2361,8 @@ impl PvDatabase {
                             _ => siol_val,
                         };
                         let _ = instance.record.put_field("RVAL", coerced);
+                        let ctx = instance.common.process_context();
+                        instance.record.set_process_context(&ctx);
                         let _ = instance.record.process();
                     } else {
                         // Records without RVAL fall back to SIMM=YES

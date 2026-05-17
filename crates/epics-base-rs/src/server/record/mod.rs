@@ -15,7 +15,7 @@ pub use link::{
 };
 pub use record_instance::RecordInstance;
 pub use record_trait::{
-    CommonFieldPutResult, FieldDesc, ProcessAction, ProcessOutcome, ProcessSnapshot, Record,
-    RecordProcessResult, SubroutineFn,
+    CommonFieldPutResult, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessAction, ProcessContext,
+    ProcessOutcome, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
 pub use scan::ScanType;

@@ -1,8 +1,10 @@
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::server::record::{
+    EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessContext, ProcessOutcome, Record,
+};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
-use chrono::Local;
+use chrono::{Local, TimeZone};
 
 /// EPICS epoch: 1990-01-01 00:00:00 UTC
 const EPICS_EPOCH_OFFSET: i64 = 631152000;
@@ -50,6 +52,13 @@ pub struct TimestampRecord {
     /// select an explicit format; any other value is rendered with
     /// format 0 (C `switch` `default:` branch).
     pub tst: i16,
+    /// Framework-owned `dbCommon.tse`, pushed via
+    /// [`Record::set_process_context`] before `process()`. C
+    /// `timestampRecord.c:90` branches on
+    /// `tse == epicsTimeEventDeviceTime`: device-time takes the raw OS
+    /// clock (`epicsTimeFromTime_t(&time, time(0))`, whole seconds, no
+    /// fraction); any other value uses the EPICS time-stamp framework.
+    tse: i16,
 }
 
 impl Default for TimestampRecord {
@@ -59,6 +68,7 @@ impl Default for TimestampRecord {
             oval: String::new(),
             rval: 0,
             tst: 0,
+            tse: 0,
         }
     }
 }
@@ -88,7 +98,26 @@ static FIELDS: &[FieldDesc] = &[
 
 impl TimestampRecord {
     fn format_timestamp(&self) -> (String, i32) {
-        let now = Local::now();
+        // C `timestampRecord.c:90-93`: `tse == epicsTimeEventDeviceTime`
+        // takes the raw OS clock via `epicsTimeFromTime_t(&time, time(0))`
+        // — whole seconds only, the nanosecond field is zero. Any other
+        // TSE value goes through `recGblGetTimeStamp`, which carries
+        // sub-second precision. The Rust port mirrors the observable
+        // difference: device-time truncates `now` to whole seconds so
+        // the `.%03f` formats (TST 9/10) render `.000`.
+        let now = if self.tse == EPICS_TIME_EVENT_DEVICE_TIME {
+            let secs = Local::now().timestamp();
+            // `timestamp_opt(secs, 0)` is always `Single` for any
+            // in-range Unix second; fall back to the un-truncated clock
+            // on the impossible `None`/`Ambiguous` case rather than
+            // panicking.
+            Local
+                .timestamp_opt(secs, 0)
+                .single()
+                .unwrap_or_else(Local::now)
+        } else {
+            Local::now()
+        };
         let unix_secs = now.timestamp();
         let sec_past_epoch = (unix_secs - EPICS_EPOCH_OFFSET) as i32;
 
@@ -211,6 +240,13 @@ impl Record for TimestampRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELDS
+    }
+
+    /// C `timestampRecord.c:90` reads `ptimestamp->tse`. The framework
+    /// owns `dbCommon.tse`; this hook captures it so `process()` can
+    /// take the device-time branch.
+    fn set_process_context(&mut self, ctx: &ProcessContext) {
+        self.tse = ctx.tse;
     }
 
     fn clears_udf(&self) -> bool {

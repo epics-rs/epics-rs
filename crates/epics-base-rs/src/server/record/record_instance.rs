@@ -1430,6 +1430,15 @@ impl RecordInstance {
                 self.record.set_device_did_compute(true);
             }
         }
+        // Push framework-owned common state (UDF/PHAS/TSE/TSEL) so the
+        // record's process() can see it — same as the processing.rs link
+        // path. `process_local` is the foreign-call path
+        // (`db.process_record`); without this a record driven through it
+        // (e.g. QSRV group-process members) would not see UDF/TSE.
+        {
+            let ctx = self.common.process_context();
+            self.record.set_process_context(&ctx);
+        }
         let outcome = self.record.process()?;
         let process_result = outcome.result;
         // Note: process_local() does not execute ProcessActions — those are

@@ -250,3 +250,90 @@ fn test_field_list() {
     assert_eq!(fields[2].name, "RVAL");
     assert_eq!(fields[3].name, "TST");
 }
+
+// ============================================================
+// TSE device-time branch — C `timestampRecord.c:90-93`. When
+// `tse == epicsTimeEventDeviceTime` (-2), the record uses the raw OS
+// clock via `epicsTimeFromTime_t(&time, time(0))` — whole seconds, no
+// nanosecond fraction. The framework pushes `dbCommon.tse` into the
+// record via `set_process_context`.
+// ============================================================
+use epics_base_rs::server::record::{EPICS_TIME_EVENT_DEVICE_TIME, ProcessContext};
+
+fn ctx_with_tse(tse: i16) -> ProcessContext {
+    ProcessContext {
+        udf: false,
+        udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
+        phas: 0,
+        tse,
+        tsel: String::new(),
+    }
+}
+
+/// C `timestampRecord.c:90-91`: `tse == epicsTimeEventDeviceTime` takes
+/// `epicsTimeFromTime_t(&time, time(0))`, whose nanosecond field is
+/// zero. The `.%03f` formats (TST 9/10) therefore render `.000`.
+#[test]
+fn test_tse_device_time_truncates_fraction_format_9() {
+    let mut rec = TimestampRecord::default();
+    rec.tst = 9; // "%b %d %Y %H:%M:%S.%03f"
+    rec.set_process_context(&ctx_with_tse(EPICS_TIME_EVENT_DEVICE_TIME));
+    rec.process().unwrap();
+    assert!(
+        rec.val.ends_with(".000"),
+        "device-time TSE must zero the fraction; format 9 should end \
+         '.000', got: {}",
+        rec.val
+    );
+}
+
+/// Same for TST 10 (`%m/%d/%y %H:%M:%S.%03f`).
+#[test]
+fn test_tse_device_time_truncates_fraction_format_10() {
+    let mut rec = TimestampRecord::default();
+    rec.tst = 10;
+    rec.set_process_context(&ctx_with_tse(EPICS_TIME_EVENT_DEVICE_TIME));
+    rec.process().unwrap();
+    assert!(
+        rec.val.ends_with(".000"),
+        "device-time TSE must zero the fraction; format 10 should end \
+         '.000', got: {}",
+        rec.val
+    );
+}
+
+/// C `timestampRecord.c:92-93`: any TSE value other than
+/// `epicsTimeEventDeviceTime` goes through `recGblGetTimeStamp`, which
+/// preserves sub-second precision. The default TSE (0,
+/// `epicsTimeEventCurrentTime`) keeps the millisecond fraction — the
+/// `.000` outcome is statistically near-impossible, so a non-`.000`
+/// suffix confirms the non-device branch ran. The format itself
+/// (a leading "." present) is asserted unconditionally.
+#[test]
+fn test_tse_current_time_keeps_format_9() {
+    let mut rec = TimestampRecord::default();
+    rec.tst = 9;
+    rec.set_process_context(&ctx_with_tse(0)); // epicsTimeEventCurrentTime
+    rec.process().unwrap();
+    assert!(
+        rec.val.contains('.'),
+        "non-device TSE must still emit the .%03f fraction field, got: {}",
+        rec.val
+    );
+}
+
+/// A non-fractional format (TST 0) is byte-identical between the
+/// device-time and current-time branches when they fall in the same
+/// second — TSE only changes the nanosecond field, which TST 0 never
+/// prints. Guards against the device-time branch corrupting the date.
+#[test]
+fn test_tse_device_time_format_0_well_formed() {
+    let mut rec = TimestampRecord::default();
+    rec.tst = 0; // "%y/%m/%d %H:%M:%S"
+    rec.set_process_context(&ctx_with_tse(EPICS_TIME_EVENT_DEVICE_TIME));
+    rec.process().unwrap();
+    // YY/MM/DD HH:MM:SS — two slashes, two colons, no fraction.
+    assert_eq!(rec.val.matches('/').count(), 2, "got: {}", rec.val);
+    assert_eq!(rec.val.matches(':').count(), 2, "got: {}", rec.val);
+    assert!(!rec.val.contains('.'), "got: {}", rec.val);
+}

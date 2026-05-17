@@ -4,8 +4,8 @@ use std::time::Instant;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, LinkType, ProcessAction, ProcessOutcome, Record,
-    link_field_type,
+    AlarmSeverity, CommonFields, FieldDesc, LinkType, ProcessAction, ProcessContext,
+    ProcessOutcome, Record, link_field_type,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -177,6 +177,20 @@ pub struct EpidRecord {
     /// raised. The framework `check_alarms` hook reads this flag and
     /// applies the severity via `recGblSetSevr`.
     pub inp_constant: bool,
+    /// Framework-owned `dbCommon.udf`, pushed by the framework via
+    /// [`Record::set_process_context`] immediately before `process()`.
+    /// C `epidRecord.c:195` reads `pepid->udf` at the top of
+    /// `process()` and skips `do_pid` entirely while it is set. The
+    /// matching `UDF_ALARM` (C `epidRecord.c:199`,
+    /// `recGblSetSevr(pepid,UDF_ALARM,pepid->udfs)`) is raised by the
+    /// framework's centralised `rec_gbl_check_udf` after `process()`.
+    udf: bool,
+    /// Set by `process()` for a cycle on which the UDF gate skipped
+    /// `do_pid`. C `epidRecord.c:201` `return(0)` is reached before
+    /// `recGblFwdLink` and before `do_pid` writes the output, so on
+    /// such a cycle the framework must NOT write the OUTL link
+    /// (`multi_output_links`) or fire the forward link.
+    compute_skipped: bool,
 }
 
 impl Default for EpidRecord {
@@ -236,6 +250,8 @@ impl Default for EpidRecord {
             ctp: now,
             device_did_compute: false,
             inp_constant: false,
+            udf: true,
+            compute_skipped: false,
         }
     }
 }
@@ -633,6 +649,53 @@ impl Record for EpidRecord {
         // For "Soft Channel" or no device support, the framework skips
         // read(), so pid_done stays false and process() runs the built-in
         // PID here.
+
+        // C `epidRecord.c:189-203`: the UDF gate is taken only on the
+        // non-callback pass (`if (!pact)`). `device_did_compute` is the
+        // Rust equivalent of "device support already ran do_pid" — the
+        // callback pass — so the gate applies only when it is false.
+        //
+        // C `epidRecord.c:191-193`: in closed-loop mode (SMSL=1) a
+        // successful `dbGetLink(stpl)` clears `udf` *before* the
+        // `if (udf==TRUE)` check at line 195. The framework fetches
+        // STPL→VAL (via `multi_input_links`, SMSL=1 only) before
+        // `process()` but only recomputes `common.udf` *after* it, so
+        // the pushed `self.udf` is last cycle's state. Mirror C: a
+        // closed-loop epid with a now-defined VAL is no longer undefined.
+        // Fresh cycle: assume the compute will run. The UDF gate below
+        // sets this true to suppress the framework's OUT-link write and
+        // FLNK — C `epidRecord.c:201` `return(0)` happens *before*
+        // `recGblFwdLink` and before `do_pid` writes the output.
+        self.compute_skipped = false;
+        if !self.device_did_compute {
+            let stpl_cleared_udf = self.smsl == 1 && !self.val.is_nan();
+            if self.udf && !stpl_cleared_udf {
+                // C `epidRecord.c:195-202`: while `udf==TRUE`, skip
+                // `do_pid` entirely and `return 0` — *before*
+                // `recGblGetTimeStamp`, `checkAlarms`, `monitor` and
+                // `recGblFwdLink`. The framework's centralised UDF
+                // check (`rec_gbl_check_udf`, run after process())
+                // raises `UDF_ALARM` with `udfs` severity, matching C's
+                // `recGblSetSevr(pepid, UDF_ALARM, pepid->udfs)`.
+                //
+                // `update_monitors()` is deliberately NOT called here:
+                // C's early `return(0)` skips `monitor()`, so the
+                // previous-value fields (`pp`/`ip`/`dp`/...) and the
+                // `mlst`/`alst` deadband baselines must NOT advance
+                // while the record is undefined.
+                //
+                // C `return(0)` is reached before `recGblFwdLink` and
+                // the `do_pid` output write. The Rust framework drives
+                // the OUTL write (`multi_output_links`) and FLNK; flag
+                // this cycle so `multi_output_links` and
+                // `should_fire_forward_link` suppress them — otherwise
+                // a stale OVAL would be pushed to the OUTL target.
+                self.device_did_compute = false;
+                self.compute_skipped = true;
+                return Ok(ProcessOutcome::complete());
+            }
+        }
+
         if !self.device_did_compute {
             crate::device_support::epid_soft::EpidSoftDeviceSupport::do_pid(self);
         }
@@ -999,6 +1062,13 @@ impl Record for EpidRecord {
         self.device_did_compute = did_compute;
     }
 
+    /// C `epidRecord.c:195` reads `pepid->udf` at the top of
+    /// `process()`. The framework owns `dbCommon.udf`; this hook
+    /// captures it so `process()` can gate `do_pid` on it.
+    fn set_process_context(&mut self, ctx: &ProcessContext) {
+        self.udf = ctx.udf;
+    }
+
     fn put_field_internal(
         &mut self,
         name: &str,
@@ -1063,8 +1133,20 @@ impl Record for EpidRecord {
     }
 
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
+        // C `epidRecord.c:195-202`: on a UDF-gated cycle `process()`
+        // returns before `do_pid` writes the output — suppress the
+        // OUTL->OVAL write so a stale OVAL is not pushed downstream.
+        if self.compute_skipped {
+            return &[];
+        }
         // OUTL -> OVAL (output link)
         static LINKS: &[(&str, &str)] = &[("OUTL", "OVAL")];
         LINKS
+    }
+
+    fn should_fire_forward_link(&self) -> bool {
+        // C `epidRecord.c:201` `return(0)` on a UDF-gated cycle is
+        // reached before `recGblFwdLink` — no forward link this cycle.
+        !self.compute_skipped
     }
 }

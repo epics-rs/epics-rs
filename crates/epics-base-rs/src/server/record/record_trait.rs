@@ -145,6 +145,46 @@ pub enum CommonFieldPutResult {
     },
 }
 
+/// Read-only snapshot of framework-owned `CommonFields` state that a
+/// record's `process()` or device support's `read()` needs to see
+/// *during* the processing cycle.
+///
+/// The framework owns `RecordInstance.common`; a record `process()`
+/// receives only `&mut self` (the concrete record) and device support
+/// `read()` receives only `&mut dyn Record`. Neither can reach
+/// `CommonFields`. C records, by contrast, see `dbCommon` directly —
+/// e.g. `epidRecord.c:195` reads `pepid->udf`, `timestampRecord.c:90`
+/// reads `ptimestamp->tse`, `devTimeOfDay.c:122` reads `psi->phas`.
+///
+/// The framework builds a `ProcessContext` from `common` and pushes it
+/// onto the record (via [`Record::set_process_context`]) and onto the
+/// device support (via
+/// [`crate::server::device_support::DeviceSupport::set_process_context`])
+/// immediately before the respective call. This mirrors the existing
+/// `set_device_did_compute` framework-set-hook pattern: additive,
+/// no `process()` / `read()` signature change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessContext {
+    /// `dbCommon.udf` — value is undefined. C records check this at the
+    /// top of `process()` (e.g. `epidRecord.c:195`).
+    pub udf: bool,
+    /// `dbCommon.udfs` — alarm severity raised for a UDF record.
+    pub udfs: crate::server::record::AlarmSeverity,
+    /// `dbCommon.phas` — phase. Used by device support for format
+    /// selection (`devTimeOfDay.c:122`).
+    pub phas: i16,
+    /// `dbCommon.tse` — time-stamp event. `timestampRecord.c:90`
+    /// branches on `tse == epicsTimeEventDeviceTime`.
+    pub tse: i16,
+    /// `dbCommon.tsel` — time-stamp event link string.
+    pub tsel: String,
+}
+
+/// C `epicsTime.h`: `epicsTimeEventDeviceTime` — the `TSE` sentinel
+/// meaning "device support provides the time stamp". `timestampRecord.c`
+/// uses it to take the OS-clock branch instead of `recGblGetTimeStamp`.
+pub const EPICS_TIME_EVENT_DEVICE_TIME: i16 = -2;
+
 /// Snapshot of changes from a process cycle, used for notify outside lock.
 pub struct ProcessSnapshot {
     pub changed_fields: Vec<(String, EpicsValue)>,
@@ -454,6 +494,23 @@ pub trait Record: Send + Sync + 'static {
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
         Vec::new()
     }
+
+    /// Called by the framework immediately before `process()` to push a
+    /// read-only snapshot of framework-owned [`CommonFields`] state
+    /// ([`ProcessContext`]) that the record's `process()` needs to see.
+    ///
+    /// The framework owns `RecordInstance.common`; a record `process()`
+    /// only gets `&mut self`. C records read `dbCommon` directly — e.g.
+    /// `epidRecord.c:195` checks `pepid->udf` at the top of `process()`,
+    /// `timestampRecord.c:90` branches on `ptimestamp->tse`. This hook
+    /// is the controlled equivalent: a record that needs `udf`/`phas`/
+    /// `tse`/`tsel` during `process()` overrides this to stash the
+    /// values into its own fields.
+    ///
+    /// Additive, framework-set-hook pattern (same shape as
+    /// [`Record::set_device_did_compute`]). Default: ignore — most
+    /// records never need common state during `process()`.
+    fn set_process_context(&mut self, _ctx: &ProcessContext) {}
 
     /// Called by the framework before process() to indicate whether device
     /// support's read() already performed the record's compute step.

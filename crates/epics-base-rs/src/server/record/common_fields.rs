@@ -89,6 +89,21 @@ pub struct CommonFields {
     pub alst: Option<f64>,
 }
 
+impl CommonFields {
+    /// Build a [`ProcessContext`](super::record_trait::ProcessContext)
+    /// snapshot of the framework-owned state a record's `process()` or
+    /// device support's `read()` needs to observe during the cycle.
+    pub fn process_context(&self) -> super::record_trait::ProcessContext {
+        super::record_trait::ProcessContext {
+            udf: self.udf,
+            udfs: self.udfs,
+            phas: self.phas,
+            tse: self.tse,
+            tsel: self.tsel.clone(),
+        }
+    }
+}
+
 impl Default for CommonFields {
     fn default() -> Self {
         Self {

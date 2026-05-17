@@ -571,11 +571,32 @@ impl super::provider::Channel for GroupChannel {
         ordered.sort_by_key(|m| m.put_order);
 
         if self.def.atomic {
-            // Atomic put: convert all values up-front (DBF-typed), then
-            // perform the actual writes in order. In C++ QSRV this uses
-            // DBManyLocker to hold all record locks simultaneously.
-            // Since epics-base-rs doesn't expose multi-lock, we write
-            // sequentially without yielding between writes.
+            // Atomic put. C++ QSRV holds every member record's lock
+            // simultaneously via `DBManyLocker` for the whole write.
+            // `epics-base-rs` exposes no multi-record write lock, and
+            // the per-record write lock is taken *inside*
+            // `put_record_field_from_ca` / `process_record` — so the
+            // gateway cannot hold `write_owned()` guards across the
+            // member loop without deadlocking those helpers.
+            //
+            // Instead we serialize on the group's shared
+            // `atomic_write_lock`: holding it across the whole member
+            // loop guarantees two PUTs to the *same atomic group*
+            // cannot interleave, so a downstream client never observes
+            // a group half-applied by a concurrent group PUT. Each
+            // member write still `.await`s, but no other atomic-group
+            // PUT can run a member write in between.
+            //
+            // Residual limitation (documented on `atomic_write_lock`):
+            // a non-group writer — a plain CA/PVA PUT addressed to a
+            // record that also backs a group member — is not gated by
+            // this lock and can still land between member writes.
+            // Closing that needs multi-record write locking in
+            // `epics-base-rs`.
+            let _atomic_guard = self.def.atomic_write_lock.lock().await;
+
+            // Convert all values up-front (DBF-typed), then perform the
+            // actual writes in order.
             let mut writes: Vec<(&GroupMember, Option<epics_base_rs::types::EpicsValue>)> =
                 Vec::new();
 
@@ -1294,6 +1315,8 @@ fn build_timestamp_from_snapshot_masked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qsrv::provider::Channel;
+    use std::time::Duration;
 
     #[test]
     fn nested_field_set_simple() {
@@ -1547,5 +1570,148 @@ mod tests {
         assert_eq!(comps.len(), 2);
         assert_eq!(comps[0].index, Some(1));
         assert_eq!(comps[1].index, Some(2));
+    }
+
+    // ---- BUG 4: atomic-group PUT serialization ----
+
+    /// Build a two-member atomic group over `A:rec` / `B:rec`,
+    /// returning the db and the parsed `GroupPvDef`.
+    async fn atomic_group_fixture() -> (Arc<PvDatabase>, GroupPvDef) {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("A:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("B:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let cfg = r#"{
+            "ATOMIC:GRP": {
+                "+atomic": true,
+                "a": {"+type": "plain", "+channel": "A:rec.VAL", "+putorder": 0},
+                "b": {"+type": "plain", "+channel": "B:rec.VAL", "+putorder": 1}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        assert!(def.atomic);
+        (db, def)
+    }
+
+    /// A PvStructure carrying `a` and `b` plain double values for the
+    /// atomic group PUT path.
+    fn atomic_put_value(a: f64, b: f64) -> PvStructure {
+        use epics_pva_rs::pvdata::ScalarValue;
+        let mut pv = PvStructure::new("structure");
+        pv.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Double(a))));
+        pv.fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Double(b))));
+        pv
+    }
+
+    /// BUG 4 regression: an atomic-group PUT holds the group's shared
+    /// `atomic_write_lock` for the whole member-write loop, so a
+    /// concurrent PUT to the same atomic group cannot run a member
+    /// write in between. Pre-fix the atomic branch `.await`-ed each
+    /// member write with no cross-write lock, letting a second PUT
+    /// interleave and leave the group observably half-applied.
+    #[tokio::test]
+    async fn bug4_atomic_put_serializes_on_group_lock() {
+        let (db, def) = atomic_group_fixture().await;
+        let channel = GroupChannel::new(db.clone(), def.clone());
+
+        // Hold the group's atomic_write_lock — exactly the guard the
+        // atomic PUT branch acquires. While held, a `put` on the same
+        // group def must not be able to enter the member-write loop.
+        let guard = def.atomic_write_lock.clone().lock_owned().await;
+
+        let put_fut = tokio::spawn(async move {
+            channel.put(&atomic_put_value(11.0, 22.0)).await.unwrap();
+        });
+
+        // The PUT must still be blocked on the lock.
+        let blocked = tokio::time::timeout(Duration::from_millis(150), async {}).await;
+        assert!(blocked.is_ok());
+        assert!(
+            !put_fut.is_finished(),
+            "atomic PUT must block while another holder owns atomic_write_lock"
+        );
+
+        // Release the lock — the PUT now proceeds and completes.
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), put_fut)
+            .await
+            .expect("atomic PUT must complete once the lock is free")
+            .expect("put task did not panic");
+
+        // Both member records received the written values.
+        let a = db.get_pv("A:rec.VAL").await.unwrap();
+        let b = db.get_pv("B:rec.VAL").await.unwrap();
+        match (a, b) {
+            (
+                epics_base_rs::types::EpicsValue::Double(va),
+                epics_base_rs::types::EpicsValue::Double(vb),
+            ) => {
+                assert_eq!(va, 11.0);
+                assert_eq!(vb, 22.0);
+            }
+            other => panic!("unexpected member values: {other:?}"),
+        }
+    }
+
+    /// BUG 4 regression: two concurrent atomic-group PUTs serialize —
+    /// the second cannot start its member-write loop until the first
+    /// releases `atomic_write_lock`. With the lock removed the two
+    /// `.await`-ing loops would interleave member writes.
+    #[tokio::test]
+    async fn bug4_concurrent_atomic_puts_do_not_interleave() {
+        let (db, def) = atomic_group_fixture().await;
+
+        let ch1 = GroupChannel::new(db.clone(), def.clone());
+        let ch2 = GroupChannel::new(db.clone(), def.clone());
+
+        // Pre-acquire the lock so PUT #1 blocks deterministically;
+        // start both PUTs, then release. They must run strictly
+        // serially through the shared lock.
+        let guard = def.atomic_write_lock.clone().lock_owned().await;
+        let p1 = tokio::spawn(async move {
+            ch1.put(&atomic_put_value(1.0, 1.0)).await.unwrap();
+        });
+        let p2 = tokio::spawn(async move {
+            ch2.put(&atomic_put_value(2.0, 2.0)).await.unwrap();
+        });
+        // Neither PUT can proceed while the lock is held externally.
+        tokio::time::timeout(Duration::from_millis(120), async {})
+            .await
+            .ok();
+        assert!(!p1.is_finished() && !p2.is_finished());
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            p1.await.unwrap();
+            p2.await.unwrap();
+        })
+        .await
+        .expect("both atomic PUTs must complete");
+
+        // Final state is one of the two PUTs fully applied — never a
+        // mix (1.0,2.0) / (2.0,1.0). The lock guarantees the loops did
+        // not interleave member writes.
+        let a = db.get_pv("A:rec.VAL").await.unwrap();
+        let b = db.get_pv("B:rec.VAL").await.unwrap();
+        match (a, b) {
+            (
+                epics_base_rs::types::EpicsValue::Double(va),
+                epics_base_rs::types::EpicsValue::Double(vb),
+            ) => {
+                assert_eq!(
+                    va, vb,
+                    "atomic group must not be half-applied: a={va} b={vb}"
+                );
+                assert!(va == 1.0 || va == 2.0);
+            }
+            other => panic!("unexpected member values: {other:?}"),
+        }
     }
 }

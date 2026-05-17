@@ -34,6 +34,21 @@ pub struct GroupPvDef {
     pub struct_id: Option<String>,
     pub atomic: bool,
     pub members: Vec<GroupMember>,
+    /// Serializes concurrent PUTs to the same `atomic` group so an
+    /// atomic-flagged group cannot be observed half-applied by another
+    /// PUT to the same group. Shared (`Arc`) across every `clone` of
+    /// this def — `create_channel` clones the def per downstream
+    /// channel, and all clones for a given group name come from one
+    /// map entry, so they share the same lock instance.
+    ///
+    /// This closes the group-vs-group interleave: two atomic PUTs to
+    /// the same group run strictly serially. It does NOT close a
+    /// non-group writer (a plain CA/PVA PUT to a record that also
+    /// backs an atomic-group member) interleaving between member
+    /// writes — that would require multi-record write locking the
+    /// `epics-base-rs` database layer does not expose. See
+    /// `GroupChannel::put`.
+    pub atomic_write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A single member within a group PV.
@@ -223,6 +238,7 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         struct_id: raw.id,
         atomic: raw.atomic,
         members,
+        atomic_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     })
 }
 

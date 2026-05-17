@@ -485,6 +485,16 @@ impl AuditSink for NoopAudit {
     fn record(&self, _event: AuditEvent) {}
 }
 
+/// Forward through a shared / type-erased sink. Lets a config carry an
+/// `Arc<dyn AuditSink>` (the gateway's audit-sink plumbing) and still
+/// satisfy `AuditLayer::new`'s concrete `A: AuditSink` bound. Covers
+/// both `Arc<ConcreteSink>` and `Arc<dyn AuditSink>`.
+impl<A: AuditSink + ?Sized> AuditSink for Arc<A> {
+    fn record(&self, event: AuditEvent) {
+        (**self).record(event);
+    }
+}
+
 /// Boxed-closure audit sink — convenient for inline tests +
 /// custom integrations without a dedicated trait impl.
 pub struct ClosureAudit<F: Fn(AuditEvent) + Send + Sync + 'static>(pub F);

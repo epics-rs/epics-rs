@@ -299,12 +299,25 @@ impl ChannelSource for GatewayChannelSource {
         entry.snapshot()
     }
 
-    /// Round-29: gateway-side ACF gate for GET. Denies with `None`
-    /// (wire layer surfaces ECA_NORDACCESS-equivalent) before the
-    /// upstream lookup, so a denied client never opens an upstream
-    /// channel and never appears in upstream audit logs as the
-    /// gateway.
+    /// Ctx-less PUT (no downstream credentials). BUG 3: this path
+    /// MUST apply the same gateway-side ACF gate as
+    /// `put_value_checked` — pre-fix it forwarded `pvput`
+    /// unconditionally, so a `read_only` / deny-WRITE ACF policy was
+    /// silently inert for any non-credentialed PUT. The check runs
+    /// with empty/anonymous credentials (the only identity available
+    /// on this path); when no ACF is installed the gate returns
+    /// `ReadWrite`, preserving the legacy pass-through.
     async fn put_value(&self, name: &str, value: PvField) -> Result<(), String> {
+        let checked = self.gate.check(name, "", "", "anonymous", "").await;
+        if !checked.allows_write() {
+            tracing::debug!(
+                pv = %name,
+                "pva-gateway: ctx-less PUT denied by gateway ACF"
+            );
+            return Err(format!(
+                "PUT denied by gateway access security: PV '{name}' (anonymous)"
+            ));
+        }
         // Look up the entry to keep the upstream channel alive (and
         // confirm the PV exists) before issuing the PUT through the
         // shared client. The client's connection pool reuses the
@@ -467,6 +480,63 @@ impl ChannelSource for GatewayChannelSource {
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err(format!("upstream rpc timeout for {name}")),
         }
+    }
+
+    /// Forward a PVA PROCESS (wire cmd 16) to the upstream PV. The
+    /// `ChannelSource` default returns `Ok(())` — for a proxying
+    /// gateway that silently swallows the PROCESS and falsely reports
+    /// success, so a downstream `caput -c` / `pvcall .PROC` never
+    /// actually triggers the upstream record. This override resolves
+    /// the PV through the cache (confirming it exists) and forwards
+    /// `pvprocess` through the shared client.
+    async fn process(&self, name: &str) -> Result<(), String> {
+        let _entry = self
+            .cache
+            .lookup(name, self.connect_timeout)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.cache
+            .client()
+            .pvprocess(name)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Credential-aware PROCESS. pvxs treats PROCESS as a WRITE-class
+    /// operation for ACF (it mutates record state), so a non-write
+    /// token is refused with a gateway-identifying error. On allow
+    /// the request is forwarded through the per-(account, method)
+    /// upstream client pool — the same identity-preserving routing
+    /// `put_value_checked` uses.
+    async fn process_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> Result<(), String> {
+        if !checked.allows_write() {
+            tracing::debug!(
+                pv = %checked.pv_name(),
+                account = %ctx.account,
+                method = %ctx.method,
+                "pva-gateway: PROCESS denied by gateway ACF"
+            );
+            return Err(format!(
+                "PROCESS denied by gateway access security: \
+                 PV '{pv}' from {host}/{account}/{method}",
+                pv = checked.pv_name(),
+                host = ctx.host,
+                account = ctx.account,
+                method = ctx.method,
+            ));
+        }
+        let name = checked.pv_name();
+        let _entry = self
+            .cache
+            .lookup(name, self.connect_timeout)
+            .await
+            .map_err(|e| e.to_string())?;
+        let client = self.upstream_client_for(&ctx);
+        client.pvprocess(name).await.map_err(|e| e.to_string())
     }
 
     async fn subscribe_raw(
@@ -1010,6 +1080,87 @@ ASG(DEFAULT) {
             err.contains("denied by gateway access security"),
             "denial message must name the gateway as enforcer: {err:?}",
         );
+    }
+
+    /// BUG 3 regression: the ctx-less `put_value` path must apply the
+    /// gateway-side ACF gate, exactly like `put_value_checked`.
+    /// Pre-fix `put_value` forwarded `pvput` unconditionally, so a
+    /// deny-WRITE / `read_only` ACF policy was silently inert for any
+    /// non-credentialed PUT.
+    #[tokio::test]
+    async fn bug3_put_value_denied_when_acf_no_write() {
+        let src = make_source();
+        // ASG with READ but no WRITE rule — every peer is denied WRITE.
+        let cfg = parse_acf(r#"ASG(DEFAULT) { RULE(1, READ) }"#).unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        let dummy = PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0));
+        let err = src
+            .put_value("any:pv", dummy)
+            .await
+            .expect_err("ctx-less PUT must be denied by the gateway ACF");
+        assert!(
+            err.contains("denied by gateway access security"),
+            "denial must name the gateway as enforcer: {err:?}",
+        );
+    }
+
+    /// BUG 3: with no ACF installed (legacy pass-through), the ctx-less
+    /// `put_value` is NOT ACL-denied — the gate returns ReadWrite and
+    /// the call proceeds to the upstream lookup (which fails in-test
+    /// with a lookup/timeout error, never the ACL denial).
+    #[tokio::test]
+    async fn bug3_put_value_passthrough_when_no_acf() {
+        let src = make_source();
+        let dummy = PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0));
+        if let Err(msg) = src.put_value("any:pv", dummy).await {
+            assert!(
+                !msg.contains("denied by gateway access security"),
+                "no-ACF PUT must NOT be ACL-denied: {msg:?}",
+            );
+        }
+    }
+
+    /// MINOR (PVA PROCESS forwarding): `process_checked` gates on the
+    /// gateway ACF as a WRITE-class op. Pre-fix the gateway used the
+    /// trait default `process` (`Ok(())`), silently swallowing every
+    /// PROCESS and reporting false success. A non-write token must be
+    /// refused with a gateway-identifying error.
+    #[tokio::test]
+    async fn process_checked_denied_when_acf_no_write() {
+        let src = make_source();
+        let cfg = parse_acf(r#"ASG(DEFAULT) { RULE(1, READ) }"#).unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        let ctx = make_ctx("anyhost", "intruder", "anonymous");
+        let token = check(&src, "some:pv", &ctx).await;
+        let err = src
+            .process_checked(token, ctx)
+            .await
+            .expect_err("PROCESS must be denied for a non-write peer");
+        assert!(
+            err.contains("PROCESS denied by gateway access security"),
+            "denial must name the gateway as enforcer: {err:?}",
+        );
+    }
+
+    /// MINOR: with WRITE granted the `process_checked` ACL passes and
+    /// the call reaches the upstream forward (which fails in-test with
+    /// a lookup/timeout, never the ACL denial).
+    #[tokio::test]
+    async fn process_checked_passes_acl_when_write_granted() {
+        let src = make_source();
+        let cfg = parse_acf(r#"ASG(DEFAULT) { RULE(1, READ) RULE(1, WRITE) }"#).unwrap();
+        src.set_acf(Some(cfg)).await;
+
+        let ctx = make_ctx("anyhost", "anyone", "anonymous");
+        let token = check(&src, "some:pv", &ctx).await;
+        if let Err(msg) = src.process_checked(token, ctx).await {
+            assert!(
+                !msg.contains("denied by gateway access security"),
+                "WRITE-granted PROCESS must NOT be ACL-denied: {msg:?}",
+            );
+        }
     }
 
     /// Round-32A (R31-G6): the F-G12 raw-frame fast path must consult

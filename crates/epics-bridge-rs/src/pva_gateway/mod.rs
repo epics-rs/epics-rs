@@ -84,5 +84,9 @@ pub use channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL, UpstreamEntry};
 pub use control::{ControlSource, CredentialCheck};
 pub use error::{GwError, GwResult};
 pub use gateway::{PvaGateway, PvaGatewayConfig};
+pub use middleware::{
+    AclConfig, AuditEvent, AuditEventKind, AuditResult, AuditSink, ClosureAudit, MpscAuditSink,
+    NoopAudit,
+};
 pub use multi_gateway::{MultiTenantPvaGateway, MultiTenantPvaGatewayBuilder};
 pub use source::GatewayChannelSource;

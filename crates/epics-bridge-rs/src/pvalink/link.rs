@@ -1,6 +1,7 @@
 //! `PvaLink` — a single live PVA link bound to a remote PV.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -51,6 +52,16 @@ pub struct PvaLink {
     client: PvaClient,
     /// Latest received value (INP only — None until first event).
     latest: Arc<Mutex<Option<PvField>>>,
+    /// Live-connection flag for INP+monitor links (B-pvalink-restart).
+    ///
+    /// The INP monitor task is a re-subscribe loop: it sets this
+    /// `true` while a subscription is live and `false` the moment
+    /// `pvmonitor` returns (IOC restart / transient I/O), then
+    /// re-subscribes with exponential backoff. `is_connected()`
+    /// reads this flag so a downstream IOC restart is reflected as
+    /// a disconnect instead of serving the stale cached value
+    /// forever. `None` for OUT / non-monitor links.
+    monitor_connected: Option<Arc<AtomicBool>>,
     /// Receiver half of the INP-monitor record-notification channel.
     ///
     /// B3: every monitor event for an INP+monitor link pushes the new
@@ -68,7 +79,27 @@ pub struct PvaLink {
     /// causes a Put that fails because the upstream is unreachable to
     /// be enqueued and replayed by `flush_deferred` on reconnect.
     /// Mirrors pvxs `pvaLink::put_queue` (pvalink_channel.cpp:147).
-    put_queue: Mutex<Vec<PvField>>,
+    ///
+    /// Stores [`QueuedPut`], not a bare `PvField`: a string-form
+    /// `write` must replay through the string `pvput` path (which
+    /// coerces the text against the channel's introspected type),
+    /// not as a `PvField::Scalar(String)` — replaying a String to a
+    /// numeric record was a type mismatch.
+    put_queue: Mutex<Vec<QueuedPut>>,
+}
+
+/// A queued OUT-link Put, preserving the caller's original value
+/// form so the deferred replay uses the same type-correct path the
+/// immediate Put would have used.
+#[derive(Debug, Clone)]
+enum QueuedPut {
+    /// From [`PvaLink::write`] — replayed via the string `pvput`
+    /// path so the text is coerced against the channel's native
+    /// scalar type, not forced to a `String` field.
+    Str(String),
+    /// From [`PvaLink::write_pv_field`] — replayed verbatim via the
+    /// typed `pvput_pv_field` path.
+    Field(PvField),
 }
 
 /// Upper bound on the OUT-side retry/defer queue. pvxs bounds the
@@ -95,6 +126,7 @@ impl PvaLink {
         let latest = Arc::new(Mutex::new(None));
         let mut notify_rx = None;
         let mut monitor_abort = None;
+        let mut monitor_connected = None;
 
         if matches!(config.direction, LinkDirection::Inp) && config.monitor {
             // B3 / B4-Q: the channel buffer is sized to the link's
@@ -109,6 +141,9 @@ impl PvaLink {
             let pv_name = config.pv_name.clone();
             let latest_clone = latest.clone();
             let client_clone = client.clone();
+            let connected = Arc::new(AtomicBool::new(false));
+            let connected_for_task = connected.clone();
+            monitor_connected = Some(connected);
             // B4-pipeline / B4-Q: when the link asks for pipeline
             // flow-control or a non-default queue depth, build a
             // pvRequest carrying `record[pipeline=...,queueSize=N]`
@@ -116,24 +151,56 @@ impl PvaLink {
             // the plain monitor (lower overhead, matches prior
             // behaviour).
             let request = monitor_request(&config);
+            // B-pvalink-restart: the INP monitor is a re-subscribe
+            // loop, mirroring `channel_cache.rs::spawn_upstream_monitor`.
+            // `pvmonitor` blocks until the subscription ends (IOC
+            // restart / transient I/O); when it returns we mark the
+            // link disconnected and re-subscribe after an exponential
+            // backoff. Pre-fix this ran `pvmonitor` exactly once, so
+            // a single IOC restart froze the cached value forever and
+            // `is_connected()` stayed true.
             let join = tokio::spawn(async move {
-                match request {
-                    Some(req) => {
-                        let _ = client_clone
-                            .pvmonitor_with_request(&pv_name, &req, |value| {
-                                *latest_clone.lock() = Some(value.clone());
-                                let _ = tx.try_send(value.clone());
-                            })
-                            .await;
+                let mut backoff = Duration::from_millis(250);
+                let max_backoff = Duration::from_secs(30);
+                loop {
+                    let tx_inner = tx.clone();
+                    let latest_inner = latest_clone.clone();
+                    let connected_inner = connected_for_task.clone();
+                    // Liveness is proven by a delivered event, not by
+                    // entering `pvmonitor` (which may fail immediately
+                    // against a down IOC). The callback flips the flag
+                    // `true` on the first event of each subscription;
+                    // it is reset `false` when `pvmonitor` returns.
+                    let on_event = move |value: &PvField| {
+                        connected_inner.store(true, Ordering::Release);
+                        *latest_inner.lock() = Some(value.clone());
+                        let _ = tx_inner.try_send(value.clone());
+                    };
+                    let result = match &request {
+                        Some(req) => {
+                            client_clone
+                                .pvmonitor_with_request(&pv_name, req, on_event)
+                                .await
+                        }
+                        None => client_clone.pvmonitor(&pv_name, on_event).await,
+                    };
+                    // Subscription ended — reflect the disconnect so
+                    // `is_connected()` goes false until re-subscribed.
+                    connected_for_task.store(false, Ordering::Release);
+                    match &result {
+                        Ok(()) => tracing::debug!(
+                            pv = %pv_name,
+                            "pvalink: INP monitor ended, re-subscribing"
+                        ),
+                        Err(e) => tracing::warn!(
+                            pv = %pv_name,
+                            error = %e,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "pvalink: INP monitor failed, will retry"
+                        ),
                     }
-                    None => {
-                        let _ = client_clone
-                            .pvmonitor(&pv_name, |value| {
-                                *latest_clone.lock() = Some(value.clone());
-                                let _ = tx.try_send(value.clone());
-                            })
-                            .await;
-                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
                 }
             });
             monitor_abort = Some(MonitorAbort(join.abort_handle()));
@@ -143,6 +210,7 @@ impl PvaLink {
             config,
             client,
             latest,
+            monitor_connected,
             notify_rx: Mutex::new(notify_rx),
             put_queue: Mutex::new(Vec::new()),
             _monitor_abort: monitor_abort,
@@ -215,17 +283,19 @@ impl PvaLink {
         if matches!(self.config.direction, LinkDirection::Inp) {
             return Err(PvaLinkError::NotWritable);
         }
-        // String form: parse into a typed PvField scalar so the
-        // defer / retry queue is value-typed and uniform with
-        // `write_pv_field`. A bare scalar is the common case for the
-        // string path.
-        let field = PvField::Scalar(ScalarValue::String(value_str.to_string()));
+        // Keep the value in string form on the defer / retry queue so
+        // the replay goes through the string `pvput` path — which
+        // coerces the text against the channel's introspected scalar
+        // type. Storing `PvField::Scalar(String)` instead would
+        // replay a String field to a possibly-numeric record.
         if self.config.defer {
-            return self.enqueue_put(field);
+            return self.enqueue_put(QueuedPut::Str(value_str.to_string()));
         }
         match self.client.pvput(&self.config.pv_name, value_str).await {
             Ok(()) => Ok(()),
-            Err(e) if self.config.retry && is_disconnect(&e) => self.enqueue_put(field),
+            Err(e) if self.config.retry && is_disconnect(&e) => {
+                self.enqueue_put(QueuedPut::Str(value_str.to_string()))
+            }
             Err(e) => Err(PvaLinkError::Pva(e)),
         }
     }
@@ -241,7 +311,7 @@ impl PvaLink {
             return Err(PvaLinkError::NotWritable);
         }
         if self.config.defer {
-            return self.enqueue_put(value.clone());
+            return self.enqueue_put(QueuedPut::Field(value.clone()));
         }
         match self
             .client
@@ -249,14 +319,16 @@ impl PvaLink {
             .await
         {
             Ok(()) => Ok(()),
-            Err(e) if self.config.retry && is_disconnect(&e) => self.enqueue_put(value.clone()),
+            Err(e) if self.config.retry && is_disconnect(&e) => {
+                self.enqueue_put(QueuedPut::Field(value.clone()))
+            }
             Err(e) => Err(PvaLinkError::Pva(e)),
         }
     }
 
     /// Push `value` onto the deferred / retry Put queue (B4). Returns
     /// `RetryQueueFull` once the queue hits [`MAX_PUT_QUEUE`].
-    fn enqueue_put(&self, value: PvField) -> PvaLinkResult<()> {
+    fn enqueue_put(&self, value: QueuedPut) -> PvaLinkResult<()> {
         let mut q = self.put_queue.lock();
         if q.len() >= MAX_PUT_QUEUE {
             return Err(PvaLinkError::RetryQueueFull(q.len()));
@@ -284,21 +356,25 @@ impl PvaLink {
         if matches!(self.config.direction, LinkDirection::Inp) {
             return Err(PvaLinkError::NotWritable);
         }
-        let queued: Vec<PvField> = std::mem::take(&mut *self.put_queue.lock());
+        let queued: Vec<QueuedPut> = std::mem::take(&mut *self.put_queue.lock());
         let mut sent = 0usize;
         for (idx, value) in queued.iter().enumerate() {
-            match self
-                .client
-                .pvput_pv_field(&self.config.pv_name, value)
-                .await
-            {
+            // Replay each queued Put through the SAME path the
+            // immediate Put would have used: a string Put goes
+            // through `pvput` (text coerced to the channel's native
+            // type), a typed Put through `pvput_pv_field`.
+            let put_result = match value {
+                QueuedPut::Str(s) => self.client.pvput(&self.config.pv_name, s).await,
+                QueuedPut::Field(f) => self.client.pvput_pv_field(&self.config.pv_name, f).await,
+            };
+            match put_result {
                 Ok(()) => sent += 1,
                 Err(e) if self.config.retry && is_disconnect(&e) => {
                     // Still disconnected — restore the unsent tail
                     // (including the current value) to the front so
                     // a later flush picks up where we left off.
                     let mut q = self.put_queue.lock();
-                    let mut tail: Vec<PvField> = queued[idx..].to_vec();
+                    let mut tail: Vec<QueuedPut> = queued[idx..].to_vec();
                     tail.append(&mut q);
                     *q = tail;
                     return Err(PvaLinkError::Pva(e));
@@ -313,7 +389,7 @@ impl PvaLink {
                     // tail is silently lost.
                     if idx + 1 < queued.len() {
                         let mut q = self.put_queue.lock();
-                        let mut tail: Vec<PvField> = queued[idx + 1..].to_vec();
+                        let mut tail: Vec<QueuedPut> = queued[idx + 1..].to_vec();
                         tail.append(&mut q);
                         *q = tail;
                     }
@@ -324,11 +400,23 @@ impl PvaLink {
         Ok(sent)
     }
 
-    /// True when the link's monitor has received at least one update
-    /// (i.e., the upstream PV is reachable and has emitted a value).
+    /// True when the link currently has a live upstream connection.
     /// Mirrors pvxs `pvaIsConnected` (pvalink_lset.cpp:186).
+    ///
+    /// B-pvalink-restart: for INP+monitor links this reads the
+    /// monitor task's live-connection flag — it goes `false` the
+    /// moment the upstream subscription ends (IOC restart / transient
+    /// I/O) and back `true` once the re-subscribe loop delivers a
+    /// fresh event. Pre-fix this returned `latest.is_some()`, which
+    /// stayed `true` forever once any value had been cached, so an
+    /// IOC restart was never reflected. For non-monitor links (which
+    /// never run the monitor task) it falls back to "a value has been
+    /// cached".
     pub fn is_connected(&self) -> bool {
-        self.latest.lock().is_some()
+        match &self.monitor_connected {
+            Some(flag) => flag.load(Ordering::Acquire),
+            None => self.latest.lock().is_some(),
+        }
     }
 
     /// Raw remote NT `alarm.severity` of the latest cached value, in
@@ -448,9 +536,34 @@ impl PvaLink {
             config,
             client,
             latest: Arc::new(Mutex::new(cached)),
+            monitor_connected: None,
             notify_rx: Mutex::new(None),
             put_queue: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Test-only constructor for an INP+monitor link whose
+    /// live-connection flag is externally controllable. Returns the
+    /// link plus the shared `AtomicBool` so a test can simulate the
+    /// re-subscribe loop's connect / event / disconnect transitions
+    /// (B-pvalink-restart) without standing up a PVA server.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_monitor_flag(
+        config: PvaLinkConfig,
+        cached: Option<PvField>,
+    ) -> (Self, Arc<AtomicBool>) {
+        let client = PvaClient::builder().timeout(Duration::from_secs(1)).build();
+        let flag = Arc::new(AtomicBool::new(false));
+        let link = Self {
+            _monitor_abort: None,
+            config,
+            client,
+            latest: Arc::new(Mutex::new(cached)),
+            monitor_connected: Some(flag.clone()),
+            notify_rx: Mutex::new(None),
+            put_queue: Mutex::new(Vec::new()),
+        };
+        (link, flag)
     }
 }
 
@@ -755,6 +868,31 @@ mod tests {
         assert_eq!(link.pending_put_count(), 2);
     }
 
+    /// MINOR (pvalink string-PUT): a deferred string `write` is queued
+    /// as a `QueuedPut::Str`, NOT a `PvField::Scalar(String)`. The
+    /// replay then goes through the string `pvput` path, which coerces
+    /// the text against the channel's native scalar type — replaying a
+    /// String field to a numeric record was the bug. A typed
+    /// `write_pv_field` is queued as `QueuedPut::Field` verbatim.
+    #[tokio::test]
+    async fn minor_deferred_string_put_keeps_string_form() {
+        let link = PvaLink::for_test(out_cfg(true, false), None);
+        link.write("42").await.unwrap();
+        link.write_pv_field(&PvField::Scalar(ScalarValue::Double(1.0)))
+            .await
+            .unwrap();
+        let q = link.put_queue.lock();
+        assert_eq!(q.len(), 2);
+        match &q[0] {
+            QueuedPut::Str(s) => assert_eq!(s, "42"),
+            other => panic!("string write must queue QueuedPut::Str, got {other:?}"),
+        }
+        match &q[1] {
+            QueuedPut::Field(PvField::Scalar(ScalarValue::Double(d))) => assert_eq!(*d, 1.0),
+            other => panic!("typed write must queue QueuedPut::Field, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn b4_retry_queues_on_disconnect() {
         // retry=true, no server reachable → write should queue rather
@@ -832,6 +970,73 @@ mod tests {
         // covered by the integration-side forwarder test.
         let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), None);
         assert!(link.take_notify_rx().is_none());
+    }
+
+    // ---- B-pvalink-restart: INP monitor disconnect reflection ----
+
+    /// BUG 2 regression: `is_connected()` for an INP+monitor link is
+    /// driven by the monitor task's live-connection flag, so an
+    /// upstream disconnect (IOC restart / transient I/O) is reflected
+    /// even though a value is still cached. Pre-fix `is_connected()`
+    /// returned `latest.is_some()`, which stayed `true` forever once
+    /// any value had been cached.
+    #[test]
+    fn bug2_is_connected_reflects_monitor_disconnect() {
+        // Link with a cached value (a prior event) but the monitor
+        // flag still false — not yet (re)connected.
+        let (link, flag) = PvaLink::for_test_with_monitor_flag(
+            inp_cfg(SevrMode::Nms),
+            Some(PvField::Scalar(ScalarValue::Double(1.0))),
+        );
+        assert!(
+            !link.is_connected(),
+            "cached value alone must NOT report connected"
+        );
+
+        // Monitor delivers an event → flag flips true.
+        flag.store(true, Ordering::Release);
+        assert!(link.is_connected(), "live subscription reports connected");
+
+        // Upstream subscription ends (IOC restart) → flag false, even
+        // though `latest` still holds the stale cached value.
+        flag.store(false, Ordering::Release);
+        assert!(
+            link.latest_value().is_some(),
+            "stale value is still cached after disconnect"
+        );
+        assert!(
+            !link.is_connected(),
+            "disconnect must be reflected despite the stale cached value"
+        );
+
+        // Re-subscribe loop delivers a fresh event → connected again.
+        flag.store(true, Ordering::Release);
+        assert!(link.is_connected(), "re-subscribe restores connected");
+    }
+
+    /// BUG 2: a live INP+monitor link spawns the re-subscribe loop and
+    /// installs the `monitor_connected` flag. Before the first event
+    /// the link reports disconnected (no liveness proven yet); the
+    /// monitor task is present so a later disconnect is observable.
+    #[tokio::test]
+    async fn bug2_inp_monitor_link_installs_connection_flag() {
+        // INP + monitor against a PV with no server reachable. `open`
+        // spawns the re-subscribe loop; `pvmonitor` fails fast and the
+        // loop backs off — `is_connected()` stays false (no event
+        // delivered) instead of being absent/true.
+        let cfg = PvaLinkConfig {
+            monitor: true,
+            ..PvaLinkConfig::defaults_for("BUG2:NOPV", LinkDirection::Inp)
+        };
+        let link = PvaLink::open(cfg).await.expect("open INP monitor link");
+        assert!(
+            link.monitor_connected.is_some(),
+            "INP+monitor link must install the live-connection flag"
+        );
+        assert!(
+            !link.is_connected(),
+            "no event delivered yet → not connected"
+        );
     }
 
     #[test]

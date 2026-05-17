@@ -555,15 +555,15 @@ pub async fn run_ca_pva_qsrv_ioc(
             .await;
     }
 
-    // ── CA links (`calink` feature) ──
-    // Install the `"ca"` link set so a loaded database with
-    // `INP="somepv CA"` (or `ca://somepv`) links resolves through the
-    // monitor-backed CA cache, and register the `caxr` / `dbcaxr`
-    // iocsh commands. This is the CA-side counterpart of the `"pva"`
-    // link set installed by `install_pvalink_resolver`.
-    #[cfg(feature = "calink")]
+    // ── External links (`calink` / `pvalink` features) ──
+    // Install the `"ca"` and `"pva"` link sets so a loaded database
+    // with `INP="somepv CA"` / `ca://somepv` or `pva://somepv` links
+    // resolves through the monitor-backed caches, and register the
+    // matching `caxr` / `dbcaxr` and `pvxr` / `dbpvxr` /
+    // `pvalink_enable` / `pvalink_disable` iocsh commands.
+    #[cfg(any(feature = "calink", feature = "pvalink"))]
     let mut shell_commands = config.shell_commands;
-    #[cfg(not(feature = "calink"))]
+    #[cfg(not(any(feature = "calink", feature = "pvalink")))]
     let shell_commands = config.shell_commands;
     #[cfg(feature = "calink")]
     {
@@ -578,6 +578,18 @@ pub async fn run_ca_pva_qsrv_ioc(
                 tracing::warn!("calink: CA link set NOT installed: {e}");
             }
         }
+    }
+    #[cfg(feature = "pvalink")]
+    {
+        // `install_pvalink_resolver` is infallible — the PVA client is
+        // created lazily per link — so there is no init failure to
+        // abort the IOC on. A database with no PVA links is still
+        // fully serviceable. This is the PVA-side counterpart of the
+        // `"ca"` link set installed above.
+        let resolver =
+            crate::pvalink::install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        shell_commands.extend(crate::pvalink::register_pvalink_commands(resolver));
+        tracing::info!("pvalink: `pva` link set installed");
     }
 
     // ── CA server (background) ──

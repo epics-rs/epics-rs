@@ -5,6 +5,7 @@
 //! into a single PvStructure.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -335,19 +336,41 @@ impl GroupChannel {
         // For atomic groups, hold all record locks simultaneously to
         // prevent intermediate states from being observed (pvxs
         // groupsource.cpp:444-459 DBManyLocker pattern).
-        let _guards = if self.def.atomic {
-            lock_group_records_read(&self.db, &self.def.members).await
-        } else {
-            Vec::new()
-        };
-
-        for member in &self.def.members {
-            if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure {
-                continue;
+        //
+        // CRITICAL: an atomic group MUST NOT re-lock a member record
+        // inside `read_member` — `lock_group_records_read` already
+        // holds an `OwnedRwLockReadGuard` on every member record, and
+        // `tokio::sync::RwLock` is write-preferring. A plain CA/PVA
+        // writer queued between the first guard and a second `.read()`
+        // would make that `.read().await` block behind the writer,
+        // which itself blocks behind the still-held first guard — a
+        // recursive-read deadlock. So the atomic path resolves every
+        // member against the pre-acquired guards and never re-locks.
+        if self.def.atomic {
+            let guards = lock_group_records_read(&self.db, &self.def.members).await;
+            // Build a name→guard lookup so each member resolves
+            // against the already-held guard for its backing record.
+            let guard_map: HashMap<&str, &epics_base_rs::server::record::RecordInstance> = guards
+                .iter()
+                .map(|(name, g)| (name.as_str(), &**g))
+                .collect();
+            for member in &self.def.members {
+                if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure
+                {
+                    continue;
+                }
+                let field = self.read_member_locked(member, &guard_map)?;
+                set_nested_field(&mut pv, &member.field_name, field);
             }
-
-            let field = self.read_member(member).await?;
-            set_nested_field(&mut pv, &member.field_name, field);
+        } else {
+            for member in &self.def.members {
+                if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure
+                {
+                    continue;
+                }
+                let field = self.read_member(member).await?;
+                set_nested_field(&mut pv, &member.field_name, field);
+            }
         }
 
         Ok(pv)
@@ -382,20 +405,31 @@ impl GroupChannel {
         Ok(pv)
     }
 
-    /// Read a single member's value from the database.
+    /// Resolve the channel-less mappings (Const / Structure / Proc)
+    /// that need no record lock. Returns `Some(field)` for those
+    /// mappings, `None` for a mapping that requires a backing record.
+    fn read_member_channelless(member: &GroupMember) -> Option<PvField> {
+        match member.mapping {
+            FieldMapping::Const => Some(
+                member
+                    .const_value
+                    .clone()
+                    .unwrap_or(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))),
+            ),
+            FieldMapping::Structure => Some(PvField::Structure(PvStructure::new(""))),
+            FieldMapping::Proc => Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))),
+            _ => None,
+        }
+    }
+
+    /// Read a single member's value from the database. Used by the
+    /// non-atomic [`read_group`] path: it locks the backing record
+    /// itself (no pre-held guard exists). The atomic path MUST use
+    /// [`Self::read_member_locked`] instead — see the deadlock note
+    /// in [`read_group`].
     async fn read_member(&self, member: &GroupMember) -> BridgeResult<PvField> {
-        // Const and Structure have no backing channel — return immediately.
-        if member.mapping == FieldMapping::Const {
-            return Ok(member
-                .const_value
-                .clone()
-                .unwrap_or(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))));
-        }
-        if member.mapping == FieldMapping::Structure {
-            return Ok(PvField::Structure(PvStructure::new("")));
-        }
-        if member.mapping == FieldMapping::Proc {
-            return Ok(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0)));
+        if let Some(field) = Self::read_member_channelless(member) {
+            return Ok(field);
         }
 
         let (record_name, field_name) =
@@ -408,7 +442,40 @@ impl GroupChannel {
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
         let instance = rec.read().await;
+        Self::decode_member(member, record_name, field_name, &instance)
+    }
 
+    /// Read a single member's value against a record instance that the
+    /// caller already holds a read guard on. The atomic [`read_group`]
+    /// path uses this so it never re-locks a record whose guard is
+    /// held by `lock_group_records_read` (recursive-read deadlock).
+    fn read_member_locked(
+        &self,
+        member: &GroupMember,
+        guard_map: &HashMap<&str, &epics_base_rs::server::record::RecordInstance>,
+    ) -> BridgeResult<PvField> {
+        if let Some(field) = Self::read_member_channelless(member) {
+            return Ok(field);
+        }
+
+        let (record_name, field_name) =
+            epics_base_rs::server::database::parse_pv_name(&member.channel);
+
+        let instance = *guard_map
+            .get(record_name)
+            .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
+        Self::decode_member(member, record_name, field_name, instance)
+    }
+
+    /// Decode one member's value from an already-borrowed record
+    /// instance. Shared by the locked (atomic) and self-locking
+    /// (non-atomic) read paths so both produce identical output.
+    fn decode_member(
+        member: &GroupMember,
+        record_name: &str,
+        field_name: &str,
+        instance: &epics_base_rs::server::record::RecordInstance,
+    ) -> BridgeResult<PvField> {
         match member.mapping {
             FieldMapping::Scalar => {
                 let snapshot = instance.snapshot_for_field(field_name).ok_or_else(|| {
@@ -1657,6 +1724,88 @@ mod tests {
                 assert_eq!(vb, 22.0);
             }
             other => panic!("unexpected member values: {other:?}"),
+        }
+    }
+
+    /// CRITICAL regression: an atomic-group `read_group` must not
+    /// deadlock when a plain writer is contending for a member
+    /// record's `RwLock`. Pre-fix `read_group` held an
+    /// `OwnedRwLockReadGuard` on every member record, then
+    /// `read_member` called `rec.read().await` on the SAME lock — a
+    /// recursive read that, with a write-preferring `tokio::RwLock`
+    /// and a writer queued in between, deadlocked unresolvably. The
+    /// fixed path resolves members against the pre-held guards and
+    /// never re-locks, so a concurrent writer cannot wedge it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critical_atomic_read_group_no_deadlock_under_writer() {
+        let (db, def) = atomic_group_fixture().await;
+        let channel = GroupChannel::new(db.clone(), def.clone());
+
+        // Spawn a writer that hammers a member record (A:rec) — each
+        // `put_pv` acquires the record write lock. Without the fix, a
+        // writer queued between the read_group guard and the
+        // read_member re-lock wedges the reader forever.
+        let writer_db = db.clone();
+        let writer = tokio::spawn(async move {
+            for i in 0..200 {
+                let _ = writer_db
+                    .put_pv(
+                        "A:rec.VAL",
+                        epics_base_rs::types::EpicsValue::Double(i as f64),
+                    )
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Concurrently read the atomic group many times. Each
+        // `read_group` must complete — a deadlock would hang the
+        // timeout below.
+        let reader = tokio::spawn(async move {
+            for _ in 0..200 {
+                channel
+                    .read_group()
+                    .await
+                    .expect("atomic read_group must succeed");
+                tokio::task::yield_now().await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            reader.await.expect("reader task panicked");
+            writer.await.expect("writer task panicked");
+        })
+        .await
+        .expect("atomic read_group deadlocked under a concurrent writer");
+    }
+
+    /// CRITICAL regression: the atomic read path returns the same
+    /// values the non-atomic path would — proves `read_member_locked`
+    /// (guard reuse) decodes identically to `read_member` (self-lock).
+    #[tokio::test]
+    async fn critical_atomic_read_group_returns_member_values() {
+        let (db, def) = atomic_group_fixture().await;
+        db.put_pv("A:rec.VAL", epics_base_rs::types::EpicsValue::Double(7.5))
+            .await
+            .unwrap();
+        db.put_pv("B:rec.VAL", epics_base_rs::types::EpicsValue::Double(9.25))
+            .await
+            .unwrap();
+
+        let channel = GroupChannel::new(db.clone(), def);
+        let pv = channel.read_group().await.unwrap();
+
+        match get_nested_field(&pv, "a").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 7.5)
+            }
+            other => panic!("member a: expected Double(7.5), got {other:?}"),
+        }
+        match get_nested_field(&pv, "b").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 9.25)
+            }
+            other => panic!("member b: expected Double(9.25), got {other:?}"),
         }
     }
 

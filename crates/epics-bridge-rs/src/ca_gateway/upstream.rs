@@ -494,9 +494,25 @@ impl UpstreamManager {
                         // The next successful event will flip state
                         // back to Inactive (see top of inner loop).
                     }
+                    // `CaError::Shutdown` means the CA client
+                    // coordinator is gone — `subscribe()` will never
+                    // succeed again, so re-trying just spins this task
+                    // at the backoff cap forever. Exit cleanly; the
+                    // cache entry stays in Disconnect and the next
+                    // search resolver pass re-creates the channel
+                    // against a live client.
+                    Err(CaError::Shutdown) => {
+                        tracing::debug!(
+                            pv = %name,
+                            "ca-gateway-rs: CA coordinator gone, \
+                             stopping upstream monitor task"
+                        );
+                        return;
+                    }
                     Err(_) => {
-                        // Stay in Disconnect; another iteration of the
-                        // outer loop will retry after the next sleep.
+                        // Transient failure — stay in Disconnect;
+                        // another iteration of the outer loop will
+                        // retry after the next sleep.
                         continue;
                     }
                 }

@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use epics_base_rs::server::database::{LinkSet, PvDatabase};
@@ -40,6 +41,17 @@ pub struct CaLink {
     /// (channel not yet connected / no value cached) — the C
     /// `dbCaGetLink` "not connected" case.
     cache: Arc<ArcSwap<Option<Snapshot>>>,
+    /// Live-connection flag, mirroring `pvalink`'s
+    /// `PvaLink::monitor_connected`. The connection-event watcher task
+    /// flips this `true` on `ConnectionEvent::Connected` and `false`
+    /// on `Disconnected` / `Unresponsive`. `is_connected()` reads it
+    /// so a downstream IOC restart is reflected as a real disconnect
+    /// — pre-fix `is_connected()` keyed off cache presence alone and
+    /// stayed `true` forever once any event had been cached, serving
+    /// the last stale `Snapshot` through the whole outage with no
+    /// LINK alarm. `dbCa.c` sets `pca->connected = FALSE` in its
+    /// `connectionCallback` for exactly this reason.
+    connected: Arc<AtomicBool>,
     /// The CA channel — kept alive so the monitor stays subscribed.
     /// Used by the OUT-link write path.
     channel: Arc<CaChannel>,
@@ -47,6 +59,10 @@ pub struct CaLink {
     /// `CaLink` stops the task and (via `MonitorHandle::drop`)
     /// unsubscribes the remote monitor.
     _monitor_task: AbortOnDrop,
+    /// Abort-on-drop handle for the connection-event watcher task.
+    /// Drains `CaChannel::connection_events()` and keeps `connected`
+    /// in sync with the real circuit state.
+    _conn_task: AbortOnDrop,
 }
 
 /// Abort the wrapped tokio task when dropped. A bare `JoinHandle`
@@ -60,27 +76,40 @@ impl Drop for AbortOnDrop {
 }
 
 impl CaLink {
-    /// True once at least one monitor event has been cached — the
-    /// practical "link is live" signal. C `dbCaGetLink` (`dbCa.c:448`)
-    /// likewise treats a CA link as readable only once the monitor
-    /// callback has populated `pca->pgetNative`; a connected channel
-    /// with no value yet is not yet servable. `CaChannel` exposes no
-    /// synchronous connection accessor, and the cache-presence test
-    /// is the same observable C uses.
+    /// True when the CA circuit is currently up AND at least one
+    /// monitor event has been cached. C `dbCaGetLink` (`dbCa.c:448`)
+    /// treats a CA link as readable only when `pca->connected` is set
+    /// (the `connectionCallback` clears it on disconnect) *and* the
+    /// monitor callback has populated `pca->pgetNative`. We mirror
+    /// both: a circuit-state flag (`connected`, driven by
+    /// `CaChannel::connection_events()`) AND cache presence.
+    ///
+    /// Pre-fix this keyed off cache presence alone, so an upstream
+    /// IOC restart was invisible — `is_connected()` stayed `true` and
+    /// stale data was served with no LINK alarm.
     pub fn is_connected(&self) -> bool {
-        self.cache.load().as_ref().is_some()
+        self.connected.load(Ordering::Acquire) && self.cache.load().as_ref().is_some()
     }
 
-    /// Current cached value, or `None` when no monitor event has been
-    /// delivered yet.
+    /// Current cached value, or `None` when the link is not connected
+    /// (no event yet, or the circuit is currently down). A
+    /// disconnected link serves no value — the C `dbCaGetLink`
+    /// "not connected" error path — so a downstream IOC outage does
+    /// not leak the last stale value into the owning record.
     pub fn value(&self) -> Option<EpicsValue> {
+        if !self.connected.load(Ordering::Acquire) {
+            return None;
+        }
         self.cache.load().as_ref().as_ref().map(|s| s.value.clone())
     }
 
-    /// Current cached alarm severity (0..3), or `None` when nothing is
-    /// cached. Mirrors C `dbCaGetAlarmLimits` reading the cached
-    /// `pca->sevr`.
+    /// Current cached alarm severity (0..3), or `None` when the link
+    /// is not connected. Mirrors C `dbCaGetAlarmLimits` reading the
+    /// cached `pca->sevr` — gated on `pca->connected`.
     pub fn alarm_severity(&self) -> Option<i32> {
+        if !self.connected.load(Ordering::Acquire) {
+            return None;
+        }
         self.cache
             .load()
             .as_ref()
@@ -88,8 +117,12 @@ impl CaLink {
             .map(|s| s.alarm.severity as i32)
     }
 
-    /// Cached timestamp as `(seconds_past_epoch, nanoseconds)`.
+    /// Cached timestamp as `(seconds_past_epoch, nanoseconds)`, or
+    /// `None` when the link is not connected.
     pub fn time_stamp(&self) -> Option<(i64, i32)> {
+        if !self.connected.load(Ordering::Acquire) {
+            return None;
+        }
         let snap = self.cache.load();
         let snap = snap.as_ref().as_ref()?;
         let dur = snap.timestamp.duration_since(std::time::UNIX_EPOCH).ok()?;
@@ -156,11 +189,26 @@ impl CaLinkResolver {
                 reason: e.to_string(),
             })?;
         let cache: Arc<ArcSwap<Option<Snapshot>>> = Arc::new(ArcSwap::from_pointee(None));
-        let task = self.handle.spawn(run_monitor(monitor, cache.clone()));
+        let connected = Arc::new(AtomicBool::new(false));
+        // Connection-event watcher: keeps `connected` in sync with the
+        // real circuit state so `is_connected()` reflects upstream
+        // disconnects. Mirrors `pvalink`'s `monitor_connected` flag.
+        let conn_rx = channel.connection_events();
+        let conn_task = self
+            .handle
+            .spawn(run_connection_watcher(conn_rx, connected.clone()));
+        let task = self.handle.spawn(run_monitor(
+            monitor,
+            cache.clone(),
+            connected.clone(),
+            pv_name.to_string(),
+        ));
         let link = Arc::new(CaLink {
             cache,
+            connected,
             channel,
             _monitor_task: AbortOnDrop(task),
+            _conn_task: AbortOnDrop(conn_task),
         });
         // Re-check under the write lock so two concurrent first-callers
         // converge on one link (the loser's freshly opened link drops,
@@ -227,14 +275,62 @@ impl CaLinkResolver {
 async fn run_monitor(
     mut monitor: epics_ca_rs::client::MonitorHandle,
     cache: Arc<ArcSwap<Option<Snapshot>>>,
+    connected: Arc<AtomicBool>,
+    pv_name: String,
 ) {
     while let Some(event) = monitor.recv().await {
-        // A monitor error event (e.g. a transient server-side
-        // problem) leaves the last cached value in place — the next
-        // good event refreshes it. C `dbCa.c` keeps the stale value
-        // on a monitor error the same way.
-        if let Ok(snapshot) = event {
-            cache.store(Arc::new(Some(snapshot)));
+        match event {
+            Ok(snapshot) => {
+                // A delivered monitor event is itself proof of
+                // liveness — mark the link connected even if the
+                // `Connected` lifecycle event has not been observed
+                // yet (race-free, mirrors `pvalink`'s callback).
+                connected.store(true, Ordering::Release);
+                cache.store(Arc::new(Some(snapshot)));
+            }
+            // A monitor error event (e.g. a transient server-side
+            // problem) leaves the last cached value in place — the
+            // next good event refreshes it. C `dbCa.c` keeps the
+            // stale value on a monitor error the same way.
+            Err(e) => {
+                tracing::debug!(
+                    pv = %pv_name,
+                    error = %e,
+                    "calink: monitor error event ignored, keeping last cached value"
+                );
+            }
+        }
+    }
+    // Subscription ended (channel dropped). Reflect the disconnect.
+    connected.store(false, Ordering::Release);
+}
+
+/// Connection-event watcher: keep `connected` in sync with the CA
+/// circuit state. `Connected` flips it `true`; `Disconnected` /
+/// `Unresponsive` flip it `false` so a downstream IOC restart is
+/// reflected by `CaLink::is_connected()`. Mirrors `dbCa.c`'s
+/// `connectionCallback` setting `pca->connected`.
+async fn run_connection_watcher(
+    mut conn_rx: epics_base_rs::runtime::sync::broadcast::Receiver<
+        epics_ca_rs::client::ConnectionEvent,
+    >,
+    connected: Arc<AtomicBool>,
+) {
+    use epics_ca_rs::client::ConnectionEvent;
+    loop {
+        match conn_rx.recv().await {
+            Ok(ConnectionEvent::Connected) => connected.store(true, Ordering::Release),
+            Ok(ConnectionEvent::Disconnected) | Ok(ConnectionEvent::Unresponsive) => {
+                connected.store(false, Ordering::Release)
+            }
+            // AccessRightsChanged / NativeTypeChanged don't affect the
+            // connected flag.
+            Ok(_) => {}
+            // Lagged: a burst of events overran the bounded channel.
+            // Keep watching; the next event resyncs the flag.
+            Err(epics_base_rs::runtime::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            // Closed: the channel was dropped — watcher's job is done.
+            Err(epics_base_rs::runtime::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
 }
@@ -335,10 +431,107 @@ pub async fn install_calink_resolver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_ca_rs::client::ConnectionEvent;
 
     #[test]
     fn strip_ca_scheme_handles_both_forms() {
         assert_eq!(strip_ca_scheme("ca://OTHER:PV"), "OTHER:PV");
         assert_eq!(strip_ca_scheme("OTHER:PV"), "OTHER:PV");
+    }
+
+    /// Block until `flag` reaches `want`, or panic after a deadline —
+    /// the connection watcher updates the flag asynchronously.
+    async fn await_flag(flag: &AtomicBool, want: bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while flag.load(Ordering::Acquire) != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connected flag never reached {want}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// BUG 1 regression: `CaLink::is_connected()` must go false when
+    /// the upstream CA circuit disconnects. The connection-event
+    /// watcher drains `connection_events()` and flips the shared
+    /// `connected` flag; `is_connected()` reads it. Pre-fix
+    /// `is_connected()` keyed off cache presence alone and stayed
+    /// `true` forever once any event had been cached — an upstream
+    /// IOC restart was invisible and stale data was served.
+    #[tokio::test]
+    async fn bug1_connection_watcher_tracks_disconnect() {
+        let (tx, rx) = epics_base_rs::runtime::sync::broadcast::channel::<ConnectionEvent>(16);
+        let connected = Arc::new(AtomicBool::new(false));
+        let watcher = tokio::spawn(run_connection_watcher(rx, connected.clone()));
+
+        // Circuit comes up — flag goes true.
+        tx.send(ConnectionEvent::Connected).unwrap();
+        await_flag(&connected, true).await;
+
+        // Upstream IOC restart — circuit drops. Flag MUST go false;
+        // pre-fix it stayed true forever.
+        tx.send(ConnectionEvent::Disconnected).unwrap();
+        await_flag(&connected, false).await;
+
+        // Reconnect — flag goes true again (CA monitors auto-restore).
+        tx.send(ConnectionEvent::Connected).unwrap();
+        await_flag(&connected, true).await;
+
+        // An Unresponsive event (TCP up, server hung) also clears it.
+        tx.send(ConnectionEvent::Unresponsive).unwrap();
+        await_flag(&connected, false).await;
+
+        // Dropping the sender closes the channel — the watcher exits.
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), watcher)
+            .await
+            .expect("watcher must exit when the event channel closes")
+            .expect("watcher task panicked");
+    }
+
+    /// BUG 1 regression: the `is_connected()` / `value()` gating logic
+    /// itself — a link with a populated cache but a `false` connected
+    /// flag must report not-connected and serve no value. This is the
+    /// state during an upstream outage (cache holds the last
+    /// Snapshot, circuit is down).
+    #[test]
+    fn bug1_disconnected_link_serves_no_stale_value() {
+        // Reproduce the exact gate `is_connected()` / `value()` apply:
+        // both require `connected == true`.
+        let cache: Arc<ArcSwap<Option<Snapshot>>> = Arc::new(ArcSwap::from_pointee(None));
+        let connected = Arc::new(AtomicBool::new(false));
+
+        // Populate the cache with a stale snapshot, circuit still down.
+        cache.store(Arc::new(Some(Snapshot::new(
+            EpicsValue::Double(42.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        ))));
+
+        // Gate: cache is present but connected is false.
+        let is_connected = connected.load(Ordering::Acquire) && cache.load().as_ref().is_some();
+        assert!(
+            !is_connected,
+            "a disconnected link must report not-connected even with a cached snapshot"
+        );
+        let value = if connected.load(Ordering::Acquire) {
+            cache.load().as_ref().as_ref().map(|s| s.value.clone())
+        } else {
+            None
+        };
+        assert!(
+            value.is_none(),
+            "a disconnected link must serve no stale value"
+        );
+
+        // Circuit comes back — both gates open.
+        connected.store(true, Ordering::Release);
+        let is_connected = connected.load(Ordering::Acquire) && cache.load().as_ref().is_some();
+        assert!(
+            is_connected,
+            "reconnected link with cache must be connected"
+        );
     }
 }

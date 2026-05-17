@@ -384,6 +384,28 @@ impl ChannelSource for ControlSource {
         }
     }
 
+    /// Reject PROCESS. The `ChannelSource` default `process` returns
+    /// `Ok(())` — for this source that would silently swallow a PVA
+    /// PROCESS (`caput -c` / `pvcall .PROC`) and falsely report
+    /// success. Neither the diagnostic PVs (read-only) nor the
+    /// control PVs (RPC targets) have processing semantics, so a
+    /// PROCESS is refused the same way `put_value` refuses a PUT.
+    /// `process_checked`'s default delegates here after its WRITE
+    /// gate, so this one override covers both entry points.
+    async fn process(&self, name: &str) -> Result<(), String> {
+        if self.is_control(name) {
+            Err(format!(
+                "control PV '{name}' is invoked via RPC (pvcall), not PROCESS"
+            ))
+        } else if self.is_diag(name) {
+            Err(format!(
+                "'{name}' is a read-only diagnostic PV — PROCESS not supported"
+            ))
+        } else {
+            Err(format!("unknown control PV '{name}'"))
+        }
+    }
+
     /// B6: writable control surface. RPC is gated by the operator
     /// credential predicate; `rpc` (the ctx-less path) carries no
     /// identity and so can never be allowed — only `rpc_checked`,
@@ -547,6 +569,48 @@ mod tests {
         epics_base_rs::server::access_security::AccessGate::open()
             .check(pv, "localhost", "ops", "ca", "")
             .await
+    }
+
+    /// MINOR regression: `ControlSource` must reject a PVA PROCESS.
+    /// The `ChannelSource` default `process` returns `Ok(())`, which
+    /// would silently swallow a `caput -c` / `pvcall .PROC` and
+    /// falsely report success. Neither the diagnostic PVs nor the
+    /// control PVs have processing semantics — PROCESS is refused the
+    /// same way `put_value` refuses a PUT. `process_checked`'s default
+    /// delegates to `process` after its WRITE gate, so the single
+    /// `process` override covers both entry points.
+    #[tokio::test]
+    async fn control_process_is_rejected() {
+        let (cache, gw) = make_source();
+        let ctrl = ControlSource::new("gw", cache, gw);
+
+        // Control PV (RPC target).
+        let err = ctrl
+            .process("gw:flush")
+            .await
+            .expect_err("PROCESS of a control PV must be rejected");
+        assert!(err.contains("not PROCESS"), "control PV reason: {err:?}");
+
+        // Diagnostic PV (read-only).
+        let err = ctrl
+            .process("gw:cacheSize")
+            .await
+            .expect_err("PROCESS of a diagnostic PV must be rejected");
+        assert!(
+            err.contains("PROCESS not supported"),
+            "diag PV reason: {err:?}"
+        );
+
+        // process_checked (WRITE-granted token) still rejects because
+        // the default delegates to the overridden `process`.
+        let err = ctrl
+            .process_checked(checked("gw:flush").await, ctx("ops", "ca"))
+            .await
+            .expect_err("process_checked must reject even with a WRITE token");
+        assert!(
+            err.contains("not PROCESS"),
+            "process_checked reason: {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -100,6 +100,73 @@ struct EntryState {
     introspection: Option<FieldDesc>,
 }
 
+/// Result of folding one upstream monitor event into [`EntryState`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MonitorEventOutcome {
+    /// This was the first event — `first_event` waiters should wake.
+    was_first: bool,
+    /// The upstream introspection changed vs. the cached descriptor.
+    type_changed: bool,
+    /// The body decoded successfully and `latest` was updated.
+    decoded: bool,
+}
+
+/// Decode one upstream raw monitor frame and fold it into `state`.
+///
+/// BUG 2: this runs for EVERY upstream monitor event so a gateway GET
+/// (`UpstreamEntry::snapshot` → `get_value`) always returns the
+/// CURRENT upstream value. Pre-fix the callback decoded only the first
+/// event, freezing `state.latest` forever.
+///
+/// `body` is the wire `changed | value | overrun` triplet. A delta
+/// event carries only the changed fields; `decode_pv_field_with_bitset`
+/// zero-fills the unmarked leaves, so when a prior snapshot exists (and
+/// the introspection is unchanged) the decoded delta is merged onto it
+/// via `fill_unmarked_from_prior` — the same merge the client-side
+/// `pvmonitor` applies. A first event or an introspection change
+/// replaces `state.latest` wholesale.
+fn apply_monitor_event(
+    state: &RwLock<EntryState>,
+    desc: &FieldDesc,
+    body: &[u8],
+    order: epics_pva_rs::proto::ByteOrder,
+) -> MonitorEventOutcome {
+    let decoded = (|| -> Option<(epics_pva_rs::proto::BitSet, PvField)> {
+        let mut cur = std::io::Cursor::new(body);
+        let changed = epics_pva_rs::proto::BitSet::decode(&mut cur, order).ok()?;
+        let v = epics_pva_rs::pvdata::encode::decode_pv_field_with_bitset(
+            desc, &changed, 0, &mut cur, order,
+        )
+        .ok()?;
+        Some((changed, v))
+    })();
+
+    let Some((changed, v)) = decoded else {
+        return MonitorEventOutcome::default();
+    };
+
+    let mut s = state.write();
+    let was_first = s.introspection.is_none();
+    let type_changed = s
+        .introspection
+        .as_ref()
+        .is_some_and(|existing| existing != desc);
+    s.introspection = Some(desc.clone());
+    match s.latest.take() {
+        Some(prior) if !type_changed => {
+            s.latest = Some(epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
+                desc, &changed, 0, v, &prior,
+            ));
+        }
+        _ => s.latest = Some(v),
+    }
+    MonitorEventOutcome {
+        was_first,
+        type_changed,
+        decoded: true,
+    }
+}
+
 impl UpstreamEntry {
     /// Latest cached value; cheap clone of the `PvField` enum.
     pub fn snapshot(&self) -> Option<PvField> {
@@ -455,61 +522,26 @@ impl ChannelCache {
                 let _ = tx_inner; // typed broadcast retired in raw path
                 let handle_result = client
                     .pvmonitor_raw_frames_handle(&pv_name_owned, move |desc, body, order| {
-                        let was_first;
-                        let mut type_changed = false;
-                        // Decode first event ONCE so GET / INFO
-                        // callers (which read `state.latest`) see
-                        // a populated snapshot. Subsequent events
-                        // skip the decode — only raw bytes flow
-                        // through the broadcast for fan-out.
-                        // The snapshot becomes "first-value
-                        // sticky" for lookups; this is the same
-                        // semantics pvxs/pva2pva expose since
-                        // GET-against-gateway isn't the hot path.
-                        let needs_decode_for_snapshot = {
-                            let s = state_inner.read();
-                            s.latest.is_none() || s.introspection.as_ref() != Some(desc)
-                        };
-                        if needs_decode_for_snapshot {
-                            // body = [changed bitset | value | overrun bitset];
-                            // decode walks the changed bitset, then the
-                            // value with that bitset, then trailing
-                            // overrun. We only care about the value.
-                            let decoded = (|| -> Option<epics_pva_rs::pvdata::PvField> {
-                                let mut cur = std::io::Cursor::new(&body[..]);
-                                let changed =
-                                    epics_pva_rs::proto::BitSet::decode(&mut cur, order).ok()?;
-                                let v = epics_pva_rs::pvdata::encode::decode_pv_field_with_bitset(
-                                    desc, &changed, 0, &mut cur, order,
-                                )
-                                .ok()?;
-                                Some(v)
-                            })();
-                            if let Some(v) = decoded {
-                                let mut s = state_inner.write();
-                                was_first = s.introspection.is_none();
-                                if let Some(existing) = &s.introspection {
-                                    if existing != desc {
-                                        type_changed = true;
-                                        s.latest = None;
-                                    }
-                                }
-                                s.introspection = Some(desc.clone());
-                                s.latest = Some(v);
-                            } else {
-                                was_first = false;
-                            }
-                        } else {
-                            was_first = false;
-                        }
-                        if type_changed {
+                        // BUG 2: decode EVERY monitor event into
+                        // `state.latest`, not just the first. A
+                        // gateway GET (`get_value` / `snapshot()`)
+                        // must return the CURRENT upstream value —
+                        // pre-fix only the first event was decoded,
+                        // so a downstream `pvget` against the gateway
+                        // returned a frozen first value forever after
+                        // the first monitor event. `apply_monitor_event`
+                        // owns the decode + delta-merge; the raw bytes
+                        // still fan out through `tx_raw` with no
+                        // re-encode.
+                        let outcome = apply_monitor_event(&state_inner, desc, &body, order);
+                        if outcome.type_changed {
                             tracing::warn!(
                                 pv = %pv_clone,
                                 "pva-gateway: upstream introspection changed — \
                                  cache descriptor reset"
                             );
                         }
-                        if was_first {
+                        if outcome.was_first {
                             first_event_inner.notify_waiters();
                         }
                         // Fan out raw body — refcount only, no copy.
@@ -686,6 +718,112 @@ impl Drop for ChannelCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_pva_rs::proto::{BitSet, ByteOrder};
+    use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
+
+    /// Encode a wire monitor body (`changed | value`) for `value`
+    /// against `desc`, marking the bits in `set_bits` as changed.
+    /// Mirrors what `pvmonitor_raw_frames_handle` hands the gateway
+    /// callback (the trailing overrun bitset is not consumed by the
+    /// decoder so it is omitted).
+    fn encode_body(desc: &FieldDesc, value: &PvField, set_bits: &[usize]) -> Vec<u8> {
+        let mut changed = BitSet::new();
+        for &b in set_bits {
+            changed.set(b);
+        }
+        let mut body = Vec::new();
+        changed.write_into(ByteOrder::Little, &mut body);
+        epics_pva_rs::pvdata::encode::encode_pv_field_with_bitset(
+            value,
+            desc,
+            &changed,
+            0,
+            ByteOrder::Little,
+            &mut body,
+        );
+        body
+    }
+
+    /// BUG 2 regression: `apply_monitor_event` must update
+    /// `state.latest` on EVERY upstream monitor event, so a gateway
+    /// GET (`UpstreamEntry::snapshot` → `get_value`) returns the live
+    /// value. Pre-fix only the first event was decoded — the snapshot
+    /// froze at the first value forever.
+    #[test]
+    fn bug2_get_value_tracks_every_monitor_event() {
+        let desc = FieldDesc::Scalar(ScalarType::Double);
+        let state = RwLock::new(EntryState::default());
+
+        // First event: value = 1.0.
+        let body1 = encode_body(&desc, &PvField::Scalar(ScalarValue::Double(1.0)), &[0]);
+        let o1 = apply_monitor_event(&state, &desc, &body1, ByteOrder::Little);
+        assert!(o1.was_first && o1.decoded && !o1.type_changed);
+        assert_eq!(
+            state.read().latest,
+            Some(PvField::Scalar(ScalarValue::Double(1.0)))
+        );
+
+        // Second event: value = 2.0. Pre-fix this was DROPPED — the
+        // snapshot would still read 1.0.
+        let body2 = encode_body(&desc, &PvField::Scalar(ScalarValue::Double(2.0)), &[0]);
+        apply_monitor_event(&state, &desc, &body2, ByteOrder::Little);
+        assert_eq!(
+            state.read().latest,
+            Some(PvField::Scalar(ScalarValue::Double(2.0))),
+            "snapshot must reflect the 2nd monitor event, not freeze at the 1st"
+        );
+
+        // Third event: value = 3.0.
+        let body3 = encode_body(&desc, &PvField::Scalar(ScalarValue::Double(3.0)), &[0]);
+        apply_monitor_event(&state, &desc, &body3, ByteOrder::Little);
+        assert_eq!(
+            state.read().latest,
+            Some(PvField::Scalar(ScalarValue::Double(3.0))),
+            "snapshot must track the live value across many events"
+        );
+    }
+
+    /// BUG 2 / BUG 3 regression: a delta monitor event (only some
+    /// fields marked changed) must be MERGED onto the prior snapshot,
+    /// so unmarked fields keep their current value rather than being
+    /// zero-filled. This is what makes the gateway's default
+    /// `put_delta_checked` (get_value → fill_unmarked_from_prior →
+    /// pvput) merge against CURRENT upstream data.
+    #[test]
+    fn bug2_delta_event_merges_onto_prior_snapshot() {
+        // A 2-field structure: bit 0 = struct, 1 = a, 2 = b.
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        let full = |a: i32, b: i32| {
+            let mut s = epics_pva_rs::pvdata::PvStructure::new("");
+            s.fields
+                .push(("a".to_string(), PvField::Scalar(ScalarValue::Int(a))));
+            s.fields
+                .push(("b".to_string(), PvField::Scalar(ScalarValue::Int(b))));
+            PvField::Structure(s)
+        };
+        let state = RwLock::new(EntryState::default());
+
+        // First event: full value a=10, b=20 (whole struct marked).
+        let body1 = encode_body(&desc, &full(10, 20), &[0, 1, 2]);
+        apply_monitor_event(&state, &desc, &body1, ByteOrder::Little);
+        assert_eq!(state.read().latest, Some(full(10, 20)));
+
+        // Delta event: only `a` changed → bit 1. `b` is unmarked and
+        // arrives zero-filled; the merge must restore b=20.
+        let body2 = encode_body(&desc, &full(99, 0), &[1]);
+        apply_monitor_event(&state, &desc, &body2, ByteOrder::Little);
+        assert_eq!(
+            state.read().latest,
+            Some(full(99, 20)),
+            "delta merge must keep unmarked field `b` at its prior value"
+        );
+    }
 
     /// Smoke test: we can build an entry standalone (no cache, no
     /// real client) and exercise the subscribe / poke counters.

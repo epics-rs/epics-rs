@@ -114,6 +114,16 @@ pub struct ScalerRecord {
     /// Set by device support's read() when counting has completed.
     /// process() checks and clears this flag.
     pub(crate) done_flag: bool,
+
+    /// Channel-1 preset captured by `process()` at the start of a
+    /// REQSTART count, BEFORE the `pr[0] = NINT(tp*freq)`
+    /// self-consistency guard runs. C `scalerRecord.c:406` captures
+    /// `old_pr1 = pscal->pr1` *before* the `:409-410` guard; the
+    /// `:424` `old_pr1 != pr1` test therefore fires when the guard
+    /// alone changed PR1 (e.g. the user wrote TP and `frac(tp*freq)
+    /// >= 0.5`). `process()` writes this; `run_start_count` reads it
+    /// as the true pre-guard baseline for `count_start_finalize_tp`.
+    pub(crate) reqstart_old_pr1: u32,
 }
 
 impl ScalerRecord {
@@ -176,6 +186,7 @@ impl Default for ScalerRecord {
             delay_start: None,
             autocount_delay: 0.0,
             done_flag: false,
+            reqstart_old_pr1: 0,
         }
     }
 }
@@ -613,6 +624,15 @@ impl Record for ScalerRecord {
                 }
 
                 if self.us == USER_STATE_REQSTART {
+                    // C scalerRecord.c:406 — capture old_pr1 BEFORE the
+                    // :409-410 self-consistency guard. The guard itself
+                    // may change pr[0] (user wrote TP and frac(tp*freq)
+                    // >= 0.5); C's :424 `old_pr1 != pr1` TP-recompute
+                    // must see that pre-guard baseline, so the count-start
+                    // reconciliation in run_start_count reads this field
+                    // rather than re-capturing pr[0] post-guard.
+                    self.reqstart_old_pr1 = self.pr[0];
+
                     // Ensure channel-1 preset count agrees with time
                     // preset and freq. C scalerRecord.c:409-410 uses
                     // NINT (round-to-nearest), unlike init_record/special.

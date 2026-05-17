@@ -133,7 +133,7 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
         record: &mut dyn Record,
         command: &str,
         args: &[EpicsValue],
-    ) -> CaResult<()> {
+    ) -> CaResult<Vec<&'static str>> {
         let mut driver = self.driver.lock().unwrap();
         match command {
             CMD_RESET => {
@@ -185,18 +185,22 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
                     .as_any_mut()
                     .and_then(|a| a.downcast_mut::<ScalerRecord>())
                     .expect("ScalerAsynDeviceSupport requires a ScalerRecord");
-                Self::run_start_count(&mut **driver, scaler)?;
+                // C scalerRecord.c:425-430 — PR1/TP/FREQ monitors are
+                // posted by the framework from the returned field names.
+                return Self::run_start_count(&mut **driver, scaler);
             }
             CMD_AUTOCOUNT => {
                 let scaler = record
                     .as_any_mut()
                     .and_then(|a| a.downcast_mut::<ScalerRecord>())
                     .expect("ScalerAsynDeviceSupport requires a ScalerRecord");
-                Self::run_autocount(&mut **driver, scaler)?;
+                // C scalerRecord.c:530 — FREQ monitor posted by the
+                // framework from the returned field name.
+                return Self::run_autocount(&mut **driver, scaler);
             }
             _ => {}
         }
-        Ok(())
+        Ok(Vec::new())
     }
 }
 
@@ -207,7 +211,10 @@ impl ScalerAsynDeviceSupport {
     /// (`scalerRecord.c:409-411`) and emitted `CMD_RESET` before this.
     /// Here we reproduce the rest:
     ///
-    /// - `:412` capture `save_pr1`; `:406` capture `old_pr1`.
+    /// - `:406` `old_pr1` was captured by `process()` BEFORE the
+    ///   `:409-410` guard (stored in `ScalerRecord::reqstart_old_pr1`);
+    ///   re-capturing `pr[0]` here would miss a guard-only PR1 change.
+    /// - `:412` capture `save_pr1` (post-guard, pre-write).
     /// - `:413-419` write every gated channel's preset. Channel 0's
     ///   write returns the count the driver actually programmed; that
     ///   replaces `pr[0]` — the C `write_preset` mutates `psr->pr1`.
@@ -217,11 +224,27 @@ impl ScalerAsynDeviceSupport {
     ///   when the driver adjusted it; the second `write_preset` may
     ///   adjust it again, and the final value lands in `pr[0]`.
     /// - `:424-428` `count_start_finalize_tp` recomputes `tp` from the
-    ///   final `pr[0]`/`freq`.
+    ///   final `pr[0]`/`freq` when it differs from the pre-guard
+    ///   `old_pr1`.
+    /// - `:425/:427/:430` PR1/TP/FREQ monitor events are posted by the
+    ///   framework's `DeviceCommand` dispatch from the field names this
+    ///   function returns; C does this with `db_post_events`.
     /// - `:431` arm.
-    fn run_start_count(driver: &mut dyn ScalerDriver, scaler: &mut ScalerRecord) -> CaResult<()> {
-        // C scalerRecord.c:406 — old_pr1 captured before any write.
-        let old_pr1 = scaler.pr[0];
+    ///
+    /// Returns the record field names whose values changed so the
+    /// framework can post `DBE_VALUE` monitor events for them.
+    fn run_start_count(
+        driver: &mut dyn ScalerDriver,
+        scaler: &mut ScalerRecord,
+    ) -> CaResult<Vec<&'static str>> {
+        // C scalerRecord.c:406 — old_pr1 was captured by process()
+        // BEFORE the :409-410 guard. Reading scaler.pr[0] here would be
+        // post-guard and the :424 guard-only TP recompute would be lost.
+        let old_pr1 = scaler.reqstart_old_pr1;
+        // C scalerRecord.c:407 — old_freq captured before any driver
+        // write so the :430 FREQ monitor post fires when the driver
+        // adopted a different clock.
+        let old_freq = scaler.freq;
 
         // C scalerRecord.c:412 — save_pr1 captured before the loop.
         let save_pr1 = scaler.pr[0];
@@ -253,12 +276,30 @@ impl ScalerAsynDeviceSupport {
             scaler.pr[0] = programmed;
         }
 
-        // C scalerRecord.c:424-428 — recompute tp from the final pr1.
-        scaler.count_start_finalize_tp(old_pr1);
+        // C scalerRecord.c:424-430 — post monitors for the fields the
+        // count-start reconciliation changed. `process()` already ran
+        // and its snapshot has been notified, so these posts cannot be
+        // expressed as record-field diffs; the field names are returned
+        // for the framework's DeviceCommand dispatch to post (the C
+        // record calls `db_post_events` directly here).
+        let mut changed: Vec<&'static str> = Vec::new();
+        // C scalerRecord.c:424-428 — `if (old_pr1 != pr1)`: post PR1,
+        // recompute tp from the final pr1/freq, post TP.
+        if old_pr1 != scaler.pr[0] {
+            // C:425 — db_post_events(pr1).
+            changed.push("PR1");
+            // C:426-427 — recompute and post tp.
+            scaler.count_start_finalize_tp(old_pr1);
+            changed.push("TP");
+        }
+        // C scalerRecord.c:429-430 — `if (old_freq != freq)`: post FREQ.
+        if old_freq != scaler.freq {
+            changed.push("FREQ");
+        }
 
         // C scalerRecord.c:431 — arm.
         driver.arm(true)?;
-        Ok(())
+        Ok(changed)
     }
 
     /// Auto-count driver sequence — C `scalerRecord.c:508-535`.
@@ -268,8 +309,19 @@ impl ScalerAsynDeviceSupport {
     /// (truncating, `:514`); the `save_pr1 != pr1` re-write
     /// (`:515-522`) recomputes from `tp1*freq` again; afterward the
     /// user's `PR1` is **restored** (`:532`) and `TP` is left alone.
-    fn run_autocount(driver: &mut dyn ScalerDriver, scaler: &mut ScalerRecord) -> CaResult<()> {
+    ///
+    /// Returns the record field names whose values changed so the
+    /// framework can post `DBE_VALUE` monitor events. C only posts FREQ
+    /// here (`:530`); PR1 is restored to the user value (`:532`) so it
+    /// never changes, and TP is intentionally not recomputed.
+    fn run_autocount(
+        driver: &mut dyn ScalerDriver,
+        scaler: &mut ScalerRecord,
+    ) -> CaResult<Vec<&'static str>> {
+        // C scalerRecord.c:510 — old_pr1 captured to restore PR1 at the
+        // end; C:509 — old_freq captured to gate the :530 FREQ post.
         let old_pr1 = scaler.pr[0];
+        let old_freq = scaler.freq;
 
         if scaler.tp1 >= 1.0e-3 {
             // C scalerRecord.c:513-514 — truncating cast, not NINT.
@@ -300,9 +352,7 @@ impl ScalerAsynDeviceSupport {
         }
 
         // C scalerRecord.c:530 — adopt a driver-changed clock so FREQ
-        // reflects reality. C compares `old_freq != freq` only to gate
-        // `db_post_events`; the monitor layer owns that posting, so the
-        // port adopts the driver clock and lets the framework post.
+        // reflects reality.
         if let Some(freq) = driver.actual_frequency() {
             scaler.freq = freq;
         }
@@ -312,8 +362,16 @@ impl ScalerAsynDeviceSupport {
         // recomputed in the auto-count path.
         scaler.pr[0] = old_pr1;
 
+        // C scalerRecord.c:530 — `if (old_freq != freq) db_post_events`.
+        // process() has already notified its snapshot, so the framework
+        // posts this from the returned field name.
+        let mut changed: Vec<&'static str> = Vec::new();
+        if old_freq != scaler.freq {
+            changed.push("FREQ");
+        }
+
         // C scalerRecord.c:533 — arm.
         driver.arm(true)?;
-        Ok(())
+        Ok(changed)
     }
 }

@@ -163,14 +163,23 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// driver operations (e.g., scaler reset/arm/write_preset) without
     /// holding a direct driver reference.
     ///
-    /// Default: ignore.
+    /// `handle_command` runs AFTER the process snapshot has already been
+    /// built and notified, so any record field it mutates would not be
+    /// diffed by the snapshot path. The returned `Vec` names the record
+    /// fields the command changed; the framework posts a `DBE_VALUE`
+    /// monitor event for each, mirroring the explicit `db_post_events`
+    /// calls a C record makes from inside `process()` (e.g.
+    /// `scalerRecord.c:425-430` posts PR1/TP/FREQ after the driver
+    /// write-back). Return an empty `Vec` when no record field changed.
+    ///
+    /// Default: ignore, no fields changed.
     fn handle_command(
         &mut self,
         _record: &mut dyn Record,
         _command: &str,
         _args: &[crate::types::EpicsValue],
-    ) -> CaResult<()> {
-        Ok(())
+    ) -> CaResult<Vec<&'static str>> {
+        Ok(Vec::new())
     }
 }
 

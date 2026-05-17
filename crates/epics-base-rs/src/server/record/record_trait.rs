@@ -405,6 +405,26 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Called by the framework immediately after applying this cycle's
+    /// [`Record::multi_input_links`] fetches, before `process()`.
+    ///
+    /// `resolved` lists the `link_field` names (the first element of
+    /// each `multi_input_links` pair) whose fetch actually produced a
+    /// value this cycle — i.e. the link was non-empty and the read
+    /// succeeded. A link field absent from the slice either had no link
+    /// configured or its DB/CA fetch failed.
+    ///
+    /// This is the framework analogue of C device support inspecting
+    /// `RTN_SUCCESS(dbGetLink(...))` — e.g. `epidRecord.c:191-193`
+    /// clears `udf` only when `dbGetLink(&prec->stpl, ...)` returns
+    /// success. A record's `process()` cannot otherwise observe whether
+    /// an input link's fetch succeeded, because a failed fetch simply
+    /// leaves the target field unwritten.
+    ///
+    /// Additive, framework-set-hook pattern (same shape as
+    /// [`Record::set_process_context`]). Default: ignore.
+    fn set_resolved_input_links(&mut self, _resolved: &[&'static str]) {}
+
     /// Called before/after a field put for side-effect processing.
     fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
         Ok(())

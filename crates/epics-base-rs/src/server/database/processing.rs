@@ -514,8 +514,13 @@ impl PvDatabase {
             crate::server::record::MonitorSwitch,
             super::links::LinkAlarm,
         )> = Vec::new();
+        // Link fields (the `multi_input_links` first element) whose
+        // fetch actually produced a value this cycle — pushed to the
+        // record via `set_resolved_input_links` so its `process()` can
+        // observe link-fetch success (C `RTN_SUCCESS(dbGetLink(...))`).
+        let mut resolved_link_fields: Vec<&'static str> = Vec::new();
         {
-            let link_info: Vec<(String, String)> = {
+            let link_info: Vec<(String, &'static str, String)> = {
                 let instance = rec.read().await;
                 instance
                     .record
@@ -533,12 +538,12 @@ impl PvDatabase {
                                 }
                             })
                             .unwrap_or_default();
-                        (link_str, vf.to_string())
+                        (link_str, *lf, vf.to_string())
                     })
                     .collect()
             }; // read lock dropped
             let mut results = Vec::new();
-            for (link_str, val_field) in &link_info {
+            for (link_str, link_field, val_field) in &link_info {
                 if !link_str.is_empty() {
                     let parsed = crate::server::record::parse_link_v2(link_str);
                     // C `dbGetLink`: a `ProcessPassive` DB input link
@@ -554,6 +559,7 @@ impl PvDatabase {
                     let (value, alarm) = self.read_link_with_alarm(&parsed).await;
                     if let Some(value) = value {
                         results.push((val_field.clone(), value));
+                        resolved_link_fields.push(link_field);
                     }
                     // B2: multi-input alarm propagation covers external
                     // `pva://` / `ca://` links too — see the `inp_link_alarm`
@@ -682,6 +688,14 @@ impl PvDatabase {
                     let _ = instance.record.put_field(val_field, EpicsValue::Double(f));
                 }
             }
+
+            // Tell the record which input link fields actually resolved
+            // a value this cycle — the framework analogue of C device
+            // support inspecting `RTN_SUCCESS(dbGetLink(...))`
+            // (`epidRecord.c:191-193`).
+            instance
+                .record
+                .set_resolved_input_links(&resolved_link_fields);
 
             // Apply sel NVL -> SELN
             if let Some(nvl_val) = sel_nvl_value {
@@ -1637,8 +1651,19 @@ impl PvDatabase {
                 ProcessAction::DeviceCommand { command, ref args } => {
                     let mut instance = rec.write().await;
                     if let Some(mut dev) = instance.device.take() {
-                        let _ = dev.handle_command(&mut *instance.record, command, args);
+                        // `handle_command` runs after the process snapshot
+                        // was already built/notified, so any record field
+                        // it mutated needs an explicit monitor post. The
+                        // returned field names are posted with DBE_VALUE,
+                        // mirroring the C record's `db_post_events` calls
+                        // from inside `process()` (scalerRecord.c:425-430).
+                        let changed = dev
+                            .handle_command(&mut *instance.record, command, args)
+                            .unwrap_or_default();
                         instance.device = Some(dev);
+                        for field in changed {
+                            instance.notify_field(field, crate::server::recgbl::EventMask::VALUE);
+                        }
                     }
                 }
                 ProcessAction::ReprocessAfter(delay) => {

@@ -159,12 +159,20 @@ record(throttle, "TEST:THR3") {
 
 // ============================================================
 // Epid: PID runs in process via framework
+//
+// C `epidRecord.c` clears `udf` (and thus runs `do_pid`) for a
+// supervisory epid ONLY via a CONSTANT `STPL` link — `epidRecord.c:
+// 160-164` `recGblInitConstantLink` seeds `VAL` and clears `udf` at
+// init. A supervisory epid with an empty STPL keeps `udf` TRUE
+// forever and `epidRecord.c:195` `return(0)` skips `do_pid` every
+// cycle; this test uses a constant STPL so `do_pid` runs.
 // ============================================================
 
 #[tokio::test]
 async fn test_epid_pid_via_framework() {
     let db_str = r#"
 record(epid, "TEST:PID") {
+    field(STPL, "100")
     field(KP, "2.0")
     field(KI, "0")
     field(KD, "0")
@@ -183,11 +191,8 @@ record(epid, "TEST:PID") {
         .unwrap();
     let db = server.database().clone();
 
-    // Set setpoint
-    server
-        .put("TEST:PID.VAL", EpicsValue::Double(100.0))
-        .await
-        .unwrap();
+    // Setpoint VAL is seeded from the constant STPL at init
+    // (C `recGblInitConstantLink`); no operator put needed.
 
     // Process twice with a small gap so dt > 0
     db.put_record_field_from_ca("TEST:PID", "PROC", EpicsValue::Short(1))
@@ -237,6 +242,7 @@ record(epid, "TEST:PID") {
 async fn test_epid_pid_via_process_record_path() {
     let db_str = r#"
 record(epid, "TEST:PID2") {
+    field(STPL, "100")
     field(KP, "2.0")
     field(KI, "0")
     field(KD, "0")
@@ -255,11 +261,8 @@ record(epid, "TEST:PID2") {
         .unwrap();
     let db = server.database().clone();
 
-    // Setpoint.
-    server
-        .put("TEST:PID2.VAL", EpicsValue::Double(100.0))
-        .await
-        .unwrap();
+    // Setpoint VAL is seeded from the constant STPL at init
+    // (C `recGblInitConstantLink`).
 
     // Process twice via the `process_record` (process_local) path —
     // NOT the PROC-field / process_record_with_links path — with a
@@ -283,6 +286,236 @@ record(epid, "TEST:PID2") {
         }
         other => panic!("expected Double, got {:?}", other),
     }
+}
+
+// ============================================================
+// Epid Bug 1 — supervisory epid with empty STPL: do_pid NEVER runs.
+//
+// C `epidRecord.c`: `special = NULL` (line 105) — no operator UDF
+// clear. `udf` starts TRUE (`epidRecord.c` init) and is cleared only
+// by a CONSTANT STPL (`epidRecord.c:160-164`) or a closed-loop
+// `dbGetLink(stpl)` success (`epidRecord.c:191-193`). A supervisory
+// (`SMSL=0`) epid with an empty/non-constant STPL keeps `udf` TRUE
+// forever, so `epidRecord.c:195` `return(0)` skips `do_pid` on EVERY
+// cycle. An operator `caput` to VAL does NOT clear `udf`.
+//
+// This exercises the framework auto-clear path (`clears_udf()` /
+// `value_is_undefined()` recomputed after `process()`), not a manual
+// `set_process_context` push.
+// ============================================================
+
+#[tokio::test]
+async fn test_epid_supervisory_empty_stpl_never_runs_do_pid() {
+    let db_str = r#"
+record(epid, "TEST:PIDSUP") {
+    field(KP, "2.0")
+    field(KI, "0")
+    field(KD, "0")
+    field(FBON, "1")
+    field(DRVH, "1000")
+    field(DRVL, "-1000")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // Operator sets the setpoint directly — C `special = NULL`, so
+    // this does NOT clear udf.
+    server
+        .put("TEST:PIDSUP.VAL", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+
+    // Process 5 cycles via the full link path.
+    for _ in 0..5 {
+        db.put_record_field_from_ca("TEST:PIDSUP", "PROC", EpicsValue::Short(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // do_pid must NEVER have run — P stays 0 across all 5 cycles.
+    let p = server.get("TEST:PIDSUP.P").await.unwrap();
+    match p {
+        EpicsValue::Double(v) => {
+            assert_eq!(
+                v, 0.0,
+                "supervisory epid with empty STPL must NEVER run do_pid; \
+                 P must stay 0 after 5 cycles, got {}",
+                v
+            );
+        }
+        other => panic!("expected Double, got {:?}", other),
+    }
+
+    // The framework must keep UDF set every cycle.
+    let udf = server.get("TEST:PIDSUP.UDF").await.unwrap();
+    assert_eq!(
+        udf,
+        EpicsValue::Char(1),
+        "UDF must stay set for a supervisory empty-STPL epid"
+    );
+}
+
+// ============================================================
+// Epid Bug 2 — closed-loop epid with a WORKING STPL: udf clears and
+// do_pid runs.
+//
+// C `epidRecord.c:191-193`: closed-loop (`SMSL=1`) with a successful
+// `dbGetLink(stpl)` clears `udf` *before* the `if (udf==TRUE)` check
+// at `epidRecord.c:195` — so `do_pid` runs in the SAME `process()`
+// call the fetch succeeded. The framework fetches STPL->VAL and
+// reports the success via `set_resolved_input_links` BEFORE
+// `process()`, so the epid clears its UDF projection in-cycle, just
+// as C does. Therefore do_pid runs from cycle 1 (not "cycle 2").
+// ============================================================
+
+#[tokio::test]
+async fn test_epid_closed_loop_working_stpl_runs_do_pid() {
+    let db_str = r#"
+record(ao, "TEST:PIDSRC") {
+    field(VAL, "100")
+}
+record(epid, "TEST:PIDCL") {
+    field(SMSL, "1")
+    field(STPL, "TEST:PIDSRC.VAL")
+    field(KP, "2.0")
+    field(KI, "0")
+    field(KD, "0")
+    field(FBON, "1")
+    field(DRVH, "1000")
+    field(DRVL, "-1000")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // Cycle 1: STPL fetch succeeds → VAL becomes 100 and udf is
+    // cleared in-cycle (C `epidRecord.c:191-193` clears udf before the
+    // line-195 gate), so do_pid runs.
+    db.put_record_field_from_ca("TEST:PIDCL", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let p_c1 = server.get("TEST:PIDCL.P").await.unwrap();
+    match p_c1 {
+        EpicsValue::Double(v) => {
+            // P = KP * (VAL - CVAL) = 2.0 * (100 - 0) = 200.0
+            assert!(
+                (v - 200.0).abs() < 1.0,
+                "cycle 1: closed-loop epid with a resolved STPL must run \
+                 do_pid (udf cleared in-cycle); P should be ~200.0, got {}",
+                v
+            );
+        }
+        other => panic!("expected Double, got {:?}", other),
+    }
+
+    // UDF must be cleared after a successful STPL fetch.
+    let udf = server.get("TEST:PIDCL.UDF").await.unwrap();
+    assert_eq!(
+        udf,
+        EpicsValue::Char(0),
+        "closed-loop epid with a resolved STPL must have UDF cleared"
+    );
+
+    // Cycle 2: udf stays clear, do_pid keeps running.
+    db.put_record_field_from_ca("TEST:PIDCL", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let p_c2 = server.get("TEST:PIDCL.P").await.unwrap();
+    match p_c2 {
+        EpicsValue::Double(v) => {
+            assert!(
+                (v - 200.0).abs() < 1.0,
+                "cycle 2: closed-loop epid keeps running do_pid; P should \
+                 be ~200.0, got {}",
+                v
+            );
+        }
+        other => panic!("expected Double, got {:?}", other),
+    }
+}
+
+// ============================================================
+// Epid Bug 2 — closed-loop epid with a FAILING/empty STPL: udf stays
+// set, do_pid NEVER runs.
+//
+// C `epidRecord.c:191-193` clears `udf` ONLY on
+// `RTN_SUCCESS(dbGetLink(&prec->stpl, ...))`. A closed-loop epid
+// whose STPL link points at a non-existent record (the fetch fails)
+// must keep `udf` TRUE — the pre-fix `!val.is_nan()` proxy would
+// wrongly clear it because VAL stays at its finite default 0.0 when
+// the link read fails.
+// ============================================================
+
+#[tokio::test]
+async fn test_epid_closed_loop_failing_stpl_keeps_udf() {
+    let db_str = r#"
+record(epid, "TEST:PIDCLF") {
+    field(SMSL, "1")
+    field(STPL, "TEST:NOSUCHREC.VAL")
+    field(KP, "2.0")
+    field(KI, "0")
+    field(KD, "0")
+    field(FBON, "1")
+    field(DRVH, "1000")
+    field(DRVL, "-1000")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // Process 5 cycles — the STPL link can never resolve.
+    for _ in 0..5 {
+        db.put_record_field_from_ca("TEST:PIDCLF", "PROC", EpicsValue::Short(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // do_pid must NEVER have run — the STPL fetch failed every cycle.
+    let p = server.get("TEST:PIDCLF.P").await.unwrap();
+    match p {
+        EpicsValue::Double(v) => {
+            assert_eq!(
+                v, 0.0,
+                "closed-loop epid with a failing STPL must keep udf set \
+                 and never run do_pid; P must stay 0, got {}",
+                v
+            );
+        }
+        other => panic!("expected Double, got {:?}", other),
+    }
+
+    let udf = server.get("TEST:PIDCLF.UDF").await.unwrap();
+    assert_eq!(
+        udf,
+        EpicsValue::Char(1),
+        "UDF must stay set when the STPL fetch fails"
+    );
 }
 
 // ============================================================

@@ -883,18 +883,25 @@ impl ScalerDriver for QuantizingDriver {
 
 /// Dispatch the actions a record's process() returned through device
 /// support, mirroring `Database::execute_process_actions`' handling of
-/// `ProcessAction::DeviceCommand` (processing.rs:1637-1643).
+/// `ProcessAction::DeviceCommand` (processing.rs DeviceCommand arm).
+///
+/// Returns the accumulated record-field names every `handle_command`
+/// reported as changed — these are exactly the fields the framework
+/// posts `DBE_VALUE` monitor events for (C `db_post_events`,
+/// `scalerRecord.c:425-430`).
 fn run_device_commands(
     support: &mut dyn epics_base_rs::server::device_support::DeviceSupport,
     rec: &mut ScalerRecord,
     actions: &[epics_base_rs::server::record::ProcessAction],
-) {
+) -> Vec<&'static str> {
     use epics_base_rs::server::record::ProcessAction;
+    let mut posted = Vec::new();
     for action in actions {
         if let ProcessAction::DeviceCommand { command, args } = action {
-            support.handle_command(rec, command, args).unwrap();
+            posted.extend(support.handle_command(rec, command, args).unwrap());
         }
     }
+    posted
 }
 
 /// C scalerRecord.c:405-432 — REQSTART: after the per-channel

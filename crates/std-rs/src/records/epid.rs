@@ -191,6 +191,32 @@ pub struct EpidRecord {
     /// such a cycle the framework must NOT write the OUTL link
     /// (`multi_output_links`) or fire the forward link.
     compute_skipped: bool,
+    /// True iff the framework's input-link fetch for `STPL` actually
+    /// produced a value this cycle — the framework analogue of C
+    /// `RTN_SUCCESS(dbGetLink(&prec->stpl, ...))`. Pushed by the
+    /// framework via [`Record::set_resolved_input_links`] after the
+    /// `multi_input_links` fetch (STPL is only in that list when
+    /// `SMSL == closed_loop`). C `epidRecord.c:191-193` clears `udf`
+    /// only on this success — a STPL that is empty, or a DB/CA link
+    /// whose fetch failed, leaves `udf` set.
+    stpl_resolved: bool,
+    /// Epid-owned `dbCommon.udf` projection, returned by
+    /// [`Record::value_is_undefined`]. C `epidRecord.c` has
+    /// `special = NULL` (line 105) — there is no operator UDF clear,
+    /// and `udf` is cleared ONLY by the two C conditions:
+    ///
+    /// - `epidRecord.c:160-164` init: a CONSTANT `STPL` link holding
+    ///   a valid constant clears `udf` (mirrored by
+    ///   [`Record::post_init_finalize_undef`] / a CONSTANT `STPL`
+    ///   making `value_is_undefined()` return `false`).
+    /// - `epidRecord.c:191-193` process: closed-loop (`SMSL=1`) with
+    ///   a successful `dbGetLink(stpl)` clears `udf`.
+    ///
+    /// `process()` recomputes this each cycle; the framework's
+    /// post-process `common.udf = value_is_undefined()` then keeps a
+    /// supervisory / empty-STPL epid permanently undefined, exactly as
+    /// C leaves `udf == TRUE` forever for such a record.
+    value_undefined: bool,
 }
 
 impl Default for EpidRecord {
@@ -252,6 +278,10 @@ impl Default for EpidRecord {
             inp_constant: false,
             udf: true,
             compute_skipped: false,
+            stpl_resolved: false,
+            // C `epidRecord.c` init: `udf` starts TRUE and is cleared
+            // only by the two clear-conditions — see `value_undefined`.
+            value_undefined: true,
         }
     }
 }
@@ -655,21 +685,52 @@ impl Record for EpidRecord {
         // Rust equivalent of "device support already ran do_pid" — the
         // callback pass — so the gate applies only when it is false.
         //
-        // C `epidRecord.c:191-193`: in closed-loop mode (SMSL=1) a
-        // successful `dbGetLink(stpl)` clears `udf` *before* the
-        // `if (udf==TRUE)` check at line 195. The framework fetches
-        // STPL→VAL (via `multi_input_links`, SMSL=1 only) before
-        // `process()` but only recomputes `common.udf` *after* it, so
-        // the pushed `self.udf` is last cycle's state. Mirror C: a
-        // closed-loop epid with a now-defined VAL is no longer undefined.
-        // Fresh cycle: assume the compute will run. The UDF gate below
-        // sets this true to suppress the framework's OUT-link write and
-        // FLNK — C `epidRecord.c:201` `return(0)` happens *before*
-        // `recGblFwdLink` and before `do_pid` writes the output.
+        // C `epidRecord.c` clears `udf` ONLY at two sites (`special` is
+        // NULL — there is no operator UDF clear):
+        //   - `epidRecord.c:160-164` init: a CONSTANT `STPL` link with a
+        //     valid constant. A constant link's value never changes, so
+        //     it is "defined" on every cycle thereafter.
+        //   - `epidRecord.c:191-193` process: closed-loop (`SMSL=1`)
+        //     with `RTN_SUCCESS(dbGetLink(&prec->stpl, ...))` — an
+        //     ACTUAL fetch success. `self.stpl_resolved` is the
+        //     framework's report of exactly that (a STPL that is empty,
+        //     or whose DB/CA fetch failed, leaves it false).
+        // Otherwise `udf` stays TRUE forever and C `epidRecord.c:195`
+        // `return(0)` skips `do_pid` every cycle — e.g. a supervisory
+        // (`SMSL=0`) epid with an empty/non-constant STPL NEVER runs
+        // `do_pid`.
+        //
+        // `self.udf` is the framework `dbCommon.udf` pushed before
+        // `process()`; it is last cycle's value because the framework
+        // recomputes `common.udf` (from `value_is_undefined()`) only
+        // *after* `process()`. C reads `pepid->udf` at process-start
+        // identically. `udf` is sticky-false: once C clears it, it is
+        // never re-set — so the gate keys off `self.udf`, and a closed-
+        // loop epid whose STPL later fails keeps running `do_pid`.
+        //
+        // `value_undefined` is recomputed here for the framework's
+        // post-process `common.udf = value_is_undefined()`.
         self.compute_skipped = false;
+        // C clear-conditions, evaluated at process-start:
+        //  - CONSTANT STPL link  → init `recGblInitConstantLink` cleared
+        //    udf permanently (`epidRecord.c:160-164`).
+        //  - closed-loop STPL fetch succeeded this cycle
+        //    (`epidRecord.c:191-193`).
+        //
+        // `stpl_resolved` is a per-cycle signal: consume it and reset
+        // so a later `process_local`-path cycle (which performs no
+        // link resolution and never calls `set_resolved_input_links`)
+        // cannot read a stale "resolved" from an earlier links-path
+        // cycle.
+        let stpl_resolved = self.stpl_resolved;
+        self.stpl_resolved = false;
+        let stpl_clears_udf =
+            link_field_type(&self.stpl) == LinkType::Constant || (self.smsl == 1 && stpl_resolved);
+        // udf state this cycle: undefined unless already cleared
+        // (`!self.udf`) or a clear-condition fires now.
+        self.value_undefined = self.udf && !stpl_clears_udf;
         if !self.device_did_compute {
-            let stpl_cleared_udf = self.smsl == 1 && !self.val.is_nan();
-            if self.udf && !stpl_cleared_udf {
+            if self.value_undefined {
                 // C `epidRecord.c:195-202`: while `udf==TRUE`, skip
                 // `do_pid` entirely and `return 0` — *before*
                 // `recGblGetTimeStamp`, `checkAlarms`, `monitor` and
@@ -1058,6 +1119,25 @@ impl Record for EpidRecord {
         Some(self)
     }
 
+    /// C `epidRecord.c` UDF ownership — see [`EpidRecord::value_undefined`].
+    ///
+    /// The framework's post-`process()` step runs
+    /// `common.udf = value_is_undefined()` (gated on `clears_udf()`,
+    /// left at its `true` default). Returning the epid-owned
+    /// `value_undefined` — recomputed in `process()` from the two C
+    /// clear-conditions — keeps `udf` TRUE for a supervisory / empty-
+    /// STPL epid (so its UDF gate fires every cycle, as C does) and
+    /// clears it only on a CONSTANT STPL or a successful closed-loop
+    /// `dbGetLink(stpl)`.
+    ///
+    /// The default `value_is_undefined()` keys off `VAL` being NaN,
+    /// which for an epid (`VAL` defaults to a finite `0.0`, never NaN)
+    /// would wrongly clear `udf` after the first cycle — the bug this
+    /// override fixes.
+    fn value_is_undefined(&self) -> bool {
+        self.value_undefined
+    }
+
     fn set_device_did_compute(&mut self, did_compute: bool) {
         self.device_did_compute = did_compute;
     }
@@ -1067,6 +1147,40 @@ impl Record for EpidRecord {
     /// captures it so `process()` can gate `do_pid` on it.
     fn set_process_context(&mut self, ctx: &ProcessContext) {
         self.udf = ctx.udf;
+    }
+
+    /// Framework report of which `multi_input_links` fetches produced a
+    /// value this cycle — the analogue of C
+    /// `RTN_SUCCESS(dbGetLink(&prec->stpl, ...))` (`epidRecord.c:191`).
+    /// `STPL` is only ever in `multi_input_links` when
+    /// `SMSL == closed_loop`; its presence here means the closed-loop
+    /// setpoint fetch actually succeeded this cycle. A STPL that is
+    /// empty, or a DB/CA link whose fetch failed, is absent — so
+    /// `stpl_resolved` is reset to false and `udf` is not cleared.
+    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+        self.stpl_resolved = resolved.contains(&"STPL");
+    }
+
+    /// C `epidRecord.c:160-164` `init_record`: when `STPL` is a
+    /// CONSTANT link holding a valid constant, `recGblInitConstantLink`
+    /// seeds `VAL` from the constant and `udf` is cleared. The
+    /// framework owns `dbCommon.udf`; this hook is its controlled
+    /// access point. Runs once after `init_record`.
+    ///
+    /// For `SMSL == closed_loop` the framework also fetches `STPL` into
+    /// `VAL` via `multi_input_links` every cycle; the constant seed
+    /// here matters for the supervisory (`SMSL=0`) case and for the
+    /// first cycle before any process.
+    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+        let parsed = epics_base_rs::server::record::parse_link_v2(&self.stpl);
+        if parsed.link_type() == LinkType::Constant {
+            if let Some(EpicsValue::Double(v)) = parsed.constant_value() {
+                self.val = v;
+                *udf = false;
+                self.value_undefined = false;
+            }
+        }
+        Ok(())
     }
 
     fn put_field_internal(

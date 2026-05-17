@@ -1176,10 +1176,10 @@ fn test_process_runs_do_pid_once_udf_cleared() {
 
 /// C `epidRecord.c:191-193`: in closed-loop mode (SMSL=1) a successful
 /// `dbGetLink(stpl)` clears `udf` *before* the `if (udf==TRUE)` check.
-/// The framework fetches STPL->VAL before process() but recomputes
-/// `common.udf` only after it, so the pushed `udf` is stale-TRUE on the
-/// first cycle. A closed-loop epid with a now-defined VAL must still run
-/// do_pid that cycle.
+/// The framework fetches STPL->VAL before process() and reports the
+/// fetch success via `set_resolved_input_links(&["STPL"])`; with that
+/// signal, a closed-loop epid runs do_pid that cycle even though the
+/// pushed `udf` is still the stale-TRUE from before the fetch.
 #[test]
 fn test_process_closed_loop_runs_do_pid_when_stpl_gave_value() {
     let mut rec = EpidRecord::default();
@@ -1192,15 +1192,54 @@ fn test_process_closed_loop_runs_do_pid_when_stpl_gave_value() {
     rec.mdt = 0.0;
     std::thread::sleep(std::time::Duration::from_millis(5));
 
-    // Framework still pushes the stale udf=TRUE.
+    // Framework reports the STPL fetch succeeded this cycle, then
+    // pushes the stale udf=TRUE (recomputed only after process()).
+    rec.set_resolved_input_links(&["STPL"]);
     rec.set_process_context(&ctx_with_udf(true));
     rec.process().unwrap();
 
     assert!(
         (rec.p - 180.0).abs() < 1e-6,
-        "closed-loop epid with a defined VAL must run do_pid even when \
-         the pushed udf is stale-TRUE; P should be ~180.0, got {}",
+        "closed-loop epid whose STPL fetch succeeded must run do_pid \
+         even when the pushed udf is stale-TRUE; P should be ~180.0, \
+         got {}",
         rec.p
+    );
+}
+
+/// C `epidRecord.c:191-193`: in closed-loop mode the `udf` clear is
+/// gated on `RTN_SUCCESS(dbGetLink(&prec->stpl, ...))` — an ACTUAL
+/// fetch success. A closed-loop epid whose STPL link is empty / its
+/// DB/CA fetch failed (the framework reports NO resolved STPL) must
+/// keep `udf` set and skip do_pid — Bug 2 regression guard.
+#[test]
+fn test_process_closed_loop_keeps_udf_when_stpl_fetch_failed() {
+    let mut rec = EpidRecord::default();
+    rec.kp = 2.0;
+    rec.smsl = 1; // closed-loop
+    rec.val = 100.0; // default 0.0 would also exercise this; explicit here
+    rec.cval = 10.0;
+    rec.fbon = 1;
+    rec.fbop = 1;
+    rec.mdt = 0.0;
+    let p_before = rec.p;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    // Framework reports NO link resolved this cycle (STPL fetch failed
+    // or STPL empty), then pushes udf=TRUE.
+    rec.set_resolved_input_links(&[]);
+    rec.set_process_context(&ctx_with_udf(true));
+    rec.process().unwrap();
+
+    assert_eq!(
+        rec.p, p_before,
+        "closed-loop epid whose STPL fetch failed must keep udf set and \
+         skip do_pid — !val.is_nan() must NOT proxy fetch success"
+    );
+    assert!(
+        rec.value_is_undefined(),
+        "value_is_undefined() must stay true so the framework keeps \
+         common.udf set for the next cycle"
     );
 }
 

@@ -9,8 +9,24 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 /// Maximum accumulated TCP read buffer per client (DoS guard).
+///
+/// This MUST be >= the largest legal single frame, otherwise a valid
+/// large waveform (e.g. a 2 MB array, well under the 16 MB
+/// `max_payload_size()` default) would push `accumulated` past the cap
+/// and the connection would be closed before the frame could be
+/// dispatched — a permanent failure that survives reconnect.
+///
+/// Largest legal frame = extended header (24 bytes) + `max_payload_size()`
+/// payload. We add a 64 KiB slack so a partially-received *next* frame
+/// pipelined behind a full one in the same read burst does not trip the
+/// guard before the first frame is drained. `max_payload_size()` honours
+/// `EPICS_CA_MAX_ARRAY_BYTES`, so the cap tracks any operator override.
 /// Mirrors the client-side cap in `client/transport.rs`.
-const MAX_ACCUMULATED: usize = 1024 * 1024; // 1 MB
+fn max_accumulated() -> usize {
+    crate::protocol::max_payload_size()
+        .saturating_add(24)
+        .saturating_add(64 * 1024)
+}
 
 /// Optional application-level idle timeout before forcibly closing a TCP
 /// client. Disabled by default — OS-level TCP keepalive (set in `accept_loop`,
@@ -962,290 +978,318 @@ where
     let mut accumulated = Vec::new();
     let inactivity = inactivity_timeout();
 
-    loop {
-        // Bound read with inactivity timeout so a fully-silent half-open
-        // connection eventually gets cleaned up even if OS keepalive failed.
-        // Race the read against ACF reload notifications so a `reload_acf*()`
-        // call promptly re-pushes CA_PROTO_ACCESS_RIGHTS for every open
-        // channel — RSRV's `sendAllUpdateAS` analog.
-        let n = tokio::select! {
-            biased;
-            reload = acf_reload_rx.recv() => {
-                match reload {
-                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Lagged is fine — even one missed notification still
-                        // means "rules changed", so we always recompute.
-                        reeval_access_rights(&mut state, &writer).await?;
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Sender dropped — the server is going away.
-                        break;
+    // CRITICAL: every exit path from the read loop — graceful EOF
+    // (`break`), propagated I/O / protocol error, rate-limit disconnect,
+    // send-timeout disconnect — MUST pass through the single teardown
+    // block below (subscription cancel, write-notify abort,
+    // SubscriptionClosed / ChannelCleared emission). Previously the
+    // in-loop `return Ok(())` / `return Err(..)` sites bypassed the
+    // teardown, leaking write-notify tasks and inflating consumer
+    // refcounts permanently after any non-graceful disconnect.
+    //
+    // The loop is wrapped in a labeled block: in-loop exits use
+    // `break 'client_loop <CaResult>` so control always reaches the
+    // teardown, and the captured result is returned only afterwards.
+    //
+    // `disconnect_reason` carries the specific cause (rate_limited /
+    // send_timeout / error / ok) to the single post-teardown audit
+    // call — replacing the per-path `state.audit("disconnect", ..)`
+    // calls that previously had to live next to each `return`.
+    let mut disconnect_reason: &str = "ok";
+    let loop_result: CaResult<()> = 'client_loop: {
+        loop {
+            // Bound read with inactivity timeout so a fully-silent half-open
+            // connection eventually gets cleaned up even if OS keepalive failed.
+            // Race the read against ACF reload notifications so a `reload_acf*()`
+            // call promptly re-pushes CA_PROTO_ACCESS_RIGHTS for every open
+            // channel — RSRV's `sendAllUpdateAS` analog.
+            let n = tokio::select! {
+                biased;
+                reload = acf_reload_rx.recv() => {
+                    match reload {
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Lagged is fine — even one missed notification still
+                            // means "rules changed", so we always recompute. A
+                            // re-push failure must still pass through teardown.
+                            if let Err(e) = reeval_access_rights(&mut state, &writer).await {
+                                break 'client_loop Err(e);
+                            }
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // Sender dropped — the server is going away.
+                            break 'client_loop Ok(());
+                        }
                     }
                 }
-            }
-            read = read_with_optional_timeout(&mut reader, &mut buf, inactivity) => {
-                match read {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(idle) => {
-                        // Inactivity timeout — close the connection.
-                        // Disabled by default (matches C rsrv); fires only
-                        // when EPICS_CAS_INACTIVITY_TMO is set explicitly.
-                        tracing::warn!(
-                            target: "epics_ca_rs::server",
-                            peer = %state.peer,
-                            idle_secs = idle.as_secs(),
-                            "CA server: client idle, closing"
-                        );
-                        break;
+                read = read_with_optional_timeout(&mut reader, &mut buf, inactivity) => {
+                    match read {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(e)) => break 'client_loop Err(e.into()),
+                        Err(idle) => {
+                            // Inactivity timeout — close the connection.
+                            // Disabled by default (matches C rsrv); fires only
+                            // when EPICS_CAS_INACTIVITY_TMO is set explicitly.
+                            tracing::warn!(
+                                target: "epics_ca_rs::server",
+                                peer = %state.peer,
+                                idle_secs = idle.as_secs(),
+                                "CA server: client idle, closing"
+                            );
+                            break 'client_loop Ok(());
+                        }
                     }
                 }
+            };
+            if n == 0 {
+                break 'client_loop Ok(());
             }
-        };
-        if n == 0 {
-            break;
-        }
 
-        // PR #592 dbServerStats: bytes_in mirrors RSRV's
-        // `caServerBytes_in`. Counted on every successful read of `n`
-        // wire bytes, regardless of whether the inner dispatch
-        // accepts or rejects the message.
-        if let Some(ref s) = stats {
-            s.bytes_in
-                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Chaos: optional stall + simulated read drop. Compiles to a
-        // single branch when EPICS_CA_RS_CHAOS is unset.
-        if crate::chaos::enabled() {
-            crate::chaos::maybe_stall().await;
-            if crate::chaos::should_drop_read() {
-                continue;
+            // PR #592 dbServerStats: bytes_in mirrors RSRV's
+            // `caServerBytes_in`. Counted on every successful read of `n`
+            // wire bytes, regardless of whether the inner dispatch
+            // accepts or rejects the message.
+            if let Some(ref s) = stats {
+                s.bytes_in
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
             }
-        }
 
-        accumulated.extend_from_slice(&buf[..n]);
+            // Chaos: optional stall + simulated read drop. Compiles to a
+            // single branch when EPICS_CA_RS_CHAOS is unset.
+            if crate::chaos::enabled() {
+                crate::chaos::maybe_stall().await;
+                if crate::chaos::should_drop_read() {
+                    continue;
+                }
+            }
 
-        // DoS guard: a malformed or hostile client could declare a huge
-        // postsize and stream nothing more, growing this Vec unbounded.
-        if accumulated.len() > MAX_ACCUMULATED {
-            eprintln!(
-                "CA server: client accumulated buffer exceeded {} bytes, closing",
-                MAX_ACCUMULATED
-            );
-            break;
-        }
+            accumulated.extend_from_slice(&buf[..n]);
 
-        let mut offset = 0;
-        while offset + CaHeader::SIZE <= accumulated.len() {
-            // C `camessage` dispatcher (camessage.c:2471-2489): if
-            // msgsize > maxstk (recv buffer ceiling, =
-            // rsrvSizeofLargeBufTCP after expand), emit ECA_TOLARGE
-            // via send_err and drain the rest of the message. Rust
-            // `CaHeader::from_bytes_extended` returns
-            // CaError::Protocol("payload too large") when the
-            // extended postsize exceeds `max_payload_size()`
-            // (default 16 MiB), and the `?` propagation silently
-            // closes the connection. C clients waiting on the
-            // ECA_TOLARGE error callback see only EOF. Pre-check
-            // the extended postsize here and emit the wire reply
-            // before propagating the error.
-            //
-            // Normal-form headers can't overflow `max_payload_size()`
-            // because their postsize is u16 (max 0xfffe < 16 MiB),
-            // so the check only triggers on extended frames.
-            let buf = &accumulated[offset..];
-            if buf.len() >= 24 && buf[2] == 0xFF && buf[3] == 0xFF {
-                let ext_post = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
-                if ext_post > crate::protocol::max_payload_size() {
-                    // Build a stand-in header for the error reply
-                    // (cmmd echoed from the malformed frame; cid
-                    // sentinel 0xFFFFFFFF per `vsend_err`
-                    // non-channel-scoped convention).
-                    let mut probe_hdr = CaHeader::new(u16::from_be_bytes([buf[0], buf[1]]));
-                    probe_hdr.data_type = u16::from_be_bytes([buf[4], buf[5]]);
+            // DoS guard: a malformed or hostile client could declare a huge
+            // postsize and stream nothing more, growing this Vec unbounded.
+            let accum_cap = max_accumulated();
+            if accumulated.len() > accum_cap {
+                eprintln!(
+                    "CA server: client accumulated buffer exceeded {accum_cap} bytes, closing"
+                );
+                break 'client_loop Ok(());
+            }
+
+            let mut offset = 0;
+            while offset + CaHeader::SIZE <= accumulated.len() {
+                // C `camessage` dispatcher (camessage.c:2471-2489): if
+                // msgsize > maxstk (recv buffer ceiling, =
+                // rsrvSizeofLargeBufTCP after expand), emit ECA_TOLARGE
+                // via send_err and drain the rest of the message. Rust
+                // `CaHeader::from_bytes_extended` returns
+                // CaError::Protocol("payload too large") when the
+                // extended postsize exceeds `max_payload_size()`
+                // (default 16 MiB), and the `?` propagation silently
+                // closes the connection. C clients waiting on the
+                // ECA_TOLARGE error callback see only EOF. Pre-check
+                // the extended postsize here and emit the wire reply
+                // before propagating the error.
+                //
+                // Normal-form headers can't overflow `max_payload_size()`
+                // because their postsize is u16 (max 0xfffe < 16 MiB),
+                // so the check only triggers on extended frames.
+                let buf = &accumulated[offset..];
+                if buf.len() >= 24 && buf[2] == 0xFF && buf[3] == 0xFF {
+                    let ext_post =
+                        u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
+                    if ext_post > crate::protocol::max_payload_size() {
+                        // Build a stand-in header for the error reply
+                        // (cmmd echoed from the malformed frame; cid
+                        // sentinel 0xFFFFFFFF per `vsend_err`
+                        // non-channel-scoped convention).
+                        let mut probe_hdr = CaHeader::new(u16::from_be_bytes([buf[0], buf[1]]));
+                        probe_hdr.data_type = u16::from_be_bytes([buf[4], buf[5]]);
+                        let _ = send_ca_error(
+                            &writer,
+                            &probe_hdr,
+                            ECA_TOLARGE,
+                            0xFFFF_FFFF,
+                            "CAS: Server unable to load large request message",
+                        )
+                        .await;
+                        let _ = writer.lock().await.flush().await;
+                        break 'client_loop Err(epics_base_rs::error::CaError::Protocol(format!(
+                            "CA payload too large: ext_post={} > max={} \
+                         (matches C dispatcher ECA_TOLARGE wire reply + drop)",
+                            ext_post,
+                            crate::protocol::max_payload_size()
+                        )));
+                    }
+                }
+                // C `rsrv/camessage.c:~2410`: when the buffer holds a
+                // partial extended-form header (16..24 bytes of a message
+                // whose `m_postsize == 0xffff`), C does `status = RSRV_OK;
+                // break;` to await the remaining bytes — it does NOT
+                // disconnect. Without this guard, `from_bytes_extended`
+                // returns `Err("extended header incomplete")` and the `?`
+                // below closes the connection on a benign TCP segment
+                // boundary. The ECA_TOLARGE pre-check above is gated on
+                // `buf.len() >= 24`, so it never masks this 16..24 window.
+                if buf.len() < 24 && buf[2] == 0xFF && buf[3] == 0xFF {
+                    break;
+                }
+                let (hdr, hdr_size) = match CaHeader::from_bytes_extended(&accumulated[offset..]) {
+                    Ok(v) => v,
+                    Err(e) => break 'client_loop Err(e),
+                };
+                let actual_post = hdr.actual_postsize();
+                // C `rsrv/camessage.c:2452` rejects misaligned payloads
+                // ("CAS: Missaligned protocol rejected") with an
+                // ECA_INTERNAL error and disconnects the client. Our
+                // previous code silently rounded up via `align8`, which on
+                // a hostile peer would cause us to read into the next
+                // message's header and de-sync the stream. Now: emit
+                // CA_PROTO_ERROR + drop the connection (match C).
+                if actual_post & 0x7 != 0 {
+                    tracing::warn!(
+                        peer = %state.peer,
+                        cmmd = hdr.cmmd,
+                        postsize = actual_post,
+                        "CAS: Missaligned protocol rejected"
+                    );
                     let _ = send_ca_error(
                         &writer,
-                        &probe_hdr,
-                        ECA_TOLARGE,
+                        &hdr,
+                        ECA_INTERNAL,
                         0xFFFF_FFFF,
-                        "CAS: Server unable to load large request message",
+                        "CAS: Missaligned protocol rejected",
                     )
                     .await;
                     let _ = writer.lock().await.flush().await;
-                    return Err(epics_base_rs::error::CaError::Protocol(format!(
-                        "CA payload too large: ext_post={} > max={} \
-                         (matches C dispatcher ECA_TOLARGE wire reply + drop)",
-                        ext_post,
-                        crate::protocol::max_payload_size()
-                    )));
+                    break 'client_loop Err(epics_base_rs::error::CaError::Protocol(
+                        "misaligned CA payload".into(),
+                    ));
                 }
-            }
-            // C `rsrv/camessage.c:~2410`: when the buffer holds a
-            // partial extended-form header (16..24 bytes of a message
-            // whose `m_postsize == 0xffff`), C does `status = RSRV_OK;
-            // break;` to await the remaining bytes — it does NOT
-            // disconnect. Without this guard, `from_bytes_extended`
-            // returns `Err("extended header incomplete")` and the `?`
-            // below closes the connection on a benign TCP segment
-            // boundary. The ECA_TOLARGE pre-check above is gated on
-            // `buf.len() >= 24`, so it never masks this 16..24 window.
-            if buf.len() < 24 && buf[2] == 0xFF && buf[3] == 0xFF {
-                break;
-            }
-            let (hdr, hdr_size) = CaHeader::from_bytes_extended(&accumulated[offset..])?;
-            let actual_post = hdr.actual_postsize();
-            // C `rsrv/camessage.c:2452` rejects misaligned payloads
-            // ("CAS: Missaligned protocol rejected") with an
-            // ECA_INTERNAL error and disconnects the client. Our
-            // previous code silently rounded up via `align8`, which on
-            // a hostile peer would cause us to read into the next
-            // message's header and de-sync the stream. Now: emit
-            // CA_PROTO_ERROR + drop the connection (match C).
-            if actual_post & 0x7 != 0 {
-                tracing::warn!(
-                    peer = %state.peer,
-                    cmmd = hdr.cmmd,
-                    postsize = actual_post,
-                    "CAS: Missaligned protocol rejected"
-                );
-                let _ = send_ca_error(
-                    &writer,
-                    &hdr,
-                    ECA_INTERNAL,
-                    0xFFFF_FFFF,
-                    "CAS: Missaligned protocol rejected",
-                )
-                .await;
-                let _ = writer.lock().await.flush().await;
-                return Err(epics_base_rs::error::CaError::Protocol(
-                    "misaligned CA payload".into(),
-                ));
-            }
-            let msg_len = hdr_size + actual_post;
+                let msg_len = hdr_size + actual_post;
 
-            if offset + msg_len > accumulated.len() {
-                break;
-            }
+                if offset + msg_len > accumulated.len() {
+                    break;
+                }
 
-            let payload = if actual_post > 0 {
-                accumulated[offset + hdr_size..offset + hdr_size + actual_post].to_vec()
-            } else {
-                Vec::new()
-            };
+                let payload = if actual_post > 0 {
+                    accumulated[offset + hdr_size..offset + hdr_size + actual_post].to_vec()
+                } else {
+                    Vec::new()
+                };
 
-            // Rate-limit gate: drop messages when the bucket is empty;
-            // disconnect the client once it accumulates enough strikes.
-            if let Some(ref limiter) = state.rate_limiter {
-                if limiter.try_acquire().is_err() {
-                    metrics::counter!("ca_server_rate_limit_drops_total").increment(1);
-                    state.rate_limit_strikes = state.rate_limit_strikes.saturating_add(1);
-                    if state.rate_limit_strike_threshold > 0
-                        && state.rate_limit_strikes >= state.rate_limit_strike_threshold
-                    {
-                        tracing::warn!(peer = %state.peer, strikes = state.rate_limit_strikes,
+                // Rate-limit gate: drop messages when the bucket is empty;
+                // disconnect the client once it accumulates enough strikes.
+                if let Some(ref limiter) = state.rate_limiter {
+                    if limiter.try_acquire().is_err() {
+                        metrics::counter!("ca_server_rate_limit_drops_total").increment(1);
+                        state.rate_limit_strikes = state.rate_limit_strikes.saturating_add(1);
+                        if state.rate_limit_strike_threshold > 0
+                            && state.rate_limit_strikes >= state.rate_limit_strike_threshold
+                        {
+                            tracing::warn!(peer = %state.peer, strikes = state.rate_limit_strikes,
                             "rate limit exceeded; closing connection");
-                        metrics::counter!("ca_server_rate_limit_disconnects_total").increment(1);
-                        state.audit("disconnect", "", "", "rate_limited").await;
-                        return Ok(());
+                            metrics::counter!("ca_server_rate_limit_disconnects_total")
+                                .increment(1);
+                            disconnect_reason = "rate_limited";
+                            break 'client_loop Ok(());
+                        }
+                        offset += msg_len;
+                        continue;
+                    } else if state.rate_limit_strikes > 0 {
+                        state.rate_limit_strikes = 0;
                     }
-                    offset += msg_len;
-                    continue;
-                } else if state.rate_limit_strikes > 0 {
-                    state.rate_limit_strikes = 0;
                 }
+
+                // Wrap dispatch in send_timeout so a stuck-reader client
+                // (kernel send buffer full → `write_all` Pending forever)
+                // can be detected and disconnected. Without this, one
+                // misbehaving client could deadlock its own per-client
+                // task indefinitely. On timeout we drop the connection;
+                // any in-flight reply is discarded.
+                match tokio::time::timeout(
+                    send_timeout(),
+                    dispatch_message(
+                        &hdr,
+                        &payload,
+                        &mut state,
+                        &db,
+                        &writer,
+                        peer,
+                        conn_events.as_ref(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        // Regression defence: dispatch_message no longer
+                        // flushes per response (batched at the bottom of
+                        // this outer loop). On a propagated dispatch
+                        // error, exit-via-`?` would drop the BufWriter
+                        // before the outer flush fires, so any responses
+                        // queued by earlier successful handlers in this
+                        // batch — or by an error-path `send_cmd_error`
+                        // call inside the failing handler — would be
+                        // lost. Best-effort flush before propagating so
+                        // the client sees them; ignore errors here
+                        // because the underlying TCP is most likely
+                        // already broken (which is why dispatch failed).
+                        let _ = writer.lock().await.flush().await;
+                        break 'client_loop Err(e);
+                    }
+                    Err(_) => {
+                        // send_timeout fires — dispatch_message future is
+                        // cancelled mid-flight. BufWriter may hold a
+                        // partial frame (e.g., header without payload if
+                        // cancellation landed between the two write_alls
+                        // of a READ_NOTIFY response). Flushing here would
+                        // ship the orphan header to the client and leave
+                        // it parsing an incomplete frame, so we skip the
+                        // flush and let BufWriter drop discard the
+                        // partial bytes — same behaviour as before the
+                        // batch-flush refactor.
+                        tracing::warn!(
+                            peer = %peer,
+                            "CA server: dispatch send-timeout (stuck client?), closing"
+                        );
+                        disconnect_reason = "send_timeout";
+                        break 'client_loop Ok(());
+                    }
+                }
+                offset += msg_len;
             }
 
-            // Wrap dispatch in send_timeout so a stuck-reader client
-            // (kernel send buffer full → `write_all` Pending forever)
-            // can be detected and disconnected. Without this, one
-            // misbehaving client could deadlock its own per-client
-            // task indefinitely. On timeout we drop the connection;
-            // any in-flight reply is discarded.
-            match tokio::time::timeout(
-                send_timeout(),
-                dispatch_message(
-                    &hdr,
-                    &payload,
-                    &mut state,
-                    &db,
-                    &writer,
-                    peer,
-                    conn_events.as_ref(),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    // Regression defence: dispatch_message no longer
-                    // flushes per response (batched at the bottom of
-                    // this outer loop). On a propagated dispatch
-                    // error, exit-via-`?` would drop the BufWriter
-                    // before the outer flush fires, so any responses
-                    // queued by earlier successful handlers in this
-                    // batch — or by an error-path `send_cmd_error`
-                    // call inside the failing handler — would be
-                    // lost. Best-effort flush before propagating so
-                    // the client sees them; ignore errors here
-                    // because the underlying TCP is most likely
-                    // already broken (which is why dispatch failed).
-                    let _ = writer.lock().await.flush().await;
-                    return Err(e);
+            if offset > 0 {
+                accumulated.drain(..offset);
+                // Batched flush: dispatch_message buffered all responses for
+                // this read iteration into BufWriter without flushing. Flush
+                // once now so the kernel sees a single TCP write per inbound
+                // burst. Cuts e2e_bulk_get_many(100) from ~225µs → batched
+                // single write (server-side throughput floor was ~2.2µs/PV
+                // due to per-message flush; this collapses it to one syscall).
+                //
+                // Errors here mean the TCP write stalled / peer closed —
+                // surface as the read loop's normal disconnect path.
+                let mut w = writer.lock().await;
+                // PR #592 dbServerStats: bytes_out mirrors RSRV's
+                // `caServerBytes_out`. Capture the buffered size *before*
+                // flush so we know exactly how many wire bytes leave on
+                // this syscall. CA-over-TLS counts post-decrypt plaintext
+                // since the rustls layer wraps the BufWriter externally —
+                // matches what the comment on ServerStats::bytes_out
+                // already documents.
+                let pending_out = w.buffer().len() as u64;
+                if let Err(e) = w.flush().await {
+                    break 'client_loop Err(e.into());
                 }
-                Err(_) => {
-                    // send_timeout fires — dispatch_message future is
-                    // cancelled mid-flight. BufWriter may hold a
-                    // partial frame (e.g., header without payload if
-                    // cancellation landed between the two write_alls
-                    // of a READ_NOTIFY response). Flushing here would
-                    // ship the orphan header to the client and leave
-                    // it parsing an incomplete frame, so we skip the
-                    // flush and let BufWriter drop discard the
-                    // partial bytes — same behaviour as before the
-                    // batch-flush refactor.
-                    tracing::warn!(
-                        peer = %peer,
-                        "CA server: dispatch send-timeout (stuck client?), closing"
-                    );
-                    state.audit("disconnect", "", "", "send_timeout").await;
-                    return Ok(());
+                if let Some(ref s) = stats {
+                    s.bytes_out
+                        .fetch_add(pending_out, std::sync::atomic::Ordering::Relaxed);
                 }
+                drop(w);
             }
-            offset += msg_len;
         }
-
-        if offset > 0 {
-            accumulated.drain(..offset);
-            // Batched flush: dispatch_message buffered all responses for
-            // this read iteration into BufWriter without flushing. Flush
-            // once now so the kernel sees a single TCP write per inbound
-            // burst. Cuts e2e_bulk_get_many(100) from ~225µs → batched
-            // single write (server-side throughput floor was ~2.2µs/PV
-            // due to per-message flush; this collapses it to one syscall).
-            //
-            // Errors here mean the TCP write stalled / peer closed —
-            // surface as the read loop's normal disconnect path.
-            let mut w = writer.lock().await;
-            // PR #592 dbServerStats: bytes_out mirrors RSRV's
-            // `caServerBytes_out`. Capture the buffered size *before*
-            // flush so we know exactly how many wire bytes leave on
-            // this syscall. CA-over-TLS counts post-decrypt plaintext
-            // since the rustls layer wraps the BufWriter externally —
-            // matches what the comment on ServerStats::bytes_out
-            // already documents.
-            let pending_out = w.buffer().len() as u64;
-            if let Err(e) = w.flush().await {
-                return Err(e.into());
-            }
-            if let Some(ref s) = stats {
-                s.bytes_out
-                    .fetch_add(pending_out, std::sync::atomic::Ordering::Relaxed);
-            }
-            drop(w);
-        }
-    }
+    };
 
     // Cleanup: cancel all subscriptions. PR #592 dbServerStats —
     // emit `SubscriptionClosed` for each so the running close-count
@@ -1305,8 +1349,15 @@ where
         }
     }
 
-    state.audit("disconnect", "", "", "ok").await;
-    Ok(())
+    // Audit with the outcome the loop exited on, then return that
+    // outcome. The teardown above ran unconditionally regardless of
+    // whether `loop_result` is Ok or Err. An Err exit that did not set
+    // a more specific reason is reported as "error".
+    if loop_result.is_err() && disconnect_reason == "ok" {
+        disconnect_reason = "error";
+    }
+    state.audit("disconnect", "", "", disconnect_reason).await;
+    loop_result
 }
 
 async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
@@ -1940,9 +1991,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             resp.data_type = requested_type;
             resp.available = ioid;
 
+            // Abort-safety: a `send_timeout` cancel landing between a
+            // separate header and payload `write_all` would leave an
+            // orphan header in the shared BufWriter and mis-frame every
+            // following message. Build the whole READ/READ_NOTIFY frame
+            // as ONE contiguous buffer and issue a single `write_all`,
+            // so a cancel can only land at a frame boundary. Same fix
+            // already applied to the monitor path (`monitor.rs`).
+            let hdr_bytes = resp.to_bytes_extended();
+            let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
+            frame.extend_from_slice(&hdr_bytes);
+            frame.extend_from_slice(&padded);
             let mut w = writer.lock().await;
-            w.write_all(&resp.to_bytes_extended()).await?;
-            w.write_all(&padded).await?;
+            w.write_all(&frame).await?;
             // flush deferred to handle_client outer loop (batched)
         }
 
@@ -2771,18 +2832,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             resp.set_payload_size(hdr.actual_postsize(), hdr.actual_count());
             resp.cid = hdr.cid;
             resp.available = hdr.available;
-            let mut w = writer.lock().await;
+            // Abort-safety: build header + echoed payload as ONE
+            // contiguous frame and issue a single `write_all`, so a
+            // `send_timeout` cancel cannot leave an orphan header
+            // mid-frame in the shared BufWriter.
+            let mut frame = Vec::new();
             if resp.is_extended() {
-                w.write_all(&resp.to_bytes_extended()).await?;
+                frame.extend_from_slice(&resp.to_bytes_extended());
             } else {
-                w.write_all(&resp.to_bytes()).await?;
+                frame.extend_from_slice(&resp.to_bytes());
             }
             // Echo the payload back verbatim (truncated to the actual
             // postsize advertised by the request — `payload` here is
             // already that slice).
-            if !payload.is_empty() {
-                w.write_all(payload).await?;
-            }
+            frame.extend_from_slice(payload);
+            let mut w = writer.lock().await;
+            w.write_all(&frame).await?;
             // flush deferred to handle_client outer loop (batched)
         }
 
@@ -3013,9 +3078,15 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
     resp.cid = 1; // ECA_NORMAL
     resp.available = sub_id;
 
+    // Abort-safety: build header + payload as ONE contiguous frame and
+    // issue a single `write_all` so a cancel (send_timeout / task abort)
+    // cannot leave an orphan header mid-frame in the shared BufWriter.
+    let hdr_bytes = resp.to_bytes_extended();
+    let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
+    frame.extend_from_slice(&hdr_bytes);
+    frame.extend_from_slice(&padded);
     let mut w = writer.lock().await;
-    w.write_all(&resp.to_bytes_extended()).await?;
-    w.write_all(&padded).await?;
+    w.write_all(&frame).await?;
     w.flush().await?;
     Ok(())
 }
@@ -3194,10 +3265,19 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     resp.cid = chan_cid;
     resp.available = eca_status;
 
+    // Abort-safety: a CA_PROTO_ERROR reply is response-header +
+    // echoed-request-header + diagnostic string. Build all three as ONE
+    // contiguous frame and issue a single `write_all` so a `send_timeout`
+    // cancel cannot leave a partial frame (orphan header) in the shared
+    // BufWriter and mis-frame every following message.
+    let resp_bytes = resp.to_bytes_extended();
+    let orig_bytes = original_hdr.to_bytes();
+    let mut frame = Vec::with_capacity(resp_bytes.len() + orig_bytes.len() + error_msg_bytes.len());
+    frame.extend_from_slice(&resp_bytes);
+    frame.extend_from_slice(&orig_bytes);
+    frame.extend_from_slice(&error_msg_bytes);
     let mut w = writer.lock().await;
-    w.write_all(&resp.to_bytes_extended()).await?;
-    w.write_all(&original_hdr.to_bytes()).await?;
-    w.write_all(&error_msg_bytes).await?;
+    w.write_all(&frame).await?;
     // flush deferred to handle_client outer loop (batched)
     Ok(())
 }
@@ -3565,6 +3645,424 @@ mod extended_header_split_tests {
         assert!(
             res.is_ok(),
             "clean EOF after partial extended header must be Ok, got {res:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod non_graceful_disconnect_teardown_tests {
+    //! CRITICAL regression: every exit path out of `handle_client`'s
+    //! read loop — not just the graceful `break` — must run the single
+    //! teardown block (subscription cancel + `SubscriptionClosed`
+    //! emission + write-notify abort + `ChannelCleared` emission).
+    //!
+    //! Before the fix, an in-loop `return Err(..)` (misaligned payload,
+    //! payload-too-large, dispatch error, send-timeout, rate-limit
+    //! disconnect, batched-flush error) bypassed the teardown. A client
+    //! that established a subscription and then disconnected
+    //! non-gracefully (TCP RST, malformed frame) would leave its
+    //! `SubscriptionClosed` event unfired forever — inflating consumer
+    //! refcounts that key off these events (e.g. ca_gateway).
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::EpicsValue;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Build a CA_PROTO_VERSION request (minor version 13).
+    fn version_frame() -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_VERSION);
+        h.count = CA_MINOR_VERSION;
+        h.to_bytes().to_vec()
+    }
+
+    /// Build a CA_PROTO_CREATE_CHAN request for `pv_name` with the
+    /// given client cid. Payload is the 8-aligned, NUL-terminated name.
+    fn create_chan_frame(cid: u32, pv_name: &str) -> Vec<u8> {
+        let name = pad_string(pv_name);
+        let mut h = CaHeader::new(CA_PROTO_CREATE_CHAN);
+        h.cid = cid;
+        h.available = CA_MINOR_VERSION as u32;
+        h.set_payload_size(name.len(), 0);
+        let mut frame = h.to_bytes().to_vec();
+        frame.extend_from_slice(&name);
+        frame
+    }
+
+    /// Build a CA_PROTO_EVENT_ADD request: subscribe `sub_id` on `sid`.
+    /// Payload is the 16-byte monitor request (low/high/to f32 + mask).
+    fn event_add_frame(sid: u32, sub_id: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h.data_type = epics_base_rs::types::DBR_TIME_DOUBLE;
+        h.count = 1;
+        h.cid = sid;
+        h.available = sub_id;
+        h.set_payload_size(16, 1);
+        let mut frame = h.to_bytes().to_vec();
+        frame.extend_from_slice(&0f32.to_be_bytes());
+        frame.extend_from_slice(&0f32.to_be_bytes());
+        frame.extend_from_slice(&0f32.to_be_bytes());
+        frame.extend_from_slice(&3u16.to_be_bytes()); // mask: value+alarm
+        frame.extend_from_slice(&0u16.to_be_bytes()); // pad
+        frame
+    }
+
+    /// Drain `rx` for up to `timeout`, returning the first event that
+    /// satisfies `pred`, or `None` on timeout.
+    async fn await_event(
+        rx: &mut broadcast::Receiver<ServerConnectionEvent>,
+        timeout: Duration,
+        mut pred: impl FnMut(&ServerConnectionEvent) -> bool,
+    ) -> Option<ServerConnectionEvent> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(ev)) => {
+                    if pred(&ev) {
+                        return Some(ev);
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return None,
+            }
+        }
+    }
+
+    /// Read from `client` until a CA_PROTO_CREATE_CHAN response frame is
+    /// seen, then return its server-assigned sid (`m_available`). The
+    /// EVENT_ADD request must address the channel by this sid, not by
+    /// the client cid.
+    async fn read_create_chan_sid<R: tokio::io::AsyncRead + Unpin>(
+        client: &mut R,
+        timeout: Duration,
+    ) -> u32 {
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 512];
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for CREATE_CHAN response"
+            );
+            let n = tokio::time::timeout(remaining, client.read(&mut buf))
+                .await
+                .expect("read within timeout")
+                .expect("read ok");
+            assert!(n > 0, "server closed before CREATE_CHAN response");
+            acc.extend_from_slice(&buf[..n]);
+            let mut offset = 0;
+            while offset + CaHeader::SIZE <= acc.len() {
+                let (hdr, hdr_size) = CaHeader::from_bytes_extended(&acc[offset..])
+                    .expect("server response header parses");
+                let msg_len = hdr_size + hdr.actual_postsize();
+                if offset + msg_len > acc.len() {
+                    break;
+                }
+                if hdr.cmmd == CA_PROTO_CREATE_CHAN {
+                    return hdr.available;
+                }
+                offset += msg_len;
+            }
+        }
+    }
+
+    /// A client that opens a subscription and then sends a misaligned
+    /// frame (postsize not 8-aligned) MUST still have its
+    /// `SubscriptionClosed` event emitted. The misaligned frame drives
+    /// the `break 'client_loop Err(..)` path that previously bypassed
+    /// the teardown block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn misaligned_frame_after_subscribe_still_emits_subscription_closed() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("teardown:test:pv", EpicsValue::Double(1.0))
+            .await
+            .expect("add pv");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, mut conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55222".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        // Establish the channel first; read back the server-assigned sid.
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0xAA, "teardown:test:pv"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+        // Now subscribe, addressing the channel by its server sid.
+        client
+            .write_all(&event_add_frame(sid, 0xBB))
+            .await
+            .expect("event_add");
+        client.flush().await.expect("flush event_add");
+
+        // The server must accept the subscription before we test the
+        // teardown — otherwise the test would pass vacuously.
+        let opened = await_event(&mut conn_rx, Duration::from_secs(3), |ev| {
+            matches!(ev, ServerConnectionEvent::SubscriptionOpened { .. })
+        })
+        .await;
+        assert!(
+            matches!(opened, Some(ServerConnectionEvent::SubscriptionOpened { sub_id, .. }) if sub_id == 0xBB),
+            "subscription must open before the disconnect test (got {opened:?})"
+        );
+
+        // Now send a definitively malformed frame: a header whose
+        // postsize is not 8-byte aligned. The server rejects it with
+        // ECA_INTERNAL and `break 'client_loop Err(..)` — a NON-graceful
+        // exit. Before the fix this `return Err` bypassed the teardown.
+        let mut bad = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        bad.postsize = 5; // not a multiple of 8 — misaligned
+        client
+            .write_all(&bad.to_bytes())
+            .await
+            .expect("misaligned frame");
+        client.flush().await.expect("flush misaligned");
+
+        // The teardown MUST emit SubscriptionClosed for sub_id 0xBB even
+        // though the connection ended via the error path.
+        let closed = await_event(&mut conn_rx, Duration::from_secs(3), |ev| {
+            matches!(ev, ServerConnectionEvent::SubscriptionClosed { .. })
+        })
+        .await;
+        assert!(
+            matches!(closed, Some(ServerConnectionEvent::SubscriptionClosed { sub_id, .. }) if sub_id == 0xBB),
+            "SubscriptionClosed must fire on a non-graceful (error-path) \
+             disconnect — teardown was bypassed (got {closed:?})"
+        );
+
+        // The handler returns Err for the misaligned-frame path.
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_client completes")
+            .expect("join ok");
+        assert!(
+            res.is_err(),
+            "misaligned frame must close the connection with Err, got {res:?}"
+        );
+        drop(client);
+    }
+
+    /// Control case: a graceful EOF disconnect must ALSO emit
+    /// `SubscriptionClosed` (the path that always worked) — guards
+    /// against the restructure regressing the `break` path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_eof_after_subscribe_emits_subscription_closed() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("teardown:test:pv2", EpicsValue::Double(1.0))
+            .await
+            .expect("add pv");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (conn_tx, mut conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:55223".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                Some(conn_tx),
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0xCC, "teardown:test:pv2"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+        client
+            .write_all(&event_add_frame(sid, 0xDD))
+            .await
+            .expect("event_add");
+        client.flush().await.expect("flush event_add");
+
+        let opened = await_event(&mut conn_rx, Duration::from_secs(3), |ev| {
+            matches!(ev, ServerConnectionEvent::SubscriptionOpened { .. })
+        })
+        .await;
+        assert!(opened.is_some(), "subscription must open");
+
+        // Graceful close: drop the write half → server reads EOF →
+        // `break 'client_loop Ok(())`.
+        drop(client);
+
+        let closed = await_event(&mut conn_rx, Duration::from_secs(3), |ev| {
+            matches!(ev, ServerConnectionEvent::SubscriptionClosed { .. })
+        })
+        .await;
+        assert!(
+            matches!(closed, Some(ServerConnectionEvent::SubscriptionClosed { sub_id, .. }) if sub_id == 0xDD),
+            "SubscriptionClosed must fire on graceful EOF too (got {closed:?})"
+        );
+
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_client completes")
+            .expect("join ok");
+        assert!(res.is_ok(), "graceful EOF must be Ok, got {res:?}");
+    }
+}
+
+#[cfg(test)]
+mod single_write_all_framing_tests {
+    //! BUG 4: GET/READ_NOTIFY, introspection (`send_monitor_snapshot`)
+    //! and CA_PROTO_ERROR (`send_ca_error`) replies must be written to
+    //! the shared `BufWriter` as ONE contiguous `write_all`. A split
+    //! across two `write_all` awaits lets a `send_timeout` cancel land
+    //! between header and payload, leaving an orphan header that
+    //! mis-frames every following message. A true cancel-race is
+    //! non-deterministic; this asserts the structural property that
+    //! makes the race impossible: exactly one write batch == one frame.
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    /// Mock `AsyncWrite` recording each `poll_write` batch. Wrapped in a
+    /// zero-capacity `BufWriter`, batch count == `write_all` count.
+    #[derive(Default)]
+    struct RecordingWriter {
+        batches: Vec<Vec<u8>>,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.batches.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn recording_writer() -> Arc<Mutex<BufWriter<RecordingWriter>>> {
+        // Zero capacity: every write_all forwards straight through.
+        Arc::new(Mutex::new(BufWriter::with_capacity(
+            0,
+            RecordingWriter::default(),
+        )))
+    }
+
+    /// `send_ca_error` builds response-header + echoed-request-header +
+    /// diagnostic string. All three must leave in a single `write_all`.
+    #[tokio::test]
+    async fn send_ca_error_writes_single_frame() {
+        let writer = recording_writer();
+        let original = CaHeader::new(CA_PROTO_READ_NOTIFY);
+
+        send_ca_error(
+            &writer,
+            &original,
+            ECA_INTERNAL,
+            0xFFFF_FFFF,
+            "CAS: Missaligned protocol rejected",
+        )
+        .await
+        .expect("send_ca_error succeeds");
+
+        let guard = writer.lock().await;
+        let batches = &guard.get_ref().batches;
+        assert_eq!(
+            batches.len(),
+            1,
+            "send_ca_error must issue exactly one write_all (got {} batches: {:?})",
+            batches.len(),
+            batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
+        );
+        // The one batch must be the complete frame: response header +
+        // 16-byte echoed request header + padded diagnostic string.
+        let frame = &batches[0];
+        let payload_size = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+        assert_eq!(
+            16 + payload_size,
+            frame.len(),
+            "CA_PROTO_ERROR header-declared size must match the contiguous frame",
+        );
+    }
+
+    /// `send_monitor_snapshot` (the introspection EVENT_ADD reply) must
+    /// emit header + padded payload as a single `write_all`.
+    #[tokio::test]
+    async fn send_monitor_snapshot_writes_single_frame() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{DBR_LONG, EpicsValue};
+
+        let writer = recording_writer();
+        let snapshot = Snapshot::new(
+            EpicsValue::Long(123),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+
+        send_monitor_snapshot(&writer, 9, DBR_LONG, &snapshot)
+            .await
+            .expect("send_monitor_snapshot succeeds");
+
+        let guard = writer.lock().await;
+        let batches = &guard.get_ref().batches;
+        assert_eq!(
+            batches.len(),
+            1,
+            "send_monitor_snapshot must issue exactly one write_all (got {} batches: {:?})",
+            batches.len(),
+            batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
         );
     }
 }

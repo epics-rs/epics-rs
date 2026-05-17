@@ -2,7 +2,10 @@ use std::any::Any;
 use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::server::recgbl::{self, alarm_status};
+use epics_base_rs::server::record::{
+    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record,
+};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// Feedback mode for the epid record.
@@ -228,43 +231,62 @@ impl Default for EpidRecord {
 }
 
 impl EpidRecord {
-    /// Check alarms using hysteresis-based threshold comparison on VAL.
-    /// Ported from epidRecord.c `checkAlarms()`.
-    pub fn check_alarms(&mut self) -> Option<(u16, u16)> {
+    /// Decide the alarm condition using hysteresis-based threshold
+    /// comparison on VAL. Ported from epidRecord.c `checkAlarms()`,
+    /// which mirrors `aiRecord.c::checkAlarms` — per-level hysteresis
+    /// against VAL with `lalm` tracking the last-alarmed threshold.
+    ///
+    /// Returns `Some((stat, sevr))` where `stat` is the canonical
+    /// `epicsAlarmCondition` status code (`HIHI_ALARM`, `HIGH_ALARM`,
+    /// `LOLO_ALARM`, `LOW_ALARM`) and `sevr` the configured severity.
+    /// Returns `None` when VAL is inside the (hysteresis-adjusted)
+    /// limits. Updates `lalm` to the alarmed threshold (or to VAL when
+    /// no alarm is active) so a held value does not re-fire and so the
+    /// hysteresis band is honoured on the next cycle.
+    ///
+    /// The framework applies the result to the record's SEVR/STAT via
+    /// the [`Record::check_alarms`] trait hook below; this inherent
+    /// method only computes the decision so it can also be unit-tested
+    /// in isolation.
+    pub fn check_alarms(&mut self) -> Option<(u16, AlarmSeverity)> {
         let val = self.val;
         let hyst = self.hyst;
         let lalm = self.lalm;
 
         // HIHI alarm
-        if self.hhsv != 0 {
-            if val >= self.hihi || (lalm == self.hihi && val >= self.hihi - hyst) {
-                self.lalm = self.hihi;
-                return Some((3, self.hhsv as u16)); // HIHI_ALARM
-            }
+        if self.hhsv != 0 && (val >= self.hihi || (lalm == self.hihi && val >= self.hihi - hyst)) {
+            self.lalm = self.hihi;
+            return Some((
+                alarm_status::HIHI_ALARM,
+                AlarmSeverity::from_u16(self.hhsv as u16),
+            ));
         }
 
         // LOLO alarm
-        if self.llsv != 0 {
-            if val <= self.lolo || (lalm == self.lolo && val <= self.lolo + hyst) {
-                self.lalm = self.lolo;
-                return Some((4, self.llsv as u16)); // LOLO_ALARM
-            }
+        if self.llsv != 0 && (val <= self.lolo || (lalm == self.lolo && val <= self.lolo + hyst)) {
+            self.lalm = self.lolo;
+            return Some((
+                alarm_status::LOLO_ALARM,
+                AlarmSeverity::from_u16(self.llsv as u16),
+            ));
         }
 
         // HIGH alarm
-        if self.hsv != 0 {
-            if val >= self.high || (lalm == self.high && val >= self.high - hyst) {
-                self.lalm = self.high;
-                return Some((1, self.hsv as u16)); // HIGH_ALARM
-            }
+        if self.hsv != 0 && (val >= self.high || (lalm == self.high && val >= self.high - hyst)) {
+            self.lalm = self.high;
+            return Some((
+                alarm_status::HIGH_ALARM,
+                AlarmSeverity::from_u16(self.hsv as u16),
+            ));
         }
 
         // LOW alarm
-        if self.lsv != 0 {
-            if val <= self.low || (lalm == self.low && val <= self.low + hyst) {
-                self.lalm = self.low;
-                return Some((2, self.lsv as u16)); // LOW_ALARM
-            }
+        if self.lsv != 0 && (val <= self.low || (lalm == self.low && val <= self.low + hyst)) {
+            self.lalm = self.low;
+            return Some((
+                alarm_status::LOW_ALARM,
+                AlarmSeverity::from_u16(self.lsv as u16),
+            ));
         }
 
         // No alarm
@@ -569,12 +591,34 @@ impl Record for EpidRecord {
         }
         self.device_did_compute = false; // Reset for next cycle
 
-        self.check_alarms();
+        // Alarm evaluation is NOT done here. The framework invokes the
+        // `Record::check_alarms` trait hook (below) after `process()`,
+        // which is where the computed severity is applied to SEVR/STAT
+        // via `recGblSetSevr`. Calling the inherent `check_alarms` here
+        // would advance `lalm` an extra time and double-step the
+        // hysteresis state, so it is deliberately omitted.
         self.update_monitors();
 
         // Device support actions are now merged by the framework
         let actions = Vec::new();
         Ok(ProcessOutcome::complete_with(actions))
+    }
+
+    /// Per-record alarm hook — C `epidRecord.c::checkAlarms`.
+    ///
+    /// The framework calls this after `process()`; it computes the
+    /// HIHI/HIGH/LOW/LOLO condition (with `lalm` hysteresis) via the
+    /// inherent [`EpidRecord::check_alarms`] and applies the result to
+    /// the record's pending alarm state with `recGblSetSevr`. That
+    /// accumulates into `nsta`/`nsev` (raise-only / maximize-severity),
+    /// which the framework later transfers to `STAT`/`SEVR` via
+    /// `recGblResetAlarms`. Returning `None` raises nothing, so a value
+    /// that stays inside the limits leaves the record un-alarmed and a
+    /// held value does not re-fire.
+    fn check_alarms(&mut self, common: &mut CommonFields) {
+        if let Some((stat, sevr)) = EpidRecord::check_alarms(self) {
+            recgbl::rec_gbl_set_sevr(common, stat, sevr);
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

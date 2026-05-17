@@ -1,5 +1,6 @@
 #![allow(clippy::field_reassign_with_default)]
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::recgbl::alarm_status;
+use epics_base_rs::server::record::{AlarmSeverity, CommonFields, Record};
 use epics_base_rs::types::EpicsValue;
 use std_rs::EpidRecord;
 use std_rs::device_support::epid_soft::EpidSoftDeviceSupport;
@@ -137,8 +138,8 @@ fn test_check_alarms_hihi() {
     let alarm = rec.check_alarms();
     assert!(alarm.is_some());
     let (status, severity) = alarm.unwrap();
-    assert_eq!(status, 3); // HIHI_ALARM
-    assert_eq!(severity, 2);
+    assert_eq!(status, alarm_status::HIHI_ALARM);
+    assert_eq!(severity, AlarmSeverity::Major);
 }
 
 #[test]
@@ -150,8 +151,8 @@ fn test_check_alarms_lolo() {
     let alarm = rec.check_alarms();
     assert!(alarm.is_some());
     let (status, severity) = alarm.unwrap();
-    assert_eq!(status, 4); // LOLO_ALARM
-    assert_eq!(severity, 2);
+    assert_eq!(status, alarm_status::LOLO_ALARM);
+    assert_eq!(severity, AlarmSeverity::Major);
 }
 
 #[test]
@@ -191,6 +192,115 @@ fn test_check_alarms_hysteresis() {
     rec.val = 94.0;
     let alarm = rec.check_alarms();
     assert!(alarm.is_none(), "Should clear alarm below hysteresis band");
+}
+
+/// Regression: the `Record::check_alarms` trait hook (the one the
+/// framework actually invokes after `process()`) must apply the
+/// computed severity/status to the record's pending alarm state.
+/// Before the fix, `epid::process` called the inherent `check_alarms`
+/// and discarded its return, so SEVR/STAT never moved — HIHI/HIGH/
+/// LOW/LOLO limits were dead.
+#[test]
+fn test_check_alarms_hook_applies_severity() {
+    // Crossing HIGH raises the configured HIGH severity/status.
+    let mut rec = EpidRecord::default();
+    rec.high = 80.0;
+    rec.hsv = 1; // MINOR
+    rec.val = 85.0;
+    let mut common = CommonFields::default();
+    Record::check_alarms(&mut rec, &mut common);
+    assert_eq!(
+        common.nsev,
+        AlarmSeverity::Minor,
+        "HIGH crossing must raise SEVR"
+    );
+    assert_eq!(
+        common.nsta,
+        alarm_status::HIGH_ALARM,
+        "HIGH crossing must set STAT"
+    );
+
+    // Crossing HIHI raises the configured HIHI severity/status.
+    let mut rec = EpidRecord::default();
+    rec.hihi = 100.0;
+    rec.hhsv = 2; // MAJOR
+    rec.val = 110.0;
+    let mut common = CommonFields::default();
+    Record::check_alarms(&mut rec, &mut common);
+    assert_eq!(
+        common.nsev,
+        AlarmSeverity::Major,
+        "HIHI crossing must raise SEVR"
+    );
+    assert_eq!(
+        common.nsta,
+        alarm_status::HIHI_ALARM,
+        "HIHI crossing must set STAT"
+    );
+
+    // A value inside the limits must NOT raise any alarm.
+    let mut rec = EpidRecord::default();
+    rec.hihi = 100.0;
+    rec.high = 80.0;
+    rec.low = 20.0;
+    rec.lolo = 10.0;
+    rec.hhsv = 2;
+    rec.hsv = 1;
+    rec.lsv = 1;
+    rec.llsv = 2;
+    rec.val = 50.0;
+    let mut common = CommonFields::default();
+    Record::check_alarms(&mut rec, &mut common);
+    assert_eq!(
+        common.nsev,
+        AlarmSeverity::NoAlarm,
+        "in-limits must not raise SEVR"
+    );
+    assert_eq!(
+        common.nsta,
+        alarm_status::NO_ALARM,
+        "in-limits must not set STAT"
+    );
+}
+
+/// Regression: `recGblSetSevr` is raise-only (maximize-severity), so a
+/// second, lower-severity alarm in the same cycle must not lower the
+/// pending severity; a higher one must raise it.
+#[test]
+fn test_check_alarms_hook_maximizes_severity() {
+    let mut rec = EpidRecord::default();
+    rec.hihi = 100.0;
+    rec.hhsv = 2; // MAJOR
+    rec.val = 110.0;
+    let mut common = CommonFields::default();
+
+    // Pre-seed a lower pending severity, as an upstream MS link would.
+    common.nsev = AlarmSeverity::Minor;
+    common.nsta = alarm_status::LINK_ALARM;
+
+    Record::check_alarms(&mut rec, &mut common);
+    assert_eq!(
+        common.nsev,
+        AlarmSeverity::Major,
+        "higher epid alarm must raise the pending severity"
+    );
+    assert_eq!(common.nsta, alarm_status::HIHI_ALARM);
+
+    // A lower-severity epid alarm must not overwrite a higher pending one.
+    let mut rec = EpidRecord::default();
+    rec.high = 80.0;
+    rec.hsv = 1; // MINOR
+    rec.val = 85.0;
+    let mut common = CommonFields::default();
+    common.nsev = AlarmSeverity::Invalid;
+    common.nsta = alarm_status::COMM_ALARM;
+    Record::check_alarms(&mut rec, &mut common);
+    assert_eq!(
+        common.nsev,
+        AlarmSeverity::Invalid,
+        "lower epid alarm must not lower a higher pending severity"
+    );
+    assert_eq!(common.nsta, alarm_status::COMM_ALARM);
 }
 
 // ============================================================

@@ -1,7 +1,7 @@
 pub mod engine;
 pub mod math;
 
-pub use engine::error::CalcError;
+pub use engine::error::{CalcError, calc_error_str};
 pub use engine::opcodes::{CoreOp, Opcode};
 pub use engine::{CALC_NARGS, CalcResult, CompiledExpr, ExprKind, NumericInputs};
 

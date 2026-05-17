@@ -142,8 +142,26 @@ pub type SearchResolver = Arc<
 struct PvDatabaseInner {
     simple_pvs: RwLock<HashMap<String, Arc<ProcessVariable>>>,
     records: RwLock<HashMap<String, Arc<RwLock<RecordInstance>>>>,
-    /// Scan index: maps scan type → sorted set of (PHAS, record_name).
-    scan_index: RwLock<HashMap<ScanType, BTreeSet<(i16, String)>>>,
+    /// Scan index: maps scan type → sorted set of
+    /// `(PHAS, load_order, record_name)`.
+    ///
+    /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks records
+    /// in database / record-type **load order** and `addToList`
+    /// inserts each after the last element with `phas <= precord->phas`
+    /// — so within one PHAS value the scan list is a stable FIFO in
+    /// load order. The secondary sort key is the per-record
+    /// `load_order` sequence (NOT the record name), so two records
+    /// sharing a PHAS scan in the order they were loaded, matching a
+    /// C IOC built from the same `.db` file.
+    scan_index: RwLock<HashMap<ScanType, BTreeSet<(i16, u64, String)>>>,
+    /// Per-record load-order sequence number, assigned monotonically
+    /// at `add_record`. Used as the secondary scan-index sort key so
+    /// same-PHAS records preserve database load order. Survives a
+    /// `remove_record` + re-`add_record` (the re-add gets a fresh,
+    /// higher sequence — matching a fresh `.db` reload).
+    load_order: RwLock<HashMap<String, u64>>,
+    /// Monotonic counter feeding `load_order`.
+    load_order_counter: std::sync::atomic::AtomicU64,
     /// CP link index: maps source_record → list of target records to process when source changes.
     cp_links: RwLock<HashMap<String, Vec<String>>>,
     /// Alias map: alternate-name → real-record-name. Mirrors epics-base
@@ -201,19 +219,111 @@ pub struct PvDatabase {
     inner: Arc<PvDatabaseInner>,
 }
 
-/// Select which link indices are active based on SELM and SELN.
-/// SELM: 0=All, 1=Specified, 2=Mask
-fn select_link_indices(selm: i16, seln: i16, count: usize) -> Vec<usize> {
+/// Which record kind a SELM link selection is being computed for.
+/// The Specified/Mask base differs between record types in C, so the
+/// shared selector must know the caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SelmKind {
+    /// `fanout` / `seq`: Specified index is `SELN + OFFS` (0-based over
+    /// LNK0..LNKF / group 0..15); Mask is shifted by `SHFT`.
+    /// Mirrors `fanoutRecord.c:106-141` and `seqRecord.c:147-178`.
+    FanoutSeq,
+    /// `dfanout`: Specified index is `SELN - 1` (1-based, `SELN==0`
+    /// means "drive nothing", `SELN > OUT_ARG_MAX` is invalid); Mask
+    /// has NO `SHFT` and `SELN==0` means "no output".
+    /// Mirrors `dfanoutRecord.c:307-339`.
+    Dfanout,
+}
+
+/// Result of resolving a SELM/SELN selection.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SelmResult {
+    /// 0-based link indices to drive (into the LNK0../OUTA.. array).
+    pub indices: Vec<usize>,
+    /// `Some` when C would raise an alarm for an out-of-range
+    /// `SELN`/`OFFS`/`SHFT`. C uses `recGblSetSevr(prec, SOFT_ALARM,
+    /// INVALID_ALARM)` in every such path.
+    pub alarm: Option<(u16, crate::server::record::AlarmSeverity)>,
+}
+
+/// Select which link indices are active based on SELM/SELN, applying
+/// the record-type-specific `OFFS`/`SHFT` bias.
+///
+/// SELM: 0 = All, 1 = Specified, 2 = Mask. `count` is the number of
+/// link slots (16 for fanout/dfanout/seq).
+///
+/// C references:
+/// * fanout — `fanoutRecord.c:106-141`
+/// * dfanout — `dfanoutRecord.c:307-339`
+/// * seq — `seqRecord.c:147-178`
+pub(crate) fn select_link_indices_ex(
+    kind: SelmKind,
+    selm: i16,
+    seln: i16,
+    offs: i16,
+    shft: i16,
+    count: usize,
+) -> SelmResult {
+    use crate::server::record::AlarmSeverity;
+    use crate::server::recgbl::alarm_status::SOFT_ALARM;
+
+    let invalid = || SelmResult {
+        indices: Vec::new(),
+        alarm: Some((SOFT_ALARM, AlarmSeverity::Invalid)),
+    };
+    let ok = |indices: Vec<usize>| SelmResult {
+        indices,
+        alarm: None,
+    };
+
     match selm {
-        0 => (0..count).collect(),
-        1 => {
-            let i = seln as usize;
-            if i < count { vec![i] } else { vec![] }
+        // All — every slot.
+        0 => ok((0..count).collect()),
+        // Specified.
+        1 => match kind {
+            SelmKind::FanoutSeq => {
+                // C: `i = seln + offs;` 0-based; `i<0 || i>=NLINKS` → INVALID.
+                let i = seln as i32 + offs as i32;
+                if i < 0 || i >= count as i32 {
+                    invalid()
+                } else {
+                    ok(vec![i as usize])
+                }
+            }
+            SelmKind::Dfanout => {
+                // C: `seln > OUT_ARG_MAX` → INVALID; `seln == 0` → no output;
+                // otherwise drive `seln - 1`. OFFS is not a dfanout field.
+                if seln as i32 > count as i32 {
+                    invalid()
+                } else if seln <= 0 {
+                    ok(Vec::new())
+                } else {
+                    ok(vec![(seln - 1) as usize])
+                }
+            }
+        },
+        // Mask.
+        2 => {
+            let mask: u32 = match kind {
+                SelmKind::FanoutSeq => {
+                    // C: SHFT shift first, with `shft` range-checked to [-15,15].
+                    if !(-15..=15).contains(&shft) {
+                        return invalid();
+                    }
+                    let raw = (seln as u16) as u32;
+                    if shft >= 0 {
+                        raw >> shft
+                    } else {
+                        raw << (-shft)
+                    }
+                }
+                // dfanout Mask has no SHFT.
+                SelmKind::Dfanout => (seln as u16) as u32,
+            };
+            ok((0..count).filter(|i| mask & (1 << i) != 0).collect())
         }
-        2 => (0..count)
-            .filter(|i| (seln as u16) & (1 << i) != 0)
-            .collect(),
-        _ => (0..count).collect(),
+        // Any other SELM value → C `default:` raises INVALID.
+        _ => invalid(),
     }
 }
 
@@ -227,6 +337,8 @@ impl PvDatabase {
                 link_sets: RwLock::new(link_set::LinkSetRegistry::new()),
                 records: RwLock::new(HashMap::new()),
                 scan_index: RwLock::new(HashMap::new()),
+                load_order: RwLock::new(HashMap::new()),
+                load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: RwLock::new(HashMap::new()),
                 aliases: RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
@@ -557,6 +669,18 @@ impl PvDatabase {
             .await
             .insert(name.to_string(), Arc::new(RwLock::new(instance)));
 
+        // Assign a monotonic load-order sequence — the scan-index
+        // secondary sort key, so same-PHAS records keep load order.
+        let seq = self
+            .inner
+            .load_order_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner
+            .load_order
+            .write()
+            .await
+            .insert(name.to_string(), seq);
+
         if scan != ScanType::Passive {
             self.inner
                 .scan_index
@@ -564,7 +688,7 @@ impl PvDatabase {
                 .await
                 .entry(scan)
                 .or_default()
-                .insert((phas, name.to_string()));
+                .insert((phas, seq, name.to_string()));
         }
         Ok(())
     }
@@ -610,21 +734,26 @@ impl PvDatabase {
         let Some(rec_arc) = removed else {
             return false;
         };
-        let (scan, phas) = {
+        let scan = {
             let inst = rec_arc.read().await;
-            (inst.common.scan, inst.common.phas)
+            inst.common.scan
         };
 
-        // 2) Drop from scan index if it was scheduled.
+        // 2) Drop from scan index if it was scheduled. Match by record
+        // name only — PHAS and load_order are not needed and may be
+        // stale relative to the entry actually present.
         if scan != ScanType::Passive {
             let mut idx = self.inner.scan_index.write().await;
             if let Some(set) = idx.get_mut(&scan) {
-                set.remove(&(phas, name.to_string()));
+                set.retain(|(_, _, n)| n != name);
                 if set.is_empty() {
                     idx.remove(&scan);
                 }
             }
         }
+
+        // 2b) Drop the load-order entry.
+        self.inner.load_order.write().await.remove(name);
 
         // 3) Drop from CP-link tables. Removed both as source (channel
         // change → trigger targets) and as target (other channels'
@@ -904,15 +1033,65 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_select_link_indices() {
-        // All
-        assert_eq!(select_link_indices(0, 0, 6), vec![0, 1, 2, 3, 4, 5]);
-        // Specified
-        assert_eq!(select_link_indices(1, 2, 6), vec![2]);
-        assert_eq!(select_link_indices(1, 10, 6), Vec::<usize>::new());
-        // Mask: seln=5 = 0b101 -> indices 0 and 2
-        assert_eq!(select_link_indices(2, 5, 6), vec![0, 2]);
+    #[test]
+    fn select_link_indices_fanout_all_specified_mask() {
+        use crate::server::record::AlarmSeverity;
+        // All — every slot.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 0, 0, 0, 0, 16);
+        assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
+        assert!(r.alarm.is_none());
+
+        // Specified, 0-based: SELN=0 selects LNK0 (C parity, fanout).
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, 0, 0, 16);
+        assert_eq!(r.indices, vec![0]);
+        // Specified with OFFS bias: SELN=2 + OFFS=3 → index 5.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 2, 3, 0, 16);
+        assert_eq!(r.indices, vec![5]);
+        // Out-of-range Specified → INVALID alarm, no links.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 20, 0, 0, 16);
+        assert!(r.indices.is_empty());
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+        // Negative resolved index (SELN + negative OFFS) → INVALID.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, 0, -1, 0, 16);
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+
+        // Mask: SELN=0b101 → bits 0 and 2.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 0, 16);
+        assert_eq!(r.indices, vec![0, 2]);
+        // Mask with SHFT: SELN=0b101 >> 1 = 0b10 → bit 1.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 1, 16);
+        assert_eq!(r.indices, vec![1]);
+        // Mask with negative SHFT: SELN=0b101 << 1 = 0b1010 → bits 1,3.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, -1, 16);
+        assert_eq!(r.indices, vec![1, 3]);
+        // SHFT out of [-15,15] → INVALID.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, 5, 0, 16, 16);
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+
+        // Unknown SELM → INVALID.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 9, 0, 0, 0, 16);
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+    }
+
+    #[test]
+    fn select_link_indices_dfanout_specified_is_one_based() {
+        use crate::server::record::AlarmSeverity;
+        // dfanout Specified is 1-based: SELN=1 → OUTA (index 0).
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 1, 0, 0, 16);
+        assert_eq!(r.indices, vec![0]);
+        // SELN=2 → OUTB (index 1).
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 2, 0, 0, 16);
+        assert_eq!(r.indices, vec![1]);
+        // SELN=0 → drive nothing, NO alarm.
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 0, 0, 0, 16);
+        assert!(r.indices.is_empty());
+        assert!(r.alarm.is_none());
+        // SELN > 16 → INVALID.
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, 17, 0, 0, 16);
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+        // dfanout Mask has no SHFT — SHFT arg ignored.
+        let r = select_link_indices_ex(SelmKind::Dfanout, 2, 5, 0, 7, 16);
+        assert_eq!(r.indices, vec![0, 2]);
     }
 
     /// Lset that flips to "connected" after a configurable delay.

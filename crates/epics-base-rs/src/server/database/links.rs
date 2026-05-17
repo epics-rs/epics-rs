@@ -5,7 +5,7 @@ use crate::runtime::sync::RwLock;
 use crate::server::record::{AlarmSeverity, RecordInstance, ScanType};
 use crate::types::EpicsValue;
 
-use super::{PvDatabase, select_link_indices};
+use super::{PvDatabase, SelmKind, SelmResult, select_link_indices_ex};
 
 /// Alarm state from a link source, used for MS/NMS propagation.
 ///
@@ -18,6 +18,70 @@ pub(crate) struct LinkAlarm {
     pub stat: u16,
     pub sevr: AlarmSeverity,
     pub amsg: String,
+}
+
+/// One `seq` link group — C `linkGrp { dly, dol, dov, lnk }`.
+#[derive(Clone, Debug)]
+pub(crate) struct SeqGroup {
+    /// DOLn input link string (empty when unset).
+    pub dol: String,
+    /// LNKn output link string (empty when unset).
+    pub lnk: String,
+    /// DLYn per-group delay in seconds.
+    pub dly: f64,
+    /// DOn value-storage field (`linkGrp.dov`) — used when DOLn is
+    /// an empty/constant link.
+    pub dov: f64,
+}
+
+/// One `sseq` link group — DOL / LNK plus the numeric `DO` and
+/// string `STR` value-storage fields.
+#[derive(Clone, Debug)]
+pub(crate) struct SseqGroup {
+    pub dol: String,
+    pub lnk: String,
+    pub do_val: f64,
+    pub str_val: String,
+}
+
+/// Typed multi-output payload — replaces the legacy `\0`-packed
+/// `Vec<String>` so a link string containing an embedded NUL can
+/// never mis-split (parity review 04-L3).
+pub(crate) enum MultiOut {
+    /// fanout — 16 forward-link strings (LNK0..LNKF).
+    Fanout(Vec<String>),
+    /// dfanout — 16 output-link strings (OUTA..OUTP).
+    Dfanout(Vec<String>),
+    /// seq — 16 link groups (0..F).
+    Seq(Vec<SeqGroup>),
+    /// sseq — link groups with DO/STR value storage.
+    Sseq(Vec<SseqGroup>),
+}
+
+impl MultiOut {
+    /// Number of link slots — the `count` passed to the SELM selector.
+    fn len(&self) -> usize {
+        match self {
+            MultiOut::Fanout(v) => v.len(),
+            MultiOut::Dfanout(v) => v.len(),
+            MultiOut::Seq(v) => v.len(),
+            MultiOut::Sseq(v) => v.len(),
+        }
+    }
+}
+
+/// True when a link string carries an explicit `PP` (or `CP`/`CPP`)
+/// process modifier as a whitespace-separated token.
+///
+/// C `dbStaticLib.c` sets the link's process-passive flag (`ln`)
+/// only when the modifier string contains `"PP"`. For a `DBF_OUTLINK`
+/// the absence of `PP` means NPP — `dbDbPutLink` writes the value but
+/// does not process the target. `parse_link_v2` wrongly defaults a
+/// bare link to `ProcessPassive`, so the dfanout dispatch consults
+/// this helper to recover the C-correct NPP-by-default for OUT links.
+fn link_has_explicit_pp(raw: &str) -> bool {
+    raw.split_whitespace()
+        .any(|tok| tok == "PP" || tok == "CP" || tok == "CPP")
 }
 
 impl PvDatabase {
@@ -73,8 +137,15 @@ impl PvDatabase {
         calc: &crate::server::record::CalcLink,
     ) -> Option<EpicsValue> {
         use crate::calc::engine::{CALC_NARGS, NumericInputs};
+        // lnkCalc binds inputs to calc engine vars A..L (12). A link
+        // string carrying more than `CALC_NARGS` inputs is malformed —
+        // reject it rather than silently dropping the overflow args
+        // (the pre-fix `.take(12)` masked the misconfiguration).
+        if calc.args.len() > CALC_NARGS {
+            return None;
+        }
         let mut vars = [0.0f64; CALC_NARGS];
-        for (i, arg) in calc.args.iter().enumerate().take(12) {
+        for (i, arg) in calc.args.iter().enumerate() {
             let v = self.get_pv(arg).await.ok()?;
             vars[i] = v.to_f64()?;
         }
@@ -247,7 +318,63 @@ impl PvDatabase {
         }
     }
 
+    /// Read a record String field, defaulting to empty.
+    fn field_str(instance: &RecordInstance, field: &str) -> String {
+        match instance.record.get_field(field) {
+            Some(EpicsValue::String(s)) => s,
+            _ => String::new(),
+        }
+    }
+
+    /// Read a record numeric field as `i16`, defaulting to 0.
+    fn field_i16(instance: &RecordInstance, field: &str) -> i16 {
+        instance
+            .record
+            .get_field(field)
+            .and_then(|v| v.to_f64())
+            .unwrap_or(0.0) as i16
+    }
+
+    /// Apply a SELM-resolved out-of-range alarm to the record.
+    ///
+    /// C raises this alarm inside `process()` (before `recGblResetAlarms`)
+    /// via `recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM)`. The Rust
+    /// multi-output dispatch runs after the record's own alarm reset,
+    /// so we apply the severity directly to `common.sevr/stat`, refresh
+    /// the live STAT/SEVR fields, and post the monitor — matching the
+    /// observable end state (record reads INVALID/SOFT_ALARM, a
+    /// `DBE_ALARM` subscriber on STAT/SEVR is notified).
+    async fn apply_selm_alarm(
+        rec: &Arc<RwLock<RecordInstance>>,
+        alarm: Option<(u16, AlarmSeverity)>,
+    ) {
+        let Some((stat, sevr)) = alarm else {
+            return;
+        };
+        let posted = {
+            let mut inst = rec.write().await;
+            // Raise-only, mirroring recGblSetSevr.
+            if (sevr as u16) > (inst.common.sevr as u16) {
+                inst.common.sevr = sevr;
+                inst.common.stat = stat;
+                true
+            } else {
+                false
+            }
+        };
+        if posted {
+            let inst = rec.read().await;
+            inst.notify_field("SEVR", crate::server::recgbl::EventMask::ALARM);
+            inst.notify_field("STAT", crate::server::recgbl::EventMask::VALUE);
+        }
+    }
+
     /// Multi-output dispatch for fanout, dfanout, seq record types.
+    ///
+    /// The per-record payload is a typed [`MultiOut`] — seq / sseq
+    /// groups are kept as struct fields, NOT `\0`-packed strings
+    /// (the pre-fix encoding could mis-split a link string that
+    /// happened to contain an embedded NUL).
     pub(crate) async fn dispatch_multi_output(
         &self,
         rec: &Arc<RwLock<RecordInstance>>,
@@ -258,56 +385,37 @@ impl PvDatabase {
         // call below can propagate it to its target — C `dbDbLink.c::
         // processTarget` invariant (see write_db_link_value doc).
         let src_putf = rec.read().await.common.putf;
-        let (_rtype, dispatch_info) = {
+        let dispatch_info: Option<(SelmResult, MultiOut, Option<EpicsValue>)> = {
             let instance = rec.read().await;
-            let rtype = instance.record.record_type().to_string();
-            match rtype.as_str() {
+            match instance.record.record_type() {
                 "fanout" => {
-                    let selm = instance
-                        .record
-                        .get_field("SELM")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0) as i16;
-                    let seln = instance
-                        .record
-                        .get_field("SELN")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0) as i16;
+                    let selm = Self::field_i16(&instance, "SELM");
+                    let seln = Self::field_i16(&instance, "SELN");
+                    let offs = Self::field_i16(&instance, "OFFS");
+                    let shft = Self::field_i16(&instance, "SHFT");
+                    // C parity (fanoutRecord.c:39): 16 forward links
+                    // LNK0..LNKF. LNK0 is the natural first slot.
                     let links: Vec<String> = [
-                        "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9",
-                        "LNKA", "LNKB", "LNKC", "LNKD", "LNKE", "LNKF",
+                        "LNK0", "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8",
+                        "LNK9", "LNKA", "LNKB", "LNKC", "LNKD", "LNKE", "LNKF",
                     ]
                     .iter()
-                    .map(|f| {
-                        instance
-                            .record
-                            .get_field(f)
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default()
-                    })
+                    .map(|f| Self::field_str(&instance, f))
                     .collect();
-                    (
-                        rtype,
-                        Some(("fanout".to_string(), selm, seln, links, None::<EpicsValue>)),
-                    )
+                    // SELM resolution with OFFS/SHFT bias (fanoutRecord.c).
+                    let sel = select_link_indices_ex(
+                        SelmKind::FanoutSeq,
+                        selm,
+                        seln,
+                        offs,
+                        shft,
+                        links.len(),
+                    );
+                    Some((sel, MultiOut::Fanout(links), None))
                 }
                 "dfanout" => {
-                    let selm = instance
-                        .record
-                        .get_field("SELM")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0) as i16;
-                    let seln = instance
-                        .record
-                        .get_field("SELN")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0) as i16;
+                    let selm = Self::field_i16(&instance, "SELM");
+                    let seln = Self::field_i16(&instance, "SELN");
                     // IVOA / IVOV — invalid output handling, mirrors
                     // epics-base PR #688. When the record's SEVR is
                     // INVALID, IVOA selects: 0 = continue (use VAL as
@@ -340,82 +448,76 @@ impl PvDatabase {
                         "OUTJ", "OUTK", "OUTL", "OUTM", "OUTN", "OUTO", "OUTP",
                     ]
                     .iter()
-                    .map(|f| {
-                        instance
-                            .record
-                            .get_field(f)
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default()
-                    })
+                    .map(|f| Self::field_str(&instance, f))
                     .collect();
-                    (rtype, Some(("dfanout".to_string(), selm, seln, links, val)))
+                    // dfanout Specified is 1-based; Mask has no SHFT
+                    // (dfanoutRecord.c:307-339).
+                    let sel = select_link_indices_ex(
+                        SelmKind::Dfanout,
+                        selm,
+                        seln,
+                        0,
+                        0,
+                        links.len(),
+                    );
+                    Some((sel, MultiOut::Dfanout(links), val))
                 }
                 "seq" => {
-                    let selm = instance
-                        .record
-                        .get_field("SELM")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0) as i16;
-                    let seln = instance
-                        .record
-                        .get_field("SELN")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0) as i16;
-                    // Collect DOL/LNK pairs
+                    let selm = Self::field_i16(&instance, "SELM");
+                    let seln = Self::field_i16(&instance, "SELN");
+                    let offs = Self::field_i16(&instance, "OFFS");
+                    let shft = Self::field_i16(&instance, "SHFT");
+                    // C parity (seqRecord.c:86): 16 link groups 0..F,
+                    // each DOLn / DOn (value storage) / DLYn / LNKn.
                     let dol_names = [
-                        "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9",
-                        "DOLA",
+                        "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8",
+                        "DOL9", "DOLA", "DOLB", "DOLC", "DOLD", "DOLE", "DOLF",
                     ];
                     let lnk_names = [
-                        "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9",
-                        "LNKA",
+                        "LNK0", "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8",
+                        "LNK9", "LNKA", "LNKB", "LNKC", "LNKD", "LNKE", "LNKF",
                     ];
-                    let mut pairs = Vec::new();
-                    for (dol_f, lnk_f) in dol_names.iter().zip(lnk_names.iter()) {
-                        let dol_str = instance
-                            .record
-                            .get_field(dol_f)
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        let lnk_str = instance
-                            .record
-                            .get_field(lnk_f)
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        pairs.push(format!("{}\0{}", dol_str, lnk_str));
-                    }
-                    (rtype, Some(("seq".to_string(), selm, seln, pairs, None)))
+                    let dly_names = [
+                        "DLY0", "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8",
+                        "DLY9", "DLYA", "DLYB", "DLYC", "DLYD", "DLYE", "DLYF",
+                    ];
+                    let do_names = [
+                        "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9",
+                        "DOA", "DOB", "DOC", "DOD", "DOE", "DOF",
+                    ];
+                    let groups: Vec<SeqGroup> = (0..16)
+                        .map(|i| SeqGroup {
+                            dol: Self::field_str(&instance, dol_names[i]),
+                            lnk: Self::field_str(&instance, lnk_names[i]),
+                            dly: instance
+                                .record
+                                .get_field(dly_names[i])
+                                .and_then(|v| v.to_f64())
+                                .unwrap_or(0.0),
+                            dov: instance
+                                .record
+                                .get_field(do_names[i])
+                                .and_then(|v| v.to_f64())
+                                .unwrap_or(0.0),
+                        })
+                        .collect();
+                    let sel = select_link_indices_ex(
+                        SelmKind::FanoutSeq,
+                        selm,
+                        seln,
+                        offs,
+                        shft,
+                        groups.len(),
+                    );
+                    Some((sel, MultiOut::Seq(groups), None))
                 }
                 "sseq" => {
-                    let selm = instance
-                        .record
-                        .get_field("SELM")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0) as i16;
-                    let seln = instance
-                        .record
-                        .get_field("SELN")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0) as i16;
-                    // Collect DOL/LNK pairs (same as seq but also read DO/STR fields)
+                    let selm = Self::field_i16(&instance, "SELM");
+                    let seln = Self::field_i16(&instance, "SELN");
+                    let offs = Self::field_i16(&instance, "OFFS");
+                    let shft = Self::field_i16(&instance, "SHFT");
+                    // sseq keeps the legacy 10-group 1-based layout —
+                    // DOL1..DOLA / LNK1..LNKA with DO/STR value storage.
                     let dol_names = [
                         "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9",
                         "DOLA",
@@ -431,65 +533,47 @@ impl PvDatabase {
                         "STR1", "STR2", "STR3", "STR4", "STR5", "STR6", "STR7", "STR8", "STR9",
                         "STRA",
                     ];
-                    let mut pairs = Vec::new();
-                    for i in 0..10 {
-                        let dol_str = instance
-                            .record
-                            .get_field(dol_names[i])
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        let lnk_str = instance
-                            .record
-                            .get_field(lnk_names[i])
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        // For sseq: if DOL is empty, use DO/STR value directly
-                        let do_val = instance
-                            .record
-                            .get_field(do_names[i])
-                            .and_then(|v| v.to_f64())
-                            .unwrap_or(0.0);
-                        let str_val = instance
-                            .record
-                            .get_field(str_names[i])
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        // Encode: dol\0lnk\0do_val\0str_val
-                        pairs.push(format!("{}\0{}\0{}\0{}", dol_str, lnk_str, do_val, str_val));
-                    }
-                    (rtype, Some(("sseq".to_string(), selm, seln, pairs, None)))
+                    let groups: Vec<SseqGroup> = (0..10)
+                        .map(|i| SseqGroup {
+                            dol: Self::field_str(&instance, dol_names[i]),
+                            lnk: Self::field_str(&instance, lnk_names[i]),
+                            do_val: instance
+                                .record
+                                .get_field(do_names[i])
+                                .and_then(|v| v.to_f64())
+                                .unwrap_or(0.0),
+                            str_val: Self::field_str(&instance, str_names[i]),
+                        })
+                        .collect();
+                    let sel = select_link_indices_ex(
+                        SelmKind::FanoutSeq,
+                        selm,
+                        seln,
+                        offs,
+                        shft,
+                        groups.len(),
+                    );
+                    Some((sel, MultiOut::Sseq(groups), None))
                 }
-                _ => (rtype, None),
+                _ => None,
             }
         };
 
-        let (dispatch_type, selm, seln, links, val) = match dispatch_info {
+        let (sel, payload, val) = match dispatch_info {
             Some(info) => info,
             None => return,
         };
+        debug_assert!(sel.indices.iter().all(|&i| i < payload.len()));
 
-        let indices = select_link_indices(selm, seln, links.len());
+        // C raises SOFT_ALARM/INVALID_ALARM when SELN/OFFS/SHFT resolve
+        // out of range (fanoutRecord.c:116, dfanoutRecord.c:317,
+        // seqRecord.c:157). Apply it before dispatching the (empty)
+        // selection.
+        Self::apply_selm_alarm(rec, sel.alarm).await;
+        let indices = sel.indices;
 
-        match dispatch_type.as_str() {
-            "fanout" => {
+        match payload {
+            MultiOut::Fanout(links) => {
                 for idx in indices {
                     let link_str = &links[idx];
                     if link_str.is_empty() {
@@ -503,7 +587,7 @@ impl PvDatabase {
                     }
                 }
             }
-            "dfanout" => {
+            MultiOut::Dfanout(links) => {
                 if let Some(ref val) = val {
                     for idx in indices {
                         let link_str = &links[idx];
@@ -512,32 +596,58 @@ impl PvDatabase {
                         }
                         let parsed = crate::server::record::parse_link_v2(link_str);
                         if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                            self.write_db_link_value(db, val.clone(), src_putf, visited, depth)
+                            // C `dfanoutRecord.c:323` drives each OUTn via
+                            // `dbPutLink`, whose `DBF_OUTLINK` target is
+                            // processed by `dbDbPutLink` only when the link
+                            // carries an explicit `PP` modifier
+                            // (`dbDbLink.c:415` — `pvlMask & ln`). The C
+                            // default for an out-link with no modifier is
+                            // NPP: the value is written but the target is
+                            // NOT processed. `parse_link_v2` defaults a
+                            // bare link to `ProcessPassive`, so without
+                            // this correction a bare `OUTn` would re-process
+                            // the target — and a Soft-Channel ai target's
+                            // `convert()` would then clobber the value just
+                            // written. Honour C: process the dfanout OUTn
+                            // target only on an explicit `PP` token.
+                            let explicit_pp = link_has_explicit_pp(link_str);
+                            let mut db = db.clone();
+                            if !explicit_pp
+                                && db.policy
+                                    == crate::server::record::LinkProcessPolicy::ProcessPassive
+                            {
+                                db.policy = crate::server::record::LinkProcessPolicy::NoProcess;
+                            }
+                            self.write_db_link_value(&db, val.clone(), src_putf, visited, depth)
                                 .await;
                         }
                     }
                 }
             }
-            "seq" => {
+            MultiOut::Seq(groups) => {
                 for idx in indices {
-                    let pair_str = &links[idx];
-                    let parts: Vec<&str> = pair_str.splitn(2, '\0').collect();
-                    if parts.len() != 2 {
+                    let grp = &groups[idx];
+                    if grp.lnk.is_empty() {
                         continue;
                     }
-                    let (dol_str, lnk_str) = (parts[0], parts[1]);
-                    if lnk_str.is_empty() {
-                        continue;
+                    // Per-group DLYn staggering — C `seqRecord.c`
+                    // schedules each group after its delay. Groups
+                    // process sequentially in index order, each after
+                    // its own delay (callbackRequestDelayed chain).
+                    if grp.dly > 0.0 {
+                        tokio::time::sleep(std::time::Duration::from_secs_f64(grp.dly)).await;
                     }
-                    // Read value from DOL
-                    let dol_val = if !dol_str.is_empty() {
-                        let dol_parsed = crate::server::record::parse_link_v2(dol_str);
+                    // Value: read from DOLn link, else the stored DOn
+                    // value (linkGrp.dov) — C uses DOn as the value
+                    // when DOLn is a constant/empty link.
+                    let value = if !grp.dol.is_empty() {
+                        let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
                         self.read_link_value(&dol_parsed).await
                     } else {
-                        None
+                        Some(EpicsValue::Double(grp.dov))
                     };
-                    if let Some(value) = dol_val {
-                        let lnk_parsed = crate::server::record::parse_link_v2(lnk_str);
+                    if let Some(value) = value {
+                        let lnk_parsed = crate::server::record::parse_link_v2(&grp.lnk);
                         if let crate::server::record::ParsedLink::Db(ref db) = lnk_parsed {
                             self.write_db_link_value(db, value, src_putf, visited, depth)
                                 .await;
@@ -545,29 +655,23 @@ impl PvDatabase {
                     }
                 }
             }
-            "sseq" => {
+            MultiOut::Sseq(groups) => {
                 for idx in indices {
-                    let pair_str = &links[idx];
-                    let parts: Vec<&str> = pair_str.splitn(4, '\0').collect();
-                    if parts.len() != 4 {
-                        continue;
-                    }
-                    let (dol_str, lnk_str, do_val_str, str_val) =
-                        (parts[0], parts[1], parts[2], parts[3]);
-                    if lnk_str.is_empty() {
+                    let grp = &groups[idx];
+                    if grp.lnk.is_empty() {
                         continue;
                     }
                     // Determine value: read from DOL link, or use DO/STR field
-                    let value = if !dol_str.is_empty() {
-                        let dol_parsed = crate::server::record::parse_link_v2(dol_str);
+                    let value = if !grp.dol.is_empty() {
+                        let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
                         self.read_link_value(&dol_parsed).await
-                    } else if !str_val.is_empty() {
-                        Some(EpicsValue::String(str_val.to_string()))
+                    } else if !grp.str_val.is_empty() {
+                        Some(EpicsValue::String(grp.str_val.clone()))
                     } else {
-                        do_val_str.parse::<f64>().ok().map(EpicsValue::Double)
+                        Some(EpicsValue::Double(grp.do_val))
                     };
                     if let Some(value) = value {
-                        let lnk_parsed = crate::server::record::parse_link_v2(lnk_str);
+                        let lnk_parsed = crate::server::record::parse_link_v2(&grp.lnk);
                         if let crate::server::record::ParsedLink::Db(ref db) = lnk_parsed {
                             self.write_db_link_value(db, value, src_putf, visited, depth)
                                 .await;
@@ -575,8 +679,39 @@ impl PvDatabase {
                     }
                 }
             }
-            _ => {}
         }
+    }
+
+    /// Post the software event named by an `event` record's `VAL`.
+    ///
+    /// Mirrors C `eventRecord.c:120` `postEvent(prec->epvt)` — every
+    /// `process()` of an event record posts its event, waking the
+    /// `SCAN="Event"` records whose `EVNT` resolves to that name.
+    /// No-op for any other record type, or when `VAL` is empty /
+    /// resolves to event 0 (`eventNameToHandle` returns NULL).
+    pub(crate) async fn dispatch_event_record(&self, rec: &Arc<RwLock<RecordInstance>>) {
+        let event_name = {
+            let instance = rec.read().await;
+            if instance.record.record_type() != "event" {
+                return;
+            }
+            match instance.record.get_field("VAL") {
+                Some(EpicsValue::String(s)) => s,
+                _ => return,
+            }
+        };
+        if event_name.trim().is_empty() {
+            return;
+        }
+        // C `postEvent` queues callbacks on the scan ring buffer —
+        // the event-scanned records run on a separate callback thread,
+        // NOT recursively inside this process cycle. Spawn the routed
+        // post so a chain of event records cannot recurse unboundedly
+        // and the current cycle's FLNK/CP dispatch is not blocked.
+        let db = self.clone();
+        crate::runtime::task::spawn(async move {
+            db.post_event_named(&event_name).await;
+        });
     }
 
     /// Register a CP link: when source_record changes, process target_record.
@@ -650,11 +785,12 @@ impl PvDatabase {
                     }
                 }
                 // Check additional input link fields that may use CP:
-                // DOL (ao/bo/longout/mbbo), DOL1-DOLA (seq/sseq),
+                // DOL (ao/bo/longout/mbbo), DOL0-DOLF (seq — 16
+                // groups), DOL1-DOLA (sseq — legacy 10 groups),
                 // NVL (sel), SELL (sseq), SDIS (common), SGNL (histogram)
                 const CP_INPUT_LINK_FIELDS: &[&str] = &[
-                    "DOL", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9",
-                    "DOLA", "NVL", "SELL", "SGNL",
+                    "DOL", "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8",
+                    "DOL9", "DOLA", "DOLB", "DOLC", "DOLD", "DOLE", "DOLF", "NVL", "SELL", "SGNL",
                 ];
                 for field_name in CP_INPUT_LINK_FIELDS {
                     if let Some(EpicsValue::String(link_str)) =

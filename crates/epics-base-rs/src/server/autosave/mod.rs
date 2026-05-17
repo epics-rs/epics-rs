@@ -12,9 +12,10 @@ pub mod verify;
 
 pub use backup::BackupConfig;
 pub use error::{AutosaveError, AutosaveResult};
+pub use format::CompatMode;
 pub use manager::{AutosaveBuilder, AutosaveManager};
 pub use save_set::{
-    RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy, TriggerMode,
+    RestoreMode, RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy, TriggerMode,
 };
 pub use startup::AutosaveStartupConfig;
 

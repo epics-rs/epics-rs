@@ -332,6 +332,20 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// The value the MDEL/ADEL deadband is evaluated against.
+    ///
+    /// For most records C `monitor()` applies the value deadband to
+    /// `VAL`, so the default is [`Self::val`]. A record whose monitored
+    /// quantity is not its primary value must override this: the motor
+    /// record, for instance, has `VAL` as the setpoint and applies
+    /// MDEL/ADEL to `RBV` (the readback) — its C `monitor()` deadbands
+    /// `RBV`, not `VAL`. Such a record returns its readback field here.
+    ///
+    /// Default is `val()`, so existing records are unaffected.
+    fn monitor_deadband_value(&self) -> Option<EpicsValue> {
+        self.val()
+    }
+
     /// Initialize record (pass 0: field defaults; pass 1: dependent init).
     fn init_record(&mut self, _pass: u8) -> CaResult<()> {
         Ok(())
@@ -367,6 +381,51 @@ pub trait Record: Send + Sync + 'static {
     fn clears_udf(&self) -> bool {
         true
     }
+
+    /// Whether the record's current `VAL` is undefined (UDF must
+    /// stay set).
+    ///
+    /// C parity: `aiRecord.c:285` / `calcRecord.c::checkAlarms` /
+    /// `int64inRecord.c:144` clear `UDF` **only** when the computed /
+    /// read value is valid — `if (status == 0)` and, for floating
+    /// records, only when `VAL` is not NaN. The framework owns
+    /// `common.udf`; it calls `clears_udf()` to decide whether this
+    /// record type clears UDF at all, then this method to decide
+    /// whether the *value produced this cycle* is actually defined.
+    ///
+    /// Default: a floating `VAL` that is NaN (e.g. a calc
+    /// divide-by-zero, or a soft input whose link read failed and
+    /// left VAL un-updated) is undefined; everything else is defined.
+    /// A record whose `val()` yields `None` (no primary value) is
+    /// also treated as undefined.
+    fn value_is_undefined(&self) -> bool {
+        match self.val() {
+            Some(EpicsValue::Double(v)) => v.is_nan(),
+            Some(EpicsValue::Float(v)) => v.is_nan(),
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Per-record alarm hook — evaluate record-type-specific alarms
+    /// (STATE / COS / analog limit / SOFT) and accumulate them into
+    /// `nsta`/`nsev` via `recGblSetSevr`.
+    ///
+    /// The framework centralises the generic alarm machinery (UDF
+    /// check, `recGblResetAlarms` transfer, MS/MSI/MSS link-alarm
+    /// inheritance). The record-type-specific severity logic that C
+    /// puts in each record's `checkAlarms()` belongs here so a record
+    /// can raise its own alarms without the framework hardcoding a
+    /// per-type `match` on `record_type()`.
+    ///
+    /// `common` is the record's [`CommonFields`]; implementations
+    /// raise alarms with [`crate::server::recgbl::rec_gbl_set_sevr`]
+    /// / [`crate::server::recgbl::rec_gbl_set_sevr_msg`].
+    ///
+    /// Default: no-op — records that have not yet migrated their
+    /// `checkAlarms` logic here are still covered by the framework's
+    /// legacy centralised `evaluate_alarms` match.
+    fn check_alarms(&mut self, _common: &mut crate::server::record::CommonFields) {}
 
     /// Return multi-input link field pairs: (link_field, value_field).
     /// Override in calc, calcout, sel, sub to return INPA..INPL → A..L mappings.

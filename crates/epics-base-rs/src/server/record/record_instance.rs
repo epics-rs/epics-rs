@@ -639,11 +639,14 @@ impl RecordInstance {
             "DTYP" => Some(EpicsValue::String(self.common.dtyp.clone())),
             "TSE" => Some(EpicsValue::Short(self.common.tse)),
             "TSEL" => Some(EpicsValue::String(self.common.tsel.clone())),
+            // C `UTAG` is DBF_UINT64 — modelled as Int64 (no
+            // unsigned-64 scalar in the Rust value model).
+            "UTAG" => Some(EpicsValue::Int64(self.common.utag as i64)),
             "ASG" => Some(EpicsValue::String(self.common.asg.clone())),
             "ASL" => Some(EpicsValue::Char(self.common.asl)),
             "DESC" => Some(EpicsValue::String(self.common.desc.clone())),
             "PHAS" => Some(EpicsValue::Short(self.common.phas)),
-            "EVNT" => Some(EpicsValue::Short(self.common.evnt)),
+            "EVNT" => Some(EpicsValue::String(self.common.evnt.clone())),
             "PRIO" => Some(EpicsValue::Short(self.common.prio)),
             "DISV" => Some(EpicsValue::Short(self.common.disv)),
             "DISA" => Some(EpicsValue::Short(self.common.disa)),
@@ -879,6 +882,18 @@ impl RecordInstance {
                     self.parsed_tsel = parse_link_v2(&self.common.tsel);
                 }
             }
+            "UTAG" => {
+                // C UTAG is DBF_UINT64 — accept any integer-shaped
+                // value and store the unsigned 64-bit tag.
+                match value {
+                    EpicsValue::Int64(v) => self.common.utag = v as u64,
+                    EpicsValue::Long(v) => self.common.utag = v as u64,
+                    EpicsValue::Short(v) => self.common.utag = v as u64,
+                    EpicsValue::Enum(v) => self.common.utag = v as u64,
+                    EpicsValue::Char(v) => self.common.utag = v as u64,
+                    _ => {}
+                }
+            }
             "ASG" => {
                 if let EpicsValue::String(s) = value {
                     self.common.asg = s;
@@ -924,8 +939,21 @@ impl RecordInstance {
                 }
             }
             "EVNT" => {
-                if let EpicsValue::Short(v) = value {
-                    self.common.evnt = v;
+                // C `EVNT` is DBF_STRING (event name). Accept a
+                // string directly; accept a numeric value too for
+                // backward compatibility (numeric events / a calc
+                // record driving EVNT) by formatting it as a string.
+                match value {
+                    EpicsValue::String(s) => self.common.evnt = s,
+                    EpicsValue::Short(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::Long(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::Enum(v) => self.common.evnt = v.to_string(),
+                    EpicsValue::Double(v) => {
+                        // Match C `eventNameToHandle`: a double with
+                        // an integer part is treated as that integer.
+                        self.common.evnt = (v as i64).to_string();
+                    }
+                    _ => {}
                 }
             }
             "PRIO" => {
@@ -1156,201 +1184,10 @@ impl RecordInstance {
                     self.evaluate_analog_alarm(val, alarm_cfg);
                 }
             }
-            "bi" | "bo" | "busy" => {
-                let val = match self.record.val() {
-                    Some(EpicsValue::Enum(v)) => v,
-                    _ => return,
-                };
-                let zsv = self
-                    .record
-                    .get_field("ZSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                let osv = self
-                    .record
-                    .get_field("OSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                let cosv = self
-                    .record
-                    .get_field("COSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-
-                // Guard: val > 1 means no alarm check (like C)
-                if val <= 1 {
-                    // State alarm: ZSV for val==0, OSV for val==1
-                    let state_sev = if val == 0 { zsv } else { osv };
-                    // AFTC low-pass filter on alarm severity (PR #817).
-                    // bi only carries AFTC for `bi`, not `bo`/`busy` —
-                    // skip filter for the latter two by checking rtype.
-                    let filtered_sev = if rtype == "bi" {
-                        let aftc = self
-                            .record
-                            .get_field("AFTC")
-                            .and_then(|v| v.to_f64())
-                            .unwrap_or(0.0);
-                        let afvl = self
-                            .record
-                            .get_field("AFVL")
-                            .and_then(|v| v.to_f64())
-                            .unwrap_or(0.0);
-                        let now = crate::runtime::general_time::get_current();
-                        let (out, new_afvl) =
-                            Self::aftc_filter(state_sev as u16, aftc, afvl, self.common.time, now);
-                        let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
-                        out as i16
-                    } else {
-                        state_sev
-                    };
-                    let sev = AlarmSeverity::from_u16(filtered_sev as u16);
-                    if sev != AlarmSeverity::NoAlarm {
-                        recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::STATE_ALARM, sev);
-                    }
-
-                    // COS alarm: only fires when val changed from LALM
-                    let lalm = self
-                        .record
-                        .get_field("LALM")
-                        .and_then(|v| {
-                            if let EpicsValue::Enum(s) = v {
-                                Some(s)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(val);
-
-                    if val != lalm {
-                        let cos_sev = AlarmSeverity::from_u16(cosv as u16);
-                        if cos_sev != AlarmSeverity::NoAlarm {
-                            recgbl::rec_gbl_set_sevr(
-                                &mut self.common,
-                                alarm_status::COS_ALARM,
-                                cos_sev,
-                            );
-                        }
-                        let _ = self.record.put_field("LALM", EpicsValue::Enum(val));
-                    }
-                }
-            }
-            "mbbi" | "mbbo" => {
-                let val = match self.record.val() {
-                    Some(EpicsValue::Enum(v)) => v as usize,
-                    _ => return,
-                };
-                let sv_fields = [
-                    "ZRSV", "ONSV", "TWSV", "THSV", "FRSV", "FVSV", "SXSV", "SVSV", "EISV", "NISV",
-                    "TESV", "ELSV", "TVSV", "TTSV", "FTSV", "FFSV",
-                ];
-                let unsv = self
-                    .record
-                    .get_field("UNSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                let cosv = self
-                    .record
-                    .get_field("COSV")
-                    .and_then(|v| {
-                        if let EpicsValue::Short(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-
-                // State alarm: per-state severity or UNSV for unknown states
-                let state_sev = if val < 16 {
-                    self.record
-                        .get_field(sv_fields[val])
-                        .and_then(|v| {
-                            if let EpicsValue::Short(s) = v {
-                                Some(s)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0)
-                } else {
-                    unsv
-                };
-
-                // AFTC low-pass filter on alarm severity (PR #817).
-                // mbbi only — mbbo skipped, matching epics-base.
-                let filtered_state_sev = if rtype == "mbbi" {
-                    let aftc = self
-                        .record
-                        .get_field("AFTC")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0);
-                    let afvl = self
-                        .record
-                        .get_field("AFVL")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0);
-                    let now = crate::runtime::general_time::get_current();
-                    let (out, new_afvl) =
-                        Self::aftc_filter(state_sev as u16, aftc, afvl, self.common.time, now);
-                    let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
-                    out as i16
-                } else {
-                    state_sev
-                };
-                let sev = AlarmSeverity::from_u16(filtered_state_sev as u16);
-                if sev != AlarmSeverity::NoAlarm {
-                    recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::STATE_ALARM, sev);
-                }
-
-                // COS alarm: only when val changed from LALM (like bi/bo)
-                let lalm = self
-                    .record
-                    .get_field("LALM")
-                    .and_then(|v| {
-                        if let EpicsValue::Enum(s) = v {
-                            Some(s as usize)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(val);
-
-                if val != lalm {
-                    let cos_sev = AlarmSeverity::from_u16(cosv as u16);
-                    if cos_sev != AlarmSeverity::NoAlarm {
-                        recgbl::rec_gbl_set_sevr(
-                            &mut self.common,
-                            alarm_status::COS_ALARM,
-                            cos_sev,
-                        );
-                    }
-                    let _ = self.record.put_field("LALM", EpicsValue::Enum(val as u16));
-                }
-            }
+            // bi / bo / busy / mbbi / mbbo STATE+COS (and mbbo SOFT)
+            // alarm evaluation now lives in each record's
+            // `Record::check_alarms` hook (C `checkAlarms`). Keeping an
+            // arm here would double-raise.
             _ => {} // no-op for other types
         }
     }
@@ -1498,6 +1335,25 @@ impl RecordInstance {
         if let Some(ref sub_fn) = self.subroutine {
             sub_fn(&mut *self.record)?;
         }
+        // Soft-Channel input records must skip the RVAL->VAL convert
+        // (C `devAiSoft.c` `read_ai` returns 2 = "don't convert" for
+        // every Soft-Channel input record, incl. one with a constant /
+        // unset INP). Without this, `process_local` on a soft input
+        // with a preset VAL — e.g. NaN — would run `convert()` and
+        // clobber it, after which the UDF check below would see a
+        // defined value and wrongly clear UDF (06-H-2). The
+        // `processing.rs` link path already does this; `process_local`
+        // is the separate foreign-call path (`db.process_record`) and
+        // needs the same skip. "Raw Soft Channel" has a distinct DTYP
+        // so it is excluded by `is_soft` and still runs convert.
+        {
+            let is_soft =
+                self.common.dtyp.is_empty() || self.common.dtyp == "Soft Channel";
+            let is_output = self.record.can_device_write();
+            if is_soft && !is_output {
+                self.record.set_device_did_compute(true);
+            }
+        }
         let outcome = self.record.process()?;
         let process_result = outcome.result;
         // Note: process_local() does not execute ProcessActions — those are
@@ -1556,6 +1412,16 @@ impl RecordInstance {
             });
         }
 
+        // UDF update before alarm evaluation — C parity (see
+        // `processing.rs`). A NaN / undefined value keeps UDF true so
+        // `recGblCheckUDF` raises UDF_ALARM this cycle instead of the
+        // record reporting a stale/garbage value with no alarm.
+        if self.record.clears_udf() {
+            self.common.udf = self.record.value_is_undefined();
+        }
+        // Per-record alarm hook (C `checkAlarms()`).
+        self.record.check_alarms(&mut self.common);
+
         // Evaluate alarms (accumulates into nsta/nsev)
         self.evaluate_alarms();
 
@@ -1563,9 +1429,7 @@ impl RecordInstance {
         let alarm_result = recgbl::rec_gbl_reset_alarms(&mut self.common);
 
         self.common.time = crate::runtime::general_time::get_current();
-        if self.record.clears_udf() {
-            self.common.udf = false;
-        }
+        // UDF already updated above — do not clear unconditionally.
 
         // Compute event mask
         let mut event_mask = EventMask::NONE;
@@ -1589,11 +1453,16 @@ impl RecordInstance {
                 changed_fields.push(("VAL".to_string(), val));
             }
         }
-        if alarm_result.alarm_changed {
+        // C `recGblResetAlarms` posts SEVR ONLY on a sevr change and
+        // STAT only on a stat change — never SEVR on a stat-only
+        // transition. Condition each push on its own field.
+        if self.common.sevr != alarm_result.prev_sevr {
             changed_fields.push((
                 "SEVR".to_string(),
                 EpicsValue::Short(self.common.sevr as i16),
             ));
+        }
+        if self.common.stat != alarm_result.prev_stat {
             changed_fields.push((
                 "STAT".to_string(),
                 EpicsValue::Short(self.common.stat as i16),
@@ -1679,7 +1548,16 @@ impl RecordInstance {
     /// silent compromise — `record_tests.rs::deadband_*` pins both
     /// the NaN-sentinel behaviour and the C four-quadrant transitions.
     pub fn check_deadband_ext(&mut self) -> (bool, bool) {
-        let val = match self.record.val().and_then(|v| v.to_f64()) {
+        // The deadband is evaluated against `monitor_deadband_value()`,
+        // not `val()` directly: a record whose monitored quantity is
+        // not its primary value (e.g. the motor record, VAL=setpoint /
+        // RBV=readback — C `monitor()` deadbands RBV) overrides that
+        // hook. Default is `val()`, so other records are unaffected.
+        let val = match self
+            .record
+            .monitor_deadband_value()
+            .and_then(|v| v.to_f64())
+        {
             Some(v) => v,
             None => return (true, true),
         };

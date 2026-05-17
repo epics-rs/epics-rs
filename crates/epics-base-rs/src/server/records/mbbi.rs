@@ -191,6 +191,14 @@ impl MbbiRecord {
         }
         65535
     }
+
+    /// Per-state severity fields ZRSV..FFSV indexed by state 0..15.
+    fn state_severities(&self) -> [i16; 16] {
+        [
+            self.zrsv, self.onsv, self.twsv, self.thsv, self.frsv, self.fvsv, self.sxsv, self.svsv,
+            self.eisv, self.nisv, self.tesv, self.elsv, self.tvsv, self.ttsv, self.ftsv, self.ffsv,
+        ]
+    }
 }
 
 static MBBI_FIELDS: &[FieldDesc] = &[
@@ -496,6 +504,22 @@ static MBBI_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// True for the mbbi/mbbo state-table fields whose modification must
+/// trigger an `sdef` recompute — the 16 state values (ZRVL..FFVL) and
+/// the 16 state strings (ZRST..FFST). Shared by `mbbi` and `mbbo`
+/// `special()` (C `mbbiRecord.c`/`mbboRecord.c` `init_common`).
+pub(crate) fn is_state_table_field(field: &str) -> bool {
+    const VL: [&str; 16] = [
+        "ZRVL", "ONVL", "TWVL", "THVL", "FRVL", "FVVL", "SXVL", "SVVL", "EIVL", "NIVL", "TEVL",
+        "ELVL", "TVVL", "TTVL", "FTVL", "FFVL",
+    ];
+    const ST: [&str; 16] = [
+        "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST", "TEST",
+        "ELST", "TVST", "TTST", "FTST", "FFST",
+    ];
+    VL.contains(&field) || ST.contains(&field)
+}
+
 /// Helper macro: maps EPICS field name strings to struct fields.
 macro_rules! mbb_get_field {
     ($self:expr, $name:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
@@ -615,6 +639,61 @@ impl Record for MbbiRecord {
 
     fn set_device_did_compute(&mut self, did: bool) {
         self.skip_convert = did;
+    }
+
+    /// C `mbbiRecord.c::checkAlarms` — UDF alarm, STATE alarm from the
+    /// per-state severity (ZRSV..FFSV, or UNSV for an unknown state)
+    /// with the AFTC low-pass filter (PR #817), and COS alarm (COSV).
+    /// C `checkAlarms:300-305` raises `UDF_ALARM/udfs`, zeroes AFVL,
+    /// and returns early when `udf` is set; we mirror that (raising
+    /// UDF is idempotent with the framework's `rec_gbl_check_udf`).
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        use crate::server::record::AlarmSeverity;
+        use crate::server::recgbl::{self, alarm_status};
+
+        if common.udf {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
+            self.afvl = 0.0;
+            return;
+        }
+        let val = self.val;
+        let raw_sev = if val > 15 {
+            self.unsv
+        } else {
+            self.state_severities()[val as usize]
+        };
+        let (filtered, new_afvl) = super::bi::aftc_filter(
+            raw_sev as u16,
+            self.aftc,
+            self.afvl,
+            common.time,
+            crate::runtime::general_time::get_current(),
+        );
+        self.afvl = new_afvl;
+        let sev = AlarmSeverity::from_u16(filtered);
+        if sev != AlarmSeverity::NoAlarm {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
+        }
+        if val != self.lalm {
+            let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
+            if cos_sev != AlarmSeverity::NoAlarm {
+                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, cos_sev);
+            }
+            self.lalm = val;
+        }
+    }
+
+    /// C `mbbiRecord.c::special` — after a runtime write to any of the
+    /// state value (ZRVL..FFVL) or state string (ZRST..FFST) fields,
+    /// `init_common()` re-derives `sdef`. Without this a record that
+    /// started with an empty state table (`sdef=false`) would stay on
+    /// the no-states `VAL=RVAL` path even after a CA put populated a
+    /// state value.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && is_state_table_field(field) {
+            self.compute_sdef();
+        }
+        Ok(())
     }
 
     /// Override set_val: convert raw value from hardware → enum index.

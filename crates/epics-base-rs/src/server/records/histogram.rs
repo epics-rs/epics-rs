@@ -3,59 +3,136 @@ use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// Histogram record — counts values into buckets.
+///
+/// C `histogramRecord.c`: bucket counters are `epicsUInt32`
+/// (`cvt_dbaddr` sets `dbr_field_type = DBF_ULONG`) and wrap
+/// explicitly at `UINT_MAX` (`add_count`: `if (*pdest == UINT_MAX)
+/// *pdest = 0; (*pdest)++;`).
+///
+/// The counters are stored in an `i32` vector — the public field type
+/// is unchanged for callers — but each increment goes through
+/// `u32`-wrapping arithmetic (`(v as u32).wrapping_add(1) as i32`).
+/// The `i32` slot is treated as the two's-complement *bit container*
+/// for the C `epicsUInt32`: this wraps at `UINT_MAX` exactly as C
+/// does, and never panics on overflow the way a plain signed
+/// `i32 += 1` would at 2^31 counts. The CA wire has no unsigned-long
+/// DBR type, so `VAL` is exposed as `LongArray` — the same bit
+/// pattern a C client sees over `DBR_LONG`.
 pub struct HistogramRecord {
-    pub val: Vec<i32>, // Bucket counts
+    pub val: Vec<i32>, // Bucket counts (C epicsUInt32 bit pattern, wraps at UINT_MAX)
     pub nelm: i32,     // Number of buckets
     pub ulim: f64,     // Upper limit
     pub llim: f64,     // Lower limit
+    pub wdth: f64,     // Width of one bucket = (ulim-llim)/nelm
     pub sgnl: f64,     // Signal value to bin (C: DBF_DOUBLE)
-    pub cmd: i16,      // 0=Read, 1=Clear
-    pub sdel: f64,     // Signal deadband
+    pub cmd: i16,      // 0=Read, 1=Clear, 2=Start, 3=Stop
+    pub csta: bool,    // Counting state — TRUE while counting is enabled
+    pub sdel: f64,     // Signal deadband (monitor refresh period, seconds)
+    pub mdel: i32,     // Monitor count deadband
+    pub mcnt: i32,     // Counts accumulated since last monitor post
 }
 
 impl Default for HistogramRecord {
     fn default() -> Self {
+        let nelm = 10;
+        let ulim = 10.0;
+        let llim = 0.0;
         Self {
-            val: vec![0; 10],
-            nelm: 10,
-            ulim: 10.0,
-            llim: 0.0,
+            val: vec![0; nelm as usize],
+            nelm,
+            ulim,
+            llim,
+            wdth: (ulim - llim) / nelm as f64,
             sgnl: 0.0,
             cmd: 0,
+            // C init leaves CSTA at its DBD default; the histogram
+            // record counts by default (CSTA defaults TRUE) so a
+            // freshly created record accumulates without an explicit
+            // CMD=2 start.
+            csta: true,
             sdel: 0.0,
+            mdel: 0,
+            mcnt: 0,
         }
     }
 }
 
 impl HistogramRecord {
     pub fn new(nelm: i32, llim: f64, ulim: f64) -> Self {
+        let n = nelm.max(1);
         Self {
-            val: vec![0; nelm as usize],
+            val: vec![0; n as usize],
             nelm,
             ulim,
             llim,
+            wdth: (ulim - llim) / n as f64,
             ..Default::default()
         }
     }
 
-    /// Add a sample value to the histogram.
-    pub fn add_sample(&mut self, value: f64) {
-        if value < self.llim || value >= self.ulim || self.nelm <= 0 {
-            return; // Out of range
-        }
-        let range = self.ulim - self.llim;
-        if range <= 0.0 {
+    /// Recompute bucket width — C `special` SPC_RESET path
+    /// (`prec->wdth = (ulim-llim)/nelm`).
+    fn recompute_wdth(&mut self) {
+        let n = self.nelm.max(1) as f64;
+        self.wdth = (self.ulim - self.llim) / n;
+    }
+
+    /// Add one sample. Mirrors C `add_count` (histogramRecord.c:320-352):
+    /// early-out when counting is stopped; reject out-of-range signal;
+    /// pick the bucket with the closed-upper-edge `temp <= i*wdth`
+    /// loop; wrap the `epicsUInt32` counter at `UINT_MAX`.
+    pub fn add_count(&mut self) {
+        if !self.csta {
             return;
         }
-        let bucket = ((value - self.llim) / range * self.nelm as f64) as usize;
-        let bucket = bucket.min(self.nelm as usize - 1);
-        self.val[bucket] += 1;
+        if self.llim >= self.ulim || self.nelm <= 0 {
+            return;
+        }
+        if self.sgnl < self.llim || self.sgnl >= self.ulim {
+            return;
+        }
+        // C: temp = sgnl - llim; for (i=1; i<=nelm; i++) if (temp <= i*wdth) break;
+        let temp = self.sgnl - self.llim;
+        let mut i = 1i32;
+        while i <= self.nelm {
+            if temp <= i as f64 * self.wdth {
+                break;
+            }
+            i += 1;
+        }
+        // C: pdest = bptr + i - 1. The loop can leave i == nelm+1 only
+        // when rounding pushes temp past the last edge; clamp so the
+        // index stays inside the buffer.
+        let bucket = ((i - 1).max(0) as usize).min(self.val.len().saturating_sub(1));
+        if bucket < self.val.len() {
+            // C: if (*pdest == UINT_MAX) *pdest = 0; (*pdest)++;
+            // The i32 slot holds the epicsUInt32 bit pattern — wrap
+            // through u32 so the rollover happens at UINT_MAX.
+            self.val[bucket] = (self.val[bucket] as u32).wrapping_add(1) as i32;
+            self.mcnt = self.mcnt.saturating_add(1);
+        }
+    }
+
+    /// Back-compat helper: set SGNL then count one sample.
+    pub fn add_sample(&mut self, value: f64) {
+        self.sgnl = value;
+        self.add_count();
+    }
+
+    /// C `clear_histogram` — zero every bucket and arm a monitor post.
+    fn clear_histogram(&mut self) {
+        for v in &mut self.val {
+            *v = 0;
+        }
+        self.mcnt = self.mdel + 1;
     }
 }
 
 static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
+        // CA wire has no DBR_ULONG; C `cvt_dbaddr` uses DBF_ULONG
+        // internally but a CA client reads it as DBR_LONG.
         dbf_type: DbFieldType::Long,
         read_only: false,
     },
@@ -75,6 +152,11 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        name: "WDTH",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
         name: "SGNL",
         dbf_type: DbFieldType::Double,
         read_only: false,
@@ -85,9 +167,24 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        name: "CSTA",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
         name: "SDEL",
         dbf_type: DbFieldType::Double,
         read_only: false,
+    },
+    FieldDesc {
+        name: "MDEL",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MCNT",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
     },
 ];
 
@@ -97,24 +194,28 @@ impl Record for HistogramRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if self.cmd == 1 {
-            for v in &mut self.val {
-                *v = 0;
-            }
-            self.cmd = 0;
-        }
+        // C `process` → `add_count(prec)` then `monitor`. The signal
+        // is read from the input link by the framework before
+        // process(); count it into the current bucket.
+        self.add_count();
         Ok(ProcessOutcome::complete())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
+            // Counters surfaced as-is (the i32 slot is the
+            // epicsUInt32 bit pattern C exposes over DBR_LONG).
             "VAL" => Some(EpicsValue::LongArray(self.val.clone())),
             "NELM" => Some(EpicsValue::Long(self.nelm)),
             "ULIM" => Some(EpicsValue::Double(self.ulim)),
             "LLIM" => Some(EpicsValue::Double(self.llim)),
+            "WDTH" => Some(EpicsValue::Double(self.wdth)),
             "SGNL" => Some(EpicsValue::Double(self.sgnl)),
             "CMD" => Some(EpicsValue::Short(self.cmd)),
+            "CSTA" => Some(EpicsValue::Short(if self.csta { 1 } else { 0 })),
             "SDEL" => Some(EpicsValue::Double(self.sdel)),
+            "MDEL" => Some(EpicsValue::Long(self.mdel)),
+            "MCNT" => Some(EpicsValue::Long(self.mcnt)),
             _ => None,
         }
     }
@@ -131,6 +232,9 @@ impl Record for HistogramRecord {
             "ULIM" => match value {
                 EpicsValue::Double(v) => {
                     self.ulim = v;
+                    // C SPC_RESET: recompute width and clear.
+                    self.recompute_wdth();
+                    self.clear_histogram();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("ULIM".into())),
@@ -138,20 +242,40 @@ impl Record for HistogramRecord {
             "LLIM" => match value {
                 EpicsValue::Double(v) => {
                     self.llim = v;
+                    self.recompute_wdth();
+                    self.clear_histogram();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("LLIM".into())),
             },
             "SGNL" => {
                 self.sgnl = value.to_f64().unwrap_or(0.0);
+                // C `special` SPC_MOD on SGNL → add_count.
+                self.add_count();
                 Ok(())
             }
             "CMD" => match value {
                 EpicsValue::Short(v) => {
+                    // C `special` SPC_CALC: cmd<=1 clear, cmd==2 start,
+                    // cmd==3 stop; cmd is always reset to 0 afterwards.
                     self.cmd = v;
+                    match v {
+                        2 => self.csta = true,
+                        3 => self.csta = false,
+                        // <= 1 (Read / Clear) clears the histogram.
+                        _ => self.clear_histogram(),
+                    }
+                    self.cmd = 0;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CMD".into())),
+            },
+            "CSTA" => match value {
+                EpicsValue::Short(v) => {
+                    self.csta = v != 0;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("CSTA".into())),
             },
             "SDEL" => match value {
                 EpicsValue::Double(v) => {
@@ -160,7 +284,14 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SDEL".into())),
             },
-            "NELM" => Err(CaError::ReadOnlyField(name.to_string())),
+            "MDEL" => match value {
+                EpicsValue::Long(v) => {
+                    self.mdel = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("MDEL".into())),
+            },
+            "NELM" | "WDTH" | "MCNT" => Err(CaError::ReadOnlyField(name.to_string())),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -171,5 +302,66 @@ impl Record for HistogramRecord {
 
     fn primary_field(&self) -> &'static str {
         "VAL"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// C-2: a counter at the `UINT_MAX` bit pattern must wrap to 0,
+    /// never panic the way a signed `i32 += 1` would at overflow.
+    #[test]
+    fn counter_wraps_at_u32_max_no_panic() {
+        let mut rec = HistogramRecord::new(2, 0.0, 10.0);
+        rec.val[0] = u32::MAX as i32; // -1 i32, == UINT_MAX bit pattern
+        rec.sgnl = 1.0;
+        rec.add_count();
+        assert_eq!(rec.val[0], 0, "epicsUInt32 counter wraps UINT_MAX -> 0");
+    }
+
+    /// H-11: CMD=3 stops counting, CMD=2 resumes it.
+    #[test]
+    fn cmd_start_stop_pauses_counting() {
+        let mut rec = HistogramRecord::new(2, 0.0, 10.0);
+        rec.put_field("CMD", EpicsValue::Short(3)).unwrap(); // stop
+        assert!(!rec.csta);
+        rec.add_sample(1.0);
+        assert_eq!(rec.val[0], 0, "stopped histogram must not count");
+        rec.put_field("CMD", EpicsValue::Short(2)).unwrap(); // start
+        assert!(rec.csta);
+        rec.add_sample(1.0);
+        assert_eq!(rec.val[0], 1, "started histogram counts again");
+    }
+
+    /// H-11: CMD<=1 clears all buckets.
+    #[test]
+    fn cmd_clear_zeros_buckets() {
+        let mut rec = HistogramRecord::new(2, 0.0, 10.0);
+        rec.add_sample(1.0);
+        rec.add_sample(6.0);
+        rec.put_field("CMD", EpicsValue::Short(1)).unwrap();
+        assert_eq!(rec.val, vec![0, 0]);
+    }
+
+    /// M-3: closed-upper-edge bucket selection — a value exactly on an
+    /// internal boundary lands in the lower bucket.
+    #[test]
+    fn bin_boundary_uses_closed_upper_edge() {
+        let mut rec = HistogramRecord::new(2, 0.0, 10.0); // wdth = 5
+        rec.add_sample(5.0); // temp=5 <= 1*5 → bucket 0
+        assert_eq!(rec.val, vec![1, 0]);
+        rec.add_sample(5.0001); // temp>5 → bucket 1
+        assert_eq!(rec.val, vec![1, 1]);
+    }
+
+    /// Out-of-range signal is rejected (C `add_count` early return).
+    #[test]
+    fn out_of_range_signal_rejected() {
+        let mut rec = HistogramRecord::new(2, 0.0, 10.0);
+        rec.add_sample(-1.0);
+        rec.add_sample(10.0); // >= ulim → rejected
+        rec.add_sample(99.0);
+        assert_eq!(rec.val, vec![0, 0]);
     }
 }

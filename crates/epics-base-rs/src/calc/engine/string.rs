@@ -37,11 +37,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::Random => {
                     stack.push(StackValue::Double(simple_random()));
                 }
-                CoreOp::NormalRandom | CoreOp::FetchVal => {
+                CoreOp::NormalRandom => {
                     let u1 = simple_random();
                     let u2 = simple_random();
                     let n = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                     stack.push(StackValue::Double(n));
+                }
+                CoreOp::FetchVal => {
+                    // C FETCH_VAL pushes *presult (the record's previous result).
+                    stack.push(StackValue::Double(inputs.prev_val));
                 }
 
                 // Type-aware arithmetic
@@ -87,18 +91,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Div => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    if b == 0.0 {
-                        stack.push(StackValue::Double(f64::NAN));
-                    } else {
-                        stack.push(StackValue::Double(a / b));
-                    }
+                    // C calcPerform.c:157-160: bare IEEE divide (1/0 = +Inf, 0/0 = NaN).
+                    stack.push(StackValue::Double(a / b));
                 }
                 CoreOp::Mod => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    if b as i64 == 0 {
+                    // C: itop = (epicsInt32)den; if(itop) (epicsInt32)num % itop else NaN
+                    let den = d2i(b);
+                    if den == 0 {
                         stack.push(StackValue::Double(f64::NAN));
                     } else {
-                        stack.push(StackValue::Double(((a as i64) % (b as i64)) as f64));
+                        stack.push(StackValue::Double((d2i(a).wrapping_rem(den)) as f64));
                     }
                 }
                 CoreOp::Neg => {
@@ -110,12 +113,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(a.powf(b)));
                 }
 
-                // Type-aware comparison
+                // Type-aware comparison.
+                // C calcPerform.c:373-393 compares doubles with exact IEEE
+                // operators; the numeric evaluator does the same, so the string
+                // evaluator must not apply an epsilon.
                 CoreOp::Eq => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() < 1e-11,
+                        (StackValue::Double(x), StackValue::Double(y)) => x == y,
                         (StackValue::Str(x), StackValue::Str(y)) => x == y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -125,7 +131,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() > 1e-11,
+                        (StackValue::Double(x), StackValue::Double(y)) => x != y,
                         (StackValue::Str(x), StackValue::Str(y)) => x != y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -135,7 +141,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => (y - x) > 1e-11,
+                        (StackValue::Double(x), StackValue::Double(y)) => x < y,
                         (StackValue::Str(x), StackValue::Str(y)) => x < y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -145,9 +151,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (x - y).abs() < 1e-11 || *x < *y
-                        }
+                        (StackValue::Double(x), StackValue::Double(y)) => x <= y,
                         (StackValue::Str(x), StackValue::Str(y)) => x <= y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -157,7 +161,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => (x - y) > 1e-11,
+                        (StackValue::Double(x), StackValue::Double(y)) => x > y,
                         (StackValue::Str(x), StackValue::Str(y)) => x > y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -167,9 +171,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (x - y).abs() < 1e-11 || *x > *y
-                        }
+                        (StackValue::Double(x), StackValue::Double(y)) => x >= y,
                         (StackValue::Str(x), StackValue::Str(y)) => x >= y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -198,34 +200,34 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(if a == 0.0 { 1.0 } else { 0.0 }));
                 }
 
-                // Bitwise
+                // Bitwise - use C's d2i/d2ui conversion (wrap-on-overflow 32-bit)
                 CoreOp::BitAnd => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(((a as i32) & (b as i32)) as f64));
+                    stack.push(StackValue::Double((d2i(a) & d2i(b)) as f64));
                 }
                 CoreOp::BitOr => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(((a as i32) | (b as i32)) as f64));
+                    stack.push(StackValue::Double((d2i(a) | d2i(b)) as f64));
                 }
                 CoreOp::BitXor => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(((a as i32) ^ (b as i32)) as f64));
+                    stack.push(StackValue::Double((d2i(a) ^ d2i(b)) as f64));
                 }
                 CoreOp::BitNot => {
                     let a = pop1_f64(&mut stack)?;
-                    stack.push(StackValue::Double(!(a as i32) as f64));
+                    stack.push(StackValue::Double(!d2i(a) as f64));
                 }
                 CoreOp::Shl => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(((a as i32) << ((b as i32) & 31)) as f64));
+                    stack.push(StackValue::Double((d2i(a) << (d2i(b) & 31)) as f64));
                 }
                 CoreOp::Shr => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(((a as i32) >> ((b as i32) & 31)) as f64));
+                    stack.push(StackValue::Double((d2i(a) >> (d2i(b) & 31)) as f64));
                 }
                 CoreOp::ShrLogical => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(((a as u32) >> ((b as u32) & 31)) as f64));
+                    stack.push(StackValue::Double((d2ui(a) >> (d2ui(b) & 31)) as f64));
                 }
 
                 // Conditional
@@ -311,12 +313,9 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Nint => {
                     let a = pop1_f64(&mut stack)?;
-                    let rounded = if a >= 0.0 {
-                        (a + 0.5) as i64
-                    } else {
-                        (a - 0.5) as i64
-                    };
-                    stack.push(StackValue::Double(rounded as f64));
+                    // C: *ptop = (epicsInt32)(top>=0 ? top+0.5 : top-0.5)
+                    let pre = if a >= 0.0 { a + 0.5 } else { a - 0.5 };
+                    stack.push(StackValue::Double(f64_to_i32_wrap(pre) as f64));
                 }
                 CoreOp::IsNan(nargs) => {
                     let n = *nargs as usize;
@@ -945,6 +944,45 @@ fn format_double(d: f64) -> String {
     }
 }
 
+/// C `d2i` macro: positive doubles route through `epicsUInt32` first; negative
+/// doubles cast directly. Wraps modulo 2^32 on overflow.
+#[inline]
+fn d2i(x: f64) -> i32 {
+    if x < 0.0 {
+        f64_to_i32_wrap(x)
+    } else {
+        f64_to_u32_wrap(x) as i32
+    }
+}
+
+/// C `d2ui` macro.
+#[inline]
+fn d2ui(x: f64) -> u32 {
+    if x < 0.0 {
+        f64_to_i32_wrap(x) as u32
+    } else {
+        f64_to_u32_wrap(x)
+    }
+}
+
+/// `(epicsInt32)x` with C wrap-on-overflow semantics (Rust `as` saturates).
+#[inline]
+fn f64_to_i32_wrap(x: f64) -> i32 {
+    if x.is_nan() {
+        return 0;
+    }
+    (x.trunc().rem_euclid(4294967296.0) as u64 as u32) as i32
+}
+
+/// `(epicsUInt32)x` with C wrap-on-overflow semantics.
+#[inline]
+fn f64_to_u32_wrap(x: f64) -> u32 {
+    if x.is_nan() {
+        return 0;
+    }
+    x.trunc().rem_euclid(4294967296.0) as u64 as u32
+}
+
 fn pop1(stack: &mut Vec<StackValue>) -> Result<StackValue, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
 }
@@ -960,28 +998,31 @@ fn pop2_f64(stack: &mut Vec<StackValue>) -> Result<(f64, f64), CalcError> {
     Ok((a, b))
 }
 
+/// Forward-scan for a matching conditional opcode, mirroring C `cond_search`
+/// (calcPerform.c:520-557): `count` starts at 1, the target opcode decrements
+/// it (return when 0), `COND_IF` increments it.
 fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, CalcError> {
-    let mut depth = 0;
+    let mut count: i32 = 1;
     let mut pc = start;
 
     while pc < code.len() {
-        match &code[pc] {
-            Opcode::Core(CoreOp::CondIf) => depth += 1,
-            Opcode::Core(CoreOp::CondElse) => {
-                if depth == 0 && find_else {
-                    return Ok(pc + 1);
-                }
+        let op = &code[pc];
+        if matches!(op, Opcode::Core(CoreOp::End)) {
+            break;
+        }
+        let is_match = match op {
+            Opcode::Core(CoreOp::CondElse) => find_else,
+            Opcode::Core(CoreOp::CondEnd) => !find_else,
+            _ => false,
+        };
+        if is_match {
+            count -= 1;
+            if count == 0 {
+                return Ok(pc + 1);
             }
-            Opcode::Core(CoreOp::CondEnd) => {
-                if depth == 0 && !find_else {
-                    return Ok(pc + 1);
-                }
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
-            Opcode::Core(CoreOp::End) => break,
-            _ => {}
+        }
+        if matches!(op, Opcode::Core(CoreOp::CondIf)) {
+            count += 1;
         }
         pc += 1;
     }
@@ -1004,5 +1045,46 @@ fn simple_random() -> f64 {
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
     SEED.store(s, Ordering::Relaxed);
-    ((s >> 11) as f64) / ((1u64 << 53) as f64) + f64::MIN_POSITIVE
+    // C calcRandom() returns (double)rand()/RAND_MAX — a closed [0,1] range.
+    (s >> 11) as f64 / ((1u64 << 53) - 1) as f64
+}
+
+#[cfg(test)]
+mod parity_tests {
+    //! C-parity regression tests for the string evaluator
+    //! (parity-review/01-calc.md H-6, H-7).
+    use crate::calc::{StackValue, StringInputs, scalc};
+
+    fn run_num(expr: &str) -> f64 {
+        let mut inp = StringInputs::new();
+        match scalc(expr, &mut inp).unwrap() {
+            StackValue::Double(v) => v,
+            StackValue::Str(s) => panic!("expected double, got string {s:?}"),
+        }
+    }
+
+    // H-6: `==` compares doubles exactly, not within an epsilon.
+    #[test]
+    fn h6_eq_is_exact() {
+        // 1e-12 is not equal to 0 under exact IEEE comparison.
+        assert_eq!(run_num("1e-12 == 0"), 0.0);
+        assert_eq!(run_num("1e-12 # 0"), 1.0); // `#` is the NE operator
+        assert_eq!(run_num("0 == 0"), 1.0);
+    }
+
+    #[test]
+    fn h6_inequalities_exact() {
+        // 1e-12 < 1e-11 must be true (epsilon would have hidden it).
+        assert_eq!(run_num("1e-12 < 1e-11"), 1.0);
+        assert_eq!(run_num("1 >= 1"), 1.0);
+        assert_eq!(run_num("2 > 1"), 1.0);
+    }
+
+    // H-7: division by zero yields IEEE Inf/NaN, not forced NaN.
+    #[test]
+    fn h7_div_by_zero_is_ieee() {
+        assert_eq!(run_num("1/0"), f64::INFINITY);
+        assert_eq!(run_num("-1/0"), f64::NEG_INFINITY);
+        assert!(run_num("0/0").is_nan());
+    }
 }

@@ -80,6 +80,13 @@ pub fn bind_loopback_mcast(port: u16) -> io::Result<UdpSocket> {
     // Send side: any send to 224.0.0.128 from this socket goes out
     // via loopback (TTL=1 so it stays on this host) and loops back
     // into our own and any peer's listeners.
+    //
+    // TTL is intentionally hard-coded to 1 and does NOT honour
+    // `runtime::net::ca_mcast_ttl()` / `EPICS_CA_MCAST_TTL`: this is
+    // the host-local pvxs ORIGIN_TAG channel (udp_collector.cpp),
+    // which is TTL=1 by design. `EPICS_CA_MCAST_TTL` governs routed
+    // CA multicast only and must not leak this loopback channel onto
+    // the wire.
     sock.set_multicast_loop_v4(true)?;
     sock.set_multicast_ttl_v4(1)?;
     sock.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)?;

@@ -270,31 +270,21 @@ impl PvDatabase {
                     // clear above still ran, matching C's pre-`goto
                     // all_done` ordering.
                     if instance.common.stat != crate::server::recgbl::alarm_status::DISABLE_ALARM {
+                        use crate::server::recgbl::EventMask;
                         instance.common.sevr = diss;
                         instance.common.stat = crate::server::recgbl::alarm_status::DISABLE_ALARM;
-                        // Post STAT/SEVR with DBE_VALUE only, then VAL
-                        // with DBE_VALUE|DBE_ALARM — match the C order
-                        // `db_post_events(&stat, DBE_VALUE);
-                        // db_post_events(&sevr, DBE_VALUE);
-                        // db_post_events(&val, DBE_VALUE|DBE_ALARM)`.
-                        let mut changed_fields = Vec::new();
-                        changed_fields.push((
-                            "STAT".to_string(),
-                            EpicsValue::Short(instance.common.stat as i16),
-                        ));
-                        changed_fields.push((
-                            "SEVR".to_string(),
-                            EpicsValue::Short(instance.common.sevr as i16),
-                        ));
-                        if let Some(val) = instance.record.val() {
-                            changed_fields.push(("VAL".to_string(), val));
-                        }
-                        let snapshot = crate::server::record::ProcessSnapshot {
-                            changed_fields,
-                            event_mask: crate::server::recgbl::EventMask::VALUE
-                                | crate::server::recgbl::EventMask::ALARM,
-                        };
-                        instance.notify_from_snapshot(&snapshot);
+                        // C `dbAccess.c:586-593` posts each field with
+                        // its own mask:
+                        //   db_post_events(&stat, DBE_VALUE);
+                        //   db_post_events(&sevr, DBE_VALUE);
+                        //   db_post_events(&val,  DBE_VALUE|DBE_ALARM);
+                        // STAT/SEVR get DBE_VALUE only — a DBE_ALARM-only
+                        // subscriber on `.STAT`/`.SEVR` must NOT receive
+                        // this disable event. Only the value field
+                        // carries DBE_ALARM.
+                        instance.notify_field("STAT", EventMask::VALUE);
+                        instance.notify_field("SEVR", EventMask::VALUE);
+                        instance.notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
                     }
                     tx
                 };
@@ -310,22 +300,44 @@ impl PvDatabase {
             }
         }
 
-        // 0.3. TSEL link: read TSE value from another record
+        // 0.3. TSEL link: C `recGblGetTimeStampSimm` (recGbl.c:310-323).
+        //
+        // When `TSEL` is a non-constant link, C distinguishes two
+        // cases by the link target field:
+        //   * the link points at another record's `.TIME` field
+        //     (`DBLINK_FLAG_TSELisTIME`) — copy that record's
+        //     timestamp directly into `prec->time`;
+        //   * otherwise `dbGetLink(&tsel, DBR_SHORT, &prec->tse)` —
+        //     load `TSE` from the link before the event lookup.
         {
             let tsel_link = {
                 let instance = rec.read().await;
                 instance.parsed_tsel.clone()
             };
             if let crate::server::record::ParsedLink::Db(ref link) = tsel_link {
-                let pv_name = if link.field == "VAL" {
-                    link.record.clone()
+                if link.field.eq_ignore_ascii_case("TIME") {
+                    // TSEL points at a `.TIME` field — copy the source
+                    // record's timestamp straight into `time`. The
+                    // following `apply_timestamp` leaves it untouched
+                    // for TSE=-2-equivalent (device-set) semantics; we
+                    // mark TSE=-2 so it is not overwritten.
+                    if let Some(src) = self.get_record(&link.record).await {
+                        let src_time = src.read().await.common.time;
+                        let mut instance = rec.write().await;
+                        instance.common.time = src_time;
+                        instance.common.tse = -2;
+                    }
                 } else {
-                    format!("{}.{}", link.record, link.field)
-                };
-                if let Ok(val) = self.get_pv(&pv_name).await {
-                    let tse_val = val.to_f64().unwrap_or(0.0) as i16;
-                    let mut instance = rec.write().await;
-                    instance.common.tse = tse_val;
+                    let pv_name = if link.field == "VAL" {
+                        link.record.clone()
+                    } else {
+                        format!("{}.{}", link.record, link.field)
+                    };
+                    if let Ok(val) = self.get_pv(&pv_name).await {
+                        let tse_val = val.to_f64().unwrap_or(0.0) as i16;
+                        let mut instance = rec.write().await;
+                        instance.common.tse = tse_val;
+                    }
                 }
             }
         }
@@ -526,7 +538,7 @@ impl PvDatabase {
         };
 
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
-        let (snapshot, out_info, flnk_name, process_actions) = {
+        let (snapshot, out_info, flnk_name, process_actions, alarm_posts) = {
             let mut instance = rec.write().await;
 
             // Apply DOL value for output records (OMSL=CLOSED_LOOP)
@@ -609,7 +621,23 @@ impl PvDatabase {
             let is_soft = instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
             let is_output = instance.record.can_device_write();
             let mut device_actions: Vec<crate::server::record::ProcessAction> = Vec::new();
-            let mut device_did_compute = soft_inp_applied && is_soft;
+            // C `devAiSoft.c:65` `read_ai` (and the other soft-channel
+            // input `read_xxx`) ALWAYS returns 2 ("don't convert") for a
+            // Soft-Channel input record — whether the value arrived via
+            // an INP link or the INP link is constant/unset
+            // (`dbLinkIsConstant` → `return 2`). Only `aiRecord.c:158`'s
+            // `if (status==0) convert(prec)` runs RVAL→VAL conversion, so
+            // for a plain Soft-Channel input record `convert()` must be
+            // skipped unconditionally. Without this, a soft ai with no
+            // INP would run `convert()` and clobber a preset VAL — e.g.
+            // a preset NaN would be rewritten to 0.0, then the framework
+            // UDF check (`value_is_undefined()`) would see a defined 0.0
+            // and wrongly clear UDF (06-H-2 regression). `is_raw_soft`
+            // (Raw Soft Channel, `devAiSoftRaw` returns 0) is excluded —
+            // it deliberately wants the RVAL→VAL convert.
+            let soft_input_skips_convert = is_soft && !is_output && !is_raw_soft;
+            let mut device_did_compute =
+                (soft_inp_applied && is_soft) || soft_input_skips_convert;
             if !is_soft && !is_output {
                 if let Some(mut dev) = instance.device.take() {
                     match dev.read(&mut *instance.record) {
@@ -808,6 +836,30 @@ impl PvDatabase {
                 }
             }
 
+            // UDF update — C parity (aiRecord.c:285, calcRecord.c
+            // checkAlarms, int64inRecord.c:144): clear UDF only when
+            // this cycle produced a *defined* value. A NaN computed
+            // value (calc divide-by-zero) or a failed link read that
+            // left VAL un-updated must keep UDF true so the following
+            // `recGblCheckUDF` raises UDF_ALARM at severity UDFS.
+            //
+            // This MUST run before `evaluate_alarms()` (which calls
+            // `rec_gbl_check_udf`): C records set `prec->udf` inside
+            // `process()` before `checkAlarms()` runs.
+            if instance.record.clears_udf() {
+                instance.common.udf = instance.record.value_is_undefined();
+            }
+
+            // Per-record alarm hook — record-type-specific STATE / COS
+            // / limit / SOFT alarms (C `checkAlarms()`). Records that
+            // have migrated their alarm logic here raise into
+            // `nsta`/`nsev`; the rest fall back to the framework's
+            // centralised `evaluate_alarms` match below.
+            {
+                let inst = &mut *instance;
+                inst.record.check_alarms(&mut inst.common);
+            }
+
             // Evaluate alarms (accumulates into nsta/nsev)
             instance.evaluate_alarms();
 
@@ -836,9 +888,10 @@ impl PvDatabase {
 
             // Apply timestamp based on TSE
             apply_timestamp(&mut instance.common, is_soft);
-            if instance.record.clears_udf() {
-                instance.common.udf = false;
-            }
+            // NOTE: UDF was already updated before `evaluate_alarms`
+            // above — keyed on `value_is_undefined()` so a NaN result
+            // keeps UDF true and UDF_ALARM is raised this cycle. Do
+            // NOT clear UDF unconditionally here.
 
             // IVOA check for output records with INVALID alarm
             let skip_out = if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid
@@ -1008,7 +1061,13 @@ impl PvDatabase {
 
             // Build snapshot
             let mut changed_fields = Vec::new();
-            if include_val {
+            // C `recGblResetAlarms` returns `val_mask = DBE_ALARM`
+            // when any alarm field moved — the record's VAL is posted
+            // with DBE_ALARM even if the value deadband did not fire,
+            // so a `DBE_ALARM`-only subscriber sees the value at the
+            // moment the alarm changed.
+            let val_on_alarm = alarm_result.alarm_changed || alarm_result.amsg_changed;
+            if include_val || val_on_alarm {
                 if let Some(val) = instance.record.val() {
                     changed_fields.push(("VAL".to_string(), val));
                 }
@@ -1041,37 +1100,49 @@ impl PvDatabase {
                 changed_fields.extend(sub_updates);
                 event_mask |= crate::server::recgbl::EventMask::VALUE;
             }
-            if alarm_result.alarm_changed {
-                changed_fields.push((
-                    "SEVR".to_string(),
-                    EpicsValue::Short(instance.common.sevr as i16),
-                ));
-                changed_fields.push((
-                    "STAT".to_string(),
-                    EpicsValue::Short(instance.common.stat as i16),
-                ));
+            // C `recGblResetAlarms` (recGbl.c:201-220) posts each
+            // alarm field with its own per-field mask:
+            //   * SEVR — DBE_VALUE, ONLY when `prev_sevr != new_sevr`.
+            //   * STAT/AMSG — `stat_mask` = DBE_ALARM (on sevr- or
+            //     amsg-change) | DBE_VALUE (on stat-change).
+            //   * ACKS — DBE_VALUE when `stat_mask != 0`.
+            // The pre-fix port pushed SEVR + STAT together on any
+            // `alarm_changed`, over-posting SEVR on a stat-only
+            // transition and collapsing the per-field mask into one
+            // record-wide mask. Posting these via `notify_field` with
+            // their individual masks restores C's granularity.
+            let sevr_changed = instance.common.sevr != alarm_result.prev_sevr;
+            let stat_changed = instance.common.stat != alarm_result.prev_stat;
+            let stat_mask = {
+                let mut m = EventMask::NONE;
+                if sevr_changed || alarm_result.amsg_changed {
+                    m |= EventMask::ALARM;
+                }
+                if stat_changed {
+                    m |= EventMask::VALUE;
+                }
+                m
+            };
+            if !stat_mask.is_empty() {
+                // C `val_mask = DBE_ALARM` — the value field carries
+                // DBE_ALARM whenever any alarm field moved.
+                event_mask |= EventMask::ALARM;
             }
-            // C `recGbl.c:210-211` — AMSG is posted whenever
-            // `stat_mask` is non-zero, i.e. on sevr-change, stat-change,
-            // OR amsg-change. The Rust port previously only posted AMSG
-            // when sevr/stat changed; an amsg-only update was silently
-            // dropped, leaving CA / PVA subscribers reading the stale
-            // pre-cycle message string.
-            if alarm_result.alarm_changed || alarm_result.amsg_changed {
-                changed_fields.push((
-                    "AMSG".to_string(),
-                    EpicsValue::String(instance.common.amsg.clone()),
-                ));
+            // Defer the SEVR/STAT/AMSG/ACKS posts to dedicated
+            // `notify_field` calls (collected here, fired after the
+            // snapshot notify below) so each gets its exact C mask.
+            let mut alarm_posts: Vec<(&'static str, EventMask)> = Vec::new();
+            if sevr_changed {
+                alarm_posts.push(("SEVR", EventMask::VALUE));
             }
-            // C parity (recGbl.c:216): when recGblResetAlarms raises
-            // `acks`, post it so operator screens that subscribe to
-            // ACKS see the sticky-alarm severity update.
-            if alarm_result.acks_changed {
-                changed_fields.push((
-                    "ACKS".to_string(),
-                    EpicsValue::Short(instance.common.acks as i16),
-                ));
-                event_mask |= EventMask::VALUE;
+            if !stat_mask.is_empty() {
+                alarm_posts.push(("STAT", stat_mask));
+                alarm_posts.push(("AMSG", stat_mask));
+            }
+            // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only
+            // when `stat_mask != 0` AND recGblResetAlarms raised it.
+            if alarm_result.acks_changed && !stat_mask.is_empty() {
+                alarm_posts.push(("ACKS", EventMask::VALUE));
             }
             if !event_mask.is_empty() {
                 changed_fields.push((
@@ -1102,13 +1173,18 @@ impl PvDatabase {
                 }
             }
 
-            (snapshot, out_info, flnk_name, process_actions)
+            (snapshot, out_info, flnk_name, process_actions, alarm_posts)
         };
 
         // 3. Notify subscribers (outside lock)
         {
             let instance = rec.read().await;
             instance.notify_from_snapshot(&snapshot);
+            // Post the alarm fields (SEVR/STAT/AMSG/ACKS) with their
+            // individual C masks — see recGblResetAlarms above.
+            for &(field, mask) in &alarm_posts {
+                instance.notify_field(field, mask);
+            }
         }
 
         // Snapshot source PUTF for the C `processTarget` invariant (see
@@ -1130,6 +1206,9 @@ impl PvDatabase {
 
         // 4.5. Multi-output dispatch (fanout/dfanout/seq)
         self.dispatch_multi_output(&rec, visited, depth).await;
+
+        // 4.55. event record: post the named software event.
+        self.dispatch_event_record(&rec).await;
 
         // 4.6. Generic multi-output links (transform OUTA..OUTP -> A..P)
         {
@@ -1201,7 +1280,21 @@ impl PvDatabase {
         // 6. CP link targets -- process records that have CP input links from this record
         self.dispatch_cp_targets(name, visited, depth).await;
 
-        // 7. RPRO: if reprocess requested, clear flag and reprocess
+        // 7. RPRO: if reprocess requested, clear flag and queue a
+        // fresh process pass.
+        //
+        // C `recGblFwdLink` (recGbl.c:296-300) consumes RPRO via
+        // `scanOnce(pdbc)` — the record is QUEUED on the scanOnce ring
+        // buffer and reprocessed in a separate pass with a fresh lock
+        // cycle AFTER the current process chain fully unwinds. It does
+        // NOT recurse inline within the current link chain.
+        //
+        // Spawning a detached task is the Rust equivalent of the
+        // scanOnce queue: the reprocess runs with a clean (empty)
+        // `visited` set and starts at depth 0, so it cannot be
+        // silently skipped by the current chain's cycle guard nor hit
+        // the MAX_LINK_DEPTH / MAX_LINK_OPS budget the current chain
+        // has already consumed.
         {
             let needs_rpro = {
                 let mut instance = rec.write().await;
@@ -1213,10 +1306,14 @@ impl PvDatabase {
                 }
             };
             if needs_rpro {
-                visited.remove(name);
-                let _ = self
-                    .process_record_with_links(name, visited, depth + 1)
-                    .await;
+                let db = self.clone();
+                let rpro_name = name.to_string();
+                crate::runtime::task::spawn(async move {
+                    let mut fresh_visited = std::collections::HashSet::new();
+                    let _ = db
+                        .process_record_with_links(&rpro_name, &mut fresh_visited, 0)
+                        .await;
+                });
             }
         }
 
@@ -1455,6 +1552,18 @@ impl PvDatabase {
         let (snapshot, out_info, flnk_name) = {
             let mut instance = rec.write().await;
 
+            // UDF update before alarm evaluation (C parity — see the
+            // sync process path). A NaN/undefined value keeps UDF true
+            // so `recGblCheckUDF` raises UDF_ALARM this cycle.
+            if instance.record.clears_udf() {
+                instance.common.udf = instance.record.value_is_undefined();
+            }
+            // Per-record alarm hook (C `checkAlarms()`).
+            {
+                let inst = &mut *instance;
+                inst.record.check_alarms(&mut inst.common);
+            }
+
             // Evaluate alarms
             instance.evaluate_alarms();
 
@@ -1482,9 +1591,7 @@ impl PvDatabase {
             let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
             apply_timestamp(&mut instance.common, is_soft);
-            if instance.record.clears_udf() {
-                instance.common.udf = false;
-            }
+            // UDF was already updated before `evaluate_alarms` above.
 
             // Clear PACT
             instance
@@ -1523,21 +1630,25 @@ impl PvDatabase {
                     changed_fields.push(("VAL".to_string(), val));
                 }
             }
-            if alarm_result.alarm_changed {
+            // C `recGblResetAlarms` posts SEVR only on a sevr change,
+            // STAT only on a stat change — never SEVR on a stat-only
+            // transition. AMSG is posted on any `stat_mask != 0`
+            // (sevr-, stat-, or amsg-change).
+            let sevr_changed = instance.common.sevr != alarm_result.prev_sevr;
+            let stat_changed = instance.common.stat != alarm_result.prev_stat;
+            if sevr_changed {
                 changed_fields.push((
                     "SEVR".to_string(),
                     EpicsValue::Short(instance.common.sevr as i16),
                 ));
+            }
+            if stat_changed {
                 changed_fields.push((
                     "STAT".to_string(),
                     EpicsValue::Short(instance.common.stat as i16),
                 ));
             }
-            // C `recGbl.c:210-211` — AMSG is posted whenever
-            // `stat_mask` is non-zero. Mirror the main-path AMSG branch
-            // (process_record_with_links_inner) so async completions
-            // also surface amsg-only updates.
-            if alarm_result.alarm_changed || alarm_result.amsg_changed {
+            if sevr_changed || stat_changed || alarm_result.amsg_changed {
                 changed_fields.push((
                     "AMSG".to_string(),
                     EpicsValue::String(instance.common.amsg.clone()),
@@ -1704,6 +1815,9 @@ impl PvDatabase {
         // Multi-output dispatch (fanout/dfanout/seq/sseq)
         self.dispatch_multi_output(&rec, visited, depth).await;
 
+        // event record: post the named software event.
+        self.dispatch_event_record(&rec).await;
+
         // Generic multi-output links (transform OUTA..OUTP -> A..P)
         {
             let multi_out = {
@@ -1773,6 +1887,31 @@ impl PvDatabase {
 
         // CP link targets
         self.dispatch_cp_targets(name, visited, depth).await;
+
+        // RPRO: C `recGblFwdLink` consumes a pending reprocess via
+        // `scanOnce` — queued, not recursed. Mirror the synchronous
+        // path: spawn a fresh process pass (clean `visited`, depth 0).
+        {
+            let needs_rpro = {
+                let mut guard = rec.write().await;
+                if guard.common.rpro {
+                    guard.common.rpro = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if needs_rpro {
+                let db = self.clone();
+                let rpro_name = name.to_string();
+                crate::runtime::task::spawn(async move {
+                    let mut fresh_visited = std::collections::HashSet::new();
+                    let _ = db
+                        .process_record_with_links(&rpro_name, &mut fresh_visited, 0)
+                        .await;
+                });
+            }
+        }
 
         // C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` after
         // the forward-link dispatch. The same clearing must happen

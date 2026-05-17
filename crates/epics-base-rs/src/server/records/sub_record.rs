@@ -2,36 +2,58 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
-/// Sub (subroutine) record — calls a named subroutine function on process.
+/// Number of subroutine input arguments. C `subRecord.c`:
+/// `#define INP_ARG_MAX 21` — fields `A..U` / `INPA..INPU`.
+const INP_ARG_MAX: usize = 21;
+
+/// The 21 input value field names `A..U`.
+const VAL_NAMES: [&str; INP_ARG_MAX] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U",
+];
+
+/// The 21 input link field names `INPA..INPU`.
+const INP_NAMES: [&str; INP_ARG_MAX] = [
+    "INPA", "INPB", "INPC", "INPD", "INPE", "INPF", "INPG", "INPH", "INPI", "INPJ", "INPK", "INPL",
+    "INPM", "INPN", "INPO", "INPP", "INPQ", "INPR", "INPS", "INPT", "INPU",
+];
+
+/// (INP link, value field) pairs for the 21 channels.
+const INP_VAL_PAIRS: [(&str, &str); INP_ARG_MAX] = [
+    ("INPA", "A"),
+    ("INPB", "B"),
+    ("INPC", "C"),
+    ("INPD", "D"),
+    ("INPE", "E"),
+    ("INPF", "F"),
+    ("INPG", "G"),
+    ("INPH", "H"),
+    ("INPI", "I"),
+    ("INPJ", "J"),
+    ("INPK", "K"),
+    ("INPL", "L"),
+    ("INPM", "M"),
+    ("INPN", "N"),
+    ("INPO", "O"),
+    ("INPP", "P"),
+    ("INPQ", "Q"),
+    ("INPR", "R"),
+    ("INPS", "S"),
+    ("INPT", "T"),
+    ("INPU", "U"),
+];
+
+/// Sub (subroutine) record — calls a named subroutine function on
+/// process. C `subRecord.c` exposes 21 inputs `A..U` fed from links
+/// `INPA..INPU`; the subroutine itself is invoked by the framework
+/// (`RecordInstance::subroutine`).
 pub struct SubRecord {
     pub val: f64,
     pub snam: String,
-    // Input links
-    pub inpa: String,
-    pub inpb: String,
-    pub inpc: String,
-    pub inpd: String,
-    pub inpe: String,
-    pub inpf: String,
-    pub inpg: String,
-    pub inph: String,
-    pub inpi: String,
-    pub inpj: String,
-    pub inpk: String,
-    pub inpl: String,
-    // Input values
-    pub a: f64,
-    pub b: f64,
-    pub c: f64,
-    pub d: f64,
-    pub e: f64,
-    pub f: f64,
-    pub g: f64,
-    pub h: f64,
-    pub i: f64,
-    pub j: f64,
-    pub k: f64,
-    pub l: f64,
+    /// Input links `INPA..INPU`.
+    pub inp: [String; INP_ARG_MAX],
+    /// Input values `A..U`.
+    pub a: [f64; INP_ARG_MAX],
 }
 
 impl Default for SubRecord {
@@ -39,30 +61,8 @@ impl Default for SubRecord {
         Self {
             val: 0.0,
             snam: String::new(),
-            inpa: String::new(),
-            inpb: String::new(),
-            inpc: String::new(),
-            inpd: String::new(),
-            inpe: String::new(),
-            inpf: String::new(),
-            inpg: String::new(),
-            inph: String::new(),
-            inpi: String::new(),
-            inpj: String::new(),
-            inpk: String::new(),
-            inpl: String::new(),
-            a: 0.0,
-            b: 0.0,
-            c: 0.0,
-            d: 0.0,
-            e: 0.0,
-            f: 0.0,
-            g: 0.0,
-            h: 0.0,
-            i: 0.0,
-            j: 0.0,
-            k: 0.0,
-            l: 0.0,
+            inp: std::array::from_fn(|_| String::new()),
+            a: [0.0; INP_ARG_MAX],
         }
     }
 }
@@ -78,127 +78,67 @@ static SUB_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         read_only: false,
     },
-    FieldDesc {
-        name: "INPA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPI",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "A",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "C",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "D",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "E",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "F",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "G",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "H",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "I",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "J",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "K",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "L",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
+    // INPA..INPU
+    field_str("INPA"),
+    field_str("INPB"),
+    field_str("INPC"),
+    field_str("INPD"),
+    field_str("INPE"),
+    field_str("INPF"),
+    field_str("INPG"),
+    field_str("INPH"),
+    field_str("INPI"),
+    field_str("INPJ"),
+    field_str("INPK"),
+    field_str("INPL"),
+    field_str("INPM"),
+    field_str("INPN"),
+    field_str("INPO"),
+    field_str("INPP"),
+    field_str("INPQ"),
+    field_str("INPR"),
+    field_str("INPS"),
+    field_str("INPT"),
+    field_str("INPU"),
+    // A..U
+    field_dbl("A"),
+    field_dbl("B"),
+    field_dbl("C"),
+    field_dbl("D"),
+    field_dbl("E"),
+    field_dbl("F"),
+    field_dbl("G"),
+    field_dbl("H"),
+    field_dbl("I"),
+    field_dbl("J"),
+    field_dbl("K"),
+    field_dbl("L"),
+    field_dbl("M"),
+    field_dbl("N"),
+    field_dbl("O"),
+    field_dbl("P"),
+    field_dbl("Q"),
+    field_dbl("R"),
+    field_dbl("S"),
+    field_dbl("T"),
+    field_dbl("U"),
 ];
+
+const fn field_str(name: &'static str) -> FieldDesc {
+    FieldDesc {
+        name,
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    }
+}
+
+const fn field_dbl(name: &'static str) -> FieldDesc {
+    FieldDesc {
+        name,
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    }
+}
 
 impl Record for SubRecord {
     fn record_type(&self) -> &'static str {
@@ -206,102 +146,65 @@ impl Record for SubRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // The subroutine is invoked by the framework via
+        // `RecordInstance::subroutine` (it needs the registry of
+        // named functions, which the record does not own).
         Ok(ProcessOutcome::complete())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::Double(self.val)),
-            "SNAM" => Some(EpicsValue::String(self.snam.clone())),
-            "INPA" => Some(EpicsValue::String(self.inpa.clone())),
-            "INPB" => Some(EpicsValue::String(self.inpb.clone())),
-            "INPC" => Some(EpicsValue::String(self.inpc.clone())),
-            "INPD" => Some(EpicsValue::String(self.inpd.clone())),
-            "INPE" => Some(EpicsValue::String(self.inpe.clone())),
-            "INPF" => Some(EpicsValue::String(self.inpf.clone())),
-            "INPG" => Some(EpicsValue::String(self.inpg.clone())),
-            "INPH" => Some(EpicsValue::String(self.inph.clone())),
-            "INPI" => Some(EpicsValue::String(self.inpi.clone())),
-            "INPJ" => Some(EpicsValue::String(self.inpj.clone())),
-            "INPK" => Some(EpicsValue::String(self.inpk.clone())),
-            "INPL" => Some(EpicsValue::String(self.inpl.clone())),
-            "A" => Some(EpicsValue::Double(self.a)),
-            "B" => Some(EpicsValue::Double(self.b)),
-            "C" => Some(EpicsValue::Double(self.c)),
-            "D" => Some(EpicsValue::Double(self.d)),
-            "E" => Some(EpicsValue::Double(self.e)),
-            "F" => Some(EpicsValue::Double(self.f)),
-            "G" => Some(EpicsValue::Double(self.g)),
-            "H" => Some(EpicsValue::Double(self.h)),
-            "I" => Some(EpicsValue::Double(self.i)),
-            "J" => Some(EpicsValue::Double(self.j)),
-            "K" => Some(EpicsValue::Double(self.k)),
-            "L" => Some(EpicsValue::Double(self.l)),
-            _ => None,
+            "VAL" => return Some(EpicsValue::Double(self.val)),
+            "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
+            _ => {}
         }
+        if let Some(idx) = INP_NAMES.iter().position(|&n| n == name) {
+            return Some(EpicsValue::String(self.inp[idx].clone()));
+        }
+        if let Some(idx) = VAL_NAMES.iter().position(|&n| n == name) {
+            return Some(EpicsValue::Double(self.a[idx]));
+        }
+        None
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL" => match value {
-                EpicsValue::Double(v) => {
-                    self.val = v;
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("VAL".into())),
-            },
-            "SNAM" => match value {
-                EpicsValue::String(s) => {
-                    self.snam = s;
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch("SNAM".into())),
-            },
-            "INPA" | "INPB" | "INPC" | "INPD" | "INPE" | "INPF" | "INPG" | "INPH" | "INPI"
-            | "INPJ" | "INPK" | "INPL" => match value {
-                EpicsValue::String(s) => {
-                    match name {
-                        "INPA" => self.inpa = s,
-                        "INPB" => self.inpb = s,
-                        "INPC" => self.inpc = s,
-                        "INPD" => self.inpd = s,
-                        "INPE" => self.inpe = s,
-                        "INPF" => self.inpf = s,
-                        "INPG" => self.inpg = s,
-                        "INPH" => self.inph = s,
-                        "INPI" => self.inpi = s,
-                        "INPJ" => self.inpj = s,
-                        "INPK" => self.inpk = s,
-                        "INPL" => self.inpl = s,
-                        _ => unreachable!(),
+            "VAL" => {
+                return match value {
+                    EpicsValue::Double(v) => {
+                        self.val = v;
+                        Ok(())
                     }
+                    _ => Err(CaError::TypeMismatch("VAL".into())),
+                };
+            }
+            "SNAM" => {
+                return match value {
+                    EpicsValue::String(s) => {
+                        self.snam = s;
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch("SNAM".into())),
+                };
+            }
+            _ => {}
+        }
+        if let Some(idx) = INP_NAMES.iter().position(|&n| n == name) {
+            return match value {
+                EpicsValue::String(s) => {
+                    self.inp[idx] = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
-            },
-            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" => {
-                let v = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
-                match name {
-                    "A" => self.a = v,
-                    "B" => self.b = v,
-                    "C" => self.c = v,
-                    "D" => self.d = v,
-                    "E" => self.e = v,
-                    "F" => self.f = v,
-                    "G" => self.g = v,
-                    "H" => self.h = v,
-                    "I" => self.i = v,
-                    "J" => self.j = v,
-                    "K" => self.k = v,
-                    "L" => self.l = v,
-                    _ => unreachable!(),
-                }
-                Ok(())
-            }
-            _ => Err(CaError::FieldNotFound(name.to_string())),
+            };
         }
+        if let Some(idx) = VAL_NAMES.iter().position(|&n| n == name) {
+            self.a[idx] = value
+                .to_f64()
+                .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+            return Ok(());
+        }
+        Err(CaError::FieldNotFound(name.to_string()))
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {
@@ -309,19 +212,32 @@ impl Record for SubRecord {
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
-        &[
-            ("INPA", "A"),
-            ("INPB", "B"),
-            ("INPC", "C"),
-            ("INPD", "D"),
-            ("INPE", "E"),
-            ("INPF", "F"),
-            ("INPG", "G"),
-            ("INPH", "H"),
-            ("INPI", "I"),
-            ("INPJ", "J"),
-            ("INPK", "K"),
-            ("INPL", "L"),
-        ]
+        &INP_VAL_PAIRS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H-3: inputs M..U and INPM..INPU exist (C `INP_ARG_MAX == 21`).
+    #[test]
+    fn inputs_m_through_u_present() {
+        let mut rec = SubRecord::default();
+        for name in ["M", "Q", "U"] {
+            rec.put_field(name, EpicsValue::Double(2.5)).unwrap();
+            assert_eq!(rec.get_field(name), Some(EpicsValue::Double(2.5)));
+        }
+        for name in ["INPM", "INPR", "INPU"] {
+            rec.put_field(name, EpicsValue::String("src".into())).unwrap();
+            assert_eq!(rec.get_field(name), Some(EpicsValue::String("src".into())));
+        }
+    }
+
+    /// All 21 input channels are wired into `multi_input_links`.
+    #[test]
+    fn twenty_one_multi_input_links() {
+        let rec = SubRecord::default();
+        assert_eq!(rec.multi_input_links().len(), 21);
     }
 }

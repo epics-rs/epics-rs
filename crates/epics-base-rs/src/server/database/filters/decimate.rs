@@ -56,11 +56,12 @@ impl SubscriptionFilter for DecimateFilter {
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        // C `decimate.c`: only `DBE_PROPERTY` (and read context) bypass
-        // the counter. `DBE_ALARM` runs through the decimation logic
-        // and may be dropped — matches the C `if (pfl->mask &
-        // DBE_PROPERTY) return pfl` short-circuit exactly.
-        if event.mask.intersects(EventMask::PROPERTY) {
+        // C `decimate.c:64`: `if (pfl->ctx == dbfl_context_read ||
+        // (pfl->mask & DBE_PROPERTY)) return pfl;` — a single-read
+        // emission and a `DBE_PROPERTY` event both bypass the counter
+        // unchanged. `DBE_ALARM` runs through the decimation logic
+        // and may be dropped.
+        if event.read_context || event.mask.intersects(EventMask::PROPERTY) {
             return Some(event);
         }
         let mut counter = self.counter.lock();

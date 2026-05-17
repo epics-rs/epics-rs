@@ -8,7 +8,7 @@
 //! `should_output_fn` knob this file can switch back to the derive form.
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, Record};
+use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 pub struct LongoutRecord {
@@ -313,6 +313,18 @@ static LONGOUT_FIELDS: &[FieldDesc] = &[
 impl Record for LongoutRecord {
     fn record_type(&self) -> &'static str {
         "longout"
+    }
+
+    /// C `longoutRecord.c::convert` (lines 436-441): clamp VAL into the
+    /// drive-limit window `[DRVL, DRVH]` every process cycle, but only
+    /// when `DRVH > DRVL` (equal limits = no clamping). Without this an
+    /// operator or DOL link writing outside the window propagates the
+    /// unclamped value to the OUT link / device.
+    fn process(&mut self) -> CaResult<ProcessOutcome> {
+        if self.drvh > self.drvl {
+            self.val = self.val.clamp(self.drvl, self.drvh);
+        }
+        Ok(ProcessOutcome::complete())
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {

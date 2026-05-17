@@ -178,11 +178,13 @@ impl SubscriptionFilter for SyncFilter {
     }
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
-        // C `sync.c::filter`: only DBE_PROPERTY (and read context)
-        // bypass the state machine; DBE_ALARM runs through the
-        // configured mode just like a value event. The 446e0d4a rule
-        // applies to dbnd, not sync.
-        if event.mask.intersects(EventMask::PROPERTY) {
+        // C `sync.c:98`: `if (pfl->ctx == dbfl_context_read ||
+        // (pfl->mask & DBE_PROPERTY)) return pfl;` — a single-read
+        // emission and a `DBE_PROPERTY` event both bypass the state
+        // machine unchanged. DBE_ALARM runs through the configured
+        // mode like a value event. The 446e0d4a rule applies to
+        // dbnd, not sync.
+        if event.read_context || event.mask.intersects(EventMask::PROPERTY) {
             return Some(event);
         }
         let actstate = self.state.get();

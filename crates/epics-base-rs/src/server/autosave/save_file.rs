@@ -4,7 +4,7 @@ use crate::types::EpicsValue;
 use chrono::Local;
 
 use super::error::{AutosaveError, AutosaveResult};
-use super::format::{ARRAY_MARKER, END_MARKER, VERSION};
+use super::format::{ARRAY_MARKER, CompatMode, END_MARKER, VERSION};
 
 /// A single PV entry in a .sav file.
 #[derive(Debug, Clone)]
@@ -15,14 +15,44 @@ pub struct SaveEntry {
 }
 
 /// Write a .sav file atomically (tmp -> fsync -> rename).
+///
+/// Uses the autosave-rs native format ([`CompatMode::Native`]). For a
+/// file a C IOC must be able to read, use [`write_save_file_with_mode`]
+/// with [`CompatMode::CRead`].
 pub async fn write_save_file(path: &Path, entries: &[SaveEntry]) -> AutosaveResult<()> {
+    write_save_file_with_mode(path, entries, CompatMode::Native).await
+}
+
+/// Write a .sav file atomically (tmp -> fsync -> rename) in the given
+/// [`CompatMode`].
+///
+/// In [`CompatMode::CRead`] the header banner is `save/restore` (the
+/// banner a C IOC's `restore.c` / `asVerify` expects) instead of the
+/// autosave-rs banner. The per-PV line format (`PVNAME value`,
+/// arrays as `PVNAME @array@ { ... }`) is shared by both modes — the
+/// `SaveEntry.value` text is already mode-encoded by the caller via
+/// [`value_to_save_str`] / [`value_to_save_str_c`]. A C IOC can read
+/// a `CRead`-written file because the line grammar and `<END>` marker
+/// match C autosave's `dbrestore.c` parser.
+pub async fn write_save_file_with_mode(
+    path: &Path,
+    entries: &[SaveEntry],
+    mode: CompatMode,
+) -> AutosaveResult<()> {
     let mut content = String::new();
 
-    // Header
+    // Header. C autosave writes `# <banner>\t<datetime>` where the
+    // banner begins with `save/restore` — restore.c only checks for a
+    // leading `#` comment and skips it, but asVerify and operators
+    // expect the canonical banner.
     let now = Local::now();
+    let banner = match mode {
+        CompatMode::Native => VERSION,
+        CompatMode::CRead => "save/restore V1.7",
+    };
     content.push_str(&format!(
         "# {}\t{}\n",
-        VERSION,
+        banner,
         now.format("%Y-%m-%d %H:%M:%S")
     ));
 
@@ -275,6 +305,58 @@ pub fn value_to_save_str(value: &EpicsValue) -> String {
     }
 }
 
+/// Convert an `EpicsValue` to a **C-autosave wire-compatible** save
+/// string, so a C IOC (or `asVerify` in a C IOC) can read the file.
+///
+/// Differences from [`value_to_save_str`] (autosave-rs native):
+///
+/// * Scalar strings are written **unquoted** — C autosave's
+///   `dbrestore.c` treats everything after the first space on a line
+///   as the literal value; it does not strip quotes from a scalar.
+/// * Scalar numbers are plain (same as native).
+/// * Arrays use C's `@array@ { "v" "v" ... }` form (the form the
+///   native reader already accepts via `parse_c_array_line`), with
+///   every element double-quoted and `"`/`\` escaped — instead of the
+///   native `[v,v,v]` form a C IOC cannot parse.
+pub fn value_to_save_str_c(value: &EpicsValue) -> String {
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+    fn c_array<T, I>(iter: I) -> String
+    where
+        I: IntoIterator<Item = T>,
+        T: ToString,
+    {
+        let parts: Vec<String> = iter
+            .into_iter()
+            .map(|v| format!("\"{}\"", esc(&v.to_string())))
+            .collect();
+        format!("{ARRAY_MARKER} {{ {} }}", parts.join(" "))
+    }
+    match value {
+        // Scalars: plain printf form, strings unquoted.
+        EpicsValue::String(s) => s.clone(),
+        EpicsValue::Double(v) => format!("{:.14e}", v),
+        EpicsValue::Float(v) => format!("{:.7e}", v),
+        EpicsValue::Short(v) => v.to_string(),
+        EpicsValue::Long(v) => v.to_string(),
+        EpicsValue::Int64(v) => v.to_string(),
+        EpicsValue::Enum(v) => v.to_string(),
+        EpicsValue::Char(v) => v.to_string(),
+        // Arrays: C `@array@ { "v" "v" }` form.
+        EpicsValue::DoubleArray(arr) => {
+            c_array(arr.iter().map(|v| format!("{:.14e}", v)))
+        }
+        EpicsValue::FloatArray(arr) => c_array(arr.iter().map(|v| format!("{:.7e}", v))),
+        EpicsValue::LongArray(arr) => c_array(arr.iter()),
+        EpicsValue::CharArray(arr) => c_array(arr.iter()),
+        EpicsValue::ShortArray(arr) => c_array(arr.iter()),
+        EpicsValue::EnumArray(arr) => c_array(arr.iter()),
+        EpicsValue::Int64Array(arr) => c_array(arr.iter()),
+        EpicsValue::StringArray(arr) => c_array(arr.iter().cloned()),
+    }
+}
+
 /// Parse a save file value string back to EpicsValue, using template for type.
 pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
     let s = s.trim();
@@ -347,4 +429,91 @@ where
         return Some(Vec::new());
     }
     inner.split(',').map(|v| parse_elem(v.trim())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::autosave::format::CompatMode;
+    use crate::types::EpicsValue;
+
+    /// M6: a C-format scalar string is written UNQUOTED (C autosave
+    /// treats everything after the first space as the literal value).
+    #[test]
+    fn c_format_scalar_string_unquoted() {
+        let v = EpicsValue::String("hello world".to_string());
+        assert_eq!(value_to_save_str_c(&v), "hello world");
+        // Native quotes it.
+        assert_eq!(value_to_save_str(&v), "\"hello world\"");
+    }
+
+    /// M6: a C-format array uses the `@array@ { "v" "v" }` form a C
+    /// IOC can parse — not the native `[v,v,v]` form.
+    #[test]
+    fn c_format_array_uses_at_array_form() {
+        let v = EpicsValue::LongArray(vec![1, 2, 3]);
+        assert_eq!(value_to_save_str_c(&v), "@array@ { \"1\" \"2\" \"3\" }");
+        assert_eq!(value_to_save_str(&v), "[1,2,3]");
+    }
+
+    /// M6: a `.sav` written in `CompatMode::CRead` carries the
+    /// `save/restore` banner (the banner a C IOC expects) and is
+    /// still readable by the Rust reader — the array form
+    /// round-trips through `parse_c_array_line`.
+    #[tokio::test]
+    async fn c_compat_save_file_has_c_banner_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.sav");
+
+        let entries = vec![
+            SaveEntry {
+                pv_name: "PV:SCALAR".to_string(),
+                value: value_to_save_str_c(&EpicsValue::Long(42)),
+                connected: true,
+            },
+            SaveEntry {
+                pv_name: "PV:ARRAY".to_string(),
+                value: value_to_save_str_c(&EpicsValue::LongArray(vec![10, 20])),
+                connected: true,
+            },
+        ];
+        write_save_file_with_mode(&path, &entries, CompatMode::CRead)
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            content.starts_with("# save/restore"),
+            "C-compat file must carry the save/restore banner, got: {content}"
+        );
+        assert!(content.contains("PV:ARRAY @array@ { \"10\" \"20\" }"));
+
+        // Reader accepts the C-format file.
+        let read = read_save_file(&path).await.unwrap().expect("valid file");
+        assert_eq!(read.len(), 2);
+        let arr = read.iter().find(|e| e.pv_name == "PV:ARRAY").unwrap();
+        assert_eq!(arr.value, "[10,20]");
+        let parsed =
+            parse_save_value(&arr.value, &EpicsValue::LongArray(vec![])).unwrap();
+        assert_eq!(parsed, EpicsValue::LongArray(vec![10, 20]));
+    }
+
+    /// M6: native mode still writes the autosave-rs banner.
+    #[tokio::test]
+    async fn native_save_file_keeps_native_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native.sav");
+        write_save_file(
+            &path,
+            &[SaveEntry {
+                pv_name: "PV1".to_string(),
+                value: "1".to_string(),
+                connected: true,
+            }],
+        )
+        .await
+        .unwrap();
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(content.starts_with("# autosave-rs"));
+    }
 }

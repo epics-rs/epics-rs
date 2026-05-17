@@ -4,16 +4,27 @@ use crate::types::{DbFieldType, EpicsValue};
 
 // printf record (EPICS 7).
 // Evaluates FMT as a printf format string with up to 10 inputs (INP0-INP9, values A-J).
-// Each format specifier in FMT is matched to the corresponding input in order.
-// VAL holds the resulting string (up to 256 chars).
+// Each format specifier in FMT consumes the next input in order. A `*`
+// (variable width/precision) also consumes one input. VAL holds the
+// resulting string (capped by SIZV).
+//
+// C `printfRecord.c::doPrintf` reads each input link with the DBR type
+// implied by the conversion + length modifier: `%s`/`%ls` read a
+// string, the numeric conversions read a number. The Rust framework
+// pre-fetches every INPn link into the matching value field A..J; we
+// therefore store the raw `EpicsValue` per slot so a `%s` conversion
+// can recover the string content (H-6) instead of stringifying a
+// coerced f64.
 pub struct PrintfRecord {
     pub val: String,
     pub sizv: u16,
     pub fmt: String,
-    // INP0-INP9: input link strings
+    /// INP0-INP9: input link strings.
     pub inp_links: [String; 10],
-    // A-J: current numeric values from input links
-    pub num_vals: [f64; 10],
+    /// A-J: current values from the input links, kept in their native
+    /// type. `%s` reads the string form, numeric conversions read the
+    /// numeric form.
+    pub vals: [EpicsValue; 10],
 }
 
 impl Default for PrintfRecord {
@@ -23,17 +34,168 @@ impl Default for PrintfRecord {
             sizv: 256,
             fmt: String::new(),
             inp_links: Default::default(),
-            num_vals: [0.0; 10],
+            vals: std::array::from_fn(|_| EpicsValue::Double(0.0)),
         }
     }
 }
 
+/// One parsed printf conversion directive.
+struct Directive {
+    /// Width; `None` when given as `*` (read from the next input).
+    width: Option<usize>,
+    star_width: bool,
+    /// Precision; `None` when absent, `Some(*)` flag handled separately.
+    precision: Option<usize>,
+    star_prec: bool,
+    left_align: bool,
+    zero_pad: bool,
+    alt_form: bool, // '#'
+    /// Final conversion character.
+    conv: u8,
+    /// `l`/`ll` long modifier present (selects `%ls` long string).
+    long: bool,
+    bad: bool,
+}
+
 impl PrintfRecord {
+    /// Stringify an input value for the `%s` / `%ls` conversion.
+    /// Mirrors C reading the link as `DBR_STRING` / `DBR_CHAR`.
+    fn val_as_string(v: &EpicsValue) -> String {
+        match v {
+            EpicsValue::String(s) => s.clone(),
+            EpicsValue::CharArray(bytes) => {
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                String::from_utf8_lossy(&bytes[..end]).into_owned()
+            }
+            EpicsValue::Double(d) => format!("{d}"),
+            EpicsValue::Float(f) => format!("{f}"),
+            EpicsValue::Long(n) => format!("{n}"),
+            EpicsValue::Short(n) => format!("{n}"),
+            EpicsValue::Int64(n) => format!("{n}"),
+            EpicsValue::Char(c) => format!("{c}"),
+            EpicsValue::Enum(e) => format!("{e}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn val_as_f64(v: &EpicsValue) -> f64 {
+        v.to_f64().unwrap_or(0.0)
+    }
+
+    /// Parse one `%...` directive starting at `bytes[i]` (which is `%`).
+    /// Returns the directive and the index just past the conversion
+    /// char. Consumes `*` width/precision values from `star_idx`.
+    fn parse_directive(bytes: &[u8], mut i: usize) -> (Directive, usize) {
+        let mut d = Directive {
+            width: None,
+            star_width: false,
+            precision: None,
+            star_prec: false,
+            left_align: false,
+            zero_pad: false,
+            alt_form: false,
+            conv: b's',
+            long: false,
+            bad: false,
+        };
+        i += 1; // skip '%'
+        // Flags.
+        loop {
+            match bytes.get(i) {
+                Some(b'-') => d.left_align = true,
+                Some(b'+') | Some(b' ') => {}
+                Some(b'#') => d.alt_form = true,
+                Some(b'0') => d.zero_pad = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        // Width.
+        if bytes.get(i) == Some(&b'*') {
+            d.star_width = true;
+            i += 1;
+        } else {
+            let mut w = 0usize;
+            let mut any = false;
+            while let Some(c) = bytes.get(i) {
+                if c.is_ascii_digit() {
+                    w = w * 10 + (c - b'0') as usize;
+                    any = true;
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if any {
+                d.width = Some(w);
+            }
+        }
+        // Precision.
+        if bytes.get(i) == Some(&b'.') {
+            i += 1;
+            if bytes.get(i) == Some(&b'*') {
+                d.star_prec = true;
+                i += 1;
+            } else {
+                let mut p = 0usize;
+                while let Some(c) = bytes.get(i) {
+                    if c.is_ascii_digit() {
+                        p = p * 10 + (c - b'0') as usize;
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                d.precision = Some(p);
+            }
+        }
+        // Length modifiers: h, hh, l, ll.
+        loop {
+            match bytes.get(i) {
+                Some(b'h') => {
+                    i += 1;
+                }
+                Some(b'l') => {
+                    d.long = true;
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        // Conversion character.
+        match bytes.get(i) {
+            Some(&c) if b"diouxXeEfFgGcs".contains(&c) => {
+                d.conv = c;
+                i += 1;
+            }
+            Some(_) => {
+                d.bad = true;
+                i += 1;
+            }
+            None => {
+                d.bad = true;
+            }
+        }
+        (d, i)
+    }
+
     fn apply_fmt(&self) -> String {
         let mut result = String::new();
         let bytes = self.fmt.as_bytes();
         let mut i = 0;
-        let mut inp_idx = 0;
+        let mut inp_idx = 0usize;
+
+        // Fetch the next input value, advancing the cursor.
+        let take = |idx: &mut usize| -> Option<&EpicsValue> {
+            if *idx < 10 {
+                let v = &self.vals[*idx];
+                *idx += 1;
+                Some(v)
+            } else {
+                *idx += 1;
+                None
+            }
+        };
 
         while i < bytes.len() {
             if bytes[i] != b'%' {
@@ -41,57 +203,120 @@ impl PrintfRecord {
                 i += 1;
                 continue;
             }
-            // Check %% escape
-            if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+            // %% escape.
+            if bytes.get(i + 1) == Some(&b'%') {
                 result.push('%');
                 i += 2;
                 continue;
             }
-            // Parse %[flags][width][.prec]type
-            let spec_start = i;
-            i += 1;
-            while i < bytes.len() && matches!(bytes[i], b'-' | b'+' | b' ' | b'0' | b'#') {
-                i += 1;
+            let (d, next) = Self::parse_directive(bytes, i);
+            i = next;
+            if d.bad {
+                // Bad format directive — C copies the directive text.
+                continue;
             }
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b'.' {
-                i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-            if i >= bytes.len() {
-                break;
-            }
-            let spec = bytes[i];
-            i += 1;
-            let fmt_str = std::str::from_utf8(&bytes[spec_start..i]).unwrap_or("%s");
 
-            let val = if inp_idx < 10 {
-                self.num_vals[inp_idx]
+            // Resolve `*` width / precision from the next input(s).
+            let width = if d.star_width {
+                take(&mut inp_idx)
+                    .map(|v| Self::val_as_f64(v) as i64)
+                    .unwrap_or(0)
             } else {
-                0.0
+                d.width.unwrap_or(0) as i64
             };
-            inp_idx += 1;
+            let precision = if d.star_prec {
+                take(&mut inp_idx)
+                    .map(|v| Self::val_as_f64(v) as i64)
+                    .unwrap_or(0)
+                    .max(0) as usize
+            } else {
+                d.precision.unwrap_or(usize::MAX)
+            };
+            let (width, left_align) = if width < 0 {
+                ((-width) as usize, true)
+            } else {
+                (width as usize, d.left_align)
+            };
 
-            let substituted = match spec {
-                b'd' | b'i' => format_int(fmt_str, val as i64),
-                b'u' => format_uint(fmt_str, val as u64),
-                b'o' => format_octhex(fmt_str, val as u64, b'o'),
-                b'x' => format_octhex(fmt_str, val as u64, b'x'),
-                b'X' => format_octhex(fmt_str, val as u64, b'X'),
-                b'e' | b'E' | b'f' | b'g' | b'G' => format_float(fmt_str, val),
-                b's' => format!("{}", val),
-                _ => format!("{}", val),
+            let arg = take(&mut inp_idx);
+            let conv_prec = if precision == usize::MAX { 6 } else { precision };
+
+            let substituted = match d.conv {
+                b'd' | b'i' => {
+                    let v = arg.map(Self::val_as_f64).unwrap_or(0.0);
+                    pad_string(format!("{}", v as i64), width, left_align, d.zero_pad)
+                }
+                b'u' => {
+                    let v = arg.map(Self::val_as_f64).unwrap_or(0.0);
+                    pad_string(format!("{}", v as i64 as u64), width, left_align, d.zero_pad)
+                }
+                b'o' => {
+                    let v = arg.map(Self::val_as_f64).unwrap_or(0.0) as i64 as u64;
+                    let s = if d.alt_form && v != 0 {
+                        format!("0{v:o}")
+                    } else {
+                        format!("{v:o}")
+                    };
+                    pad_string(s, width, left_align, d.zero_pad)
+                }
+                b'x' => {
+                    let v = arg.map(Self::val_as_f64).unwrap_or(0.0) as i64 as u64;
+                    let s = if d.alt_form && v != 0 {
+                        format!("0x{v:x}")
+                    } else {
+                        format!("{v:x}")
+                    };
+                    pad_string(s, width, left_align, d.zero_pad)
+                }
+                b'X' => {
+                    let v = arg.map(Self::val_as_f64).unwrap_or(0.0) as i64 as u64;
+                    let s = if d.alt_form && v != 0 {
+                        format!("0X{v:X}")
+                    } else {
+                        format!("{v:X}")
+                    };
+                    pad_string(s, width, left_align, d.zero_pad)
+                }
+                b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => {
+                    let v = arg.map(Self::val_as_f64).unwrap_or(0.0);
+                    let s = format_float_conv(d.conv, v, conv_prec, d.alt_form);
+                    pad_string(s, width, left_align, d.zero_pad)
+                }
+                b'c' => {
+                    // %c: the input value as a single character (C reads
+                    // DBR_CHAR). Numeric value → its code point.
+                    let ch = match arg {
+                        Some(EpicsValue::String(s)) => s.chars().next().unwrap_or(' '),
+                        Some(v) => {
+                            let code = Self::val_as_f64(v) as u32;
+                            char::from_u32(code).unwrap_or('\u{0}')
+                        }
+                        None => '\u{0}',
+                    };
+                    pad_string(ch.to_string(), width, left_align, false)
+                }
+                b's' => {
+                    // %s / %ls: print the link's STRING content (H-6).
+                    let mut s = arg.map(Self::val_as_string).unwrap_or_default();
+                    // Precision caps the number of characters printed.
+                    if precision != usize::MAX && s.chars().count() > precision {
+                        s = s.chars().take(precision).collect();
+                    }
+                    pad_string(s, width, left_align, false)
+                }
+                _ => String::new(),
             };
             result.push_str(&substituted);
         }
 
         let max = (self.sizv as usize).saturating_sub(1);
         if result.len() > max {
-            result.truncate(max);
+            // Truncate on a UTF-8 boundary.
+            let trunc = (0..=max)
+                .rev()
+                .find(|&n| result.is_char_boundary(n))
+                .unwrap_or(0);
+            result.truncate(trunc);
         }
         result
     }
@@ -99,7 +324,7 @@ impl PrintfRecord {
     fn inp_index(name: &str) -> Option<usize> {
         // INP0-INP9
         let bytes = name.as_bytes();
-        if bytes.len() == 4 && bytes[0] == b'I' && bytes[1] == b'N' && bytes[2] == b'P' {
+        if bytes.len() == 4 && &bytes[0..3] == b"INP" {
             let digit = bytes[3];
             if digit.is_ascii_digit() {
                 return Some((digit - b'0') as usize);
@@ -120,97 +345,44 @@ impl PrintfRecord {
     }
 }
 
-// Returns (width, prec, left_align, zero_pad).
-// zero_pad is true when '0' flag is present (e.g. %08d), unless '-' overrides it.
-fn parse_width_prec(inner: &str) -> (usize, usize, bool, bool) {
-    let left_align = inner.contains('-');
-    let zero_pad = !left_align && {
-        // After stripping non-'0' flag chars, check if next char is '0' followed by a digit.
-        let after_flags = inner.trim_start_matches(['-', '+', ' ', '#']);
-        after_flags.starts_with('0')
-            && after_flags
-                .as_bytes()
-                .get(1)
-                .map_or(false, |b| b.is_ascii_digit())
-    };
-    let s = inner.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-    let (width_str, prec_str) = if let Some(dot) = s.find('.') {
-        (&s[..dot], &s[dot + 1..])
-    } else {
-        (s, "")
-    };
-    let width: usize = width_str
-        .trim_matches(|c: char| !c.is_ascii_digit())
-        .parse()
-        .unwrap_or(0);
-    let prec: usize = prec_str
-        .trim_matches(|c: char| !c.is_ascii_digit())
-        .parse()
-        .unwrap_or(6);
-    (width, prec, left_align, zero_pad)
-}
-
 // Apply width padding. Handles left-align, right-align, and zero-fill.
 // For zero-fill on signed values the sign is placed before the zeros.
 fn pad_string(s: String, width: usize, left_align: bool, zero_pad: bool) -> String {
-    if width <= s.len() {
+    if width <= s.chars().count() {
         return s;
     }
     if left_align {
-        format!("{:<width$}", s, width = width)
+        format!("{s:<width$}")
     } else if zero_pad {
         if s.starts_with('-') || s.starts_with('+') {
             format!("{}{:0>width$}", &s[..1], &s[1..], width = width - 1)
         } else {
-            format!("{:0>width$}", s, width = width)
+            format!("{s:0>width$}")
         }
     } else {
-        format!("{:>width$}", s, width = width)
+        format!("{s:>width$}")
     }
 }
 
-fn format_int(fmt: &str, val: i64) -> String {
-    let inner = &fmt[1..fmt.len() - 1];
-    let (width, _, left_align, zero_pad) = parse_width_prec(inner);
-    pad_string(format!("{}", val), width, left_align, zero_pad)
+fn format_float_conv(conv: u8, val: f64, prec: usize, alt_form: bool) -> String {
+    match conv {
+        b'e' => format!("{val:.prec$e}"),
+        b'E' => format!("{val:.prec$E}"),
+        b'f' | b'F' => format!("{val:.prec$}"),
+        b'g' => format_g_val(val, prec, false, alt_form),
+        b'G' => format_g_val(val, prec, true, alt_form),
+        _ => format!("{val:.prec$}"),
+    }
 }
 
-fn format_uint(fmt: &str, val: u64) -> String {
-    let inner = &fmt[1..fmt.len() - 1];
-    let (width, _, left_align, zero_pad) = parse_width_prec(inner);
-    pad_string(format!("{}", val), width, left_align, zero_pad)
-}
-
-fn format_octhex(fmt: &str, val: u64, spec: u8) -> String {
-    let inner = &fmt[1..fmt.len() - 1];
-    let (width, _, left_align, zero_pad) = parse_width_prec(inner);
-    let s = match spec {
-        b'o' => format!("{:o}", val),
-        b'x' => format!("{:x}", val),
-        _ => format!("{:X}", val),
-    };
-    pad_string(s, width, left_align, zero_pad)
-}
-
-fn format_float(fmt: &str, val: f64) -> String {
-    let bytes = fmt.as_bytes();
-    let spec = *bytes.last().unwrap_or(&b'g');
-    let inner = &fmt[1..fmt.len() - 1];
-    let (width, prec, left_align, zero_pad) = parse_width_prec(inner);
-
-    let s = match spec {
-        b'e' => format!("{:.prec$e}", val, prec = prec),
-        b'E' => format!("{:.prec$E}", val, prec = prec),
-        b'f' => format!("{:.prec$}", val, prec = prec),
-        b'g' => format_g_val(val, prec, false),
-        b'G' => format_g_val(val, prec, true),
-        _ => format!("{:.prec$}", val, prec = prec),
-    };
-    pad_string(s, width, left_align, zero_pad)
-}
-
-fn format_g_val(val: f64, prec: usize, upper: bool) -> String {
+fn format_g_val(val: f64, prec: usize, upper: bool, alt_form: bool) -> String {
     if val == 0.0 {
+        // libc `%g` of 0.0 is "0"; `%#g` keeps trailing zeros.
+        if alt_form {
+            let p = if prec == 0 { 1 } else { prec };
+            let decimals = p.saturating_sub(1);
+            return format!("{:.*}", decimals, 0.0);
+        }
         return "0".to_string();
     }
     let p = if prec == 0 { 1 } else { prec };
@@ -219,15 +391,21 @@ fn format_g_val(val: f64, prec: usize, upper: bool) -> String {
     if exp < -4 || exp >= p as i32 {
         let sig_prec = p.saturating_sub(1);
         let raw = if upper {
-            format!("{:.prec$E}", val, prec = sig_prec)
+            format!("{val:.sig_prec$E}")
         } else {
-            format!("{:.prec$e}", val, prec = sig_prec)
+            format!("{val:.sig_prec$e}")
         };
-        strip_trailing_zeros_sci(&raw, upper)
+        if alt_form {
+            raw
+        } else {
+            strip_trailing_zeros_sci(&raw, upper)
+        }
     } else {
         let decimal_places = (p as i32 - 1 - exp).max(0) as usize;
-        let raw = format!("{:.prec$}", val, prec = decimal_places);
-        if raw.contains('.') {
+        let raw = format!("{val:.decimal_places$}");
+        if alt_form {
+            raw
+        } else if raw.contains('.') {
             raw.trim_end_matches('0').trim_end_matches('.').to_string()
         } else {
             raw
@@ -245,7 +423,7 @@ fn strip_trailing_zeros_sci(s: &str, upper: bool) -> String {
         } else {
             mantissa
         };
-        format!("{}{}", trimmed, exp_part)
+        format!("{trimmed}{exp_part}")
     } else {
         s.to_string()
     }
@@ -401,7 +579,7 @@ impl Record for PrintfRecord {
                     return Some(EpicsValue::String(self.inp_links[idx].clone()));
                 }
                 if let Some(idx) = Self::val_index(name) {
-                    return Some(EpicsValue::Double(self.num_vals[idx]));
+                    return Some(self.vals[idx].clone());
                 }
                 None
             }
@@ -412,7 +590,9 @@ impl Record for PrintfRecord {
         match name {
             "SIZV" => {
                 if let EpicsValue::Short(v) = value {
-                    self.sizv = v.max(1) as u16;
+                    // C `init_record`: SIZV clamps to [16, 0x7fff].
+                    let v = (v as i32).clamp(16, 0x7fff);
+                    self.sizv = v as u16;
                 }
             }
             "FMT" => {
@@ -430,9 +610,9 @@ impl Record for PrintfRecord {
                         return Err(CaError::TypeMismatch(name.into()));
                     }
                 } else if let Some(idx) = Self::val_index(name) {
-                    self.num_vals[idx] = value
-                        .to_f64()
-                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                    // Store the raw value so `%s` can recover the
+                    // string form of a string-typed input link.
+                    self.vals[idx] = value;
                 } else {
                     return Err(CaError::FieldNotFound(name.to_string()));
                 }
@@ -454,5 +634,94 @@ impl Record for PrintfRecord {
             ("INP8", "I"),
             ("INP9", "J"),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec_with(fmt: &str) -> PrintfRecord {
+        PrintfRecord {
+            fmt: fmt.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// H-6: `%s` prints the input link's STRING content, not a number.
+    #[test]
+    fn percent_s_formats_string_input() {
+        let mut rec = rec_with("name=%s");
+        rec.vals[0] = EpicsValue::String("motor1".into());
+        rec.process().unwrap();
+        assert_eq!(rec.val, "name=motor1");
+    }
+
+    /// H-6: a string input survives even when other slots are numeric.
+    #[test]
+    fn percent_s_with_width_padding() {
+        let mut rec = rec_with("[%8s]");
+        rec.vals[0] = EpicsValue::String("ab".into());
+        rec.process().unwrap();
+        assert_eq!(rec.val, "[      ab]");
+    }
+
+    /// H-7: `%*d` reads the field width from the next input link.
+    #[test]
+    fn star_width_consumes_an_input() {
+        let mut rec = rec_with("%*d");
+        rec.vals[0] = EpicsValue::Long(6); // width
+        rec.vals[1] = EpicsValue::Long(42); // value
+        rec.process().unwrap();
+        assert_eq!(rec.val, "    42");
+    }
+
+    /// H-7: `%ld` long modifier is consumed, not emitted literally.
+    #[test]
+    fn long_modifier_consumed() {
+        let mut rec = rec_with("%ld");
+        rec.vals[0] = EpicsValue::Long(99);
+        rec.process().unwrap();
+        assert_eq!(rec.val, "99");
+    }
+
+    /// H-7: `%ls` long-string conversion prints the string input.
+    #[test]
+    fn long_string_conversion() {
+        let mut rec = rec_with("%ls");
+        rec.vals[0] = EpicsValue::String("hello".into());
+        rec.process().unwrap();
+        assert_eq!(rec.val, "hello");
+    }
+
+    /// H-7: `%c` prints a single character.
+    #[test]
+    fn percent_c_formats_char() {
+        let mut rec = rec_with("%c");
+        rec.vals[0] = EpicsValue::Long(65); // 'A'
+        rec.process().unwrap();
+        assert_eq!(rec.val, "A");
+    }
+
+    /// L-2: `%#g` of zero keeps trailing zeros; plain `%g` is "0".
+    #[test]
+    fn g_zero_alt_form() {
+        let mut rec = rec_with("%g");
+        rec.vals[0] = EpicsValue::Double(0.0);
+        rec.process().unwrap();
+        assert_eq!(rec.val, "0");
+
+        let mut rec = rec_with("%#.3g");
+        rec.vals[0] = EpicsValue::Double(0.0);
+        rec.process().unwrap();
+        assert_eq!(rec.val, "0.00");
+    }
+
+    /// `%%` escapes a literal percent.
+    #[test]
+    fn percent_escape() {
+        let mut rec = rec_with("100%%");
+        rec.process().unwrap();
+        assert_eq!(rec.val, "100%");
     }
 }

@@ -1,6 +1,48 @@
+use std::time::SystemTime;
+
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
+
+/// AFTC low-pass alarm-severity filter shared by `bi` and `mbbi`.
+///
+/// Mirrors C `biRecord.c::checkAlarms` / `mbbiRecord.c::checkAlarms`
+/// (epics-base PR #817): when `aftc > 0` the raw state severity is
+/// run through an exponential filter so a momentary state change does
+/// not raise an alarm until the signal has been in the alarm range for
+/// roughly `aftc` seconds. Returns `(filtered_alarm, new_afvl)`.
+pub(crate) fn aftc_filter(
+    raw_alarm: u16,
+    aftc: f64,
+    afvl_in: f64,
+    time_last: SystemTime,
+    time_now: SystemTime,
+) -> (u16, f64) {
+    const THRESHOLD: f64 = 0.6321; // 1 - 1/e
+    if aftc <= 0.0 {
+        return (raw_alarm, 0.0);
+    }
+    if afvl_in == 0.0 {
+        // Initial sample: seed the accumulator without filtering.
+        return (raw_alarm, raw_alarm as f64);
+    }
+    let dt = time_now
+        .duration_since(time_last)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let alpha = aftc / (dt + aftc);
+    let mut afvl = alpha * afvl_in
+        + if afvl_in > 0.0 {
+            1.0 - alpha
+        } else {
+            alpha - 1.0
+        } * (raw_alarm as f64);
+    if afvl - afvl.floor() > THRESHOLD {
+        afvl = -afvl;
+    }
+    let alarm = afvl.floor().abs() as u16;
+    (alarm, afvl)
+}
 
 /// Binary input record matching C biRecord behavior.
 /// RVAL from device support is converted to VAL (0 or 1).
@@ -190,6 +232,48 @@ impl Record for BiRecord {
 
     fn set_device_did_compute(&mut self, did_compute: bool) {
         self.skip_convert = did_compute;
+    }
+
+    /// C `biRecord.c::checkAlarms` — UDF alarm, STATE alarm (ZSV/OSV
+    /// with the AFTC low-pass filter) and COS alarm (COSV). C
+    /// `checkAlarms:232-235` raises `UDF_ALARM/udfs` and returns early
+    /// when `udf` is set; we mirror that here (raising UDF is
+    /// idempotent with the framework's own `rec_gbl_check_udf`, which
+    /// also runs on the process path).
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        use crate::server::record::AlarmSeverity;
+        use crate::server::recgbl::{self, alarm_status};
+
+        if common.udf {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, common.udfs);
+            return;
+        }
+        let val = self.val;
+        if val > 1 {
+            return;
+        }
+        let state_sev = if val == 0 { self.zsv } else { self.osv };
+        // AFTC low-pass filter on the state severity (PR #817).
+        let (filtered, new_afvl) = aftc_filter(
+            state_sev as u16,
+            self.aftc,
+            self.afvl,
+            common.time,
+            crate::runtime::general_time::get_current(),
+        );
+        self.afvl = new_afvl;
+        let sev = AlarmSeverity::from_u16(filtered);
+        if sev != AlarmSeverity::NoAlarm {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, sev);
+        }
+        // COS alarm — fires only when VAL changed from LALM.
+        if val != self.lalm {
+            let cos_sev = AlarmSeverity::from_u16(self.cosv as u16);
+            if cos_sev != AlarmSeverity::NoAlarm {
+                recgbl::rec_gbl_set_sevr(common, alarm_status::COS_ALARM, cos_sev);
+            }
+            self.lalm = val;
+        }
     }
 
     fn accepts_raw_soft_input(&self) -> bool {

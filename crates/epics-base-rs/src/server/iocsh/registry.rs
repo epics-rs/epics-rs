@@ -276,19 +276,24 @@ fn find_closing_paren(s: &str) -> usize {
 
 /// Split comma-separated arguments, respecting quoted strings.
 /// Trims whitespace around each argument and strips outer quotes.
+///
+/// M-1: both `"` and `'` open a quoted string; the quote is closed
+/// only by the *same* character it was opened with — matching C
+/// `iocsh.cpp` `split()` (`if ((c == '"') || (c == '\'')) quote = c;`).
 fn split_comma_args(s: &str) -> Vec<String> {
     // First, split on commas respecting quoted strings
     let mut raw_parts: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut in_quotes = false;
+    // `0` = not in a quote; otherwise the opening quote char.
+    let mut quote: char = '\0';
     let mut chars = s.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if in_quotes {
+        if quote != '\0' {
             if ch == '\\' {
                 if let Some(&next) = chars.peek() {
                     match next {
-                        '"' | '\\' => {
+                        '"' | '\'' | '\\' => {
                             current.push(chars.next().unwrap());
                         }
                         _ => {
@@ -298,14 +303,14 @@ fn split_comma_args(s: &str) -> Vec<String> {
                 } else {
                     current.push(ch);
                 }
-            } else if ch == '"' {
-                in_quotes = false;
+            } else if ch == quote {
+                quote = '\0';
                 current.push(ch);
             } else {
                 current.push(ch);
             }
-        } else if ch == '"' {
-            in_quotes = true;
+        } else if ch == '"' || ch == '\'' {
+            quote = ch;
             current.push(ch);
         } else if ch == ',' {
             raw_parts.push(std::mem::take(&mut current));
@@ -322,52 +327,59 @@ fn split_comma_args(s: &str) -> Vec<String> {
         if trimmed.is_empty() && args.is_empty() {
             continue; // skip leading empty
         }
-        if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-            // Strip outer quotes and process escapes
-            let inner = &trimmed[1..trimmed.len() - 1];
-            let mut val = String::new();
-            let mut chs = inner.chars().peekable();
-            while let Some(c) = chs.next() {
-                if c == '\\' {
-                    if let Some(&next) = chs.peek() {
-                        match next {
-                            '"' | '\\' => {
-                                val.push(chs.next().unwrap());
+        let outer_quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'');
+        if let Some(q) = outer_quote {
+            if trimmed.len() >= 2 && trimmed.ends_with(q) {
+                // Strip outer quotes and process escapes
+                let inner = &trimmed[1..trimmed.len() - 1];
+                let mut val = String::new();
+                let mut chs = inner.chars().peekable();
+                while let Some(c) = chs.next() {
+                    if c == '\\' {
+                        if let Some(&next) = chs.peek() {
+                            match next {
+                                '"' | '\'' | '\\' => {
+                                    val.push(chs.next().unwrap());
+                                }
+                                _ => {
+                                    val.push(c);
+                                }
                             }
-                            _ => {
-                                val.push(c);
-                            }
+                        } else {
+                            val.push(c);
                         }
                     } else {
                         val.push(c);
                     }
-                } else {
-                    val.push(c);
                 }
+                args.push(val);
+                continue;
             }
-            args.push(val);
-        } else {
-            args.push(trimmed.to_string());
         }
+        args.push(trimmed.to_string());
     }
 
     args
 }
 
 /// Split space/tab separated arguments, respecting quoted strings.
+///
+/// M-1: both `"` and `'` delimit a quoted string; the quote is closed
+/// only by the matching character — mirrors C `iocsh.cpp` `split()`.
 fn split_space_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
-    let mut in_quotes = false;
+    // `0` = not in a quote; otherwise the opening quote char.
+    let mut quote: char = '\0';
     let mut has_token = false;
     let mut chars = s.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if in_quotes {
+        if quote != '\0' {
             if ch == '\\' {
                 if let Some(&next) = chars.peek() {
                     match next {
-                        '"' | '\\' => {
+                        '"' | '\'' | '\\' => {
                             current.push(chars.next().unwrap());
                         }
                         _ => {
@@ -377,13 +389,13 @@ fn split_space_args(s: &str) -> Vec<String> {
                 } else {
                     current.push(ch);
                 }
-            } else if ch == '"' {
-                in_quotes = false;
+            } else if ch == quote {
+                quote = '\0';
             } else {
                 current.push(ch);
             }
-        } else if ch == '"' {
-            in_quotes = true;
+        } else if ch == '"' || ch == '\'' {
+            quote = ch;
             has_token = true;
         } else if ch == ' ' || ch == '\t' {
             if has_token {
@@ -401,6 +413,41 @@ fn split_space_args(s: &str) -> Vec<String> {
     }
 
     args
+}
+
+/// Scan a command line for the malformed-input conditions C
+/// `iocsh.cpp` `split()` (lines 362-371) flags: an unbalanced quote
+/// (`"` or `'`) and a trailing backslash. Returns a human-readable
+/// diagnostic for the first problem found, or `None` if the line is
+/// well-formed. L-5: C marks such a line errored; the Rust tokenizer
+/// previously consumed them silently.
+pub(crate) fn lint_line(line: &str) -> Option<&'static str> {
+    let mut quote: char = '\0';
+    let mut backslash = false;
+    for ch in line.chars() {
+        if backslash {
+            backslash = false;
+            continue;
+        }
+        if ch == '\\' {
+            backslash = true;
+            continue;
+        }
+        if quote != '\0' {
+            if ch == quote {
+                quote = '\0';
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = ch;
+        }
+    }
+    if quote != '\0' {
+        return Some("Unbalanced quote.");
+    }
+    if backslash {
+        return Some("Trailing backslash.");
+    }
+    None
 }
 
 /// Substitute `$(NAME)` and `${NAME}` references with environment variable

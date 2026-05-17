@@ -1,0 +1,575 @@
+//! Access-security iocsh commands — the `as*` family.
+//!
+//! H-5: C registers the whole `as*` command family in
+//! `asIocRegister.c`. The Rust port previously registered none of
+//! them, so an ACF could not be loaded or inspected from the shell.
+//!
+//! These commands operate on a process-global ACF state holder
+//! ([`as_state`]) that mirrors the C `asDbLib.c` globals — a deferred
+//! filename + substitutions string set by `asSetFilename` /
+//! `asSetSubstitutions`, and the parsed [`AccessSecurityConfig`]
+//! activated by `asInit`. The C flow is identical: `asSetFilename`
+//! has "no immediate effect", `asInit` does the (re)load.
+
+use std::sync::Mutex;
+
+use super::registry::*;
+use crate::server::access_security::{
+    parse_acf, AccessLevel, AccessSecurityConfig, RuleAccess,
+};
+
+/// Process-global access-security shell state. Mirrors the
+/// `asDbLib.c` file-scope globals (`acf`, `substitutions`).
+#[derive(Default)]
+struct AsState {
+    /// Path to the ACF file, set by `asSetFilename`. `None` until set.
+    filename: Option<String>,
+    /// Macro substitutions applied when reading the ACF, set by
+    /// `asSetSubstitutions`.
+    substitutions: Option<String>,
+    /// The active parsed configuration, populated by `asInit`.
+    config: Option<AccessSecurityConfig>,
+}
+
+fn as_state() -> &'static Mutex<AsState> {
+    static STATE: std::sync::OnceLock<Mutex<AsState>> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(AsState::default()))
+}
+
+/// Register the `as*` command family on `registry`.
+pub(crate) fn register(registry: &mut CommandRegistry) {
+    registry.register(cmd_as_set_filename());
+    registry.register(cmd_as_set_substitutions());
+    registry.register(cmd_as_init());
+    registry.register(cmd_asdbdump());
+    registry.register(cmd_aspuag());
+    registry.register(cmd_asphag());
+    registry.register(cmd_asprules());
+    registry.register(cmd_aspmem());
+    registry.register(cmd_astac());
+    registry.register(cmd_ascar());
+}
+
+/// `asSetFilename <ascf>` — record the ACF path. No immediate effect;
+/// `asInit` performs the (re)load. Mirrors C `asSetFilename`.
+fn cmd_as_set_filename() -> CommandDef {
+    CommandDef::new(
+        "asSetFilename",
+        vec![ArgDesc {
+            name: "ascf",
+            arg_type: ArgType::String,
+            optional: false,
+        }],
+        "asSetFilename <ascf> — Set path+file of ACF file. Run asInit to (re)load.",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let path = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => return Err("asSetFilename: missing ascf path".into()),
+            };
+            as_state().lock().unwrap().filename = Some(path.clone());
+            ctx.println(&format!("asSetFilename: ACF path set to '{path}'"));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `asSetSubstitutions <substitutions>` — record macro substitutions
+/// applied when reading the ACF. Mirrors C `asSetSubstitutions`.
+fn cmd_as_set_substitutions() -> CommandDef {
+    CommandDef::new(
+        "asSetSubstitutions",
+        vec![ArgDesc {
+            name: "substitutions",
+            arg_type: ArgType::String,
+            optional: false,
+        }],
+        "asSetSubstitutions <subs> — Set substitutions used when reading the ACF file.",
+        |args: &[ArgValue], _ctx: &CommandContext| {
+            let subs = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => return Err("asSetSubstitutions: missing substitutions".into()),
+            };
+            as_state().lock().unwrap().substitutions = Some(subs);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `asInit` — (re)load the ACF file named by `asSetFilename`,
+/// applying any `asSetSubstitutions`. Mirrors C `asInit`.
+fn cmd_as_init() -> CommandDef {
+    CommandDef::new(
+        "asInit",
+        vec![],
+        "asInit — (Re)load the ACF file set by asSetFilename.",
+        |_args: &[ArgValue], ctx: &CommandContext| {
+            // Snapshot the deferred config under the lock, release it
+            // before file I/O so the lock is not held across syscalls.
+            let (filename, substitutions) = {
+                let st = as_state().lock().unwrap();
+                (st.filename.clone(), st.substitutions.clone())
+            };
+            let Some(filename) = filename else {
+                // C `asInit` with no filename disables access security
+                // (asInitialize(NULL)); report it rather than silently
+                // succeeding.
+                return Err(
+                    "asInit: no ACF file set — call asSetFilename first".into()
+                );
+            };
+            let raw = std::fs::read_to_string(&filename)
+                .map_err(|e| format!("asInit: cannot read '{filename}': {e}"))?;
+            let content = match &substitutions {
+                Some(subs) if !subs.is_empty() => {
+                    let macros = super::commands::parse_macro_string(subs);
+                    crate::server::db_loader::substitute_macros(&raw, &macros)
+                }
+                _ => raw,
+            };
+            let config = parse_acf(&content)
+                .map_err(|e| format!("asInit: parse error in '{filename}': {e}"))?;
+            let summary = format!(
+                "asInit: loaded '{filename}' — {} UAG, {} HAG, {} ASG",
+                config.uag.len(),
+                config.hag.len(),
+                config.asg.len()
+            );
+            as_state().lock().unwrap().config = Some(config);
+            ctx.println(&summary);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Helper: run `f` with the active config, or report "not loaded".
+fn with_config<F: FnOnce(&AccessSecurityConfig)>(ctx: &CommandContext, f: F) -> CommandResult {
+    let st = as_state().lock().unwrap();
+    match &st.config {
+        Some(cfg) => {
+            f(cfg);
+            Ok(CommandOutcome::Continue)
+        }
+        None => {
+            ctx.println("Access security not loaded — run asInit.");
+            Ok(CommandOutcome::Continue)
+        }
+    }
+}
+
+/// `asdbdump` — dump the processed ACF (UAGs, HAGs, ASGs, rules).
+/// Mirrors C `asdbdump` / `asDumpFP`.
+fn cmd_asdbdump() -> CommandDef {
+    CommandDef::new(
+        "asdbdump",
+        vec![],
+        "asdbdump — Dump the processed ACF file (as read).",
+        |_args: &[ArgValue], ctx: &CommandContext| {
+            with_config(ctx, |cfg| {
+                let mut uags: Vec<_> = cfg.uag.keys().collect();
+                uags.sort();
+                for name in uags {
+                    ctx.println(&format!("UAG({name})"));
+                    for m in &cfg.uag[name] {
+                        ctx.println(&format!("\t{m}"));
+                    }
+                }
+                let mut hags: Vec<_> = cfg.hag.keys().collect();
+                hags.sort();
+                for name in hags {
+                    ctx.println(&format!("HAG({name})"));
+                    for h in &cfg.hag[name] {
+                        ctx.println(&format!("\t{h}"));
+                    }
+                }
+                let mut asgs: Vec<_> = cfg.asg.keys().collect();
+                asgs.sort();
+                for name in asgs {
+                    ctx.println(&format!("ASG({name})"));
+                    print_asg(ctx, cfg, name);
+                }
+            })
+        },
+    )
+}
+
+/// Print the INP links and RULEs of one ASG (shared by `asdbdump`
+/// and `asprules`).
+fn print_asg(ctx: &CommandContext, cfg: &AccessSecurityConfig, name: &str) {
+    let Some(asg) = cfg.asg.get(name) else {
+        return;
+    };
+    for inp in &asg.inp {
+        let letter = (b'A' + inp.index) as char;
+        ctx.println(&format!("\tINP{letter}(\"{}\")", inp.link));
+    }
+    for rule in &asg.rules {
+        let access = match rule.access {
+            RuleAccess::None => "NONE",
+            RuleAccess::Read => "READ",
+            RuleAccess::Write => "WRITE",
+        };
+        let disabled = if rule.ignore { " [DISABLED]" } else { "" };
+        ctx.println(&format!(
+            "\tRULE({},{access}){disabled}",
+            rule.level
+        ));
+        for u in &rule.uag {
+            ctx.println(&format!("\t\tUAG({u})"));
+        }
+        for h in &rule.hag {
+            ctx.println(&format!("\t\tHAG({h})"));
+        }
+        for m in &rule.method {
+            ctx.println(&format!("\t\tMETHOD(\"{m}\")"));
+        }
+        for a in &rule.authority {
+            ctx.println(&format!("\t\tAUTHORITY(\"{a}\")"));
+        }
+        if let Some(calc) = &rule.calc {
+            ctx.println(&format!("\t\tCALC(\"{calc}\")"));
+        }
+    }
+}
+
+/// `aspuag [uagname]` — show members of a UAG, or every UAG.
+/// Mirrors C `aspuag` / `asDumpUagFP`.
+fn cmd_aspuag() -> CommandDef {
+    CommandDef::new(
+        "aspuag",
+        vec![ArgDesc {
+            name: "uagname",
+            arg_type: ArgType::String,
+            optional: true,
+        }],
+        "aspuag [uagname] — Show members of a User Access Group (all if omitted).",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let filter = match &args[0] {
+                ArgValue::String(s) => Some(s.as_str()),
+                _ => None,
+            };
+            with_config(ctx, |cfg| {
+                let mut names: Vec<_> = cfg.uag.keys().collect();
+                names.sort();
+                for name in names {
+                    if filter.is_some_and(|f| f != name) {
+                        continue;
+                    }
+                    ctx.println(&format!("UAG({name})"));
+                    for m in &cfg.uag[name] {
+                        ctx.println(&format!("\t{m}"));
+                    }
+                }
+            })
+        },
+    )
+}
+
+/// `asphag [hagname]` — show members of a HAG, or every HAG.
+/// Mirrors C `asphag` / `asDumpHagFP`.
+fn cmd_asphag() -> CommandDef {
+    CommandDef::new(
+        "asphag",
+        vec![ArgDesc {
+            name: "hagname",
+            arg_type: ArgType::String,
+            optional: true,
+        }],
+        "asphag [hagname] — Show members of a Host Access Group (all if omitted).",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let filter = match &args[0] {
+                ArgValue::String(s) => Some(s.as_str()),
+                _ => None,
+            };
+            with_config(ctx, |cfg| {
+                let mut names: Vec<_> = cfg.hag.keys().collect();
+                names.sort();
+                for name in names {
+                    if filter.is_some_and(|f| f != name) {
+                        continue;
+                    }
+                    ctx.println(&format!("HAG({name})"));
+                    for h in &cfg.hag[name] {
+                        ctx.println(&format!("\t{h}"));
+                    }
+                }
+            })
+        },
+    )
+}
+
+/// `asprules [asgname]` — list rules of an ASG, or every ASG.
+/// Mirrors C `asprules` / `asDumpRulesFP`.
+fn cmd_asprules() -> CommandDef {
+    CommandDef::new(
+        "asprules",
+        vec![ArgDesc {
+            name: "asgname",
+            arg_type: ArgType::String,
+            optional: true,
+        }],
+        "asprules [asgname] — List rules of an Access Security Group (all if omitted).",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let filter = match &args[0] {
+                ArgValue::String(s) => Some(s.as_str()),
+                _ => None,
+            };
+            with_config(ctx, |cfg| {
+                let mut names: Vec<_> = cfg.asg.keys().collect();
+                names.sort();
+                for name in names {
+                    if filter.is_some_and(|f| f != name) {
+                        continue;
+                    }
+                    ctx.println(&format!("ASG({name})"));
+                    print_asg(ctx, cfg, name);
+                }
+            })
+        },
+    )
+}
+
+/// `aspmem [asgname] [clients]` — list members (records) of an ASG.
+///
+/// C `aspmem` walks the live `asgMemberList`. This crate has no
+/// AS-member registry; it derives membership by scanning every record
+/// for its `ASG` field — the same record→ASG mapping. The `clients`
+/// flag (show attached CA clients) is accepted for syntax parity but
+/// has no effect: per-member CA-client tracking is not modelled here.
+fn cmd_aspmem() -> CommandDef {
+    CommandDef::new(
+        "aspmem",
+        vec![
+            ArgDesc {
+                name: "asgname",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "clients",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "aspmem [asgname] [clients] — List records that are members of an ASG.",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let filter = match &args[0] {
+                ArgValue::String(s) => Some(s.clone()),
+                _ => None,
+            };
+            if matches!(&args[1], ArgValue::Int(n) if *n != 0) {
+                ctx.println(
+                    "aspmem: per-member CA-client listing is not available in this IOC",
+                );
+            }
+            // Group every record by its ASG field.
+            let names = ctx.block_on(ctx.db().all_record_names());
+            let mut by_asg: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for rec_name in &names {
+                if let Some(rec) = ctx.block_on(ctx.db().get_record(rec_name)) {
+                    let inst = ctx.block_on(rec.read());
+                    by_asg
+                        .entry(inst.common.asg.clone())
+                        .or_default()
+                        .push(rec_name.clone());
+                }
+            }
+            for (asg, members) in &by_asg {
+                if filter.as_deref().is_some_and(|f| f != asg) {
+                    continue;
+                }
+                ctx.println(&format!("ASG({asg})"));
+                for m in members {
+                    ctx.println(&format!("\t{m}"));
+                }
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `astac <record> <user> <host>` — show the read/write permission
+/// `user:host` would have on `record`. Mirrors C `astac`.
+fn cmd_astac() -> CommandDef {
+    CommandDef::new(
+        "astac",
+        vec![
+            ArgDesc {
+                name: "recordname",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "user",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "host",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+        ],
+        "astac <record> <user> <host> — Show the access user:host would have on a PV.",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let record = match &args[0] {
+                ArgValue::String(s) => s.clone(),
+                _ => return Err("astac: missing record name".into()),
+            };
+            let user = match &args[1] {
+                ArgValue::String(s) => s.clone(),
+                _ => return Err("astac: missing user".into()),
+            };
+            let host = match &args[2] {
+                ArgValue::String(s) => s.clone(),
+                _ => return Err("astac: missing host".into()),
+            };
+            // Resolve the record's ASG and ASL.
+            let (asg, asl) = match ctx.block_on(ctx.db().get_record(&record)) {
+                Some(rec) => {
+                    let inst = ctx.block_on(rec.read());
+                    (inst.common.asg.clone(), inst.common.asl)
+                }
+                None => {
+                    ctx.println(&format!("astac: record '{record}' not found"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            with_config(ctx, |cfg| {
+                let level = cfg.check_access_asl(&asg, &host, &user, asl);
+                let perm = match level {
+                    AccessLevel::NoAccess => "NoAccess",
+                    AccessLevel::Read => "Read",
+                    AccessLevel::ReadWrite => "ReadWrite",
+                };
+                ctx.println(&format!(
+                    "{record} ASG({asg}) ASL={asl} {user}@{host}: {perm}"
+                ));
+            })
+        },
+    )
+}
+
+/// `ascar <level>` — report on the PVs used in `INP*()` rules.
+///
+/// C `ascar` walks the CA channels opened for `INP*` links. This
+/// crate stores the `INP*` link strings but does not open CA channels
+/// for them (CALC rules are disabled — see access_security.rs H-3), so
+/// the report lists the declared INP links and notes they are not
+/// connected. The `level` argument is accepted for syntax parity.
+fn cmd_ascar() -> CommandDef {
+    CommandDef::new(
+        "ascar",
+        vec![ArgDesc {
+            name: "level",
+            arg_type: ArgType::Int,
+            optional: true,
+        }],
+        "ascar [level] — Report status of PVs used in INP*() Access Security rules.",
+        |_args: &[ArgValue], ctx: &CommandContext| {
+            with_config(ctx, |cfg| {
+                let mut total = 0usize;
+                let mut asgs: Vec<_> = cfg.asg.keys().collect();
+                asgs.sort();
+                for name in asgs {
+                    for inp in &cfg.asg[name].inp {
+                        let letter = (b'A' + inp.index) as char;
+                        ctx.println(&format!(
+                            "ASG({name}) INP{letter} \"{}\" — not connected",
+                            inp.link
+                        ));
+                        total += 1;
+                    }
+                }
+                ctx.println(&format!(
+                    "ascar: {total} INP link(s) declared; \
+                     CALC-rule channels are not opened by this IOC"
+                ));
+            })
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::database::PvDatabase;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    fn make_ctx() -> (Arc<PvDatabase>, CommandContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Arc::new(PvDatabase::new());
+        let handle = rt.handle().clone();
+        let ctx = CommandContext::new(db.clone(), handle);
+        std::mem::forget(rt);
+        (db, ctx)
+    }
+
+    fn reset_state() {
+        let mut st = as_state().lock().unwrap();
+        *st = AsState::default();
+    }
+
+    /// asInit before asSetFilename must error (no silent success).
+    #[test]
+    fn as_init_without_filename_errors() {
+        reset_state();
+        let (_db, ctx) = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register(&mut reg);
+        let cmd = reg.get("asInit").unwrap();
+        let args = parse_args(&[], &cmd.args).unwrap();
+        assert!(cmd.handler.call(&args, &ctx).is_err());
+    }
+
+    /// asSetFilename + asInit loads an ACF; asprules then dumps it.
+    #[test]
+    fn as_set_filename_then_init_loads_acf() {
+        reset_state();
+        let (_db, ctx) = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register(&mut reg);
+
+        let tmp = tempfile::Builder::new().suffix(".acf").tempfile().unwrap();
+        writeln!(
+            tmp.as_file(),
+            "UAG(ops) {{ alice }}\nASG(DEFAULT) {{ RULE(1, WRITE) {{ UAG(ops) }} }}"
+        )
+        .unwrap();
+
+        let set = reg.get("asSetFilename").unwrap();
+        let a = parse_args(&[tmp.path().to_string_lossy().into()], &set.args).unwrap();
+        assert!(set.handler.call(&a, &ctx).is_ok());
+
+        let init = reg.get("asInit").unwrap();
+        let a = parse_args(&[], &init.args).unwrap();
+        assert!(init.handler.call(&a, &ctx).is_ok());
+
+        // Config is now active.
+        assert!(as_state().lock().unwrap().config.is_some());
+    }
+
+    /// asInit on a malformed ACF surfaces the parse error.
+    #[test]
+    fn as_init_bad_acf_errors() {
+        reset_state();
+        let (_db, ctx) = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register(&mut reg);
+
+        let tmp = tempfile::Builder::new().suffix(".acf").tempfile().unwrap();
+        writeln!(tmp.as_file(), "ASG(X) {{ RULE(-1, READ) }}").unwrap();
+
+        let set = reg.get("asSetFilename").unwrap();
+        let a = parse_args(&[tmp.path().to_string_lossy().into()], &set.args).unwrap();
+        set.handler.call(&a, &ctx).unwrap();
+
+        let init = reg.get("asInit").unwrap();
+        let a = parse_args(&[], &init.args).unwrap();
+        assert!(
+            init.handler.call(&a, &ctx).is_err(),
+            "negative RULE level must fail asInit"
+        );
+    }
+}

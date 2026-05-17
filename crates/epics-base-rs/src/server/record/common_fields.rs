@@ -41,6 +41,11 @@ pub struct CommonFields {
     pub time: SystemTime,
     pub tse: i16,
     pub tsel: String,
+    /// Time-tag — C `dbCommon.dbd.pod` `field(UTAG,DBF_UINT64)`. A
+    /// 64-bit user/hardware tag set alongside `time` by
+    /// `recGblGetTimeStampSimm` via `dbGetTimeStampTag`. Zero when no
+    /// time-tag source is configured.
+    pub utag: u64,
     // Analog alarm config (Some for analog record types)
     pub analog_alarm: Option<AnalogAlarmConfig>,
     // Access security group
@@ -58,7 +63,12 @@ pub struct CommonFields {
     pub desc: String,
     // Phase/priority/event
     pub phas: i16,
-    pub evnt: i16,
+    /// Event name for `SCAN="Event"` records. C `dbCommon.dbd.pod`:
+    /// `field(EVNT,DBF_STRING) { size(40) }` — since EPICS 7 this is
+    /// an event *name* (resolved by `eventNameToHandle`), not a
+    /// numeric subscript. A numeric string ("5") still works for
+    /// backward compatibility. Empty means "no event".
+    pub evnt: String,
     pub prio: i16,
     // Disable support
     pub disv: i16,
@@ -104,12 +114,13 @@ impl Default for CommonFields {
             time: SystemTime::UNIX_EPOCH,
             tse: 0,
             tsel: String::new(),
+            utag: 0,
             analog_alarm: None,
             asg: "DEFAULT".to_string(),
             asl: 0,
             desc: String::new(),
             phas: 0,
-            evnt: 0,
+            evnt: String::new(),
             prio: 0,
             disv: 1,
             disa: 0,

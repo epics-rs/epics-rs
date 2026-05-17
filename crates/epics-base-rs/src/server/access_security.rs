@@ -315,11 +315,29 @@ ASG(DEFAULT) {
     }
 }
 
+/// Access granted by a matching `RULE`. Mirrors the C three-way
+/// `asAccessRights` enum (`asNOACCESS` / `asREAD` / `asWRITE`) used by
+/// `rule_head_mandatory` in `asLib.y:253-269`. The Rust port previously
+/// collapsed this to a `write: bool`, which turned `RULE(0, NONE)` —
+/// and any misspelled keyword — into a READ-granting rule (M-3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RuleAccess {
+    /// `RULE(N, NONE)` — grants `asNOACCESS`.
+    #[default]
+    None,
+    /// `RULE(N, READ)` — grants `asREAD`.
+    Read,
+    /// `RULE(N, WRITE)` — grants `asWRITE`.
+    Write,
+}
+
 /// A single access rule within an ASG.
 #[derive(Debug, Clone, Default)]
 pub struct AccessRule {
     pub level: u8,
-    pub write: bool, // true = WRITE rule, false = READ rule
+    /// Three-way access this rule grants when it matches. C
+    /// `asLib.y:259-267` distinguishes `NONE`/`READ`/`WRITE`.
+    pub access: RuleAccess,
     pub uag: Vec<String>,
     pub hag: Vec<String>,
     /// Authentication method scope (epics-base PR #563). When set,
@@ -333,12 +351,69 @@ pub struct AccessRule {
     /// X.509 issuer DN, or the cap-token issuer ID. Empty means "any
     /// authority".
     pub authority: Vec<String>,
+    /// Write-trap mask (epics-base `asLib.y:272-283` `rule_log_option`,
+    /// `AS_TRAP_WRITE`). `true` when the RULE header carried the
+    /// `TRAPWRITE` option, `false` for `NOTRAPWRITE` or no option.
+    /// The grammar is honoured here; the `asTrapWrite` put-logging
+    /// listener that consumes this mask is a separate subsystem not
+    /// present in this crate (see the H-2 UNFIXED note).
+    pub trap: bool,
+    /// CALC condition expression (epics-base `asLib.y:294-299`,
+    /// `RULE(...) { CALC("A=1") }`). `None` means an unconditional
+    /// rule. When `Some`, the rule only grants access while the
+    /// expression evaluates to 1 against the ASG's `INP*` link values.
+    pub calc: Option<String>,
+    /// True when the rule must be treated as inert by `asComputePvt`.
+    /// C `asAsgRuleDisable` (`asLib.y:300-306`) sets `pasgrule->ignore`
+    /// for a RULE that contains an unsupported keyword. This port also
+    /// sets it for a `CALC` clause that cannot be evaluated here (no
+    /// `INP*` link resolution), so an un-evaluable conditional rule
+    /// fails CLOSED instead of becoming unconditional (H-3).
+    pub ignore: bool,
+}
+
+/// The access a matching rule grants, with the `ignore` flag folded in
+/// — an ignored rule is inert (`None`). Helper for `asComputePvt`.
+fn rule_access(rule: &AccessRule) -> AccessLevel {
+    if rule.ignore {
+        return AccessLevel::NoAccess;
+    }
+    match rule.access {
+        RuleAccess::None => AccessLevel::NoAccess,
+        RuleAccess::Read => AccessLevel::Read,
+        RuleAccess::Write => AccessLevel::ReadWrite,
+    }
+}
+
+/// Monotonic ordering of access levels used by `asComputePvt`'s
+/// `access >= pasgrule->access` short-circuit.
+fn rule_rank(level: AccessLevel) -> u8 {
+    match level {
+        AccessLevel::NoAccess => 0,
+        AccessLevel::Read => 1,
+        AccessLevel::ReadWrite => 2,
+    }
 }
 
 /// Access Security Group.
 #[derive(Debug, Clone, Default)]
 pub struct AccessSecurityGroup {
     pub rules: Vec<AccessRule>,
+    /// `INP(A..U)` database link declarations (epics-base
+    /// `asLib.y:234-243`). Index 0 = `INPA`, .. 20 = `INPU`. Each
+    /// entry is the link string. Stored for `asdbdump` / `ascar`
+    /// inspection and to feed `CALC` rule evaluation; the link
+    /// values are not resolved by this crate (see `AccessRule::calc`).
+    pub inp: Vec<AsgInp>,
+}
+
+/// A single `INP(A..U)` link declaration within an ASG.
+#[derive(Debug, Clone)]
+pub struct AsgInp {
+    /// Letter index: 0 = `A`, .. 20 = `U`.
+    pub index: u8,
+    /// The link string (typically a record.field PV name).
+    pub link: String,
 }
 
 /// Access Security Configuration parsed from an ACF file.
@@ -377,29 +452,58 @@ impl AccessSecurityConfig {
         method: &str,
         authority: &str,
     ) -> AccessLevel {
+        // C `asAddMemberPvt` (asLibRoutines.c:893-928): a member whose
+        // ASG name is not present in the parsed config is silently
+        // reassigned to `DEFAULT`. `asInitialize` (asLibRoutines.c:107)
+        // *always* synthesises a `DEFAULT` ASG before parsing, so this
+        // lookup never legitimately misses — `parse_acf` reproduces
+        // that by always inserting an (empty) `DEFAULT`. A missing
+        // `DEFAULT` here would mean the config was built by hand
+        // bypassing `parse_acf`; fail CLOSED rather than open.
         let asg = match self.asg.get(asg_name) {
             Some(a) => a,
             None => match self.asg.get("DEFAULT") {
                 Some(a) => a,
-                None => return AccessLevel::ReadWrite,
+                // C-2 fix: never grant ReadWrite on an ASG-lookup
+                // miss. C resolves every miss to the always-present
+                // empty `DEFAULT` ⇒ `asNOACCESS`.
+                None => return AccessLevel::NoAccess,
             },
         };
-        // Empty rule set: ASG declared but no RULE — legacy semantics
-        // grant ReadWrite (matching `check_access_asl`'s pre-PR #563
-        // behaviour). The C-G6 fix (record-ASL gate) does not apply
-        // when no rules exist to gate.
-        if asg.rules.is_empty() {
-            return AccessLevel::ReadWrite;
-        }
-        if user.is_empty() || host.is_empty() {
-            return self.unknown_access;
-        }
-        let mut can_read = false;
-        let mut can_write = false;
+        // C `asComputePvt` (asLibRoutines.c:983) initialises
+        // `access = asNOACCESS` and only ever *raises* it on a matching
+        // RULE. An ASG with no RULE statements (`ASG(LOCKED) { }`)
+        // therefore denies every client. C-1 fix: never short-circuit
+        // an empty rule list to ReadWrite.
+        //
+        // An empty/unknown user or host cannot match a UAG/HAG-scoped
+        // rule, but a rule with empty `uag`/`hag` lists still applies
+        // (C `asComputePvt` only checks the UAG list when
+        // `ellCount(&pasgrule->uagList) > 0`). So the loop below is run
+        // unconditionally — it naturally denies a `("", "")` peer for
+        // any UAG/HAG-scoped rule while still honouring an
+        // unconditional `RULE(0, READ)`.
+        let mut access = AccessLevel::NoAccess;
         for rule in &asg.rules {
+            // C `asComputePvt`: a rule disabled by `asAsgRuleDisable`
+            // (unsupported keyword / un-evaluable CALC) is skipped.
+            if rule.ignore {
+                continue;
+            }
+            // Monotonic raise: once WRITE is reached nothing can lower
+            // it, and a rule whose access is not stronger than the
+            // current level cannot change the outcome.
+            if access == AccessLevel::ReadWrite {
+                break;
+            }
+            if rule_rank(rule_access(rule)) <= rule_rank(access) {
+                continue;
+            }
             if record_asl > rule.level {
                 continue;
             }
+            // UAG: only consulted when the rule scopes one. An empty
+            // UAG list means "any user" — including an empty username.
             let user_match = rule.uag.is_empty()
                 || rule.uag.iter().any(|g| {
                     self.uag
@@ -407,34 +511,43 @@ impl AccessSecurityConfig {
                         .map(|members| members.iter().any(|m| m == user))
                         .unwrap_or(false)
                 });
+            if !user_match {
+                continue;
+            }
+            // HAG: host comparison is case-insensitive (H-1). C stores
+            // every HAG host lowercased (`asHagAddHost`) and lowercases
+            // the connecting client's host before `asComputePvt`.
+            let host_lc = host.to_ascii_lowercase();
             let host_match = rule.hag.is_empty()
                 || rule.hag.iter().any(|g| {
                     self.hag
                         .get(g)
-                        .map(|members| members.iter().any(|m| m == host))
+                        .map(|members| {
+                            members
+                                .iter()
+                                .any(|m| m.eq_ignore_ascii_case(&host_lc))
+                        })
                         .unwrap_or(false)
                 });
+            if !host_match {
+                continue;
+            }
             let method_match = rule.method.is_empty()
                 || rule.method.iter().any(|m| m.eq_ignore_ascii_case(method));
+            if !method_match {
+                continue;
+            }
             let authority_match = rule.authority.is_empty()
                 || rule
                     .authority
                     .iter()
                     .any(|a| a.eq_ignore_ascii_case(authority));
-            if user_match && host_match && method_match && authority_match {
-                if rule.write {
-                    can_write = true;
-                    can_read = true;
-                } else {
-                    can_read = true;
-                }
+            if !authority_match {
+                continue;
             }
+            access = rule_access(rule);
         }
-        match (can_read, can_write) {
-            (_, true) => AccessLevel::ReadWrite,
-            (true, false) => AccessLevel::Read,
-            _ => AccessLevel::NoAccess,
-        }
+        access
     }
 
     /// Check access taking the per-record ASL into account.
@@ -471,6 +584,17 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
         unknown_access: AccessLevel::Read,
     };
 
+    // C `asInitialize` (asLibRoutines.c:107) calls `asAsgAdd(DEFAULT)`
+    // *before* parsing the file, so a `DEFAULT` ASG always exists.
+    // Synthesise it here unconditionally (C-2/C-3): any record whose
+    // `ASG` field names an unknown group resolves to this empty
+    // `DEFAULT`, which has no RULEs ⇒ `asNOACCESS` ⇒ access denied.
+    // A `DEFAULT` block declared in the file simply overwrites this
+    // placeholder below.
+    config
+        .asg
+        .insert("DEFAULT".to_string(), AccessSecurityGroup::default());
+
     let mut chars = content.chars().peekable();
     let mut buf = String::new();
 
@@ -488,7 +612,13 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
             "HAG" => {
                 let name = read_paren_name(&mut chars)?;
                 let members = read_brace_list(&mut chars)?;
-                let expanded = expand_hag_members(&members);
+                // H-1: store every HAG host lowercased — C
+                // `asHagAddHost` (asLibRoutines.c:1218-1256)
+                // `tolower()`s each host char so host matching is
+                // case-insensitive.
+                let lowered: Vec<String> =
+                    members.iter().map(|m| m.to_ascii_lowercase()).collect();
+                let expanded = expand_hag_members(&lowered);
                 config.hag.insert(name, expanded);
             }
             "ASG" => {
@@ -498,14 +628,67 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
             }
             "" => break,
             other => {
-                return Err(CaError::Protocol(format!(
-                    "ACF: unexpected keyword '{other}'"
-                )));
+                // M-4: C `asLib.y:88-103` treats an unrecognised
+                // top-level block as a *warning*
+                // (`yywarn "Ignoring unsupported TOP LEVEL block"`)
+                // and parsing continues — forward-compat with
+                // future/vendor ACF extensions. Skip the unknown
+                // keyword's `(...)` head and `{...}` body if present
+                // so the rest of the file still parses, instead of
+                // aborting the whole load (which, per C-3, would
+                // otherwise leave the IOC with no security layer).
+                tracing::warn!(
+                    target: "epics_base_rs::access_security",
+                    keyword = %other,
+                    "ACF: ignoring unsupported top-level block"
+                );
+                skip_unknown_top_level_block(&mut chars);
             }
         }
     }
 
     Ok(config)
+}
+
+/// Skip an unrecognised top-level block: an optional `(...)` head and
+/// an optional `{...}` body. Mirrors C's recover-and-continue posture
+/// for `yywarn "Ignoring unsupported TOP LEVEL block"` (M-4).
+fn skip_unknown_top_level_block(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    skip_ws_comments(chars);
+    if chars.peek() == Some(&'(') {
+        // Consume balanced parens.
+        let mut depth = 0;
+        while let Some(&c) = chars.peek() {
+            chars.next();
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    skip_ws_comments(chars);
+    if chars.peek() == Some(&'{') {
+        let mut depth = 0;
+        while let Some(&c) = chars.peek() {
+            chars.next();
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Expand HAG members with their resolved IP addresses for soft
@@ -593,16 +776,74 @@ fn read_paren_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
         return Err(CaError::Protocol("ACF: expected '('".into()));
     }
     skip_ws_comments(chars);
+    // L-4: C's lexer requires a single `tokenSTRING` then `')'`.
+    // Accept an optional double-quoted form; in the unquoted form
+    // interior whitespace ends the name — a second non-space run
+    // before `)` is a parse error rather than being silently merged
+    // (`UAG(my group)` must NOT become `mygroup`). EOF before `)` is
+    // also an error.
     let mut name = String::new();
-    while let Some(&c) = chars.peek() {
-        if c == ')' {
+    if chars.peek() == Some(&'"') {
+        chars.next();
+        let mut closed = false;
+        while let Some(&c) = chars.peek() {
             chars.next();
-            break;
-        }
-        if !c.is_whitespace() {
+            if c == '"' {
+                closed = true;
+                break;
+            }
             name.push(c);
         }
-        chars.next();
+        if !closed {
+            return Err(CaError::Protocol(
+                "ACF: unterminated quoted name".into(),
+            ));
+        }
+        skip_ws_comments(chars);
+        if chars.next() != Some(')') {
+            return Err(CaError::Protocol(
+                "ACF: expected ')' after quoted name".into(),
+            ));
+        }
+        return Ok(name);
+    }
+    loop {
+        match chars.peek() {
+            Some(&')') => {
+                chars.next();
+                break;
+            }
+            Some(&c) if c.is_whitespace() => {
+                // Whitespace ends the name. Allow only trailing
+                // whitespace before `)`; reject embedded whitespace.
+                skip_ws_comments(chars);
+                match chars.peek() {
+                    Some(&')') => {
+                        chars.next();
+                        break;
+                    }
+                    Some(_) => {
+                        return Err(CaError::Protocol(
+                            "ACF: whitespace inside parenthesised name".into(),
+                        ));
+                    }
+                    None => {
+                        return Err(CaError::Protocol(
+                            "ACF: unterminated '(' — missing ')'".into(),
+                        ));
+                    }
+                }
+            }
+            Some(&c) => {
+                name.push(c);
+                chars.next();
+            }
+            None => {
+                return Err(CaError::Protocol(
+                    "ACF: unterminated '(' — missing ')'".into(),
+                ));
+            }
+        }
     }
     Ok(name)
 }
@@ -668,9 +909,29 @@ fn parse_asg_body(
                 if kw == "RULE" {
                     let rule = parse_rule(chars)?;
                     asg.rules.push(rule);
+                } else if let Some(stripped) = kw.strip_prefix("INP") {
+                    // H-4: `INP(A..U)("link")` — C `asLib_lex.l:48-52`
+                    // lexes `INP[A-U]` as one token whose `Int64`
+                    // payload is the letter index (`yytext[3] - 'A'`).
+                    // `asLib.y:234-243` then reads the parenthesised
+                    // link string.
+                    let index = match parse_inp_index(stripped) {
+                        Some(i) => i,
+                        None => {
+                            return Err(CaError::Protocol(format!(
+                                "ACF: invalid INP link selector 'INP{stripped}' \
+                                 (expected INPA..INPU)"
+                            )));
+                        }
+                    };
+                    let link = read_paren_name(chars)?;
+                    asg.inp.push(AsgInp { index, link });
                 } else if kw.is_empty() {
                     chars.next(); // skip unknown char
                 }
+                // Unknown alphanumeric keywords inside an ASG body are
+                // skipped (forward-compat); the next loop iteration
+                // resumes from the following token.
             }
             None => return Err(CaError::Protocol("ACF: unterminated ASG".into())),
         }
@@ -679,15 +940,38 @@ fn parse_asg_body(
     Ok(asg)
 }
 
+/// Parse the `A..U` selector suffix of an `INP` token into a 0-based
+/// letter index. `"A"` → 0, .. `"U"` → 20. Anything else → `None`.
+fn parse_inp_index(suffix: &str) -> Option<u8> {
+    let mut it = suffix.chars();
+    let c = it.next()?;
+    if it.next().is_some() {
+        return None; // INP selector is exactly one letter
+    }
+    let c = c.to_ascii_uppercase();
+    if ('A'..='U').contains(&c) {
+        Some((c as u8) - b'A')
+    } else {
+        None
+    }
+}
+
 fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<AccessRule> {
     skip_ws_comments(chars);
     if chars.next() != Some('(') {
         return Err(CaError::Protocol("ACF: expected '(' after RULE".into()));
     }
 
-    // Read level
+    // Read level. M-2: C `asLib.y:253-258` requires `tokenINT64` and
+    // rejects a negative or non-numeric level with `yyerror`, which
+    // fails the whole ACF load (a fail-safe abort). Accept an optional
+    // leading sign so a `RULE(-1, ...)` is detected and rejected
+    // rather than silently re-read as level 1.
     skip_ws_comments(chars);
     let mut level_str = String::new();
+    if matches!(chars.peek(), Some('+') | Some('-')) {
+        level_str.push(chars.next().unwrap());
+    }
     while let Some(&c) = chars.peek() {
         if c.is_ascii_digit() {
             level_str.push(c);
@@ -696,29 +980,81 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
             break;
         }
     }
-    let level: u8 = level_str.parse().unwrap_or(1);
+    let level_num: i64 = level_str.parse().map_err(|_| {
+        CaError::Protocol(format!(
+            "ACF: RULE level must be an integer, got '{level_str}'"
+        ))
+    })?;
+    if level_num < 0 {
+        return Err(CaError::Protocol(format!(
+            "ACF: RULE LEVEL must be positive: {level_num}"
+        )));
+    }
+    let level: u8 = u8::try_from(level_num).map_err(|_| {
+        CaError::Protocol(format!("ACF: RULE level out of range: {level_num}"))
+    })?;
 
     skip_ws_comments(chars);
     if chars.peek() == Some(&',') {
         chars.next();
     }
 
-    // Read access type
+    // Read access keyword. M-3: C `asLib.y:259-267` distinguishes
+    // `NONE`/`READ`/`WRITE`; any other keyword triggers
+    // `yywarn "Ignoring RULE that contains an unsupported keyword"`
+    // and the rule is dropped. We keep the rule but mark it `ignore`
+    // (inert) so a misspelled keyword fails CLOSED.
     skip_ws_comments(chars);
     let mut access_str = String::new();
     read_word(chars, &mut access_str);
-    let write = access_str.eq_ignore_ascii_case("WRITE");
+    let (access, mut ignore) = if access_str.eq_ignore_ascii_case("WRITE") {
+        (RuleAccess::Write, false)
+    } else if access_str.eq_ignore_ascii_case("READ") {
+        (RuleAccess::Read, false)
+    } else if access_str.eq_ignore_ascii_case("NONE") {
+        (RuleAccess::None, false)
+    } else {
+        tracing::warn!(
+            target: "epics_base_rs::access_security",
+            keyword = %access_str,
+            "ACF: ignoring RULE with unsupported access keyword"
+        );
+        (RuleAccess::None, true)
+    };
+
+    // Optional log option: `RULE(level, access, TRAPWRITE)` /
+    // `RULE(level, access, NOTRAPWRITE)`. H-2: C `asLib.y:272-283`
+    // (`rule_log_option`). The grammar is honoured and the trap mask
+    // captured in `AccessRule::trap`; the `asTrapWrite` put-logging
+    // listener that would consume the mask is a separate subsystem
+    // not present in this crate (see the H-2 UNFIXED note).
+    let mut trap = false;
+    skip_ws_comments(chars);
+    if chars.peek() == Some(&',') {
+        chars.next();
+        skip_ws_comments(chars);
+        let mut log_opt = String::new();
+        read_word(chars, &mut log_opt);
+        if log_opt.eq_ignore_ascii_case("TRAPWRITE") {
+            trap = true;
+        } else if !log_opt.eq_ignore_ascii_case("NOTRAPWRITE") {
+            return Err(CaError::Protocol(format!(
+                "ACF: RULE log option must be TRAPWRITE or NOTRAPWRITE, got '{log_opt}'"
+            )));
+        }
+    }
 
     skip_ws_comments(chars);
     if chars.peek() == Some(&')') {
         chars.next();
     }
 
-    // Optional body with UAG/HAG/METHOD/AUTHORITY.
+    // Optional body with UAG/HAG/METHOD/AUTHORITY/CALC.
     let mut uag = Vec::new();
     let mut hag = Vec::new();
     let mut method = Vec::new();
     let mut authority = Vec::new();
+    let mut calc: Option<String> = None;
 
     skip_ws_comments(chars);
     if chars.peek() == Some(&'{') {
@@ -745,26 +1081,115 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
                     } else if kw == "AUTHORITY" {
                         // PR #563/#618: AUTHORITY("CA Issuer", ...)
                         authority.extend(read_paren_string_list(chars)?);
+                    } else if kw == "CALC" {
+                        // H-3: `CALC("<expr>")` — C `asLib.y:294-299`.
+                        // The expression gates the rule against the
+                        // ASG's INP* link values. Take the *last*
+                        // CALC clause if several are given (matches
+                        // C `asAsgRuleCalc` last-wins overwrite).
+                        let expr = read_paren_name_raw(chars)?;
+                        calc = Some(expr);
                     } else if kw.is_empty() {
                         // Unknown punctuation — advance to avoid infinite loop.
                         chars.next();
+                    } else {
+                        // M-3 / C `asLib.y:300-306`: a RULE body with
+                        // an unsupported keyword is *disabled* by
+                        // `asAsgRuleDisable`. Mark the rule inert and
+                        // consume the keyword's `(...)` argument if
+                        // present so parsing recovers.
+                        tracing::warn!(
+                            target: "epics_base_rs::access_security",
+                            keyword = %kw,
+                            "ACF: ignoring RULE with unsupported keyword — rule disabled"
+                        );
+                        ignore = true;
+                        skip_ws_comments(chars);
+                        if chars.peek() == Some(&'(') {
+                            let _ = read_paren_name(chars)?;
+                        }
                     }
-                    // Unknown alphanumeric keywords are silently ignored
-                    // (forward-compat with future RULE body extensions).
                 }
                 None => break,
             }
         }
     }
 
+    // H-3: a CALC clause must actually gate the rule. This crate's
+    // access-security layer has no `INP*` database-link resolution
+    // (the `AsgInp` links are stored but never read), so the calc
+    // expression cannot be evaluated at access-check time. C disables
+    // any rule it cannot fully honour (`asAsgRuleDisable`); to fail
+    // CLOSED we do the same — a present-but-unevaluable CALC condition
+    // marks the rule inert rather than letting it become an
+    // unconditional grant. The expression is still validated (compiled)
+    // here so a syntactically broken CALC is rejected exactly as C's
+    // `postfix()` rejects it in `asAsgRuleCalc`.
+    if let Some(ref expr) = calc {
+        match crate::calc::compile(expr) {
+            Ok(_) => {
+                ignore = true;
+            }
+            Err(e) => {
+                return Err(CaError::Protocol(format!(
+                    "ACF: bad CALC expression '{expr}': {e}"
+                )));
+            }
+        }
+    }
+
     Ok(AccessRule {
         level,
-        write,
+        access,
         uag,
         hag,
         method,
         authority,
+        trap,
+        calc,
+        ignore,
     })
+}
+
+/// Read a parenthesised, double-quoted string verbatim — used for the
+/// `CALC("<expr>")` clause where the expression contains operators and
+/// spaces that `read_paren_name` would mangle (it strips whitespace).
+/// Accepts `( "expr" )` or `( expr )`; whitespace around the parens is
+/// skipped, whitespace *inside* a quoted body is preserved.
+fn read_paren_name_raw(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<String> {
+    skip_ws_comments(chars);
+    if chars.next() != Some('(') {
+        return Err(CaError::Protocol("ACF: expected '(' after CALC".into()));
+    }
+    skip_ws_comments(chars);
+    let mut body = String::new();
+    if chars.peek() == Some(&'"') {
+        chars.next();
+        while let Some(&c) = chars.peek() {
+            chars.next();
+            if c == '"' {
+                break;
+            }
+            body.push(c);
+        }
+        skip_ws_comments(chars);
+        if chars.next() != Some(')') {
+            return Err(CaError::Protocol(
+                "ACF: expected ')' after CALC expression".into(),
+            ));
+        }
+    } else {
+        // Unquoted form — read until the closing paren.
+        while let Some(&c) = chars.peek() {
+            if c == ')' {
+                chars.next();
+                break;
+            }
+            body.push(c);
+            chars.next();
+        }
+    }
+    Ok(body.trim().to_string())
 }
 
 /// Parse `(item1, "item 2", ...)` — commas separate items, optional
@@ -979,8 +1404,17 @@ ASG(DEFAULT) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        // Unknown user/host → conservative default
-        assert_eq!(config.check_access("DEFAULT", "", ""), AccessLevel::Read);
+        // C `asComputePvt` parity: a RULE with an empty UAG list
+        // applies to *every* client regardless of user/host — the
+        // UAG check is skipped when `ellCount(&pasgrule->uagList)==0`.
+        // So an unconditional `RULE(1, WRITE)` grants WRITE even to a
+        // client with an empty/unknown user. (The old port returned
+        // `Read` here via a `unknown_access` special-case that C does
+        // not have.)
+        assert_eq!(
+            config.check_access("DEFAULT", "", ""),
+            AccessLevel::ReadWrite
+        );
     }
 
     // ----- epics-base PR #563/#618: METHOD / AUTHORITY -----
@@ -1114,6 +1548,288 @@ ASG(MIXED_CASE) {
         assert_eq!(
             config.check_access_method("MIXED_CASE", "h", "u", 0, "x509", ""),
             AccessLevel::ReadWrite
+        );
+    }
+
+    // ----- C-1 / C-2 / C-3: access security must fail CLOSED -----
+
+    /// C-1: an ASG declared with no RULE statements denies every
+    /// client. C `asComputePvt` starts `access = asNOACCESS` and only
+    /// raises it on a matching RULE — an empty rule list never raises.
+    #[test]
+    fn empty_rule_asg_denies_access() {
+        let config = parse_acf("ASG(LOCKED) { }").unwrap();
+        assert_eq!(
+            config.check_access("LOCKED", "host", "user"),
+            AccessLevel::NoAccess,
+            "ASG with no RULE must deny — C asComputePvt fails closed"
+        );
+    }
+
+    /// C-2: a record whose ASG names a group not in the file resolves
+    /// to the always-present (empty) `DEFAULT`, which denies access.
+    #[test]
+    fn unknown_asg_falls_back_to_empty_default_and_denies() {
+        let config = parse_acf("UAG(ops) { alice }").unwrap();
+        // `DEFAULT` is auto-synthesised by parse_acf (C asInitialize
+        // always calls asAsgAdd("DEFAULT")) and has no rules.
+        assert!(config.asg.contains_key("DEFAULT"));
+        assert_eq!(
+            config.check_access("TYPO", "host", "alice"),
+            AccessLevel::NoAccess,
+            "unknown ASG must resolve to empty DEFAULT ⇒ NoAccess"
+        );
+    }
+
+    /// C-2 corner: even `DEFAULT` itself, when never declared with
+    /// rules, denies — the auto-synthesised placeholder is empty.
+    #[test]
+    fn default_asg_without_rules_denies() {
+        let config = parse_acf("UAG(ops) { alice }").unwrap();
+        assert_eq!(
+            config.check_access("DEFAULT", "host", "alice"),
+            AccessLevel::NoAccess
+        );
+    }
+
+    /// C-3: an empty ACF file, or one with only comments / only
+    /// UAG/HAG blocks, yields a fail-closed config — every check
+    /// denies, matching a C IOC whose only ASG is the empty DEFAULT.
+    #[test]
+    fn empty_acf_denies_all_access() {
+        for acf in ["", "# just a comment\n", "UAG(ops){alice}\nHAG(h){pc1}\n"] {
+            let config = parse_acf(acf).unwrap();
+            assert_eq!(
+                config.check_access("DEFAULT", "host", "alice"),
+                AccessLevel::NoAccess,
+                "empty/rule-less ACF must deny (input was {acf:?})"
+            );
+            assert_eq!(
+                config.check_access("ANY_GROUP", "host", "alice"),
+                AccessLevel::NoAccess,
+                "unknown ASG against empty ACF must deny (input was {acf:?})"
+            );
+        }
+    }
+
+    /// A config built by hand (bypassing `parse_acf`) with no
+    /// `DEFAULT` and an unknown ASG must still fail closed.
+    #[test]
+    fn handbuilt_config_missing_default_denies() {
+        let config = AccessSecurityConfig {
+            uag: HashMap::new(),
+            hag: HashMap::new(),
+            asg: HashMap::new(),
+            unknown_access: AccessLevel::Read,
+        };
+        assert_eq!(
+            config.check_access("WHATEVER", "host", "user"),
+            AccessLevel::NoAccess
+        );
+    }
+
+    // ----- M-3: NONE keyword and unsupported keywords -----
+
+    /// `RULE(0, NONE)` grants asNOACCESS — it must not be treated as a
+    /// READ-granting rule. With only a NONE rule, access stays denied.
+    #[test]
+    fn rule_none_grants_no_access() {
+        let config = parse_acf("ASG(N) { RULE(0, NONE) }").unwrap();
+        assert_eq!(
+            config.check_access("N", "host", "user"),
+            AccessLevel::NoAccess
+        );
+    }
+
+    /// A misspelled access keyword disables the rule (C warns and
+    /// drops it) — it must not silently become a READ rule.
+    #[test]
+    fn rule_unsupported_access_keyword_is_inert() {
+        let config = parse_acf("ASG(B) { RULE(0, WRIET) }").unwrap();
+        assert_eq!(config.asg["B"].rules.len(), 1);
+        assert!(config.asg["B"].rules[0].ignore, "bad keyword ⇒ inert rule");
+        assert_eq!(
+            config.check_access("B", "host", "user"),
+            AccessLevel::NoAccess
+        );
+    }
+
+    // ----- M-2: RULE level validation -----
+
+    #[test]
+    fn rule_negative_level_is_rejected() {
+        let err = parse_acf("ASG(X) { RULE(-1, READ) }");
+        assert!(err.is_err(), "negative RULE level must fail the parse");
+    }
+
+    #[test]
+    fn rule_non_numeric_level_is_rejected() {
+        let err = parse_acf("ASG(X) { RULE(abc, READ) }");
+        assert!(err.is_err(), "non-numeric RULE level must fail the parse");
+    }
+
+    // ----- M-4: unknown top-level block tolerated -----
+
+    #[test]
+    fn unknown_top_level_block_is_skipped_not_fatal() {
+        let acf = r#"
+VENDOR(extension) { whatever }
+ASG(DEFAULT) { RULE(1, READ) }
+"#;
+        let config =
+            parse_acf(acf).expect("unknown top-level block must not abort the parse");
+        assert_eq!(
+            config.check_access("DEFAULT", "host", "user"),
+            AccessLevel::Read,
+            "the ASG after the unknown block must still parse"
+        );
+    }
+
+    // ----- H-1: HAG host matching is case-insensitive -----
+
+    #[test]
+    fn hag_host_match_is_case_insensitive() {
+        let acf = r#"
+HAG(lab) { LabPC1.invalid }
+ASG(C) {
+    RULE(1, WRITE) { HAG(lab) }
+    RULE(1, READ)
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        // Client reports a differently-cased hostname.
+        assert_eq!(
+            config.check_access("C", "labpc1.invalid", "user"),
+            AccessLevel::ReadWrite,
+            "lowercased HAG entry must match a mixed-case client host"
+        );
+        assert_eq!(
+            config.check_access("C", "LABPC1.INVALID", "user"),
+            AccessLevel::ReadWrite
+        );
+        // A genuinely different host still only gets READ.
+        assert_eq!(
+            config.check_access("C", "other.invalid", "user"),
+            AccessLevel::Read
+        );
+    }
+
+    // ----- H-2: TRAPWRITE / NOTRAPWRITE log option parses -----
+
+    #[test]
+    fn rule_trapwrite_log_option_parses() {
+        let config =
+            parse_acf("ASG(T) { RULE(1, WRITE, TRAPWRITE) RULE(1, READ, NOTRAPWRITE) }")
+                .unwrap();
+        assert_eq!(config.asg["T"].rules.len(), 2);
+        assert_eq!(config.asg["T"].rules[0].access, RuleAccess::Write);
+        assert!(
+            config.asg["T"].rules[0].trap,
+            "TRAPWRITE must set the trap mask"
+        );
+        assert_eq!(config.asg["T"].rules[1].access, RuleAccess::Read);
+        assert!(
+            !config.asg["T"].rules[1].trap,
+            "NOTRAPWRITE must clear the trap mask"
+        );
+    }
+
+    #[test]
+    fn rule_bad_log_option_is_rejected() {
+        assert!(parse_acf("ASG(T) { RULE(1, WRITE, BOGUS) }").is_err());
+    }
+
+    // ----- H-3: CALC clause gates (or disables) the rule -----
+
+    /// A CALC condition must never let a rule become unconditional.
+    /// This crate cannot resolve INP* link values, so a CALC rule is
+    /// disabled (fail closed) — it grants nothing.
+    #[test]
+    fn calc_rule_is_disabled_when_unevaluable() {
+        let config =
+            parse_acf(r#"ASG(G) { INPA("ref") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
+        let rule = &config.asg["G"].rules[0];
+        assert!(rule.calc.is_some(), "CALC clause must be parsed and stored");
+        assert!(
+            rule.ignore,
+            "an unevaluable CALC rule must be disabled, not unconditional"
+        );
+        assert_eq!(
+            config.check_access("G", "host", "user"),
+            AccessLevel::NoAccess,
+            "CALC rule must not silently grant WRITE"
+        );
+    }
+
+    #[test]
+    fn calc_rule_with_bad_expression_is_rejected() {
+        assert!(
+            parse_acf(r#"ASG(G) { RULE(1, WRITE) { CALC("A=") } }"#).is_err(),
+            "syntactically broken CALC must fail the parse"
+        );
+    }
+
+    // ----- H-4: INP(A..U) link declarations -----
+
+    #[test]
+    fn asg_inp_links_are_parsed() {
+        let acf = r#"
+ASG(G) {
+    INPA("rec1.VAL")
+    INPC("rec3.VAL")
+    RULE(1, READ)
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        let inp = &config.asg["G"].inp;
+        assert_eq!(inp.len(), 2);
+        assert_eq!(inp[0].index, 0);
+        assert_eq!(inp[0].link, "rec1.VAL");
+        assert_eq!(inp[1].index, 2);
+        assert_eq!(inp[1].link, "rec3.VAL");
+    }
+
+    #[test]
+    fn asg_inp_bad_selector_is_rejected() {
+        // INPZ is out of the A..U range.
+        assert!(parse_acf(r#"ASG(G) { INPZ("x") }"#).is_err());
+    }
+
+    // ----- L-4: parenthesised name robustness -----
+
+    #[test]
+    fn paren_name_rejects_embedded_whitespace() {
+        // `UAG(my group)` must NOT silently become `mygroup`.
+        assert!(parse_acf("UAG(my group) { x }").is_err());
+    }
+
+    #[test]
+    fn paren_name_rejects_unterminated() {
+        assert!(parse_acf("UAG(unterminated").is_err());
+    }
+
+    #[test]
+    fn paren_name_accepts_quoted_form() {
+        let config = parse_acf(r#"UAG("my group") { x }"#).unwrap();
+        assert!(config.uag.contains_key("my group"));
+    }
+
+    /// ASL gate still works: a low-level WRITE rule does not apply to
+    /// a high-ASL record. C `RULE(N,…)` applies only when ASL ≤ N.
+    #[test]
+    fn asl_gate_still_honoured_after_fail_closed_rewrite() {
+        let config =
+            parse_acf("ASG(A) { RULE(0, READ) RULE(1, WRITE) }").unwrap();
+        // ASL-0 record: READ rule applies, WRITE rule applies.
+        assert_eq!(
+            config.check_access_method("A", "h", "u", 0, "", ""),
+            AccessLevel::ReadWrite
+        );
+        // ASL-2 record: both rules require ASL ≤ their level, so
+        // neither applies ⇒ denied.
+        assert_eq!(
+            config.check_access_method("A", "h", "u", 2, "", ""),
+            AccessLevel::NoAccess
         );
     }
 }

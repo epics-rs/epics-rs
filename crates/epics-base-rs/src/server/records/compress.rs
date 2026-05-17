@@ -35,6 +35,13 @@ pub struct CompressRecord {
     /// increments on every accumulator update, resets to 0 after the
     /// N-th waveform when the average is emitted.
     pub inx: i32,
+    /// `CVB` (compress value buffer) — C `prec->cvb`. The running
+    /// scalar accumulator for the N-to-1 *scalar* path
+    /// (`compress_scalar`, compressRecord.c:273-304): Low/High keep a
+    /// running extreme, Average keeps the incremental mean
+    /// `(inx*cvb + value)/(inx+1)`. Exposed as a readable field so a
+    /// CA client can observe the partial accumulation mid-cycle.
+    pub cvb: f64,
     /// `PBUF` (partial buffer) — epics-base 7.0.8.
     /// `0 = NO` (default): VAL is read by clients as the whole NSAM
     /// vector; the leading `NUSE` elements are valid, the rest are
@@ -46,7 +53,10 @@ pub struct CompressRecord {
     /// Both modes update internal state identically; the difference
     /// is purely in what `get_field("VAL")` returns.
     pub pbuf: i16,
-    // Internal accumulator for N-to-1 algorithms
+    // Internal element-wise summing buffer for the rolling-Average
+    // algorithm (alg=3) — C `prec->sptr`. The N-to-1 algorithms keep
+    // their running state in `cvb`/`inx` (`compress_scalar`) or work
+    // a whole waveform in one call (`compress_array`).
     accum: Vec<f64>,
 }
 
@@ -66,6 +76,7 @@ impl Default for CompressRecord {
             ilil: 0.0,
             ihil: 0.0,
             inx: 0,
+            cvb: 0.0,
             accum: Vec::new(),
         }
     }
@@ -79,15 +90,6 @@ impl CompressRecord {
             alg,
             ..Default::default()
         }
-    }
-
-    /// True when ILIL < IHIL and `input` falls outside the limits.
-    /// C `compress_array` (compressRecord.c:163-170) drops these
-    /// samples before compression so the configured algorithm
-    /// (min/max/mean/median) never sees spurious outliers.
-    #[inline]
-    fn ilil_ihil_rejects(&self, input: f64) -> bool {
-        self.ilil < self.ihil && (input < self.ilil || input > self.ihil)
     }
 
     /// Write one value into the circular buffer, advancing `off`
@@ -109,11 +111,14 @@ impl CompressRecord {
         }
     }
 
-    /// Push a value into the compress record.
+    /// Push a single scalar value into the compress record.
+    ///
+    /// C `compressRecord.c::process` routes a 1-element input to
+    /// `compress_scalar`, which keeps a running scalar `cvb`/`inx`
+    /// rather than an N-element accumulator. ILIL/IHIL filtering is
+    /// **not** applied on the scalar path — C's skip loop lives only
+    /// in `compress_array` (the `nelements > 1` branch).
     pub fn push_value(&mut self, input: f64) {
-        if self.ilil_ihil_rejects(input) {
-            return;
-        }
         match self.alg {
             // menuCompressALG_Circular_Buffer
             4 => self.put_one(input),
@@ -123,14 +128,43 @@ impl CompressRecord {
             // running average behaves predictably for either input
             // shape.
             3 => self.push_array_average(&[input]),
-            // N-to-1 algorithms (Low/High/N_to_1_Average/Median):
-            // accumulate N samples then compress.
-            _ => {
-                self.accum.push(input);
-                if self.accum.len() >= self.n as usize {
-                    self.flush_accum();
+            // N-to-1 algorithms — C `compress_scalar`: running `cvb`.
+            _ => self.compress_scalar(input),
+        }
+    }
+
+    /// C `compress_scalar` (compressRecord.c:273-304): fold one
+    /// sample into the running `cvb` accumulator and emit a
+    /// compressed value once `inx` reaches `n` (or `pbuf == YES`).
+    fn compress_scalar(&mut self, value: f64) {
+        let inx = self.inx;
+        match self.alg {
+            // N_to_1_Low_Value
+            0 => {
+                if value < self.cvb || inx == 0 {
+                    self.cvb = value;
                 }
             }
+            // N_to_1_High_Value
+            1 => {
+                if value > self.cvb || inx == 0 {
+                    self.cvb = value;
+                }
+            }
+            // N_to_1_Average / N_to_1_Median (scalar Median == Average)
+            _ => {
+                self.cvb = (inx as f64 * self.cvb + value) / (inx as f64 + 1.0);
+            }
+        }
+        let inx = inx + 1;
+        let n = self.n.max(1);
+        if inx >= n || self.pbuf != 0 {
+            let cvb = self.cvb;
+            self.put_one(cvb);
+            // C: prec->inx = (inx >= n) ? 0 : inx;
+            self.inx = if inx >= n { 0 } else { inx };
+        } else {
+            self.inx = inx;
         }
     }
 
@@ -207,67 +241,64 @@ impl CompressRecord {
                 }
             }
             // Average (rolling, alg=3): single array_average call.
-            3 => {
-                // ILIL/IHIL apply per element; reject before averaging.
-                if self.ilil < self.ihil {
-                    let filtered: Vec<f64> = input
-                        .iter()
-                        .copied()
-                        .filter(|v| !(*v < self.ilil || *v > self.ihil))
-                        .collect();
-                    self.push_array_average(&filtered);
-                } else {
-                    self.push_array_average(input);
-                }
-            }
-            // N-to-1 algorithms (Low/High/N_to_1_Average/Median).
-            _ => {
-                for &v in input {
-                    if self.ilil_ihil_rejects(v) {
-                        continue;
-                    }
-                    self.accum.push(v);
-                    if self.accum.len() >= self.n as usize {
-                        self.flush_accum();
-                    }
-                }
-                if self.pbuf != 0 && !self.accum.is_empty() {
-                    self.flush_accum();
-                }
-            }
+            // C `array_average` does NOT apply ILIL/IHIL filtering —
+            // the skip loop lives only in `compress_array`.
+            3 => self.push_array_average(input),
+            // N-to-1 algorithms (Low/High/N_to_1_Average/Median):
+            // C `compress_array` (compressRecord.c:154-221).
+            _ => self.compress_array(input),
         }
     }
 
-    /// Compress `self.accum` via the configured algorithm and push
-    /// the result into the circular VAL buffer via [`Self::put_one`]
-    /// so BALG (FIFO vs LIFO) is honoured. Clears `accum` regardless
-    /// of partial vs full — callers decide *whether* to flush; this
-    /// just executes it.
-    fn flush_accum(&mut self) {
-        if self.accum.is_empty() {
-            return;
-        }
-        let compressed = match self.alg {
-            // menuCompressALG_N_to_1_Low_Value
-            0 => self.accum.iter().cloned().fold(f64::INFINITY, f64::min),
-            // menuCompressALG_N_to_1_High_Value
-            1 => self.accum.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-            // menuCompressALG_N_to_1_Average
-            2 => self.accum.iter().sum::<f64>() / self.accum.len() as f64,
-            // menuCompressALG_N_to_1_Median: middle element after sort.
-            // C `compressRecord.c:212` uses `psource[n/2]` after `qsort`
-            // — identical for integer-indexed mid pick.
-            5 => {
-                let mut sorted = self.accum.clone();
-                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                sorted[sorted.len() / 2]
+    /// C `compress_array` (compressRecord.c:154-221). Skips a
+    /// **leading** run of out-of-limit samples (NOT a per-sample
+    /// filter — an out-of-limit sample in the middle of the array is
+    /// kept), then compresses consecutive N-element chunks. A trailing
+    /// partial chunk (`< N`) is emitted only when `PBUF == YES`,
+    /// otherwise it is dropped (C `break`s out of the loop).
+    fn compress_array(&mut self, input: &[f64]) {
+        // C: skip leading out-of-limit data.
+        let mut start = 0usize;
+        if self.ilil < self.ihil {
+            while start < input.len()
+                && (input[start] < self.ilil || input[start] > self.ihil)
+            {
+                start += 1;
             }
-            // alg=3 (Average rolling) doesn't use the N-element
-            // accumulator — push_array_average handles it directly.
-            _ => 0.0,
-        };
-        self.accum.clear();
-        self.put_one(compressed);
+        }
+        let source = &input[start..];
+        let n = self.n.max(1) as usize;
+        // C: nnew = min(no_elements, nsam * n).
+        let nsam = self.nsam.max(1) as usize;
+        let mut remaining = source.len().min(nsam.saturating_mul(n));
+        let mut pos = 0usize;
+        while remaining > 0 {
+            // C: if (nnew < n && pbuf != YES) break;
+            if remaining < n && self.pbuf == 0 {
+                break;
+            }
+            let chunk_len = n.min(remaining);
+            let chunk = &source[pos..pos + chunk_len];
+            let value = match self.alg {
+                // N_to_1_Low_Value
+                0 => chunk.iter().cloned().fold(f64::INFINITY, f64::min),
+                // N_to_1_High_Value
+                1 => chunk.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                // N_to_1_Average
+                2 => chunk.iter().sum::<f64>() / chunk_len as f64,
+                // N_to_1_Median: middle element after sort (C `psource[n/2]`).
+                _ => {
+                    let mut sorted = chunk.to_vec();
+                    sorted.sort_by(|a, b| {
+                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    sorted[sorted.len() / 2]
+                }
+            };
+            self.put_one(value);
+            pos += chunk_len;
+            remaining -= chunk_len;
+        }
     }
 
     /// Linearise the circular buffer per BALG: returns NUSE elements
@@ -356,6 +387,11 @@ static COMPRESS_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         read_only: true,
     },
+    FieldDesc {
+        name: "CVB",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
 ];
 
 impl Record for CompressRecord {
@@ -365,8 +401,14 @@ impl Record for CompressRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if self.res != 0 {
+            // C `reset` (compressRecord.c:85-99) clears the running
+            // accumulator state too — `inx`, `cvb` and the summing
+            // buffer — not just `off`/`nuse`.
             self.off = 0;
             self.nuse = 0;
+            self.inx = 0;
+            self.cvb = 0.0;
+            self.accum.clear();
             for v in &mut self.val {
                 *v = 0.0;
             }
@@ -398,6 +440,7 @@ impl Record for CompressRecord {
             "ILIL" => Some(EpicsValue::Double(self.ilil)),
             "IHIL" => Some(EpicsValue::Double(self.ihil)),
             "INX" => Some(EpicsValue::Long(self.inx)),
+            "CVB" => Some(EpicsValue::Double(self.cvb)),
             _ => None,
         }
     }
@@ -405,8 +448,17 @@ impl Record for CompressRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
+                // C `compressRecord.c` has NO raw-overwrite path for
+                // VAL: VAL *is* the circular buffer and a CA put is
+                // handled by `put_array_info`, which feeds data
+                // through the algorithm and advances `off`/`nuse`.
+                // Replacing `self.val` directly desynced `nuse`/`off`
+                // and could shrink the backing buffer below `nsam`,
+                // panicking `linearise_val` (out-of-bounds index).
+                // Route the array through the normal `push_array`
+                // ingestion so the buffer invariant is preserved.
                 EpicsValue::DoubleArray(arr) => {
-                    self.val = arr;
+                    self.push_array(&arr);
                     Ok(())
                 }
                 EpicsValue::Double(v) => {
@@ -438,6 +490,8 @@ impl Record for CompressRecord {
                     // CA clients see the empty array immediately.
                     self.nuse = 0;
                     self.off = 0;
+                    self.inx = 0;
+                    self.cvb = 0.0;
                     self.res = 0;
                     self.accum.clear();
                     let nsam = self.nsam.max(0) as usize;
@@ -484,7 +538,9 @@ impl Record for CompressRecord {
                 }
                 _ => Err(CaError::TypeMismatch("IHIL".into())),
             },
-            "NSAM" | "OFF" | "NUSE" | "INX" => Err(CaError::ReadOnlyField(name.to_string())),
+            "NSAM" | "OFF" | "NUSE" | "INX" | "CVB" => {
+                Err(CaError::ReadOnlyField(name.to_string()))
+            }
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -495,6 +551,22 @@ impl Record for CompressRecord {
 
     fn primary_field(&self) -> &'static str {
         "VAL"
+    }
+
+    /// C `compressRecord.c::process` calls `dbGetLink(&prec->inp, ...)`
+    /// every cycle and feeds the result to the algorithm. The Rust
+    /// record cannot read links itself; it asks the framework to pull
+    /// `INP` into `VAL` before `process()`. The `VAL` put routes
+    /// through `push_array`, so the data is ingested by the configured
+    /// compression algorithm (NOT a raw buffer overwrite — see C-1).
+    fn pre_process_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+        if self.inp.is_empty() {
+            return Vec::new();
+        }
+        vec![crate::server::record::ProcessAction::ReadDbLink {
+            link_field: "INP",
+            target_field: "VAL",
+        }]
     }
 }
 
@@ -606,24 +678,24 @@ mod pbuf_tests {
     }
 
     #[test]
-    fn pbuf_no_n_to_1_partial_tail_held_for_next_array() {
-        // Same input, PBUF=NO (default): tail [11,12] stays in accum
-        // for the next push_array call. nuse=2 (only full chunks).
+    fn pbuf_no_n_to_1_partial_tail_dropped_per_array() {
+        // C `compress_array` is per-waveform: with PBUF=NO the
+        // trailing partial chunk (`nnew < n`) hits the `break` and is
+        // DROPPED — it does NOT persist into the next push_array.
         let mut rec = CompressRecord::new(8, 2);
         rec.n = 5;
         rec.pbuf = 0;
         let first: Vec<f64> = (1..=12).map(|i| i as f64).collect();
         rec.push_array(&first);
-        assert_eq!(rec.nuse, 2, "PBUF=NO must defer partial chunk");
-        // Next array of 3 more samples fills the chunk (2+3=5), so
-        // a third compressed value emits — [11,12,13,14,15] mean=13.
-        let second: Vec<f64> = vec![13.0, 14.0, 15.0];
-        rec.push_array(&second);
-        assert_eq!(rec.nuse, 3, "completed chunk emits on next array");
+        // Chunks [1..5]=3, [6..10]=8; leftover [11,12] dropped.
+        assert_eq!(rec.nuse, 2, "PBUF=NO drops the trailing partial chunk");
+        // A second array of only 3 samples (< N=5) emits nothing —
+        // there is no carried-over partial state.
+        rec.push_array(&[13.0, 14.0, 15.0]);
+        assert_eq!(rec.nuse, 2, "short array < N emits nothing with PBUF=NO");
         if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
             assert_eq!(v[0], 3.0);
             assert_eq!(v[1], 8.0);
-            assert_eq!(v[2], 13.0);
         } else {
             panic!("expected DoubleArray");
         }
@@ -661,24 +733,42 @@ mod pbuf_tests {
         }
     }
 
-    /// ILIL/IHIL input range filter (C `compress_array`
-    /// compressRecord.c:163-170): samples outside `[ILIL, IHIL]` are
-    /// dropped before compression.
+    /// ILIL/IHIL input range filter — C `compress_array`
+    /// (compressRecord.c:163-170) skips only the *leading* run of
+    /// out-of-limit samples; an out-of-limit sample in the middle of
+    /// the array is NOT dropped.
     #[test]
-    fn ilil_ihil_filters_out_of_range_samples() {
+    fn ilil_ihil_skips_only_leading_out_of_limit_run() {
         let mut rec = CompressRecord::new(8, 2);
         rec.n = 3;
         rec.ilil = 0.0;
         rec.ihil = 100.0;
-        // 50 and 75 pass, -5 and 200 rejected. After 3 valid samples
-        // the mean (10+50+75)/3 = 45 is emitted.
+        // First sample 10 is in range → nothing skipped. First chunk
+        // [10,-5,50] keeps the mid-array out-of-limit -5: mean=55/3.
         rec.push_array(&[10.0, -5.0, 50.0, 200.0, 75.0]);
-        assert_eq!(
-            rec.nuse, 1,
-            "exactly one chunk emitted after 3 valid samples"
-        );
+        assert_eq!(rec.nuse, 1, "one full chunk; trailing [200,75] dropped");
         if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
-            assert!((v[0] - 45.0).abs() < 1e-9, "mean of {{10,50,75}} == 45");
+            assert!(
+                (v[0] - 55.0 / 3.0).abs() < 1e-9,
+                "mid-array out-of-limit sample is kept"
+            );
+        } else {
+            panic!("expected DoubleArray");
+        }
+    }
+
+    /// Leading out-of-limit samples ARE skipped before compression.
+    #[test]
+    fn ilil_ihil_skips_leading_run() {
+        let mut rec = CompressRecord::new(8, 2);
+        rec.n = 2;
+        rec.ilil = 0.0;
+        rec.ihil = 100.0;
+        // Leading -5, 200 skipped; chunk [10,20] mean=15.
+        rec.push_array(&[-5.0, 200.0, 10.0, 20.0]);
+        assert_eq!(rec.nuse, 1);
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert!((v[0] - 15.0).abs() < 1e-9);
         } else {
             panic!("expected DoubleArray");
         }

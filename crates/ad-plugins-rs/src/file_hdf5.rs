@@ -165,7 +165,8 @@ enum Hdf5Handle {
         primary: Option<rust_hdf5::H5Dataset>,
     },
     Swmr {
-        writer: SwmrFileWriter,
+        // Boxed: `SwmrFileWriter` is much larger than the `Standard` variant.
+        writer: Box<SwmrFileWriter>,
         ds_index: usize,
         /// True only when a compression type was requested but no filter
         /// pipeline could be built for it; false when compression is applied.
@@ -178,6 +179,10 @@ pub struct Hdf5Writer {
     current_path: Option<PathBuf>,
     handle: Option<Hdf5Handle>,
     frame_count: usize,
+    /// Standard-mode frame band: LE bytes of frames buffered until a
+    /// `nFramesChunks`-deep chunk band fills. With one frame per chunk this
+    /// holds at most one frame.
+    frame_band: Vec<Vec<u8>>,
     dataset_name: String,
     /// Cached data type of the open primary dataset.
     open_data_type: Option<NDDataType>,
@@ -242,6 +247,7 @@ impl Hdf5Writer {
             current_path: None,
             handle: None,
             frame_count: 0,
+            frame_band: Vec::new(),
             dataset_name: "data".to_string(),
             open_data_type: None,
             open_frame_dims: None,
@@ -522,16 +528,15 @@ impl Hdf5Writer {
     /// HDF5 attributes (`HDF5_nExtraDims`, `HDF5_extraDimSize0..`,
     /// `HDF5_extraDimName0..`) so the N-dimensional layout is recoverable.
     ///
-    /// The chunk shape is `[1, rc, cc]` for a 2-D frame, where `rc`/`cc` are
-    /// the row/column chunk sizes from `HDF5_nRowChunks` / `HDF5_nColChunks`
-    /// (0, auto, or out-of-range → the full dimension, matching C++
-    /// `NDFileHDF5` chunk-size selection). A frame is written as a grid of
-    /// `write_chunk_at` tiles. `HDF5_nFramesChunks` is NOT applied to the
-    /// chunk frame axis: a partial final multi-frame chunk would over-extend
-    /// the dataset's logical frame count and `rust-hdf5` 0.2.14
-    /// `extend_dataset` refuses to shrink it back — so the frame axis stays
-    /// one frame per chunk. Frames with other than two dimensions are not
-    /// sub-tiled (full per-frame chunk).
+    /// The chunk shape is `[fc, rc, cc]` for a 2-D frame: `fc` frames per
+    /// chunk (`HDF5_nFramesChunks`), and `rc`/`cc` the row/column chunk sizes
+    /// (`HDF5_nRowChunks` / `HDF5_nColChunks`; 0, auto, or out-of-range → the
+    /// full dimension, matching C++ `NDFileHDF5` chunk-size selection). A
+    /// chunk band is written as a grid of `write_chunk_at` tiles; `close_file`
+    /// calls `set_extent` to trim the logical extent to the exact frame count
+    /// (`rust-hdf5` 0.2.15), so a non-dividing chunk size or a partial final
+    /// band never pads the frame shape. With a fixed extra-dim layout the
+    /// frame axis stays one frame per chunk (the extra dims own that axis).
     ///
     /// Returns `(shape, chunk, extra_dim_extent)` where `extra_dim_extent` is
     /// `Some(total_frames)` when extra dims fix the dataset size up front, or
@@ -554,6 +559,13 @@ impl Hdf5Writer {
 
         let ndims = shape.len();
         let mut chunk = vec![1usize; ndims];
+        // Frames per chunk: the extra-dim layout owns the leading axis, so it
+        // stays one frame per chunk; otherwise honor HDF5_nFramesChunks.
+        chunk[0] = if extra_extent.is_some() {
+            1
+        } else {
+            self.chunk.n_frames_chunks.max(1)
+        };
         if frame_dims.len() == 2 {
             // 2-D frame: honor the user row/column chunk sizes.
             let y = frame_dims[0].max(1);
@@ -561,7 +573,7 @@ impl Hdf5Writer {
             chunk[1] = Self::clamp_chunk(self.chunk.n_row_chunks, y, self.chunk.auto);
             chunk[2] = Self::clamp_chunk(self.chunk.n_col_chunks, x, self.chunk.auto);
         } else {
-            // Other rank: one full per-frame chunk (no sub-tiling).
+            // Other rank: one full per-frame tile (no sub-tiling).
             for (i, &d) in frame_dims.iter().enumerate() {
                 chunk[1 + i] = d.max(1);
             }
@@ -571,40 +583,42 @@ impl Hdf5Writer {
 
     /// C++ `NDFileHDF5` chunk-size rule: 0, auto, or a value larger than the
     /// dimension means "chunk the whole dimension"; otherwise the user value.
-    ///
-    /// Additional constraint: the chunk size must divide the dimension evenly.
-    /// `rust-hdf5` 0.2.14 `write_chunk_at` rounds the dataset's logical extent
-    /// up to a whole number of chunks and `extend_dataset` cannot shrink it
-    /// back, so a non-dividing chunk size would pad the frame dimension with
-    /// spurious rows/columns. A non-dividing request falls back to the full
-    /// dimension (one chunk) rather than corrupting the frame shape.
     fn clamp_chunk(requested: usize, dim: usize, auto: bool) -> usize {
-        if auto || requested == 0 || requested > dim || dim % requested != 0 {
+        if auto || requested == 0 || requested > dim {
             dim
         } else {
             requested
         }
     }
 
-    /// Write one frame into the primary dataset at frame index `frame_idx`.
+    /// Write one chunk band (`chunk[0]` consecutive frames) into the primary
+    /// dataset at band index `band_idx`.
     ///
-    /// The frame is split into `ceil(Y/rc) x ceil(X/cc)` chunk tiles, each
-    /// written with `write_chunk_at(&[frame_idx, row_tile, col_tile], ..)`.
-    /// Edge tiles are zero-padded to the full chunk size. When the chunk
-    /// covers the whole frame this is a single `write_chunk_at` call.
-    fn write_frame_chunk(
+    /// The band is split into `ceil(Y/rc) x ceil(X/cc)` chunk tiles, each
+    /// written with `write_chunk_at(&[band_idx, row_tile, col_tile], ..)`.
+    /// Tiles are `[fc, rc, cc]`; edge tiles and a partial final band (fewer
+    /// than `fc` frames) are zero-padded. `close_file`'s `set_extent` trims
+    /// the resulting over-extension back to the exact frame count.
+    fn flush_band(
         ds: &rust_hdf5::H5Dataset,
-        frame_idx: usize,
-        frame_bytes: &[u8],
+        band_idx: usize,
+        frames: &[Vec<u8>],
         frame_dims: &[usize],
         chunk: &[usize],
         elem_size: usize,
     ) -> ADResult<()> {
-        // Non-2-D frame, or chunk == whole frame: one tile.
-        if frame_dims.len() != 2 || (chunk[1] >= frame_dims[0] && chunk[2] >= frame_dims[1]) {
+        let fc = chunk[0];
+        // Non-2-D frame: one chunk per band, frames stacked along the band
+        // axis (a partial band leaves trailing frames zero).
+        if frame_dims.len() != 2 {
+            let frame_len = frame_dims.iter().product::<usize>() * elem_size;
+            let mut buf = vec![0u8; fc * frame_len];
+            for (f, fb) in frames.iter().take(fc).enumerate() {
+                buf[f * frame_len..f * frame_len + frame_len].copy_from_slice(fb);
+            }
             let mut coords = vec![0usize; chunk.len()];
-            coords[0] = frame_idx;
-            return ds.write_chunk_at(&coords, frame_bytes).map_err(|e| {
+            coords[0] = band_idx;
+            return ds.write_chunk_at(&coords, &buf).map_err(|e| {
                 ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
             });
         }
@@ -615,29 +629,75 @@ impl Hdf5Writer {
         let col_tiles = x.div_ceil(cc);
         for ry in 0..row_tiles {
             for cx in 0..col_tiles {
-                let mut tile = vec![0u8; rc * cc * elem_size];
-                for r in 0..rc {
-                    let sy = ry * rc + r;
-                    if sy >= y {
-                        break;
-                    }
-                    for c in 0..cc {
-                        let sx = cx * cc + c;
-                        if sx >= x {
+                let mut tile = vec![0u8; fc * rc * cc * elem_size];
+                for f in 0..fc {
+                    let Some(fb) = frames.get(f) else {
+                        break; // partial band: trailing frames stay zero
+                    };
+                    for r in 0..rc {
+                        let sy = ry * rc + r;
+                        if sy >= y {
                             break;
                         }
-                        let src = (sy * x + sx) * elem_size;
-                        let dst = (r * cc + c) * elem_size;
-                        tile[dst..dst + elem_size]
-                            .copy_from_slice(&frame_bytes[src..src + elem_size]);
+                        for c in 0..cc {
+                            let sx = cx * cc + c;
+                            if sx >= x {
+                                break;
+                            }
+                            let src = (sy * x + sx) * elem_size;
+                            let dst = ((f * rc + r) * cc + c) * elem_size;
+                            tile[dst..dst + elem_size].copy_from_slice(&fb[src..src + elem_size]);
+                        }
                     }
                 }
-                ds.write_chunk_at(&[frame_idx, ry, cx], &tile)
-                    .map_err(|e| {
-                        ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
-                    })?;
+                ds.write_chunk_at(&[band_idx, ry, cx], &tile).map_err(|e| {
+                    ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
+                })?;
             }
         }
+        Ok(())
+    }
+
+    /// Flush any partial frame band and trim the primary dataset's logical
+    /// extent to the exact frame count. Called from `close_file`.
+    fn finalize_standard_primary(&mut self) -> ADResult<()> {
+        let Some(frame_dims) = self.open_frame_dims.clone() else {
+            return Ok(());
+        };
+        let (_, chunk, extra_extent) = self.primary_layout(&frame_dims);
+        let elem_size = self.open_data_type.map(|t| t.element_size()).unwrap_or(1);
+        let total = self.frame_count;
+        let fc = chunk[0];
+        {
+            let ds = match &self.handle {
+                Some(Hdf5Handle::Standard {
+                    primary: Some(ds), ..
+                }) => ds,
+                _ => return Ok(()),
+            };
+            if !self.frame_band.is_empty() {
+                let band_idx = total.saturating_sub(1) / fc;
+                Self::flush_band(
+                    ds,
+                    band_idx,
+                    &self.frame_band,
+                    &frame_dims,
+                    &chunk,
+                    elem_size,
+                )?;
+            }
+            // Trim the logical extent: write_chunk_at rounds dims up to chunk
+            // boundaries; set_extent restores the exact [N, Y, X] (extensible
+            // datasets only — a fixed extra-dim dataset has no over-extension).
+            if extra_extent.is_none() && total > 0 {
+                let mut dims = vec![total];
+                dims.extend_from_slice(&frame_dims);
+                ds.set_extent(&dims).map_err(|e| {
+                    ADError::UnsupportedConversion(format!("HDF5 set_extent error: {}", e))
+                })?;
+            }
+        }
+        self.frame_band.clear();
         Ok(())
     }
 
@@ -648,18 +708,27 @@ impl Hdf5Writer {
 
         let frame_dims: Vec<u64> = array.dims.iter().rev().map(|d| d.size as u64).collect();
 
-        // rust-hdf5 0.2.14 exposes `create_streaming_dataset_compressed`, so
-        // the filter pipeline IS applied to SWMR streaming datasets.
+        // Full chunk geometry, `[fc, rc, cc]`: HDF5_nFramesChunks deep and
+        // the row/column tile sizes. rust-hdf5 0.2.15
+        // `create_streaming_dataset_chunked` band-buffers whole frames and
+        // zero-pads the final partial band at close, keeping the logical
+        // frame count exact.
         let element_size = array.data.data_type().element_size();
         let pipeline = self.build_pipeline(element_size);
+        let chunk: Vec<u64> = {
+            let usize_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
+            let (_, c, _) = self.primary_layout(&usize_dims);
+            c.iter().map(|&v| v as u64).collect()
+        };
 
         macro_rules! create_ds {
             ($t:ty) => {
                 match pipeline.clone() {
                     Some(pl) => swmr
-                        .create_streaming_dataset_compressed::<$t>(
+                        .create_streaming_dataset_chunked_compressed::<$t>(
                             &self.dataset_name,
                             &frame_dims,
+                            &chunk,
                             pl,
                         )
                         .map_err(|e| {
@@ -669,7 +738,11 @@ impl Hdf5Writer {
                             ))
                         }),
                     None => swmr
-                        .create_streaming_dataset::<$t>(&self.dataset_name, &frame_dims)
+                        .create_streaming_dataset_chunked::<$t>(
+                            &self.dataset_name,
+                            &frame_dims,
+                            &chunk,
+                        )
                         .map_err(|e| {
                             ADError::UnsupportedConversion(format!(
                                 "SWMR create dataset error: {}",
@@ -711,7 +784,7 @@ impl Hdf5Writer {
         }
 
         self.handle = Some(Hdf5Handle::Swmr {
-            writer: swmr,
+            writer: Box::new(swmr),
             ds_index,
             compression_dropped,
         });
@@ -843,13 +916,23 @@ impl Hdf5Writer {
         let pipeline = self.build_pipeline(element_size);
         // Max shape: with extra dims the dataset is created at full size, so
         // every axis is fixed (`Some`). Without extra dims the leading frame
-        // axis is extensible (`None`); spatial axes are fixed.
+        // axis is extensible (`None`); spatial axes get headroom to the
+        // chunk-aligned ceiling so a `write_chunk_at` edge tile of a
+        // non-dividing chunk can extend into it — `close_file`'s `set_extent`
+        // trims back to the exact frame shape.
         let max_shape: Vec<Option<usize>> = shape
             .iter()
+            .zip(chunk.iter())
             .enumerate()
-            .map(|(i, &s)| {
-                if i == 0 && extra_extent.is_none() {
-                    None
+            .map(|(i, (&s, &c))| {
+                if i == 0 {
+                    if extra_extent.is_none() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                } else if extra_extent.is_none() {
+                    Some(s.div_ceil(c) * c)
                 } else {
                     Some(s)
                 }
@@ -1063,10 +1146,11 @@ impl Hdf5Writer {
             )));
         }
 
-        let (shape, chunk, _extra) = self.primary_layout(&frame_dims);
+        let (_shape, chunk, _extra) = self.primary_layout(&frame_dims);
         let frame_idx = self.frame_count;
         let extra_extent = self.open_extra_extent;
         let elem_size = array.data.data_type().element_size();
+        let fc = chunk[0];
 
         // With a fixed extra-dim layout, the frame counter must not exceed
         // the product of the extra-dim sizes.
@@ -1079,35 +1163,35 @@ impl Hdf5Writer {
             }
         }
 
-        let ds = match self.handle {
-            Some(Hdf5Handle::Standard {
-                primary: Some(ref ds),
-                ..
-            }) => ds,
-            _ => {
-                return Err(ADError::UnsupportedConversion(
-                    "HDF5 primary dataset not initialised".into(),
-                ));
-            }
-        };
-
-        if extra_extent.is_none() {
-            // No extra dims: extend the leading (frame) dimension per write.
-            let mut new_shape = shape.clone();
-            new_shape[0] = frame_idx + 1;
-            ds.extend(&new_shape)
-                .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 extend error: {}", e)))?;
-        }
-        // With extra dims the dataset is created at full size; frame `frame_idx`
-        // maps row-major onto the extra-dim grid, so the linear chunk index is
-        // the frame counter itself.
-
         // The dataset declares a little-endian element type; serialize the
         // frame to LE explicitly rather than passing host-endian bytes
-        // (see `nd_buffer_to_le_bytes`). `write_chunk` is the only chunked
-        // write path the crate exposes, so a typed write is not possible.
-        let frame_bytes = nd_buffer_to_le_bytes(&array.data);
-        Self::write_frame_chunk(ds, frame_idx, &frame_bytes, &frame_dims, &chunk, elem_size)?;
+        // (see `nd_buffer_to_le_bytes`). Frames accumulate in a band buffer
+        // and a full `fc`-deep band is flushed as a grid of write_chunk_at
+        // tiles; close_file flushes the partial final band.
+        self.frame_band.push(nd_buffer_to_le_bytes(&array.data));
+        if self.frame_band.len() >= fc {
+            let band_idx = frame_idx / fc;
+            let ds = match self.handle {
+                Some(Hdf5Handle::Standard {
+                    primary: Some(ref ds),
+                    ..
+                }) => ds,
+                _ => {
+                    return Err(ADError::UnsupportedConversion(
+                        "HDF5 primary dataset not initialised".into(),
+                    ));
+                }
+            };
+            Self::flush_band(
+                ds,
+                band_idx,
+                &self.frame_band,
+                &frame_dims,
+                &chunk,
+                elem_size,
+            )?;
+            self.frame_band.clear();
+        }
 
         // Append NDAttribute values for this frame.
         if self.store_attributes {
@@ -1384,6 +1468,7 @@ impl NDFileWriter for Hdf5Writer {
     fn open_file(&mut self, path: &Path, mode: NDFileMode, array: &NDArray) -> ADResult<()> {
         self.current_path = Some(path.to_path_buf());
         self.frame_count = 0;
+        self.frame_band.clear();
         self.total_runtime = 0.0;
         self.total_bytes = 0;
         self.swmr_cb_counter = 0;
@@ -1502,8 +1587,10 @@ impl NDFileWriter for Hdf5Writer {
     fn close_file(&mut self) -> ADResult<()> {
         match self.handle {
             Some(Hdf5Handle::Standard { .. }) => {
-                // Emit the accumulated attribute and performance datasets
-                // before the file is finalised.
+                // Flush the partial frame band and trim the logical extent,
+                // then emit the accumulated attribute and performance
+                // datasets before the file is finalised.
+                self.finalize_standard_primary()?;
                 self.flush_attribute_datasets()?;
                 self.flush_performance_dataset()?;
                 self.handle = None;
@@ -2195,27 +2282,81 @@ mod tests {
     }
 
     #[test]
-    fn test_non_dividing_chunk_falls_back_to_full() {
-        // A chunk size that does not divide the frame must fall back to the
-        // full dimension — never pad the dataset shape.
+    fn test_non_dividing_chunk_is_honored_and_extent_trimmed() {
+        // A chunk size that does not divide the frame is honored as-is;
+        // write_chunk_at rounds the extent up, and close_file's set_extent
+        // trims the dataset shape back to the exact [N, Y, X].
         let path = temp_path("hdf5_subchunk_nd");
         let mut writer = Hdf5Writer::new();
         writer.set_chunk_size_auto(false); // honor explicit chunk sizes
-        writer.set_n_row_chunks(3); // Y = 8, 8 % 3 != 0 → full
+        writer.set_n_row_chunks(3); // Y = 8, 8 % 3 != 0 → honored
         writer.set_n_col_chunks(4); // X = 8 → honored
 
-        let arr = NDArray::new(
+        let mut arr = NDArray::new(
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = i as u16;
+            }
+        }
         writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
         writer.write_file(&arr).unwrap();
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
         let ds = h5.dataset("data").unwrap();
-        assert_eq!(ds.shape(), vec![1, 8, 8]);
-        assert_eq!(ds.chunk_dims(), Some(vec![1, 8, 4]));
+        assert_eq!(ds.shape(), vec![2, 8, 8], "extent trimmed, not padded");
+        assert_eq!(ds.chunk_dims(), Some(vec![1, 3, 4]));
+        let raw: Vec<u16> = ds.read_raw().unwrap();
+        assert_eq!(raw.len(), 2 * 64);
+        for i in 0..64usize {
+            assert_eq!(raw[i], i as u16);
+            assert_eq!(raw[64 + i], i as u16);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_n_frames_chunks_band() {
+        // HDF5_nFramesChunks groups frames into a multi-frame chunk band; the
+        // logical frame count stays exact even when the last band is partial.
+        let path = temp_path("hdf5_framechunks");
+        let mut writer = Hdf5Writer::new();
+        writer.set_chunk_size_auto(false);
+        writer.set_n_frames_chunks(2); // 2 frames per chunk band
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        // 5 frames → bands [0,1], [2,3], [4] (partial).
+        for f in 0..5u16 {
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = f * 1000 + i as u16;
+                }
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&arr).unwrap();
+        }
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![5, 4, 4], "exact frame count, no padding");
+        assert_eq!(ds.chunk_dims(), Some(vec![2, 4, 4]));
+        let raw: Vec<u16> = ds.read_raw().unwrap();
+        for f in 0..5u16 {
+            for i in 0..16usize {
+                assert_eq!(raw[f as usize * 16 + i], f * 1000 + i as u16);
+            }
+        }
 
         std::fs::remove_file(&path).ok();
     }

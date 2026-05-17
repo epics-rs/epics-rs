@@ -75,9 +75,12 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
 
         let mut driver = self.driver.lock().unwrap();
 
-        // Check if counting completed
+        // Check if counting completed. C devScalerAsyn.c:292-301
+        // `scaler_done()` is the dset entry the record polls every
+        // process cycle (scalerRecord.c:367); here device support
+        // marks the record done before process() runs.
         if driver.done() {
-            scaler.done_flag = true;
+            scaler.set_done();
         }
 
         // Read all channel counts into the record

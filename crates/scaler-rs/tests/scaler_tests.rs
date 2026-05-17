@@ -22,12 +22,31 @@ fn test_default_values() {
     assert_eq!(rec.freq, 1.0e7);
     assert_eq!(rec.cnt, 0);
     assert_eq!(rec.cont, 0);
-    assert_eq!(rec.tp, 1.0);
+    // scalerRecord.dbd: TP has no `initial` — raw default is 0.0.
+    // The 1.0 default is applied by init_record (scalerRecord.c:320-323).
+    assert_eq!(rec.tp, 0.0);
+    // scalerRecord.dbd: TP1 `initial("1")`.
     assert_eq!(rec.tp1, 1.0);
+    // scalerRecord.dbd: RATE `initial("10")`.
     assert_eq!(rec.rate, 10.0);
     assert_eq!(rec.vers, 3.19);
-    assert_eq!(rec.d[0], 1); // D1 default is "Dn"
-    assert_eq!(rec.d[1], 0); // D2 default is "Up"
+    // scalerRecord.dbd: D1 `initial("1")` (Dn); D2..D64 default 0 (Up).
+    assert_eq!(rec.d[0], 1);
+    assert_eq!(rec.d[1], 0);
+    // scalerRecord.dbd: G1 `initial("1")` (Y); G2..G64 default 0 (N).
+    assert_eq!(rec.g[0], 1);
+    assert_eq!(rec.g[1], 0);
+}
+
+/// init_record applies the both-zero TP/PR1 rule (scalerRecord.c:320-323):
+/// with the dbd default (TP=0, PR1=0) the count time becomes 1.0 s.
+#[test]
+fn test_init_record_applies_default_count_time() {
+    let mut rec = ScalerRecord::default();
+    assert_eq!(rec.tp, 0.0);
+    rec.init_record(1).unwrap();
+    assert_eq!(rec.tp, 1.0);
+    assert_eq!(rec.pr[0], 10_000_000); // 1.0 s * 1e7 Hz
 }
 
 #[test]
@@ -317,6 +336,10 @@ fn test_update_time() {
     assert!((rec.t - 0.5).abs() < 1e-10);
 }
 
+/// C scalerRecord.c:367 — the record learns counting finished from
+/// device support's `done()` (here `done_flag`), NOT by inspecting
+/// presets itself. On a user count completing, process() sets CNT=0,
+/// us=IDLE, ss=IDLE and (scalerRecord.c:475-479) copies VAL = T.
 #[test]
 fn test_val_set_on_completion() {
     let mut rec = ScalerRecord::default();
@@ -325,15 +348,16 @@ fn test_val_set_on_completion() {
     rec.us = 3; // USER COUNTING
     rec.cnt = 1;
     rec.pcnt = 1;
-    rec.s[0] = 10_000_000; // 1 second
+    rec.s[0] = 10_000_000; // 1 second of clock ticks
 
-    // Set up a gated channel that reached preset to trigger "done"
-    rec.g[0] = 1;
-    rec.pr[0] = 10_000_000;
+    // Device support's read() marks counting done before process() runs.
+    rec.set_done();
 
     rec.process().unwrap();
-    // Should detect done and set VAL = T
+    // process() detects done, finishes the user count, sets VAL = T.
     assert_eq!(rec.ss, 0); // IDLE
+    assert_eq!(rec.us, 0); // IDLE
+    assert_eq!(rec.cnt, 0); // user count cleared
     assert!(
         (rec.val - 1.0).abs() < 1e-6,
         "VAL should be ~1.0, got {}",
@@ -542,28 +566,40 @@ fn test_asyn_device_support_clamps_nch() {
 // PR1 / TP conversion consistency
 // ============================================================
 
-/// `tp_to_pr1` (special-driven) and the REQSTART path in `process()` must
-/// agree: both round to the nearest clock tick.
+/// TP -> PR1 conversion rounding differs between code paths in the C
+/// record, and the port must reproduce that exactly:
+///
+/// - `special()` TP handler — scalerRecord.c:672 — truncating cast
+///   `(epicsUInt32)(tp * freq)`.
+/// - `process()` REQSTART path — scalerRecord.c:409-410 — `NINT`
+///   (round-to-nearest).
+///
+/// For `tp * freq` with a fractional part of 0.5 the two paths produce
+/// values that differ by one tick.
 #[test]
-fn test_tp_to_pr1_rounds_consistently() {
+fn test_tp_to_pr1_special_truncates_process_rounds() {
+    // 1.000_000_05 s * 1e7 Hz = 10_000_000.5 ticks.
+    let tp = 1.000_000_05;
+
+    // special() TP — truncating: 10_000_000.5 -> 10_000_000.
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
-    // Choose a TP whose tick count has a non-zero fractional part:
-    // 1.000_000_05 s * 1e7 Hz = 10_000_000.5 ticks -> rounds to 10_000_001.
-    rec.tp = 1.000_000_05;
+    rec.tp = tp;
     rec.special("TP", true).unwrap();
-    let pr1_via_special = rec.pr[0];
-    assert_eq!(pr1_via_special, 10_000_001);
+    assert_eq!(rec.pr[0], 10_000_000, "special() TP must truncate (C:672)");
 
-    // The REQSTART path recomputes expected PR1; it must match.
+    // process() REQSTART — NINT: 10_000_000.5 -> 10_000_001.
     let mut rec2 = ScalerRecord::default();
     rec2.freq = 1e7;
-    rec2.tp = 1.000_000_05;
+    rec2.tp = tp;
     rec2.init_record(1).unwrap();
     rec2.cnt = 1;
     rec2.special("CNT", true).unwrap();
     rec2.process().unwrap();
-    assert_eq!(rec2.pr[0], pr1_via_special);
+    assert_eq!(
+        rec2.pr[0], 10_000_001,
+        "process() REQSTART must round-to-nearest (C:409-410)"
+    );
 }
 
 /// A very large TP must saturate `pr[0]` at `u32::MAX` rather than wrap.
@@ -574,4 +610,167 @@ fn test_tp_to_pr1_saturates_on_large_tp() {
     rec.tp = 1e30; // tp * freq overflows u32 by many orders of magnitude
     rec.special("TP", true).unwrap();
     assert_eq!(rec.pr[0], u32::MAX);
+}
+
+// ============================================================
+// C-parity regression tests (this audit)
+// ============================================================
+
+/// C scalerRecord.c:670-677 — special() TP truncates `tp * freq`
+/// and unconditionally sets D1 = G1 = 1.
+#[test]
+fn test_special_tp_truncates() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    // 1.9 ticks of fractional part: 0.999_999_99 s * 1e7 = 9_999_999.9.
+    rec.tp = 0.999_999_99;
+    rec.special("TP", true).unwrap();
+    assert_eq!(rec.pr[0], 9_999_999, "special() TP must truncate");
+    assert_eq!(rec.d[0], 1);
+    assert_eq!(rec.g[0], 1);
+}
+
+/// C scalerRecord.c has NO special() case for RAT1 — putting RAT1 must
+/// NOT clamp it (only RATE is clamped, scalerRecord.c:690-693).
+#[test]
+fn test_special_rat1_not_clamped() {
+    let mut rec = ScalerRecord::default();
+    rec.rat1 = 100.0;
+    rec.special("RAT1", true).unwrap();
+    assert_eq!(rec.rat1, 100.0, "RAT1 has no special() handler in C");
+}
+
+/// C scalerRecord.c:367 — process() polls device support's done()
+/// every cycle. A done report while the user is counting clears CNT,
+/// returns US/SS to IDLE, and finishes the user count.
+#[test]
+fn test_process_done_detection_unconditional() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.ss = 2; // COUNTING
+    rec.us = 3; // USER_COUNTING
+    rec.cnt = 1;
+    rec.pcnt = 1;
+    rec.set_done();
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 0); // IDLE
+    assert_eq!(rec.us, 0); // IDLE
+    assert_eq!(rec.cnt, 0); // user count cleared (C:371)
+}
+
+/// C scalerRecord.c:369-376 — an auto-count cycle is NOT allowed to
+/// reset CNT. When done() fires during an auto-count (us != COUNTING),
+/// ss returns to IDLE but CNT is untouched.
+#[test]
+fn test_process_done_during_autocount_does_not_clear_cnt() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.ss = 2; // COUNTING
+    rec.us = 0; // IDLE — this is an auto-count, not a user count
+    rec.cnt = 0;
+    rec.set_done();
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 0); // IDLE
+    assert_eq!(rec.cnt, 0); // unchanged
+}
+
+/// C scalerRecord.c:571-575 — while US == WAITING, updateCounts()
+/// forces the displayed scaler values to 0; T is recomputed from S1.
+#[test]
+fn test_process_zeroes_counts_while_waiting() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.dly = 100.0; // long delay so we stay WAITING
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    assert_eq!(rec.us, 1); // WAITING
+
+    // Device support left stale counts in S1..; process() must zero them.
+    rec.s[0] = 12_345;
+    rec.s[3] = 999;
+    rec.process().unwrap();
+    assert_eq!(rec.s[0], 0, "S1 zeroed while WAITING");
+    assert_eq!(rec.s[3], 0, "S4 zeroed while WAITING");
+    assert_eq!(rec.t, 0.0, "T recomputed from zeroed S1");
+}
+
+/// C scalerRecord.c:487-490 — after a user count finishes, the
+/// auto-count hold time is `MAX(dly1, scaler_wait_time)` (>= 10 s),
+/// not the raw DLY1. The record enters SCALER_STATE_WAITING.
+#[test]
+fn test_autocount_uses_long_hold_after_user_count() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1; // AutoCount enabled
+    rec.dly1 = 0.0; // raw auto-delay is zero
+    rec.ss = 2; // COUNTING (a user count in progress)
+    rec.us = 3; // USER_COUNTING
+    rec.cnt = 1;
+    rec.pcnt = 1;
+
+    // User count completes this cycle.
+    rec.set_done();
+    rec.process().unwrap();
+
+    // just_finished_user_count -> dly_sec = MAX(0, 10) = 10 -> WAITING.
+    assert_eq!(
+        rec.ss, 1,
+        "auto-count must wait (SCALER_STATE_WAITING), not start immediately"
+    );
+    assert_eq!(rec.us, 0); // IDLE
+}
+
+/// C scalerRecord.c:485-540 — with CONT set and no delay, auto-count
+/// starts immediately (SCALER_STATE_COUNTING) on an idle process cycle.
+#[test]
+fn test_autocount_starts_immediately_when_no_delay() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1;
+    rec.dly1 = 0.0;
+    rec.tp1 = 1.0;
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "auto-count starts immediately with DLY1=0");
+}
+
+/// C drvScalerSoft.c:303-313 — scalerResetCommand clears all presets.
+#[test]
+fn test_soft_driver_reset_clears_presets() {
+    let mut driver = SoftScalerDriver::new(8);
+    driver.write_preset(0, 1000).unwrap();
+    driver.arm(true).unwrap();
+    driver.reset().unwrap();
+    // After reset the preset is gone, so a count that previously would
+    // have completed no longer triggers done.
+    let shared = driver.shared_counts();
+    {
+        let mut g = shared.lock().unwrap();
+        g[0] = 5000;
+    }
+    driver.arm(true).unwrap();
+    let mut counts = [0u32; MAX_SCALER_CHANNELS];
+    driver.read(&mut counts).unwrap();
+    assert!(!driver.done(), "no preset after reset -> never done");
+}
+
+/// C drvScalerSoft.c:315-329 — scalerArmCommand clears the scaler data
+/// so a stale count cannot make the scaler report done immediately.
+#[test]
+fn test_soft_driver_arm_clears_counts() {
+    let mut driver = SoftScalerDriver::new(8);
+    driver.write_preset(0, 1000).unwrap();
+
+    // A stale count above the preset is sitting in shared state.
+    let shared = driver.shared_counts();
+    {
+        let mut g = shared.lock().unwrap();
+        g[0] = 5000;
+    }
+
+    // Arming must wipe that stale count, so the first read is not "done".
+    driver.arm(true).unwrap();
+    let mut counts = [0u32; MAX_SCALER_CHANNELS];
+    driver.read(&mut counts).unwrap();
+    assert_eq!(counts[0], 0, "arm() cleared the stale count");
+    assert!(!driver.done(), "arm() prevented an immediate done");
 }

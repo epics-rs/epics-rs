@@ -15,13 +15,18 @@ impl PvDatabase {
         let rec = self.get_record(name).await;
 
         if let Some(rec) = rec {
-            let snapshot = {
+            let (snapshot, alarm_posts) = {
                 let mut instance = rec.write().await;
                 instance.process_local()?
             };
             // Notify outside lock
             let instance = rec.read().await;
             instance.notify_from_snapshot(&snapshot);
+            // Post the alarm fields (SEVR/STAT/ACKS) with their
+            // individual C masks — see `process_local` / recGblResetAlarms.
+            for &(field, mask) in &alarm_posts {
+                instance.notify_field(field, mask);
+            }
             Ok(())
         } else {
             Err(CaError::ChannelNotFound(name.to_string()))

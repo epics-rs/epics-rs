@@ -219,6 +219,73 @@ record(epid, "TEST:PID") {
 }
 
 // ============================================================
+// Epid: PID runs when processed through the `process_record`
+// (process_local) path — regression guard for the overloaded
+// `set_device_did_compute` hook.
+//
+// A Soft-Channel epid driven via `db.process_record(...)` (the
+// foreign-call path used by, e.g., QSRV group `proc` members)
+// must still run its built-in `do_pid()`. The `process_local`
+// path used to call `set_device_did_compute(true)` for every
+// soft input, which `epid` reads as "skip the entire PID
+// compute" — so P stayed 0. The fix gates that call on
+// `soft_channel_skips_convert()` (false for epid), exactly as
+// the `processing.rs` link path already does.
+// ============================================================
+
+#[tokio::test]
+async fn test_epid_pid_via_process_record_path() {
+    let db_str = r#"
+record(epid, "TEST:PID2") {
+    field(KP, "2.0")
+    field(KI, "0")
+    field(KD, "0")
+    field(FBON, "1")
+    field(DRVH, "1000")
+    field(DRVL, "-1000")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // Setpoint.
+    server
+        .put("TEST:PID2.VAL", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+
+    // Process twice via the `process_record` (process_local) path —
+    // NOT the PROC-field / process_record_with_links path — with a
+    // gap so dt > 0.
+    db.process_record("TEST:PID2").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    db.process_record("TEST:PID2").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // P = KP * (VAL - CVAL) = 2.0 * (100 - 0) = 200.0.
+    // Before the fix, process_local set device_did_compute=true and
+    // epid skipped do_pid(), leaving P = 0.
+    let p = server.get("TEST:PID2.P").await.unwrap();
+    match p {
+        EpicsValue::Double(v) => {
+            assert!(
+                (v - 200.0).abs() < 1.0,
+                "P should be ~200.0 (do_pid must run on the process_record path), got {}",
+                v
+            );
+        }
+        other => panic!("expected Double, got {:?}", other),
+    }
+}
+
+// ============================================================
 // Timestamp: process produces output
 // ============================================================
 

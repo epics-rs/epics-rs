@@ -574,27 +574,27 @@ fn test_deadband_mdel() {
 
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(3.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(6.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(10.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(12.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 }
 
@@ -606,12 +606,12 @@ fn test_deadband_mdel_zero() {
 
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(0.001)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 }
 
@@ -623,7 +623,7 @@ fn test_deadband_mdel_negative() {
 
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
     assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
 }
 
@@ -709,7 +709,10 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
     // value-change check. This test verifies the C-correct behavior:
     // a genuine SEVR transition posts SEVR and STAT even though the
     // VAL change is smaller than MDEL and is therefore deadband-
-    // filtered out of the same snapshot.
+    // filtered out of the same snapshot. `process_local` returns
+    // SEVR/STAT in `alarm_posts` (each with its own C event mask),
+    // not in the record-wide `changed_fields` snapshot.
+    use epics_base_rs::server::recgbl::EventMask;
     let mut rec = AiRecord::default();
     rec.mdel = 100.0; // VAL change of 1.0 is below the value deadband.
     let mut instance = RecordInstance::new("TEST".into(), rec);
@@ -728,12 +731,33 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
 
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, alarm_posts) = instance.process_local().unwrap();
     // VAL is deadband-filtered (|1.0 - 0.0| < MDEL=100).
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
-    // SEVR / STAT posted because the alarm severity actually changed.
-    assert!(snap.changed_fields.iter().any(|(k, _)| k == "SEVR"));
-    assert!(snap.changed_fields.iter().any(|(k, _)| k == "STAT"));
+    // SEVR / STAT are NOT in the record-wide snapshot — they ride
+    // the per-field `alarm_posts` list instead.
+    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "SEVR"));
+    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "STAT"));
+    // SEVR posted DBE_VALUE on a sevr change.
+    let sevr_mask = alarm_posts
+        .iter()
+        .find(|(f, _)| *f == "SEVR")
+        .map(|(_, m)| *m);
+    assert_eq!(
+        sevr_mask,
+        Some(EventMask::VALUE),
+        "SEVR must post with DBE_VALUE only"
+    );
+    // STAT posted DBE_ALARM (sevr change) | DBE_VALUE (stat change).
+    let stat_mask = alarm_posts
+        .iter()
+        .find(|(f, _)| *f == "STAT")
+        .map(|(_, m)| *m);
+    assert_eq!(
+        stat_mask,
+        Some(EventMask::ALARM | EventMask::VALUE),
+        "STAT must post with DBE_ALARM | DBE_VALUE on a sevr+stat change"
+    );
 }
 
 #[test]
@@ -741,15 +765,18 @@ fn test_no_alarm_change_does_not_post_sevr_stat() {
     // C `recGbl.c:202-207`: when `prev_sevr == new_sevr` and
     // `prev_stat == new_stat`, `recGblResetAlarms` posts neither
     // SEVR nor STAT. A record processed with no alarm transition
-    // must not emit alarm-field monitor events.
+    // must not emit alarm-field monitor events — neither in the
+    // record-wide snapshot nor in the per-field `alarm_posts` list.
     let mut rec = AiRecord::default();
     rec.mdel = 100.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
-    let snap = instance.process_local().unwrap();
+    let (snap, alarm_posts) = instance.process_local().unwrap();
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "SEVR"));
     assert!(!snap.changed_fields.iter().any(|(k, _)| k == "STAT"));
+    assert!(!alarm_posts.iter().any(|(f, _)| *f == "SEVR"));
+    assert!(!alarm_posts.iter().any(|(f, _)| *f == "STAT"));
 }
 
 #[test]

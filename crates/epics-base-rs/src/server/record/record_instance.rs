@@ -1285,7 +1285,22 @@ impl RecordInstance {
 
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
     /// This does NOT handle links — see process_with_context in database.rs.
-    pub fn process_local(&mut self) -> CaResult<ProcessSnapshot> {
+    ///
+    /// Returns the value/log snapshot plus a list of alarm-field posts
+    /// (`SEVR`/`STAT`/`AMSG`/`ACKS`) with their individual C event masks.
+    /// `SEVR` is posted `DBE_VALUE` only; `STAT`/`AMSG` carry `DBE_ALARM`
+    /// (sevr/amsg change) and/or `DBE_VALUE` (stat change). The caller
+    /// must fire these via `notify_field` so a `DBE_VALUE`-only `.SEVR`
+    /// subscriber is not missed on an alarm-only change and a
+    /// `DBE_ALARM`-only subscriber is not wrongly notified — C parity
+    /// with `recGblResetAlarms` (recGbl.c:201-220), matching the
+    /// `processing.rs` link path.
+    pub fn process_local(
+        &mut self,
+    ) -> CaResult<(
+        ProcessSnapshot,
+        Vec<(&'static str, crate::server::recgbl::EventMask)>,
+    )> {
         use crate::server::recgbl::{self, EventMask};
         const LCNT_ALARM_THRESHOLD: i16 = 10;
 
@@ -1298,10 +1313,13 @@ impl RecordInstance {
                 self.common.sevr = AlarmSeverity::Invalid;
                 self.common.stat = recgbl::alarm_status::SCAN_ALARM;
             }
-            return Ok(ProcessSnapshot {
-                changed_fields: Vec::new(),
-                event_mask: EventMask::NONE,
-            });
+            return Ok((
+                ProcessSnapshot {
+                    changed_fields: Vec::new(),
+                    event_mask: EventMask::NONE,
+                },
+                Vec::new(),
+            ));
         }
         self.common.lcnt = 0;
         // RAII guard that resets `self.processing` to false on drop —
@@ -1346,10 +1364,21 @@ impl RecordInstance {
         // is the separate foreign-call path (`db.process_record`) and
         // needs the same skip. "Raw Soft Channel" has a distinct DTYP
         // so it is excluded by `is_soft` and still runs convert.
+        //
+        // Gated on `soft_channel_skips_convert()` — identical to the
+        // `processing.rs` link path — so this only suppresses the
+        // `RVAL → VAL` convert step. `set_device_did_compute` is an
+        // overloaded hook: `ai/bi/mbbi/mbbi_direct` read it as
+        // "skip convert" (override true), but `epid` reads it as
+        // "skip the whole built-in PID compute" (keeps default false).
+        // Without this gate, a Soft-Channel `epid` driven through
+        // `process_local` (`db.process_record`, e.g. QSRV group proc
+        // members) would skip `do_pid()` entirely — the regression
+        // d1032fe5 fixed on the `processing.rs` path only.
         {
             let is_soft = self.common.dtyp.is_empty() || self.common.dtyp == "Soft Channel";
             let is_output = self.record.can_device_write();
-            if is_soft && !is_output {
+            if is_soft && !is_output && self.record.soft_channel_skips_convert() {
                 self.record.set_device_did_compute(true);
             }
         }
@@ -1370,10 +1399,13 @@ impl RecordInstance {
             // Async: PACT stays set, no further processing this cycle
             // Don't clear processing flag (guard won't run — we leak it intentionally)
             std::mem::forget(_guard);
-            return Ok(ProcessSnapshot {
-                changed_fields: Vec::new(),
-                event_mask: EventMask::NONE,
-            });
+            return Ok((
+                ProcessSnapshot {
+                    changed_fields: Vec::new(),
+                    event_mask: EventMask::NONE,
+                },
+                Vec::new(),
+            ));
         }
         if let RecordProcessResult::AsyncPendingNotify(fields) = process_result {
             // Intermediate notification (e.g. DMOV=0 at move start).
@@ -1405,10 +1437,13 @@ impl RecordInstance {
                 EventMask::VALUE | EventMask::ALARM
             };
             // _guard drops here, clearing the processing flag
-            return Ok(ProcessSnapshot {
-                changed_fields,
-                event_mask,
-            });
+            return Ok((
+                ProcessSnapshot {
+                    changed_fields,
+                    event_mask,
+                },
+                Vec::new(),
+            ));
         }
 
         // UDF update before alarm evaluation — C parity (see
@@ -1452,29 +1487,41 @@ impl RecordInstance {
                 changed_fields.push(("VAL".to_string(), val));
             }
         }
-        // C `recGblResetAlarms` posts SEVR ONLY on a sevr change and
-        // STAT only on a stat change — never SEVR on a stat-only
-        // transition. Condition each push on its own field.
-        if self.common.sevr != alarm_result.prev_sevr {
-            changed_fields.push((
-                "SEVR".to_string(),
-                EpicsValue::Short(self.common.sevr as i16),
-            ));
+        // C `recGblResetAlarms` (recGbl.c:201-220) posts each alarm
+        // field with its OWN per-field mask, not one record-wide mask:
+        //   * SEVR — DBE_VALUE, ONLY on a sevr change.
+        //   * STAT — DBE_ALARM (sevr change) | DBE_VALUE (stat change).
+        //   * ACKS — DBE_VALUE, only when an alarm field moved.
+        // Pushing SEVR/STAT into `changed_fields` collapses them onto
+        // the single record-wide `event_mask` (which carries ALARM on
+        // `alarm_changed`): a DBE_VALUE-only `.SEVR` subscriber would
+        // miss a stat-only-driven sevr change, and a DBE_ALARM-only
+        // `.SEVR` subscriber would be wrongly notified. Post them via
+        // `notify_field` with their individual masks instead — exactly
+        // as the `processing.rs` link path does.
+        let sevr_changed = self.common.sevr != alarm_result.prev_sevr;
+        let stat_changed = self.common.stat != alarm_result.prev_stat;
+        let stat_mask = {
+            let mut m = EventMask::NONE;
+            if sevr_changed {
+                m |= EventMask::ALARM;
+            }
+            if stat_changed {
+                m |= EventMask::VALUE;
+            }
+            m
+        };
+        let mut alarm_posts: Vec<(&'static str, EventMask)> = Vec::new();
+        if sevr_changed {
+            alarm_posts.push(("SEVR", EventMask::VALUE));
         }
-        if self.common.stat != alarm_result.prev_stat {
-            changed_fields.push((
-                "STAT".to_string(),
-                EpicsValue::Short(self.common.stat as i16),
-            ));
+        if !stat_mask.is_empty() {
+            alarm_posts.push(("STAT", stat_mask));
         }
-        // C parity (recGbl.c:216): post raised ACKS so sticky-alarm
-        // tracking screens see the update.
-        if alarm_result.acks_changed {
-            changed_fields.push((
-                "ACKS".to_string(),
-                EpicsValue::Short(self.common.acks as i16),
-            ));
-            event_mask |= EventMask::VALUE;
+        // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only when
+        // an alarm field moved (`stat_mask != 0`) AND it was raised.
+        if alarm_result.acks_changed && !stat_mask.is_empty() {
+            alarm_posts.push(("ACKS", EventMask::VALUE));
         }
 
         // Add subscribed fields that actually changed since last notification.
@@ -1500,10 +1547,13 @@ impl RecordInstance {
             event_mask |= EventMask::VALUE;
         }
 
-        Ok(ProcessSnapshot {
-            changed_fields,
-            event_mask,
-        })
+        Ok((
+            ProcessSnapshot {
+                changed_fields,
+                event_mask,
+            },
+            alarm_posts,
+        ))
     }
 
     /// Put a f64 value into a record field, coercing to the field's native type.

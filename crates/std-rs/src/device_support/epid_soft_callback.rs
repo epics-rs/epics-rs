@@ -70,7 +70,23 @@ impl DeviceSupport for EpidSoftCallbackDeviceSupport {
                 LinkType::Ca => {
                     // CA TRIG link: fire the trigger and arrange a
                     // re-process — the PID compute happens on the
-                    // second pass. C sets `pact=TRUE` and returns.
+                    // second pass. C `devEpidSoftCallback.c:143-145`
+                    // sets `pepid->pact = TRUE` and `return(0)`, and
+                    // C `epidRecord.c:207` then returns BEFORE the
+                    // process tail (`checkAlarms` / `monitor` /
+                    // `recGblFwdLink`) — the trigger pass runs NONE of
+                    // the tail.
+                    //
+                    // The Rust framework runs `read()` before
+                    // `process()`, so `read()` cannot itself
+                    // short-circuit the cycle. Mark the record as a
+                    // CA-trigger pass; `EpidRecord::process` consumes
+                    // the flag and returns `ProcessOutcome::
+                    // async_pending()`, so the framework skips the
+                    // alarm/timestamp/snapshot/OUT/FLNK tail this
+                    // cycle. The trigger pass performs NO PID compute,
+                    // so `did_compute` is `false` (the actions below
+                    // are still merged and executed by the framework).
                     let actions = vec![
                         ProcessAction::WriteDbLink {
                             link_field: "TRIG",
@@ -78,8 +94,12 @@ impl DeviceSupport for EpidSoftCallbackDeviceSupport {
                         },
                         ProcessAction::ReprocessAfter(std::time::Duration::from_millis(1)),
                     ];
+                    epid.set_ca_trig_pending();
                     self.triggered = true;
-                    return Ok(DeviceReadOutcome::computed_with(actions));
+                    return Ok(DeviceReadOutcome {
+                        actions,
+                        did_compute: false,
+                    });
                 }
                 LinkType::Db => {
                     // DB TRIG link: the trigger write is C's

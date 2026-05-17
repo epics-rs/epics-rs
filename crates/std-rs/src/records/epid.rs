@@ -226,6 +226,29 @@ pub struct EpidRecord {
     /// supervisory / empty-STPL epid permanently undefined, exactly as
     /// C leaves `udf == TRUE` forever for such a record.
     value_undefined: bool,
+    /// Set by [`crate::device_support::epid_soft_callback::
+    /// EpidSoftCallbackDeviceSupport::read`] on the first (trigger) pass
+    /// of a CA-type TRIG link, cleared by `process()`.
+    ///
+    /// C `devEpidSoftCallback.c:143-145`: a CA TRIG link fires the
+    /// readback trigger asynchronously (`dbCaPutLinkCallback`), sets
+    /// `pepid->pact = TRUE` and `return(0)`. C `epidRecord.c:207`
+    /// `if (!pact && pepid->pact) return(0)` then returns BEFORE
+    /// `recGblGetTimeStamp` / `checkAlarms` / `monitor` /
+    /// `recGblFwdLink` — so the trigger pass runs NONE of the
+    /// process tail; the tail runs exactly once, on the callback
+    /// (reprocess) pass.
+    ///
+    /// The Rust framework runs device support `read()` before
+    /// `process()`; `read()` cannot itself short-circuit the cycle.
+    /// This flag is `read()`'s signal to `process()` that the cycle is
+    /// a CA-trigger pass — `process()` consumes it and returns
+    /// `ProcessOutcome::async_pending()`, which makes the framework
+    /// skip the alarm/timestamp/snapshot/OUT/FLNK tail for this cycle
+    /// (the `read()`-returned `WriteDbLink{TRIG}` + `ReprocessAfter`
+    /// actions are still executed). The reprocess pass runs `do_pid`
+    /// and the tail exactly once.
+    ca_trig_pending: bool,
 }
 
 impl Default for EpidRecord {
@@ -292,6 +315,7 @@ impl Default for EpidRecord {
             // C `epidRecord.c` init: `udf` starts TRUE and is cleared
             // only by the two clear-conditions — see `value_undefined`.
             value_undefined: true,
+            ca_trig_pending: false,
         }
     }
 }
@@ -362,6 +386,19 @@ impl EpidRecord {
         // No alarm — C `aiRecord.c:409` resets LALM to VAL unconditionally.
         self.lalm = val;
         None
+    }
+
+    /// Mark this cycle as a CA-TRIG trigger pass.
+    ///
+    /// Called by [`crate::device_support::epid_soft_callback::
+    /// EpidSoftCallbackDeviceSupport::read`] on the first pass of a
+    /// CA-type TRIG link, before `process()` runs. `process()` consumes
+    /// the flag and returns `ProcessOutcome::async_pending()` so the
+    /// trigger pass skips the process tail (checkAlarms / monitor /
+    /// recGblFwdLink) — C `devEpidSoftCallback.c:143-145` +
+    /// `epidRecord.c:205-210`. See [`EpidRecord::ca_trig_pending`].
+    pub fn set_ca_trig_pending(&mut self) {
+        self.ca_trig_pending = true;
     }
 
     /// Update monitor tracking fields. Returns list of fields that changed.
@@ -643,31 +680,43 @@ impl Record for EpidRecord {
         "epid"
     }
 
-    /// Bumpless-transfer readback — C `devEpidSoft.c:153-158`.
+    /// Bumpless-transfer readback — C `devEpidSoft.c:153-158` (PID) and
+    /// `devEpidSoft.c:178-184` / `devEpidSoftCallback.c:214-220`
+    /// (MaxMin).
     ///
-    /// On the feedback OFF->ON edge (`FBOP==0 && FBON!=0`) in PID mode,
-    /// C seeds the integral term `I` by reading the `OUTL` output
-    /// link's *actual current value* (`dbGetLink(&pepid->outl, ...,
-    /// &i, ...)`), but only when `outl.type != CONSTANT`. The Rust
-    /// framework's `ReadDbLink` pre-process action performs exactly
-    /// that — a synchronous read of a DB link's target value into a
-    /// record field, executed BEFORE `process()` / `do_pid` runs.
+    /// On the feedback OFF->ON edge (`FBOP==0 && FBON!=0`) C seeds the
+    /// turn-on state from the `OUTL` output link's *actual current
+    /// value* via `dbGetLink(&pepid->outl, DBR_DOUBLE, ...)`, guarded by
+    /// `outl.type != CONSTANT`. The seeded field differs by FMOD:
+    ///
+    ///   - PID (`fmod==0`), C `devEpidSoft.c:155`:
+    ///     `dbGetLink(&pepid->outl, DBR_DOUBLE, &i, ...)` — the OUTL
+    ///     readback lands in the integral term `I`.
+    ///   - MaxMin (`fmod==1`), C `devEpidSoft.c:181` /
+    ///     `devEpidSoftCallback.c:217`:
+    ///     `dbGetLink(&pepid->outl, DBR_DOUBLE, &oval, ...)` — the OUTL
+    ///     readback lands in the output value `OVAL`.
+    ///
+    /// The Rust framework's `ReadDbLink` pre-process action performs
+    /// exactly that synchronous read of the DB link's target value into
+    /// a record field, executed BEFORE `process()` / `do_pid` runs.
     ///
     /// `FBOP` still holds the *previous* cycle's `FBON` at this point
-    /// (it is committed to the new value at the end of `do_pid`), so
-    /// the edge is detectable here. The action is emitted only for a
-    /// non-CONSTANT `OUTL` link, mirroring C's `outl.type != CONSTANT`
-    /// guard — for a CONSTANT/empty `OUTL`, `I` keeps its prior value.
+    /// (it is committed at the end of `do_pid`), so the edge is
+    /// detectable here. The action is emitted only for a non-CONSTANT
+    /// `OUTL` link, mirroring C's `outl.type != CONSTANT` guard — for a
+    /// CONSTANT/empty `OUTL` the seeded field keeps its prior value.
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
         let edge = self.fbon != 0 && self.fbop == 0;
-        // Only PID mode (FMOD==0) reads OUTL for bumpless transfer;
-        // MaxMin mode seeds OVAL from itself (devEpidSoft.c:179-182).
-        if edge && self.fmod == 0 {
+        if edge {
+            // PID seeds `I` from OUTL (devEpidSoft.c:153-158);
+            // MaxMin seeds `OVAL` from OUTL (devEpidSoft.c:178-184).
+            let target_field = if self.fmod == 0 { "I" } else { "OVAL" };
             match link_field_type(&self.outl) {
                 LinkType::Db | LinkType::Ca => {
                     return vec![ProcessAction::ReadDbLink {
                         link_field: "OUTL",
-                        target_field: "I",
+                        target_field,
                     }];
                 }
                 _ => {}
@@ -721,6 +770,33 @@ impl Record for EpidRecord {
         // `value_undefined` is recomputed here for the framework's
         // post-process `common.udf = value_is_undefined()`.
         self.compute_skipped = false;
+
+        // CA-TRIG trigger pass — C `devEpidSoftCallback.c:143-145` +
+        // `epidRecord.c:205-210`. `EpidSoftCallbackDeviceSupport::read`
+        // ran first this cycle, saw a CA-type TRIG link, fired the
+        // asynchronous readback trigger (returning `WriteDbLink{TRIG}` +
+        // `ReprocessAfter` actions), and set `ca_trig_pending` — the
+        // analogue of C `do_pid` setting `pepid->pact = TRUE` and
+        // `return(0)`.
+        //
+        // C `epidRecord.c:207` `if (!pact && pepid->pact) return(0)`
+        // then returns BEFORE `recGblGetTimeStamp` / `checkAlarms` /
+        // `monitor` / `recGblFwdLink`: the trigger pass runs NONE of
+        // the process tail. Return `async_pending` so the framework
+        // skips the alarm/timestamp/snapshot/OUT/FLNK tail for this
+        // cycle. The `read()`-returned actions were merged by the
+        // framework and are still executed; the reprocess pass runs
+        // `do_pid` and the tail exactly once.
+        //
+        // `device_did_compute` is cleared here because the trigger pass
+        // performed NO compute — without this reset the reprocess pass
+        // could observe a stale `true`.
+        if self.ca_trig_pending {
+            self.ca_trig_pending = false;
+            self.device_did_compute = false;
+            return Ok(ProcessOutcome::async_pending());
+        }
+
         // C clear-conditions, evaluated at process-start:
         //  - CONSTANT STPL link  → init `recGblInitConstantLink` cleared
         //    udf permanently (`epidRecord.c:160-164`).

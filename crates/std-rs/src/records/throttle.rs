@@ -1,7 +1,9 @@
 use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
+use epics_base_rs::server::record::{
+    FieldDesc, LinkType, ProcessAction, ProcessOutcome, Record, link_field_type,
+};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// Throttle record — rate-limits value changes to prevent device damage.
@@ -66,6 +68,14 @@ pub struct ThrottleRecord {
     last_send_time: Option<Instant>,
     /// Value queued during delay period (sent when delay expires)
     pending_value: Option<f64>,
+    /// Whether the most recent `process()` cycle actually issued an OUT
+    /// write. C `throttleRecord.c:308` has `recGblFwdLink` commented out
+    /// in `process()`; the forward link fires ONLY inside `valuePut`
+    /// (`throttleRecord.c:580`), i.e. only on a cycle where the OUT link
+    /// was written. `should_fire_forward_link` returns this flag so a
+    /// queuing-during-delay cycle or a rejected out-of-range cycle does
+    /// NOT fire FLNK.
+    out_written: bool,
 }
 
 impl Default for ThrottleRecord {
@@ -98,6 +108,7 @@ impl Default for ThrottleRecord {
             delay_active: false,
             last_send_time: None,
             pending_value: None,
+            out_written: false,
         }
     }
 }
@@ -143,12 +154,38 @@ impl ThrottleRecord {
         Ok(val)
     }
 
-    /// Send the value to the output, updating SENT/OSENT and timing.
-    fn send_value(&mut self, value: f64) {
+    /// Send the value to the output — C `throttleRecord.c::valuePut`
+    /// (lines 540-594).
+    ///
+    /// C `valuePut` line 557 branches on the OUT link type:
+    ///   - `if (plink->type != CONSTANT)` — `dbPutLink` is issued and
+    ///     STS is set from its result (`throttleSTS_SUC` on success,
+    ///     `throttleSTS_ERR` on failure), SENT/OSENT advance, the
+    ///     forward link fires (line 580).
+    ///   - `else` (CONSTANT/empty OUT) — no write happens, STS is forced
+    ///     to `throttleSTS_ERR`, SENT/OSENT do NOT advance, no FLNK.
+    ///
+    /// Returns `true` when the caller must emit the `WriteDbLink{OUT}`
+    /// action (a real, non-CONSTANT link). The port cannot observe the
+    /// `dbPutLink` result inline, so a real link is treated optimistically
+    /// as STS=Success — the emitted write either lands or the framework
+    /// raises its own link alarm.
+    fn send_value(&mut self, value: f64) -> bool {
+        if link_field_type(&self.out) == LinkType::Constant
+            || link_field_type(&self.out) == LinkType::Empty
+        {
+            // CONSTANT / empty OUT — C `valuePut` else branch: STS=Error,
+            // SENT/OSENT unchanged, no write, no FLNK.
+            self.sts = 1; // throttleSTS_ERR
+            self.out_written = false;
+            return false;
+        }
         self.osent = self.sent;
         self.sent = value;
         self.last_send_time = Some(Instant::now());
-        self.sts = 2; // Success
+        self.sts = 2; // throttleSTS_SUC
+        self.out_written = true;
+        true
     }
 
     /// Check if the delay period has elapsed since last send.
@@ -313,6 +350,14 @@ impl Record for ThrottleRecord {
         // latest limit-checked `prec->val` at timer-fire time.
         let mut actions = Vec::new();
 
+        // C `throttleRecord.c:308` keeps `recGblFwdLink` commented out in
+        // `process()`; the forward link fires ONLY from `valuePut`'s
+        // non-CONSTANT branch (line 580). Reset the per-cycle FLNK flag
+        // here so a queuing-during-delay cycle, a rejected out-of-range
+        // cycle, or a drain with nothing queued does NOT fire FLNK —
+        // only a real OUT write (via `send_value`) sets it true.
+        self.out_written = false;
+
         // --- Drain path: the post-delay timer callback (C `valuePut()`
         //     reached via `delayFuncCallback`, lines 530-538/540-594) ---
         //
@@ -333,11 +378,14 @@ impl Record for ThrottleRecord {
                 // the delay; send the (already limit-checked) queued
                 // value, set SENT/OSENT/STS, and re-arm the timer.
                 Some(pv) => {
-                    self.send_value(pv);
-                    actions.push(ProcessAction::WriteDbLink {
-                        link_field: "OUT",
-                        value: EpicsValue::Double(self.sent),
-                    });
+                    // C `valuePut`: a CONSTANT/empty OUT yields STS=Error
+                    // and no write; a real link yields the WriteDbLink.
+                    if self.send_value(pv) {
+                        actions.push(ProcessAction::WriteDbLink {
+                            link_field: "OUT",
+                            value: EpicsValue::Double(self.sent),
+                        });
+                    }
                     if self.dly > 0.0 {
                         self.delay_active = true;
                         self.wait = 1;
@@ -407,13 +455,16 @@ impl Record for ThrottleRecord {
         }
 
         // No delay in progress: send immediately (C `enterValue` calls
-        // `valuePut` directly when `!delay_flag`). `valuePut` writes the
-        // OUT link and sets SENT/OSENT and STS=Success.
-        self.send_value(self.val);
-        actions.push(ProcessAction::WriteDbLink {
-            link_field: "OUT",
-            value: EpicsValue::Double(self.sent),
-        });
+        // `valuePut` directly when `!delay_flag`). C `valuePut` writes the
+        // OUT link and sets SENT/OSENT and STS=Success only for a
+        // non-CONSTANT OUT; a CONSTANT/empty OUT yields STS=Error and no
+        // write.
+        if self.send_value(self.val) {
+            actions.push(ProcessAction::WriteDbLink {
+                link_field: "OUT",
+                value: EpicsValue::Double(self.sent),
+            });
+        }
 
         // Arm the delay timer (C `callbackRequestDelayed`, lines 592-593)
         // when DLY > 0. WAIT is True for the duration of the delay: C
@@ -565,6 +616,20 @@ impl Record for ThrottleRecord {
             },
             "DLY" => match value {
                 EpicsValue::Double(v) => {
+                    // C `throttleRecord.c` models the delay with
+                    // `Duration::from_secs_f64(self.dly)` in `process()`,
+                    // which panics on a non-finite argument. C's
+                    // `special()` DLY handler (lines 392-409) only ever
+                    // anticipated a negative delay; a CA put of `+inf`
+                    // or `NaN` is not a value any real delay can
+                    // represent. Reject it at the single writer of
+                    // `self.dly` so the record task can never panic and
+                    // `self.dly` stays finite and >= 0 as an invariant.
+                    if !v.is_finite() {
+                        return Err(CaError::InvalidValue(format!(
+                            "throttle DLY must be finite, got {v}"
+                        )));
+                    }
                     self.dly = v;
                     Ok(())
                 }
@@ -603,6 +668,20 @@ impl Record for ThrottleRecord {
         FIELDS
     }
 
+    /// C `throttleRecord.c:308` keeps `recGblFwdLink(prec)` commented
+    /// out in `process()` — the forward link is fired ONLY from
+    /// `valuePut`'s non-CONSTANT branch (`throttleRecord.c:580`), i.e.
+    /// only on a cycle where a real OUT write actually occurred. The
+    /// framework default fires FLNK every `process()`, which would also
+    /// fire it on a queuing-during-delay cycle, a rejected out-of-range
+    /// cycle, a drain with nothing queued, and a CONSTANT-OUT cycle —
+    /// none of which write OUT in C. `process()` maintains `out_written`
+    /// (reset to false each cycle, set true only by `send_value` on a
+    /// real OUT write); this hook returns it.
+    fn should_fire_forward_link(&self) -> bool {
+        self.out_written
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         // C `init_record` (throttleRecord.c:133-228). Pass 0 copies the
         // VERSION string into VER; the Rust port sets VER in `Default`
@@ -619,6 +698,7 @@ impl Record for ThrottleRecord {
             self.delay_active = false;
             self.last_send_time = None;
             self.pending_value = None;
+            self.out_written = false;
         }
         Ok(())
     }

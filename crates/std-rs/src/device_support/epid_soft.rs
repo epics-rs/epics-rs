@@ -147,8 +147,24 @@ impl EpidSoftDeviceSupport {
                 // MaxMin mode
                 if epid.fbon != 0 {
                     if epid.fbop == 0 {
-                        // Feedback just transitioned OFF -> ON.
-                        // Set output to current value (bumpless).
+                        // Feedback just transitioned OFF -> ON (bumpless
+                        // turn-on). C `devEpidSoft.c:178-184` /
+                        // `devEpidSoftCallback.c:214-220`:
+                        //   if (pepid->outl.type != CONSTANT) {
+                        //       if (dbGetLink(&pepid->outl,DBR_DOUBLE,
+                        //                     &oval,..))
+                        //           recGblSetSevr(...,LINK_ALARM,INVALID);
+                        //   }
+                        // — the output is seeded from the OUTL output
+                        // link's *actual current value*. The framework
+                        // reads OUTL's current value into `OVAL` BEFORE
+                        // this runs via `EpidRecord::pre_process_actions`
+                        // (a `ReadDbLink` on `OUTL` into `OVAL` for the
+                        // FMOD==1 edge). So `epid.oval` already holds the
+                        // read-back value here. When OUTL is
+                        // CONSTANT/empty there is no ReadDbLink and
+                        // `epid.oval` keeps its prior value, matching
+                        // C's `outl.type != CONSTANT` guard.
                         oval = epid.oval;
                     } else {
                         e = cval - pcval;

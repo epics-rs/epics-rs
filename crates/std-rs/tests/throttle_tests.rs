@@ -94,6 +94,9 @@ fn test_unknown_field() {
 fn test_process_sends_value_no_delay() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 0.0; // No delay
+    // C `throttleRecord.c::valuePut` (line 557) only writes — and only
+    // sets STS=Success / advances SENT — for a non-CONSTANT OUT link.
+    rec.out = "OUTPUT:PV".to_string();
     rec.val = 42.0;
     rec.process().unwrap();
     assert_eq!(rec.sent, 42.0);
@@ -105,6 +108,7 @@ fn test_process_sends_value_no_delay() {
 fn test_process_sends_value_with_delay() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 1.0; // 1 second delay
+    rec.out = "OUTPUT:PV".to_string();
     rec.val = 42.0;
     let outcome = rec.process().unwrap();
     assert_eq!(rec.sent, 42.0);
@@ -126,6 +130,7 @@ fn test_process_sends_value_with_delay() {
 fn test_process_queues_during_delay() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 10.0; // Long delay
+    rec.out = "OUTPUT:PV".to_string();
     rec.val = 42.0;
     rec.process().unwrap(); // First value sent, delay starts
     assert_eq!(rec.sent, 42.0);
@@ -162,6 +167,7 @@ fn test_process_updates_oval() {
 fn test_process_osent_tracking() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 0.0;
+    rec.out = "OUTPUT:PV".to_string();
     rec.val = 10.0;
     rec.process().unwrap();
     assert_eq!(rec.sent, 10.0);
@@ -184,6 +190,7 @@ fn test_limit_clipping_on() {
     rec.drvll = 0.0;
     rec.drvlc = 1; // Clipping ON
     rec.dly = 0.0; // No delay for immediate send
+    rec.out = "OUTPUT:PV".to_string();
     rec.init_record(1).unwrap();
 
     rec.val = 150.0;
@@ -200,6 +207,7 @@ fn test_limit_clipping_low() {
     rec.drvll = 10.0;
     rec.drvlc = 1; // Clipping ON
     rec.dly = 0.0;
+    rec.out = "OUTPUT:PV".to_string();
     rec.init_record(1).unwrap();
 
     rec.val = 5.0;
@@ -240,6 +248,7 @@ fn test_no_limits_when_equal() {
     rec.drvlh = 0.0;
     rec.drvll = 0.0; // Equal → limits disabled
     rec.dly = 0.0;
+    rec.out = "OUTPUT:PV".to_string();
     rec.init_record(1).unwrap();
 
     rec.val = 999.0;
@@ -263,6 +272,7 @@ fn test_pending_value_clamped_to_drive_limit_on_drain() {
     rec.drvll = 0.0;
     rec.drvlc = 1; // Clipping ON
     rec.dly = 0.05; // short delay so the drain is observable in-test
+    rec.out = "OUTPUT:PV".to_string();
     rec.init_record(1).unwrap();
 
     // First (in-range) value: sent immediately, delay window opens.
@@ -308,6 +318,7 @@ fn test_pending_value_rejected_on_drain_when_clipping_off() {
     rec.drvll = 0.0;
     rec.drvlc = 0; // Clipping OFF → reject out-of-range
     rec.dly = 0.05;
+    rec.out = "OUTPUT:PV".to_string();
     rec.init_record(1).unwrap();
 
     rec.val = 50.0;
@@ -438,6 +449,7 @@ fn test_limit_clipping_low_bound_order() {
     rec.drvll = 10.0;
     rec.drvlc = 1; // clipping On
     rec.dly = 0.0;
+    rec.out = "OUTPUT:PV".to_string();
     rec.init_record(1).unwrap();
 
     rec.val = -50.0; // below low limit
@@ -475,4 +487,210 @@ fn test_sync_pre_process_actions_and_reset() {
 fn test_can_device_write() {
     let rec = ThrottleRecord::default();
     assert!(rec.can_device_write());
+}
+
+// ============================================================
+// BUG 3 — throttle FLNK fires only on a cycle that wrote OUT.
+//
+// C `throttleRecord.c:308` keeps `recGblFwdLink` commented out in
+// `process()`; the forward link fires ONLY inside `valuePut`'s
+// non-CONSTANT branch (`throttleRecord.c:580`) — i.e. only on a
+// cycle where a real OUT write actually occurred. The throttle
+// overrides `should_fire_forward_link` to report that.
+// ============================================================
+
+#[test]
+fn test_should_fire_forward_link_only_when_out_written() {
+    let mut rec = ThrottleRecord::default();
+    rec.dly = 0.0;
+    rec.out = "OUTPUT:PV".to_string();
+    rec.val = 42.0;
+    rec.process().unwrap();
+    assert!(
+        rec.should_fire_forward_link(),
+        "a cycle that wrote OUT must fire FLNK"
+    );
+}
+
+#[test]
+fn test_no_forward_link_on_queuing_cycle() {
+    let mut rec = ThrottleRecord::default();
+    rec.dly = 10.0; // long delay
+    rec.out = "OUTPUT:PV".to_string();
+    rec.val = 42.0;
+    rec.process().unwrap(); // first value sent — wrote OUT
+    assert!(
+        rec.should_fire_forward_link(),
+        "first send wrote OUT — FLNK fires"
+    );
+
+    // Second value arrives DURING the delay — queued, no OUT write.
+    rec.val = 99.0;
+    rec.process().unwrap();
+    assert!(
+        !rec.should_fire_forward_link(),
+        "a queuing-during-delay cycle writes no OUT — C never fires FLNK \
+         (recGblFwdLink commented out in process(), valuePut not reached)"
+    );
+}
+
+#[test]
+fn test_no_forward_link_on_rejected_cycle() {
+    let mut rec = ThrottleRecord::default();
+    rec.drvlh = 100.0;
+    rec.drvll = 0.0;
+    rec.drvlc = 0; // clipping OFF -> reject out-of-range
+    rec.dly = 0.0;
+    rec.out = "OUTPUT:PV".to_string();
+    rec.init_record(1).unwrap();
+
+    rec.oval = 50.0;
+    rec.val = 150.0; // out of range -> rejected, no OUT write
+    rec.process().unwrap();
+    assert!(
+        !rec.should_fire_forward_link(),
+        "a rejected out-of-range cycle writes no OUT — no FLNK"
+    );
+}
+
+#[test]
+fn test_no_forward_link_on_drain_with_nothing_queued() {
+    let mut rec = ThrottleRecord::default();
+    rec.dly = 0.05;
+    rec.out = "OUTPUT:PV".to_string();
+    rec.val = 10.0;
+    rec.process().unwrap(); // send + arm delay timer
+    assert!(rec.should_fire_forward_link());
+
+    // Drain the delay window with NOTHING queued.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    rec.process().unwrap();
+    assert!(
+        !rec.should_fire_forward_link(),
+        "a drain cycle with nothing queued writes no OUT — no FLNK"
+    );
+}
+
+// ============================================================
+// BUG 4 — throttle STS reflects the OUT link type.
+//
+// C `throttleRecord.c::valuePut` (lines 557-588): a non-CONSTANT
+// OUT link gets `dbPutLink` and STS from its result; a CONSTANT/
+// empty OUT link is NOT written and STS is forced to error.
+// ============================================================
+
+#[test]
+fn test_constant_out_link_reports_error_and_no_write() {
+    let mut rec = ThrottleRecord::default();
+    rec.dly = 0.0;
+    rec.out = "5.0".to_string(); // CONSTANT OUT link
+    rec.val = 42.0;
+    let outcome = rec.process().unwrap();
+
+    assert_eq!(
+        rec.sts, 1,
+        "a CONSTANT OUT link must report STS=Error (C valuePut else branch)"
+    );
+    assert_eq!(
+        rec.sent, 0.0,
+        "a CONSTANT OUT link is never written — SENT must not advance"
+    );
+    let has_write = outcome
+        .actions
+        .iter()
+        .any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
+    assert!(!has_write, "a CONSTANT OUT link emits no WriteDbLink");
+    assert!(
+        !rec.should_fire_forward_link(),
+        "a CONSTANT OUT cycle writes no OUT — no FLNK (C fires FLNK only \
+         in valuePut's non-CONSTANT branch)"
+    );
+}
+
+#[test]
+fn test_empty_out_link_reports_error_and_no_write() {
+    let mut rec = ThrottleRecord::default();
+    rec.dly = 0.0;
+    // OUT left empty (default) — C `valuePut` treats it as non-PV.
+    rec.val = 42.0;
+    let outcome = rec.process().unwrap();
+
+    assert_eq!(rec.sts, 1, "an empty OUT link must report STS=Error");
+    assert_eq!(rec.sent, 0.0, "an empty OUT link is never written");
+    let has_write = outcome
+        .actions
+        .iter()
+        .any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
+    assert!(!has_write, "an empty OUT link emits no WriteDbLink");
+}
+
+#[test]
+fn test_real_out_link_reports_success_and_writes() {
+    let mut rec = ThrottleRecord::default();
+    rec.dly = 0.0;
+    rec.out = "OUTPUT:PV".to_string(); // real DB link
+    rec.val = 42.0;
+    let outcome = rec.process().unwrap();
+
+    assert_eq!(rec.sts, 2, "a real OUT link write reports STS=Success");
+    assert_eq!(rec.sent, 42.0, "a real OUT link advances SENT");
+    let has_write = outcome
+        .actions
+        .iter()
+        .any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
+    assert!(has_write, "a real OUT link emits a WriteDbLink");
+}
+
+// ============================================================
+// BUG 5 — a CA put of DLY = +inf / NaN must not panic the record.
+//
+// `process()` models the delay with `Duration::from_secs_f64`,
+// which panics on a non-finite argument. `put_field` rejects a
+// non-finite DLY so the record task cannot panic.
+// ============================================================
+
+#[test]
+fn test_dly_infinity_rejected() {
+    let mut rec = ThrottleRecord::default();
+    assert!(
+        rec.put_field("DLY", EpicsValue::Double(f64::INFINITY))
+            .is_err(),
+        "a CA put of DLY = +inf must be rejected, not stored"
+    );
+    assert_eq!(rec.dly, 0.0, "DLY must keep its prior finite value");
+}
+
+#[test]
+fn test_dly_neg_infinity_rejected() {
+    let mut rec = ThrottleRecord::default();
+    assert!(
+        rec.put_field("DLY", EpicsValue::Double(f64::NEG_INFINITY))
+            .is_err(),
+        "a CA put of DLY = -inf must be rejected"
+    );
+    assert_eq!(rec.dly, 0.0);
+}
+
+#[test]
+fn test_dly_nan_rejected() {
+    let mut rec = ThrottleRecord::default();
+    assert!(
+        rec.put_field("DLY", EpicsValue::Double(f64::NAN)).is_err(),
+        "a CA put of DLY = NaN must be rejected"
+    );
+    assert_eq!(rec.dly, 0.0);
+}
+
+#[test]
+fn test_dly_infinity_does_not_panic_process() {
+    // Even if a non-finite DLY somehow reached the record, a
+    // subsequent process() must not panic. With the put_field guard,
+    // DLY stays finite, so process() with the rejected-then-unchanged
+    // DLY=0.0 runs cleanly.
+    let mut rec = ThrottleRecord::default();
+    rec.out = "OUTPUT:PV".to_string();
+    let _ = rec.put_field("DLY", EpicsValue::Double(f64::INFINITY));
+    rec.val = 1.0;
+    // Must not panic.
+    rec.process().unwrap();
 }

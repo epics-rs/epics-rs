@@ -1,3 +1,4 @@
+use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServerBuilder;
 use std::collections::HashMap;
@@ -8,15 +9,22 @@ use std::collections::HashMap;
 
 #[tokio::test]
 async fn test_throttle_delayed_reprocess() {
+    // C `throttleRecord.c::valuePut` only sends through a non-CONSTANT
+    // OUT link — the throttle needs a real OUT target.
     let db_str = r#"
+record(ao, "TEST:THR:TGT") {
+    field(VAL, "0")
+}
 record(throttle, "TEST:THR") {
     field(DLY, "0.2")
     field(PREC, "2")
+    field(OUT, "TEST:THR:TGT PP")
 }
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
         .build()
@@ -78,14 +86,23 @@ record(throttle, "TEST:THR") {
 
 #[tokio::test]
 async fn test_throttle_no_delay_immediate() {
+    // C `throttleRecord.c::valuePut` (line 557) only writes — and only
+    // advances SENT / sets STS=Success — for a non-CONSTANT OUT link;
+    // an empty/CONSTANT OUT yields STS=Error and no send. The throttle
+    // therefore needs a real OUT target to send through.
     let db_str = r#"
+record(ao, "TEST:THR2:TGT") {
+    field(VAL, "0")
+}
 record(throttle, "TEST:THR2") {
     field(DLY, "0")
+    field(OUT, "TEST:THR2:TGT PP")
 }
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
         .build()
@@ -116,16 +133,21 @@ record(throttle, "TEST:THR2") {
 #[tokio::test]
 async fn test_throttle_limit_clipping_via_framework() {
     let db_str = r#"
+record(ao, "TEST:THR3:TGT") {
+    field(VAL, "0")
+}
 record(throttle, "TEST:THR3") {
     field(DLY, "0")
     field(DRVLH, "100")
     field(DRVLL, "0")
     field(DRVLC, "1")
+    field(OUT, "TEST:THR3:TGT PP")
 }
 "#;
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
         .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
         .db_string(db_str, &macros)
         .unwrap()
         .build()
@@ -559,4 +581,94 @@ record(timestamp, "TEST:TS") {
         EpicsValue::Long(v) => assert!(v > 0, "RVAL should be positive"),
         other => panic!("expected Long, got {:?}", other),
     }
+}
+
+// ============================================================
+// CRITICAL 1 — a CA-TRIG epid process cycle fires FLNK exactly
+// once, through the framework.
+//
+// C `devEpidSoftCallback.c:143-145` + `epidRecord.c:205-212`: the
+// CA TRIG path sets `pact=TRUE` / `return(0)`, `epidRecord.c:207`
+// returns BEFORE `recGblFwdLink` on the trigger pass, and the
+// reprocess (callback) pass runs `recGblFwdLink` once. So a single
+// CA-TRIG epid cycle must fire its forward link exactly once — NOT
+// twice.
+//
+// Before the fix, the CA-TRIG `read()` returned `computed_with`
+// (result == Complete), so the framework ran the full process tail
+// (including FLNK) on the trigger pass AND again on the reprocess
+// pass — FLNK fired twice.
+//
+// The FLNK target is a self-incrementing calc (`INPA` reads its own
+// VAL, `CALC="A+1"`): each forward-link process bumps VAL by 1, so
+// the final VAL is the exact FLNK fire count.
+// ============================================================
+#[tokio::test]
+async fn test_ca_trig_epid_fires_flnk_exactly_once() {
+    // The CA TRIG link `ca://...` points at a remote PV that does
+    // not exist in-test; the trigger write simply does not land, but
+    // the asynchronous two-pass sequence (trigger pass -> reprocess
+    // pass) still runs — which is exactly what this test exercises.
+    let db_str = r#"
+record(calc, "CTR") {
+    field(INPA, "CTR.VAL")
+    field(CALC, "A+1")
+}
+record(epid, "PID") {
+    field(DTYP, "Epid Async Soft")
+    field(STPL, "100")
+    field(KP, "1.0")
+    field(KI, "0")
+    field(KD, "0")
+    field(FBON, "1")
+    field(DRVH, "1000")
+    field(DRVL, "-1000")
+    field(MDT, "0")
+    field(TRIG, "ca://REMOTE:READBACK")
+    field(TVAL, "42.0")
+    field(FLNK, "CTR")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .register_record_type("calc", || {
+            Box::new(epics_base_rs::server::records::calc::CalcRecord::new("A+1"))
+        })
+        .register_device_support("Epid Async Soft", || {
+            Box::new(
+                std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport::new(),
+            )
+        })
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // Counter starts at 0 — no FLNK has fired yet.
+    assert_eq!(server.get("CTR").await.unwrap(), EpicsValue::Double(0.0));
+
+    // Process the CA-TRIG epid ONCE. This is a single logical cycle:
+    // trigger pass (read() fires the CA trigger, process() returns
+    // AsyncPending) followed by the reprocess pass (~1ms later, runs
+    // the PID and the process tail).
+    db.put_record_field_from_ca("PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    // Wait well past the 1ms ReprocessAfter so the reprocess pass and
+    // its FLNK dispatch have completed.
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+    // The decisive assertion: FLNK fired EXACTLY ONCE for the cycle.
+    // Pre-fix the trigger pass also ran the tail, so CTR would be 2.
+    let count = server.get("CTR").await.unwrap();
+    assert_eq!(
+        count,
+        EpicsValue::Double(1.0),
+        "a single CA-TRIG epid cycle must fire FLNK exactly once \
+         (got {count:?}; 2.0 means the trigger pass wrongly ran the \
+         process tail as well as the reprocess pass)"
+    );
 }

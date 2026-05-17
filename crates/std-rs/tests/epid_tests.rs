@@ -1471,3 +1471,174 @@ fn test_process_with_device_did_compute_ignores_udf_gate() {
         "device-computed pass must not run the built-in PID"
     );
 }
+
+// ============================================================
+// CRITICAL 1 — CA-TRIG epid: the process tail (checkAlarms /
+// monitor / recGblFwdLink) must run EXACTLY ONCE per CA-trigger
+// cycle, on the reprocess pass — NOT on the trigger pass.
+//
+// C `devEpidSoftCallback.c:143-145` sets `pepid->pact = TRUE` and
+// `return(0)` on the CA TRIG path; C `epidRecord.c:207`
+// `if (!pact && pepid->pact) return(0)` then returns BEFORE
+// `recGblGetTimeStamp` / `checkAlarms` / `monitor` /
+// `recGblFwdLink` — so the trigger pass runs NONE of the tail.
+// The reprocess (callback) pass runs the tail once.
+//
+// In the Rust port the framework skips the alarm/timestamp/
+// snapshot/OUT/FLNK tail exactly when `process()` returns
+// `RecordProcessResult::AsyncPending`. The trigger pass must
+// therefore return `AsyncPending`; the reprocess pass must return
+// `Complete` (tail runs once).
+// ============================================================
+use epics_base_rs::server::record::RecordProcessResult;
+
+#[test]
+fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
+    let mut rec = EpidRecord::default();
+    rec.trig = "ca://REMOTE:READBACK".to_string();
+    assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
+    rec.kp = 1.0;
+    rec.fbon = 1;
+    rec.fbop = 1;
+    // A CONSTANT STPL clears UDF (C `epidRecord.c:160-164`) so the
+    // UDF gate does not pre-empt the trigger path — isolate the
+    // CA-TRIG path under test.
+    rec.stpl = "10.0".to_string();
+    let mut udf = true;
+    rec.post_init_finalize_undef(&mut udf).unwrap();
+
+    let mut dev = EpidSoftCallbackDeviceSupport::new();
+
+    // --- Trigger pass: read() fires the CA trigger ---
+    let outcome1 = dev.read(&mut rec).expect("trigger-pass read ok");
+    assert!(
+        outcome1.actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "TRIG",
+                ..
+            }
+        )),
+        "CA TRIG trigger pass must emit a WriteDbLink{{TRIG}}"
+    );
+    assert!(
+        outcome1
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "CA TRIG trigger pass must emit a ReprocessAfter"
+    );
+
+    // The framework hands read()'s did_compute to the record.
+    rec.set_device_did_compute(outcome1.did_compute);
+    let proc1 = rec.process().expect("trigger-pass process ok");
+    assert_eq!(
+        proc1.result,
+        RecordProcessResult::AsyncPending,
+        "CA-TRIG trigger pass: process() MUST return AsyncPending so the \
+         framework skips the checkAlarms / monitor / recGblFwdLink tail \
+         (C epidRecord.c:207 returns before the tail)"
+    );
+
+    // --- Reprocess (callback) pass: read() runs the PID ---
+    let outcome2 = dev.read(&mut rec).expect("reprocess-pass read ok");
+    assert!(
+        outcome2.actions.is_empty(),
+        "reprocess pass must not re-trigger"
+    );
+    rec.set_device_did_compute(outcome2.did_compute);
+    let proc2 = rec.process().expect("reprocess-pass process ok");
+    assert_eq!(
+        proc2.result,
+        RecordProcessResult::Complete,
+        "CA-TRIG reprocess pass: process() MUST return Complete so the \
+         process tail (FLNK / monitors) runs — exactly once for the cycle"
+    );
+}
+
+/// BUG 2 — epid MaxMin bumpless OFF->ON edge must read the OUTL
+/// link into OVAL.
+///
+/// C `devEpidSoft.c:178-184` / `devEpidSoftCallback.c:214-220`: on
+/// the MaxMin (FMOD==1) feedback OFF->ON edge, when `outl.type !=
+/// CONSTANT`, `dbGetLink(&pepid->outl, DBR_DOUBLE, &oval, ...)` —
+/// the OUTL target's current value is read into OVAL (NOT into the
+/// integral term `I`, which is the PID-mode target).
+#[test]
+fn test_maxmin_bumpless_edge_emits_outl_readback_into_oval() {
+    let mut rec = EpidRecord::default();
+    rec.outl = "DAC:REC.VAL".to_string();
+    rec.fmod = 1; // MaxMin mode
+    rec.fbon = 1;
+    rec.fbop = 0; // OFF -> ON edge
+
+    let actions = rec.pre_process_actions();
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::ReadDbLink {
+                link_field: "OUTL",
+                target_field: "OVAL"
+            }
+        )),
+        "MaxMin bumpless OFF->ON edge with a DB OUTL must read OUTL into \
+         OVAL (devEpidSoft.c:181 reads into &oval), got {actions:?}"
+    );
+    // The MaxMin edge must NOT seed the integral term I (that is the
+    // PID-mode target — devEpidSoft.c:155 reads into &i).
+    assert!(
+        !actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::ReadDbLink {
+                target_field: "I",
+                ..
+            }
+        )),
+        "MaxMin edge must NOT read OUTL into I — that is PID-mode only"
+    );
+}
+
+/// BUG 2 — a CONSTANT OUTL link on the MaxMin edge emits no readback:
+/// C only reads OUTL when `outl.type != CONSTANT`
+/// (`devEpidSoft.c:180`).
+#[test]
+fn test_maxmin_bumpless_edge_no_readback_for_constant_outl() {
+    let mut rec = EpidRecord::default();
+    rec.outl = "5.0".to_string(); // CONSTANT link
+    assert_eq!(link_field_type(&rec.outl), LinkType::Constant);
+    rec.fmod = 1; // MaxMin
+    rec.fbon = 1;
+    rec.fbop = 0; // OFF -> ON edge
+
+    assert!(
+        rec.pre_process_actions().is_empty(),
+        "CONSTANT OUTL must not emit a MaxMin bumpless readback"
+    );
+}
+
+/// BUG 2 — the MaxMin edge then uses the read-back OVAL. The
+/// framework's `ReadDbLink{OUTL->OVAL}` has already populated
+/// `epid.oval` by the time `do_pid` runs; `do_pid`'s MaxMin edge
+/// outputs that value (devEpidSoft.c:217 `dbGetLink(...&oval...)`
+/// then the output is set to it).
+#[test]
+fn test_maxmin_bumpless_edge_output_uses_readback_oval() {
+    let mut rec = EpidRecord::default();
+    rec.fmod = 1; // MaxMin
+    rec.fbon = 1;
+    rec.fbop = 0; // OFF -> ON edge
+    rec.kp = 1.0;
+    rec.drvh = 1000.0;
+    rec.drvl = -1000.0;
+    rec.mdt = 0.0;
+    // Simulate the framework having applied ReadDbLink{OUTL->OVAL}:
+    // the OUTL target's current value (7.0) is now in OVAL.
+    rec.oval = 7.0;
+
+    EpidSoftDeviceSupport::do_pid(&mut rec);
+
+    assert_eq!(
+        rec.oval, 7.0,
+        "MaxMin bumpless edge output must be the OUTL read-back value"
+    );
+}

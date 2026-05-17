@@ -441,6 +441,105 @@ impl PvDatabase {
         }
     }
 
+    /// Write a value to an external (`ca://` / `pva://`) OUT link
+    /// through the registered [`LinkSet`].
+    ///
+    /// This is the OUTPUT-side twin of [`Self::resolve_external_pv`]:
+    /// the input side dispatches a `ParsedLink::Ca`/`Pva` read through
+    /// `lset.get_value`, this dispatches a record's OUT-link write
+    /// through `lset.put_value`. Mirrors C `dbLink.c::dbPutLink`
+    /// (dbLink.c:434-448), which routes every link write — DB or CA —
+    /// through `plink->lset->putValue` and raises a link alarm
+    /// (`setLinkAlarm`) on failure.
+    ///
+    /// `name` may be a fully scheme-prefixed string (`pva://X`,
+    /// `ca://X`) or the bare body (the form stored in
+    /// `ParsedLink::Ca`/`Pva` after `record/link.rs` strips the
+    /// scheme). For a bare name every registered lset is tried in
+    /// turn — the first whose `put_value` succeeds wins.
+    ///
+    /// Returns `Ok(())` on a successful remote write, `Err(reason)`
+    /// when no lset is registered for the scheme or the lset rejects
+    /// the write (the caller folds that into a LINK alarm — it must
+    /// never panic).
+    pub(crate) async fn write_external_pv(
+        &self,
+        name: &str,
+        value: EpicsValue,
+    ) -> Result<(), String> {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+            ("pva", rest)
+        } else if let Some(rest) = name.strip_prefix("ca://") {
+            ("ca", rest)
+        } else {
+            // Bare name — try every registered lset in turn, first
+            // accepting write wins (mirrors `resolve_external_pv`'s
+            // bare-name path).
+            let registry = self.inner.link_sets.read().await;
+            let schemes = registry.schemes();
+            if schemes.is_empty() {
+                return Err(format!("no link set registered for external link '{name}'"));
+            }
+            let mut last_err = String::new();
+            for s in schemes {
+                if let Some(lset) = registry.get(&s) {
+                    match lset.put_value(name, value.clone()) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => last_err = e,
+                    }
+                }
+            }
+            return Err(last_err);
+        };
+        let lset = self
+            .inner
+            .link_sets
+            .read()
+            .await
+            .get(scheme)
+            .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
+        lset.put_value(body, value)
+    }
+
+    /// Write a value through a parsed OUT link, dispatching DB links
+    /// to [`Self::write_db_link_value`] and external (`ca://`/`pva://`)
+    /// links to [`Self::write_external_pv`].
+    ///
+    /// This is the OUTPUT-side counterpart of [`Self::read_link_value`]'s
+    /// scheme dispatch: the OUT-link write stage in `processing.rs`
+    /// must route a `ParsedLink::Ca`/`Pva` through the link set, not
+    /// only handle `ParsedLink::Db`. An external link with no
+    /// registered lset fails gracefully — the error is logged and the
+    /// record is left to its alarm state, never a panic.
+    ///
+    /// `Constant`/`Hw`/`Calc`/`None` OUT links are not writable
+    /// targets and are silently skipped (C `dbPutLink` returns
+    /// `S_db_noLSET` for a link with no lset — the same no-op).
+    pub(crate) async fn write_out_link_value(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        value: EpicsValue,
+        src_putf: bool,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) {
+        match link {
+            crate::server::record::ParsedLink::Db(db) => {
+                self.write_db_link_value(db, value, src_putf, visited, depth)
+                    .await;
+            }
+            crate::server::record::ParsedLink::Ca(name)
+            | crate::server::record::ParsedLink::Pva(name) => {
+                if let Err(e) = self.write_external_pv(name, value).await {
+                    eprintln!("OUT-link write to external PV '{name}' failed: {e}");
+                }
+            }
+            // Constant / Hw / Calc / None are not writable OUT-link
+            // targets — no-op (C `dbPutLink` → `S_db_noLSET`).
+            _ => {}
+        }
+    }
+
     /// Read a record String field, defaulting to empty.
     fn field_str(instance: &RecordInstance, field: &str) -> String {
         match instance.record.get_field(field) {
@@ -808,31 +907,58 @@ impl PvDatabase {
                             continue;
                         }
                         let parsed = crate::server::record::parse_link_v2(link_str);
-                        if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                            // C `dfanoutRecord.c:323` drives each OUTn via
-                            // `dbPutLink`, whose `DBF_OUTLINK` target is
-                            // processed by `dbDbPutLink` only when the link
-                            // carries an explicit `PP` modifier
-                            // (`dbDbLink.c:415` — `pvlMask & ln`). The C
-                            // default for an out-link with no modifier is
-                            // NPP: the value is written but the target is
-                            // NOT processed. `parse_link_v2` defaults a
-                            // bare link to `ProcessPassive`, so without
-                            // this correction a bare `OUTn` would re-process
-                            // the target — and a Soft-Channel ai target's
-                            // `convert()` would then clobber the value just
-                            // written. Honour C: process the dfanout OUTn
-                            // target only on an explicit `PP` token.
-                            let explicit_pp = link_has_explicit_pp(link_str);
-                            let mut db = db.clone();
-                            if !explicit_pp
-                                && db.policy
-                                    == crate::server::record::LinkProcessPolicy::ProcessPassive
-                            {
-                                db.policy = crate::server::record::LinkProcessPolicy::NoProcess;
-                            }
-                            self.write_db_link_value(&db, val.clone(), src_putf, visited, depth)
+                        match parsed {
+                            crate::server::record::ParsedLink::Db(ref db) => {
+                                // C `dfanoutRecord.c:323` drives each OUTn
+                                // via `dbPutLink`, whose `DBF_OUTLINK`
+                                // target is processed by `dbDbPutLink`
+                                // only when the link carries an explicit
+                                // `PP` modifier (`dbDbLink.c:415` —
+                                // `pvlMask & ln`). The C default for an
+                                // out-link with no modifier is NPP: the
+                                // value is written but the target is NOT
+                                // processed. `parse_link_v2` defaults a
+                                // bare link to `ProcessPassive`, so
+                                // without this correction a bare `OUTn`
+                                // would re-process the target — and a
+                                // Soft-Channel ai target's `convert()`
+                                // would then clobber the value just
+                                // written. Honour C: process the dfanout
+                                // OUTn target only on an explicit `PP`
+                                // token.
+                                let explicit_pp = link_has_explicit_pp(link_str);
+                                let mut db = db.clone();
+                                if !explicit_pp
+                                    && db.policy
+                                        == crate::server::record::LinkProcessPolicy::ProcessPassive
+                                {
+                                    db.policy = crate::server::record::LinkProcessPolicy::NoProcess;
+                                }
+                                self.write_db_link_value(
+                                    &db,
+                                    val.clone(),
+                                    src_putf,
+                                    visited,
+                                    depth,
+                                )
                                 .await;
+                            }
+                            // External `ca://`/`pva://` OUTn — C
+                            // `dbPutLink` routes a CA-link write through
+                            // the link set's `putValue` identically to a
+                            // DB link (dbLink.c:434-448). PP has no
+                            // meaning for an external write (the remote
+                            // record processes on its own IOC), so route
+                            // straight through the link set.
+                            crate::server::record::ParsedLink::Ca(ref name)
+                            | crate::server::record::ParsedLink::Pva(ref name) => {
+                                if let Err(e) = self.write_external_pv(name, val.clone()).await {
+                                    eprintln!(
+                                        "dfanout OUT-link write to external PV '{name}' failed: {e}"
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -869,11 +995,13 @@ impl PvDatabase {
                         // `parse_output_link_v2` applies that
                         // OUT-link-correct NPP default (the dfanout arm
                         // above open-codes the same downgrade).
+                        // LNKn may be a local DB link or an external
+                        // `ca://`/`pva://` link — C `dbPutLink` routes
+                        // both through the link set's `putValue`
+                        // (dbLink.c:434-448).
                         let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
-                        if let crate::server::record::ParsedLink::Db(ref db) = lnk_parsed {
-                            self.write_db_link_value(db, value, src_putf, visited, depth)
-                                .await;
-                        }
+                        self.write_out_link_value(&lnk_parsed, value, src_putf, visited, depth)
+                            .await;
                     }
                 }
             }
@@ -904,12 +1032,13 @@ impl PvDatabase {
                         // sseq `LNKn` is `DBF_OUTLINK` driven via
                         // `dbPutLink` → `dbDbPutValue` (`dbDbLink.c:388`):
                         // a bare `LNKn` is NPP. `parse_output_link_v2`
-                        // applies the OUT-link-correct NPP default.
+                        // applies the OUT-link-correct NPP default. An
+                        // external `ca://`/`pva://` `LNKn` is routed
+                        // through the link set's `putValue`
+                        // (dbLink.c:434-448).
                         let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
-                        if let crate::server::record::ParsedLink::Db(ref db) = lnk_parsed {
-                            self.write_db_link_value(db, value, src_putf, visited, depth)
-                                .await;
-                        }
+                        self.write_out_link_value(&lnk_parsed, value, src_putf, visited, depth)
+                            .await;
                     }
                 }
             }

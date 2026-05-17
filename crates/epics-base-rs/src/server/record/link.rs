@@ -178,6 +178,23 @@ impl ParsedLink {
     pub fn is_hw(&self) -> bool {
         matches!(self, ParsedLink::Hw(_))
     }
+
+    /// True iff this link is a writable OUT-link target — a local
+    /// `Db` link or an external `Ca`/`Pva` link.
+    ///
+    /// The OUT-link write stage in `processing.rs` uses this to decide
+    /// whether a record's OUT link has a target the value should be
+    /// driven into. `Constant`/`Hw`/`Calc`/`None` are not writable
+    /// targets (C `dbPutLink` returns `S_db_noLSET` for a link with no
+    /// lset). Mirrors C `dbLink.c::dbPutLink` (dbLink.c:434-448), which
+    /// dispatches DB *and* CA link writes uniformly through the link
+    /// set's `putValue`.
+    pub fn is_writable_out_link(&self) -> bool {
+        matches!(
+            self,
+            ParsedLink::Db(_) | ParsedLink::Ca(_) | ParsedLink::Pva(_)
+        )
+    }
 }
 
 /// Try to recognize a JSON-style link option (epics-base PR #86).

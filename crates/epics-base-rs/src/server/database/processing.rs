@@ -1123,17 +1123,14 @@ impl PvDatabase {
             let out_info = if skip_out {
                 None
             } else if !can_dev_write {
-                // Non-output records (calcout, etc.) may still have a soft OUT link.
+                // Non-output records (calcout, etc.) may still have a
+                // soft OUT link (DB or external ca://`/`pva://`).
                 // Write OVAL to OUT when the record says should_output().
-                if record_should_output {
-                    if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out {
-                        let oval = instance.record.get_field("OVAL");
-                        let val = instance.record.val();
-                        let out_val = oval.or(val);
-                        out_val.map(|v| (link.clone(), v))
-                    } else {
-                        None
-                    }
+                if record_should_output && instance.parsed_out.is_writable_out_link() {
+                    let oval = instance.record.get_field("OVAL");
+                    let val = instance.record.val();
+                    let out_val = oval.or(val);
+                    out_val.map(|v| (instance.parsed_out.clone(), v))
                 } else {
                     None
                 }
@@ -1145,13 +1142,12 @@ impl PvDatabase {
                     // condition-not-met cycle silently skip the link
                     // write without disturbing alarms / monitors.
                     None
-                } else if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out
-                {
+                } else if instance.parsed_out.is_writable_out_link() {
                     let out_val = instance
                         .record
                         .get_field("OVAL")
                         .or_else(|| instance.record.val());
-                    out_val.map(|v| (link.clone(), v))
+                    out_val.map(|v| (instance.parsed_out.clone(), v))
                 } else {
                     None
                 }
@@ -1372,9 +1368,14 @@ impl PvDatabase {
         // multi-OUT / FLNK dispatch in this cycle propagates the same bit.
         let src_putf = rec.read().await.common.putf;
 
-        // 4. OUT link
+        // 4. OUT link — DB *or* external `ca://`/`pva://`. C
+        // `dbLink.c::dbPutLink` (dbLink.c:434-448) routes every link
+        // write through the link set's `putValue`, so the OUTPUT side
+        // dispatches by scheme exactly as the INPUT side does (B
+        // `resolve_external_pv`). An external link with no registered
+        // lset fails gracefully inside `write_out_link_value`.
         if let Some((ref link, ref out_val)) = out_info {
-            self.write_db_link_value(link, out_val.clone(), src_putf, visited, depth)
+            self.write_out_link_value(link, out_val.clone(), src_putf, visited, depth)
                 .await;
             // OOPT 7.0.8: latch the record's post-output state so the
             // next cycle's `should_output` sees the right pval.
@@ -1541,17 +1542,18 @@ impl PvDatabase {
                     // `multi_output_links` carries record OUT links
                     // (sseq `LNKn`, scalcout `OUTn` — all `DBF_OUTLINK`)
                     // driven via `dbPutLink` → `dbDbPutValue`
-                    // (`dbDbLink.c:388`): a bare link is NPP, the value
-                    // is written but the target is NOT processed.
+                    // (`dbDbLink.c:388`): a bare DB link is NPP, the
+                    // value is written but the target is NOT processed.
                     // `parse_output_link_v2` applies the
                     // OUT-link-correct NPP default; `parse_link_v2` would
                     // wrongly default a bare link to ProcessPassive and
-                    // re-process the target.
+                    // re-process the target. An external `ca://`/`pva://`
+                    // OUT link is routed through the link set's
+                    // `putValue` (C `dbLink.c::dbPutLink`,
+                    // dbLink.c:434-448).
                     let parsed = crate::server::record::parse_output_link_v2(&link_str);
-                    if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        self.write_db_link_value(db, val, src_putf, visited, depth)
-                            .await;
-                    }
+                    self.write_out_link_value(&parsed, val, src_putf, visited, depth)
+                        .await;
                 }
             }
         }
@@ -1734,12 +1736,17 @@ impl PvDatabase {
                     if link_str.is_empty() {
                         continue;
                     }
-                    // 2. Parse and write to the linked PV
+                    // 2. Parse and write to the linked PV — DB *or*
+                    // external `ca://`/`pva://`. A record's `process()`
+                    // emits `WriteDbLink` to drive an OUT-link field
+                    // (transform `OUTn`, throttle/scaler `COUTP`, epid
+                    // `TRIG`/`OUTL`); that field may resolve to a CA/PVA
+                    // link, which C `dbPutLink` routes through the link
+                    // set's `putValue` identically to a DB link
+                    // (dbLink.c:434-448).
                     let parsed = crate::server::record::parse_link_v2(&link_str);
-                    if let crate::server::record::ParsedLink::Db(ref db_link) = parsed {
-                        self.write_db_link_value(db_link, value, src_putf, visited, depth)
-                            .await;
-                    }
+                    self.write_out_link_value(&parsed, value, src_putf, visited, depth)
+                        .await;
                 }
                 ProcessAction::DeviceCommand { command, ref args } => {
                     let mut instance = rec.write().await;
@@ -2057,26 +2064,23 @@ impl PvDatabase {
                 None
             } else if !can_dev_write {
                 // Non-output records (calcout, etc.) with soft OUT link
-                if record_should_output {
-                    if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out {
-                        let out_val = instance
-                            .record
-                            .get_field("OVAL")
-                            .or_else(|| instance.record.val());
-                        out_val.map(|v| (link.clone(), v))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else if is_soft_out {
-                if let crate::server::record::ParsedLink::Db(ref link) = instance.parsed_out {
+                // (DB or external `ca://`/`pva://`).
+                if record_should_output && instance.parsed_out.is_writable_out_link() {
                     let out_val = instance
                         .record
                         .get_field("OVAL")
                         .or_else(|| instance.record.val());
-                    out_val.map(|v| (link.clone(), v))
+                    out_val.map(|v| (instance.parsed_out.clone(), v))
+                } else {
+                    None
+                }
+            } else if is_soft_out {
+                if instance.parsed_out.is_writable_out_link() {
+                    let out_val = instance
+                        .record
+                        .get_field("OVAL")
+                        .or_else(|| instance.record.val());
+                    out_val.map(|v| (instance.parsed_out.clone(), v))
                 } else {
                     None
                 }
@@ -2117,9 +2121,11 @@ impl PvDatabase {
         // propagate through the (now-completing) OUT / FLNK chain.
         let src_putf = rec.read().await.common.putf;
 
-        // OUT link
+        // OUT link — DB *or* external `ca://`/`pva://`. Same scheme
+        // dispatch as the sync path (C `dbLink.c::dbPutLink`,
+        // dbLink.c:434-448).
         if let Some((link, out_val)) = out_info {
-            self.write_db_link_value(&link, out_val, src_putf, visited, depth)
+            self.write_out_link_value(&link, out_val, src_putf, visited, depth)
                 .await;
         }
 
@@ -2175,14 +2181,14 @@ impl PvDatabase {
                 for (link_str, val) in pairs {
                     // `multi_output_links` carries record OUT links
                     // (sseq `LNKn`, scalcout `OUTn` — all `DBF_OUTLINK`):
-                    // a bare link is NPP (`dbDbLink.c:388`).
+                    // a bare DB link is NPP (`dbDbLink.c:388`).
                     // `parse_output_link_v2` applies the OUT-link-correct
-                    // NPP default — see the sync-path twin above.
+                    // NPP default; an external `ca://`/`pva://` link is
+                    // routed through the link set's `putValue` — see the
+                    // sync-path twin above.
                     let parsed = crate::server::record::parse_output_link_v2(&link_str);
-                    if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        self.write_db_link_value(db, val, src_putf, visited, depth)
-                            .await;
-                    }
+                    self.write_out_link_value(&parsed, val, src_putf, visited, depth)
+                        .await;
                 }
             }
         }

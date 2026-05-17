@@ -60,7 +60,10 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
             .expect("ScalerAsynDeviceSupport requires a ScalerRecord");
 
         let driver = self.driver.lock().unwrap();
-        scaler.nch = driver.num_channels() as i16;
+        // A custom `ScalerDriver` may report any channel count. Clamp to the
+        // physical array bound so the record's fixed 64-element arrays are
+        // never indexed out of range.
+        scaler.nch = driver.num_channels().min(MAX_SCALER_CHANNELS) as i16;
         Ok(())
     }
 

@@ -438,3 +438,140 @@ fn test_scaler_record_factory() {
     let rec = factory();
     assert_eq!(rec.record_type(), "scaler");
 }
+
+// ============================================================
+// BUG 3 regression: nch out of range must not panic
+// ============================================================
+
+/// A driver reporting more channels than the record's fixed array bound.
+/// Device support sets `nch` from `num_channels()`; an unclamped value
+/// would index the 64-element `g`/`pr` arrays out of bounds.
+#[test]
+fn test_count_start_does_not_panic_when_nch_exceeds_max() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    rec.init_record(1).unwrap();
+
+    // A custom driver could report far more channels than the array holds.
+    rec.nch = 200;
+    // Gate channel 0 so the start sequence builds at least one preset action.
+    rec.g[0] = 1;
+
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    // process() calls build_start_actions, which iterates 0..nch and indexes
+    // g[i]/pr[i]. Must not panic with nch > MAX_SCALER_CHANNELS.
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2); // COUNTING — start sequence completed
+}
+
+/// Negative `nch` (i16 wrap) must not produce a huge `usize` loop bound.
+#[test]
+fn test_count_start_does_not_panic_when_nch_negative() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    rec.init_record(1).unwrap();
+
+    rec.nch = -1;
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2); // COUNTING — no panic, loop bound clamped to 0
+}
+
+/// Auto-count start path (`build_autocount_actions`) with an oversized nch.
+#[test]
+fn test_autocount_start_does_not_panic_when_nch_exceeds_max() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 128;
+    rec.g[0] = 1;
+    rec.pr[0] = 1000;
+    // tp1 below the auto-PR1 threshold so the per-channel preset loop runs.
+    rec.tp1 = 0.0;
+    rec.cont = 1; // CONT mode triggers the auto-count path
+
+    rec.process().unwrap();
+    // No panic; build_autocount_actions iterated a clamped channel range.
+}
+
+/// Device support clamps `num_channels()` so `nch` is in range.
+#[test]
+fn test_asyn_device_support_clamps_nch() {
+    use epics_base_rs::server::device_support::DeviceSupport;
+    use scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport;
+
+    struct WideDriver;
+    impl ScalerDriver for WideDriver {
+        fn reset(&mut self) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn arm(&mut self, _start: bool) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn write_preset(
+            &mut self,
+            _channel: usize,
+            _preset: u32,
+        ) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn read(
+            &mut self,
+            _counts: &mut [u32; MAX_SCALER_CHANNELS],
+        ) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn done(&self) -> bool {
+            false
+        }
+        fn num_channels(&self) -> usize {
+            999
+        }
+    }
+
+    let mut support = ScalerAsynDeviceSupport::new(Box::new(WideDriver));
+    let mut rec = ScalerRecord::default();
+    support.init(&mut rec).unwrap();
+    assert_eq!(rec.nch as usize, MAX_SCALER_CHANNELS);
+}
+
+// ============================================================
+// PR1 / TP conversion consistency
+// ============================================================
+
+/// `tp_to_pr1` (special-driven) and the REQSTART path in `process()` must
+/// agree: both round to the nearest clock tick.
+#[test]
+fn test_tp_to_pr1_rounds_consistently() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    // Choose a TP whose tick count has a non-zero fractional part:
+    // 1.000_000_05 s * 1e7 Hz = 10_000_000.5 ticks -> rounds to 10_000_001.
+    rec.tp = 1.000_000_05;
+    rec.special("TP", true).unwrap();
+    let pr1_via_special = rec.pr[0];
+    assert_eq!(pr1_via_special, 10_000_001);
+
+    // The REQSTART path recomputes expected PR1; it must match.
+    let mut rec2 = ScalerRecord::default();
+    rec2.freq = 1e7;
+    rec2.tp = 1.000_000_05;
+    rec2.init_record(1).unwrap();
+    rec2.cnt = 1;
+    rec2.special("CNT", true).unwrap();
+    rec2.process().unwrap();
+    assert_eq!(rec2.pr[0], pr1_via_special);
+}
+
+/// A very large TP must saturate `pr[0]` at `u32::MAX` rather than wrap.
+#[test]
+fn test_tp_to_pr1_saturates_on_large_tp() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1e30; // tp * freq overflows u32 by many orders of magnitude
+    rec.special("TP", true).unwrap();
+    assert_eq!(rec.pr[0], u32::MAX);
+}

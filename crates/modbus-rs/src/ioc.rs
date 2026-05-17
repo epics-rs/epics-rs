@@ -432,6 +432,9 @@ impl PortDriver for ModbusPortDriver {
 
     fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
         let dt = self.datatype_of(user.reason)?;
+        // Reject a negative or out-of-range offset before it is cast to
+        // `usize` in `flush_write` and wraps to a bogus wire address.
+        self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let mut regs = Vec::new();
         for &v in data {
             regs.extend(datatype::write_int32(dt, v).map_err(to_asyn)?);
@@ -441,6 +444,9 @@ impl PortDriver for ModbusPortDriver {
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
         let dt = self.datatype_of(user.reason)?;
+        // Reject a negative or out-of-range offset before it is cast to
+        // `usize` in `flush_write` and wraps to a bogus wire address.
+        self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let mut regs = Vec::new();
         for &v in data {
             regs.extend(datatype::write_float(dt, v).map_err(to_asyn)?);

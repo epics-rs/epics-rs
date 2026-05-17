@@ -28,6 +28,12 @@ pub const WAGO_OFFSET: i32 = 0x200;
 /// Number of UDP retransmits on a read failure before giving up.
 const UDP_MAX_RETRIES: u32 = 5;
 
+/// Maximum number of stale (mismatched-transaction-ID) frames `transact`
+/// will skip before giving up. A peer that keeps sending mismatched-TXID
+/// frames would otherwise loop forever — each `read_frame` succeeds so the
+/// per-read timeout never fires.
+const MAX_STALE_FRAMES: u32 = 32;
+
 /// The Modbus operation a driver port is configured for.
 ///
 /// The `*F23` variants are driver-internal pseudo-codes (C `123` / `223`):
@@ -410,12 +416,23 @@ impl ModbusEngine {
             }
             ReadHoldingRegisters | ReadInputRegisters | ReadInputRegistersF23 => {
                 let payload = resp.read_data()?;
-                let nread = payload.len() / 2;
-                if nread != len {
-                    return Err(ModbusError::FrameTooShort {
-                        got: nread,
-                        need: len,
-                    });
+                // `read_data` truncates to the wire byte count. Registers are
+                // two bytes each, so a valid reply has an even byte count
+                // equal to `len * 2`. An odd byte count is a malformed frame
+                // and must be rejected — `payload.len() / 2` would silently
+                // drop the trailing byte and could still equal `len`.
+                if payload.len() % 2 != 0 {
+                    return Err(ModbusError::MalformedResponse(format!(
+                        "register read byte count {} is odd",
+                        payload.len()
+                    )));
+                }
+                if payload.len() != len * 2 {
+                    return Err(ModbusError::MalformedResponse(format!(
+                        "register read byte count {} does not match expected {} ({len} registers)",
+                        payload.len(),
+                        len * 2,
+                    )));
                 }
                 Ok(payload
                     .chunks_exact(2)
@@ -423,13 +440,10 @@ impl ModbusEngine {
                     .collect())
             }
             ReportSlaveId => {
+                // Slave-ID replies are vendor-defined variable length; the C
+                // driver copies whatever the slave returns. Accept the actual
+                // reply length rather than requiring an exact `len` match.
                 let payload = resp.read_data()?;
-                if payload.len() != len {
-                    return Err(ModbusError::FrameTooShort {
-                        got: payload.len(),
-                        need: len,
-                    });
-                }
                 Ok(payload.iter().map(|&b| b as u16).collect())
             }
             WriteSingleCoil
@@ -518,14 +532,24 @@ impl ModbusEngine {
     ) -> ModbusResult<Vec<u8>> {
         transport.write_frame(framed)?;
         let mut udp_retries = 0u32;
+        let mut stale_frames = 0u32;
         loop {
             match transport.read_frame(READ_TIMEOUT) {
                 Ok(raw) => {
                     let unwrapped = self.framer.unwrap_response(&raw)?;
                     match unwrapped.transaction_id {
                         // TCP/UDP: a stale reply from an earlier request —
-                        // keep reading without retransmitting.
-                        Some(tid) if tid != expected_txid => continue,
+                        // keep reading without retransmitting. Bound the skip
+                        // count so a peer that keeps sending mismatched-TXID
+                        // frames cannot trap us in an unbounded loop (each
+                        // `read_frame` succeeds, so the timeout never fires).
+                        Some(tid) if tid != expected_txid => {
+                            stale_frames += 1;
+                            if stale_frames > MAX_STALE_FRAMES {
+                                return Err(ModbusError::Timeout);
+                            }
+                            continue;
+                        }
                         _ => return Ok(unwrapped.pdu),
                     }
                 }
@@ -936,6 +960,118 @@ mod tests {
         assert!(engine.check_offset(9).is_ok());
         assert!(engine.check_offset(10).is_err());
         assert!(engine.check_offset(-1).is_err());
+    }
+
+    #[test]
+    fn register_read_rejects_odd_byte_count() {
+        // BUG 1 regression: a register-read reply with an odd byte count is
+        // malformed. `payload.len() / 2` would silently drop the trailing
+        // byte and could still equal the requested register count.
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
+        // fcode 0x03, byte_count 3 (odd), three data bytes. 3/2 == 1 == len,
+        // so the old check accepted it.
+        let resp_pdu = [0x01u8, 0x03, 0x03, 0x12, 0x34, 0x56];
+        let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
+        let err = engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ModbusError::MalformedResponse(_)));
+        assert_eq!(engine.stats.io_errors, 1);
+    }
+
+    #[test]
+    fn register_read_rejects_byte_count_mismatch() {
+        // BUG 1 regression: an even byte count that does not equal len * 2
+        // must also be rejected.
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 3),
+            LinkType::Tcp,
+        )
+        .unwrap();
+        // byte_count 4 (two registers) but three registers were requested.
+        let resp_pdu = [0x01u8, 0x03, 0x04, 0x00, 0x0A, 0x00, 0x14];
+        let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
+        let err = engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                3,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ModbusError::MalformedResponse(_)));
+    }
+
+    #[test]
+    fn report_slave_id_accepts_variable_length_reply() {
+        // MINOR fix: ReportSlaveId replies are vendor-defined variable
+        // length; the actual reply length must be accepted, not required to
+        // equal `len`.
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReportSlaveId, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
+        // slave 0x01, fcode 0x11, byte_count 5, five identification bytes.
+        let resp_pdu = [0x01u8, 0x11, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
+        let words = engine
+            .do_modbus_io(&mut transport, ModbusFunctionCode::ReportSlaveId, 0, &[], 1)
+            .unwrap();
+        assert_eq!(words, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+    }
+
+    #[test]
+    fn transact_bounds_stale_tcp_frame_loop() {
+        // BUG 2 regression: a peer that keeps sending mismatched-TXID frames
+        // must not trap `transact` in an unbounded loop. Each `read_frame`
+        // succeeds so the per-read timeout never fires.
+        struct StaleFlood {
+            pdu: Vec<u8>,
+        }
+        impl OctetTransport for StaleFlood {
+            fn write_frame(&mut self, _data: &[u8]) -> ModbusResult<()> {
+                Ok(())
+            }
+            fn read_frame(&mut self, _timeout: Duration) -> ModbusResult<Vec<u8>> {
+                // Always a stale transaction ID (0); the request's ID is 1.
+                let mut frame = crate::protocol::MbapHeader::new(0, self.pdu.len() as u16)
+                    .to_bytes()
+                    .to_vec();
+                frame.extend_from_slice(&self.pdu);
+                Ok(frame)
+            }
+        }
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
+        let mut transport = StaleFlood {
+            pdu: vec![0x01, 0x03, 0x02, 0x12, 0x34],
+        };
+        let err = engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ModbusError::Timeout));
+        assert_eq!(engine.stats.io_errors, 1);
     }
 
     #[test]

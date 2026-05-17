@@ -142,8 +142,38 @@ impl ScalerRecord {
         }
     }
 
+    /// Number of active channels, clamped to the physical array bound.
+    ///
+    /// `nch` is a public record field; device support sets it from a custom
+    /// driver's `num_channels()` with no inherent bound, and a negative
+    /// `i16` would wrap to a huge `usize`. Every `0..nch` loop that indexes
+    /// the fixed 64-element `g`/`pr`/`d`/`s` arrays must go through this so a
+    /// bad `nch` cannot cause an out-of-bounds panic.
+    fn active_channels(&self) -> usize {
+        if self.nch < 0 {
+            0
+        } else {
+            (self.nch as usize).min(MAX_SCALER_CHANNELS)
+        }
+    }
+
+    /// Convert a count preset time (`tp`, seconds) into a clock-tick count
+    /// for channel 1 (`pr[0]`). Rounds to the nearest tick (`+ 0.5`) and
+    /// saturates into the `u32` range so a large `tp` cannot wrap. This is
+    /// the single source of truth for the TP -> PR1 conversion.
+    fn pr1_from_tp(tp: f64, freq: f64) -> u32 {
+        let ticks = tp * freq + 0.5;
+        if ticks <= 0.0 {
+            0
+        } else if ticks >= u32::MAX as f64 {
+            u32::MAX
+        } else {
+            ticks as u32
+        }
+    }
+
     fn tp_to_pr1(&mut self) {
-        self.pr[0] = (self.tp * self.freq) as u32;
+        self.pr[0] = Self::pr1_from_tp(self.tp, self.freq);
         self.d[0] = 1;
         self.g[0] = 1;
     }
@@ -179,7 +209,7 @@ impl ScalerRecord {
         });
 
         // Write presets for gated channels
-        for i in 0..self.nch as usize {
+        for i in 0..self.active_channels() {
             if self.g[i] != 0 {
                 actions.push(ProcessAction::DeviceCommand {
                     command: CMD_WRITE_PRESET,
@@ -216,13 +246,13 @@ impl ScalerRecord {
             args: vec![],
         });
         if self.tp1 >= 1.0e-3 {
-            let auto_pr1 = (self.tp1 * self.freq) as u32;
+            let auto_pr1 = Self::pr1_from_tp(self.tp1, self.freq);
             actions.push(ProcessAction::DeviceCommand {
                 command: CMD_WRITE_PRESET,
                 args: vec![EpicsValue::Long(0), EpicsValue::Long(auto_pr1 as i32)],
             });
         } else {
-            for i in 0..self.nch as usize {
+            for i in 0..self.active_channels() {
                 if self.g[i] != 0 {
                     actions.push(ProcessAction::DeviceCommand {
                         command: CMD_WRITE_PRESET,
@@ -451,7 +481,7 @@ impl Record for ScalerRecord {
 
                 if self.us == USER_STATE_REQSTART {
                     // Ensure PR1 matches TP * FREQ
-                    let expected_pr1 = (self.tp * self.freq + 0.5) as u32;
+                    let expected_pr1 = Self::pr1_from_tp(self.tp, self.freq);
                     if self.pr[0] != expected_pr1 {
                         self.pr[0] = expected_pr1;
                     }
@@ -854,12 +884,12 @@ impl Record for ScalerRecord {
             self.freq = 1.0e7;
         }
         if self.tp > 0.0 {
-            self.pr[0] = (self.tp * self.freq) as u32;
+            self.pr[0] = Self::pr1_from_tp(self.tp, self.freq);
         } else if self.pr[0] > 0 && self.freq > 0.0 {
             self.tp = self.pr[0] as f64 / self.freq;
         } else {
             self.tp = 1.0;
-            self.pr[0] = (self.tp * self.freq) as u32;
+            self.pr[0] = Self::pr1_from_tp(self.tp, self.freq);
         }
         Ok(())
     }

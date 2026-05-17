@@ -100,6 +100,10 @@ pub enum ModbusError {
     #[error("frame too large: {0} bytes exceeds the {max} byte limit", max = crate::protocol::MAX_MODBUS_FRAME_SIZE)]
     FrameTooLarge(usize),
 
+    /// A response frame carried a byte count inconsistent with the request.
+    #[error("malformed response: {0}")]
+    MalformedResponse(String),
+
     /// RTU CRC-16 check failed.
     #[error("RTU CRC check failed")]
     CrcError,

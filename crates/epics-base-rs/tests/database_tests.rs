@@ -2642,6 +2642,66 @@ async fn test_calc_multi_input_npp_does_not_process_source() {
     }
 }
 
+/// Defect 1 regression (CRITICAL): two passive calc records whose
+/// `INPA` PP links point at each other (`A.INPA="B PP"`,
+/// `B.INPA="A PP"`) form a PP-link cycle. Before the fix
+/// `process_passive_db_source` created a FRESH `visited` set and
+/// reset depth to 0 on every PP hop, so neither `MAX_LINK_DEPTH`
+/// nor the `visited` cycle guard fired across the hop — the cycle
+/// recursed unboundedly to a stack overflow / SIGABRT.
+///
+/// C terminates this cycle because `calcRecord.c::process` sets
+/// `prec->pact = TRUE` *before* `fetch_values()` (calcRecord.c:119),
+/// so the re-entrant `dbProcess` hits `if (precord->pact) goto
+/// all_done;` (dbAccess.c:537) and bails after one bounce. The Rust
+/// fix threads the caller's `visited` set / `depth` through the PP
+/// hop so the existing `visited.insert` guard
+/// (`process_record_with_links_inner`) fires instead.
+///
+/// This test passing at all proves the fix: a regression re-aborts
+/// the whole test process with a stack overflow.
+#[tokio::test]
+async fn test_calc_pp_link_cycle_terminates() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+
+    // CALC_A.INPA = "CALC_B PP", CALC_B.INPA = "CALC_A PP".
+    // Both passive, both CALC="A" (copy the input).
+    let mut a = CalcRecord::new("A");
+    a.inpa = "CALC_B PP".to_string();
+    db.add_record("CALC_A", Box::new(a)).await.unwrap();
+
+    let mut b = CalcRecord::new("A");
+    b.inpa = "CALC_A PP".to_string();
+    db.add_record("CALC_B", Box::new(b)).await.unwrap();
+
+    // Must return cleanly (Ok) without overflowing the stack — the
+    // cycle guard terminates the A->B->A bounce.
+    let mut visited = HashSet::new();
+    let result = db
+        .process_record_with_links("CALC_A", &mut visited, 0)
+        .await;
+    assert!(
+        result.is_ok(),
+        "PP-link A<->B cycle must terminate cleanly, got {result:?}"
+    );
+
+    // Both records read a finite value (default 0.0 — neither has a
+    // real source). The point is that processing completed at all.
+    let va = db.get_pv("CALC_A").await.unwrap();
+    let vb = db.get_pv("CALC_B").await.unwrap();
+    match (va, vb) {
+        (EpicsValue::Double(x), EpicsValue::Double(y)) => {
+            assert!(
+                x.is_finite() && y.is_finite(),
+                "cycle must leave finite values, got A={x} B={y}"
+            );
+        }
+        other => panic!("expected Double values, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_calc_constant_inputs() {
     use epics_base_rs::server::records::calc::CalcRecord;
@@ -4102,8 +4162,9 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
         time_source: Some('A'),
     };
     let parsed = ParsedLink::Calc(calc.clone());
+    let mut visited = HashSet::new();
     let value = db
-        .read_link_value_soft(&parsed, true)
+        .read_link_value_soft(&parsed, true, &mut visited, 0)
         .await
         .expect("calc link evaluates");
     match value {

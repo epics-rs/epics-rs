@@ -1271,10 +1271,10 @@ fn test_snapshot_alarm_state() {
 // ---------------------------------------------------------------------------
 
 /// (PR #817) bi record AFTC integration. C `biRecord.c::checkAlarms`
-/// seeds the AFVL accumulator with a UNIT sign (`±1`), not the raw
-/// severity number: `+1` for an alarmed sample, `-1` for NO_ALARM.
-/// On the first (seed) sample `afvl >= 0` so the raw severity passes
-/// through unfiltered.
+/// (biRecord.c:249-263) seeds the AFVL accumulator with the RAW
+/// severity number — `afvl = (double) alarm;` (biRecord.c:252) — NOT
+/// a unit sign. On the first (seed) sample `alarm` is left unchanged
+/// so the raw severity passes through `recGblSetSevr` verbatim.
 #[test]
 fn test_bi_aftc_seeds_afvl_on_initial_sample() {
     let mut rec = BiRecord::new(0); // val=0 → ZSV path
@@ -1291,33 +1291,36 @@ fn test_bi_aftc_seeds_afvl_on_initial_sample() {
     inst.evaluate_alarms();
     epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
 
-    // Initial sample: alarm passes through unfiltered (seed afvl=+1 >= 0).
+    // Initial sample: C `biRecord.c:251-252` `if (afvl == 0) afvl =
+    // (double) alarm;` leaves `alarm` unchanged → raw severity passes
+    // through.
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Major,
         "initial AFTC sample must pass raw severity through"
     );
-    // AFVL is seeded with the unit sign +1.0 (alarmed sample), NOT the
-    // raw severity number — C `alarm==NO_ALARM ? -1 : 1`.
+    // C `biRecord.c:252` — AFVL is seeded with the RAW severity number
+    // (2.0 for MAJOR), NOT a unit sign.
     let afvl = inst
         .record
         .get_field("AFVL")
         .and_then(|v| v.to_f64())
         .expect("AFVL readable");
     assert!(
-        (afvl - 1.0).abs() < 1e-9,
-        "AFVL seed must be the unit sign +1.0 for an alarmed sample, got {afvl}"
+        (afvl - 2.0).abs() < 1e-9,
+        "AFVL seed must be the raw severity 2.0 for a MAJOR sample, got {afvl}"
     );
 }
 
-/// (Defect 4) The AFTC filter must SUPPRESS a momentary alarm: after a
-/// long NO_ALARM history the accumulator sits near -1; a single
-/// alarmed sample only nudges it slightly and it stays negative, so
-/// `checkAlarms` reports NO_ALARM until the signal has been in the
-/// alarm range for ~AFTC seconds. This pins the signed `±1`
-/// accumulator and the `afvl < 0 → suppress` gate.
+/// (PR #817) The AFTC filter delays the CLEARING of an alarm. C
+/// `biRecord.c::checkAlarms` (biRecord.c:249-263): once AFVL holds a
+/// non-zero severity, a NO_ALARM sample decays it by
+/// `afvl = alpha*afvl + (1-alpha)*0` and the fold-back
+/// `if (afvl - floor(afvl) > THRESHOLD) afvl = -afvl;` keeps
+/// `abs(floor(afvl))` reporting the prior MAJOR until enough
+/// NO_ALARM time has elapsed. A sustained MAJOR holds AFVL at 2.0.
 #[test]
-fn test_bi_aftc_suppresses_momentary_alarm() {
+fn test_bi_aftc_delays_alarm_clear() {
     use std::time::Duration;
 
     // Direct unit test of the filter primitive across cycles.
@@ -1325,47 +1328,58 @@ fn test_bi_aftc_suppresses_momentary_alarm() {
     let aftc = 10.0;
     let t0 = std::time::SystemTime::UNIX_EPOCH;
 
-    // Cycle 1: seed with a NO_ALARM sample → afvl = -1, alarm 0.
-    let (a1, afvl1) = aftc_filter(0, aftc, 0.0, t0, t0);
-    assert_eq!(a1, 0, "NO_ALARM seed must report NO_ALARM");
+    // Cycle 1: seed with a MAJOR sample. C `biRecord.c:251-252`
+    // `if (afvl == 0) afvl = (double) alarm;` → afvl = 2.0, alarm = 2.
+    let (a1, afvl1) = aftc_filter(2, aftc, 0.0, t0, t0);
+    assert_eq!(a1, 2, "MAJOR seed must report the raw MAJOR severity");
     assert!(
-        (afvl1 + 1.0).abs() < 1e-9,
-        "NO_ALARM seed must set afvl=-1, got {afvl1}"
+        (afvl1 - 2.0).abs() < 1e-9,
+        "MAJOR seed must set afvl=2.0 (raw severity), got {afvl1}"
     );
 
-    // Cycle 2: a single MAJOR (sev=2) sample 1s later. With aftc=10
-    // the accumulator only moves ~0.18 toward +1, staying negative —
-    // so the momentary alarm is SUPPRESSED (reported NO_ALARM).
+    // Cycle 2: a single NO_ALARM sample 1s later. C
+    // `biRecord.c:255-262`: alpha = 10/(1+10) ≈ 0.909,
+    // afvl = 0.909*2 + 0.0 ≈ 1.818; fractional part 0.818 > 0.6321
+    // → afvl = -1.818; alarm = abs(floor(-1.818)) = abs(-2) = 2.
+    // The momentary clear is FILTERED — still reports MAJOR.
     let t1 = t0 + Duration::from_secs(1);
-    let (a2, afvl2) = aftc_filter(2, aftc, afvl1, t0, t1);
+    let (a2, afvl2) = aftc_filter(0, aftc, afvl1, t0, t1);
     assert!(
-        afvl2 < 0.0,
-        "one momentary alarm sample must leave afvl negative, got {afvl2}"
+        (afvl2 - (-1.0 * (10.0 / 11.0) * 2.0)).abs() < 1e-9,
+        "one NO_ALARM sample must fold afvl to -1.818..., got {afvl2}"
     );
     assert_eq!(
-        a2, 0,
-        "momentary alarm must be SUPPRESSED while afvl<0 (reported NO_ALARM)"
+        a2, 2,
+        "a momentary alarm-clear must be FILTERED (still reports MAJOR)"
     );
 
-    // Sustained alarm: feed MAJOR repeatedly until afvl crosses >= 0,
-    // then the raw severity is reported verbatim.
+    // Sustained NO_ALARM: feed NO_ALARM repeatedly until the reported
+    // severity finally drops to 0.
     let mut afvl = afvl2;
     let mut t = t1;
-    let mut reported = 0u16;
-    for _ in 0..200 {
+    let mut reported = 2u16;
+    for _ in 0..400 {
         let prev = t;
         t += Duration::from_secs(1);
-        let (a, v) = aftc_filter(2, aftc, afvl, prev, t);
+        let (a, v) = aftc_filter(0, aftc, afvl, prev, t);
         afvl = v;
         reported = a;
-        if reported != 0 {
+        if reported == 0 {
             break;
         }
     }
-    assert!(afvl >= 0.0, "sustained alarm must drive afvl non-negative");
     assert_eq!(
-        reported, 2,
-        "after sustained alarm the raw MAJOR severity passes through"
+        reported, 0,
+        "after sustained NO_ALARM the filter eventually clears the alarm"
+    );
+
+    // A sustained MAJOR holds the accumulator at 2.0 — C smoothing
+    // `afvl = alpha*2 + (1-alpha)*2 = 2` is a fixed point.
+    let (a3, afvl3) = aftc_filter(2, aftc, 2.0, t0, t1);
+    assert_eq!(a3, 2, "sustained MAJOR keeps reporting MAJOR");
+    assert!(
+        (afvl3 - 2.0).abs() < 1e-9,
+        "sustained MAJOR holds afvl at the fixed point 2.0, got {afvl3}"
     );
 }
 

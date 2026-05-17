@@ -286,35 +286,45 @@ fn sel_median_empty_yields_undefined() {
     assert!(rec.value_is_undefined());
 }
 
-// --- Defect 5: sel High/Low with no valid inputs → NaN / undefined ---
+// --- sel High/Low with no valid inputs → ±inf, UDF clear (C parity) ---
 
 #[test]
-fn sel_high_empty_yields_undefined() {
+fn sel_high_empty_yields_neg_inf_udf_clear() {
     let mut rec = SelRecord::default();
     rec.selm = 1; // High
-    // All inputs default to NaN — the NEG_INFINITY seed must not leak
-    // into VAL. value_is_undefined() checks is_nan(), which does not
-    // catch -inf, so an all-NaN High selection must produce NaN.
+    // C `selRecord.c:362` seeds `val = -epicsINF`; when every input is
+    // NaN the loop never updates `val`, so `prec->val = val` assigns
+    // -inf. `prec->udf = isnan(prec->val)` (selRecord.c:402) — and
+    // `isnan(-inf)` is FALSE — so UDF stays CLEAR. (Contrast SELM=3
+    // Median, whose `order[0] = epicsNAN` seed genuinely yields NaN.)
     rec.process().unwrap();
     assert!(
-        rec.val.is_nan(),
-        "all-NaN High selection must yield NaN VAL, got {}",
+        rec.val == f64::NEG_INFINITY,
+        "all-NaN High selection must yield VAL = -inf (C selRecord.c:362), got {}",
         rec.val
     );
-    assert!(rec.value_is_undefined());
+    assert!(
+        !rec.value_is_undefined(),
+        "all-NaN High: isnan(-inf) is FALSE so UDF must stay clear"
+    );
 }
 
 #[test]
-fn sel_low_empty_yields_undefined() {
+fn sel_low_empty_yields_pos_inf_udf_clear() {
     let mut rec = SelRecord::default();
     rec.selm = 2; // Low
+    // C `selRecord.c:371` seeds `val = epicsINF`; an all-NaN Low
+    // selection leaves VAL = +inf with UDF CLEAR (isnan(+inf) FALSE).
     rec.process().unwrap();
     assert!(
-        rec.val.is_nan(),
-        "all-NaN Low selection must yield NaN VAL, got {}",
+        rec.val == f64::INFINITY,
+        "all-NaN Low selection must yield VAL = +inf (C selRecord.c:371), got {}",
         rec.val
     );
-    assert!(rec.value_is_undefined());
+    assert!(
+        !rec.value_is_undefined(),
+        "all-NaN Low: isnan(+inf) is FALSE so UDF must stay clear"
+    );
 }
 
 // --- M-2: sel limit alarms ---

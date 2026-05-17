@@ -429,7 +429,9 @@ impl PvDatabase {
         };
 
         // Read INP value
-        let inp_value = self.read_link_value_soft(&inp_parsed, is_soft).await;
+        let inp_value = self
+            .read_link_value_soft(&inp_parsed, is_soft, visited, depth)
+            .await;
 
         // epics-base PR #d0cf47c: single-INP MS-class link must also
         // propagate the source record's STAT/SEVR/AMSG just like the
@@ -471,7 +473,7 @@ impl PvDatabase {
 
         // Read DOL value
         let dol_value = if let Some((ref dol_parsed, _oif)) = dol_info {
-            self.read_link_value(dol_parsed).await
+            self.read_link_value(dol_parsed, visited, depth).await
         } else {
             None
         };
@@ -518,7 +520,7 @@ impl PvDatabase {
                     // path. Without this, calc/sel/sub/aSub INPA..INPL
                     // PP links read a stale source value.
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        self.process_passive_db_source(db).await;
+                        self.process_passive_db_source(db, visited, depth).await;
                     }
                     let (value, alarm) = self.read_link_with_alarm(&parsed).await;
                     if let Some(value) = value {
@@ -572,7 +574,7 @@ impl PvDatabase {
                 if !nvl_str.is_empty() {
                     drop(instance); // release read lock before async read
                     let parsed = crate::server::record::parse_link_v2(&nvl_str);
-                    self.read_link_value(&parsed).await
+                    self.read_link_value(&parsed, visited, depth).await
                 } else {
                     None
                 }
@@ -731,7 +733,7 @@ impl PvDatabase {
             if !pre_actions.is_empty() {
                 let rec_name = instance.name.clone();
                 drop(instance);
-                self.execute_read_db_links(&rec_name, &rec, &pre_actions)
+                self.execute_read_db_links(&rec_name, &rec, &pre_actions, visited, depth)
                     .await;
                 instance = rec.write().await;
             }
@@ -1406,6 +1408,8 @@ impl PvDatabase {
         _record_name: &str,
         rec: &Arc<crate::runtime::sync::RwLock<RecordInstance>>,
         actions: &[crate::server::record::ProcessAction],
+        visited: &mut HashSet<String>,
+        depth: usize,
     ) {
         use crate::server::record::ProcessAction;
         for action in actions {
@@ -1432,7 +1436,7 @@ impl PvDatabase {
                     continue;
                 }
                 let parsed = crate::server::record::parse_link_v2(&link_str);
-                if let Some(value) = self.read_link_value(&parsed).await {
+                if let Some(value) = self.read_link_value(&parsed, visited, depth).await {
                     let mut instance = rec.write().await;
                     let _ = instance.record.put_field_internal(target_field, value);
                 }
@@ -1483,7 +1487,7 @@ impl PvDatabase {
                     }
                     // 2. Parse and read the linked PV
                     let parsed = crate::server::record::parse_link_v2(&link_str);
-                    if let Some(value) = self.read_link_value(&parsed).await {
+                    if let Some(value) = self.read_link_value(&parsed, visited, depth).await {
                         // 3. Write into the record field (internal put bypasses read-only)
                         let mut instance = rec.write().await;
                         let _ = instance.record.put_field_internal(target_field, value);

@@ -86,9 +86,16 @@ fn link_has_explicit_pp(raw: &str) -> bool {
 
 impl PvDatabase {
     /// Read a value from a parsed link (DB, Constant, or external Ca/Pva).
+    ///
+    /// `visited` / `depth` are the caller's processing-chain state so a
+    /// PP source is processed within the same chain — see
+    /// [`Self::process_passive_db_source`] for why a fresh set / depth 0
+    /// would defeat the cycle guard.
     pub(crate) async fn read_link_value(
         &self,
         link: &crate::server::record::ParsedLink,
+        visited: &mut HashSet<String>,
+        depth: usize,
     ) -> Option<EpicsValue> {
         match link {
             crate::server::record::ParsedLink::None => None,
@@ -96,19 +103,11 @@ impl PvDatabase {
             | crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => {
-                // PP: process source record if Passive before reading
-                if db.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
-                    if let Some(src) = self.get_record(&db.record).await {
-                        let is_passive = src.read().await.common.scan
-                            == crate::server::record::ScanType::Passive;
-                        if is_passive {
-                            let mut visited = std::collections::HashSet::new();
-                            let _ = self
-                                .process_record_with_links(&db.record, &mut visited, 0)
-                                .await;
-                        }
-                    }
-                }
+                // PP: process source record if Passive before reading.
+                // Threads the caller's `visited`/`depth` so an A↔B PP
+                // cycle terminates at the existing cycle guard instead
+                // of recursing with a fresh set.
+                self.process_passive_db_source(db, visited, depth).await;
                 let pv_name = if db.field == "VAL" {
                     db.record.clone()
                 } else {
@@ -277,7 +276,28 @@ impl PvDatabase {
     /// Shared by `read_link_value_soft` (single-INP path) and the
     /// multi-input fetch loop (`INPA..INPL` for calc/sel/sub/aSub) so
     /// both paths get the identical C-correct PP-processing behavior.
-    pub(crate) async fn process_passive_db_source(&self, db: &crate::server::record::DbLink) {
+    ///
+    /// The caller's `visited` set and `depth` are threaded through into
+    /// the source's processing cycle — NOT a fresh set / depth 0. This
+    /// is required for the cycle guard to span the PP hop: in C,
+    /// `calcRecord.c::process` sets `prec->pact = TRUE` *before*
+    /// `fetch_values()` (calcRecord.c:119-120), so when a PP input link
+    /// re-enters `dbProcess` on a record already mid-fetch, the
+    /// `if (precord->pact) goto all_done;` guard (dbAccess.c:537-557)
+    /// terminates the cycle after one bounce. The Rust port sets its
+    /// PACT `AtomicBool` only on `AsyncPending` *after* `record.process()`
+    /// returns, so it cannot catch a record mid-link-fetch. Threading
+    /// the caller's `visited` set makes the existing `visited.insert`
+    /// cycle guard (`process_record_with_links_inner`, processing.rs)
+    /// fire instead — an A↔B `PP` cycle bails when the second hop tries
+    /// to re-insert a name already on the chain. The FLNK path threads
+    /// `visited`/`depth` the same way (processing.rs FLNK dispatch).
+    pub(crate) async fn process_passive_db_source(
+        &self,
+        db: &crate::server::record::DbLink,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) {
         if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive {
             return;
         }
@@ -285,25 +305,31 @@ impl PvDatabase {
             let is_passive =
                 src.read().await.common.scan == crate::server::record::ScanType::Passive;
             if is_passive {
-                let mut visited = std::collections::HashSet::new();
                 let _ = self
-                    .process_record_with_links(&db.record, &mut visited, 0)
+                    .process_record_with_links(&db.record, visited, depth + 1)
                     .await;
             }
         }
     }
 
     /// Read a value from a parsed link for INP (only reads DB links when soft channel).
+    ///
+    /// `visited` / `depth` are the caller's processing-chain state — a PP
+    /// input link's source is processed *within* that same chain so the
+    /// `visited` cycle guard spans the PP hop (see
+    /// [`Self::process_passive_db_source`]).
     pub async fn read_link_value_soft(
         &self,
         link: &crate::server::record::ParsedLink,
         is_soft: bool,
+        visited: &mut HashSet<String>,
+        depth: usize,
     ) -> Option<EpicsValue> {
         match link {
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) if is_soft => {
                 // PP: process source record if Passive before reading
-                self.process_passive_db_source(db).await;
+                self.process_passive_db_source(db, visited, depth).await;
                 let pv_name = if db.field == "VAL" {
                     db.record.clone()
                 } else {
@@ -704,7 +730,7 @@ impl PvDatabase {
                     // when DOLn is a constant/empty link.
                     let value = if !grp.dol.is_empty() {
                         let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
-                        self.read_link_value(&dol_parsed).await
+                        self.read_link_value(&dol_parsed, visited, depth).await
                     } else {
                         Some(EpicsValue::Double(grp.dov))
                     };
@@ -726,7 +752,7 @@ impl PvDatabase {
                     // Determine value: read from DOL link, or use DO/STR field
                     let value = if !grp.dol.is_empty() {
                         let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
-                        self.read_link_value(&dol_parsed).await
+                        self.read_link_value(&dol_parsed, visited, depth).await
                     } else if !grp.str_val.is_empty() {
                         Some(EpicsValue::String(grp.str_val.clone()))
                     } else {

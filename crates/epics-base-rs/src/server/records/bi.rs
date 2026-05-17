@@ -37,25 +37,43 @@ pub fn aftc_filter(
     time_last: SystemTime,
     time_now: SystemTime,
 ) -> (u16, f64) {
+    // C `biRecord.c:45` — `#define THRESHOLD 0.6321` (≈ 1 - 1/e).
+    const THRESHOLD: f64 = 0.6321;
+    // C `biRecord.c:246-247` — `double afvl = 0;`. When `aftc <= 0`
+    // the filter is disabled: C never enters the `if (aftc > 0)`
+    // block, so `prec->afvl` is assigned the local `afvl` which is
+    // still 0, and `alarm` keeps the raw severity.
     if aftc <= 0.0 {
         return (raw_alarm, 0.0);
     }
-    // Unit contribution: -1 for NO_ALARM, +1 for any raised severity.
-    let sign = if raw_alarm == 0 { -1.0 } else { 1.0 };
-    let afvl = if afvl_in != 0.0 {
-        let dt = time_now
-            .duration_since(time_last)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let alpha = aftc / (dt + aftc);
-        alpha * afvl_in + (1.0 - alpha) * sign
-    } else {
-        // Seed: first sample after AFVL was zeroed. Always ±1.
-        sign
-    };
-    // Sign-based gate: a negative accumulator suppresses the alarm;
-    // otherwise the raw severity passes through unchanged.
-    let alarm = if afvl < 0.0 { 0 } else { raw_alarm };
+    // C `biRecord.c:251-252` — `if (afvl == 0) afvl = (double) alarm;`.
+    // Seed branch: the accumulator is loaded with the RAW severity
+    // (0/1/2); C leaves `alarm` unchanged this cycle, so the raw
+    // severity is what `recGblSetSevr` sees.
+    if afvl_in == 0.0 {
+        return (raw_alarm, raw_alarm as f64);
+    }
+    // C `biRecord.c:254-262` — exponential smoothing of the integer
+    // severity with a signed contribution and a fold-back on the
+    // fractional part.
+    let dt = time_now
+        .duration_since(time_last)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let alpha = aftc / (dt + aftc);
+    // `afvl = alpha*afvl + ((afvl>0) ? (1-alpha) : (alpha-1)) * alarm`
+    let mut afvl = alpha * afvl_in
+        + if afvl_in > 0.0 {
+            1.0 - alpha
+        } else {
+            alpha - 1.0
+        } * (raw_alarm as f64);
+    // `if (afvl - floor(afvl) > THRESHOLD) afvl = -afvl;`
+    if afvl - afvl.floor() > THRESHOLD {
+        afvl = -afvl;
+    }
+    // `alarm = abs((int)floor(afvl));`
+    let alarm = afvl.floor().abs() as u16;
     (alarm, afvl)
 }
 

@@ -332,38 +332,35 @@ impl Record for SelRecord {
             }
             1 => {
                 // High Signal: max of non-NaN values; SELN = winning index.
-                // With zero valid inputs VAL must be NaN so UDF is set —
-                // `value_is_undefined()` checks `is_nan()`, which does
-                // NOT catch ±infinity, so the NEG_INFINITY seed must not
-                // leak into VAL. C `selRecord.c` seeds with finite
-                // `-epicsMAX_DOUBLE`; track whether any input won so a
-                // genuine ±inf input is still selectable. Mirrors the
-                // SELM=3 empty-input branch.
+                // C `selRecord.c:361-368` seeds `val = -epicsINF` and,
+                // when every input is NaN, leaves `val` at -inf. `prec->
+                // val = val` then assigns -inf and `prec->udf =
+                // isnan(prec->val)` (selRecord.c:401-402) — `isnan(-inf)`
+                // is FALSE, so UDF stays CLEAR. An all-NaN High selection
+                // therefore yields VAL = -inf, not NaN.
                 let mut val = f64::NEG_INFINITY;
-                let mut any = false;
                 for (i, &v) in vals.iter().enumerate() {
                     if !v.is_nan() && val < v {
                         val = v;
                         self.seln = i as i16;
-                        any = true;
                     }
                 }
-                self.val = if any { val } else { f64::NAN };
+                self.val = val;
             }
             2 => {
                 // Low Signal: min of non-NaN values; SELN = winning index.
-                // See SELM=1 above — an all-NaN selection must yield a
-                // NaN VAL, not the INFINITY seed.
+                // C `selRecord.c:369-377` seeds `val = epicsINF`; an
+                // all-NaN selection leaves VAL = +inf with UDF CLEAR —
+                // see the SELM=High branch above for the `isnan`
+                // reasoning.
                 let mut val = f64::INFINITY;
-                let mut any = false;
                 for (i, &v) in vals.iter().enumerate() {
                     if !v.is_nan() && val > v {
                         val = v;
                         self.seln = i as i16;
-                        any = true;
                     }
                 }
-                self.val = if any { val } else { f64::NAN };
+                self.val = val;
             }
             3 => {
                 // Median: C inserts non-NaN values into `order`, sets

@@ -32,7 +32,7 @@ use rust_hdf5::{H5Dataset, H5File};
 const DTYPE_ATTR: &str = "NDArrayDataType";
 
 /// Serialize an NDArray data buffer to **little-endian** bytes. `rust-hdf5`
-/// 0.2.14 records every numeric datatype message as little-endian and copies
+/// 0.2.15 records every numeric datatype message as little-endian and copies
 /// the `&[u8]` passed to `write_chunk` verbatim, so a typed dataset fed
 /// host-endian `as_u8_slice()` bytes is only correct on a little-endian host.
 /// This makes the on-disk bytes match the declared LE datatype on every host.
@@ -385,7 +385,7 @@ impl NexusWriter {
     /// Write the NeXus `NX_class` group marker as a true HDF5 group attribute.
     ///
     /// NeXus requires `NX_class` to be an HDF5 *group attribute*. rust-hdf5
-    /// 0.2.14 exposes `H5Group::set_attr_string`, so the class name is written
+    /// 0.2.15 exposes `H5Group::set_attr_string`, so the class name is written
     /// as a real attribute on the group itself — NeXus-aware readers (nexpy,
     /// DAWN, h5py NeXus) recognise the group class.
     fn write_nx_class(group: &rust_hdf5::H5Group, class_name: &str) -> ADResult<()> {
@@ -512,7 +512,7 @@ impl NexusWriter {
             }
             Some("Attr") | None if node.name == "Attr" => {
                 // Group attribute node — written as a true HDF5 group
-                // attribute (rust-hdf5 0.2.14 `H5Group::set_attr_string`).
+                // attribute (rust-hdf5 0.2.15 `H5Group::set_attr_string`).
                 if let Some(parent) = parent {
                     let attr_name = node.attr("name").unwrap_or(&node.name);
                     let value = if node.attr("type") == Some("ND_ATTR") {
@@ -640,7 +640,7 @@ impl NDFileWriter for NexusWriter {
             self.data_node_name = data_node;
         } else {
             // Built-in NXentry/NXdata hierarchy. NX_class on every group is a
-            // true HDF5 group attribute (rust-hdf5 0.2.14).
+            // true HDF5 group attribute (rust-hdf5 0.2.15).
             let entry = h5file
                 .create_group("entry")
                 .map_err(|e| ADError::UnsupportedConversion(format!("NeXus group error: {}", e)))?;
@@ -661,7 +661,7 @@ impl NDFileWriter for NexusWriter {
             self.data_node_name = "data".to_string();
             // The image data must appear inside the NXdata group so NeXus
             // readers locate the signal. write_file hard-links the detector
-            // dataset into this group (rust-hdf5 0.2.14 `H5Group::link`).
+            // dataset into this group (rust-hdf5 0.2.15 `H5Group::link`).
             self.nxdata_group_path = Some("entry/data".to_string());
         }
 
@@ -696,7 +696,7 @@ impl NDFileWriter for NexusWriter {
 
         // Element type recorded on the data dataset for lossless read-back,
         // and the frame bytes serialized explicitly little-endian (rust-hdf5
-        // 0.2.14 records LE datatypes and copies write_chunk bytes verbatim).
+        // 0.2.15 records LE datatypes and copies write_chunk bytes verbatim).
         let dtype_ordinal = array.data.data_type() as i32;
         let frame_bytes = nd_buffer_to_le_bytes(&array.data);
 
@@ -706,7 +706,7 @@ impl NDFileWriter for NexusWriter {
             let mut ds_shape = vec![1usize];
             ds_shape.extend_from_slice(&frame_shape);
             let chunk_dims = ds_shape.clone();
-            // Only the leading frame axis is unlimited. rust-hdf5 0.2.14 picks
+            // Only the leading frame axis is unlimited. rust-hdf5 0.2.15 picks
             // the chunk index from the unlimited-dimension count: one unlimited
             // dim → extensible array (linear `write_chunk`); two or more →
             // v2 B-tree (which requires `write_chunk_at`). `.resizable()` would
@@ -775,7 +775,7 @@ impl NDFileWriter for NexusWriter {
             if let Some(ref nxpath) = nxdata_group_path {
                 let nxdata_group = resolve_group(nxpath)?;
                 // Hard-link the detector dataset into the NXdata group: one
-                // physical dataset, two names (rust-hdf5 0.2.14 H5Group::link).
+                // physical dataset, two names (rust-hdf5 0.2.15 H5Group::link).
                 // Extending the detector dataset per frame is automatically
                 // visible through the link — no duplicate copy.
                 let target = format!("/{}/{}", self.data_group_path, data_node_name);
@@ -1365,7 +1365,7 @@ mod tests {
     #[test]
     fn test_nx_class_is_true_group_attribute() {
         // NeXus requires NX_class to be an HDF5 group attribute, not a child
-        // dataset. rust-hdf5 0.2.14 supports group attributes on every group.
+        // dataset. rust-hdf5 0.2.15 supports group attributes on every group.
         let path = temp_path("nexus_nxclass");
         let mut writer = NexusWriter::new();
         let mut arr = NDArray::new(

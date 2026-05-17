@@ -832,7 +832,7 @@ impl Hdf5Writer {
     /// not just the groups implied by the dataset placement. No-op when no
     /// layout is loaded.
     ///
-    /// `rust-hdf5` 0.2.14's `create_group` errors on a duplicate path, so each
+    /// `rust-hdf5` 0.2.15's `create_group` errors on a duplicate path, so each
     /// distinct group path is created exactly once via a created-set; paths
     /// are processed shortest-first so a parent always exists before a child.
     fn build_layout_groups(&self) -> ADResult<()> {
@@ -1012,7 +1012,7 @@ impl Hdf5Writer {
                 .chunk(&chunk[..])
                 .max_shape(&max_shape[..])
                 // C parity: NDFileHDF5 sets HDF5_fillValue on the dataset
-                // creation property list (H5Pset_fill_value). rust-hdf5 0.2.14
+                // creation property list (H5Pset_fill_value). rust-hdf5 0.2.15
                 // exposes `DatasetBuilder::fill_value`, which writes it into the
                 // DCPL fill-value message so unwritten chunks read back as
                 // `fill` rather than zero.
@@ -1409,7 +1409,7 @@ impl Hdf5Writer {
 
 /// Serialize an NDArray data buffer to **little-endian** bytes.
 ///
-/// `rust-hdf5` 0.2.14 records every numeric datatype message as little-endian
+/// `rust-hdf5` 0.2.15 records every numeric datatype message as little-endian
 /// (`Endianness::LittleEndian`) and its only chunked-write API, `write_chunk`,
 /// copies the supplied `&[u8]` verbatim into the chunk with no byte-swap.
 /// `NDDataBuffer::as_u8_slice()` returns the buffer in *host* byte order, so
@@ -2408,7 +2408,7 @@ mod tests {
 
     #[test]
     fn test_fill_value_recorded_on_dataset() {
-        // The configured HDF5_fillValue reaches the DCPL via rust-hdf5 0.2.14's
+        // The configured HDF5_fillValue reaches the DCPL via rust-hdf5 0.2.15's
         // `DatasetBuilder::fill_value`; it is also mirrored as a dataset
         // attribute for tooling. Verify both the attribute and that an
         // unwritten region of a fill-valued dataset reads back as `fill`.
@@ -2830,7 +2830,7 @@ mod tests {
 
     #[test]
     fn test_swmr_compression_is_applied() {
-        // rust-hdf5 0.2.14 exposes a filtered SWMR dataset constructor, so
+        // rust-hdf5 0.2.15 exposes a filtered SWMR dataset constructor, so
         // SWMR + compression produces a genuinely compressed file — the
         // compression is NOT dropped, and the data round-trips.
         let path = temp_path("hdf5_swmr_comp");

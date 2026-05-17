@@ -835,14 +835,10 @@ impl Hdf5Writer {
     /// `rust-hdf5` 0.2.15's `create_group` errors on a duplicate path, so each
     /// distinct group path is created exactly once via a created-set; paths
     /// are processed shortest-first so a parent always exists before a child.
-    fn build_layout_groups(&self) -> ADResult<()> {
+    fn build_layout_groups(&self, file: &H5File) -> ADResult<()> {
         let layout = match self.layout.as_ref() {
             Some(l) => l,
             None => return Ok(()),
-        };
-        let file = match self.handle {
-            Some(Hdf5Handle::Standard { ref file, .. }) => file,
-            _ => return Ok(()),
         };
         fn collect(g: &crate::hdf5_layout::LayoutGroup, prefix: &str, out: &mut Vec<String>) {
             let here = if prefix.is_empty() {
@@ -899,14 +895,17 @@ impl Hdf5Writer {
     /// Called from `close_file` so that both the primary image dataset and the
     /// per-frame NDAttribute datasets — any of which a hardlink may target —
     /// already exist on disk. No-op when no layout is loaded.
-    fn build_layout_hardlinks(&self) -> ADResult<()> {
+    ///
+    /// `file` is the write-mode HDF5 handle into which the links are created:
+    /// the live `Standard` handle for the standard close path, or a freshly
+    /// `open_rw`-reopened handle for the SWMR close path (the `SwmrFileWriter`
+    /// exposes no link API of its own, so SWMR hardlinks are materialised
+    /// after `close()` against the finished file — C++ `NDFileHDF5.cpp:320`
+    /// `createHardLinks` likewise runs for SWMR files).
+    fn build_layout_hardlinks(&self, file: &H5File) -> ADResult<()> {
         let layout = match self.layout.as_ref() {
             Some(l) => l,
             None => return Ok(()),
-        };
-        let file = match self.handle {
-            Some(Hdf5Handle::Standard { ref file, .. }) => file,
-            _ => return Ok(()),
         };
         // Collect (parent_group_path, hardlink) for every group in the tree.
         fn collect<'a>(
@@ -998,7 +997,10 @@ impl Hdf5Writer {
         // Build the layout group hierarchy (if a layout XML is loaded) before
         // placing the dataset. With no layout this is a no-op and the dataset
         // lands flat at the file root.
-        self.build_layout_groups()?;
+        match self.handle {
+            Some(Hdf5Handle::Standard { ref file, .. }) => self.build_layout_groups(file)?,
+            _ => return Err(ADError::UnsupportedConversion("no HDF5 file open".into())),
+        }
 
         // Collect the `constant` HDF5 attributes the layout XML attaches to the
         // primary image dataset (the one at `resolved_dataset_path`, e.g. the
@@ -1489,6 +1491,16 @@ fn nd_buffer_to_le_bytes(buf: &NDDataBuffer) -> Vec<u8> {
     }
 }
 
+/// Whether the loaded layout declares at least one `<hardlink>` anywhere in
+/// its group tree. Used by the SWMR close path to skip the re-open-for-append
+/// round-trip entirely when there is nothing to materialise.
+fn layout_has_hardlinks(layout: &Hdf5Layout) -> bool {
+    fn group_has(g: &crate::hdf5_layout::LayoutGroup) -> bool {
+        !g.hardlinks.is_empty() || g.groups.iter().any(group_has)
+    }
+    layout.groups.iter().any(group_has)
+}
+
 /// Write `buffer` into a chunked dataset, one `chunk_bytes`-sized chunk at a
 /// time at consecutive linear indices. The trailing partial chunk is
 /// zero-padded to a full chunk, which `rust-hdf5`'s `write_chunk` requires.
@@ -1651,7 +1663,12 @@ impl NDFileWriter for Hdf5Writer {
                 self.flush_performance_dataset()?;
                 // Materialise layout `<hardlink>` elements last, once every
                 // dataset a link may target exists on disk.
-                self.build_layout_hardlinks()?;
+                match self.handle {
+                    Some(Hdf5Handle::Standard { ref file, .. }) => {
+                        self.build_layout_hardlinks(file)?
+                    }
+                    _ => unreachable!("handle is Standard in this arm"),
+                }
                 self.handle = None;
             }
             Some(Hdf5Handle::Swmr { .. }) => {
@@ -1659,6 +1676,31 @@ impl NDFileWriter for Hdf5Writer {
                     writer.close().map_err(|e| {
                         ADError::UnsupportedConversion(format!("SWMR close error: {}", e))
                     })?;
+                }
+                // The `SwmrFileWriter` exposes no hard-link API and is now
+                // consumed by `close()`. C++ `NDFileHDF5.cpp:320`
+                // `createHardLinks` runs for SWMR files too, so re-open the
+                // finished file in append mode and materialise the layout
+                // `<hardlink>` elements against it. No-op when no layout (or
+                // no hardlinks) is loaded.
+                if self.layout.as_ref().is_some_and(layout_has_hardlinks) {
+                    if let Some(path) = self.current_path.clone() {
+                        let file = H5File::open_rw(&path).map_err(|e| {
+                            ADError::UnsupportedConversion(format!(
+                                "SWMR hardlink: re-open '{}' for append failed: {}",
+                                path.display(),
+                                e
+                            ))
+                        })?;
+                        self.build_layout_groups(&file)?;
+                        self.build_layout_hardlinks(&file)?;
+                        file.close().map_err(|e| {
+                            ADError::UnsupportedConversion(format!(
+                                "SWMR hardlink: close re-opened file failed: {}",
+                                e
+                            ))
+                        })?;
+                    }
                 }
             }
             None => {}
@@ -3154,6 +3196,82 @@ mod tests {
         let alias = h5.dataset("entry/data/data_alias").unwrap();
         let orig = h5.dataset("entry/data/data").unwrap();
         assert_eq!(alias.shape(), orig.shape());
+
+        drop(h5);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
+    }
+
+    #[test]
+    fn test_swmr_layout_hardlink_is_materialised() {
+        // A `<hardlink>` declared in the layout XML must also be materialised
+        // for SWMR-mode files. C ADCore `NDFileHDF5.cpp:320` calls
+        // `createHardLinks` before `startSWMR()`, so SWMR files get the link
+        // too. The `SwmrFileWriter` exposes no link API, so the Rust port
+        // re-opens the finished file in append mode after `close()` and
+        // materialises the layout `<hardlink>` elements then.
+        //
+        // SWMR mode writes the image dataset at the flat default name
+        // `data`; the layout hardlink here targets `/data` (where the SWMR
+        // dataset actually lands) and lives inside a non-colliding group.
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_swmr_layout_hardlink.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <group name="links">
+                <hardlink name="data_alias" target="/data"/>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_swmr_layout_hardlink");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        assert!(
+            writer.set_layout_filename(layout.to_str().unwrap()),
+            "layout XML must parse: {}",
+            writer.layout_error
+        );
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = i as u16;
+            }
+        }
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        assert!(
+            writer.is_swmr_active(),
+            "writer must be in SWMR mode for this test"
+        );
+        writer.write_file(&arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let names = h5.dataset_names();
+        // The primary SWMR dataset at the flat root.
+        assert!(
+            names.contains(&"data".to_string()),
+            "SWMR image dataset must exist at flat `data`; got {:?}",
+            names
+        );
+        // The hard link materialised under the layout `links` group.
+        assert!(
+            names.contains(&"links/data_alias".to_string()),
+            "SWMR layout <hardlink> must be materialised as a hard link; got {:?}",
+            names
+        );
+        // The link shares the target object: same shape, readable as a dataset.
+        let alias = h5.dataset("links/data_alias").unwrap();
+        let orig = h5.dataset("data").unwrap();
+        assert_eq!(alias.shape(), orig.shape());
+        assert_eq!(orig.shape(), vec![2, 4, 4]);
 
         drop(h5);
         std::fs::remove_file(&path).ok();

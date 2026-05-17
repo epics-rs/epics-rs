@@ -1091,46 +1091,56 @@ where
     n
 }
 
-/// Bit-reinterpret an unsigned source element as the same-width signed
-/// destination element. C++ `NDStdArrays` serves the raw NDArray bytes to the
-/// asyn array reader unchanged; for a same-width unsigned->signed pair (e.g. a
-/// `U8` NDArray read through `readInt8Array`) that is a bitwise reinterpret,
-/// NOT a numeric clamp. Routing such a pair through `copy_convert`'s f64
-/// round-trip would saturate (255u8 -> 127i8) and diverge from C++.
-trait ReinterpretAs<D> {
-    fn reinterpret(self) -> D;
+/// Cast an integer source element to an integer destination element with C
+/// cast semantics. C++ `NDArrayPool::convert` (`NDArrayPool.cpp:388`,
+/// `convertType`: `*pDataOut++ = (dataTypeOut)(*pDataIn++)`; and `:466`,
+/// `convertDim`) performs a plain C cast between integer types. A C cast:
+///   - same-width sign change is a bitwise reinterpret
+///     (`(epicsInt8)(epicsUInt8)255 == -1`);
+///   - narrowing truncates to the low bits, wrapping
+///     (`(epicsInt8)(epicsUInt16)300 == 44`);
+///   - widening sign/zero-extends exactly.
+///
+/// Rust's `as` between integer types implements exactly these semantics. The
+/// f64 round-trip in [`copy_convert`] does NOT: it saturates on narrowing
+/// (`300.0 as i8 == 127`), diverging from C++. So every integer-source ->
+/// integer-target NDArray array read must go through this C-cast path, not
+/// `copy_convert`.
+trait CCastTo<D> {
+    fn ccast(self) -> D;
 }
-impl ReinterpretAs<i8> for u8 {
-    fn reinterpret(self) -> i8 {
-        self as i8
-    }
+macro_rules! impl_ccast {
+    ( $src:ty => $( $dst:ty ),+ ) => {
+        $(
+            impl CCastTo<$dst> for $src {
+                #[inline]
+                fn ccast(self) -> $dst {
+                    self as $dst
+                }
+            }
+        )+
+    };
 }
-impl ReinterpretAs<i16> for u16 {
-    fn reinterpret(self) -> i16 {
-        self as i16
-    }
-}
-impl ReinterpretAs<i32> for u32 {
-    fn reinterpret(self) -> i32 {
-        self as i32
-    }
-}
-impl ReinterpretAs<i64> for u64 {
-    fn reinterpret(self) -> i64 {
-        self as i64
-    }
-}
+impl_ccast!(i8 => i16, i32, i64);
+impl_ccast!(u8 => i8, i16, i32, i64);
+impl_ccast!(i16 => i8, i32, i64);
+impl_ccast!(u16 => i8, i16, i32, i64);
+impl_ccast!(i32 => i8, i16, i64);
+impl_ccast!(u32 => i8, i16, i32, i64);
+impl_ccast!(i64 => i8, i16, i32);
+impl_ccast!(u64 => i8, i16, i32, i64);
 
-/// Copy a same-width unsigned source slice into a signed destination buffer by
-/// bitwise reinterpretation (see [`ReinterpretAs`]).
-fn copy_reinterpret<S, D>(src: &[S], dst: &mut [D]) -> usize
+/// Copy an integer source slice into an integer destination buffer using C
+/// cast semantics (see [`CCastTo`]) — truncating on narrowing, never
+/// saturating.
+fn copy_ccast<S, D>(src: &[S], dst: &mut [D]) -> usize
 where
-    S: ReinterpretAs<D> + Copy,
+    S: CCastTo<D> + Copy,
     D: Copy,
 {
     let n = src.len().min(dst.len());
     for i in 0..n {
-        dst[i] = src[i].reinterpret();
+        dst[i] = src[i].ccast();
     }
     n
 }
@@ -1232,7 +1242,7 @@ impl CastFromF64 for f64 {
 macro_rules! impl_read_array {
     (
         $self:expr, $buf:expr, $direct_variant:ident,
-        reinterpret: [ $( $reinterpret_variant:ident ),* ],
+        ccast: [ $( $ccast_variant:ident ),* ],
         convert: [ $( $variant:ident ),* ]
     ) => {{
         use crate::ndarray::NDDataBuffer;
@@ -1247,7 +1257,7 @@ macro_rules! impl_read_array {
         };
         let n = match &array.data {
             NDDataBuffer::$direct_variant(v) => copy_direct(v, $buf),
-            $( NDDataBuffer::$reinterpret_variant(v) => copy_reinterpret(v, $buf), )*
+            $( NDDataBuffer::$ccast_variant(v) => copy_ccast(v, $buf), )*
             $( NDDataBuffer::$variant(v) => copy_convert(v, $buf), )*
         };
         Ok(n)
@@ -1299,43 +1309,43 @@ impl PortDriver for PluginPortDriver {
     }
 
     fn read_int8_array(&mut self, _user: &AsynUser, buf: &mut [i8]) -> AsynResult<usize> {
-        // U8 -> i8 is a bitwise reinterpret (C++ NDStdArrays serves raw bytes);
-        // every other source type is a numeric conversion.
+        // Every integer source -> i8 is a C cast (truncating, per C++
+        // NDArrayPool.cpp:388); float sources keep the numeric f64 conversion.
         impl_read_array!(
             self, buf, I8,
-            reinterpret: [U8],
-            convert: [I16, U16, I32, U32, I64, U64, F32, F64]
+            ccast: [U8, I16, U16, I32, U32, I64, U64],
+            convert: [F32, F64]
         )
     }
 
     fn read_int16_array(&mut self, _user: &AsynUser, buf: &mut [i16]) -> AsynResult<usize> {
         impl_read_array!(
             self, buf, I16,
-            reinterpret: [U16],
-            convert: [I8, U8, I32, U32, I64, U64, F32, F64]
+            ccast: [I8, U8, U16, I32, U32, I64, U64],
+            convert: [F32, F64]
         )
     }
 
     fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         impl_read_array!(
             self, buf, I32,
-            reinterpret: [U32],
-            convert: [I8, U8, I16, U16, I64, U64, F32, F64]
+            ccast: [I8, U8, I16, U16, U32, I64, U64],
+            convert: [F32, F64]
         )
     }
 
     fn read_int64_array(&mut self, _user: &AsynUser, buf: &mut [i64]) -> AsynResult<usize> {
         impl_read_array!(
             self, buf, I64,
-            reinterpret: [U64],
-            convert: [I8, U8, I16, U16, I32, U32, F32, F64]
+            ccast: [I8, U8, I16, U16, I32, U32, U64],
+            convert: [F32, F64]
         )
     }
 
     fn read_float32_array(&mut self, _user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
         impl_read_array!(
             self, buf, F32,
-            reinterpret: [],
+            ccast: [],
             convert: [I8, U8, I16, U16, I32, U32, I64, U64, F64]
         )
     }
@@ -1343,7 +1353,7 @@ impl PortDriver for PluginPortDriver {
     fn read_float64_array(&mut self, _user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
         impl_read_array!(
             self, buf, F64,
-            reinterpret: [],
+            ccast: [],
             convert: [I8, U8, I16, U16, I32, U32, I64, U64, F32]
         )
     }
@@ -2837,5 +2847,65 @@ mod tests {
             "arrays dropped on a full queue must be counted (got {})",
             dropped.load(Ordering::Acquire)
         );
+    }
+
+    #[test]
+    fn test_cross_width_narrowing_array_read_truncates() {
+        // Cross-width integer narrowing array reads must TRUNCATE (wrapping),
+        // matching the C cast in C++ NDArrayPool.cpp:388 `convertType`
+        //   *pDataOut++ = (dataTypeOut)(*pDataIn++);
+        // A C cast `(epicsInt8)(epicsUInt16)300` keeps the low 8 bits == 44.
+        // The f64 round-trip in copy_convert would SATURATE (`300.0 as i8`
+        // == 127) and diverge from C++ — copy_ccast must be used instead.
+
+        // U16 -> i8: 300 = 0x012C; low byte 0x2C = 44.
+        let mut out = [0i8; 1];
+        let n = copy_ccast(&[300u16], &mut out);
+        assert_eq!(n, 1);
+        assert_eq!(out[0], 44, "(epicsInt8)(epicsUInt16)300 == 44 (low 8 bits)");
+        // copy_convert would have saturated:
+        let mut sat = [0i8; 1];
+        copy_convert(&[300u16], &mut sat);
+        assert_eq!(sat[0], 127, "f64 round-trip saturates — the wrong behavior");
+
+        // I32 -> i8: 0x1234_5678 -> low byte 0x78 = 120.
+        let mut out2 = [0i8; 1];
+        copy_ccast(&[0x1234_5678i32], &mut out2);
+        assert_eq!(out2[0], 0x78);
+
+        // I32 -> i8: -1 stays -1 (all-ones low byte).
+        let mut out3 = [0i8; 1];
+        copy_ccast(&[-1i32], &mut out3);
+        assert_eq!(out3[0], -1);
+
+        // U16 -> i8: 0x00FF = 255 -> low byte 0xFF reinterpreted as i8 == -1.
+        let mut out4 = [0i8; 1];
+        copy_ccast(&[255u16], &mut out4);
+        assert_eq!(out4[0], -1);
+
+        // I64 -> i32: 0x0000_0001_0000_002A -> low 32 bits == 42.
+        let mut out5 = [0i32; 1];
+        copy_ccast(&[0x0000_0001_0000_002Ai64], &mut out5);
+        assert_eq!(out5[0], 42);
+
+        // U32 -> i16: 70000 = 0x0001_1170 -> low 16 bits 0x1170 == 4464.
+        let mut out6 = [0i16; 1];
+        copy_ccast(&[70000u32], &mut out6);
+        assert_eq!(out6[0], 4464);
+
+        // Same-width sign change still works as a bitwise reinterpret:
+        // U8 255 -> i8 -1.
+        let mut out7 = [0i8; 1];
+        copy_ccast(&[255u8], &mut out7);
+        assert_eq!(out7[0], -1);
+
+        // F64 out-of-range -> i32 still routes through copy_convert (the
+        // `convert:` arm for float sources). C++ converts float->int with a
+        // C cast too, but the runtime keeps the f64 numeric path for float
+        // sources; this asserts the integer-narrowing fix did not change the
+        // float-source path.
+        let mut fout = [0i32; 1];
+        copy_convert(&[42.9f64], &mut fout);
+        assert_eq!(fout[0], 42, "f64 -> i32 truncates toward zero");
     }
 }

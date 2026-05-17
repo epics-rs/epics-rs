@@ -1489,11 +1489,27 @@ impl PvDatabase {
         // 4.55. event record: post the named software event.
         self.dispatch_event_record(rec).await;
 
-        // 4.6. Generic multi-output links (transform OUTA..OUTP -> A..P)
+        // 4.6. Generic multi-output links (transform OUTA..OUTP -> A..P,
+        // scalcout OUT->OVAL, epid OUTL).
+        //
+        // SINGLE-OWNER INVARIANT: a record type whose link groups are
+        // dispatched by `dispatch_multi_output` (§4.5 above) MUST be
+        // skipped here — otherwise its `LNKn`/`OUTn` would be written
+        // twice per cycle. `sseq` previously also implemented the
+        // `Record::multi_output_links` trait method, so this block
+        // re-dispatched every selected `LNKn` after §4.5 already drove
+        // it. The `multi_output_dispatch_owned` gate makes the
+        // double-dispatch structurally impossible — not just removed
+        // at the `SseqRecord` call site.
         {
             let multi_out = {
                 let instance = rec.read().await;
-                let links = instance.record.multi_output_links();
+                let links =
+                    if super::links::multi_output_dispatch_owned(instance.record.record_type()) {
+                        &[][..]
+                    } else {
+                        instance.record.multi_output_links()
+                    };
                 if links.is_empty() {
                     None
                 } else {
@@ -2113,11 +2129,22 @@ impl PvDatabase {
         // event record: post the named software event.
         self.dispatch_event_record(&rec).await;
 
-        // Generic multi-output links (transform OUTA..OUTP -> A..P)
+        // Generic multi-output links (transform OUTA..OUTP -> A..P,
+        // scalcout OUT->OVAL, epid OUTL).
+        //
+        // SINGLE-OWNER INVARIANT: skip any record type owned by
+        // `dispatch_multi_output` (called above) so its `LNKn`/`OUTn`
+        // is not dispatched twice — see the sync-path twin in
+        // `run_forward_link_tail_with_putf` §4.6.
         {
             let multi_out = {
                 let instance = rec.read().await;
-                let links = instance.record.multi_output_links();
+                let links =
+                    if super::links::multi_output_dispatch_owned(instance.record.record_type()) {
+                        &[][..]
+                    } else {
+                        instance.record.multi_output_links()
+                    };
                 if links.is_empty() {
                     None
                 } else {

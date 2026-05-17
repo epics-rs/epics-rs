@@ -70,6 +70,33 @@ impl MultiOut {
     }
 }
 
+/// Record types whose multi-output link groups are dispatched by
+/// [`PvDatabase::dispatch_multi_output`].
+///
+/// SINGLE-OWNER INVARIANT — each of these record types' output links
+/// (fanout `LNKn`, dfanout `OUTn`, seq/sseq `LNKn`) is dispatched
+/// (value written + target forward-link processed) **exactly once per
+/// process cycle, by `dispatch_multi_output` and by nothing else**.
+///
+/// `dispatch_multi_output` is the sole owner because it is the only
+/// path that performs the full C-record model: SELL→SELN resolution,
+/// SELM/OFFS/SHFT selection, per-group DOLn input fetch, sseq
+/// STR/DO value precedence, and per-group DLYn delay.
+///
+/// MUST NOT: the generic `multi_output_links` block in
+/// `processing.rs` (run unconditionally for every record after
+/// `dispatch_multi_output`) must skip any record type listed here.
+/// Without that gate, an `sseq` record — which also implemented the
+/// `Record::multi_output_links` trait method — was dispatched twice
+/// per cycle, writing every selected `LNKn` value to its target a
+/// second time. `multi_output_dispatch_owned` is consulted by that
+/// block (see `run_forward_link_tail_with_putf` §4.6) so the
+/// double-dispatch is structurally impossible, not merely removed at
+/// one call site.
+pub(crate) fn multi_output_dispatch_owned(record_type: &str) -> bool {
+    matches!(record_type, "fanout" | "dfanout" | "seq" | "sseq")
+}
+
 /// True when a link string carries an explicit `PP` (or `CP`/`CPP`)
 /// process modifier as a whitespace-separated token.
 ///
@@ -646,10 +673,15 @@ impl PvDatabase {
                 "sseq" => {
                     let selm = Self::field_i16(&instance, "SELM");
                     let seln = Self::field_i16(&instance, "SELN");
-                    let offs = Self::field_i16(&instance, "OFFS");
-                    let shft = Self::field_i16(&instance, "SHFT");
                     // sseq keeps the legacy 10-group 1-based layout —
                     // DOL1..DOLA / LNK1..LNKA with DO/STR value storage.
+                    // synApps `sseqRecord.dbd` has NO `OFFS`/`SHFT`
+                    // fields: `SELN` is the 1-based step number, so the
+                    // SELM=Specified base is `SELN - 1` and SELM=Mask
+                    // has no shift — exactly `SelmKind::Dfanout`. Using
+                    // `SelmKind::FanoutSeq` (0-based `SELN + OFFS`)
+                    // mis-selected every Specified/Mask step by one and
+                    // diverged from `SseqRecord::should_execute_step`.
                     let dol_names = [
                         "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9",
                         "DOLA",
@@ -677,14 +709,8 @@ impl PvDatabase {
                             str_val: Self::field_str(&instance, str_names[i]),
                         })
                         .collect();
-                    let sel = select_link_indices_ex(
-                        SelmKind::FanoutSeq,
-                        selm,
-                        seln,
-                        offs,
-                        shft,
-                        groups.len(),
-                    );
+                    let sel =
+                        select_link_indices_ex(SelmKind::Dfanout, selm, seln, 0, 0, groups.len());
                     Some((sel, MultiOut::Sseq(groups), None))
                 }
                 _ => None,
@@ -696,6 +722,15 @@ impl PvDatabase {
             None => return,
         };
         debug_assert!(sel.indices.iter().all(|&i| i < payload.len()));
+        // Single-owner invariant: every record type that produces a
+        // `MultiOut` payload here MUST be listed in
+        // `multi_output_dispatch_owned` so the generic
+        // `multi_output_links` block in `processing.rs` skips it. If
+        // this fires, the two lists have diverged and the skipped
+        // type would be dispatched twice per cycle.
+        debug_assert!(multi_output_dispatch_owned(
+            rec.read().await.record.record_type()
+        ));
 
         // C raises SOFT_ALARM/INVALID_ALARM when SELN/OFFS/SHFT resolve
         // out of range (fanoutRecord.c:116, dfanoutRecord.c:317,

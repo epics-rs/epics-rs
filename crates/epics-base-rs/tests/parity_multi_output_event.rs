@@ -289,3 +289,185 @@ async fn fanout_lnk_skips_non_passive_target() {
         "fanout LNK1 Periodic target must NOT be processed by the fanout: {visited:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Single-owner invariant: sseq LNKn dispatched exactly once per cycle.
+//
+// Round-2 review found that an `sseq` record was dispatched by TWO
+// owners every process cycle: `dispatch_multi_output`'s `MultiOut::Sseq`
+// arm AND the generic `multi_output_links` block (because `SseqRecord`
+// also implemented `Record::multi_output_links`). Each selected `LNKn`
+// value was therefore written to its target TWICE. C
+// `sseqRecord.c::processNextLink` drives each step's `LNKn` via
+// `dbPutLink` exactly once.
+// ---------------------------------------------------------------------------
+
+use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::record::FieldDesc;
+use epics_base_rs::server::records::sseq::SseqRecord;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Target record that counts every `put_field("VAL", ..)` — one count
+/// per value-write that reaches it. A duplicate sseq dispatch shows up
+/// as a count of 2 instead of 1.
+struct CountingTarget {
+    val: f64,
+    writes: Arc<AtomicUsize>,
+}
+
+impl Record for CountingTarget {
+    fn record_type(&self) -> &'static str {
+        "counting_test"
+    }
+    fn process(&mut self) -> CaResult<epics_base_rs::server::record::ProcessOutcome> {
+        Ok(epics_base_rs::server::record::ProcessOutcome::complete())
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Double(self.val)),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match name {
+            "VAL" => {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                self.val = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("VAL".into()))?;
+                Ok(())
+            }
+            _ => Err(CaError::FieldNotFound(name.into())),
+        }
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+/// One `process` of an sseq record writes each selected `LNKn` value
+/// exactly once — never twice. Regression for the two-owner
+/// double-dispatch defect.
+#[tokio::test]
+async fn sseq_lnkn_dispatched_exactly_once_per_cycle() {
+    let db = PvDatabase::new();
+
+    let writes_a = Arc::new(AtomicUsize::new(0));
+    let writes_b = Arc::new(AtomicUsize::new(0));
+    db.add_record(
+        "SSEQ_TGT_A",
+        Box::new(CountingTarget {
+            val: 0.0,
+            writes: writes_a.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    db.add_record(
+        "SSEQ_TGT_B",
+        Box::new(CountingTarget {
+            val: 0.0,
+            writes: writes_b.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // sseq: SELM=All, two steps with DO/LNK set (no DOL → DO is the
+    // value source). LNK1 → SSEQ_TGT_A, LNK2 → SSEQ_TGT_B.
+    let mut sseq = SseqRecord::new();
+    sseq.put_field("SELM", EpicsValue::Short(0)).unwrap(); // All
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_TGT_A".into()))
+        .unwrap();
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_TGT_B".into()))
+        .unwrap();
+    db.add_record("SSEQ_REC", Box::new(sseq)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SSEQ_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        writes_a.load(Ordering::SeqCst),
+        1,
+        "sseq LNK1 must write its target exactly once per cycle (double-dispatch regression)"
+    );
+    assert_eq!(
+        writes_b.load(Ordering::SeqCst),
+        1,
+        "sseq LNK2 must write its target exactly once per cycle (double-dispatch regression)"
+    );
+
+    // Value delivered correctly by the single owner.
+    let tgt_a = db.get_record("SSEQ_TGT_A").await.unwrap();
+    assert_eq!(
+        tgt_a.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(11.0)),
+        "sseq LNK1 must deliver DO1 to its target"
+    );
+    let tgt_b = db.get_record("SSEQ_TGT_B").await.unwrap();
+    assert_eq!(
+        tgt_b.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(22.0)),
+        "sseq LNK2 must deliver DO2 to its target"
+    );
+}
+
+/// `SELM=Specified` selects a single sseq step — only that step's
+/// `LNKn` is dispatched (and only once), the others are not written.
+#[tokio::test]
+async fn sseq_selm_specified_writes_only_selected_step_once() {
+    let db = PvDatabase::new();
+
+    let writes_sel = Arc::new(AtomicUsize::new(0));
+    let writes_other = Arc::new(AtomicUsize::new(0));
+    db.add_record(
+        "SSEQ_SEL_TGT",
+        Box::new(CountingTarget {
+            val: 0.0,
+            writes: writes_sel.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    db.add_record(
+        "SSEQ_OTHER_TGT",
+        Box::new(CountingTarget {
+            val: 0.0,
+            writes: writes_other.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // SELM=Specified, SELN=2 → only step index 1 (LNK2) selected.
+    let mut sseq = SseqRecord::new();
+    sseq.put_field("SELM", EpicsValue::Short(1)).unwrap(); // Specified
+    sseq.put_field("SELN", EpicsValue::Short(2)).unwrap();
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_OTHER_TGT".into()))
+        .unwrap();
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_SEL_TGT".into()))
+        .unwrap();
+    db.add_record("SSEQ_SEL_REC", Box::new(sseq)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SSEQ_SEL_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        writes_sel.load(Ordering::SeqCst),
+        1,
+        "sseq SELM=Specified must write the selected step's LNKn exactly once"
+    );
+    assert_eq!(
+        writes_other.load(Ordering::SeqCst),
+        0,
+        "sseq SELM=Specified must NOT write an unselected step's LNKn"
+    );
+}

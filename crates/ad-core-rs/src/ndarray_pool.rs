@@ -110,15 +110,37 @@ impl NDArrayPool {
             }
             let effective_size = if needed_bytes > old_size {
                 let diff = (needed_bytes - old_size) as u64;
-                let current = self.allocated_bytes.load(Ordering::Relaxed);
-                if self.max_memory > 0 && current + diff > self.max_memory as u64 {
-                    // Put the array back; the reuse path does not consume a slot.
-                    let mut free = self.free_list.lock();
-                    free.push(reused);
-                    self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
-                    return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
+                // CAS loop: the limit check and the increment must be atomic so
+                // two threads on the reuse-grow path cannot both pass the check
+                // and over-commit past `max_memory`. Mirrors the fresh-allocation
+                // path; C++ `NDArrayPool::alloc` is fully mutex-serialized.
+                if self.max_memory > 0 {
+                    loop {
+                        let current = self.allocated_bytes.load(Ordering::Relaxed);
+                        if current + diff > self.max_memory as u64 {
+                            // Put the array back; the reuse path does not consume
+                            // a slot.
+                            let mut free = self.free_list.lock();
+                            free.push(reused);
+                            self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
+                            return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
+                        }
+                        if self
+                            .allocated_bytes
+                            .compare_exchange_weak(
+                                current,
+                                current + diff,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+                } else {
+                    self.allocated_bytes.fetch_add(diff, Ordering::Relaxed);
                 }
-                self.allocated_bytes.fetch_add(diff, Ordering::Relaxed);
                 needed_bytes
             } else {
                 // Buffer already big enough: keep the larger tracked size so
@@ -1499,6 +1521,91 @@ mod tests {
             .unwrap();
         pool.pre_allocate_buffers(&template, 3).unwrap();
         assert_eq!(pool.num_free_buffers(), 3);
+    }
+
+    /// BUG 1 regression: concurrent reuse-grow must not overshoot
+    /// `max_memory`.
+    ///
+    /// Many threads each take a small free-list buffer and grow it (a
+    /// reuse-grow). The non-atomic load+fetch_add this test guards against
+    /// let two threads both pass the limit check on the same `current`
+    /// reading and both increment, pushing `allocated_bytes` past
+    /// `max_memory`. With the CAS loop, the invariant
+    /// `allocated_bytes <= max_memory` must hold after every successful
+    /// alloc.
+    #[test]
+    fn test_concurrent_reuse_grow_does_not_overshoot_max_memory() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        const N: usize = 16;
+        // Repeat to exercise the race window.
+        for _ in 0..50 {
+            // N free buffers, each tracked at data_size = 100 bytes:
+            // allocated_bytes = 1600. max_memory = 2000 leaves only 400 bytes
+            // of headroom. Each reuse-grow from 100 -> 200 bytes adds 100, so
+            // at most 4 of the N grows may succeed; the rest must be rejected.
+            // With a non-atomic load+fetch_add, more than 4 succeed and
+            // allocated_bytes overshoots 2000.
+            let pool = Arc::new(NDArrayPool::new(2000));
+            // Build N genuine reuse-grow candidates: each buffer is allocated
+            // and tracked at 100 bytes (data_size = 100) but its backing Vec is
+            // reserved to >= 200 bytes of capacity. A later 200-byte request
+            // then selects it (capacity 200 >= 200, within the 1.5x threshold)
+            // and takes the reuse-GROW branch (200 > old data_size 100). This
+            // makes the reuse-grow path deterministic regardless of allocator
+            // slack.
+            let mut warm = Vec::with_capacity(N);
+            for _ in 0..N {
+                let mut a = pool
+                    .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+                    .unwrap();
+                // data_size stays 100 (pool accounting); only the Vec capacity
+                // grows. swap the buffer for one with len 100 but capacity 200.
+                if let NDDataBuffer::U8(ref mut v) = a.data {
+                    let mut big = Vec::with_capacity(200);
+                    big.resize(100, 0u8);
+                    *v = big;
+                }
+                assert_eq!(a.data_size, 100);
+                assert!(a.data.capacity_bytes() >= 200);
+                warm.push(a);
+            }
+            for a in warm {
+                pool.release(a);
+            }
+            assert_eq!(pool.allocated_bytes(), 1600);
+            assert_eq!(pool.num_free_buffers(), N as u32);
+
+            let overshoot = Arc::new(AtomicBool::new(false));
+            let mut handles = Vec::new();
+            for _ in 0..N {
+                let pool = pool.clone();
+                let overshoot = overshoot.clone();
+                handles.push(thread::spawn(move || {
+                    // Reuse a 100-byte free buffer, grow it to 200 bytes.
+                    let res = pool.alloc(vec![NDDimension::new(200)], NDDataType::UInt8);
+                    if res.is_ok() && pool.allocated_bytes() > pool.max_memory() as u64 {
+                        overshoot.store(true, Ordering::Relaxed);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            assert!(
+                !overshoot.load(Ordering::Relaxed),
+                "allocated_bytes overshot max_memory during concurrent reuse-grow"
+            );
+            assert!(
+                pool.allocated_bytes() <= pool.max_memory() as u64,
+                "final allocated_bytes {} > max_memory {}",
+                pool.allocated_bytes(),
+                pool.max_memory()
+            );
+        }
     }
 
     /// G11: `report` produces a non-empty diagnostic dump.

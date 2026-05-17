@@ -133,9 +133,13 @@ pub struct ProfileResult {
 /// Compute min/max/mean/sigma/total from an NDDataBuffer, with min/max positions
 /// and optional background subtraction.
 ///
-/// When `bgd_width > 0`, the average of edge pixels (bgd_width pixels from each
-/// edge of a 2D image) is subtracted: `net = total - bgd_avg * num_elements`.
-/// When `bgd_width == 0`, `net = total`.
+/// When `bgd_width > 0`, the background is computed as N-dimensional edge
+/// strips (per dimension a low-edge and a high-edge strip, each spanning the
+/// full extent of the other dimensions) exactly as C++ `NDPluginStats`
+/// `doComputeStatistics` does — corner pixels are counted twice. The
+/// per-pixel average background is subtracted: `net = total - bgd_avg *
+/// num_elements`, where `bgd_avg = bgd_counts / bgd_pixels`. This works for
+/// any dimensionality (1-D, 2-D, 3-D+). When `bgd_width == 0`, `net = total`.
 pub fn compute_stats(
     data: &NDDataBuffer,
     dims: &[ad_core_rs::ndarray::NDDimension],
@@ -270,31 +274,90 @@ pub fn compute_stats(
             let sigma = (variance / v.len() as f64).sqrt();
             let x_size = dims.first().map_or(v.len(), |d| d.size);
 
-            // Background subtraction
-            let net = if bgd_width > 0 && dims.len() >= 2 {
-                let y_size = dims[1].size;
-                let mut bgd_sum = 0.0f64;
-                let mut bgd_count = 0usize;
-                for iy in 0..y_size {
-                    for ix in 0..x_size {
-                        let is_edge = ix < bgd_width
-                            || ix >= x_size.saturating_sub(bgd_width)
-                            || iy < bgd_width
-                            || iy >= y_size.saturating_sub(bgd_width);
-                        if is_edge {
-                            let idx = iy * x_size + ix;
-                            if idx < v.len() {
-                                bgd_sum += v[idx] as f64;
-                                bgd_count += 1;
-                            }
+            // Background subtraction.
+            //
+            // C parity: NDPluginStats.cpp:486-528 `doComputeStatistics` background
+            // section. The background is the union of, per dimension, a low-edge
+            // strip and a high-edge strip (each spanning the full extent of every
+            // other dimension). Strip totals/pixel-counts are SUMMED, so pixels in
+            // the corner of multiple strips are counted twice in both `bgdCounts`
+            // and `bgdPixels` — the C++ source documents this as intentional
+            // (NDPluginStats.cpp:485-488). Works for any dimensionality (1-D,
+            // 2-D, 3-D+).
+            let net = if bgd_width > 0 && !dims.is_empty() {
+                let sizes: Vec<usize> = dims.iter().map(|d| d.size).collect();
+                // Row-major strides: dim 0 varies fastest (matches the x_size /
+                // y_size index math used above).
+                let ndims = sizes.len();
+                let mut strides = vec![1usize; ndims];
+                for i in 1..ndims {
+                    strides[i] = strides[i - 1] * sizes[i - 1];
+                }
+
+                // Sum a strip: dimension `sd` restricted to [s_off, s_off+s_len),
+                // every other dimension spanning its full extent. Returns
+                // (sum, pixel_count).
+                let strip = |sd: usize, s_off: usize, s_len: usize| -> (f64, usize) {
+                    if s_len == 0 {
+                        return (0.0, 0);
+                    }
+                    // Number of pixels in the strip = s_len * product of other dims.
+                    let mut count = s_len;
+                    for (d, &sz) in sizes.iter().enumerate() {
+                        if d != sd {
+                            count *= sz;
                         }
                     }
-                }
-                let bgd_avg = if bgd_count > 0 {
-                    bgd_sum / bgd_count as f64
-                } else {
-                    0.0
+                    let mut sum = 0.0f64;
+                    // Iterate over every flat coordinate in the strip by counting
+                    // through per-dimension coordinates.
+                    let mut coords = vec![0usize; ndims];
+                    for _ in 0..count {
+                        let mut flat = 0usize;
+                        for d in 0..ndims {
+                            let c = if d == sd {
+                                coords[d] + s_off
+                            } else {
+                                coords[d]
+                            };
+                            flat += c * strides[d];
+                        }
+                        if flat < v.len() {
+                            sum += v[flat] as f64;
+                        }
+                        // Increment the mixed-radix coordinate counter. The radix
+                        // for the strip dimension is `s_len`; for others it is the
+                        // full dimension size.
+                        for d in 0..ndims {
+                            let radix = if d == sd { s_len } else { sizes[d] };
+                            coords[d] += 1;
+                            if coords[d] < radix {
+                                break;
+                            }
+                            coords[d] = 0;
+                        }
+                    }
+                    (sum, count)
                 };
+
+                let mut bgd_counts = 0.0f64;
+                let mut bgd_pixels = 0usize;
+                for (d, &dim_size) in sizes.iter().enumerate() {
+                    // Low-edge strip: offset 0, size min(bgd_width, dim_size).
+                    let low_len = bgd_width.min(dim_size);
+                    let (low_sum, low_n) = strip(d, 0, low_len);
+                    bgd_counts += low_sum;
+                    bgd_pixels += low_n;
+                    // High-edge strip: offset max(0, dim_size - bgd_width),
+                    // size min(bgd_width, dim_size - offset).
+                    let high_off = dim_size.saturating_sub(bgd_width);
+                    let high_len = bgd_width.min(dim_size - high_off);
+                    let (high_sum, high_n) = strip(d, high_off, high_len);
+                    bgd_counts += high_sum;
+                    bgd_pixels += high_n;
+                }
+                // C parity: NDPluginStats.cpp:526 — `if (bgdPixels < 1) bgdPixels = 1`.
+                let bgd_avg = bgd_counts / bgd_pixels.max(1) as f64;
                 total - bgd_avg * v.len() as f64
             } else {
                 total
@@ -1355,6 +1418,114 @@ mod tests {
         // total = 15*10 + 110 = 260
         // net = 260 - 10.0 * 16 = 260 - 160 = 100
         assert!((stats.net - 100.0).abs() < 1e-10);
+    }
+
+    /// BUG 2 regression: 2-D background matches C++ `NDPluginStats`
+    /// edge-strip computation, including corner double-counting.
+    ///
+    /// 4x4 image, bgd_width=1. C++ strips (dim 0 = x fastest):
+    ///   dim x: low strip ix=0 (4 px), high strip ix=3 (4 px)
+    ///   dim y: low strip iy=0 (4 px), high strip iy=3 (4 px)
+    /// bgd_pixels = 16 (the 4 corners are counted twice; the 4 interior
+    /// pixels are never counted). bgd_counts is the sum over those 16
+    /// strip slots, corners contributing twice.
+    #[test]
+    fn test_compute_stats_bgd_2d_corner_double_count() {
+        // 4x4, row-major, dim0=x fastest. Asymmetric data so that corner
+        // double-counting demonstrably changes the result:
+        //   corners      = 100   (idx 0, 3, 12, 15)
+        //   other edges  = 10    (idx 1, 2, 4, 7, 8, 11, 13, 14)
+        //   interior     = 1     (idx 5, 6, 9, 10)
+        // Rows (y):
+        //   y0: [100,  10,  10, 100]
+        //   y1: [ 10,   1,   1,  10]
+        //   y2: [ 10,   1,   1,  10]
+        //   y3: [100,  10,  10, 100]
+        let dims = vec![NDDimension::new(4), NDDimension::new(4)];
+        let mut pixels = vec![1u16; 16];
+        for &i in &[1usize, 2, 4, 7, 8, 11, 13, 14] {
+            pixels[i] = 10;
+        }
+        for &i in &[0usize, 3, 12, 15] {
+            pixels[i] = 100;
+        }
+        let total_expected: f64 = pixels.iter().map(|&p| p as f64).sum();
+        let data = NDDataBuffer::U16(pixels);
+        let stats = compute_stats(&data, &dims, 1);
+
+        // C++ strip sum (bgd_width=1):
+        //   x low strip  (ix=0): idx 0,4,8,12  -> 100,10,10,100 = 220
+        //   x high strip (ix=3): idx 3,7,11,15 -> 100,10,10,100 = 220
+        //   y low strip  (iy=0): idx 0,1,2,3   -> 100,10,10,100 = 220
+        //   y high strip (iy=3): idx 12,13,14,15 -> 100,10,10,100 = 220
+        // Each corner (100) appears in two strips => double-counted.
+        let bgd_counts = 220 + 220 + 220 + 220; // 880
+        let bgd_pixels = 16; // 4 strips * 4 px each
+        let bgd_avg = bgd_counts as f64 / bgd_pixels as f64; // 55.0
+        let expected_net = total_expected - bgd_avg * 16.0;
+        assert!(
+            (stats.net - expected_net).abs() < 1e-9,
+            "net {} != expected {}",
+            stats.net,
+            expected_net
+        );
+
+        // A once-each perimeter (12 distinct pixels) would average
+        // (4*100 + 8*10)/12 = 40.0, NOT 55.0 — proving the corners are
+        // double-counted exactly as C++ documents.
+        let perimeter_avg = (4.0 * 100.0 + 8.0 * 10.0) / 12.0;
+        assert!(
+            (bgd_avg - perimeter_avg).abs() > 1e-9,
+            "corner double-count must change bgd_avg vs a once-each perimeter"
+        );
+        assert!((bgd_avg - 55.0).abs() < 1e-9);
+    }
+
+    /// BUG 2 regression: background works for 1-D arrays (C++ runs the
+    /// strip algorithm for any `ndims`, not just >= 2).
+    #[test]
+    fn test_compute_stats_bgd_1d() {
+        // 1-D, 8 elements: [10, 20, 30, 40, 50, 60, 70, 80], bgd_width=2.
+        let dims = vec![NDDimension::new(8)];
+        let data = NDDataBuffer::U16(vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        let stats = compute_stats(&data, &dims, 2);
+
+        // Single dimension: low strip indices 0,1 -> 10,20;
+        // high strip offset 8-2=6, indices 6,7 -> 70,80.
+        // No corner overlap in 1-D (strips disjoint here).
+        let bgd_counts = 10 + 20 + 70 + 80;
+        let bgd_pixels = 4;
+        let bgd_avg = bgd_counts as f64 / bgd_pixels as f64; // 45.0
+        let total = (10 + 20 + 30 + 40 + 50 + 60 + 70 + 80) as f64;
+        let expected_net = total - bgd_avg * 8.0;
+        assert!(
+            (stats.net - expected_net).abs() < 1e-9,
+            "1-D net {} != expected {}",
+            stats.net,
+            expected_net
+        );
+    }
+
+    /// BUG 2 regression: background works for 3-D arrays.
+    #[test]
+    fn test_compute_stats_bgd_3d() {
+        // 2x2x2 array, every element = 1, bgd_width = 1.
+        // With bgd_width >= every dim size, every strip covers the whole
+        // array; corners counted many times. bgd_avg must still be 1.0
+        // (uniform data), so net = total - 1.0 * 8 = 0.
+        let dims = vec![
+            NDDimension::new(2),
+            NDDimension::new(2),
+            NDDimension::new(2),
+        ];
+        let data = NDDataBuffer::U8(vec![1u8; 8]);
+        let stats = compute_stats(&data, &dims, 1);
+        assert!(
+            stats.net.abs() < 1e-9,
+            "3-D uniform net should be 0, got {}",
+            stats.net
+        );
+        assert_eq!(stats.total, 8.0);
     }
 
     #[test]

@@ -139,6 +139,15 @@ pub enum ModbusError {
     #[error("invalid Modbus function code: {0}")]
     InvalidFunction(i32),
 
+    /// Absolute addressing (`modbusStartAddress == -1`) was requested. This
+    /// port does not implement absolute mode; the engine is built around a
+    /// single contiguous polled buffer rather than per-record I/O.
+    #[error(
+        "absolute addressing (modbusStartAddress == -1) is not supported by this port; \
+         use a fixed start address"
+    )]
+    AbsoluteAddressingUnsupported,
+
     /// I/O error from the underlying asyn octet port.
     #[error("octet I/O error: {0}")]
     Io(String),

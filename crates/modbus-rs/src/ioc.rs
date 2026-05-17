@@ -773,6 +773,88 @@ mod tests {
         v
     }
 
+    /// A transport that never produces traffic — sufficient for tests that
+    /// exercise the offset-checking paths, which fail before any I/O.
+    struct NullTransport;
+
+    impl OctetTransport for NullTransport {
+        fn write_frame(&mut self, _data: &[u8]) -> crate::error::ModbusResult<()> {
+            Ok(())
+        }
+        fn read_frame(&mut self, _timeout: Duration) -> crate::error::ModbusResult<Vec<u8>> {
+            Err(ModbusError::Timeout)
+        }
+    }
+
+    fn test_config(start_address: i32, length: usize) -> ModbusConfig {
+        ModbusConfig {
+            slave: 1,
+            function: ModbusFunctionCode::ReadHoldingRegisters,
+            start_address,
+            length,
+            data_type: ModbusDataType::UInt16,
+            poll_delay: Duration::from_millis(100),
+            plc_type: String::new(),
+        }
+    }
+
+    /// A record configured with absolute addressing must be rejected when the
+    /// port driver is built — never reach an accessor that would panic.
+    #[test]
+    fn absolute_addressing_rejected_at_driver_construction() {
+        let result = ModbusPortDriver::new(
+            "MB_ABS",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        );
+        let err = match result {
+            Ok(_) => panic!("absolute addressing must be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("absolute addressing"),
+            "error should name absolute addressing, got: {msg}"
+        );
+    }
+
+    /// An `addr` beyond `config.length` must yield a clean error from the
+    /// read/write accessors, not an out-of-bounds panic on the engine buffer.
+    #[test]
+    fn out_of_range_addr_returns_error_not_panic() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_OOR",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("non-absolute config must build");
+        // UINT16 is a numeric data parameter; recover its reason.
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        // addr 100 is well past the 4-word buffer.
+        user.addr = 100;
+
+        assert!(driver.read_int32(&user).is_err());
+        assert!(driver.read_int64(&user).is_err());
+        assert!(driver.read_float64(&user).is_err());
+        assert!(driver.read_uint32_digital(&user, 0).is_err());
+        let mut sbuf = [0u8; 8];
+        assert!(driver.read_octet(&user, &mut sbuf).is_err());
+
+        let mut wuser = AsynUser::new(reason);
+        wuser.addr = 100;
+        assert!(driver.write_int32(&mut wuser, 1).is_err());
+        assert!(driver.write_int64(&mut wuser, 1).is_err());
+        assert!(driver.write_float64(&mut wuser, 1.0).is_err());
+        assert!(driver.write_uint32_digital(&mut wuser, 1, 0).is_err());
+        assert!(driver.write_octet(&mut wuser, b"hi").is_err());
+    }
+
     #[test]
     fn parse_configure_args_named_datatype() {
         let (port, octet, cfg) = parse_configure_args(&args(vec![

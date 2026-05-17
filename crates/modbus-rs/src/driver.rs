@@ -172,14 +172,19 @@ impl ModbusConfig {
         }
     }
 
-    /// Validate the configuration, returning the effective start address used
-    /// for non-absolute polling. Mirrors the constructor's length checks.
+    /// Validate the configuration. Mirrors the constructor's length checks.
+    ///
+    /// Absolute addressing (`start_address == -1`) is rejected: see
+    /// [`ModbusEngine`] for why this port does not implement that mode.
     pub fn validate(&self) -> ModbusResult<()> {
         if self.length == 0 {
             return Err(ModbusError::InvalidFunction(0));
         }
         if self.length > self.function.max_length() {
             return Err(ModbusError::FrameTooLarge(self.length));
+        }
+        if self.absolute_addressing() {
+            return Err(ModbusError::AbsoluteAddressingUnsupported);
         }
         Ok(())
     }
@@ -254,6 +259,18 @@ pub trait OctetTransport: Send + Sync {
 
 /// The Modbus driver engine: request construction, the write/read cycle,
 /// response parsing, and the in-memory register buffer.
+///
+/// # Absolute addressing is not supported
+///
+/// The C `drvModbusAsyn` accepts `modbusStartAddress == -1` ("absolute
+/// addressing"), under which the poller is disabled and every record issues
+/// an individual Modbus request to its own absolute wire address with a
+/// per-record length carried in `pasynUser->drvUser`. This engine is built
+/// around a single contiguous [`data`](Self::data) buffer of `config.length`
+/// words, polled in one request — there is no per-record I/O path and no
+/// `drvUser` length struct (see the `ioc` module docs). Implementing absolute
+/// mode is a structural addition beyond a bounds fix, so it is rejected at
+/// configuration time by [`ModbusConfig::validate`].
 pub struct ModbusEngine {
     config: ModbusConfig,
     framer: ModbusFramer,
@@ -297,19 +314,16 @@ impl ModbusEngine {
 
     /// Validate a register/coil offset against the configured range. Port of
     /// `checkOffset`.
+    ///
+    /// The offset must be a valid index into the [`data`](Self::data) buffer,
+    /// i.e. `0 <= offset < config.length`. Absolute addressing — where the C
+    /// `checkOffset` would instead allow any `offset <= 65535` — is rejected
+    /// at configuration time ([`ModbusConfig::validate`]), so the engine here
+    /// always indexes the contiguous `length`-word buffer. Enforcing the
+    /// buffer bound here keeps every `ioc`-layer accessor from indexing out of
+    /// bounds.
     pub fn check_offset(&self, offset: i32) -> ModbusResult<()> {
-        if offset < 0 {
-            return Err(ModbusError::OffsetOutOfRange {
-                offset,
-                length: self.config.length as i32,
-            });
-        }
-        let ok = if self.config.absolute_addressing() {
-            offset <= 65535
-        } else {
-            (offset as usize) < self.config.length
-        };
-        if ok {
+        if offset >= 0 && (offset as usize) < self.config.length {
             Ok(())
         } else {
             Err(ModbusError::OffsetOutOfRange {
@@ -640,6 +654,36 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.length = MAX_READ_WORDS + 1;
         assert!(matches!(cfg.validate(), Err(ModbusError::FrameTooLarge(_))));
+    }
+
+    #[test]
+    fn absolute_addressing_is_rejected_at_validation() {
+        let mut cfg = read_config(ModbusFunctionCode::ReadHoldingRegisters, 10);
+        cfg.start_address = -1;
+        assert!(cfg.absolute_addressing());
+        assert!(matches!(
+            cfg.validate(),
+            Err(ModbusError::AbsoluteAddressingUnsupported)
+        ));
+        // The engine constructor must surface the same rejection.
+        assert!(matches!(
+            ModbusEngine::new(cfg, LinkType::Tcp),
+            Err(ModbusError::AbsoluteAddressingUnsupported)
+        ));
+    }
+
+    #[test]
+    fn check_offset_rejects_beyond_buffer_length() {
+        let engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 4),
+            LinkType::Tcp,
+        )
+        .unwrap();
+        // An offset past the contiguous buffer must be a clean error, never a
+        // panic source for the ioc-layer accessors.
+        assert!(engine.check_offset(4).is_err());
+        assert!(engine.check_offset(70_000).is_err());
+        assert_eq!(engine.data().len(), 4);
     }
 
     #[test]

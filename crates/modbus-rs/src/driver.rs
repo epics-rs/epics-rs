@@ -415,23 +415,20 @@ impl ModbusEngine {
                 Ok(out)
             }
             ReadHoldingRegisters | ReadInputRegisters | ReadInputRegistersF23 => {
+                // The C driver derives the word count by integer-dividing the
+                // reply byte count by two and requires it to equal the
+                // configured length: drvModbusAsyn.cpp doModbusIO,
+                // MODBUS_READ_HOLDING_REGISTERS case
+                // `nread = readResp->byteCount/2;` at drvModbusAsyn.cpp:2281
+                // followed by `if ((int)nread != len)` at drvModbusAsyn.cpp:2284
+                // returning asynError on mismatch. An odd byte count is
+                // tolerated by C (the trailing byte is dropped by the integer
+                // division); match that rather than rejecting frames C accepts.
                 let payload = resp.read_data()?;
-                // `read_data` truncates to the wire byte count. Registers are
-                // two bytes each, so a valid reply has an even byte count
-                // equal to `len * 2`. An odd byte count is a malformed frame
-                // and must be rejected — `payload.len() / 2` would silently
-                // drop the trailing byte and could still equal `len`.
-                if payload.len() % 2 != 0 {
+                let nread = payload.len() / 2;
+                if nread != len {
                     return Err(ModbusError::MalformedResponse(format!(
-                        "register read byte count {} is odd",
-                        payload.len()
-                    )));
-                }
-                if payload.len() != len * 2 {
-                    return Err(ModbusError::MalformedResponse(format!(
-                        "register read byte count {} does not match expected {} ({len} registers)",
-                        payload.len(),
-                        len * 2,
+                        "register read word count {nread} does not match expected {len}",
                     )));
                 }
                 Ok(payload
@@ -440,10 +437,18 @@ impl ModbusEngine {
                     .collect())
             }
             ReportSlaveId => {
-                // Slave-ID replies are vendor-defined variable length; the C
-                // driver copies whatever the slave returns. Accept the actual
-                // reply length rather than requiring an exact `len` match.
+                // The C driver requires the reply byte count to exactly equal
+                // the configured length: drvModbusAsyn.cpp doModbusIO,
+                // MODBUS_REPORT_SLAVE_ID case `if ((int)nread != len)` at
+                // drvModbusAsyn.cpp:2306 returns asynError on mismatch. Each
+                // byte maps to one output word (`data[i] = pCharIn[i]`).
                 let payload = resp.read_data()?;
+                if payload.len() != len {
+                    return Err(ModbusError::MalformedResponse(format!(
+                        "report-slave-id byte count {} does not match expected {len}",
+                        payload.len(),
+                    )));
+                }
                 Ok(payload.iter().map(|&b| b as u16).collect())
             }
             WriteSingleCoil
@@ -963,20 +968,21 @@ mod tests {
     }
 
     #[test]
-    fn register_read_rejects_odd_byte_count() {
-        // BUG 1 regression: a register-read reply with an odd byte count is
-        // malformed. `payload.len() / 2` would silently drop the trailing
-        // byte and could still equal the requested register count.
+    fn register_read_matches_c_odd_byte_count_truncation() {
+        // C parity: drvModbusAsyn.cpp:2281 computes `nread = byteCount/2` with
+        // integer division, so an odd byte count of 3 with len 1 yields
+        // `nread == 1 == len` and C ACCEPTS the frame (drvModbusAsyn.cpp:2284),
+        // copying one register and dropping the trailing byte. The Rust engine
+        // must not reject a frame C accepts.
         let mut engine = ModbusEngine::new(
             read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
             LinkType::Tcp,
         )
         .unwrap();
-        // fcode 0x03, byte_count 3 (odd), three data bytes. 3/2 == 1 == len,
-        // so the old check accepted it.
+        // fcode 0x03, byte_count 3 (odd), three data bytes. 3/2 == 1 == len.
         let resp_pdu = [0x01u8, 0x03, 0x03, 0x12, 0x34, 0x56];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
-        let err = engine
+        let words = engine
             .do_modbus_io(
                 &mut transport,
                 ModbusFunctionCode::ReadHoldingRegisters,
@@ -984,9 +990,10 @@ mod tests {
                 &[],
                 1,
             )
-            .unwrap_err();
-        assert!(matches!(err, ModbusError::MalformedResponse(_)));
-        assert_eq!(engine.stats.io_errors, 1);
+            .unwrap();
+        // One register decoded from the first two bytes; trailing 0x56 dropped.
+        assert_eq!(words, vec![0x1234]);
+        assert_eq!(engine.stats.io_errors, 0);
     }
 
     #[test]
@@ -1014,12 +1021,13 @@ mod tests {
     }
 
     #[test]
-    fn report_slave_id_accepts_variable_length_reply() {
-        // MINOR fix: ReportSlaveId replies are vendor-defined variable
-        // length; the actual reply length must be accepted, not required to
-        // equal `len`.
+    fn report_slave_id_requires_exact_length_match() {
+        // C parity: drvModbusAsyn.cpp:2306 `if ((int)nread != len)` returns
+        // asynError when the report-slave-id reply byte count differs from the
+        // configured length. A reply of 5 bytes with len 5 is accepted and
+        // each byte becomes one word.
         let mut engine = ModbusEngine::new(
-            read_config(ModbusFunctionCode::ReportSlaveId, 1),
+            read_config(ModbusFunctionCode::ReportSlaveId, 5),
             LinkType::Tcp,
         )
         .unwrap();
@@ -1027,9 +1035,30 @@ mod tests {
         let resp_pdu = [0x01u8, 0x11, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
         let words = engine
-            .do_modbus_io(&mut transport, ModbusFunctionCode::ReportSlaveId, 0, &[], 1)
+            .do_modbus_io(&mut transport, ModbusFunctionCode::ReportSlaveId, 0, &[], 5)
             .unwrap();
         assert_eq!(words, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+    }
+
+    #[test]
+    fn report_slave_id_rejects_length_mismatch() {
+        // C parity: drvModbusAsyn.cpp:2306 returns asynError when the reply
+        // byte count does not equal the configured length. Commit cff0152d
+        // removed this check on the false premise that C "copies whatever the
+        // slave returns" — C does not; it enforces `nread == len`.
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReportSlaveId, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
+        // byte_count 5 but the port is configured for len 1.
+        let resp_pdu = [0x01u8, 0x11, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
+        let err = engine
+            .do_modbus_io(&mut transport, ModbusFunctionCode::ReportSlaveId, 0, &[], 1)
+            .unwrap_err();
+        assert!(matches!(err, ModbusError::MalformedResponse(_)));
+        assert_eq!(engine.stats.io_errors, 1);
     }
 
     #[test]

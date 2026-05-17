@@ -311,6 +311,16 @@ impl MotorRecord {
 
         // tdir reflects the actual first-command direction
         self.stat.tdir = move_target > self.pos.drbv;
+        // C parity (motorRecord.cc do_work): `diff` is recomputed
+        // fresh as `dval - drbv` immediately before CDIR is derived.
+        // The VAL/DVAL/RVAL/RLV/TWF write paths update `pos.dval` but
+        // never refresh `pos.diff` — only `process_motor_info` (poll)
+        // and the `Set` branch do. A user VAL write while idle with no
+        // poll update in the same cycle would otherwise compute CDIR
+        // (and the downstream consumers in `handle_retarget` /
+        // `ls_blocks_retry`) from a stale `diff`. Recompute here so
+        // CDIR always reflects the target being dispatched.
+        self.pos.diff = self.pos.dval - self.pos.drbv;
         // CDIR: commanded direction from the position error
         // C: cdir = (rdif < 0) ? 0 : 1, where rdif = diff/mres
         // When MRES < 0, the sign inverts

@@ -415,6 +415,16 @@ impl PortActor {
                 Ok(RequestResult::bounds_read(low, high))
             }
             RequestOp::BlockProcess => {
+                // Block-token contract: the block identity is
+                // `user.block_token` when set, else it falls back to
+                // `user.reason`. CALLER CONTRACT: any caller that
+                // relies on block/unblock exclusivity MUST set a
+                // distinct `block_token` — two callers that share a
+                // `reason` and both omit `block_token` would collide
+                // on the same fallback token, so one could
+                // unblock/nest the other's lock. `block` /
+                // `unblock` / and any owner-gated op must use the
+                // SAME token; mismatched tokens are rejected below.
                 let token = user.block_token.unwrap_or(user.reason as u64);
                 if let Some((existing, ref mut count)) = self.blocked_by {
                     if existing == token {

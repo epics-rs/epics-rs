@@ -83,6 +83,47 @@ fn absolute_move_reaches_target_and_sets_dmov() {
     assert!((rec.pos.drbv - 50.0).abs() < 1e-6);
 }
 
+/// BUG 2 regression: `plan_absolute_move` must recompute `pos.diff`
+/// (= dval - drbv) fresh before deriving CDIR. The VAL write path
+/// updates `pos.dval` but never `pos.diff` — only a poll
+/// (`process_motor_info`) or the `Set` branch does. A VAL write while
+/// idle with no poll update in the same cycle would otherwise compute
+/// CDIR from a stale `diff`.
+#[test]
+fn cdir_uses_fresh_diff_not_stale_pos_diff() {
+    let mut rec = make_record();
+
+    // Motor is at dial position 0, idle.
+    rec.pos.drbv = 0.0;
+    rec.pos.dval = 0.0;
+    rec.pos.val = 0.0;
+    // Inject a STALE positive diff — as if a prior positive move's
+    // poll left it set and no fresh poll has run since.
+    rec.pos.diff = 50.0;
+
+    // User commands a move in the NEGATIVE direction (VAL = -30).
+    rec.put_field("VAL", EpicsValue::Double(-30.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    // The move must be issued in the negative direction.
+    assert!(rec.stat.mip.contains(MipFlags::MOVE));
+    assert_eq!(effects.commands.len(), 1);
+
+    // CDIR must reflect the fresh diff (dval - drbv = -30 - 0 < 0),
+    // i.e. negative direction. With MRES > 0, cdir = (diff >= 0).
+    // Pre-fix this read the stale diff = +50 and asserted cdir = true.
+    assert!(
+        !rec.stat.cdir,
+        "CDIR must be derived from fresh diff (-30), not stale pos.diff (+50)"
+    );
+    // pos.diff itself must have been refreshed.
+    assert!(
+        (rec.pos.diff - (-30.0)).abs() < 1e-9,
+        "pos.diff must be recomputed to dval - drbv = -30, got {}",
+        rec.pos.diff
+    );
+}
+
 #[test]
 fn soft_limit_rejects_move_and_sets_lvio() {
     let mut rec = make_record();

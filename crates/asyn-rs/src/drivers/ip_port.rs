@@ -759,6 +759,76 @@ impl PortDriver for DrvAsynIPPort {
         Ok(())
     }
 
+    fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+        // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:~250)
+        // calls flushIt before write+read so the post-write read
+        // returns only the response to *this* command. For IP ports
+        // C asyn's flushIt (drvAsynIPPort.c flushIt) does a
+        // non-blocking recv loop that reads and discards every byte
+        // already queued in the socket's receive buffer. The serial
+        // driver achieves the same with tcflush(TCIFLUSH).
+        //
+        // `IpIoState::flush` only flushes the *write* side
+        // (`stream.flush()`), so it is NOT used here — that would
+        // leave stale input in place. Drain the socket's input
+        // directly: switch to non-blocking, read until WouldBlock,
+        // then restore blocking mode.
+        //
+        // EOF / connection-reset during the drain is treated as
+        // benign: there is nothing to flush on a dead socket and the
+        // subsequent write/read will surface the disconnect.
+        let mut scratch = [0u8; 4096];
+        match self.io.inner.as_mut() {
+            Some(IpIoInner::Tcp(stream)) => {
+                let restore = stream.set_nonblocking(true);
+                loop {
+                    match stream.read(&mut scratch) {
+                        Ok(0) => break, // EOF — nothing left to drain
+                        Ok(_) => continue,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break, // reset/other — write/read will report it
+                    }
+                }
+                if restore.is_ok() {
+                    let _ = stream.set_nonblocking(false);
+                }
+            }
+            Some(IpIoInner::Udp(socket)) => {
+                let restore = socket.set_nonblocking(true);
+                loop {
+                    match socket.recv(&mut scratch) {
+                        Ok(_) => continue,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                if restore.is_ok() {
+                    let _ = socket.set_nonblocking(false);
+                }
+            }
+            #[cfg(unix)]
+            Some(IpIoInner::Unix(stream)) => {
+                let restore = stream.set_nonblocking(true);
+                loop {
+                    match stream.read(&mut scratch) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                if restore.is_ok() {
+                    let _ = stream.set_nonblocking(false);
+                }
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
         match key {
             "noDelay" => {
@@ -1323,6 +1393,68 @@ mod tests {
 
         handle.join().unwrap();
         let _ = std::fs::remove_file(&sock_path2);
+    }
+
+    // --- io_flush input-drain test (BUG 1 regression) ---
+
+    /// `io_flush` must drain stale bytes already queued on the socket's
+    /// receive buffer, matching C asyn `asynOctetSyncIO::writeRead`'s
+    /// pre-write flush. Pre-fix `DrvAsynIPPort` had no `io_flush`
+    /// override, so the trait default no-op left stale input in place
+    /// and a subsequent read returned it instead of the fresh response.
+    #[test]
+    fn io_flush_drains_stale_tcp_input() {
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Pre-existing stale bytes on the warm line.
+            stream.write_all(b"STALE_PROMPT>").unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            // After the flush + client write, send the real response.
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"CMD");
+            stream.write_all(b"RESPONSE").unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        // Let the stale bytes land in the socket's receive buffer.
+        thread::sleep(Duration::from_millis(50));
+
+        // Flush should discard "STALE_PROMPT>".
+        let mut fuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.io_flush(&mut fuser).unwrap();
+
+        // Write the command and read the response — must be "RESPONSE",
+        // not the stale prompt.
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut wuser, b"CMD").unwrap();
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 64];
+        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"RESPONSE",
+            "io_flush must drain stale input; got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+
+        handle.join().unwrap();
+    }
+
+    /// `io_flush` on a disconnected port is a benign no-op (no socket
+    /// to drain).
+    #[test]
+    fn io_flush_noop_when_disconnected() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:9999").unwrap();
+        let mut user = AsynUser::new(0);
+        drv.io_flush(&mut user).unwrap();
     }
 
     // --- UDP broadcast flag test ---

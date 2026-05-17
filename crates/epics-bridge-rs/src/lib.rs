@@ -75,6 +75,9 @@ pub mod ca_gateway;
 #[cfg(feature = "pvalink")]
 pub mod pvalink;
 
+#[cfg(feature = "calink")]
+pub mod calink;
+
 #[cfg(feature = "pva-gateway")]
 pub mod pva_gateway;
 

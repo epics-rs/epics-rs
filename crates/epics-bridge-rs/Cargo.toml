@@ -45,12 +45,16 @@ ca-gateway-tls = [
 ]
 # PVA links for record INP/OUT (planned)
 pvalink = ["dep:epics-pva-rs"]
+# CA links for record INP/OUT — resolves ` CA`-modified / `ca://`
+# record link fields to a live CA client (monitor-backed cache).
+# Mirrors C `dbCa.c` / `dbCaLink`.
+calink = ["dep:epics-ca-rs"]
 # PVA-to-PVA proxy — mirrors C++ pva2pva/p2pApp.
 pva-gateway = ["dep:epics-pva-rs", "dep:regex"]
 # PVA gateway daemon binary (pva-gateway-rs).
 pva-gateway-bin = ["pva-gateway", "dep:clap", "dep:tracing-subscriber"]
 # Convenience: enable all bridges + binaries
-all-bridges = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin", "pvalink", "pva-gateway", "pva-gateway-bin", "dual-gateway", "dual-gateway-bin"]
+all-bridges = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin", "pvalink", "calink", "pva-gateway", "pva-gateway-bin", "dual-gateway", "dual-gateway-bin"]
 # Dual-protocol IOC: serves the same PV database over both CA and PVA
 # from a single process. Drops in for sites whose tooling mix is
 # transitioning to PVA.

@@ -359,10 +359,21 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         return ParsedLink::Pva(rest.to_string());
     }
 
-    // Strip trailing link attributes: PP, NPP, CP, CPP, MS, NMS, MSS, MSI
+    // Strip trailing link attributes: PP, NPP, CP, CPP, CA, MS, NMS, MSS, MSI
     // They can appear in any order: "REC.FIELD NPP NMS", "REC CP", etc.
+    //
+    // The bare ` CA` modifier forces a `pv_link` to be a CA link
+    // (C `link.h` `CA_LINK` 11). C `dbStaticLib.c:2372`
+    // (`else if (strstr(pstr, "CA")) pinfo->modifiers = pvlOptCA;`)
+    // sets `pvlOptCA`; `dbAccess.c:1103-1104` then keeps the link a
+    // `PV_LINK` instead of creating a local `dbChannel`, so the link
+    // ends up a `CA_LINK` after `dbCaAddLink`. A ` CA` may co-occur
+    // with `PP`/`MS`-style modifiers — `force_ca` records the CA
+    // override while `policy`/`ms` continue to capture the rest, and
+    // a CA-forced link is classified `ParsedLink::Ca` below.
     let mut policy = LinkProcessPolicy::ProcessPassive;
     let mut ms = MonitorSwitch::NoMaximize;
+    let mut force_ca = false;
     let mut link_part = s;
     loop {
         let trimmed = link_part.trim_end();
@@ -404,8 +415,29 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
             link_part = rest;
             continue;
         }
+        // Bare ` CA` modifier — forces the link to be a CA link.
+        // C `dbStaticLib.c:2372`. Stripped here so a combination such
+        // as `REC.FIELD CA MS` leaves `link_part == "REC.FIELD"` and
+        // both `force_ca` and `ms` are recorded.
+        if let Some(rest) = trimmed.strip_suffix(" CA") {
+            force_ca = true;
+            link_part = rest;
+            continue;
+        }
         link_part = trimmed;
         break;
+    }
+
+    // A bare ` CA` modifier forces the link to be a CA link. C
+    // `dbParseLink` only reaches the modifier scan after the
+    // constant test (`dbStaticLib.c:2347`) has already failed — a
+    // string carrying a ` CA` suffix never parses as a bare double,
+    // so a CA-forced link is always a `PV_LINK`. Honour that here:
+    // once ` CA` was stripped, classify as `ParsedLink::Ca` with the
+    // remaining `link_part` (the `record.field` PV name) verbatim,
+    // never as a Constant or local Db link.
+    if force_ca {
+        return ParsedLink::Ca(link_part.to_string());
     }
 
     // Numeric constant
@@ -628,6 +660,55 @@ mod json_link_tests {
             link_field_type(r#"{calc: {"expr": "A+1", "args": ["pv1"]}}"#),
             LinkType::Other
         );
+    }
+
+    // Bare ` CA` modifier — C `dbStaticLib.c:2372` forces a
+    // `pv_link` to a CA link (`link.h` `CA_LINK` 11).
+
+    #[test]
+    fn ca_modifier_classifies_as_ca() {
+        // `REC.FIELD CA` must parse as a CA link carrying the
+        // `record.field` PV name — NOT a Db link to field "FIELD CA".
+        assert_eq!(
+            parse_link_v2("REC.FIELD CA"),
+            ParsedLink::Ca("REC.FIELD".to_string())
+        );
+        assert_eq!(link_field_type("REC.FIELD CA"), LinkType::Ca);
+    }
+
+    #[test]
+    fn ca_modifier_bare_pv_name() {
+        // No field suffix — `localPv CA` is still a CA link.
+        assert_eq!(
+            parse_link_v2("localPv CA"),
+            ParsedLink::Ca("localPv".to_string())
+        );
+        assert_eq!(link_field_type("localPv CA"), LinkType::Ca);
+    }
+
+    #[test]
+    fn ca_modifier_combined_with_pp_ms() {
+        // `CA` may co-occur with PP/MS-style modifiers in any order.
+        // All non-CA modifiers are stripped; the link is still a CA
+        // link carrying just the PV name.
+        assert_eq!(
+            parse_link_v2("REC.VAL CA MS"),
+            ParsedLink::Ca("REC.VAL".to_string())
+        );
+        assert_eq!(
+            parse_link_v2("REC.VAL PP CA"),
+            ParsedLink::Ca("REC.VAL".to_string())
+        );
+        assert_eq!(link_field_type("REC.VAL CA NMS"), LinkType::Ca);
+    }
+
+    #[test]
+    fn ca_modifier_does_not_affect_plain_db_link() {
+        // A link with no ` CA` modifier stays a Db link — the fix
+        // must not over-trigger on record names that merely contain
+        // the letters "ca".
+        assert_eq!(link_field_type("camera.VAL"), LinkType::Db);
+        assert_eq!(link_field_type("REC.VAL PP"), LinkType::Db);
     }
 
     #[test]

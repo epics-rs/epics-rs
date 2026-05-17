@@ -124,6 +124,14 @@ pub struct ScalerRecord {
     /// >= 0.5`). `process()` writes this; `run_start_count` reads it
     /// as the true pre-guard baseline for `count_start_finalize_tp`.
     pub(crate) reqstart_old_pr1: u32,
+
+    /// Set by `special("CNT")` to request a `COUTP` link fire. C
+    /// `scalerRecord.c:623-624` calls `dbPutLink(&pscal->coutp, ...)`
+    /// inside `special()` itself, before the CNT-triggered `scanOnce()`.
+    /// `special()` here cannot emit `ProcessAction`s, so it raises this
+    /// flag and the CNT-triggered `process()` emits the `WriteDbLink`
+    /// and clears it.
+    coutp_pending: bool,
 }
 
 impl ScalerRecord {
@@ -187,6 +195,7 @@ impl Default for ScalerRecord {
             autocount_delay: 0.0,
             done_flag: false,
             reqstart_old_pr1: 0,
+            coutp_pending: false,
         }
     }
 }
@@ -387,7 +396,7 @@ impl ScalerRecord {
     /// `CMD_AUTOCOUNT` whose `handle_command` reproduces
     /// `scalerRecord.c:510-535`.
     fn build_autocount_actions(&self) -> Vec<ProcessAction> {
-        vec![
+        let mut actions = vec![
             ProcessAction::DeviceCommand {
                 command: CMD_RESET,
                 args: vec![],
@@ -396,7 +405,19 @@ impl ScalerRecord {
                 command: CMD_AUTOCOUNT,
                 args: vec![],
             },
-        ]
+        ];
+        // C scalerRecord.c:537-538 — once autocount is armed and
+        // `ss = SCALER_STATE_COUNTING`, the record schedules the first
+        // periodic display update via `callbackRequestDelayed(pupdateCallback,
+        // 1.0/rat1)` when `rat1 > .1`. `update_counts()` has already run
+        // earlier this process cycle (scalerRecord.c:453) and saw `ss !=
+        // COUNTING`, so it could not queue this — emit it here directly.
+        if self.rat1 > 0.1 {
+            actions.push(ProcessAction::ReprocessAfter(
+                std::time::Duration::from_secs_f64(1.0 / self.rat1 as f64),
+            ));
+        }
+        actions
     }
 }
 
@@ -684,6 +705,12 @@ impl Record for ScalerRecord {
                 fire_coutp = true;
             }
         }
+        // C scalerRecord.c:623-624 — `special("CNT")` fires COUTP on every
+        // CNT write; `special()` deferred it to this CNT-triggered process.
+        if self.coutp_pending {
+            self.coutp_pending = false;
+            fire_coutp = true;
+        }
         if fire_coutp {
             actions.push(ProcessAction::WriteDbLink {
                 link_field: "COUTP",
@@ -757,6 +784,11 @@ impl Record for ScalerRecord {
                 if self.cnt != 0 && self.us != USER_STATE_IDLE {
                     return Ok(());
                 }
+                // C:623-624 — fire the COUTP link on every CNT write that
+                // passes the redundant-command guard. `special()` cannot
+                // emit actions; raise a flag the CNT-triggered `process()`
+                // turns into a `WriteDbLink`.
+                self.coutp_pending = true;
                 // C:633-634 — `dly = pscal->dly; if (dly<0.0) dly = 0.0;`
                 let dly = self.dly.max(0.0);
                 // C:635 — `if (dly == 0.0 || pscal->cnt == 0)`: handle now.

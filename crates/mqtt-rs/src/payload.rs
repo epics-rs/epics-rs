@@ -173,9 +173,38 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
             };
             Ok(DecodedValue::String(v))
         }
-        ValueType::IntArray | ValueType::FloatArray => Err(MqttError::UnsupportedType(
-            "JSON array extraction not yet supported".into(),
-        )),
+        ValueType::IntArray => {
+            let arr = value.as_array().ok_or_else(|| {
+                MqttError::ValueConversion(format!("expected array at '{field_path}', got {value}"))
+            })?;
+            let v = arr
+                .iter()
+                .map(|e| {
+                    e.as_i64().map(|n| n as i32).ok_or_else(|| {
+                        MqttError::ValueConversion(format!(
+                            "expected integer array element at '{field_path}', got {e}"
+                        ))
+                    })
+                })
+                .collect::<MqttResult<Vec<i32>>>()?;
+            Ok(DecodedValue::Int32Array(v))
+        }
+        ValueType::FloatArray => {
+            let arr = value.as_array().ok_or_else(|| {
+                MqttError::ValueConversion(format!("expected array at '{field_path}', got {value}"))
+            })?;
+            let v = arr
+                .iter()
+                .map(|e| {
+                    e.as_f64().ok_or_else(|| {
+                        MqttError::ValueConversion(format!(
+                            "expected number array element at '{field_path}', got {e}"
+                        ))
+                    })
+                })
+                .collect::<MqttResult<Vec<f64>>>()?;
+            Ok(DecodedValue::Float64Array(v))
+        }
     }
 }
 
@@ -347,6 +376,52 @@ mod tests {
     fn decode_json_invalid_json() {
         let addr = TopicAddress::parse("JSON:INT sensors/data value").unwrap();
         assert!(decode_payload("not json at all", &addr).is_err());
+    }
+
+    // --- BUG 5: inbound integer-array support ---
+
+    /// BUG 5 regression — a JSON-format INTARRAY topic must decode to
+    /// `Int32Array` instead of returning `UnsupportedType`, so a record
+    /// bound to an integer-array MQTT topic receives data.
+    #[test]
+    fn decode_json_int_array() {
+        let addr = TopicAddress::parse("JSON:INTARRAY sensors/data readings").unwrap();
+        let val = decode_payload(r#"{"readings": [10, 20, 30]}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::Int32Array(vec![10, 20, 30]));
+    }
+
+    /// BUG 5 regression — a nested JSON INTARRAY field decodes too.
+    #[test]
+    fn decode_json_int_array_nested() {
+        let addr = TopicAddress::parse("JSON:INTARRAY dev/data a.b").unwrap();
+        let val = decode_payload(r#"{"a": {"b": [1, 2, 3, 4]}}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::Int32Array(vec![1, 2, 3, 4]));
+    }
+
+    /// BUG 5 — a JSON FLOATARRAY field decodes to `Float64Array`.
+    #[test]
+    fn decode_json_float_array() {
+        let addr = TopicAddress::parse("JSON:FLOATARRAY sensors/data temps").unwrap();
+        let val = decode_payload(r#"{"temps": [1.5, 2.5]}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::Float64Array(vec![1.5, 2.5]));
+    }
+
+    /// BUG 5 — a non-array JSON value for an INTARRAY topic is a clean
+    /// conversion error, not a panic.
+    #[test]
+    fn decode_json_int_array_type_mismatch() {
+        let addr = TopicAddress::parse("JSON:INTARRAY sensors/data readings").unwrap();
+        assert!(decode_payload(r#"{"readings": 42}"#, &addr).is_err());
+    }
+
+    /// BUG 5 — the FLAT INTARRAY decode path (already producing
+    /// `Int32Array`) stays intact; the event loop now delivers it via
+    /// `ParamSetValue::Int32Array`.
+    #[test]
+    fn decode_flat_int_array_for_inbound_delivery() {
+        let addr = TopicAddress::parse("FLAT:INTARRAY test/arr").unwrap();
+        let val = decode_payload("[5, 6, 7]", &addr).unwrap();
+        assert_eq!(val, DecodedValue::Int32Array(vec![5, 6, 7]));
     }
 
     // --- Encode ---

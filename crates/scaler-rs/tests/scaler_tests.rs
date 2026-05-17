@@ -1064,3 +1064,138 @@ fn test_reqstart_no_reconciliation_when_driver_does_not_adjust() {
         "non-adjusting driver leaves TP"
     );
 }
+
+/// BUG 3 regression — C scalerRecord.c:537-538 schedules the first periodic
+/// display update (`callbackRequestDelayed(pupdateCallback, 1.0/rat1)`) when
+/// autocount transitions to `ss = SCALER_STATE_COUNTING` and `rat1 > .1`.
+/// A freshly-started autocount must emit a `ReprocessAfter` so its displayed
+/// counts refresh on the RAT1 cadence.
+#[test]
+fn test_autocount_start_schedules_periodic_update() {
+    use epics_base_rs::server::record::ProcessAction;
+
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp1 = 1.0;
+    rec.rat1 = 5.0; // > 0.1 — periodic update cadence 1/5 s
+    rec.cont = 1; // CONT mode triggers the autocount path
+    rec.dly1 = 0.0; // no hold delay — autocount starts immediately
+
+    let outcome = rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "autocount must transition to COUNTING");
+
+    let reprocess: Vec<_> = outcome
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            ProcessAction::ReprocessAfter(d) => Some(*d),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !reprocess.is_empty(),
+        "autocount start must schedule a periodic ReprocessAfter (C:537-538)"
+    );
+    assert!(
+        reprocess
+            .iter()
+            .any(|d| (d.as_secs_f64() - 1.0 / 5.0).abs() < 1e-9),
+        "periodic update must be at 1.0/rat1 = 0.2s, got {reprocess:?}"
+    );
+}
+
+/// BUG 3 regression — when `rat1 <= 0.1`, C schedules no periodic update;
+/// the autocount start must not emit a periodic `ReprocessAfter`.
+#[test]
+fn test_autocount_start_no_periodic_update_when_rat1_too_low() {
+    use epics_base_rs::server::record::ProcessAction;
+
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp1 = 1.0;
+    rec.rat1 = 0.05; // <= 0.1 — no periodic update
+    rec.cont = 1;
+    rec.dly1 = 0.0;
+
+    let outcome = rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "autocount must transition to COUNTING");
+    assert!(
+        !outcome
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "rat1 <= 0.1 must not schedule a periodic update"
+    );
+}
+
+/// BUG 4 regression — C scalerRecord.c:623-624 fires the COUTP link on every
+/// CNT write inside `special()`. The CNT-triggered `process()` must emit a
+/// `WriteDbLink` to COUTP.
+#[test]
+fn test_special_cnt_fires_coutp() {
+    use epics_base_rs::server::record::ProcessAction;
+
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    rec.init_record(1).unwrap();
+
+    // CNT write — special() must request the COUTP fire.
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+
+    // The CNT-triggered process() must emit a WriteDbLink to COUTP.
+    let outcome = rec.process().unwrap();
+    assert!(
+        outcome.actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "COUTP",
+                ..
+            }
+        )),
+        "special(CNT) must cause process() to fire the COUTP link (C:623-624)"
+    );
+
+    // The pending flag is consumed — a subsequent process() with no new CNT
+    // write must not re-fire COUTP.
+    let outcome2 = rec.process().unwrap();
+    assert!(
+        !outcome2.actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "COUTP",
+                ..
+            }
+        )),
+        "COUTP fire must not repeat without a new CNT write"
+    );
+}
+
+/// BUG 4 regression — a CNT=0 (stop) write also fires COUTP, matching C's
+/// unconditional `dbPutLink(&pscal->coutp, ...)` after the redundant guard.
+#[test]
+fn test_special_cnt_stop_fires_coutp() {
+    use epics_base_rs::server::record::ProcessAction;
+
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    rec.init_record(1).unwrap();
+
+    // CNT=0 while idle — not a redundant in-progress request, so special()
+    // still fires COUTP.
+    rec.cnt = 0;
+    rec.special("CNT", true).unwrap();
+    let outcome = rec.process().unwrap();
+    assert!(
+        outcome.actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "COUTP",
+                ..
+            }
+        )),
+        "special(CNT=0) must also fire the COUTP link"
+    );
+}

@@ -202,6 +202,19 @@ impl ModbusPortDriver {
         let histogram_axis_reason =
             base.create_param(PARAM_HISTOGRAM_TIME_AXIS, ParamType::Int32Array)?;
 
+        // C `drvModbusAsyn` constructor (drvModbusAsyn.cpp:226-230) seeds the
+        // statistics counters to 0 so a record reading them before the first
+        // poll gets a defined value.
+        for r in [
+            read_ok_reason,
+            write_ok_reason,
+            io_errors_reason,
+            last_io_reason,
+            max_io_reason,
+        ] {
+            base.set_int32_param(r, 0, 0)?;
+        }
+
         Ok(Self {
             base,
             engine,
@@ -281,8 +294,16 @@ impl ModbusPortDriver {
             addrs.insert(addr);
         }
         self.publish_stats()?;
+        // The statistics/control params are all set at asyn addr 0 (their
+        // `statistics.template` records bind `@asyn($(PORT) 0)`). Their
+        // changed-param list lives in addr 0's bucket, so flush addr 0 every
+        // cycle regardless of whether a data record happens to sit there —
+        // otherwise the statistics monitors never post.
+        self.base.call_param_callbacks(0)?;
         for addr in addrs {
-            self.base.call_param_callbacks(addr)?;
+            if addr != 0 {
+                self.base.call_param_callbacks(addr)?;
+            }
         }
         Ok(())
     }
@@ -344,7 +365,13 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
-        let dt = self.datatype_of(user.reason)?;
+        // C `drvModbusAsyn::readInt32` (drvModbusAsyn.cpp:653-723): only the
+        // `P_Data` reason runs the Modbus decode path; every other reason
+        // (statistics/control params) delegates to `asynPortDriver::readInt32`,
+        // returning the cached parameter-library value.
+        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
+            return self.base.get_int32_param(user.reason, user.addr);
+        };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
@@ -352,7 +379,10 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn read_int64(&mut self, user: &AsynUser) -> AsynResult<i64> {
-        let dt = self.datatype_of(user.reason)?;
+        // Non-data reason → cached parameter value (see `read_int32`).
+        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
+            return self.base.get_int64_param(user.reason, user.addr);
+        };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
@@ -360,7 +390,10 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
-        let dt = self.datatype_of(user.reason)?;
+        // Non-data reason → cached parameter value (see `read_int32`).
+        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
+            return self.base.get_float64_param(user.reason, user.addr);
+        };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
@@ -368,6 +401,18 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
+        // Non-data reason (e.g. ENABLE_HISTOGRAM) → cached parameter value;
+        // see `read_int32` for the C parity reference.
+        if self
+            .reason_to_datatype
+            .get(user.reason)
+            .copied()
+            .flatten()
+            .is_none()
+        {
+            let raw = self.base.get_uint32_param(user.reason, user.addr)?;
+            return Ok(if mask == 0 { raw } else { raw & mask });
+        }
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         self.touch(user.reason, user.addr);
         let raw = self.engine.data()[user.addr as usize] as u32;
@@ -956,6 +1001,93 @@ mod tests {
         driver
             .poll_cycle()
             .expect("poll_cycle must skip the stale out-of-range addr, not error");
+    }
+
+    /// BUG 1 regression — a statistics/control reason has no
+    /// `reason_to_datatype` entry. `read_int32` must return the cached
+    /// parameter value (C `readInt32` delegates `reason != P_Data` to
+    /// `asynPortDriver::readInt32`), not error.
+    #[test]
+    fn read_int32_returns_cached_value_for_statistics_reason() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_STATS_READ",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("non-absolute config must build");
+
+        // READ_OK is a statistics param — not a Modbus data parameter.
+        let read_ok = driver.read_ok_reason;
+        // Constructor seeds it to 0; reading it must succeed, not error.
+        let user = AsynUser::new(read_ok);
+        assert_eq!(
+            driver
+                .read_int32(&user)
+                .expect("statistics reason must be readable"),
+            0
+        );
+
+        // After the driver stages a new statistics value, the read reflects it.
+        driver.base.set_int32_param(read_ok, 0, 42).unwrap();
+        assert_eq!(driver.read_int32(&user).unwrap(), 42);
+
+        // The other statistics counters are equally readable.
+        for reason in [
+            driver.write_ok_reason,
+            driver.io_errors_reason,
+            driver.last_io_reason,
+            driver.max_io_reason,
+        ] {
+            let u = AsynUser::new(reason);
+            assert!(
+                driver.read_int32(&u).is_ok(),
+                "statistics reason {reason} must be readable via read_int32"
+            );
+        }
+    }
+
+    /// BUG 2 regression — when no data record sits at asyn addr 0, a poll
+    /// cycle must still flush addr 0's changed-param list so the statistics
+    /// monitors post. Bind a data record at addr 2, then verify a poll cycle
+    /// emits interrupt notifications for the statistics params at addr 0.
+    #[test]
+    fn poll_cycle_flushes_statistics_monitors_without_addr0_data_record() {
+        // ReadHoldingRegisters response for the 4-word buffer.
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let mut driver = ModbusPortDriver::new(
+            "MB_STATS_MON",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let read_ok_reason = driver.read_ok_reason;
+
+        // The only data record is at addr 2 — nothing at addr 0.
+        let mut ruser = AsynUser::new(reason);
+        ruser.addr = 2;
+        assert!(driver.read_int32(&ruser).is_ok());
+
+        let mut rx = driver.base.interrupts.subscribe_async();
+        driver.poll_cycle().expect("poll_cycle must succeed");
+
+        // The statistics params live at addr 0; their monitors must have
+        // posted even though no data record is bound there.
+        let mut saw_read_ok = false;
+        while let Ok(iv) = rx.try_recv() {
+            if iv.reason == read_ok_reason && iv.addr == 0 {
+                saw_read_ok = true;
+            }
+        }
+        assert!(
+            saw_read_ok,
+            "READ_OK statistics monitor must post at addr 0 after a poll cycle"
+        );
     }
 
     #[test]

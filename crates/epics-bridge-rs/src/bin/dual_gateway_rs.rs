@@ -260,6 +260,13 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
         read_only: args.ca_read_only,
         #[cfg(feature = "ca-gateway-tls")]
         tls: None,
+        // B10: the dual-gateway binary does not yet expose upstream
+        // TLS flags; upstream TLS falls back to the `EPICS_CA_TLS_*`
+        // environment variables honoured by `CaClient::new`.
+        #[cfg(feature = "ca-gateway-tls")]
+        upstream_tls: None,
+        #[cfg(feature = "ca-gateway-tls")]
+        upstream_tls_server_name: None,
     };
     tracing::info!("dual-gateway-rs: building CA gateway");
     let server = GatewayServer::build(config)

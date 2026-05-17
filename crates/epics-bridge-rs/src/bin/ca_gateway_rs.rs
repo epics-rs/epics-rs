@@ -103,6 +103,36 @@ struct Args {
     #[cfg(feature = "ca-gateway-tls")]
     #[arg(long)]
     tls_client_ca: Option<PathBuf>,
+
+    /// B10: CA-authority bundle (PEM) for verifying the *upstream*
+    /// IOC's server certificate. When set, the gateway's upstream
+    /// CaClient connects to the real IOC over TLS. Independent of the
+    /// downstream `--tls-*` termination. Available with
+    /// `--features ca-gateway-tls`.
+    #[cfg(feature = "ca-gateway-tls")]
+    #[arg(long)]
+    upstream_tls_roots: Option<PathBuf>,
+
+    /// B10: client certificate (PEM) presented to the upstream IOC
+    /// for mTLS. Pair with --upstream-tls-client-key. Optional —
+    /// omit for server-auth-only upstream TLS.
+    #[cfg(feature = "ca-gateway-tls")]
+    #[arg(long)]
+    upstream_tls_client_cert: Option<PathBuf>,
+
+    /// B10: client private key (PEM) for upstream mTLS. Required when
+    /// --upstream-tls-client-cert is set.
+    #[cfg(feature = "ca-gateway-tls")]
+    #[arg(long)]
+    upstream_tls_client_key: Option<PathBuf>,
+
+    /// B10: SNI / cert-hostname-verification name for the upstream
+    /// TLS connection. Set to the DNS name in the upstream IOC's
+    /// server certificate when it is hostname-bound rather than
+    /// IP-bound.
+    #[cfg(feature = "ca-gateway-tls")]
+    #[arg(long)]
+    upstream_tls_server_name: Option<String>,
 }
 
 #[cfg(feature = "ca-gateway-tls")]
@@ -133,6 +163,40 @@ fn build_tls(
         TlsConfig::Server(arc) => Ok(Some(arc)),
         TlsConfig::Client(_) => Err("expected server TlsConfig".into()),
     }
+}
+
+/// B10: build the upstream-side TLS client config from the
+/// `--upstream-tls-*` flags. Returns `Ok(None)` when
+/// `--upstream-tls-roots` is unset (upstream stays plaintext, or
+/// falls back to `EPICS_CA_TLS_*` env vars inside `CaClient::new`).
+#[cfg(feature = "ca-gateway-tls")]
+fn build_upstream_tls(args: &Args) -> Result<Option<epics_ca_rs::tls::TlsConfig>, String> {
+    use epics_ca_rs::tls::{TlsConfig, load_certs, load_private_key, load_root_store};
+    let roots_path = match &args.upstream_tls_roots {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let roots = load_root_store(roots_path.to_str().unwrap_or_default())
+        .map_err(|e| format!("loading upstream TLS roots: {e}"))?;
+    let cfg = match (&args.upstream_tls_client_cert, &args.upstream_tls_client_key) {
+        (None, None) => TlsConfig::client_from_roots(roots),
+        (Some(cert), Some(key)) => {
+            let chain = load_certs(cert.to_str().unwrap_or_default())
+                .map_err(|e| format!("loading upstream client cert: {e}"))?;
+            let priv_key = load_private_key(key.to_str().unwrap_or_default())
+                .map_err(|e| format!("loading upstream client key: {e}"))?;
+            TlsConfig::client_mtls(roots, chain, priv_key)
+                .map_err(|e| format!("upstream mTLS build: {e}"))?
+        }
+        _ => {
+            return Err(
+                "--upstream-tls-client-cert and --upstream-tls-client-key must both be \
+                 set or both unset"
+                    .into(),
+            );
+        }
+    };
+    Ok(Some(cfg))
 }
 
 async fn run_once(config: GatewayConfig) -> Result<(), String> {
@@ -188,6 +252,13 @@ async fn main() -> ExitCode {
             tracing::error!(error = %e, "ca-gateway-rs: TLS init failed");
             std::process::exit(2);
         }),
+        #[cfg(feature = "ca-gateway-tls")]
+        upstream_tls: build_upstream_tls(&args).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "ca-gateway-rs: upstream TLS init failed");
+            std::process::exit(2);
+        }),
+        #[cfg(feature = "ca-gateway-tls")]
+        upstream_tls_server_name: args.upstream_tls_server_name.clone(),
     };
 
     if args.supervised {

@@ -29,7 +29,8 @@ use crate::pvdata::{FieldDesc, PvField};
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
     DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, SubscriptionHandle, op_get, op_monitor,
-    op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle, op_put, op_rpc,
+    op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle, op_process, op_put,
+    op_put_get, op_rpc,
 };
 use super::search_engine::SearchEngine;
 
@@ -909,13 +910,31 @@ impl PvaClient {
     /// Like [`Self::pvinfo`] but also reports which server replied —
     /// useful for diagnostics on multi-source / failover deployments.
     pub async fn pvinfo_full(&self, pv_name: &str) -> PvaResult<(FieldDesc, SocketAddr)> {
+        let (intro, addr, _cred) = self.pvinfo_full_with_credentials(pv_name).await?;
+        Ok((intro, addr))
+    }
+
+    /// Like [`Self::pvinfo_full`] but additionally reports the
+    /// server's verified X.509 identity (`pvas://` only) — the
+    /// credentials pvxs `pvxinfo -v` prints. The third tuple element
+    /// is `None` for a plain `pva://` connection or a TLS server that
+    /// presented no usable certificate.
+    pub async fn pvinfo_full_with_credentials(
+        &self,
+        pv_name: &str,
+    ) -> PvaResult<(FieldDesc, SocketAddr, Option<crate::auth::X509Credentials>)> {
         let ch = self.channel(pv_name).await?;
         let intro = crate::client_native::ops_v2::op_get_field(&ch, "", self.inner.timeout).await?;
-        let server_addr = match ch.current_state() {
-            super::channel::ChannelState::Active { server, .. } => server.addr,
-            _ => SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+        let (server_addr, cred) = match ch.current_state() {
+            super::channel::ChannelState::Active { server, .. } => {
+                (server.addr, server.server_identity().cloned())
+            }
+            _ => (
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+                None,
+            ),
         };
-        Ok((intro, server_addr))
+        Ok((intro, server_addr, cred))
     }
 
     pub async fn pvrpc(
@@ -926,6 +945,49 @@ impl PvaClient {
     ) -> PvaResult<(FieldDesc, PvField)> {
         let ch = self.channel(pv_name).await?;
         op_rpc(&ch, request_desc, request_value, self.inner.timeout).await
+    }
+
+    /// Same as [`Self::pvrpc`] but pins the operation to a specific
+    /// server, bypassing UDP search. Mirrors pvxs
+    /// `ctxt.rpc(name).server(addr)` (`tools/list.cpp`). Required for
+    /// querying server-internal PVs (e.g. the special `server` PV used
+    /// by `pvlist <ip>`) which are not announced via search.
+    pub async fn pvrpc_from(
+        &self,
+        pv_name: &str,
+        server: SocketAddr,
+        request_desc: &FieldDesc,
+        request_value: &PvField,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel_with_forced(pv_name, Some(server)).await?;
+        op_rpc(&ch, request_desc, request_value, self.inner.timeout).await
+    }
+
+    /// PVA `PUT_GET` (cmd 12) — atomic put-then-get. PUTs `value_str`
+    /// to the channel's `.value` field and returns the (possibly
+    /// post-processed) value back in one round trip. Returns the
+    /// readback `(introspection, value)`.
+    ///
+    /// Use this when a write has a side effect on the value (a record
+    /// that recalculates on process) and you want the updated value
+    /// without a separate GET — it is a single wire operation and the
+    /// server applies the put then reads back atomically.
+    pub async fn pvput_get(
+        &self,
+        pv_name: &str,
+        value_str: &str,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        op_put_get(&ch, value_str, self.inner.timeout).await
+    }
+
+    /// PVA `PROCESS` (cmd 16) — trigger record processing without
+    /// transferring a value. The wire equivalent of an EPICS
+    /// `caput .PROC` / `dbProcess`. Succeeds with `()`; a processing
+    /// failure surfaces as a [`PvaError::Protocol`].
+    pub async fn pvprocess(&self, pv_name: &str) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        op_process(&ch, self.inner.timeout).await
     }
 
     /// Snapshot of the client's current state — channel cache size,

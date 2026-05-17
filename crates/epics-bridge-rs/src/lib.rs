@@ -2,18 +2,20 @@
 //!
 //! EPICS protocol bridge/adapter hub.
 //!
-//! This crate hosts multiple bridge implementations as feature-gated
+//! This crate hosts four bridge implementations as feature-gated
 //! sub-modules. Each bridge connects EPICS data sources to network
-//! protocols (CA or PVA).
+//! protocols (CA or PVA). All four are implemented.
 //!
 //! ## Sub-modules
 //!
 //! | Module | Feature | Description |
 //! |--------|---------|-------------|
 //! | [`qsrv`] | `qsrv` (default) | Record → pvAccess channels (C++ QSRV equivalent) |
-//! | `ca_gateway` | `ca-gateway` | CA fan-out gateway (C++ ca-gateway equivalent) — *planned* |
-//! | `pvalink` | `pvalink` | PVA links for record INP/OUT — *planned* |
+//! | `ca_gateway` | `ca-gateway` | CA fan-out gateway (C++ ca-gateway equivalent) |
+//! | `pvalink` | `pvalink` | PVA links for record INP/OUT fields |
 //! | [`pva_gateway`] | `pva-gateway` | PVA-to-PVA proxy (mirrors `pva2pva/p2pApp`) |
+//!
+//! Enable a bridge with its Cargo feature; `qsrv` is on by default.
 //!
 //! ## QSRV (Record ↔ PVA bridge)
 //!
@@ -27,12 +29,42 @@
 //! - [`GroupChannel`] serves multi-record composite PVs from JSON config.
 //! - [`BridgeMonitor`] / [`GroupMonitor`] bridge `DbSubscription` events to PVA monitor updates.
 //!
-//! The `ChannelProvider`, `Channel`, and `PvaMonitor` traits are defined here
-//! temporarily. They will move to `epics-pva-rs` once the PVA server is
-//! implemented by the spvirit maintainer.
+//! The `ChannelProvider`, `Channel`, and `PvaMonitor` traits are defined in
+//! [`qsrv`]; `qsrv::pva_adapter::QsrvPvStore` bridges them to the native
+//! [`epics_pva_rs::server_native::ChannelSource`] trait so the native PVA
+//! server can serve qsrv channels directly.
+//!
+//! ## ca-gateway (CA fan-out gateway)
+//!
+//! A pure-Rust port of EPICS `ca-gateway`: a Channel Access proxy that
+//! accepts downstream client connections, connects to upstream IOCs,
+//! caches PV values and fans out monitor events, applies `.pvlist`
+//! access-security rules, and supports regex PV-name aliasing. Channel
+//! resolution is lazy on-demand (a downstream search drives an upstream
+//! subscription); preloading from a file is an opt-in convenience.
+//!
+//! ## pvalink (PVA links for record INP/OUT)
+//!
+//! Resolves record INP/OUT link strings of the form `@pva://<remote-pv>`
+//! to a live PVA client that periodically reads the remote PV (INP) or
+//! pushes record output to it (OUT). Mirrors pvxs `ioc/pvalink*.cpp`.
+//!
+//! ## pva-gateway (PVA-to-PVA proxy)
+//!
+//! A PVA-to-PVA proxy mirroring C++ `pva2pva/p2pApp`: one upstream
+//! `PvaClient` keeps a per-PV channel cache, and one downstream
+//! `PvaServer` forwards GET / PUT / MONITOR / GET_FIELD operations
+//! through that cache.
 
 pub mod error;
 pub use error::{BridgeError, BridgeResult};
+
+// `EpicsValue` <-> `PvField` conversion helpers. Shared by the QSRV
+// bridge and PVA links — both need to translate record values to/from
+// pvData. Gated on the consumers that enable `epics-pva-rs` (the only
+// extra dependency it uses) so a CA-only build still drops it.
+#[cfg(any(feature = "qsrv", feature = "pvalink"))]
+pub mod convert;
 
 #[cfg(feature = "qsrv")]
 pub mod qsrv;

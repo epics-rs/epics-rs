@@ -5,7 +5,9 @@
 //! composable [`Layer`]s that add cross-cutting concerns:
 //!
 //! - [`AclLayer`] — refuse `has_pv` / `put_value` for PV names that
-//!   match the deny list
+//!   match the deny list. Patterns may be glob (`*` wildcard) or,
+//!   via [`AclConfig::deny_regex`] / [`AclConfig::allow_regex`],
+//!   full anchored regular expressions (B7).
 //! - [`ReadOnlyLayer`] — fail every PUT, even if upstream allows
 //!   it. Mirrors the existing `read_only` flag but as a composable
 //!   layer so operators can stack it with audit / ACL.
@@ -149,31 +151,109 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
 
 // ── AclLayer ─────────────────────────────────────────────────────
 
-/// Pattern-matched access control. PV names matching any entry in
-/// `deny` are rejected at the layer before reaching the upstream
+/// Pattern-matched access control. PV names matching any `deny`
+/// pattern are rejected at the layer before reaching the upstream
 /// proxy. `allow_only` (when non-empty) flips the policy — only
 /// names matching one of these patterns get through.
 ///
-/// Patterns are simple glob-style — `*` matches any chars, exact
-/// match otherwise. For full regex see the per-rule `pvlist` system
-/// in the CA gateway; here we keep the surface minimal.
+/// B7: two pattern syntaxes are supported and may be mixed freely.
+///
+/// * **Glob** — the `deny` / `allow_only` `Vec<String>` fields.
+///   `*` matches any run of characters; a pattern with no `*` is an
+///   exact match. Backward-compatible with the original AclConfig.
+/// * **Regex** — added via [`AclConfig::deny_regex`] /
+///   [`AclConfig::allow_regex`]. The pattern is a full
+///   [`regex`]-crate regular expression, **anchored** at both ends
+///   (the matcher wraps it as `^(?:pattern)$`) so `BL10C:.*`
+///   matches the same names a `BL10C:*` glob would, and a bare
+///   `MOTOR:VAL` regex matches only that exact name. Regexes are
+///   compiled once at config-build time, not per PV check.
+///
+/// A name is allowed iff it matches **no** deny pattern (glob or
+/// regex) AND, when any allow pattern is configured, matches **at
+/// least one** allow pattern (glob or regex). Deny always wins.
 #[derive(Clone, Default)]
 pub struct AclConfig {
+    /// Glob deny patterns (`*` wildcard / exact match).
     pub deny: Vec<String>,
+    /// Glob allow-only patterns (`*` wildcard / exact match).
     pub allow_only: Vec<String>,
+    /// B7: compiled regex deny patterns. Built via
+    /// [`AclConfig::deny_regex`]; anchored at both ends.
+    deny_re: Vec<regex::Regex>,
+    /// B7: compiled regex allow-only patterns. Built via
+    /// [`AclConfig::allow_regex`]; anchored at both ends.
+    allow_re: Vec<regex::Regex>,
 }
 
 impl AclConfig {
+    /// B7: add a regex pattern to the deny list. The pattern is
+    /// anchored (`^(?:pattern)$`) and compiled immediately; an
+    /// invalid pattern returns the [`regex::Error`] so the operator
+    /// learns about the typo at config time, not on the first PV
+    /// check.
+    pub fn deny_regex(mut self, pattern: &str) -> Result<Self, regex::Error> {
+        self.deny_re.push(compile_anchored(pattern)?);
+        Ok(self)
+    }
+
+    /// B7: add a regex pattern to the allow-only list. Anchored and
+    /// compiled like [`Self::deny_regex`]. As with glob
+    /// `allow_only`, a non-empty allow list flips the policy to
+    /// default-deny.
+    pub fn allow_regex(mut self, pattern: &str) -> Result<Self, regex::Error> {
+        self.allow_re.push(compile_anchored(pattern)?);
+        Ok(self)
+    }
+
+    /// True iff any allow pattern (glob or regex) is configured —
+    /// i.e. the policy is default-deny.
+    fn has_allow_list(&self) -> bool {
+        !self.allow_only.is_empty() || !self.allow_re.is_empty()
+    }
+
     pub fn allowed(&self, name: &str) -> bool {
-        if self.deny.iter().any(|p| matches_pattern(p, name)) {
-            return false;
-        }
-        if !self.allow_only.is_empty() && !self.allow_only.iter().any(|p| matches_pattern(p, name))
+        // Deny always wins — glob or regex.
+        if self.deny.iter().any(|p| matches_pattern(p, name))
+            || self.deny_re.iter().any(|re| re.is_match(name))
         {
             return false;
         }
+        // Allow-only: when configured, the name must match at least
+        // one allow pattern (glob or regex).
+        if self.has_allow_list() {
+            let allowed = self.allow_only.iter().any(|p| matches_pattern(p, name))
+                || self.allow_re.iter().any(|re| re.is_match(name));
+            if !allowed {
+                return false;
+            }
+        }
         true
     }
+}
+
+/// B7: per-pattern compiled-program size limit for operator-supplied
+/// ACL regexes. 256 KiB is far more than any realistic PV-name
+/// pattern needs (a generous allow/deny list compiles to a few KiB)
+/// while still rejecting a pathological pattern up front instead of
+/// letting it consume unbounded memory at compile time.
+const ACL_REGEX_SIZE_LIMIT: usize = 256 * 1024;
+
+/// B7: compile `pattern` as a both-ends-anchored regex so a regex
+/// ACL entry matches whole PV names, mirroring glob semantics
+/// (`BL10C:*` ≡ `BL10C:.*`, bare token ≡ exact match). Wrapping in a
+/// non-capturing group keeps top-level alternation (`a|b`) anchored
+/// as `^(?:a|b)$` rather than `^a|b$`.
+///
+/// Compiled via [`regex::RegexBuilder`] with explicit `size_limit`
+/// and `dfa_size_limit` so an operator-supplied pathological pattern
+/// fails fast with a bounded `regex::Error` rather than compiling
+/// with the crate defaults (which allow far larger programs).
+fn compile_anchored(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
+        .size_limit(ACL_REGEX_SIZE_LIMIT)
+        .dfa_size_limit(ACL_REGEX_SIZE_LIMIT)
+        .build()
 }
 
 fn matches_pattern(pattern: &str, name: &str) -> bool {
@@ -837,10 +917,141 @@ mod tests {
         let cfg = AclConfig {
             allow_only: vec!["MOTOR:*".into()],
             deny: vec!["MOTOR:JOG:*".into()],
+            ..Default::default()
         };
         assert!(cfg.allowed("MOTOR:VAL"));
         assert!(!cfg.allowed("MOTOR:JOG:UP"));
         assert!(!cfg.allowed("OTHER:PV"));
+    }
+
+    // ── B7: regex ACL ────────────────────────────────────────────
+
+    /// A regex deny entry is anchored at both ends, so `BL10C:.*`
+    /// matches the same names a `BL10C:*` glob would.
+    #[test]
+    fn acl_regex_deny_anchored() {
+        let cfg = AclConfig::default()
+            .deny_regex(r"BL10C:.*:HV")
+            .unwrap();
+        assert!(!cfg.allowed("BL10C:RFP:HV"));
+        assert!(!cfg.allowed("BL10C::HV"));
+        // Anchored: the regex must match the WHOLE name.
+        assert!(cfg.allowed("X:BL10C:RFP:HV"));
+        assert!(cfg.allowed("BL10C:RFP:HV:SETPOINT"));
+        assert!(cfg.allowed("BL10D:RFP:HV"));
+    }
+
+    /// A regex allow-only entry flips the policy to default-deny,
+    /// exactly like a glob allow-only entry.
+    #[test]
+    fn acl_regex_allow_only_default_denies() {
+        let cfg = AclConfig::default()
+            .allow_regex(r"(SR|BL)\d+:.*")
+            .unwrap();
+        assert!(cfg.allowed("SR01:CURRENT"));
+        assert!(cfg.allowed("BL10:SHUTTER"));
+        assert!(!cfg.allowed("RFP:HV"));
+        // Alternation stays anchored as ^(?:(SR|BL)\d+:.*)$ — a name
+        // that merely contains a branch must not slip through.
+        assert!(!cfg.allowed("X-SR01:CURRENT"));
+    }
+
+    /// Glob and regex patterns may be mixed in the same config;
+    /// deny (glob or regex) always wins over allow (glob or regex).
+    #[test]
+    fn acl_glob_and_regex_mixed() {
+        let cfg = AclConfig {
+            allow_only: vec!["MOTOR:*".into()],
+            ..Default::default()
+        }
+        .allow_regex(r"TEMP:\d+")
+        .unwrap()
+        .deny_regex(r"MOTOR:.*:JOG")
+        .unwrap();
+        // Glob allow.
+        assert!(cfg.allowed("MOTOR:X:VAL"));
+        // Regex allow.
+        assert!(cfg.allowed("TEMP:42"));
+        assert!(!cfg.allowed("TEMP:hot")); // \d+ requires digits
+        // Regex deny beats glob allow.
+        assert!(!cfg.allowed("MOTOR:X:JOG"));
+        // Not in any allow list → default-deny.
+        assert!(!cfg.allowed("RFP:HV"));
+    }
+
+    /// An invalid regex is reported at config-build time, not on the
+    /// first PV check.
+    #[test]
+    fn acl_invalid_regex_rejected_at_build() {
+        assert!(AclConfig::default().deny_regex(r"BL10C:[").is_err());
+        assert!(AclConfig::default().allow_regex(r"(unclosed").is_err());
+    }
+
+    /// B7: a pathological operator-supplied ACL regex whose compiled
+    /// program exceeds `ACL_REGEX_SIZE_LIMIT` must fail fast at build
+    /// time with a bounded `regex::Error` rather than compiling with
+    /// the crate's larger defaults. A bounded counted repetition of a
+    /// large bounded inner repetition blows the program size well
+    /// past 256 KiB while staying a syntactically valid pattern.
+    #[test]
+    fn acl_oversized_regex_rejected_by_size_limit() {
+        // `(?:a{1000}){1000}` — syntactically valid, but the compiled
+        // program is far larger than the 256 KiB ACL limit.
+        let pathological = r"(?:a{1000}){1000}";
+
+        // `compile_anchored` is the single funnel both `deny_regex`
+        // and `allow_regex` route through — test it directly so the
+        // failing error variant is observable (`AclConfig` is not
+        // `Debug`, so `expect_err` on the builder is unavailable).
+        match compile_anchored(pathological) {
+            Err(regex::Error::CompiledTooBig(_)) => {}
+            other => panic!("expected CompiledTooBig, got {other:?}"),
+        }
+        // Both ACL builder entry points reject it.
+        assert!(
+            AclConfig::default().deny_regex(pathological).is_err(),
+            "oversized deny regex must be rejected"
+        );
+        assert!(
+            AclConfig::default().allow_regex(pathological).is_err(),
+            "oversized allow regex must be rejected"
+        );
+
+        // A realistic ACL pattern still compiles fine under the limit.
+        assert!(compile_anchored(r"BL\d+C:.*:HV").is_ok());
+        assert!(AclConfig::default().deny_regex(r"BL\d+C:.*:HV").is_ok());
+    }
+
+    /// The regex ACL still gates through the `AclLayer` wrapper on a
+    /// real `ChannelSource`, not just the bare `AclConfig::allowed`.
+    #[tokio::test]
+    async fn acl_layer_applies_regex_via_channel_source() {
+        use super::super::channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL};
+        use super::super::source::GatewayChannelSource;
+        use epics_pva_rs::client::PvaClient;
+
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
+        let inner = GatewayChannelSource::new(cache);
+
+        let cfg = AclConfig::default()
+            .deny_regex(r"SECRET:.*")
+            .unwrap();
+        let acl = AclLayer::new(cfg).layer(inner);
+
+        // Denied name short-circuits at the layer — has_pv is false
+        // and no upstream search is triggered.
+        assert!(!acl.has_pv("SECRET:KEY").await);
+        // put_value on a denied name returns the ACL error without
+        // reaching the upstream.
+        let err = acl
+            .put_value(
+                "SECRET:KEY",
+                PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0)),
+            )
+            .await
+            .expect_err("regex-denied PUT must fail at the ACL layer");
+        assert!(err.contains("denied"));
     }
 
     /// Audit-event classifier tags ACL/read-only error messages

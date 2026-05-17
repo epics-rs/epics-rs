@@ -8,7 +8,7 @@ use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, Snapshot};
 use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
-use super::convert::{epics_to_pv_field, epics_to_scalar};
+use crate::convert::{epics_to_pv_field, epics_to_scalar};
 
 /// Field mapping type, corresponding to C++ QSRV PVIFBuilder types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,14 +209,14 @@ pub fn snapshot_to_pv_structure(snapshot: &Snapshot, nt_type: NtType) -> PvStruc
 pub fn pv_structure_to_epics(pv: &PvStructure) -> Option<EpicsValue> {
     let field = pv.get_field("value")?;
     match field {
-        PvField::Scalar(sv) => Some(super::convert::scalar_to_epics(sv)),
+        PvField::Scalar(sv) => Some(crate::convert::scalar_to_epics(sv)),
         PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_) => {
-            super::convert::pv_field_to_epics(field)
+            crate::convert::pv_field_to_epics(field)
         }
         PvField::Structure(s) => {
             // NTEnum: value is a sub-structure with "index" field
             if let Some(PvField::Scalar(sv)) = s.get_field("index") {
-                let idx = super::convert::scalar_to_epics(sv);
+                let idx = crate::convert::scalar_to_epics(sv);
                 match idx {
                     EpicsValue::Enum(v) => Some(EpicsValue::Enum(v)),
                     other => Some(EpicsValue::Enum(

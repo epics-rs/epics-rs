@@ -118,6 +118,17 @@ pub struct UpstreamManagerConfig {
     pub stats: Arc<Stats>,
     pub read_only: bool,
     pub beacon_anomaly: Arc<super::beacon::BeaconAnomaly>,
+    /// B10: optional TLS client config for the upstream `CaClient`
+    /// circuits to the real IOC. `None` keeps upstream traffic
+    /// plaintext (the default). Independent of downstream TLS
+    /// termination. Available with the `ca-gateway-tls` feature.
+    #[cfg(feature = "ca-gateway-tls")]
+    pub upstream_tls: Option<epics_ca_rs::tls::TlsConfig>,
+    /// B10: SNI / cert-hostname-verification override for the
+    /// upstream TLS connections. Available with the `ca-gateway-tls`
+    /// feature.
+    #[cfg(feature = "ca-gateway-tls")]
+    pub upstream_tls_server_name: Option<String>,
 }
 
 /// Manages upstream CA client connections for the gateway.
@@ -154,6 +165,28 @@ impl UpstreamManager {
     /// enforce the gateway's full policy (read-only, ACL, host deny,
     /// putlog) before forwarding upstream.
     pub async fn new(cfg: UpstreamManagerConfig) -> BridgeResult<Self> {
+        // B10: when an upstream TLS config is supplied, build the
+        // `CaClient` with it so every TCP virtual circuit to the real
+        // IOC is wrapped in TLS. `CaClient::new()` would instead pick
+        // TLS up from the `EPICS_CA_TLS_*` env vars — explicit config
+        // wins, so the gateway can run a TLS upstream policy distinct
+        // from whatever the ambient environment specifies. Without an
+        // upstream-TLS config we keep `CaClient::new()` so the env-var
+        // path still works for operators who prefer it.
+        #[cfg(feature = "ca-gateway-tls")]
+        let client = if cfg.upstream_tls.is_some() || cfg.upstream_tls_server_name.is_some() {
+            let mut client_cfg = epics_ca_rs::client::CaClientConfig::default();
+            client_cfg.tls = cfg.upstream_tls.clone();
+            client_cfg.tls_server_name = cfg.upstream_tls_server_name.clone();
+            CaClient::new_with_config(client_cfg)
+                .await
+                .map_err(|e| BridgeError::PutRejected(format!("CaClient init (TLS): {e}")))?
+        } else {
+            CaClient::new()
+                .await
+                .map_err(|e| BridgeError::PutRejected(format!("CaClient init: {e}")))?
+        };
+        #[cfg(not(feature = "ca-gateway-tls"))]
         let client = CaClient::new()
             .await
             .map_err(|e| BridgeError::PutRejected(format!("CaClient init: {e}")))?;
@@ -401,9 +434,25 @@ impl UpstreamManager {
                     }
 
                     // Push to shadow PvDatabase to fan out to downstream clients
-                    let _ = db_clone
+                    let post_result = db_clone
                         .put_pv_and_post(&name, snapshot.value.clone())
                         .await;
+                    // B5 RATE_STATS: count the monitor post fanned
+                    // out downstream (C++ gateServer::postEventCount).
+                    // Count only on a SUCCESSFUL fan-out so
+                    // `postEventCount` stays consistent with
+                    // `clientEventCount`, which counts successes — a
+                    // failed `put_pv_and_post` (e.g. shadow PV missing)
+                    // forwarded nothing downstream.
+                    match post_result {
+                        Ok(()) => stats_for_task.record_post_event(),
+                        Err(e) => tracing::debug!(
+                            pv = %name,
+                            error = %e,
+                            "ca-gateway-rs: shadow put_pv_and_post failed; \
+                             postEventCount not incremented"
+                        ),
+                    }
 
                     // Re-arm the backoff after a successful event.
                     backoff = Duration::from_millis(250);
@@ -793,6 +842,10 @@ mod tests {
             stats: env.stats.clone(),
             read_only: false,
             beacon_anomaly: env.beacon_anomaly.clone(),
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls: None,
+            #[cfg(feature = "ca-gateway-tls")]
+            upstream_tls_server_name: None,
         })
         .await;
         assert!(mgr.is_ok());
@@ -800,6 +853,44 @@ mod tests {
         let mgr = mgr.unwrap();
         assert_eq!(mgr.subscription_count(), 0);
         assert!(!mgr.is_subscribed("ANY"));
+    }
+
+    /// B10: an upstream `CaClient` constructed with a TLS client
+    /// config must build successfully. The config is plumbed through
+    /// `UpstreamManagerConfig` and reaches `CaClient::new_with_config`.
+    /// We do not connect to a real IOC here — the assertion is that
+    /// the TLS-configured construction path compiles and runs.
+    #[cfg(feature = "ca-gateway-tls")]
+    #[tokio::test]
+    async fn manager_construct_with_upstream_tls() {
+        use epics_ca_rs::tls::{Roots, TlsConfig};
+
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let db = Arc::new(PvDatabase::new());
+        let env = dummy_env();
+        // An empty root store is sufficient to exercise the
+        // server-auth client-config build path — no actual TLS
+        // handshake happens without a connection.
+        let tls = TlsConfig::client_from_roots(Roots::empty());
+        let mgr = UpstreamManager::new(UpstreamManagerConfig {
+            cache,
+            shadow_db: db,
+            access: env.access.clone(),
+            pvlist: env.pvlist.clone(),
+            putlog: None,
+            stats: env.stats.clone(),
+            read_only: false,
+            beacon_anomaly: env.beacon_anomaly.clone(),
+            upstream_tls: Some(tls),
+            upstream_tls_server_name: Some("ioc.example.com".to_string()),
+        })
+        .await;
+        assert!(
+            mgr.is_ok(),
+            "upstream TLS-configured CaClient failed to build: {:?}",
+            mgr.err()
+        );
+        assert_eq!(mgr.unwrap().subscription_count(), 0);
     }
 
     #[test]

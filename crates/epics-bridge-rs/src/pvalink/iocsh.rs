@@ -157,6 +157,12 @@ pub fn dbpvxr_command(resolver: PvaLinkResolver) -> CommandDef {
                                     hw.kind, hw.args
                                 ));
                             }
+                            epics_base_rs::server::record::ParsedLink::Calc(calc) => {
+                                ctx.println(&format!(
+                                    "    {field}={raw:?}  calc link expr={:?} args={:?}",
+                                    calc.expr, calc.args
+                                ));
+                            }
                         }
                     }
                 }

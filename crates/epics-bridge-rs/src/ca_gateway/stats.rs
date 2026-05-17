@@ -44,12 +44,19 @@
 //! | `<prefix>disconnected` | Long | deadCount (alias — C source treats these as the same bucket) |
 //! | `<prefix>clientEventRate` | Double | eventRate |
 //!
-//! Not implemented (intentional scope — operational metrics covered by
-//! the [`metrics`] crate Prometheus export instead):
-//! - `fd` (open-file-descriptor count) — Unix-specific syscalls
-//! - RATE_STATS internals (`clientEventCount`, `postEventCount`,
-//!   `loopCount`) — scheduler-loop instrumentation tied to the C++
-//!   event-driven main loop; the Rust async runtime has no equivalent.
+//! RATE_STATS internals (B5) — tokio-model equivalents of the C++
+//! ca-gateway `gateServer` RATE_STATS counters from `gateServer.cc`.
+//! The C source increments these inside its event-driven main loop;
+//! the Rust port increments atomic counters at the equivalent points
+//! (events received from upstream, monitor posts fanned out
+//! downstream, run-loop iterations):
+//!
+//! | PV | Type | Maps to |
+//! |----|------|---------|
+//! | `<prefix>fd` | Long | Current open file-descriptor count |
+//! | `<prefix>clientEventCount` | Long | Cumulative upstream events received |
+//! | `<prefix>postEventCount` | Long | Cumulative monitor posts fanned downstream |
+//! | `<prefix>loopCount` | Long | Cumulative gateway run-loop iterations |
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,6 +79,17 @@ pub struct Stats {
     pub read_only_rejects: AtomicU64,
     /// Heartbeat counter.
     pub heartbeat: AtomicU64,
+    /// B5 RATE_STATS: cumulative monitor posts fanned out to the
+    /// downstream shadow database. Incremented once per
+    /// `put_pv_and_post` in the upstream forwarding task. Mirrors C++
+    /// ca-gateway `gateServer::postEventCount`.
+    pub post_event_count: AtomicU64,
+    /// B5 RATE_STATS: cumulative gateway run-loop iterations. The C++
+    /// gateway increments this per fdManager event-loop pass; the
+    /// tokio port has no single event loop, so it is incremented once
+    /// per periodic maintenance tick (cleanup / stats / heartbeat
+    /// timers each call `record_loop`). Mirrors `gateServer::loopCount`.
+    pub loop_count: AtomicU64,
     /// Per-host connection set, kept behind a mutex for distinct counting.
     per_host: Mutex<HashSet<String>>,
     /// Last refresh timestamp for event rate calculation.
@@ -88,6 +106,8 @@ impl Stats {
             put_count: AtomicU64::new(0),
             read_only_rejects: AtomicU64::new(0),
             heartbeat: AtomicU64::new(0),
+            post_event_count: AtomicU64::new(0),
+            loop_count: AtomicU64::new(0),
             per_host: Mutex::new(HashSet::new()),
             last_refresh: Mutex::new(Instant::now()),
             last_total_events: AtomicU64::new(0),
@@ -102,6 +122,19 @@ impl Stats {
     /// Record a put operation.
     pub fn record_put(&self) {
         self.put_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// B5: record a monitor post fanned out to the downstream shadow
+    /// database. Called once per `put_pv_and_post` in the upstream
+    /// forwarding task.
+    pub fn record_post_event(&self) {
+        self.post_event_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// B5: record one gateway run-loop iteration. Called from each
+    /// periodic maintenance tick (cleanup / stats / heartbeat).
+    pub fn record_loop(&self) {
+        self.loop_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a put that was rejected by read-only mode.
@@ -160,6 +193,12 @@ impl Stats {
             ("connecting", EpicsValue::Long(0)),
             ("disconnected", EpicsValue::Long(0)),
             ("clientEventRate", EpicsValue::Double(0.0)),
+            // B5: RATE_STATS internals — tokio-model equivalents of
+            // the C++ ca-gateway gateServer counters.
+            ("fd", EpicsValue::Long(0)),
+            ("clientEventCount", EpicsValue::Long(0)),
+            ("postEventCount", EpicsValue::Long(0)),
+            ("loopCount", EpicsValue::Long(0)),
         ] {
             let pv = format!("{p}{suffix}");
             if let Err(e) = db.add_pv(&pv, init).await {
@@ -214,6 +253,15 @@ impl Stats {
         let heartbeat = self.heartbeat.load(Ordering::Relaxed);
         let host_count = self.host_count().await;
 
+        // B5 RATE_STATS internals.
+        let post_event_count = self.post_event_count.load(Ordering::Relaxed);
+        let loop_count = self.loop_count.load(Ordering::Relaxed);
+        // `clientEventCount` is the same upstream-event source as
+        // `total_events` — the C++ gateway exposes both the rate PV
+        // (`clientEventRate`) and the raw count (`clientEventCount`)
+        // from one counter.
+        let client_event_count = total_events;
+
         // Fan all 12 stats PV writes out concurrently. Each
         // `put_pv_and_post` is independent (no shared lock between them
         // beyond the per-PV `RwLock`), so a single `tokio::join!` cuts
@@ -245,8 +293,17 @@ impl Stats {
         let n_connecting_alias = format!("{p}connecting");
         let n_disconnected = format!("{p}disconnected");
         let n_client_event_rate = format!("{p}clientEventRate");
+        // B5 RATE_STATS PV names.
+        let n_fd = format!("{p}fd");
+        let n_client_event_count = format!("{p}clientEventCount");
+        let n_post_event_count = format!("{p}postEventCount");
+        let n_loop_count = format!("{p}loopCount");
         let connected = (active + inactive) as i32;
         let unconnected = (connecting + dead) as i32;
+        // Sample the live open-fd count. `open_fd_count` reads a kernel
+        // directory; on the rare platform where neither exists, keep
+        // the PV at its previous value rather than posting a bogus 0.
+        let fd_count = open_fd_count();
         let _ = tokio::join!(
             db.put_pv_and_post(&n_total, EpicsValue::Long(cache_size as i32)),
             db.put_pv_and_post(&n_upstream, EpicsValue::Long(upstream_count as i32)),
@@ -270,7 +327,25 @@ impl Stats {
             db.put_pv_and_post(&n_connecting_alias, EpicsValue::Long(connecting as i32)),
             db.put_pv_and_post(&n_disconnected, EpicsValue::Long(dead as i32)),
             db.put_pv_and_post(&n_client_event_rate, EpicsValue::Double(event_rate)),
+            // B5 RATE_STATS internals.
+            db.put_pv_and_post(
+                &n_client_event_count,
+                EpicsValue::Long(client_event_count as i32),
+            ),
+            db.put_pv_and_post(
+                &n_post_event_count,
+                EpicsValue::Long(post_event_count as i32),
+            ),
+            db.put_pv_and_post(&n_loop_count, EpicsValue::Long(loop_count as i32)),
         );
+
+        // `fd` is posted separately because it is only available when
+        // the kernel fd directory could be read; on an unsupported
+        // platform we leave the PV at its last value rather than
+        // posting a misleading 0.
+        if let Some(fd) = fd_count {
+            let _ = db.put_pv_and_post(&n_fd, EpicsValue::Long(fd as i32)).await;
+        }
     }
 
     /// Increment the heartbeat counter and post to the heartbeat PV.
@@ -289,6 +364,42 @@ impl Stats {
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
+}
+
+/// B5: count the process's currently open file descriptors.
+///
+/// The C++ ca-gateway publishes `fd` from `fdManager`'s registered
+/// descriptor table. The tokio port has no such table, so the count
+/// is derived from the kernel's per-process fd directory:
+///
+/// - Linux: `/proc/self/fd`
+/// - macOS / *BSD: `/dev/fd`
+///
+/// Both directories list one entry per open descriptor. The reader
+/// handle that `read_dir` itself opens is subtracted so the reported
+/// count reflects the steady-state fd usage rather than transiently
+/// counting the enumeration handle. Returns `None` on platforms
+/// where neither directory is present (the stat PV is then left at
+/// its last value rather than reporting a misleading zero).
+pub fn open_fd_count() -> Option<u64> {
+    // `/proc/self/fd` is authoritative on Linux. `/dev/fd` works on
+    // macOS and the BSDs (it is an fdescfs mount). Try the Linux path
+    // first since on Linux `/dev/fd` is a symlink into procfs anyway.
+    for dir in ["/proc/self/fd", "/dev/fd"] {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                let n = entries.filter(|e| e.is_ok()).count() as u64;
+                // `read_dir` itself holds one descriptor open for the
+                // duration of the iteration; it is included in the
+                // listing on Linux/procfs. Subtract it so the count
+                // is the steady-state value. Saturate at 0 in the
+                // (impossible) case of an empty directory.
+                return Some(n.saturating_sub(1));
+            }
+            Err(_) => continue,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -341,5 +452,112 @@ mod tests {
         let db = PvDatabase::new();
         stats.publish_initial(&db).await;
         assert!(!db.has_name("totalPvs").await);
+    }
+
+    // --- B5: fd / RATE_STATS counters ---
+
+    #[test]
+    fn rate_stats_counters_increment() {
+        let stats = Stats::new("g:".into());
+        assert_eq!(stats.post_event_count.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.loop_count.load(Ordering::Relaxed), 0);
+
+        stats.record_post_event();
+        stats.record_post_event();
+        stats.record_post_event();
+        assert_eq!(stats.post_event_count.load(Ordering::Relaxed), 3);
+
+        stats.record_loop();
+        assert_eq!(stats.loop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn open_fd_count_is_plausible() {
+        // The test process always has at least stdin/stdout/stderr
+        // open, so on any supported platform the count is non-zero.
+        // On an unsupported platform `None` is acceptable.
+        if let Some(n) = open_fd_count() {
+            assert!(n >= 3, "expected at least 3 open fds, got {n}");
+        }
+    }
+
+    #[test]
+    fn open_fd_count_tracks_new_descriptors() {
+        let before = match open_fd_count() {
+            Some(n) => n,
+            None => return, // unsupported platform — nothing to assert
+        };
+        // Open a batch of descriptors at once. A single fd would be
+        // lost in the noise of a parallel test runner (other threads
+        // open/close fds concurrently); a batch of 32 produces a
+        // delta that comfortably exceeds that noise floor. The files
+        // are held open in `_held` until the assertion runs.
+        const BATCH: usize = 32;
+        let dir = std::env::temp_dir();
+        let mut _held = Vec::with_capacity(BATCH);
+        let mut paths = Vec::with_capacity(BATCH);
+        for i in 0..BATCH {
+            let p = dir.join(format!("ca_gw_stats_fd_probe_{}_{i}", std::process::id()));
+            _held.push(std::fs::File::create(&p).expect("create temp file"));
+            paths.push(p);
+        }
+        let during = open_fd_count().expect("fd count available");
+        // The count must have risen by at least half the batch even
+        // if a few descriptors are transiently miscounted under
+        // parallel test execution.
+        assert!(
+            during >= before + (BATCH as u64) / 2,
+            "open fd count did not rise enough: before={before} during={during}"
+        );
+        drop(_held);
+        for p in paths {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_initial_creates_rate_stats_pvs() {
+        let stats = Stats::new("g:".into());
+        let db = PvDatabase::new();
+        stats.publish_initial(&db).await;
+
+        assert!(db.has_name("g:fd").await);
+        assert!(db.has_name("g:clientEventCount").await);
+        assert!(db.has_name("g:postEventCount").await);
+        assert!(db.has_name("g:loopCount").await);
+    }
+
+    #[tokio::test]
+    async fn refresh_publishes_rate_stats() {
+        let stats = Stats::new("g:".into());
+        let db = PvDatabase::new();
+        stats.publish_initial(&db).await;
+
+        // Drive the counters, then refresh and confirm the PVs reflect
+        // the new values.
+        stats.record_event(); // clientEventCount source
+        stats.record_event();
+        stats.record_post_event();
+        stats.record_loop();
+        stats.record_loop();
+        stats.record_loop();
+
+        let cache = RwLock::new(PvCache::new());
+        stats.refresh(&cache, &db, 0, 0).await;
+
+        assert_eq!(
+            db.get_pv("g:clientEventCount").await.unwrap(),
+            EpicsValue::Long(2)
+        );
+        assert_eq!(
+            db.get_pv("g:postEventCount").await.unwrap(),
+            EpicsValue::Long(1)
+        );
+        assert_eq!(db.get_pv("g:loopCount").await.unwrap(), EpicsValue::Long(3));
+        // `fd` should have been posted with a plausible value on any
+        // supported platform.
+        if let Ok(EpicsValue::Long(fd)) = db.get_pv("g:fd").await {
+            assert!(fd >= 0);
+        }
     }
 }

@@ -23,7 +23,7 @@ mod iocsh;
 mod link;
 mod registry;
 
-pub use config::{LinkDirection, PvaLinkConfig, PvaLinkParseError};
+pub use config::{LinkDirection, PvaLinkConfig, PvaLinkParseError, SevrMode};
 pub use integration::{PvaLinkResolver, install_pvalink_resolver};
 pub use iocsh::{
     db_pvxr_command, pvalink_disable_command, pvalink_enable_command, pvxrefdiff_command,

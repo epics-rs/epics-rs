@@ -133,11 +133,15 @@ pub(crate) fn encode_typed_scalar_array(
 }
 
 /// Decode a scalar array of length `n` into a [`TypedScalarArray`].
-/// Returns `Ok(Some(_))` for POD primitives + variable-length types
-/// where we can safely build an `Arc<[T]>`, `Ok(None)` when the type
-/// is not yet handled by the typed path (e.g. obscure encodings —
-/// today none, all map to typed variants), and `Err` on a wire
-/// decode error. F-G10.
+/// Returns `Ok(Some(_))` for every one of the 12 scalar element types
+/// (each maps to a typed `Arc<[T]>` variant) and `Err` on a wire decode
+/// error. The `Option` wrapper is retained as an extension point: a
+/// caller seeing `Ok(None)` would fall back to the generic
+/// `Vec<ScalarValue>` loop in [`decode_pv_field`]. No element type
+/// currently exercises that branch — pvData has exactly 12 scalar codes
+/// and all are covered here, so the typed fast path is total. The
+/// matching *encode*-side generic fallback ([`encode_pv_field_generic`])
+/// is the one that handles obscure value/descriptor combinations. F-G10.
 #[inline]
 pub(crate) fn decode_typed_scalar_array(
     st: ScalarType,
@@ -816,16 +820,31 @@ pub fn decode_scalar_value(
 /// Encode the value bytes for a `PvField` given its descriptor.
 pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out: &mut Vec<u8>) {
     match (desc, value) {
-        (FieldDesc::Scalar(_), PvField::Scalar(sv)) => encode_scalar_value(sv, order, out),
-        (FieldDesc::ScalarArray(_), PvField::ScalarArrayTyped(arr)) => {
+        (FieldDesc::Scalar(st), PvField::Scalar(sv)) => {
+            // The descriptor's scalar type owns the wire width: when the
+            // value variant matches, encode directly; otherwise coerce
+            // so a stray Int-against-Double never desyncs the stream.
+            if sv.scalar_type() == *st {
+                encode_scalar_value(sv, order, out);
+            } else {
+                encode_scalar_value(&coerce_scalar(sv, *st), order, out);
+            }
+        }
+        (FieldDesc::ScalarArray(st), PvField::ScalarArrayTyped(arr))
+            if arr.scalar_type() == *st =>
+        {
             // F-G9 fast path: typed array → bulk memcpy when host
             // endian == wire endian, per-element byte-swap loop
             // otherwise (still O(n) but no enum match per element).
             // pvxs `to_wire(shared_array)` parity (pvaproto.h:477).
+            // Element type must equal the descriptor's; a mismatch
+            // routes through the generic fallback for coercion.
             encode_size_into(arr.len() as u32, order, out);
             encode_typed_scalar_array(arr, order, out);
         }
-        (FieldDesc::ScalarArray(_), PvField::ScalarArray(items)) => {
+        (FieldDesc::ScalarArray(st), PvField::ScalarArray(items))
+            if items.iter().all(|v| v.scalar_type() == *st) =>
+        {
             // Slow path: legacy Vec<ScalarValue>. The per-element
             // enum match + write makes this allocator- and CPU-bound
             // for large arrays; new code should use the typed
@@ -909,10 +928,222 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         (FieldDesc::BoundedString(_), PvField::Scalar(ScalarValue::String(s))) => {
             encode_string_into(s, order, out);
         }
-        // Fallback: write zero bytes for "missing" / mismatched values. Real
-        // callers should ensure value/desc match; this just keeps encoding
-        // total when they don't.
-        _ => {}
+        // ── Generic fallback (F-G10) ────────────────────────────────────
+        //
+        // The typed arms above cover the case where the value variant
+        // structurally matches its descriptor. pvData itself is purely
+        // descriptor-driven (pvxs `to_wire_field` keys solely on the
+        // FieldDesc TypeCode), so the *descriptor* must always determine
+        // the wire shape — never the runtime value variant. The cases
+        // below reach the same descriptor-driven shape for value/desc
+        // pairs the typed arms miss, instead of emitting zero bytes and
+        // desyncing the stream.
+        (desc, value) => encode_pv_field_generic(value, desc, order, out),
+    }
+}
+
+/// Descriptor-driven encode for value/descriptor pairs the typed arms of
+/// [`encode_pv_field`] do not match. Every shape pvxs `to_wire_field`
+/// can emit is reachable here; the function never emits zero bytes for a
+/// non-empty descriptor, so the wire stream cannot desync. F-G10.
+///
+/// Handled "obscure" combinations:
+///
+/// - `PvField::Null` against any descriptor — encodes the descriptor's
+///   canonical null/empty form (`0xFF` selector for Union/Variant, a
+///   zero Size for the array kinds, a default scalar for Scalar).
+/// - A `Variant` / `VariantArray` descriptor carrying a value *not*
+///   wrapped in `PvField::Variant` — the value's own runtime descriptor
+///   is inferred via [`PvField::descriptor`] and emitted inline, exactly
+///   as pvxs does from the value's stored FieldDesc.
+/// - A `Union` descriptor carrying a value that is not `PvField::Union`
+///   — the value is matched against the first variant whose descriptor
+///   it fits; if none fits the union is encoded as null.
+/// - Mismatched scalar / scalar-array variants — re-encoded under the
+///   descriptor's scalar type so the wire width is always correct.
+fn encode_pv_field_generic(
+    value: &PvField,
+    desc: &FieldDesc,
+    order: ByteOrder,
+    out: &mut Vec<u8>,
+) {
+    match desc {
+        FieldDesc::Scalar(st) => {
+            // Coerce whatever scalar the value carries into the
+            // descriptor's type so the wire width matches the tag.
+            let sv = match value {
+                PvField::Scalar(v) => coerce_scalar(v, *st),
+                _ => zero_scalar(*st),
+            };
+            encode_scalar_value(&sv, order, out);
+        }
+        FieldDesc::ScalarArray(st) => {
+            // Re-encode the elements coerced to the descriptor's type.
+            match value {
+                PvField::ScalarArray(items) => {
+                    encode_size_into(items.len() as u32, order, out);
+                    for v in items {
+                        encode_scalar_value(&coerce_scalar(v, *st), order, out);
+                    }
+                }
+                PvField::ScalarArrayTyped(arr) => {
+                    // Element type differs from the descriptor: expand to
+                    // ScalarValues and coerce each to the descriptor type.
+                    let items = arr.to_scalar_values();
+                    encode_size_into(items.len() as u32, order, out);
+                    for v in &items {
+                        encode_scalar_value(&coerce_scalar(v, *st), order, out);
+                    }
+                }
+                _ => encode_size_into(0, order, out),
+            }
+        }
+        FieldDesc::Structure { fields, .. } => {
+            // Value is not a PvField::Structure — emit defaults so the
+            // field count on the wire stays correct.
+            for (_, child_desc) in fields {
+                encode_pv_field(&default_value_for(child_desc), child_desc, order, out);
+            }
+        }
+        FieldDesc::StructureArray { .. } => {
+            // Non-StructureArray value (e.g. Null) → empty array.
+            encode_size_into(0, order, out);
+        }
+        FieldDesc::Union { variants, .. } => {
+            // pvData Union selector wire form: 0xFF == null, otherwise a
+            // Size index followed by the chosen variant's value.
+            match value {
+                PvField::Null => out.put_u8(0xFF),
+                // A raw value handed against a Union descriptor: pick the
+                // first variant whose descriptor the value satisfies.
+                other => {
+                    let chosen = variants
+                        .iter()
+                        .position(|(_, vd)| value_fits_desc(other, vd));
+                    match chosen {
+                        Some(idx) => {
+                            encode_size_into(idx as u32, order, out);
+                            encode_pv_field(other, &variants[idx].1, order, out);
+                        }
+                        None => out.put_u8(0xFF),
+                    }
+                }
+            }
+        }
+        FieldDesc::UnionArray { .. } => {
+            // Non-UnionArray value → empty array.
+            encode_size_into(0, order, out);
+        }
+        FieldDesc::Variant => {
+            // "any": embed the value's own descriptor then the value.
+            // pvxs `to_wire_field` emits `to_wire(desc(fld))` then
+            // `to_wire_full(fld)`; a bare value carries no stored
+            // descriptor so we infer it.
+            match value {
+                PvField::Null => out.put_u8(0xFF),
+                other => {
+                    let inferred = other.descriptor();
+                    encode_type_desc(&inferred, order, out);
+                    encode_pv_field(other, &inferred, order, out);
+                }
+            }
+        }
+        FieldDesc::VariantArray => {
+            // Non-VariantArray value → empty array.
+            encode_size_into(0, order, out);
+        }
+        FieldDesc::BoundedString(_) => {
+            // Coerce any scalar to its string form; non-scalar → empty.
+            let s = match value {
+                PvField::Scalar(v) => scalar_to_string(v),
+                _ => String::new(),
+            };
+            encode_string_into(&s, order, out);
+        }
+    }
+}
+
+/// Coerce a [`ScalarValue`] to the wire scalar type `st`. Numeric kinds
+/// convert by `as`-cast; anything ↔ String routes through the textual
+/// form. Used by the generic encode fallback so the wire width always
+/// matches the descriptor's tag.
+fn coerce_scalar(v: &ScalarValue, st: ScalarType) -> ScalarValue {
+    if v.scalar_type() == st {
+        return v.clone();
+    }
+    if st == ScalarType::String {
+        return ScalarValue::String(scalar_to_string(v));
+    }
+    if let ScalarValue::String(s) = v {
+        // String → numeric: parse, falling back to the zero value.
+        return ScalarValue::parse(st, s).unwrap_or_else(|_| zero_scalar(st));
+    }
+    // Numeric → numeric: route through f64 / i64 to preserve magnitude.
+    let as_f64 = scalar_as_f64(v);
+    match st {
+        ScalarType::Boolean => ScalarValue::Boolean(as_f64 != 0.0),
+        ScalarType::Byte => ScalarValue::Byte(as_f64 as i8),
+        ScalarType::UByte => ScalarValue::UByte(as_f64 as u8),
+        ScalarType::Short => ScalarValue::Short(as_f64 as i16),
+        ScalarType::UShort => ScalarValue::UShort(as_f64 as u16),
+        ScalarType::Int => ScalarValue::Int(as_f64 as i32),
+        ScalarType::UInt => ScalarValue::UInt(as_f64 as u32),
+        ScalarType::Long => ScalarValue::Long(as_f64 as i64),
+        ScalarType::ULong => ScalarValue::ULong(as_f64 as u64),
+        ScalarType::Float => ScalarValue::Float(as_f64 as f32),
+        ScalarType::Double => ScalarValue::Double(as_f64),
+        ScalarType::String => ScalarValue::String(scalar_to_string(v)),
+    }
+}
+
+/// Numeric magnitude of a scalar as `f64` (booleans → 0.0/1.0,
+/// strings → parsed or 0.0). Used only by [`coerce_scalar`].
+fn scalar_as_f64(v: &ScalarValue) -> f64 {
+    match v {
+        ScalarValue::Boolean(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        ScalarValue::Byte(x) => *x as f64,
+        ScalarValue::UByte(x) => *x as f64,
+        ScalarValue::Short(x) => *x as f64,
+        ScalarValue::UShort(x) => *x as f64,
+        ScalarValue::Int(x) => *x as f64,
+        ScalarValue::UInt(x) => *x as f64,
+        ScalarValue::Long(x) => *x as f64,
+        ScalarValue::ULong(x) => *x as f64,
+        ScalarValue::Float(x) => *x as f64,
+        ScalarValue::Double(x) => *x,
+        ScalarValue::String(s) => s.trim().parse().unwrap_or(0.0),
+    }
+}
+
+/// Textual form of a scalar — its `Display` impl.
+fn scalar_to_string(v: &ScalarValue) -> String {
+    format!("{v}")
+}
+
+/// Whether a runtime [`PvField`] value can be encoded under descriptor
+/// `desc` without coercion-induced data loss. Used by the generic Union
+/// fallback to pick a variant slot for a bare value.
+fn value_fits_desc(value: &PvField, desc: &FieldDesc) -> bool {
+    match (desc, value) {
+        (FieldDesc::Scalar(st), PvField::Scalar(v)) => v.scalar_type() == *st,
+        (FieldDesc::ScalarArray(st), PvField::ScalarArray(items)) => {
+            items.iter().all(|v| v.scalar_type() == *st)
+        }
+        (FieldDesc::ScalarArray(st), PvField::ScalarArrayTyped(arr)) => arr.scalar_type() == *st,
+        (FieldDesc::Structure { .. }, PvField::Structure(_)) => true,
+        (FieldDesc::StructureArray { .. }, PvField::StructureArray(_)) => true,
+        (FieldDesc::Union { .. }, PvField::Union { .. }) => true,
+        (FieldDesc::UnionArray { .. }, PvField::UnionArray(_)) => true,
+        (FieldDesc::Variant, PvField::Variant(_)) => true,
+        (FieldDesc::VariantArray, PvField::VariantArray(_)) => true,
+        (FieldDesc::BoundedString(_), PvField::Scalar(ScalarValue::String(_))) => true,
+        _ => false,
     }
 }
 
@@ -1811,5 +2042,151 @@ mod tests {
             msg.contains("MAX_FIELD_DEPTH"),
             "expected MAX_FIELD_DEPTH error, got: {msg}"
         );
+    }
+
+    // ── F-G10: generic encode fallback ──────────────────────────────────
+
+    /// `PvField::Null` against a Union descriptor must emit the `0xFF`
+    /// null selector — not zero bytes — so the stream stays in sync.
+    #[test]
+    fn generic_null_union_round_trips() {
+        let desc = FieldDesc::Union {
+            struct_id: String::new(),
+            variants: vec![
+                ("intValue".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("doubleValue".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut buf = Vec::new();
+            encode_pv_field(&PvField::Null, &desc, order, &mut buf);
+            assert_eq!(buf, vec![0xFF], "null union must encode as single 0xFF");
+            let mut cur = Cursor::new(buf.as_slice());
+            let dec = decode_pv_field(&desc, &mut cur, order).unwrap();
+            assert!(
+                matches!(dec, PvField::Union { selector: -1, .. }),
+                "decoded {dec:?}"
+            );
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    /// `PvField::Null` against a Variant descriptor must emit `0xFF`.
+    #[test]
+    fn generic_null_variant_round_trips() {
+        let desc = FieldDesc::Variant;
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut buf = Vec::new();
+            encode_pv_field(&PvField::Null, &desc, order, &mut buf);
+            assert_eq!(buf, vec![0xFF]);
+            let mut cur = Cursor::new(buf.as_slice());
+            let dec = decode_pv_field(&desc, &mut cur, order).unwrap();
+            match dec {
+                PvField::Variant(vv) => assert!(vv.desc.is_none()),
+                other => panic!("expected null variant, got {other:?}"),
+            }
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    /// A bare `PvField::Scalar` handed against a `Variant` descriptor
+    /// must encode `<inferred desc><value>` and round-trip — mirroring
+    /// pvxs `to_wire_field` reading the value's stored descriptor.
+    #[test]
+    fn generic_bare_scalar_against_variant_desc() {
+        let desc = FieldDesc::Variant;
+        let value = PvField::Scalar(ScalarValue::Int(0x1234_5678));
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut buf = Vec::new();
+            encode_pv_field(&value, &desc, order, &mut buf);
+            assert!(!buf.is_empty(), "must not emit zero bytes");
+            let mut cur = Cursor::new(buf.as_slice());
+            let dec = decode_pv_field(&desc, &mut cur, order).unwrap();
+            match dec {
+                PvField::Variant(vv) => {
+                    assert_eq!(vv.desc, Some(FieldDesc::Scalar(ScalarType::Int)));
+                    assert_eq!(vv.value, PvField::Scalar(ScalarValue::Int(0x1234_5678)));
+                }
+                other => panic!("expected variant, got {other:?}"),
+            }
+            assert_eq!(cur.remaining(), 0);
+        }
+    }
+
+    /// `PvField::Null` against the array descriptors must emit a zero
+    /// Size, never zero bytes, so the length prefix stays present.
+    #[test]
+    fn generic_null_against_array_descs() {
+        for desc in [
+            FieldDesc::StructureArray {
+                struct_id: "S".into(),
+                fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Int))],
+            },
+            FieldDesc::UnionArray {
+                struct_id: String::new(),
+                variants: vec![("v".into(), FieldDesc::Scalar(ScalarType::Int))],
+            },
+            FieldDesc::VariantArray,
+        ] {
+            for order in [ByteOrder::Little, ByteOrder::Big] {
+                let mut buf = Vec::new();
+                encode_pv_field(&PvField::Null, &desc, order, &mut buf);
+                assert_eq!(buf, vec![0x00], "zero-length Size for {desc}");
+                let mut cur = Cursor::new(buf.as_slice());
+                let dec = decode_pv_field(&desc, &mut cur, order).unwrap();
+                let empty = match &dec {
+                    PvField::StructureArray(v) => v.is_empty(),
+                    PvField::UnionArray(v) => v.is_empty(),
+                    PvField::VariantArray(v) => v.is_empty(),
+                    other => panic!("unexpected decode {other:?}"),
+                };
+                assert!(empty, "decoded array must be empty");
+                assert_eq!(cur.remaining(), 0);
+            }
+        }
+    }
+
+    /// A mismatched scalar variant (Int value vs Double descriptor) is
+    /// re-encoded under the descriptor's width — `coerce_scalar` keeps
+    /// the wire layout correct so decode does not desync.
+    #[test]
+    fn generic_scalar_type_coercion() {
+        let desc = FieldDesc::Scalar(ScalarType::Double);
+        let value = PvField::Scalar(ScalarValue::Int(42));
+        let mut buf = Vec::new();
+        encode_pv_field(&value, &desc, ByteOrder::Little, &mut buf);
+        assert_eq!(buf.len(), 8, "must occupy a full f64 slot");
+        let mut cur = Cursor::new(buf.as_slice());
+        let dec = decode_pv_field(&desc, &mut cur, ByteOrder::Little).unwrap();
+        assert_eq!(dec, PvField::Scalar(ScalarValue::Double(42.0)));
+        assert_eq!(cur.remaining(), 0);
+    }
+
+    /// A bare structure value handed against a Union descriptor selects
+    /// the matching variant slot and round-trips.
+    #[test]
+    fn generic_bare_value_picks_union_variant() {
+        let desc = FieldDesc::Union {
+            struct_id: String::new(),
+            variants: vec![
+                ("s".into(), FieldDesc::Scalar(ScalarType::String)),
+                ("d".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let value = PvField::Scalar(ScalarValue::Double(3.5));
+        let mut buf = Vec::new();
+        encode_pv_field(&value, &desc, ByteOrder::Little, &mut buf);
+        let mut cur = Cursor::new(buf.as_slice());
+        let dec = decode_pv_field(&desc, &mut cur, ByteOrder::Little).unwrap();
+        match dec {
+            PvField::Union {
+                selector, value, ..
+            } => {
+                assert_eq!(selector, 1, "must select the Double variant");
+                assert_eq!(*value, PvField::Scalar(ScalarValue::Double(3.5)));
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+        assert_eq!(cur.remaining(), 0);
     }
 }

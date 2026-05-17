@@ -12,7 +12,7 @@ use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::types::DbFieldType;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType};
 
-use super::convert::{dbf_to_scalar_type, epics_to_pv_field};
+use crate::convert::{dbf_to_scalar_type, epics_to_pv_field};
 use super::group_config::{GroupMember, GroupPvDef, TriggerDef};
 use super::monitor::BridgeMonitor;
 use super::pvif::{self, FieldMapping, NtType};
@@ -529,13 +529,13 @@ impl GroupChannel {
         match pv_field {
             PvField::Scalar(sv) => {
                 let target = self.member_dbf_type(member).await;
-                Some(super::convert::scalar_to_epics_typed(sv, target))
+                Some(crate::convert::scalar_to_epics_typed(sv, target))
             }
             // Arrays and structures: defer to the fallback array converter.
             // C++ QSRV uses dbChannelFinalNoElements + DBR types for arrays;
             // for now we delegate to pv_field_to_epics which preserves
             // element types.
-            _ => super::convert::pv_field_to_epics(pv_field),
+            _ => crate::convert::pv_field_to_epics(pv_field),
         }
     }
 }

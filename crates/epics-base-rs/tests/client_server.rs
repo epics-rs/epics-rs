@@ -4,6 +4,16 @@
 //! put, and monitor operations. They also exercise the error paths
 //! fixed in the DBR_TIME/CTRL work (ECA error propagation, snapshot
 //! None handling, etc.).
+//!
+//! Gated on the `ca-server-tls-test` feature: `run_tcp_listener`'s
+//! `tls` / `cap_token_verifier` params are `#[cfg]`-gated on
+//! `epics-ca-rs`'s `experimental-rust-tls` / `cap-tokens` features.
+//! `ca-server-tls-test` forces both on, so whenever this file
+//! compiles the function has its full 12-arg signature and the call
+//! below matches deterministically — under any workspace feature
+//! union (e.g. `epics-bridge-rs` pulling those `epics-ca-rs` features
+//! in independently).
+#![cfg(feature = "ca-server-tls-test")]
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -50,10 +60,8 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
             None, // audit
             drain,
             None, // stats: not asserted in this test
-            #[cfg(feature = "ca-experimental-rust-tls")]
-            None, // tls
-            #[cfg(feature = "ca-cap-tokens")]
-            None, // cap_token_verifier
+            None, // tls: not exercised in this test
+            None, // cap_token_verifier: not exercised in this test
         )
         .await;
     });

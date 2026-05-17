@@ -49,7 +49,7 @@ pub use access::AccessConfig;
 pub use beacon::BeaconAnomaly;
 pub use cache::{CacheTimeouts, GwPvEntry, PvCache, PvState};
 pub use command::{CommandHandler, GatewayCommand};
-pub use downstream::DownstreamServer;
+pub use downstream::{ConnEventRecv, ConnEventReplay, DownstreamServer, ReplayingReceiver};
 pub use master::{RestartPolicy, SuperviseError, supervise};
 pub use putlog::{PutLog, PutOutcome};
 pub use pvlist::{EvaluationOrder, PvList, PvListEntry, PvListMatch};

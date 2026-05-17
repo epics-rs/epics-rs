@@ -32,6 +32,59 @@ if-addrs = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# PKCS#12 (`.p12`/`.pfx`) keychain parsing — pvxs `PKCS12_parse` parity.
+# Pure-Rust; opt-in via the `pkcs12` feature so PEM-only deployments
+# can drop the extra dependency. Enabled by default.
+p12 = { version = "0.6", optional = true }
+# SHA-1 for PKCS#12 `localKeyID` reconstruction — OpenSSL sets a key
+# bag's `localKeyID` to the SHA-1 of its leaf cert's DER, so matching
+# `sha1(cert_der)` against the key bag's id reliably identifies the
+# leaf when the cert bags themselves carry no `localKeyID`. Pulled in
+# transitively by `p12` already, so this adds no new compile cost.
+sha1 = { version = "0.10", optional = true }
+# PBES2 (PBKDF2 + AES-CBC) PKCS#12 decryption — OpenSSL 3.x writes
+# `.p12` files with PBES2 by default (no `-legacy`), which the classic
+# `p12` crate cannot decrypt. The PKCS#12 PFX / AuthenticatedSafe /
+# ContentInfo / EncryptedData / SafeBag structures are plain ASN.1, so
+# we parse them directly with the stable `der` crate (small `Sequence`
+# types defined in `tls.rs`) and decrypt PBES2-protected SafeContents /
+# ShroudedKeyBags with the stable `pkcs5` crate. The classic-PBE path
+# still goes through `p12`; this stable-RustCrypto path is a fallback
+# the loader takes only when `p12` rejects the bag encryption (PBES2).
+# Every crate here is a stable crates.io release — no pre-release pins.
+pkcs5 = { version = "0.8", optional = true, default-features = false, features = ["pbes2", "alloc"] }
+der = { version = "0.8", optional = true, default-features = false, features = ["alloc", "oid", "derive"] }
+spki = { version = "0.8", optional = true, default-features = false, features = ["alloc"] }
+# SHA-256 + SHA-1 + HMAC for the PKCS#12 keychain MAC (PKCS#12 KDF +
+# HMAC, not PBES2). These ride the stable `digest` 0.11 release line
+# that `pkcs5`'s `pbes2` feature also uses — distinct from the `sha1`
+# 0.10 used by `sha1_digest` for `localKeyID` reconstruction. Cargo
+# links both majors side by side.
+rc-sha2 = { package = "sha2", version = "0.11", optional = true }
+rc-sha1 = { package = "sha1", version = "0.11", optional = true }
+rc-hmac = { package = "hmac", version = "0.13", optional = true }
+# X.509 identity extraction from the verified TLS peer chain — pvxs
+# `SSLContext::fill_credentials` parity (CN → ACF account, root CA CN →
+# authority). Same crate/version `epics-ca-rs` already depends on.
+x509-parser = "0.16"
+
+[features]
+default = ["pkcs12"]
+# PKCS#12 keychain support in `auth::tls`. When disabled, the keychain
+# loader falls back to PEM-only and rejects DER/PKCS#12 inputs.
+# Covers both the classic PBE path (`p12`) and the PBES2/AES path
+# (stable `pkcs5`/`der`/`spki`), so any PKCS#12 written by OpenSSL 1.x
+# or 3.x loads with the feature on.
+pkcs12 = [
+    "dep:p12",
+    "dep:sha1",
+    "dep:pkcs5",
+    "dep:der",
+    "dep:spki",
+    "dep:rc-sha2",
+    "dep:rc-sha1",
+    "dep:rc-hmac",
+]
 
 # POSIX getgrouplist / getpwuid / getgrgid for posix_groups() — pvxs
 # osdGetRoles parity. The auth::plain::posix_groups() path is

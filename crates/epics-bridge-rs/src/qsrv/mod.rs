@@ -25,7 +25,6 @@
 //! server can serve qsrv channels directly.
 
 pub mod channel;
-pub mod convert;
 pub mod group;
 pub mod group_config;
 pub mod iocsh;

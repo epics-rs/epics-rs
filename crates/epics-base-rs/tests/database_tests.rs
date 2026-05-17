@@ -3270,6 +3270,76 @@ async fn test_sseq_bare_lnk_does_not_process_passive_target() {
     );
 }
 
+// sseq per-step DLYn regression — C `sseqRecord.c` schedules each
+// selected step's LNKn write after its DLYn delay (`callbackRequestDelayed`),
+// exactly as the base `seqRecord` does for DLY0..DLYF. Pre-fix the
+// `MultiOut::Sseq` arm dispatched every step with no delay.
+#[tokio::test]
+async fn test_sseq_per_step_dly_delays_step_write() {
+    use epics_base_rs::server::records::sseq::SseqRecord;
+    let db = PvDatabase::new();
+
+    // Two Passive targets driven by explicit-PP LNKn so they accept
+    // the written value. Step 1 carries a 0.3 s DLY1, step 2 has no
+    // delay.
+    db.add_record("SSEQ_DLY_TGT1", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_DLY_TGT2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0; // All steps selected.
+    // Step 1: delayed write.
+    sseq.put_field("DLY1", EpicsValue::Double(0.3)).unwrap();
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_DLY_TGT1 PP".to_string()))
+        .unwrap();
+    // Step 2: no delay (but dispatched only after step 1 completes).
+    sseq.put_field("DLY2", EpicsValue::Double(0.0)).unwrap();
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_DLY_TGT2 PP".to_string()))
+        .unwrap();
+    db.add_record("SSEQ_DLY_REC", Box::new(sseq)).await.unwrap();
+
+    // Dispatch concurrently so we can sample target state mid-delay.
+    let db_proc = db.clone();
+    let handle = tokio::spawn(async move {
+        let mut visited = HashSet::new();
+        db_proc
+            .process_record_with_links("SSEQ_DLY_REC", &mut visited, 0)
+            .await
+            .unwrap();
+    });
+
+    // Before DLY1 elapses, step 1's value must NOT be written yet.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        db.get_pv("SSEQ_DLY_TGT1").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "step 1 LNKn must not fire before its DLY1 delay elapses"
+    );
+    assert_eq!(
+        db.get_pv("SSEQ_DLY_TGT2").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "step 2 must not fire before step 1's delay completes"
+    );
+
+    // After the dispatch finishes, both steps' values are written.
+    handle.await.unwrap();
+    assert_eq!(
+        db.get_pv("SSEQ_DLY_TGT1").await.unwrap(),
+        EpicsValue::Double(11.0),
+        "step 1 LNKn must fire after DLY1 elapses"
+    );
+    assert_eq!(
+        db.get_pv("SSEQ_DLY_TGT2").await.unwrap(),
+        EpicsValue::Double(22.0),
+        "step 2 LNKn must fire after step 1"
+    );
+}
+
 #[tokio::test]
 async fn test_sel_nvl_link() {
     use epics_base_rs::server::records::sel::SelRecord;

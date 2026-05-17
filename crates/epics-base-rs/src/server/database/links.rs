@@ -42,6 +42,8 @@ pub(crate) struct SseqGroup {
     pub lnk: String,
     pub do_val: f64,
     pub str_val: String,
+    /// DLYn per-step delay in seconds.
+    pub dly: f64,
 }
 
 /// Typed multi-output payload — replaces the legacy `\0`-packed
@@ -697,6 +699,15 @@ impl PvDatabase {
                         "STR1", "STR2", "STR3", "STR4", "STR5", "STR6", "STR7", "STR8", "STR9",
                         "STRA",
                     ];
+                    // synApps `sseqRecord` carries a per-step DLYn
+                    // (DLY1..DLYA, 1-based) — C `sseqRecord.c` schedules
+                    // each selected step after its delay via
+                    // `callbackRequestDelayed`, exactly as the base
+                    // `seqRecord` does for its DLY0..DLYF groups.
+                    let dly_names = [
+                        "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8", "DLY9",
+                        "DLYA",
+                    ];
                     let groups: Vec<SseqGroup> = (0..10)
                         .map(|i| SseqGroup {
                             dol: Self::field_str(&instance, dol_names[i]),
@@ -707,6 +718,11 @@ impl PvDatabase {
                                 .and_then(|v| v.to_f64())
                                 .unwrap_or(0.0),
                             str_val: Self::field_str(&instance, str_names[i]),
+                            dly: instance
+                                .record
+                                .get_field(dly_names[i])
+                                .and_then(|v| v.to_f64())
+                                .unwrap_or(0.0),
                         })
                         .collect();
                     let sel =
@@ -866,6 +882,14 @@ impl PvDatabase {
                     let grp = &groups[idx];
                     if grp.lnk.is_empty() {
                         continue;
+                    }
+                    // Per-step DLYn staggering — C `sseqRecord.c`
+                    // schedules each selected step after its delay
+                    // (`callbackRequestDelayed`). Steps process
+                    // sequentially in index order, each after its own
+                    // delay — identical to the `MultiOut::Seq` arm.
+                    if grp.dly > 0.0 {
+                        tokio::time::sleep(std::time::Duration::from_secs_f64(grp.dly)).await;
                     }
                     // Determine value: read from DOL link, or use DO/STR field
                     let value = if !grp.dol.is_empty() {

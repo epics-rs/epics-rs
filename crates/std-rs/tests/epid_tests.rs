@@ -523,18 +523,27 @@ fn test_pid_bumpless_turn_on() {
     rec.cval = 50.0;
     rec.fbon = 1; // Feedback ON
     rec.fbop = 0; // Was OFF → bumpless transition
-    rec.oval = 42.0; // Current output before turn-on
+    rec.oval = 42.0; // Last commanded output before turn-on
     rec.drvh = 200.0;
     rec.drvl = -200.0;
     rec.mdt = 0.0;
 
+    // C `devEpidSoft.c:153-158`: on the bumpless edge the integral
+    // term is seeded from the OUTL output link's *actual current
+    // value*, NOT from the last commanded OVAL. The framework reads
+    // OUTL into `I` via the `ReadDbLink` pre-process action emitted by
+    // `EpidRecord::pre_process_actions` BEFORE `do_pid` runs. Simulate
+    // that readback here: `I` already holds OUTL's value (37.0).
+    rec.i = 37.0;
+
     std::thread::sleep(std::time::Duration::from_millis(5));
     EpidSoftDeviceSupport::do_pid(&mut rec);
 
-    // On bumpless turn-on, I is set to current OVAL (42.0)
+    // do_pid must KEEP the readback value on the bumpless edge —
+    // it must not overwrite I with OVAL (the old approximation).
     assert!(
-        (rec.i - 42.0).abs() < 1e-6,
-        "I should be set to OVAL on bumpless turn-on, got {}",
+        (rec.i - 37.0).abs() < 1e-6,
+        "I must keep the OUTL readback value on bumpless turn-on, got {}",
         rec.i
     );
 }
@@ -895,4 +904,199 @@ fn test_fast_do_pid_ignores_fmod() {
     );
     assert_eq!(a.p, b.p);
     assert_eq!(a.d, b.d);
+}
+
+// ============================================================
+// Link-type discrimination — C `link.h` CONSTANT / DB_LINK /
+// CA_LINK; epid consumers `devEpidSoft.c` / `devEpidSoftCallback.c`.
+// ============================================================
+
+use epics_base_rs::server::device_support::DeviceSupport;
+use epics_base_rs::server::record::{LinkType, ProcessAction, link_field_type};
+use std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport;
+
+/// C `devEpidSoft.c:110-112`: a CONSTANT `INP` link means "nothing to
+/// control" — `do_pid` must skip the PID compute and the record must
+/// be flagged SOFT_ALARM/INVALID_ALARM by the `check_alarms` hook.
+#[test]
+fn test_constant_inp_raises_soft_alarm_and_skips_compute() {
+    let mut rec = EpidRecord::default();
+    // CONSTANT INP link — a literal value, not a PV reference.
+    rec.inp = "3.14".to_string();
+    rec.kp = 2.0;
+    rec.val = 100.0;
+    rec.cval = 10.0;
+    rec.fbon = 1;
+    rec.fmod = 0;
+    let oval_before = rec.oval;
+
+    assert_eq!(link_field_type(&rec.inp), LinkType::Constant);
+
+    EpidSoftDeviceSupport::do_pid(&mut rec);
+
+    // Compute skipped: OVAL unchanged, and the constant flag is set.
+    assert!(rec.inp_constant, "CONSTANT INP must set inp_constant");
+    assert_eq!(
+        rec.oval, oval_before,
+        "PID compute must be skipped for a CONSTANT INP link"
+    );
+
+    // check_alarms hook raises SOFT_ALARM/INVALID_ALARM.
+    let mut common = CommonFields::default();
+    Record::check_alarms(&mut rec, &mut common);
+    assert_eq!(common.nsta, alarm_status::SOFT_ALARM);
+    assert_eq!(common.nsev, AlarmSeverity::Invalid);
+}
+
+/// A DB `INP` link does NOT trip the constant path — PID runs normally.
+#[test]
+fn test_db_inp_does_not_raise_soft_alarm() {
+    let mut rec = EpidRecord::default();
+    rec.inp = "OTHER:REC.VAL".to_string();
+    assert_eq!(link_field_type(&rec.inp), LinkType::Db);
+    rec.kp = 2.0;
+    rec.val = 100.0;
+    rec.cval = 10.0;
+    rec.fbon = 1;
+    rec.fbop = 1; // not the bumpless edge
+    rec.mdt = 0.0;
+
+    EpidSoftDeviceSupport::do_pid(&mut rec);
+    assert!(!rec.inp_constant, "DB INP must not set inp_constant");
+}
+
+/// C `devEpidSoftCallback.c:117-130`: a DB (`type != CA_LINK`) TRIG
+/// link is written synchronously and the record falls through to PID
+/// in the SAME pass — no second-pass deferral.
+#[test]
+fn test_db_trig_link_synchronous_fallthrough() {
+    let mut rec = EpidRecord::default();
+    rec.trig = "READBACK:REC.VAL".to_string();
+    assert_eq!(link_field_type(&rec.trig), LinkType::Db);
+    rec.kp = 1.0;
+    rec.fbon = 1;
+    rec.fbop = 1;
+
+    let mut dev = EpidSoftCallbackDeviceSupport::new();
+    let outcome = dev.read(&mut rec).expect("read ok");
+
+    // DB link: a WriteDbLink for TRIG, but NO ReprocessAfter — PID ran
+    // synchronously this pass (did_compute is true).
+    assert!(outcome.did_compute, "DB TRIG: PID runs this pass");
+    assert!(
+        outcome.actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "TRIG",
+                ..
+            }
+        )),
+        "DB TRIG must emit a WriteDbLink"
+    );
+    assert!(
+        !outcome
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "DB TRIG must NOT defer to a second pass"
+    );
+}
+
+/// C `devEpidSoftCallback.c:131-146`: a CA TRIG link cannot be waited
+/// on synchronously — the trigger is fired, `pact` is set, and the
+/// record is re-processed (PID deferred to the second pass).
+#[test]
+fn test_ca_trig_link_deferred_second_pass() {
+    let mut rec = EpidRecord::default();
+    rec.trig = "ca://REMOTE:READBACK".to_string();
+    assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
+    rec.kp = 1.0;
+    rec.fbon = 1;
+    rec.fbop = 1;
+
+    let mut dev = EpidSoftCallbackDeviceSupport::new();
+    let outcome = dev.read(&mut rec).expect("read ok");
+
+    // CA link: both a WriteDbLink for TRIG and a ReprocessAfter — the
+    // PID compute is deferred to the re-process pass.
+    assert!(
+        outcome.actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "TRIG",
+                ..
+            }
+        )),
+        "CA TRIG must emit a WriteDbLink"
+    );
+    assert!(
+        outcome
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "CA TRIG must defer PID to a second pass"
+    );
+
+    // Second pass: now the PID runs.
+    let outcome2 = dev.read(&mut rec).expect("second read ok");
+    assert!(outcome2.did_compute);
+    assert!(
+        outcome2.actions.is_empty(),
+        "second pass must not re-trigger"
+    );
+}
+
+/// TASK 2 — bumpless transfer: on the feedback OFF->ON edge in PID
+/// mode, the epid record's `pre_process_actions` emits a `ReadDbLink`
+/// to seed the integral term `I` from the `OUTL` output link's actual
+/// current value (C `devEpidSoft.c:153-158`).
+#[test]
+fn test_bumpless_edge_emits_outl_readback_for_db_link() {
+    let mut rec = EpidRecord::default();
+    rec.outl = "DAC:REC.VAL".to_string();
+    rec.fmod = 0; // PID mode
+    rec.fbon = 1;
+    rec.fbop = 0; // OFF -> ON edge
+
+    let actions = rec.pre_process_actions();
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            ProcessAction::ReadDbLink {
+                link_field: "OUTL",
+                target_field: "I"
+            }
+        )),
+        "bumpless OFF->ON edge with a DB OUTL must read OUTL into I"
+    );
+}
+
+/// A CONSTANT `OUTL` link must NOT emit a readback — C only reads OUTL
+/// when `outl.type != CONSTANT` (`devEpidSoft.c:153`).
+#[test]
+fn test_bumpless_edge_no_readback_for_constant_outl() {
+    let mut rec = EpidRecord::default();
+    rec.outl = "5.0".to_string(); // CONSTANT link
+    assert_eq!(link_field_type(&rec.outl), LinkType::Constant);
+    rec.fmod = 0;
+    rec.fbon = 1;
+    rec.fbop = 0;
+
+    let actions = rec.pre_process_actions();
+    assert!(
+        actions.is_empty(),
+        "CONSTANT OUTL must not emit a bumpless readback"
+    );
+}
+
+/// No edge (feedback steady ON) — no bumpless readback.
+#[test]
+fn test_no_bumpless_readback_when_no_edge() {
+    let mut rec = EpidRecord::default();
+    rec.outl = "DAC:REC.VAL".to_string();
+    rec.fmod = 0;
+    rec.fbon = 1;
+    rec.fbop = 1; // steady ON, not an edge
+
+    assert!(rec.pre_process_actions().is_empty());
 }

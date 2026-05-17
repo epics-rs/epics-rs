@@ -402,3 +402,67 @@ record(epid, "TEST:PID") {
         other => panic!("expected Double, got {:?}", other),
     }
 }
+
+// ============================================================
+// epid bumpless transfer — OUTL output-link readback (TASK 2).
+//
+// C `devEpidSoft.c:153-158`: on the feedback OFF->ON edge the
+// integral term is seeded from the OUTL output link's *actual
+// current value*. The framework reads it via a `ReadDbLink`
+// pre-process action emitted by `EpidRecord::pre_process_actions`.
+// ============================================================
+
+#[tokio::test]
+async fn test_epid_outl_readback_seeds_integral_term() {
+    // DAC holds a known current output value of 7.0; the epid's OUTL
+    // link points at it. On the feedback OFF->ON edge the epid must
+    // seed its integral term I from DAC's current value, NOT from its
+    // own last-commanded OVAL (which is 0.0).
+    let db_str = r#"
+record(ao, "DAC") {
+    field(VAL, "7.0")
+}
+record(epid, "PID") {
+    field(KP, "1.0")
+    field(KI, "0.5")
+    field(DRVH, "100")
+    field(DRVL, "-100")
+    field(OUTL, "DAC")
+    field(FMOD, "0")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // Confirm DAC holds 7.0.
+    assert_eq!(server.get("DAC").await.unwrap(), EpicsValue::Double(7.0));
+
+    // Turn feedback ON — this is the OFF->ON edge (FBOP starts 0).
+    db.put_record_field_from_ca("PID", "FBON", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    // Process the epid: pre_process_actions emits ReadDbLink{OUTL->I},
+    // the framework reads DAC's value (7.0) into I before do_pid runs,
+    // and do_pid keeps I on the bumpless edge.
+    db.put_record_field_from_ca("PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let i_term = server.get("PID.I").await.unwrap();
+    match i_term {
+        EpicsValue::Double(v) => assert!(
+            (v - 7.0).abs() < 1e-9,
+            "bumpless edge must seed I from OUTL's actual value 7.0, got {v}"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+}

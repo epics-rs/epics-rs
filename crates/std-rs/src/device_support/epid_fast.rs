@@ -78,6 +78,15 @@ pub struct EpidFastPvt {
 
     // Output port writer (set by start_callback_loop)
     pub output_writer: Option<Arc<Mutex<dyn FnMut(f64) + Send>>>,
+
+    /// Output port reader — C `devEpidFast.c:446-448` reads the actual
+    /// current value of the output (DAC) on the feedback OFF->ON edge
+    /// via `pPvt->pfloat64Output->read(...)` so the integral term is
+    /// seeded bumplessly from the hardware's real output, not the
+    /// last value the loop happened to command. When `None` (no
+    /// output-port reader wired), the bumpless edge falls back to the
+    /// last commanded `oval` — see `do_pid`.
+    pub output_reader: Option<Arc<Mutex<dyn FnMut() -> Option<f64> + Send>>>,
 }
 
 impl Default for EpidFastPvt {
@@ -110,6 +119,7 @@ impl Default for EpidFastPvt {
             accumulated: 0.0,
             count: 0,
             output_writer: None,
+            output_reader: None,
         }
     }
 }
@@ -188,12 +198,22 @@ impl EpidFastPvt {
 
         if self.fbon {
             if !self.fbop {
-                // Bumpless OFF->ON: C reads the actual DAC output
-                // value (`pfloat64Output->read`, devEpidFast.c:446).
-                // The framework has no read-back on the output
-                // port here, so the last commanded OVAL is the
-                // closest available approximation.
-                self.i = self.oval;
+                // Bumpless OFF->ON — C `devEpidFast.c:445-448`:
+                //   pPvt->pfloat64Output->read(pPvt->float64OutputPvt,
+                //       pPvt->pfloat64OutputAsynUser, &pPvt->I);
+                // The integral term is seeded from the output port's
+                // *actual current value* (the real DAC output) so the
+                // loop turns on without a bump. When an `output_reader`
+                // is wired, read it; otherwise fall back to the last
+                // commanded `oval` (the closest available estimate).
+                self.i = match &self.output_reader {
+                    Some(reader) => reader
+                        .lock()
+                        .ok()
+                        .and_then(|mut r| r())
+                        .unwrap_or(self.oval),
+                    None => self.oval,
+                };
             } else if (oval > self.drvl && oval < self.drvh)
                 || (oval >= self.drvh && di < 0.0)
                 || (oval <= self.drvl && di > 0.0)
@@ -261,6 +281,19 @@ impl EpidFastDeviceSupport {
     /// Get a handle to the shared PID state for callback registration.
     pub fn pvt(&self) -> Arc<Mutex<EpidFastPvt>> {
         Arc::clone(&self.pvt)
+    }
+
+    /// Wire the output-port readback used for bumpless transfer.
+    ///
+    /// C `devEpidFast.c:446-448` reads the actual current output value
+    /// (`pfloat64Output->read`) on the feedback OFF->ON edge to seed
+    /// the integral term. Supply a closure that returns the output
+    /// port's current value; without it the bumpless edge falls back
+    /// to the last commanded `OVAL`.
+    pub fn set_output_reader(&self, reader: Arc<Mutex<dyn FnMut() -> Option<f64> + Send>>) {
+        if let Ok(mut p) = self.pvt.lock() {
+            p.output_reader = Some(reader);
+        }
     }
 
     /// Start the interrupt-driven PID callback loop.

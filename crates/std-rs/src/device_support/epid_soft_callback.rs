@@ -1,6 +1,6 @@
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
-use epics_base_rs::server::record::{ProcessAction, Record};
+use epics_base_rs::server::record::{LinkType, ProcessAction, Record, link_field_type};
 use epics_base_rs::types::EpicsValue;
 
 use crate::records::epid::EpidRecord;
@@ -48,23 +48,57 @@ impl DeviceSupport for EpidSoftCallbackDeviceSupport {
             .expect("EpidSoftCallbackDeviceSupport requires an EpidRecord");
 
         if !self.triggered {
-            // First pass: queue TRIG write and request re-process.
-            if !epid.trig.is_empty() {
-                let actions = vec![
-                    ProcessAction::WriteDbLink {
+            // C `devEpidSoftCallback.c:116-147` — execute the
+            // readback-trigger link, then branch on its TYPE:
+            //
+            //   if (ptriglink->type != CA_LINK) {
+            //       status = dbPutLink(ptriglink,DBR_DOUBLE,&pepid->tval,1);
+            //       ...                       // fall through to PID
+            //   } else {
+            //       status = dbCaPutLinkCallback(ptriglink,...);
+            //       pepid->pact = TRUE;       // wait for the callback
+            //       return(0);
+            //   }
+            //
+            // A DB (or CONSTANT/empty) TRIG link is written synchronously
+            // and the record falls straight through to the PID compute
+            // in the SAME process pass — there is no `pact`. A CA TRIG
+            // link cannot be waited on synchronously, so the trigger is
+            // fired, the record is re-processed after the callback, and
+            // the PID compute is deferred to that second pass.
+            match link_field_type(&epid.trig) {
+                LinkType::Ca => {
+                    // CA TRIG link: fire the trigger and arrange a
+                    // re-process — the PID compute happens on the
+                    // second pass. C sets `pact=TRUE` and returns.
+                    let actions = vec![
+                        ProcessAction::WriteDbLink {
+                            link_field: "TRIG",
+                            value: EpicsValue::Double(epid.tval),
+                        },
+                        ProcessAction::ReprocessAfter(std::time::Duration::from_millis(1)),
+                    ];
+                    self.triggered = true;
+                    return Ok(DeviceReadOutcome::computed_with(actions));
+                }
+                LinkType::Db => {
+                    // DB TRIG link: write the trigger synchronously and
+                    // fall through to PID in this same pass (no pact).
+                    let actions = vec![ProcessAction::WriteDbLink {
                         link_field: "TRIG",
                         value: EpicsValue::Double(epid.tval),
-                    },
-                    // Re-process after a short delay to allow triggered device to update
-                    ProcessAction::ReprocessAfter(std::time::Duration::from_millis(1)),
-                ];
-                self.triggered = true;
-                return Ok(DeviceReadOutcome::computed_with(actions));
+                    }];
+                    super::epid_soft::EpidSoftDeviceSupport::do_pid(epid);
+                    return Ok(DeviceReadOutcome::computed_with(actions));
+                }
+                // CONSTANT / empty / Other TRIG link — `type != CA_LINK`,
+                // so still synchronous: nothing to trigger, run PID now.
+                LinkType::Constant | LinkType::Empty | LinkType::Other => {}
             }
-            // No TRIG link — fall through to synchronous PID
         }
 
-        // Second pass (or no TRIG link): execute PID
+        // Second pass (CA path completed), or a non-CA link with no
+        // trigger to fire: execute PID.
         self.triggered = false;
         super::epid_soft::EpidSoftDeviceSupport::do_pid(epid);
         Ok(DeviceReadOutcome::computed())

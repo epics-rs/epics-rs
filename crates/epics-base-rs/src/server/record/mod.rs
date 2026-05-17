@@ -10,8 +10,8 @@ pub use crate::server::recgbl::EventMask;
 pub use alarm::{AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::CommonFields;
 pub use link::{
-    CalcLink, DbLink, LinkAddress, LinkProcessPolicy, MonitorSwitch, ParsedLink, parse_link,
-    parse_link_v2,
+    CalcLink, DbLink, HwLink, HwLinkKind, LinkAddress, LinkProcessPolicy, LinkType, MonitorSwitch,
+    ParsedLink, link_field_type, parse_link, parse_link_v2,
 };
 pub use record_instance::RecordInstance;
 pub use record_trait::{

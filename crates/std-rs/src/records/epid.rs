@@ -4,7 +4,8 @@ use std::time::Instant;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record,
+    AlarmSeverity, CommonFields, FieldDesc, LinkType, ProcessAction, ProcessOutcome, Record,
+    link_field_type,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -168,6 +169,14 @@ pub struct EpidRecord {
     /// device support's read() already performed the PID computation.
     /// process() checks this to avoid running the built-in PID a second time.
     device_did_compute: bool,
+    /// Set by `do_pid` when the `INP` link is a CONSTANT link (a literal
+    /// value, not a PV reference). C `devEpidSoft.c:110-112`
+    /// (`if (pepid->inp.type == CONSTANT) recGblSetSevr(...,SOFT_ALARM,
+    /// INVALID_ALARM)`): with a constant INP there is "nothing to
+    /// control", so the PID compute is skipped and SOFT/INVALID is
+    /// raised. The framework `check_alarms` hook reads this flag and
+    /// applies the severity via `recGblSetSevr`.
+    pub inp_constant: bool,
 }
 
 impl Default for EpidRecord {
@@ -226,6 +235,7 @@ impl Default for EpidRecord {
             ct: now,
             ctp: now,
             device_did_compute: false,
+            inp_constant: false,
         }
     }
 }
@@ -577,6 +587,39 @@ impl Record for EpidRecord {
         "epid"
     }
 
+    /// Bumpless-transfer readback — C `devEpidSoft.c:153-158`.
+    ///
+    /// On the feedback OFF->ON edge (`FBOP==0 && FBON!=0`) in PID mode,
+    /// C seeds the integral term `I` by reading the `OUTL` output
+    /// link's *actual current value* (`dbGetLink(&pepid->outl, ...,
+    /// &i, ...)`), but only when `outl.type != CONSTANT`. The Rust
+    /// framework's `ReadDbLink` pre-process action performs exactly
+    /// that — a synchronous read of a DB link's target value into a
+    /// record field, executed BEFORE `process()` / `do_pid` runs.
+    ///
+    /// `FBOP` still holds the *previous* cycle's `FBON` at this point
+    /// (it is committed to the new value at the end of `do_pid`), so
+    /// the edge is detectable here. The action is emitted only for a
+    /// non-CONSTANT `OUTL` link, mirroring C's `outl.type != CONSTANT`
+    /// guard — for a CONSTANT/empty `OUTL`, `I` keeps its prior value.
+    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+        let edge = self.fbon != 0 && self.fbop == 0;
+        // Only PID mode (FMOD==0) reads OUTL for bumpless transfer;
+        // MaxMin mode seeds OVAL from itself (devEpidSoft.c:179-182).
+        if edge && self.fmod == 0 {
+            match link_field_type(&self.outl) {
+                LinkType::Db | LinkType::Ca => {
+                    return vec![ProcessAction::ReadDbLink {
+                        link_field: "OUTL",
+                        target_field: "I",
+                    }];
+                }
+                _ => {}
+            }
+        }
+        Vec::new()
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // In the C code, process() always calls pdset->do_pid() — a custom
         // device support function unique to the epid record. In Rust, the
@@ -620,6 +663,14 @@ impl Record for EpidRecord {
     /// that stays inside the limits leaves the record un-alarmed and a
     /// held value does not re-fire.
     fn check_alarms(&mut self, common: &mut CommonFields) {
+        // C `devEpidSoft.c:110-112` / `devEpidSoftCallback.c:115-117`:
+        // a CONSTANT `INP` link means "nothing to control" — raise
+        // SOFT_ALARM/INVALID_ALARM. `do_pid` set `inp_constant` and
+        // skipped the compute; apply the severity here (the framework
+        // calls this hook after `process()`).
+        if self.inp_constant {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::SOFT_ALARM, AlarmSeverity::Invalid);
+        }
         if let Some((stat, sevr, alev)) = EpidRecord::check_alarms(self) {
             // C `aiRecord.c:403-406`: `if (recGblSetSevr(...)) prec->lalm = alev;`
             // — the LALM update is gated on `recGblSetSevr` returning TRUE,

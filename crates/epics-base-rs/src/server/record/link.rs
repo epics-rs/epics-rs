@@ -108,7 +108,55 @@ pub struct DbLink {
     pub monitor_switch: MonitorSwitch,
 }
 
+/// Discriminated link *type* — the Rust analogue of the C
+/// `link.h` `pv_link` / `constantStr` discrimination
+/// (`modules/database/src/ioc/dbStatic/link.h:28-39`):
+///
+/// ```text
+/// #define CONSTANT  0   -> LinkType::Constant
+/// #define PV_LINK   1   -> (unresolved; resolves to Db or Ca)
+/// #define DB_LINK   10  -> LinkType::Db
+/// #define CA_LINK   11  -> LinkType::Ca
+/// ```
+///
+/// C device support inspects `prec->inp.type` to decide behaviour —
+/// e.g. `devEpidSoft.c:110` (`if (pepid->inp.type == CONSTANT)`),
+/// `devEpidSoftCallback.c:116` (`if (ptriglink->type != CA_LINK)`).
+/// This enum gives a record's `process()` / its device support the
+/// same discrimination on the framework's string link fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkType {
+    /// Empty / unset link — C has no value and no target.
+    Empty,
+    /// `CONSTANT` — the link is a literal numeric/string value, not a
+    /// reference to another PV. C `link.h` `#define CONSTANT 0`.
+    Constant,
+    /// `DB_LINK` — a reference to a record.field in *this* IOC's
+    /// database. C `link.h` `#define DB_LINK 10`.
+    Db,
+    /// `CA_LINK` — a reference to a PV reached over Channel Access /
+    /// PV Access (a remote PV). C `link.h` `#define CA_LINK 11`.
+    Ca,
+    /// A hardware (`@dev …` / `#Cn Sn`) or `lnkCalc` JSON link — not
+    /// one of the C `link.h` value-bearing scalar discriminants the
+    /// records in this task care about. Kept distinct so a caller is
+    /// never forced to mis-classify it.
+    Other,
+}
+
 impl ParsedLink {
+    /// The discriminated [`LinkType`] of this link — the C
+    /// `prec->xxx.type` analogue. See [`LinkType`] for the C mapping.
+    pub fn link_type(&self) -> LinkType {
+        match self {
+            ParsedLink::None => LinkType::Empty,
+            ParsedLink::Constant(_) => LinkType::Constant,
+            ParsedLink::Db(_) => LinkType::Db,
+            ParsedLink::Ca(_) | ParsedLink::Pva(_) => LinkType::Ca,
+            ParsedLink::Hw(_) | ParsedLink::Calc(_) => LinkType::Other,
+        }
+    }
+
     /// Extract the constant as an EpicsValue (Double if numeric, else String).
     pub fn constant_value(&self) -> Option<EpicsValue> {
         if let ParsedLink::Constant(s) = self {
@@ -403,6 +451,20 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     })
 }
 
+/// Determine the [`LinkType`] of a record's string link field directly
+/// from its raw text — the convenience API a record's `process()` or
+/// its device support uses to discriminate one of its `INP` / `OUTL` /
+/// `TRIG` link fields without having to match the whole [`ParsedLink`]
+/// enum.
+///
+/// This is the framework's answer to C device support reading
+/// `prec->inp.type` (`devEpidSoft.c:110`,
+/// `devEpidSoftCallback.c:116`): the existing string link fields are
+/// kept as-is, and this query is layered on top.
+pub fn link_field_type(s: &str) -> LinkType {
+    parse_link_v2(s).link_type()
+}
+
 /// Parse a link string into a LinkAddress (legacy wrapper around parse_link_v2).
 /// Formats: "REC.FIELD", "REC", "REC.FIELD PP", "REC.FIELD NPP", "" → None
 pub fn parse_link(s: &str) -> Option<LinkAddress> {
@@ -520,6 +582,52 @@ mod json_link_tests {
             }
             other => panic!("expected Hw, got {other:?}"),
         }
+    }
+
+    // Link-type discrimination — C `link.h` CONSTANT / DB_LINK /
+    // CA_LINK (`dbStatic/link.h:28-39`).
+
+    #[test]
+    fn link_type_constant_numeric() {
+        assert_eq!(link_field_type("3.14"), LinkType::Constant);
+        assert_eq!(link_field_type("{const: 7}"), LinkType::Constant);
+    }
+
+    #[test]
+    fn link_type_constant_quoted_string() {
+        assert_eq!(link_field_type(r#""hello""#), LinkType::Constant);
+    }
+
+    #[test]
+    fn link_type_empty_is_empty() {
+        assert_eq!(link_field_type(""), LinkType::Empty);
+        assert_eq!(link_field_type("   "), LinkType::Empty);
+        assert_eq!(link_field_type(r#""""#), LinkType::Empty);
+    }
+
+    #[test]
+    fn link_type_db_link() {
+        assert_eq!(link_field_type("REC.VAL"), LinkType::Db);
+        assert_eq!(link_field_type("REC"), LinkType::Db);
+        assert_eq!(link_field_type("REC.VAL PP"), LinkType::Db);
+    }
+
+    #[test]
+    fn link_type_ca_link() {
+        assert_eq!(link_field_type("ca://REMOTE:PV"), LinkType::Ca);
+        assert_eq!(link_field_type("pva://REMOTE:PV"), LinkType::Ca);
+        assert_eq!(link_field_type(r#"{ca: { pv: "REMOTE" }}"#), LinkType::Ca);
+    }
+
+    #[test]
+    fn link_type_hw_and_calc_are_other() {
+        assert_eq!(link_field_type("@dev 0 IN"), LinkType::Other);
+        assert_eq!(link_field_type("#C0 S2"), LinkType::Other);
+        // calc link uses strict JSON (quoted keys) — serde_json parse.
+        assert_eq!(
+            link_field_type(r#"{calc: {"expr": "A+1", "args": ["pv1"]}}"#),
+            LinkType::Other
+        );
     }
 
     #[test]

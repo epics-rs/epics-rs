@@ -35,6 +35,22 @@ impl EpidSoftDeviceSupport {
     /// Execute the PID algorithm on the epid record.
     /// This is the core computation, equivalent to `do_pid()` in devEpidSoft.c.
     pub fn do_pid(epid: &mut EpidRecord) {
+        // C `devEpidSoft.c:110-112`:
+        //   if (pepid->inp.type == CONSTANT) { /* nothing to control */
+        //       if (recGblSetSevr(pepid,SOFT_ALARM,INVALID_ALARM)) return(0);
+        //   }
+        // A CONSTANT `INP` link is a literal value, not a PV to read —
+        // there is nothing to feed back on, so PID is skipped and the
+        // record is flagged SOFT/INVALID. The framework `check_alarms`
+        // hook raises the severity from this flag.
+        if epics_base_rs::server::record::link_field_type(&epid.inp)
+            == epics_base_rs::server::record::LinkType::Constant
+        {
+            epid.inp_constant = true;
+            return;
+        }
+        epid.inp_constant = false;
+
         // Previous controlled value: CVLP, maintained by
         // `EpidRecord::update_monitors()` (`epid.rs` — `self.cvlp = self.cval`).
         // The MaxMin sign-detection in `fmod==1` needs the value from the
@@ -85,11 +101,23 @@ impl EpidSoftDeviceSupport {
                 let di = kp * ki * e * dt;
                 if epid.fbon != 0 {
                     if epid.fbop == 0 {
-                        // Feedback just transitioned OFF -> ON (bumpless turn-on).
-                        // Set integral term to current output value.
-                        // In the C code this reads from OUTL link; here we use
-                        // the current OVAL as the best available approximation.
-                        i = epid.oval;
+                        // Feedback just transitioned OFF -> ON (bumpless
+                        // turn-on). C `devEpidSoft.c:153-158`:
+                        //   if (pepid->outl.type != CONSTANT) {
+                        //       if (dbGetLink(&pepid->outl,DBR_DOUBLE,&i,..))
+                        //           recGblSetSevr(...,LINK_ALARM,INVALID);
+                        //   }
+                        // — the integral term is seeded from the OUTL
+                        // output link's *actual current value* so the
+                        // loop turns on without a bump. The framework
+                        // reads OUTL's current value into `I` BEFORE
+                        // this runs via `EpidRecord::pre_process_actions`
+                        // (a `ReadDbLink` on `OUTL`). So `i` already
+                        // holds the readback value here — keep it.
+                        // When OUTL is CONSTANT/empty there is no
+                        // ReadDbLink and `i` keeps its prior value,
+                        // matching C's `outl.type != CONSTANT` guard.
+                        // (`i` was loaded from `epid.i` above.)
                     } else {
                         // Anti-windup: only accumulate integral if output not saturated,
                         // or if the integral change would move away from saturation.

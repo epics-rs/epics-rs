@@ -1,0 +1,63 @@
+###################################################################
+#  Modbus IOC example records
+#
+#  Macros:
+#    P   - PV prefix          (e.g. "TEST:")
+#    R   - record prefix      (e.g. "MB:")
+#    HR  - read driver port   (holding registers, function 3)
+#    HW  - write driver port  (holding registers, function 16)
+###################################################################
+
+# ---- Reads: holding registers 0..3 as 16-bit integers ----
+record(longin, "$(P)$(R)Reg0") {
+    field(DESC, "Holding register 0")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(HR) 0) UINT16")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)Reg1") {
+    field(DESC, "Holding register 1")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(HR) 1) UINT16")
+    field(SCAN, "I/O Intr")
+}
+
+# ---- Read: registers 2..3 as one 32-bit big-endian integer ----
+record(longin, "$(P)$(R)Reg32") {
+    field(DESC, "Holding registers 2-3 as INT32_BE")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(HR) 2) INT32_BE")
+    field(SCAN, "I/O Intr")
+}
+
+# ---- Read: registers 4..5 as one 32-bit float ----
+record(ai, "$(P)$(R)RegF") {
+    field(DESC, "Holding registers 4-5 as FLOAT32_BE")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(HR) 4) FLOAT32_BE")
+    field(SCAN, "I/O Intr")
+    field(PREC, "3")
+}
+
+# ---- Write: holding register 0 of the write port ----
+record(longout, "$(P)$(R)SetReg0") {
+    field(DESC, "Write holding register 100")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(HW) 0) UINT16")
+}
+
+# ---- Driver statistics ----
+record(longin, "$(P)$(R)ReadOK") {
+    field(DESC, "Successful reads")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(HR) 0) READ_OK")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)IOErrors") {
+    field(DESC, "I/O errors")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(HR) 0) IO_ERRORS")
+    field(SCAN, "I/O Intr")
+}

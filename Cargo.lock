@@ -2241,6 +2241,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "modbus-ioc"
+version = "0.17.2"
+dependencies = [
+ "asyn-rs",
+ "epics-base-rs",
+ "epics-bridge-rs",
+ "epics-ca-rs",
+ "modbus-rs",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "modbus-rs"
+version = "0.17.2"
+dependencies = [
+ "asyn-rs",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "motor-rs"
 version = "0.17.2"
 dependencies = [

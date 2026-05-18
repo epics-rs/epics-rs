@@ -1202,6 +1202,53 @@ with reason.
   — verified by manually flipping the parser branch and re-
   running.
 
+### Cross-impl interop matrix (added across 12 batches)
+
+Beyond the original audit fixes, the following pvxs↔Rust
+interop tests now exist (all gated behind
+`cargo nextest run --profile interop`):
+
+| # | Test | Direction |
+|---|---|---|
+| 1 | `complex_types::interop_complex_types_pvxget_against_rust_server` | Rust→pvxget |
+| 2 | `reverse_complex_types::interop_reverse_complex_types_rust_client_decodes_pvxs` | pvxs→Rust client |
+| 3 | `put_cross_impl::interop_put_a_pvxput_writes_into_rust_server` | pvxput→Rust |
+| 4 | `put_cross_impl::interop_put_b_rust_client_writes_into_pvxs_server` | Rust→pvxs |
+| 5 | `be_byte_order::interop_be_a_rust_server_emits_be_to_pvxget` | BE Rust→pvxget |
+| 6 | `be_byte_order::interop_be_b_rust_client_decodes_pvxs_be_server` | pvxs BE→Rust |
+| 7 | `type_cache::interop_type_cache_emit_pvxget_accepts_backrefs` | Rust 0xFD/0xFE→pvxget |
+| 8 | `rpc_and_get_field::interop_rpc_pvxcall_against_rust_server` | pvxcall→Rust |
+| 9 | `rpc_and_get_field::interop_get_field_pvxinfo_against_rust_server` | pvxinfo→Rust |
+| 10 | `monitor_stream::interop_monitor_a_pvxmonitor_streams_from_rust_server` | pvxmonitor↔Rust |
+| 11 | `monitor_stream::interop_monitor_b_rust_client_streams_from_pvxs_server` | Rust↔pvxs |
+| 12 | `field_projection::interop_field_projection_a_pvxget_field_filter_against_rust_server` | Rust→pvxget |
+| 13 | `large_array::interop_large_array_a_pvxget_reads_huge_rust_array` | 100K array Rust→pvxget |
+| 14 | `large_array::interop_large_array_b_rust_client_reads_huge_pvxs_array` | pvxs 100K→Rust |
+| 15 | `beacon_udp::interop_beacon_a_pvxlist_discovers_rust_server` | Rust beacon→pvxlist |
+| 16 | `beacon_udp::interop_beacon_b_rust_client_receives_pvxs_beacons` | pvxs beacon→Rust |
+| 17 | `access_denied::interop_access_denied_a_pvxput_to_rejecting_handler_fails` | pvxput→Rust deny |
+| 18 | `tls_interop::interop_tls_a_pvxget_over_tls_to_rust_server` | TLS pvxget→Rust |
+
+Plus the default-suite golden replays
+(`wire_golden_complex_types_byte_exact` and
+`wire_golden_decode_roundtrip`) replay 13 pvxs-verified fixtures
+through the Rust encoder + decoder on every push without
+needing pvxs at runtime.
+
+Two real Rust source bugs surfaced during this work and were
+fixed:
+
+- **PUT subcmd 0x40 missing handler** (tcp.rs) — pvxput's
+  `fetchPresent(true)` default sent CMD_PUT with subcmd 0x40
+  (GET-before-PUT) which the Rust dispatcher tried to decode as
+  bitset+value, tripping "short read u8". Fix added the GET-leg
+  branch.
+- **NTNDArray schema divergence** (nt/nd_array.rs) — Rust's
+  layout had `descriptor` + `display` trailing fields not in
+  pvxs's canonical schema, and the field order was wrong.
+  Rewrote the descriptor + value builders + NdAttribute struct
+  to match pvxs nt.cpp:196 byte-exact.
+
 ### Deferred (4 — substantial architectural changes)
 
 - **PVA-R2** (MEDIUM) — `tcp_timeout` plumbing through
@@ -1226,6 +1273,30 @@ with reason.
   connection read loop. Requires operation-state-machine
   restructure so source futures don't head-of-line-block the
   socket parser.
+
+### Remaining cross-impl coverage gaps (documented for transparency)
+
+- **Real ACF/ASG cross-impl** — The wire-side of an
+  access-denied PUT is covered (batch 11, via `on_put`
+  rejection); the ACF parser + AccessGate semantics are
+  unit-tested in `epics-base-rs`. What's NOT exercised
+  end-to-end: loading a real `.acf` file, hooking it into a
+  `PvaServer`'s composite via `AccessGate::required`, and
+  verifying the wire result against a pvxs client. Requires
+  adding a public `PvaServerConfig::access_gate` knob and a
+  test wrapper source — not done. The constituent paths are
+  proven; integration is a small follow-up.
+- **TLS client auth (mTLS)** — Batch 12 covers server-auth
+  TLS (server presents cert, client trusts CA). Client cert
+  auth (`x509` authnz method end-to-end) needs both sides
+  configured with cert + trust; pvxs's behaviour matches but
+  the matrix entry hasn't been added.
+- **TLS via name-server** — Batch 12 uses UDP search because
+  pvxs's plaintext name-server query collides with our
+  TLS-only listener. A mixed-mode listener (plain TCP for
+  name-server, TLS for data) would close this; would also
+  cover the production "TLS in front of a name-server"
+  deployment.
 
 ### Verification
 

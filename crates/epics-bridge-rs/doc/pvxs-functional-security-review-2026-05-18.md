@@ -59,13 +59,13 @@ message.
 - BR-R33 (commit 552957f) — group GET/MONITOR carries `record._options.queueSize` + `atomic` at root; per-op queueSize negotiation is the residual gap.
 - BR-R34 (commit 46a3e24) — group monitors include `DBE_LOG` (archive-class) in the per-member value mask; LOG-only posts now wake the group `poll()`.
 - BR-R40 (commit eb88b3b) — QSRV accepts pvxs channel-filter syntax `PV.VAL{...}`; chain attaches per-subscription via new `subscribe_with_mask_and_filters`.
+- BR-R42 (commit fad743a) — gateway raw monitor signals upstream descriptor change as a subscription boundary; downstream gets MONITOR FINISH instead of bytes encoded for the new (incompatible) descriptor.
 - BR-R43 (commit fc59c1f) — pvalink monitor pvRequest always sends `pipeline` + `atomic=true` + `queueSize` (matches pvxs `pvaLink::makeRequest`).
 - BR-R44 (commit 8e67167) — gateway raw monitor reencodes on byte-order mismatch instead of silently dropping every event.
 
 Remaining open: BR-R4, R6, R7, R8, R10, R11, R12, R13, R14, R15,
-R18, R21, R24, R27, R41, R42, the BR-R29 wire BitSet narrowing
-for SelfOnly, the BR-R33 per-op queueSize negotiation (16
-findings).
+R18, R21, R24, R27, R41, the BR-R29 wire BitSet narrowing for
+SelfOnly, the BR-R33 per-op queueSize negotiation (15 findings).
 
 ## Findings
 

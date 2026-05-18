@@ -828,14 +828,19 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
             None
         }
         PvField::ScalarArray(arr) => {
-            // Pick the first variant — pvData ScalarArray is typed
-            // homogeneous on the wire, but our PvField::ScalarArray is
-            // a Vec<ScalarValue> so we walk to determine.
+            // BR-R23: pvxs `pvalink_lset.cpp:287` handles every pvData
+            // scalar-array variant (signed/unsigned 8/16/32/64-bit,
+            // float32/float64, bool, string). Mirror that coverage so
+            // an INP pvalink can read any waveform the upstream serves.
+            // Mixed-element arrays are unusual on the wire — pvData
+            // ScalarArray is homogeneous — but if a producer hands us a
+            // Vec<ScalarValue> of mixed variants we filter to the
+            // first-element kind and quietly drop the others (matches
+            // pvxs's "skip type-mismatched elements" behaviour).
             let first = arr.first()?;
             match first {
-                ScalarValue::Double(_) => {
-                    let v: Vec<f64> = arr
-                        .iter()
+                ScalarValue::Double(_) => Some(EpicsValue::DoubleArray(
+                    arr.iter()
                         .filter_map(|s| {
                             if let ScalarValue::Double(d) = s {
                                 Some(*d)
@@ -843,12 +848,21 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                                 None
                             }
                         })
-                        .collect();
-                    Some(EpicsValue::DoubleArray(v))
-                }
-                ScalarValue::Int(_) => {
-                    let v: Vec<i32> = arr
-                        .iter()
+                        .collect(),
+                )),
+                ScalarValue::Float(_) => Some(EpicsValue::FloatArray(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::Float(f) = s {
+                                Some(*f)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                ScalarValue::Int(_) => Some(EpicsValue::LongArray(
+                    arr.iter()
                         .filter_map(|s| {
                             if let ScalarValue::Int(i) = s {
                                 Some(*i)
@@ -856,10 +870,133 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                                 None
                             }
                         })
-                        .collect();
-                    Some(EpicsValue::LongArray(v))
+                        .collect(),
+                )),
+                ScalarValue::Long(_) => Some(EpicsValue::LongArray(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::Long(l) = s {
+                                Some(*l as i32)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                ScalarValue::Short(_) => Some(EpicsValue::ShortArray(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::Short(v) = s {
+                                Some(*v)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                ScalarValue::UShort(_) => Some(EpicsValue::ShortArray(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::UShort(v) = s {
+                                Some(*v as i16)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                ScalarValue::UInt(_) | ScalarValue::ULong(_) => Some(EpicsValue::LongArray(
+                    arr.iter()
+                        .filter_map(|s| match s {
+                            ScalarValue::UInt(v) => Some(*v as i32),
+                            ScalarValue::ULong(v) => Some(*v as i32),
+                            _ => None,
+                        })
+                        .collect(),
+                )),
+                // pvData `pvByte` is signed 8-bit; widen to Short so the
+                // negative range survives the DBF_CHAR-as-signed gap.
+                ScalarValue::Byte(_) => Some(EpicsValue::ShortArray(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::Byte(v) = s {
+                                Some(*v as i16)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                // pvData `pvUByte` is unsigned 8-bit — maps to DBF_CHAR
+                // (also stored as u8). Keep the raw octets.
+                ScalarValue::UByte(_) => Some(EpicsValue::CharArray(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::UByte(v) = s {
+                                Some(*v)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                ScalarValue::String(_) => Some(EpicsValue::StringArray(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::String(v) = s {
+                                Some(v.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                ScalarValue::Boolean(_) => Some(EpicsValue::LongArray(
+                    arr.iter()
+                        .filter_map(|s| {
+                            if let ScalarValue::Boolean(v) = s {
+                                Some(if *v { 1 } else { 0 })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+            }
+        }
+        // BR-R23: also support `ScalarArrayTyped` — the wire decoder
+        // produces typed arrays (`TypedScalarArray::Double(Arc<[f64]>)`
+        // etc.) for performance, and an INP pvalink that read a
+        // typed-fast-path waveform previously hit the catch-all and
+        // returned `None`. Map each variant onto its `EpicsValue`
+        // counterpart.
+        PvField::ScalarArrayTyped(arr) => {
+            use epics_pva_rs::pvdata::TypedScalarArray;
+            match arr {
+                TypedScalarArray::Double(a) => Some(EpicsValue::DoubleArray(a.to_vec())),
+                TypedScalarArray::Float(a) => Some(EpicsValue::FloatArray(a.to_vec())),
+                TypedScalarArray::Int(a) => Some(EpicsValue::LongArray(a.to_vec())),
+                TypedScalarArray::Long(a) => {
+                    Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
                 }
-                _ => None,
+                TypedScalarArray::Short(a) => Some(EpicsValue::ShortArray(a.to_vec())),
+                TypedScalarArray::UShort(a) => Some(EpicsValue::ShortArray(
+                    a.iter().map(|v| *v as i16).collect(),
+                )),
+                TypedScalarArray::UInt(a) => {
+                    Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
+                }
+                TypedScalarArray::ULong(a) => {
+                    Some(EpicsValue::LongArray(a.iter().map(|v| *v as i32).collect()))
+                }
+                TypedScalarArray::Byte(a) => Some(EpicsValue::ShortArray(
+                    a.iter().map(|v| *v as i16).collect(),
+                )),
+                TypedScalarArray::UByte(a) => Some(EpicsValue::CharArray(a.to_vec())),
+                TypedScalarArray::String(a) => Some(EpicsValue::StringArray(a.to_vec())),
+                TypedScalarArray::Boolean(a) => Some(EpicsValue::LongArray(
+                    a.iter().map(|v| if *v { 1 } else { 0 }).collect(),
+                )),
             }
         }
         _ => None,
@@ -903,6 +1040,73 @@ mod tests {
             .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
         let f = PvField::Structure(s);
         assert_eq!(pvfield_to_epics_value(&f), Some(EpicsValue::Long(42)));
+    }
+
+    /// BR-R23: string / float / short / char / typed-array shapes the
+    /// previous best-effort converter dropped now round-trip through
+    /// `EpicsValue`. The pvData `pvByte` (signed 8-bit) widens to
+    /// `ShortArray` to preserve the negative range.
+    #[test]
+    fn pvfield_array_conversions_cover_pvxs_shapes() {
+        use epics_pva_rs::pvdata::TypedScalarArray;
+
+        // Untyped (Vec<ScalarValue>) variants.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::Float(1.5),
+                ScalarValue::Float(-2.5),
+            ])),
+            Some(EpicsValue::FloatArray(vec![1.5, -2.5]))
+        );
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::Short(-7),
+                ScalarValue::Short(8),
+            ])),
+            Some(EpicsValue::ShortArray(vec![-7, 8]))
+        );
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::UByte(0x55),
+                ScalarValue::UByte(0xFF),
+            ])),
+            Some(EpicsValue::CharArray(vec![0x55, 0xFF]))
+        );
+        // pvByte → ShortArray (signed widen).
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::Byte(-1),
+                ScalarValue::Byte(2),
+            ])),
+            Some(EpicsValue::ShortArray(vec![-1, 2]))
+        );
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArray(vec![
+                ScalarValue::String("a".into()),
+                ScalarValue::String("b".into()),
+            ])),
+            Some(EpicsValue::StringArray(vec!["a".into(), "b".into()]))
+        );
+
+        // Typed-fast-path variants emitted by the wire decoder.
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::Float(
+                vec![3.25f32, -4.5].into()
+            ))),
+            Some(EpicsValue::FloatArray(vec![3.25, -4.5]))
+        );
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::String(
+                vec!["x".to_string(), "y".to_string()].into()
+            ))),
+            Some(EpicsValue::StringArray(vec!["x".into(), "y".into()]))
+        );
+        assert_eq!(
+            pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::UByte(
+                vec![1u8, 2, 3].into()
+            ))),
+            Some(EpicsValue::CharArray(vec![1, 2, 3]))
+        );
     }
 
     // ---- B3: monitor-notification forwarder wiring ----

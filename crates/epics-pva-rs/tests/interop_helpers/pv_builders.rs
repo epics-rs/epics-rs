@@ -51,29 +51,24 @@ fn nt_scalar_array_struct(t: ScalarType, value: Vec<ScalarValue>) -> (FieldDesc,
 }
 
 fn nt_enum_struct(index: i32, choices: &[&str]) -> (FieldDesc, PvField) {
-    let desc = NTEnum::new().with_choices(choices.iter().copied()).build();
-    let mut value_inner = PvStructure::new("enum_t");
-    value_inner.fields.push((
-        "index".to_string(),
-        PvField::Scalar(ScalarValue::Int(index)),
-    ));
-    value_inner.fields.push((
-        "choices".to_string(),
-        PvField::ScalarArray(
-            choices
-                .iter()
-                .map(|s| ScalarValue::String((*s).to_string()))
-                .collect(),
-        ),
-    ));
-    let mut root = PvStructure::new("epics:nt/NTEnum:1.0");
-    root.fields
-        .push(("value".to_string(), PvField::Structure(value_inner)));
-    root.fields
-        .push(("alarm".to_string(), meta::alarm_default()));
-    root.fields
-        .push(("timeStamp".to_string(), meta::time_default()));
-    (desc, PvField::Structure(root))
+    // Use the builder's `create()` so the descriptor and value
+    // agree on field layout (the descriptor has a trailing
+    // `display.description` field that the value must populate
+    // too — encoding a value short of the descriptor leaves the
+    // tail bytes default-initialised on the wire and breaks
+    // re-decode equality).
+    let builder = NTEnum::new().with_choices(choices.iter().copied());
+    let desc = builder.build();
+    let mut value = builder.create();
+    if let PvField::Structure(ref mut root) = value
+        && let Some((_, PvField::Structure(inner))) =
+            root.fields.iter_mut().find(|(n, _)| n == "value")
+        && let Some((_, PvField::Scalar(ScalarValue::Int(idx)))) =
+            inner.fields.iter_mut().find(|(n, _)| n == "index")
+    {
+        *idx = index;
+    }
+    (desc, value)
 }
 
 fn nt_table_struct() -> (FieldDesc, PvField) {

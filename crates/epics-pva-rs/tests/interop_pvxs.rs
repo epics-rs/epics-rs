@@ -34,5 +34,8 @@ mod pipeline_r1;
 #[path = "interop_pvxs_mods/pipeline_r20.rs"]
 mod pipeline_r20;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/reverse_complex_types.rs"]
+mod reverse_complex_types;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/tcp_search_r11.rs"]
 mod tcp_search_r11;

@@ -34,6 +34,9 @@ mod complex_types;
 #[path = "interop_pvxs_mods/field_projection.rs"]
 mod field_projection;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/large_array.rs"]
+mod large_array;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/monitor_stream.rs"]
 mod monitor_stream;
 #[cfg(unix)]

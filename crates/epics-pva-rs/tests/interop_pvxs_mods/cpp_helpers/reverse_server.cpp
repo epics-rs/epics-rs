@@ -156,6 +156,20 @@ int main(int argc, char** argv) {
     cfg.auto_beacon = false;
     auto srv = cfg.build();
 
+    // L:DBL — 100K-element Float64 array, used by the
+    // large_array reverse-direction test. Hosted unconditionally
+    // (read-only) since other tests don't read it.
+    {
+        auto pv = server::SharedPV::buildReadonly();
+        auto value = nt::NTScalar{TypeCode::Float64A}.create();
+        std::vector<double> xs(100000);
+        for (size_t i = 0; i < xs.size(); ++i) xs[i] = double(i) * 0.5;
+        shared_array<double> arr(xs.begin(), xs.end());
+        value["value"] = arr.freeze();
+        pv.open(value);
+        srv.addPV("L:DBL", pv);
+    }
+
     if (writable) {
         // Two mailbox PVs that accept PUTs and post the new value
         // back. Initial values intentionally different from the

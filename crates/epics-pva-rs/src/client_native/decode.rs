@@ -207,9 +207,25 @@ pub fn decode_connection_validation_request(
     let server_registry_size = cur
         .get_u16(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let count = decode_size(&mut cur, order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?
-        .unwrap_or(0) as usize;
+    // PVA-R25: pvxs `pvaproto.h:284-305` rejects the `0xFF` null
+    // marker for a `Size` decode unless the caller passes
+    // `allow_null=true`. The CONNECTION_VALIDATION auth-method count
+    // is a non-null Size: pvxs `clientconn.cpp:228-232` decodes via
+    // the default `from_wire(M, nauth)` which faults on null, and
+    // `:247-251` then disconnects. Pre-fix Rust mapped `None` (null)
+    // to `0` and proceeded as if the server advertised an empty
+    // method list, after which `clientconn.rs` defaults to
+    // `anonymous` — a malformed-handshake → auth-downgrade silently.
+    let count = match decode_size(&mut cur, order).map_err(|e| PvaError::Decode(e.to_string()))? {
+        Some(n) => n as usize,
+        None => {
+            return Err(PvaError::Decode(
+                "CONNECTION_VALIDATION auth-method count is the null Size marker (0xFF); \
+                 a malformed handshake (pvxs clientconn.cpp:228-232 disconnect parity)"
+                    .to_string(),
+            ));
+        }
+    };
     // P-G22: cap allocation against attacker-controlled count. Each
     // auth method string consumes at least 1 byte (Size + NUL); the
     // remaining cursor bytes bound how many can really arrive.

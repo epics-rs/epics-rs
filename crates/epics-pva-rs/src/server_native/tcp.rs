@@ -649,24 +649,50 @@ impl ClientCredentials {
 
 /// Parse `CONNECTION_VALIDATION` reply payload (pvxs serverconn.cpp:200).
 /// Layout: `buffer_size:u32 + intro_size:u16 + qos:u16 + method:String +
-/// auth_type + auth_value`. Returns `None` on truncation; callers fall
-/// back to anonymous credentials.
-fn parse_client_credentials(frame: &Frame, order: ByteOrder) -> Option<ClientCredentials> {
+/// auth_type + auth_value`.
+///
+/// PVA-R22: pvxs `serverconn.cpp:204-216` always decodes the auth
+/// Value via `from_wire_type_value`, then `if(!M.good()) bev.reset()`
+/// — a truncated/invalid auth body is connection-fatal. Pre-fix Rust
+/// wrapped the decode in `if let Ok` and still returned
+/// `Some(ClientCredentials)` on failure, filling `account` with the
+/// method name. A truncated `method="ca"` handshake became
+/// `method="ca", account="ca"` — every ACF rule keying on
+/// method/account/host was then evaluating a credential tuple pvxs
+/// would never have produced.
+///
+/// Now: `Ok(None)` for the empty-method / anonymous case;
+/// `Ok(Some(creds))` only when the auth Value decoded successfully;
+/// `Err(...)` on any decode fault past the method string (so the
+/// caller can disconnect, mirroring pvxs `bev.reset()`).
+fn parse_client_credentials(
+    frame: &Frame,
+    order: ByteOrder,
+) -> PvaResult<Option<ClientCredentials>> {
     let mut cur = frame.cursor();
-    let _buffer_size = cur.get_u32(order).ok()?;
-    let _intro_size = cur.get_u16(order).ok()?;
-    let _qos = cur.get_u16(order).ok()?;
+    let _buffer_size = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION buffer_size: {e}")))?;
+    let _intro_size = cur
+        .get_u16(order)
+        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION intro_size: {e}")))?;
+    let _qos = cur
+        .get_u16(order)
+        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION qos: {e}")))?;
     let method = crate::proto::decode_string(&mut cur, order)
-        .ok()
-        .flatten()
+        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION method: {e}")))?
         .unwrap_or_default();
     if method.is_empty() {
-        return Some(ClientCredentials::anonymous());
+        // pvxs anonymous handshake: empty method, no auth body to
+        // decode. Surface as `Ok(None)` so the caller can install
+        // the default anonymous credentials.
+        return Ok(None);
     }
-    // Auth value: type descriptor + full value. We only care about
-    // the `user` / `host` fields when method is "ca"; for any other
-    // method the structured payload is opaque to us and we just store
-    // the method name.
+    // Auth value: type descriptor + full value. pvxs requires both to
+    // decode cleanly before it accepts the method. A leading `0xFF`
+    // is the pvxs "null type" tag (`from_wire_type_value` returns an
+    // empty Value), used when the method carries no structured
+    // auth body — accept and treat as empty auth.
     let mut creds = ClientCredentials {
         method: method.clone(),
         account: String::new(),
@@ -674,42 +700,54 @@ fn parse_client_credentials(frame: &Frame, order: ByteOrder) -> Option<ClientCre
         authority: String::new(),
         roles: Vec::new(),
     };
-    if let Ok(desc) = decode_type_desc(&mut cur, order) {
-        if let Ok(PvField::Structure(s)) = decode_pv_field(&desc, &mut cur, order) {
-            for (name, field) in &s.fields {
-                match (name.as_str(), field) {
-                    ("user", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
-                        creds.account = v.clone();
-                    }
-                    ("host", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
-                        creds.host = v.clone();
-                    }
-                    // pvxs ca-auth advertises POSIX groups as a
-                    // string array under `groups` (or sometimes
-                    // `roles`). Accept either name. Our PvField
-                    // ScalarArray holds heterogeneous ScalarValue —
-                    // we filter to the string-typed entries.
-                    ("groups" | "roles", PvField::ScalarArray(arr)) => {
-                        creds.roles = arr
-                            .iter()
-                            .filter_map(|sv| {
-                                if let crate::pvdata::ScalarValue::String(s) = sv {
-                                    Some(s.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                    }
-                    _ => {}
+    let pos = cur.position();
+    let peek = cur
+        .get_u8()
+        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc peek: {e}")))?;
+    if peek == 0xFF {
+        // Null auth Value — empty creds, but the method is honoured.
+        return Ok(Some(creds));
+    }
+    // Rewind and decode the real descriptor.
+    cur.set_position(pos);
+    let desc = decode_type_desc(&mut cur, order)
+        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc: {e}")))?;
+    let value = decode_pv_field(&desc, &mut cur, order)
+        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth value: {e}")))?;
+    if let PvField::Structure(s) = value {
+        for (name, field) in &s.fields {
+            match (name.as_str(), field) {
+                ("user", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
+                    creds.account = v.clone();
                 }
+                ("host", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
+                    creds.host = v.clone();
+                }
+                ("groups" | "roles", PvField::ScalarArray(arr)) => {
+                    creds.roles = arr
+                        .iter()
+                        .filter_map(|sv| {
+                            if let crate::pvdata::ScalarValue::String(s) = sv {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                }
+                _ => {}
             }
         }
     }
-    if creds.account.is_empty() {
-        creds.account = method;
-    }
-    Some(creds)
+    // Pre-fix Rust filled `account` with `method` whenever the auth
+    // body didn't carry a `user` field — that turned a truncated
+    // `ca` handshake into `account="ca"`. pvxs only populates
+    // user/host/groups from a successfully decoded ca structure;
+    // anything else leaves them empty (anonymous-shaped tuple). Mirror
+    // that — leave `account` empty when the structure didn't carry a
+    // `user` field. ACF rules will then see an empty-account ca
+    // credential rather than a fabricated method=name pair.
+    Ok(Some(creds))
 }
 
 /// Type-erased read/write halves so the same handler works for plain TCP
@@ -837,12 +875,17 @@ async fn handle_connection_io(
     let _ = tx.send(set_bo).await;
 
     // Step 2: send CONNECTION_VALIDATION request (server → client).
-    // pvxs `serverconn.cpp:100-115` advertises auth methods in
-    // reverse-priority order ("anonymous" then "ca" pushed onto the
-    // wire); the client should pick `ca` when its libca credentials
-    // resolved. Keep the same set here so the validation check below
-    // accepts both.
-    const ADVERTISED_AUTH_METHODS: &[&str] = &["ca", "anonymous"];
+    // PVA-R8: pvxs `serverconn.cpp:108-114` writes "anonymous" first,
+    // then "ca", with a comment explaining that older pvAccess
+    // clients took the LAST known plugin on the wire. The reverse-
+    // priority order matters: an old client picks the last
+    // recognised method as its preferred. Pre-fix Rust sent
+    // `["ca", "anonymous"]` which made such old clients pick
+    // anonymous and silently drop user/host credentials — changing
+    // ACF decisions even though the comment claimed pvxs parity.
+    // Modern pvxs clients explicitly prefer `ca`; validation still
+    // accepts both, only the wire order changes.
+    const ADVERTISED_AUTH_METHODS: &[&str] = &["anonymous", "ca"];
     let val_req =
         build_server_connection_validation(order, 87_040, 32_767, ADVERTISED_AUTH_METHODS);
     let _ = tx.send(val_req).await;
@@ -995,18 +1038,33 @@ async fn handle_connection_io(
                 // client's CONNECTION_VALIDATION claim is parsed only
                 // for diagnostics and never replaces it.
                 if x509_locked {
-                    if let Some(claimed) = parse_client_credentials(&frame, order) {
-                        debug!(
+                    // PVA-R22: a decode fault here is still fatal —
+                    // log + propagate. Pre-fix swallowed; pvxs
+                    // `serverconn.cpp:211-216` calls `bev.reset()`.
+                    match parse_client_credentials(&frame, order)? {
+                        Some(claimed) => debug!(
                             ?peer,
                             x509_account = %cred.account,
                             x509_authority = %cred.authority,
                             claimed_method = %claimed.method,
                             claimed_account = %claimed.account,
                             "PVA client over mTLS — x509 identity overrides CONNECTION_VALIDATION claim"
-                        );
+                        ),
+                        None => debug!(
+                            ?peer,
+                            "PVA client over mTLS sent anonymous CONNECTION_VALIDATION"
+                        ),
                     }
                 } else {
-                    cred = parse_client_credentials(&frame, order).unwrap_or(cred);
+                    // PVA-R22: a decode fault is now connection-fatal
+                    // (matches pvxs `serverconn.cpp:211-216`
+                    // bev.reset). An anonymous handshake (empty
+                    // method) returns Ok(None) and keeps the
+                    // existing anonymous credential. Only a fully
+                    // decoded auth structure replaces `cred`.
+                    if let Some(claimed) = parse_client_credentials(&frame, order)? {
+                        cred = claimed;
+                    }
                 }
                 debug!(?peer, method = %cred.method, account = %cred.account,
                     authority = %cred.authority, roles = ?cred.roles,

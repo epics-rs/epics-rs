@@ -334,29 +334,68 @@ impl ServerConn {
                             // malicious or compromised server announcing a
                             // 4 GiB header to OOM the client.
                             if buf.len() >= crate::proto::PvaHeader::SIZE {
-                                if let Ok(hdr) = crate::proto::PvaHeader::decode(
+                                // PVA-R7: decode the prefix to enforce
+                                // the payload cap. An undecodable
+                                // header here would have been
+                                // swallowed by `if let Ok` pre-fix —
+                                // close the connection so the cap
+                                // path is reachable for every header
+                                // shape we receive. pvxs
+                                // `conn.cpp:153-165` disconnects
+                                // immediately on bad magic / zero
+                                // version / direction-bit mismatch.
+                                match crate::proto::PvaHeader::decode(
                                     &mut std::io::Cursor::new(&buf[..])
                                 ) {
-                                    if !hdr.flags.is_control()
-                                        && hdr.payload_length as usize > MAX_MESSAGE_SIZE
-                                    {
+                                    Ok(hdr) => {
+                                        if !hdr.flags.is_control()
+                                            && hdr.payload_length as usize > MAX_MESSAGE_SIZE
+                                        {
+                                            warn!(
+                                                payload = hdr.payload_length,
+                                                cap = MAX_MESSAGE_SIZE,
+                                                "PVA inbound payload exceeds cap, closing"
+                                            );
+                                            cancel_reader.cancel();
+                                            return;
+                                        }
+                                    }
+                                    Err(e) => {
                                         warn!(
-                                            payload = hdr.payload_length,
-                                            cap = MAX_MESSAGE_SIZE,
-                                            "PVA inbound payload exceeds cap, closing"
+                                            error = %e,
+                                            "PVA client reader: malformed header from server, closing"
                                         );
-                                        break;
+                                        cancel_reader.cancel();
+                                        return;
                                     }
                                 }
                             }
-                            // Role-aware parse: a client's inbound frames must
-                            // have the Server direction bit SET (pvxs
-                            // `conn.cpp:160`). Reject mismatches so we can't
-                            // be fooled by a peer that echoes our own
-                            // outbound shape back.
-                            while let Ok(Some((frame, fn_))) =
-                                try_parse_frame_role(&buf, PeerRole::Client)
-                            {
+                            // PVA-R7: split frame-parse result. `Ok(None)`
+                            // keeps buffering for more bytes; `Ok(Some(..))`
+                            // drains + dispatches; `Err(e)` closes the
+                            // connection. Pre-fix `while let Ok(Some(..))`
+                            // treated parse errors as "no complete frame
+                            // yet", so a malformed prefix stayed pinned in
+                            // `buf` (and could keep growing if the peer
+                            // kept sending). Mirrors pvxs
+                            // `conn.cpp:153-165` direction-bit disconnect.
+                            //
+                            // Role-aware parse: a client's inbound frames
+                            // must have the Server direction bit SET.
+                            loop {
+                                let (frame, fn_) =
+                                    match try_parse_frame_role(&buf, PeerRole::Client) {
+                                        Ok(Some(pair)) => pair,
+                                        Ok(None) => break, // need more bytes
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                "PVA client reader: frame parse failed, closing"
+                                            );
+                                            cancel_reader.cancel();
+                                            return;
+                                        }
+                                    };
                                 buf.drain(..fn_);
                                 if frame.header.flags.is_control() {
                                     handle_control_frame(&frame, &writer_tx_reader, order_reader);

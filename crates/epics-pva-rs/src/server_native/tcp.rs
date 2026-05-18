@@ -1170,13 +1170,13 @@ async fn handle_connection_io(
                 handle_get_field(&source, &frame, &tx, &channels, order).await?;
             }
             Some(Command::DestroyRequest) => {
-                handle_destroy_request(&frame, &mut channels, order);
+                handle_destroy_request(&frame, &mut channels, order)?;
             }
             Some(Command::CancelRequest) => {
-                handle_cancel_request(&frame, &mut channels, order);
+                handle_cancel_request(&frame, &mut channels, order)?;
             }
             Some(Command::Message) => {
-                handle_message(&frame, order, &peer);
+                handle_message(&frame, order, &peer)?;
             }
             Some(Command::PutGet) => {
                 // F11: atomic put-then-get. The PVA wire spec defines
@@ -1736,14 +1736,28 @@ async fn handle_create_channel(
         .get_u16(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     for _ in 0..count {
-        let cid = match cur.get_u32(order) {
-            Ok(v) => v,
-            Err(_) => break, // truncated → emulate pvxs `M.good()` break
-        };
-        let name = match crate::proto::decode_string(&mut cur, order) {
-            Ok(Some(s)) => s,
-            Ok(None) => String::new(), // pvxs `name.empty()` triggers break
-            Err(_) => break,
+        // PVA-R28: truncated CID / malformed string is a protocol-
+        // fatal decode error. pvxs `serverchan.cpp:364-368`:
+        // `if(!M.good()) { conn->log("CREATE_CHANNEL...");
+        // conn->bev.reset(); }` — the connection is reset on a bad
+        // decoder state after the per-name loop. Pre-fix Rust used
+        // `match ... Err(_) => break` which kept the connection alive
+        // and let any previously-decoded pairs stay attached. Mirror
+        // pvxs: any decode failure in a name pair tears the
+        // connection down.
+        let cid = cur
+            .get_u32(order)
+            .map_err(|e| PvaError::Decode(format!("CREATE_CHANNEL cid: {e}")))?;
+        let name = match crate::proto::decode_string(&mut cur, order)
+            .map_err(|e| PvaError::Decode(format!("CREATE_CHANNEL name: {e}")))?
+        {
+            Some(s) => s,
+            None => {
+                // pvxs treats an empty name in the inner loop as a
+                // semantic mistake; we keep that as a soft break
+                // (the for-loop ends and Ok(()) flows to caller).
+                break;
+            }
         };
         if name.is_empty() {
             break;
@@ -1926,10 +1940,18 @@ fn handle_cancel_request(
     frame: &Frame,
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
-) {
+) -> PvaResult<()> {
     let mut cur = frame.cursor();
-    let Ok(sid) = cur.get_u32(order) else { return };
-    let Ok(ioid) = cur.get_u32(order) else { return };
+    // PVA-R28: pvxs `serverconn.cpp:262-270` throws on truncated
+    // CANCEL_REQUEST (`if(!M.good()) throw ...`), which the conn
+    // loop turns into a connection reset. Pre-fix Rust silently
+    // returned. Mirror pvxs — bubble as a fatal decode error.
+    let sid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(format!("CANCEL_REQUEST sid: {e}")))?;
+    let ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(format!("CANCEL_REQUEST ioid: {e}")))?;
     if let Some(ch) = channels.get_mut(&sid) {
         if let Some(op) = ch.ops.get(&ioid) {
             // Suspend without aborting the subscriber task. pvxs
@@ -1943,40 +1965,55 @@ fn handle_cancel_request(
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    Ok(())
 }
 
 /// Handle MESSAGE (cmd 18). pvxs serverconn.cpp:323 — clients send
 /// log messages tagged with severity (Info/Warning/Error/Fatal). We
 /// surface them through the `tracing` crate at the matching level.
-fn handle_message(frame: &Frame, order: ByteOrder, peer: &SocketAddr) {
+fn handle_message(frame: &Frame, order: ByteOrder, peer: &SocketAddr) -> PvaResult<()> {
     let mut cur = frame.cursor();
-    let Ok(ioid) = cur.get_u32(order) else { return };
-    let Ok(mtype) = cur.get_u8() else { return };
-    let msg = match crate::proto::decode_string(&mut cur, order) {
-        Ok(Some(s)) => s,
-        _ => String::new(),
-    };
+    // PVA-R28: pvxs `serverconn.cpp:323-336` throws on malformed
+    // MESSAGE; conn loop turns into a reset. Pre-fix Rust silently
+    // returned (string-decode also substituted "").
+    let ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(format!("MESSAGE ioid: {e}")))?;
+    let mtype = cur
+        .get_u8()
+        .map_err(|e| PvaError::Decode(format!("MESSAGE type: {e}")))?;
+    let msg = crate::proto::decode_string(&mut cur, order)
+        .map_err(|e| PvaError::Decode(format!("MESSAGE string: {e}")))?
+        .unwrap_or_default();
     match mtype {
         0 => debug!(?peer, ioid, message = %msg, "client info"),
         1 => warn!(?peer, ioid, message = %msg, "client warning"),
         2 | 3 => error!(?peer, ioid, message = %msg, "client error"),
         _ => debug!(?peer, ioid, mtype, message = %msg, "client message (unknown type)"),
     }
+    Ok(())
 }
 
 fn handle_destroy_request(
     frame: &Frame,
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
-) {
+) -> PvaResult<()> {
     let mut cur = frame.cursor();
-    let Ok(sid) = cur.get_u32(order) else { return };
-    let Ok(ioid) = cur.get_u32(order) else { return };
+    // PVA-R28: pvxs `serverconn.cpp:297-305` throws on malformed
+    // DESTROY_REQUEST. Pre-fix Rust silently returned.
+    let sid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(format!("DESTROY_REQUEST sid: {e}")))?;
+    let ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(format!("DESTROY_REQUEST ioid: {e}")))?;
     if let Some(ch) = channels.get_mut(&sid) {
         // Removing the op drops `monitor_abort: Option<Arc<AbortOnDrop>>`.
         // Once the last clone is dropped, the subscriber task aborts.
         ch.ops.remove(&ioid);
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3114,13 +3151,21 @@ mod tests {
             payload.put_u8(mtype);
             crate::proto::encode_string_into("hello from client", order, &mut payload);
             let frame = synth_frame(Command::Message, order, payload);
-            handle_message(&frame, order, &peer); // must not panic
+            // PVA-R28: MESSAGE handler now returns PvaResult; well-formed
+            // payload must succeed.
+            handle_message(&frame, order, &peer).expect("well-formed MESSAGE");
         }
 
-        // Truncated payloads must also not panic — handler should bail
-        // silently after the first read failure.
+        // PVA-R28: truncated MESSAGE is now a protocol-fatal decode
+        // error (matches pvxs `serverconn.cpp:323-336` throw). The
+        // server loop turns this into a connection reset.
         let frame_short = synth_frame(Command::Message, order, vec![0x01, 0x02]);
-        handle_message(&frame_short, order, &peer);
+        let err =
+            handle_message(&frame_short, order, &peer).expect_err("truncated MESSAGE must Err");
+        assert!(
+            matches!(err, PvaError::Decode(_)),
+            "expected Decode error, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3179,7 +3224,7 @@ mod tests {
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
         let frame = synth_frame(Command::CancelRequest, order, payload);
-        handle_cancel_request(&frame, &mut channels, order);
+        handle_cancel_request(&frame, &mut channels, order).expect("well-formed CancelRequest");
 
         // pvxs parity: op stays in the map, started flag stays set, abort
         // guard stays attached, pause flag flips on. Subsequent START

@@ -936,10 +936,19 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         }
         (FieldDesc::UnionArray { variants, .. }, PvField::UnionArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
+            // PVA-R13: pvxs `dataencode.cpp:368-378` encodes UnionA
+            // elements as a per-element presence byte (`0x00` for
+            // null, `0x01` followed by the union body for present).
+            // The union body is itself `selector + value`, where the
+            // selector may carry pvxs's Size-null sentinel `0xFF`.
+            // Pre-fix Rust skipped the outer presence byte entirely
+            // and emitted the selector (with `0xFF` for null) — a
+            // pvxs peer reads the `0xFF` as the presence byte (≠ 0/1
+            // → protocol fault). We don't model element-null in
+            // `UnionItem`, so we always emit `0x01` here and route
+            // out-of-range selectors through the inner Size-null.
             for it in items {
-                // Out-of-range selector → null marker, mirroring the
-                // scalar Union arm; emitting a size with no value would
-                // desync the frame.
+                out.put_u8(0x01);
                 match usize::try_from(it.selector)
                     .ok()
                     .and_then(|idx| variants.get(idx).map(|v| (idx, v)))
@@ -961,9 +970,25 @@ pub fn encode_pv_field(value: &PvField, desc: &FieldDesc, order: ByteOrder, out:
         },
         (FieldDesc::VariantArray, PvField::VariantArray(items)) => {
             encode_size_into(items.len() as u32, order, out);
+            // PVA-R13: pvxs `dataencode.cpp:382-393` encodes AnyA as
+            // a presence byte (`0x00` for null, `0x01 + descriptor +
+            // value` for present). Pre-fix Rust used `0xFF` to mean
+            // "null descriptor", which a pvxs peer reads as the
+            // presence byte (`≠ 0/1` → protocol fault). We don't
+            // model element-null in `VariantValue`, so always emit
+            // `0x01` here.
             for it in items {
+                out.put_u8(0x01);
                 match &it.desc {
-                    None => out.put_u8(0xFF),
+                    None => {
+                        // Defensive: a `VariantValue { desc: None }`
+                        // is the closest we have to a null element.
+                        // Re-encode as the present-but-empty shape
+                        // (descriptor `0xFF`) so the wire stays well-
+                        // formed; pvxs reads this as a Null type tag
+                        // and skips the value body.
+                        out.put_u8(0xFF);
+                    }
                     Some(d) => {
                         encode_type_desc(d, order, out);
                         encode_pv_field(&it.value, d, order, out);
@@ -1609,26 +1634,43 @@ fn decode_pv_field_at_depth(
                 as usize;
             let mut items = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
-                // Per-element selector encoding matches the scalar Union
-                // case: Size with 0xFF as the null sentinel.
-                match decode_size(cur, order)? {
-                    None => items.push(UnionItem {
+                // PVA-R13: pvxs `dataencode.cpp:624-650` reads a per-
+                // element presence byte before the union body. 0x00
+                // = null element; 0x01 = present (then selector +
+                // value). Pre-fix Rust read the selector directly.
+                let presence = cur.get_u8()?;
+                match presence {
+                    0x00 => items.push(UnionItem {
                         selector: -1,
                         variant_name: String::new(),
                         value: PvField::Null,
                     }),
-                    Some(sel_u32) => {
-                        let sel = sel_u32 as i32;
-                        let (variant_name, vdesc) = variants
-                            .get(sel as usize)
-                            .ok_or_else(|| decode_err!("union array selector {sel} out of range"))?
-                            .clone();
-                        let value = decode_pv_field_at_depth(&vdesc, cur, order, depth + 1)?;
-                        items.push(UnionItem {
-                            selector: sel,
-                            variant_name,
-                            value,
-                        });
+                    0x01 => match decode_size(cur, order)? {
+                        None => items.push(UnionItem {
+                            selector: -1,
+                            variant_name: String::new(),
+                            value: PvField::Null,
+                        }),
+                        Some(sel_u32) => {
+                            let sel = sel_u32 as i32;
+                            let (variant_name, vdesc) = variants
+                                .get(sel as usize)
+                                .ok_or_else(|| {
+                                    decode_err!("union array selector {sel} out of range")
+                                })?
+                                .clone();
+                            let value = decode_pv_field_at_depth(&vdesc, cur, order, depth + 1)?;
+                            items.push(UnionItem {
+                                selector: sel,
+                                variant_name,
+                                value,
+                            });
+                        }
+                    },
+                    other => {
+                        return Err(decode_err!(
+                            "union array element presence byte 0x{other:02X} (expected 0x00 or 0x01)"
+                        ));
                     }
                 }
             }
@@ -1664,22 +1706,45 @@ fn decode_pv_field_at_depth(
                 as usize;
             let mut items = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
-                let peek = cur.get_u8()?;
-                if peek == 0xFF {
-                    items.push(VariantValue {
+                // PVA-R13: pvxs `dataencode.cpp:656-674` reads a per-
+                // element presence byte before the inner descriptor.
+                // 0x00 = null element; 0x01 = present (then descriptor
+                // + value). Pre-fix Rust read the descriptor tag
+                // directly with `0xFF` repurposed as "null", which a
+                // pvxs peer reads as the presence byte (≠ 0/1 →
+                // protocol fault).
+                let presence = cur.get_u8()?;
+                match presence {
+                    0x00 => items.push(VariantValue {
                         desc: None,
                         value: PvField::Null,
-                    });
-                    continue;
+                    }),
+                    0x01 => {
+                        // Inner descriptor — may itself be the null
+                        // type tag `0xFF` (an empty AnyA element).
+                        let peek = cur.get_u8()?;
+                        if peek == 0xFF {
+                            items.push(VariantValue {
+                                desc: None,
+                                value: PvField::Null,
+                            });
+                            continue;
+                        }
+                        let pos = cur.position();
+                        cur.set_position(pos - 1);
+                        let inner = decode_type_desc(cur, order)?;
+                        let value = decode_pv_field_at_depth(&inner, cur, order, depth + 1)?;
+                        items.push(VariantValue {
+                            desc: Some(inner),
+                            value,
+                        });
+                    }
+                    other => {
+                        return Err(decode_err!(
+                            "variant array element presence byte 0x{other:02X} (expected 0x00 or 0x01)"
+                        ));
+                    }
                 }
-                let pos = cur.position();
-                cur.set_position(pos - 1);
-                let inner = decode_type_desc(cur, order)?;
-                let value = decode_pv_field_at_depth(&inner, cur, order, depth + 1)?;
-                items.push(VariantValue {
-                    desc: Some(inner),
-                    value,
-                });
             }
             PvField::VariantArray(items)
         }

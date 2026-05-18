@@ -1161,8 +1161,33 @@ with reason.
   handle_destroy_request / handle_message / handle_create_channel
   propagate truncated payloads as PvaError::Decode.
 
-### Deferred (6 — substantial architectural changes)
+### Cleared in the follow-up commit
 
+- **PVA-R11** (MEDIUM) — `server_native/tcp.rs::handle_tcp_search`
+  added; dispatched from the `Command::Search` arm. Reuses the
+  UDP `parse_search_request` + `build_search_response_proto`
+  helpers (now `pub(crate)`). Plumbed `guid` through
+  `PvaServerConfig` and added a `pub fn tcp_addr()` accessor on
+  `PvaServer`. Wire-level reproducer:
+  `tests/interop_pvxs_mods/tcp_search_r11.rs::interop_r11_tcp_circuit_search_returns_matching_cid`
+  (no pvxs dep — sends a raw SEARCH on TCP, asserts the
+  SEARCH_RESPONSE cid round-trips).
+- **PVA-R20** (MEDIUM, parser coverage) — Five unit tests in
+  `server_native::tcp::tests::pva_r20_*` exercise the
+  `monitor_pipeline_options` parser through the typed forms
+  (Boolean / Int / String true / Boolean false / queueSize<2).
+  Wire-level interop originating the typed-builder shape from a
+  pvxs CLI still needs a pvxs-linked C++ harness (out of scope);
+  the Rust parser side that pvxs would speak to is verified.
+
+### Deferred (5 — substantial architectural changes)
+
+- **PVA-R1** (LOW, interop assertion only) — Real ACK-withholding
+  assertion for pipeline negotiation. Requires either a pvxs
+  harness or surfacing the per-op pipeline state through a
+  ServerReport. R20 unit tests prove the parser enables the
+  window; R1 would prove the runtime *uses* the window via a
+  timing assertion on the wire.
 - **PVA-R2** (MEDIUM) — `tcp_timeout` plumbing through
   ConnectionPool::get_or_connect + ServerConn::connect + spawned
   heartbeat task. Multi-layer signature change; out of scope for
@@ -1172,15 +1197,15 @@ with reason.
   thread through all op-response decoders + reader flattening.
 - **PVA-R4** (MEDIUM) — TCP name servers as persistent search
   peers (not direct-connect fallbacks). Architectural change to
-  SearchEngine.
+  SearchEngine. The server side now answers TCP SEARCH (R11
+  cleared), so a pvxs client with
+  `EPICS_PVA_NAME_SERVERS=<rust>:port` can resolve PVs against a
+  Rust gateway — the missing piece is the *client*-side
+  persistent name-server connection.
 - **PVA-R6** (MEDIUM) — SharedPV subscriber queue with squash-to-
   tail semantics. tokio::mpsc has no sender-side "drop oldest";
   faithful fix needs custom Mutex<VecDeque>+Notify or
   tokio::sync::watch.
-- **PVA-R11** (MEDIUM) — Server TCP CMD_SEARCH handler (pvxs
-  serverchan.cpp:173-255). Requires sharing UDP request-parser
-  filtering + SEARCH_RESPONSE builder; complementary to PVA-R4
-  for full name-server parity.
 - **PVA-R14** (MEDIUM) — Decouple server source calls from per-
   connection read loop. Requires operation-state-machine
   restructure so source futures don't head-of-line-block the

@@ -1272,6 +1272,17 @@ async fn handle_connection_io(
             Some(Command::GetField) => {
                 handle_get_field(&source, &frame, &tx, &channels, order).await?;
             }
+            Some(Command::Search) => {
+                // PVA-R11: TCP-circuit SEARCH (pvxs
+                // `serverchan.cpp:173-255`). Required for
+                // name-server-redirect deployments where pvxs
+                // clients send SEARCH over the established TCP
+                // connection rather than via UDP. Pre-fix Rust
+                // had no arm here and the frame fell through to
+                // the silent default — the redirector hung waiting
+                // for SEARCH_RESPONSE.
+                handle_tcp_search(&source, &frame, &tx, &config).await?;
+            }
             Some(Command::DestroyRequest) => {
                 handle_destroy_request(&frame, &mut channels, order)?;
             }
@@ -2167,6 +2178,63 @@ fn handle_destroy_request(
         // Removing the op drops `monitor_abort: Option<Arc<AbortOnDrop>>`.
         // Once the last clone is dropped, the subscriber task aborts.
         ch.ops.remove(&ioid);
+    }
+    Ok(())
+}
+
+/// PVA-R11: handle `Command::Search` arriving on an established
+/// TCP virtual circuit. pvxs `serverchan.cpp:173-255` accepts this
+/// path so a client configured with `EPICS_PVA_NAME_SERVERS=<srv>`
+/// can resolve PVs without UDP. The wire body is identical to the
+/// UDP SEARCH; we reuse the parser exposed by `udp.rs`. The
+/// SEARCH_RESPONSE goes back on the same TCP connection (server-
+/// direction bit set).
+async fn handle_tcp_search(
+    source: &DynSource,
+    frame: &Frame,
+    tx: &SrvTx,
+    config: &PvaServerConfig,
+) -> PvaResult<()> {
+    // Rebuild the raw frame bytes so the UDP parser sees the same
+    // shape (header + payload). `parse_search_request` reads from
+    // the header inwards.
+    let mut raw: Vec<u8> = Vec::with_capacity(PvaHeader::SIZE + frame.payload.len());
+    frame.header.write_into(&mut raw);
+    raw.extend_from_slice(&frame.payload);
+
+    let Some(req) = super::udp::parse_search_request(&raw) else {
+        // Malformed body — drop silently, same as the UDP path.
+        // pvxs `serverchan.cpp:255` returns without emitting a
+        // response on bad input.
+        return Ok(());
+    };
+
+    // PVA-R10: filter by protocol. Default protocol on TCP is
+    // "tcp" (or "tls" when TLS is in use). Empty list tolerated
+    // as wildcard for legacy peers.
+    let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
+    let protocol_ok = req.protocols.is_empty() || req.protocols.iter().any(|p| p == protocol);
+    let mut matched: Vec<u32> = Vec::with_capacity(req.queries.len());
+    if protocol_ok {
+        for (cid, name) in &req.queries {
+            if source.searchable(name).await {
+                matched.push(*cid);
+            }
+        }
+    }
+    // pvxs `serverchan.cpp:240-249`: emit the response only when
+    // there's a match OR MustReply was set. Skip otherwise to
+    // avoid leaking server presence on every probe.
+    if !matched.is_empty() || req.must_reply {
+        let response = super::udp::build_search_response_proto(
+            config.guid,
+            req.seq,
+            config.tcp_port,
+            &matched,
+            req.byte_order,
+            protocol,
+        );
+        let _ = tx.send(response).await;
     }
     Ok(())
 }
@@ -3400,6 +3468,84 @@ mod tests {
     use super::*;
     use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
+
+    /// PVA-R20: server pipeline parser accepts the typed-bool /
+    /// typed-int shape pvxs `Context::request().record("pipeline",
+    /// true)` produces, not just the string `"true"` form.
+    fn make_pipeline_request(value_pipe: PvField, queue: PvField) -> PvField {
+        let options = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![
+                ("pipeline".to_string(), value_pipe),
+                ("queueSize".to_string(), queue),
+            ],
+        });
+        let record = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("_options".to_string(), options)],
+        });
+        PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("record".to_string(), record)],
+        })
+    }
+
+    #[test]
+    fn pva_r20_pipeline_typed_bool_true_enables_window() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+        );
+        let opts = monitor_pipeline_options(&req).expect("parsed");
+        assert!(opts.enabled, "Boolean(true) must enable pipeline");
+        assert_eq!(opts.queue_size, 16);
+    }
+
+    #[test]
+    fn pva_r20_pipeline_string_true_still_enables_window() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::String("true".into())),
+            PvField::Scalar(ScalarValue::String("32".into())),
+        );
+        let opts = monitor_pipeline_options(&req).expect("parsed");
+        assert!(opts.enabled, "string \"true\" must still enable pipeline");
+        assert_eq!(opts.queue_size, 32);
+    }
+
+    #[test]
+    fn pva_r20_pipeline_typed_int_nonzero_enables_window() {
+        // pvxs treats any non-zero integer as truthy via Value::as<bool>.
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Int(1)),
+            PvField::Scalar(ScalarValue::Int(8)),
+        );
+        let opts = monitor_pipeline_options(&req).expect("parsed");
+        assert!(opts.enabled, "Int(1) must enable pipeline");
+        assert_eq!(opts.queue_size, 8);
+    }
+
+    #[test]
+    fn pva_r20_pipeline_queue_size_below_two_disables() {
+        // pvxs `servermon.cpp:533-540` rejects queueSize < 2 even
+        // when pipeline=true. Pre-fix Rust clamped to 1 and ran a
+        // broken window.
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(1)),
+        );
+        let opts = monitor_pipeline_options(&req).expect("parsed");
+        assert!(!opts.enabled, "queueSize<2 must disable pipeline");
+    }
+
+    #[test]
+    fn pva_r20_pipeline_bool_false_disables() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Int(16)),
+        );
+        let opts = monitor_pipeline_options(&req).expect("parsed");
+        assert!(!opts.enabled, "Boolean(false) must disable pipeline");
+    }
 
     fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {
         let header = PvaHeader::application(false, order, command.code(), payload.len() as u32);

@@ -14,6 +14,14 @@ use super::udp::{random_guid, run_udp_responder_v6, run_udp_responder_with_confi
 pub struct PvaServerConfig {
     pub tcp_port: u16,
     pub udp_port: u16,
+    /// PVA-R11: server identity propagated into the TCP-circuit
+    /// `Command::Search` reply (`pvxs serverchan.cpp:215-235`). UDP
+    /// SEARCH_RESPONSE uses the same guid emitted by the UDP
+    /// responder. The runtime fills this from `random_guid()` before
+    /// passing the config to `run_tcp_server_on_listener`; default
+    /// is zero so tests / direct callers that don't care still
+    /// compile.
+    pub guid: [u8; 12],
     /// Per-frame read timeout. The server *also* applies the heartbeat-
     /// based idle timeout below — `op_timeout` is just the upper bound on
     /// any single read.
@@ -202,6 +210,7 @@ impl Default for PvaServerConfig {
         Self {
             tcp_port: 5075,
             udp_port: 5076,
+            guid: [0u8; 12],
             op_timeout: Duration::from_secs(64_000),
             bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             max_connections: 1024,
@@ -441,6 +450,13 @@ impl PvaServer {
         S: ChannelSource + 'static,
     {
         let guid = random_guid();
+        // PVA-R11: the TCP-circuit SEARCH handler reads this guid
+        // out of the per-connection config copy to populate the
+        // SEARCH_RESPONSE body. Stamp it onto a local mut copy so
+        // every per-conn task sees the same identity the UDP path
+        // does.
+        let mut config = config;
+        config.guid = guid;
         // The live per-peer registry is created up-front so the
         // built-in server-info source can report connection counts.
         let peers = crate::server_native::peers::PeerRegistry::new();
@@ -610,6 +626,18 @@ impl PvaServer {
     /// Effective config snapshot. pvxs `Server::config` parity.
     pub fn config(&self) -> &PvaServerConfig {
         &self.effective_config
+    }
+
+    /// Loopback address the TCP listener actually bound to. Useful
+    /// for tests that want a raw TCP socket against the server
+    /// (e.g. wire-level interop tests that bypass the client
+    /// stack). Mirrors pvxs `Server::bound_tcp_addr`.
+    pub fn tcp_addr(&self) -> SocketAddr {
+        let loopback = match self.effective_config.bind_ip {
+            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        };
+        SocketAddr::new(loopback, self.bound_tcp_port)
     }
 
     /// Block on this server until it stops, SIGINT/SIGTERM is received,

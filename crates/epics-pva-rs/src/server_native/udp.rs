@@ -915,7 +915,9 @@ async fn process_v6_search_datagram(
 /// still a valid frame — used as an answer to `MustReply`-flagged
 /// SEARCHes (pvlist-style discovery probes) so the requester can build
 /// its server list.
-fn build_search_response_proto(
+// PVA-R11: exposed for tcp.rs so the TCP-circuit SEARCH handler
+// reuses the same wire shape the UDP responder emits.
+pub(crate) fn build_search_response_proto(
     guid: [u8; 12],
     seq: u32,
     tcp_port: u16,
@@ -988,39 +990,43 @@ fn build_beacon(
     out
 }
 
+// PVA-R11: exposed pub(crate) so the TCP-circuit SEARCH handler in
+// tcp.rs can reuse this struct + the parser below. The fields are
+// read-only after parse; TCP only consults `queries` and `protocols`
+// (and `seq` for the response echo).
 #[derive(Debug)]
-struct SearchRequest {
-    seq: u32,
-    byte_order: ByteOrder,
-    queries: Vec<(u32, String)>,
+pub(crate) struct SearchRequest {
+    pub(crate) seq: u32,
+    pub(crate) byte_order: ByteOrder,
+    pub(crate) queries: Vec<(u32, String)>,
     /// Reply destination announced inside the SEARCH payload (the
     /// 16-byte address + 2-byte port fields). `None` means the address
     /// was the unspecified sentinel (`0.0.0.0` / `::`), in which case
     /// pvxs falls back to the UDP source address. The port is always
     /// populated, even when `reply_addr` is `None`.
-    reply_addr: Option<Ipv4Addr>,
-    reply_port: u16,
+    pub(crate) reply_addr: Option<Ipv4Addr>,
+    pub(crate) reply_port: u16,
     /// True when the SEARCH header had the Unicast flag (`0x80`,
     /// `pva_search_flags::Unicast`) set. pvxs uses this as a marker
     /// that the forwarder must clear before relaying via the loopback
     /// ORIGIN_TAG channel (`udp_collector.cpp:391`).
-    unicast: bool,
+    pub(crate) unicast: bool,
     /// True when the SEARCH header had the `MustReply` flag (`0x01`,
     /// `pva_search_flags::MustReply`) set — pvlist-style discovery
     /// probes set this so every reachable server answers even with
     /// `nreply==0`. pvxs honours it at `server.cpp:730-732`
     /// (`if(nreply==0 && !msg.mustReply) return;`).
-    must_reply: bool,
+    pub(crate) must_reply: bool,
     /// PVA-R10: the transport protocols the client requested in this
     /// SEARCH. pvxs `udp_collector.cpp:408-421` records whether
     /// "tcp" appeared and `:424-443` only queues channel matches
     /// when it did. Empty = legacy SEARCH that omitted the field
     /// (tolerate as "tcp by default").
-    protocols: Vec<String>,
+    pub(crate) protocols: Vec<String>,
     /// Total bytes consumed from the input slice (header + payload),
     /// used by the multi-message drain loop to advance to the next
     /// chained message in the same datagram.
-    consumed: usize,
+    pub(crate) consumed: usize,
 }
 
 /// How a SEARCH packet reached us. Mirrors pvxs `udp_collector.cpp`'s
@@ -1041,7 +1047,7 @@ enum Origin {
     FromOriginTag,
 }
 
-fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
+pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     if frame.len() < PvaHeader::SIZE {
         return None;
     }

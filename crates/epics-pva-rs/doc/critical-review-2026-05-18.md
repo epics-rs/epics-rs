@@ -1274,29 +1274,28 @@ fixed:
   restructure so source futures don't head-of-line-block the
   socket parser.
 
-### Remaining cross-impl coverage gaps (documented for transparency)
+### Coverage gaps cleared in the follow-up
 
-- **Real ACF/ASG cross-impl** — The wire-side of an
-  access-denied PUT is covered (batch 11, via `on_put`
-  rejection); the ACF parser + AccessGate semantics are
-  unit-tested in `epics-base-rs`. What's NOT exercised
-  end-to-end: loading a real `.acf` file, hooking it into a
-  `PvaServer`'s composite via `AccessGate::required`, and
-  verifying the wire result against a pvxs client. Requires
-  adding a public `PvaServerConfig::access_gate` knob and a
-  test wrapper source — not done. The constituent paths are
-  proven; integration is a small follow-up.
-- **TLS client auth (mTLS)** — Batch 12 covers server-auth
-  TLS (server presents cert, client trusts CA). Client cert
-  auth (`x509` authnz method end-to-end) needs both sides
-  configured with cert + trust; pvxs's behaviour matches but
-  the matrix entry hasn't been added.
-- **TLS via name-server** — Batch 12 uses UDP search because
-  pvxs's plaintext name-server query collides with our
-  TLS-only listener. A mixed-mode listener (plain TCP for
-  name-server, TLS for data) would close this; would also
-  cover the production "TLS in front of a name-server"
-  deployment.
+- **Real ACF/ASG cross-impl** — `SharedSource::set_access_gate`
+  added; tests `asg_cross_impl::interop_asg_denied_put_via_real_acf`
+  parses an inline `.acf` via `parse_acf`, builds
+  `AccessGate::required(cell, resolver)`, installs it on the
+  source, and asserts pvxput is denied on the wire. Full
+  ACF → gate → tcp.rs → pvxs round-trip now covered.
+- **TLS client auth (mTLS)** — `tls_mtls::interop_tls_mtls_pvxget_with_client_cert_to_rust_server`.
+  Rust server with `WebPkiClientVerifier` requires a client
+  cert signed by the CA. pvxget presents the CA-signed leaf
+  via `EPICS_PVA_TLS_KEYCHAIN` and the GET round-trips.
+
+### Remaining (1 deferred — architectural)
+
+- **TLS via name-server (mixed-mode listener)** — Batch 12 uses
+  UDP search because pvxs's plaintext name-server query
+  collides with our TLS-only listener. Closing this requires
+  the TCP accept loop to peek at the first byte and dispatch
+  either to plain handshake or `TlsAcceptor` — a substantive
+  refactor of `server_native/tcp.rs:460-590`. Not blocked
+  technically, just out of scope for this fix round.
 
 ### Verification
 

@@ -634,13 +634,37 @@ impl Default for SharedPV {
 /// `add(name, shared_pv)`, then pass to [`super::runtime::run_pva_server`].
 pub struct SharedSource {
     pvs: Mutex<HashMap<String, SharedPV>>,
+    /// Optional per-source access gate. When `None`, the trait
+    /// default open gate is returned (back-compat). When `Some`,
+    /// every wire op routes its allow/deny check through this
+    /// gate — use with `AccessGate::required(acf, resolver)` to
+    /// enforce a real .acf policy against PVA clients. Set via
+    /// [`SharedSource::set_access_gate`].
+    access_gate: std::sync::OnceLock<epics_base_rs::server::access_security::AccessGate>,
 }
 
 impl SharedSource {
     pub fn new() -> Self {
         Self {
             pvs: Mutex::new(HashMap::new()),
+            access_gate: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install an [`AccessGate`] on this source. Subsequent wire
+    /// ops use it for every allow/deny check. Idempotent — only
+    /// the first call wins (the gate is stored in a `OnceLock`
+    /// so subscribers can hold borrowed references without
+    /// invalidation races). For dynamic ACF reload, use the
+    /// existing `AccessGate::required(...)` shape whose internal
+    /// `Arc<RwLock<...>>` already supports hot-swap.
+    pub fn set_access_gate(
+        &self,
+        gate: epics_base_rs::server::access_security::AccessGate,
+    ) -> Result<(), &'static str> {
+        self.access_gate
+            .set(gate)
+            .map_err(|_| "SharedSource access gate already installed")
     }
 
     pub fn add(&self, name: impl Into<String>, pv: SharedPV) {
@@ -683,6 +707,18 @@ impl Default for SharedSource {
 }
 
 impl super::source::ChannelSource for SharedSource {
+    fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
+        match self.access_gate.get() {
+            Some(g) => g,
+            None => {
+                static OPEN_GATE: std::sync::OnceLock<
+                    epics_base_rs::server::access_security::AccessGate,
+                > = std::sync::OnceLock::new();
+                OPEN_GATE.get_or_init(epics_base_rs::server::access_security::AccessGate::open)
+            }
+        }
+    }
+
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
         let names: Vec<String> = self.pvs.lock().keys().cloned().collect();
         async move { names }

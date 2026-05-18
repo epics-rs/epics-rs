@@ -68,6 +68,16 @@ pub struct PvaServerConfig {
     /// connection is upgraded to TLS via `tokio_rustls::TlsAcceptor`
     /// before the PVA handshake begins.
     pub tls: Option<std::sync::Arc<crate::auth::TlsServerConfig>>,
+    /// Optional override for the server's top-level access gate.
+    /// When `Some`, the user source's default open gate is
+    /// replaced with this gate for every wire op (GET, PUT,
+    /// MONITOR, RPC, PROCESS). Use with
+    /// `AccessGate::required(acf, resolver)` to load a real
+    /// `.acf` policy from disk and enforce it against pvxs (or
+    /// any) clients. Default `None` preserves the historical
+    /// open-gate behavior so existing users see no behavior
+    /// change.
+    pub access_gate_override: Option<epics_base_rs::server::access_security::AccessGate>,
     /// Wire byte order the server sends in its SET_BYTE_ORDER control
     /// message. Clients adopt whatever the server picks. pvxs's
     /// `Config::overrideSendBE` exposes the same knob; defaults to LE.
@@ -219,6 +229,7 @@ impl Default for PvaServerConfig {
             idle_timeout: Duration::from_secs(45),
             monitor_queue_depth: 64,
             tls: None,
+            access_gate_override: None,
             wire_byte_order: crate::proto::ByteOrder::Little,
             beacon_period: Duration::from_secs(15),
             beacon_period_long: Duration::from_secs(180),

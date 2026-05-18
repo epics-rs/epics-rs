@@ -1141,14 +1141,42 @@ where
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
-    let pv_req = if fields.is_empty() {
+    // PVA-R1: when `pipeline_size > 0`, inject
+    // `record._options.pipeline = "true"` + `queueSize` into the
+    // pvRequest and set the MONITOR INIT pipeline bit + initial
+    // nack trailer. Server-side credit window is keyed on the
+    // pvRequest options (pvxs servermon.cpp:523-552); pre-fix Rust
+    // sent the pipeline size on START as a trailer the server never
+    // read.
+    let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+    let pv_req: std::borrow::Cow<'_, [u8]> = if pipeline_size > 0 {
+        let fields_for_req: &[&str] = if refs.is_empty() {
+            // Empty field list = "send the whole structure";
+            // build_pv_request_pipeline still needs at least one
+            // entry to produce a valid `field` sub-structure. Use
+            // a single "value" — matches what most pvxs callers
+            // pass for default pipelined monitor.
+            &["value"]
+        } else {
+            &refs
+        };
+        std::borrow::Cow::Owned(crate::pv_request::build_pv_request_pipeline(
+            fields_for_req,
+            pipeline_size,
+            big_endian,
+        ))
+    } else if fields.is_empty() {
         std::borrow::Cow::Borrowed(sentinel_all_fields())
     } else {
-        let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
         std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian))
     };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
-    let init_req = codec.build_monitor_init(sid, ioid, &pv_req);
+    let init_req = codec.build_monitor_init(
+        sid,
+        ioid,
+        &pv_req,
+        (pipeline_size > 0).then_some(pipeline_size),
+    );
     server
         .send(init_req)
         .await
@@ -1187,7 +1215,7 @@ where
     let start = if initially_paused {
         codec.build_monitor_pause(sid, ioid)
     } else {
-        codec.build_monitor_start(sid, ioid, pipeline_size)
+        codec.build_monitor_start(sid, ioid)
     };
     server
         .send(start)
@@ -1544,8 +1572,21 @@ where
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
 
-    let pv_req = match raw_pv_req {
+    // PVA-R1: same pipeline-injection treatment as op_monitor_raw_frames.
+    // A caller-supplied `raw_pv_req` overrides — it already has the
+    // pipeline options the caller wants (or doesn't); auto-injection
+    // only applies on the default-pvRequest path.
+    let pv_req: std::borrow::Cow<'_, [u8]> = match raw_pv_req {
         Some(b) => std::borrow::Cow::Borrowed(b),
+        None if pipeline_size > 0 => {
+            let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+            let fields_for_req: &[&str] = if refs.is_empty() { &["value"] } else { &refs };
+            std::borrow::Cow::Owned(crate::pv_request::build_pv_request_pipeline(
+                fields_for_req,
+                pipeline_size,
+                big_endian,
+            ))
+        }
         None if fields.is_empty() => std::borrow::Cow::Borrowed(sentinel_all_fields()),
         None => {
             let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
@@ -1555,8 +1596,13 @@ where
 
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
 
-    // INIT
-    let init_req = codec.build_monitor_init(sid, ioid, &pv_req);
+    // INIT (with pipeline negotiation when applicable — PVA-R1).
+    let init_req = codec.build_monitor_init(
+        sid,
+        ioid,
+        &pv_req,
+        (pipeline_size > 0).then_some(pipeline_size),
+    );
     server
         .send(init_req)
         .await
@@ -1595,7 +1641,7 @@ where
     let start = if initially_paused {
         codec.build_monitor_pause(sid, ioid)
     } else {
-        codec.build_monitor_start(sid, ioid, pipeline_size)
+        codec.build_monitor_start(sid, ioid)
     };
     server
         .send(start)

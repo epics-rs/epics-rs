@@ -242,29 +242,74 @@ fn monitor_pipeline_options(req: &PvField) -> Option<PipelineOptions> {
         PvField::Structure(s) => s,
         _ => return None,
     };
-    let pipeline_str = opt_s.fields.iter().find_map(|(k, v)| {
-        (k == "pipeline").then_some(v).and_then(|v| match v {
-            PvField::Scalar(ScalarValue::String(s)) => Some(s.as_str()),
-            _ => None,
-        })
-    });
-    let enabled = matches!(pipeline_str, Some("true") | Some("1"));
-    let queue_size = opt_s
+    // PVA-R20: pvxs `servermon.cpp:523-540` parses `pipeline` via
+    // `Value::as(bool)` and `queueSize` via the analogous scalar
+    // conversion. A pvxs client using the typed builder form
+    // (`.record("pipeline", true).record("queueSize", N)`) sends a
+    // BOOL/INT, not the parsed-from-`record[pipeline=true]` STRING.
+    // Pre-fix Rust matched only the string form; the typed builder
+    // produced a pvRequest Rust decoded as non-pipelined, dropping
+    // flow control. Accept both shapes.
+    let enabled = opt_s
         .fields
         .iter()
         .find_map(|(k, v)| {
-            (k == "queueSize").then_some(v).and_then(|v| match v {
-                PvField::Scalar(ScalarValue::String(s)) => s.parse::<u32>().ok(),
-                PvField::Scalar(ScalarValue::Int(i)) => Some(*i as u32),
-                PvField::Scalar(ScalarValue::Long(l)) => Some(*l as u32),
+            (k == "pipeline").then_some(v).and_then(|v| match v {
+                PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
+                PvField::Scalar(ScalarValue::String(s)) => Some(matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                )),
+                PvField::Scalar(ScalarValue::Byte(i)) => Some(*i != 0),
+                PvField::Scalar(ScalarValue::UByte(i)) => Some(*i != 0),
+                PvField::Scalar(ScalarValue::Short(i)) => Some(*i != 0),
+                PvField::Scalar(ScalarValue::UShort(i)) => Some(*i != 0),
+                PvField::Scalar(ScalarValue::Int(i)) => Some(*i != 0),
+                PvField::Scalar(ScalarValue::UInt(i)) => Some(*i != 0),
+                PvField::Scalar(ScalarValue::Long(i)) => Some(*i != 0),
+                PvField::Scalar(ScalarValue::ULong(i)) => Some(*i != 0),
                 _ => None,
             })
         })
-        .unwrap_or(4);
-    Some(PipelineOptions {
-        enabled,
-        queue_size: queue_size.max(1),
-    })
+        .unwrap_or(false);
+    // PVA-R20: pvxs `servermon.cpp:533-540` rejects invalid or `<2`
+    // queueSize when pipeline is enabled (sets pipeline off). Pre-fix
+    // Rust silently defaulted to 4 on parse failure and clamped to
+    // 1 — accepting `queueSize=1` for a pipelined monitor, which
+    // pvxs rejects because the credit accounting needs ≥2 slots.
+    let queue_size = opt_s.fields.iter().find_map(|(k, v)| {
+        (k == "queueSize").then_some(v).and_then(|v| match v {
+            PvField::Scalar(ScalarValue::String(s)) => s.parse::<u32>().ok(),
+            PvField::Scalar(ScalarValue::Byte(i)) => u32::try_from(*i).ok(),
+            PvField::Scalar(ScalarValue::UByte(i)) => Some(u32::from(*i)),
+            PvField::Scalar(ScalarValue::Short(i)) => u32::try_from(*i).ok(),
+            PvField::Scalar(ScalarValue::UShort(i)) => Some(u32::from(*i)),
+            PvField::Scalar(ScalarValue::Int(i)) => u32::try_from(*i).ok(),
+            PvField::Scalar(ScalarValue::UInt(i)) => Some(*i),
+            PvField::Scalar(ScalarValue::Long(l)) => u32::try_from(*l).ok(),
+            PvField::Scalar(ScalarValue::ULong(l)) => u32::try_from(*l).ok(),
+            _ => None,
+        })
+    });
+    if enabled {
+        match queue_size {
+            Some(n) if n >= 2 => Some(PipelineOptions {
+                enabled: true,
+                queue_size: n,
+            }),
+            // pvxs: invalid/<2 queueSize disables pipeline rather than
+            // accepting a broken negotiation.
+            _ => Some(PipelineOptions {
+                enabled: false,
+                queue_size: queue_size.unwrap_or(4).max(1),
+            }),
+        }
+    } else {
+        Some(PipelineOptions {
+            enabled: false,
+            queue_size: queue_size.unwrap_or(4).max(1),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

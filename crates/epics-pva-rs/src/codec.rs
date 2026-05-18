@@ -178,32 +178,45 @@ impl PvaCodec {
 
     // ─── MONITOR ─────────────────────────────────────────────────────────
 
+    /// MONITOR INIT — `subcmd=0x08` (INIT) plus the pvRequest body.
+    /// When `pipeline_initial_nack` is `Some(N)`, the pipeline bit
+    /// `0x80` is OR'd into subcmd and a u32 `nack` trailer is
+    /// appended after the pvRequest. Mirrors pvxs
+    /// `clientmon.cpp:327-342`: the pipeline negotiation happens on
+    /// INIT (where the server also reads `record._options.pipeline`
+    /// from the pvRequest to decide whether to enable its credit
+    /// window), NOT on START.
     pub fn build_monitor_init(
         &self,
         server_channel_id: u32,
         ioid: u32,
         pv_request: &[u8],
+        pipeline_initial_nack: Option<u32>,
     ) -> Vec<u8> {
-        let p = Self::op_payload(server_channel_id, ioid, QOS_INIT, pv_request, self.order());
+        let order = self.order();
+        let mut body: Vec<u8> = Vec::with_capacity(pv_request.len() + 4);
+        body.extend_from_slice(pv_request);
+        let subcmd = if let Some(nack) = pipeline_initial_nack {
+            let bytes = match order {
+                ByteOrder::Big => nack.to_be_bytes(),
+                ByteOrder::Little => nack.to_le_bytes(),
+            };
+            body.extend_from_slice(&bytes);
+            QOS_INIT | 0x80
+        } else {
+            QOS_INIT
+        };
+        let p = Self::op_payload(server_channel_id, ioid, subcmd, &body, order);
         self.frame(false, CMD_MONITOR, p)
     }
 
-    pub fn build_monitor_start(
-        &self,
-        server_channel_id: u32,
-        ioid: u32,
-        pipeline_size: u32,
-    ) -> Vec<u8> {
-        let order = self.order();
-        // pvxs `servermon.cpp` uses subcmd `0x44` (0x40 START | 0x04 PROCESS)
-        // for the initial START, optionally followed by the pipeline window
-        // size. Plain `0x40` works equivalently when no pipelining is
-        // requested; we always send the 4-byte window for consistency.
-        let extra = match order {
-            ByteOrder::Big => pipeline_size.to_be_bytes(),
-            ByteOrder::Little => pipeline_size.to_le_bytes(),
-        };
-        let p = Self::op_payload(server_channel_id, ioid, 0x44, &extra, order);
+    /// MONITOR START — `subcmd=0x44` (`0x40` START | `0x04` PROCESS)
+    /// with no trailing payload. pvxs `clientmon.cpp:123-137` sends
+    /// START/STOP as `sid + ioid + subcmd` only. Pre-fix Rust
+    /// appended a 4-byte `pipeline_size` trailer here — pipeline
+    /// negotiation belongs on INIT (see [`build_monitor_init`]).
+    pub fn build_monitor_start(&self, server_channel_id: u32, ioid: u32) -> Vec<u8> {
+        let p = Self::op_payload(server_channel_id, ioid, 0x44, &[], self.order());
         self.frame(false, CMD_MONITOR, p)
     }
 

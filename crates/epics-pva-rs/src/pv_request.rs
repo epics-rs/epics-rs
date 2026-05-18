@@ -79,6 +79,129 @@ pub fn build_pv_request_fields(fields: &[&str], big_endian: bool) -> Vec<u8> {
     build(fields, order)
 }
 
+/// PVA-R1: build a pvRequest that includes
+/// `record._options.pipeline = "true"` and
+/// `record._options.queueSize = "<queue_size>"` alongside the
+/// requested `fields`. pvxs `servermon.cpp:523-552` only enables the
+/// server-side credit window when these options are present in the
+/// pvRequest. Pre-fix Rust set `pipeline_size` on the client
+/// context but never injected the options, so the server ran in
+/// default no-window mode and a Rust↔Rust monitor was effectively
+/// un-flow-controlled. The body and the `descriptor + value` shape
+/// match what pvxs `clientreq.cpp` emits when the caller does
+/// `.record("pipeline", true).record("queueSize", N)`.
+pub fn build_pv_request_pipeline(fields: &[&str], queue_size: u32, big_endian: bool) -> Vec<u8> {
+    let order = if big_endian {
+        ByteOrder::Big
+    } else {
+        ByteOrder::Little
+    };
+    build_with_pipeline(fields, queue_size, order)
+}
+
+fn build_with_pipeline(fields: &[&str], queue_size: u32, order: ByteOrder) -> Vec<u8> {
+    use crate::pvdata::PvStructure;
+    use crate::pvdata::ScalarValue;
+    use crate::pvdata::encode::encode_pv_field;
+
+    // pvRequest type:
+    //   structure {
+    //     structure field { ...<fields>... }
+    //     structure record {
+    //       structure _options {
+    //         string pipeline
+    //         string queueSize
+    //       }
+    //     }
+    //   }
+    let field_struct = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: fields
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: Vec::new(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    let options_struct = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![
+            (
+                "pipeline".to_string(),
+                FieldDesc::Scalar(crate::pvdata::ScalarType::String),
+            ),
+            (
+                "queueSize".to_string(),
+                FieldDesc::Scalar(crate::pvdata::ScalarType::String),
+            ),
+        ],
+    };
+    let record_struct = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![("_options".to_string(), options_struct.clone())],
+    };
+    let pv_request_desc = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![
+            ("field".to_string(), field_struct.clone()),
+            ("record".to_string(), record_struct),
+        ],
+    };
+
+    // pvRequest value (descriptor + full value per
+    // `from_wire_type_value`). Build the matching PvStructure:
+    let field_value = PvField::Structure(PvStructure {
+        struct_id: String::new(),
+        fields: fields
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    PvField::Structure(PvStructure {
+                        struct_id: String::new(),
+                        fields: Vec::new(),
+                    }),
+                )
+            })
+            .collect(),
+    });
+    let options_value = PvField::Structure(PvStructure {
+        struct_id: String::new(),
+        fields: vec![
+            (
+                "pipeline".to_string(),
+                PvField::Scalar(ScalarValue::String("true".to_string())),
+            ),
+            (
+                "queueSize".to_string(),
+                PvField::Scalar(ScalarValue::String(queue_size.to_string())),
+            ),
+        ],
+    });
+    let record_value = PvField::Structure(PvStructure {
+        struct_id: String::new(),
+        fields: vec![("_options".to_string(), options_value)],
+    });
+    let pv_request_value = PvField::Structure(PvStructure {
+        struct_id: String::new(),
+        fields: vec![
+            ("field".to_string(), field_value),
+            ("record".to_string(), record_value),
+        ],
+    });
+
+    let mut out = Vec::new();
+    encode_type_desc(&pv_request_desc, order, &mut out);
+    encode_pv_field(&pv_request_value, &pv_request_desc, order, &mut out);
+    out
+}
+
 /// Convert a pvRequest *structure* (rooted at `request_desc`) into a
 /// `BitSet` over the fields of `value_desc`, using pvData spec §5.4
 /// depth-first bit numbering. Mirrors pvxs `request2mask`.

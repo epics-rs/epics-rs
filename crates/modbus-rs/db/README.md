@@ -1,8 +1,9 @@
-# modbus-rs database templates
+# epics-modbus-rs database templates
 
-Standard EPICS record templates for binding records to a `modbus-rs` driver
-port. These are ported from `epics-modules/modbus`'s `modbusApp/Db` and are
-compatible with the `epics-rs` asyn record device support.
+Standard EPICS record templates for binding records to an
+`epics-modbus-rs` driver port (Rust library name `modbus_rs`). These are
+ported from `epics-modules/modbus`'s `modbusApp/Db` and are compatible
+with the `epics-rs` asyn record device support.
 
 ## Macros
 
@@ -27,6 +28,7 @@ Common macros across templates:
 ## Note on the C `=N` string length
 
 Upstream modbus allows a `drvInfo` suffix like `ZSTRING_HIGH=20` to cap the
-string length. `modbus-rs` drops the `=N` suffix (see `ioc.rs`): a string
-record's length comes from its own record buffer (`NELM`). Templates that
-relied on `=N` shorter than `NELM` should set `NELM` to the intended length.
+string length. `epics-modbus-rs` drops the `=N` suffix (see `ioc.rs`): a
+string record's length comes from its own record buffer (`NELM`).
+Templates that relied on `=N` shorter than `NELM` should set `NELM` to
+the intended length.

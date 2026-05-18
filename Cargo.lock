@@ -1089,6 +1089,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "epics-modbus-rs"
+version = "0.18.0"
+dependencies = [
+ "asyn-rs",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "epics-pva-rs"
 version = "0.18.0"
 dependencies = [
@@ -2249,20 +2261,8 @@ dependencies = [
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
- "modbus-rs",
+ "epics-modbus-rs",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "modbus-rs"
-version = "0.18.0"
-dependencies = [
- "asyn-rs",
- "epics-base-rs",
- "epics-ca-rs",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]

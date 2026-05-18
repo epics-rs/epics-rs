@@ -1,7 +1,10 @@
-//! # modbus-rs
+//! # epics-modbus-rs
 //!
 //! Rust port of the EPICS [`modbus`](https://github.com/epics-modules/modbus)
 //! module — a Modbus TCP/RTU/ASCII driver for `epics-rs`.
+//!
+//! Published on crates.io as `epics-modbus-rs`; the Rust library name is
+//! `modbus_rs`, so consumers write `use modbus_rs::...`.
 //!
 //! This is the equivalent of `drvModbusAsyn`: it layers Modbus protocol
 //! framing on top of an `asyn-rs` octet port and exposes a PLC's register

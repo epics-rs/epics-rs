@@ -1,5 +1,5 @@
 [package]
-name = "modbus-rs"
+name = "epics-modbus-rs"
 version.workspace = true
 edition.workspace = true
 description = "Rust port of EPICS modbus — Modbus TCP/RTU/ASCII driver for epics-rs"
@@ -7,6 +7,14 @@ license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true
 readme = "README.md"
+
+# Library import name kept as `modbus_rs` so consumers continue to write
+# `use modbus_rs::...` even though the crates.io package is
+# `epics-modbus-rs` (the bare `modbus-rs` name was already taken on
+# crates.io by an unrelated project).
+[lib]
+name = "modbus_rs"
+path = "src/lib.rs"
 
 [dependencies]
 asyn-rs = { workspace = true }

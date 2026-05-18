@@ -41,6 +41,6 @@ std-rs = { path = "crates/std-rs", version = "0.18.0" }
 scaler-rs = { path = "crates/scaler-rs", version = "0.18.0" }
 optics-rs = { path = "crates/optics-rs", version = "0.18.0" }
 mqtt-rs = { path = "crates/mqtt-rs", version = "0.18.0" }
-modbus-rs = { path = "crates/modbus-rs", version = "0.18.0" }
+modbus-rs = { path = "crates/modbus-rs", version = "0.18.0", package = "epics-modbus-rs" }
 epics-tools-rs = { path = "crates/epics-tools-rs", version = "0.18.0" }
 

@@ -9,6 +9,15 @@ eleven review rounds) and `v0.17.2` (areaDetector RBV constructor-time
 flag-consumption fix), plus the new entries below. See those sections
 for the full audit trail.
 
+### modbus-rs — published on crates.io as `epics-modbus-rs`
+
+The bare `modbus-rs` name on crates.io is owned by an unrelated project,
+so the workspace crate is now published as `epics-modbus-rs`. The Rust
+library name is kept as `modbus_rs` via `[lib] name = "modbus_rs"`, so
+consumers continue to write `use modbus_rs::...`; only the `crates.io`
+package name changes. The on-disk path (`crates/modbus-rs/`) and the
+workspace dep alias (`modbus-rs = { workspace = true }`) are unchanged.
+
 ### modbus-rs — absolute-mode array I/O length safety
 
 - **fix(modbus-rs)** `read_int32_array` absolute-mode requests now use

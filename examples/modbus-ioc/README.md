@@ -1,7 +1,10 @@
 # modbus-ioc
 
-Example IOC demonstrating the [`modbus-rs`](../../crates/modbus-rs) driver —
-the Rust port of EPICS `modbus` / `drvModbusAsyn`.
+Example IOC demonstrating the
+[`epics-modbus-rs`](../../crates/modbus-rs) driver — the Rust port of
+EPICS `modbus` / `drvModbusAsyn`. The on-disk path is `crates/modbus-rs/`
+and the Rust library name is `modbus_rs`; the published crates.io
+package is `epics-modbus-rs`.
 
 ## Run
 

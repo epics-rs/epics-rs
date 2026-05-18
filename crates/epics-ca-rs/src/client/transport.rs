@@ -107,13 +107,33 @@ fn max_accumulated() -> usize {
         .saturating_add(64 * 1024)
 }
 
-/// Default echo interval in seconds (matches C EPICS CA_CONN_VERIFY_PERIOD).
+/// Default echo interval (matches C EPICS CA_CONN_VERIFY_PERIOD).
 /// Overridden by EPICS_CA_CONN_TMO environment variable.
-fn echo_idle_secs() -> u64 {
+///
+/// R2-63: C `cac.cpp:186-194` parses CONN_TMO as `double` and falls
+/// back to the default (30 s) on parse failure, on `<= 0.0`, AND on
+/// any value libca's bookkeeping treats as a sentinel for "use the
+/// default". Pre-fix Rust used `.max(1.0) as u64` which (a) rounded
+/// any positive sub-second value up to 1 s (`0.5` → 1) instead of
+/// honouring it verbatim, (b) truncated fractional seconds via
+/// `as u64` (`15.9` → 15), and (c) clamped explicit `0` to 1 s
+/// instead of falling back to the default. Match C: keep as
+/// `Duration` with full sub-second precision; only `parse error`
+/// or `value <= 0.0` falls back to the default.
+fn echo_idle() -> Duration {
     epics_base_rs::runtime::env::get("EPICS_CA_CONN_TMO")
         .and_then(|s| s.parse::<f64>().ok())
-        .map(|v| v.max(1.0) as u64)
-        .unwrap_or(30)
+        .filter(|v| *v > 0.0)
+        .map(Duration::from_secs_f64)
+        .unwrap_or(Duration::from_secs(30))
+}
+/// Legacy seconds accessor kept for call sites that need a coarse
+/// number (e.g. `tokio::time::sleep(Duration::from_secs(N))` over a
+/// long interval where sub-second precision does not matter). New
+/// timer code should call `echo_idle()` directly.
+fn echo_idle_secs() -> u64 {
+    let d = echo_idle();
+    d.as_secs().max(1)
 }
 
 struct ServerConnection {
@@ -821,9 +841,17 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     pending_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    // Send watchdog: if write stalls for 2x echo timeout, declare circuit dead.
-    // Matches C EPICS tcpSendWatchdog behavior.
-    let send_timeout = Duration::from_secs(ECHO_TIMEOUT_SECS * 2);
+    // R2-40: send watchdog deadline. C `tcpSendWatchdog`
+    // (`libca/tcpSendWatchdog.cpp:43-64`) fires after `connTMO`
+    // (`EPICS_CA_CONN_TMO`, default 30 s) and calls
+    // `iiu.sendTimeoutNotify` → `unresponsiveCircuitNotify`; the
+    // TCP socket is kept and a recv probe is started. Pre-fix Rust
+    // used 2x ECHO_TIMEOUT_SECS (10 s) and converted any write
+    // timeout to `TcpClosed`, forcing a full search/connect cycle
+    // for a slow-but-live server. Match C: use the configured
+    // CONN_TMO and signal CircuitUnresponsive (not TcpClosed) on
+    // write timeout so the read path's echo probe can recover.
+    let send_timeout = echo_idle();
     let mut batch = Vec::with_capacity(4096);
     while let Some(frame) = rx.recv().await {
         let mut drained: usize = 1;
@@ -866,9 +894,27 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                 }
             }
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(_)) => {
+                // True socket error (write_all returned Err) — circuit
+                // is dead, signal close.
                 let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
                 return;
+            }
+            Err(_) => {
+                // R2-40: write-side timeout (server stalled) →
+                // signal unresponsive instead of close. The read
+                // loop's echo watchdog will follow if the server
+                // truly died; if the server recovers, the recv
+                // probe converts back to CircuitResponsive
+                // (matches C `tcpSendWatchdog::sendTimeoutNotify`
+                // → `unresponsiveCircuitNotify` flow). Keep the
+                // socket alive; partial-write state is
+                // unrecoverable, but tokio's `write_all` cancel
+                // after timeout doesn't tear down the socket.
+                let _ = event_tx.send(TransportEvent::CircuitUnresponsive { server_addr });
+                // Drop this frame and continue draining — the
+                // recv watchdog now owns the recovery decision.
+                batch.clear();
             }
         }
     }
@@ -1136,12 +1182,54 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     break;
                 }
                 Err(e) => {
-                    // Definitively malformed (e.g. extended postsize
-                    // exceeds `max_payload_size()`). Re-parsing cannot
-                    // succeed; close so the reconnect loop rebuilds.
-                    eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
-                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
-                    return;
+                    // R2-45: C `libca/tcpiiu.cpp:1269-1284` logs ONCE
+                    // and skips an oversized message (`m_postsize >
+                    // curDataMax` with realloc failure) via
+                    // `recvQue.removeBytes` — circuit kept alive.
+                    // Pre-fix Rust always closed. Try to recover the
+                    // same way: re-read the announced postsize and
+                    // skip header + payload if the bytes are present.
+                    let base_post = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+                    let skip = if base_post == 0xFFFF && frame.len() >= 24 {
+                        let ext_post =
+                            u32::from_be_bytes([frame[16], frame[17], frame[18], frame[19]])
+                                as usize;
+                        // Sanity cap to stop a corrupted ext_post from
+                        // forcing us to wait for gigabytes of "data";
+                        // if the announced size dwarfs the buffer cap
+                        // it's safer to close.
+                        if ext_post > max_payload_size() * 2 {
+                            None
+                        } else {
+                            Some(24 + ext_post)
+                        }
+                    } else if base_post == 0xFFFF {
+                        // Need annex bytes before we can recover.
+                        break;
+                    } else {
+                        Some(16 + base_post)
+                    };
+                    if let Some(skip_n) = skip {
+                        if accumulated.len() - offset >= skip_n {
+                            tracing::warn!(
+                                server = %server_addr,
+                                err = %e,
+                                skip = skip_n,
+                                "CA: oversized / unparseable TCP frame; skipping (libca tcpiiu:1269-1284 parity)"
+                            );
+                            metrics::counter!("ca_client_oversized_frame_skips_total").increment(1);
+                            offset += skip_n;
+                            continue;
+                        } else {
+                            // Wait for the rest of the bytes before
+                            // skipping.
+                            break;
+                        }
+                    } else {
+                        eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
+                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr });
+                        return;
+                    }
                 }
             };
             let actual_post = hdr.actual_postsize();
@@ -1477,6 +1565,35 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         cid: hdr.cid,
                         server_addr,
                     });
+                }
+                // R2-41: opcodes that C `libca/cac.cpp:60-89`
+                // dispatches through its TCP jump table but Rust
+                // didn't have a per-opcode arm for. R2-29 made
+                // unknown opcodes lethal (close circuit), so
+                // benign frames from a gateway / name-server
+                // / legacy IOC ended up tearing the Rust circuit
+                // down on every occurrence. Accept them here as
+                // no-ops:
+                //   * CA_PROTO_SEARCH (6) — used when a CA
+                //     server doubles as a name server
+                //     (EPICS_CA_NAME_SERVERS); libca routes via
+                //     `tcpiiu::searchRespNotify` and our TCP
+                //     search path already has a separate
+                //     nameserver pipeline.
+                //   * CA_PROTO_READ (3) — deprecated synchronous
+                //     read response; libca handles via
+                //     `cac::readRespAction`. Rust never sends
+                //     CA_PROTO_READ (only READ_NOTIFY), so any
+                //     reply on this opcode is informational.
+                //   * CA_PROTO_CLEAR_CHANNEL (12) — `cac.cpp:
+                //     1000-1003` `clearChannelRespAction` is
+                //     currently a documented no-op in C.
+                CA_PROTO_SEARCH | CA_PROTO_READ | CA_PROTO_CLEAR_CHANNEL => {
+                    tracing::trace!(
+                        server = %server_addr,
+                        cmd = hdr.cmmd,
+                        "TCP no-op opcode received (libca-recognised, Rust ignores)"
+                    );
                 }
                 unknown => {
                     // R2-29: C `libca/cac.cpp::executeResponse()`
@@ -1882,12 +1999,15 @@ mod malformed_header_close_tests {
         ));
 
         // 24-byte extended header: postsize=0xFFFF (extended marker),
-        // extended postsize = max_payload_size() + 1 MB — over the cap,
-        // so `from_bytes_extended` returns Err("payload too large").
+        // extended postsize set above the R2-45 sanity cap (2x
+        // max_payload_size()) so the skip-and-continue recovery
+        // can't apply and the loop still closes the circuit.
+        // Values <= 2x max_payload_size() are now treated as
+        // recoverable (skip + continue) per libca tcpiiu:1269-1284.
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
         hdr.postsize = 0xFFFF;
         let mut frame = hdr.to_bytes().to_vec();
-        let bad_post = (crate::protocol::max_payload_size() + 1024 * 1024) as u32;
+        let bad_post = (crate::protocol::max_payload_size() * 3) as u32;
         frame.extend_from_slice(&bad_post.to_be_bytes()); // extended postsize
         frame.extend_from_slice(&0u32.to_be_bytes()); // extended count
         assert_eq!(frame.len(), 24);

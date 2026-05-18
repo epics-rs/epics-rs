@@ -144,7 +144,18 @@ impl SubscriptionRegistry {
 
     /// Mark all subscriptions for a given server's channels as needing restore.
     /// Returns the cids that were affected.
+    ///
+    /// R2-37: also deliver one `Err(CaError::ServerError(ECA_DISCONN))`
+    /// per affected subscription's callback channel — libca
+    /// `cac::disconnectAllIO()` (`modules/ca/src/client/cac.cpp:678-698`)
+    /// iterates every in-flight IO on the channel (including
+    /// subscriptions) and fires `pNetIO->exception(... ECA_DISCONN ...)`.
+    /// Pre-fix Rust silently flipped `needs_restore = true` and waited
+    /// for reconnect, so a libca-style `MonitorHandle::recv()` saw
+    /// nothing when the circuit died.
     pub fn mark_disconnected(&mut self, cids: &[u32]) -> HashMap<SocketAddr, usize> {
+        use epics_base_rs::error::CaError;
+        const ECA_DISCONN: u32 = 192; // protocol::ECA_DISCONN
         let mut cleared = HashMap::new();
         for rec in self.subscriptions.values_mut() {
             if cids.contains(&rec.cid) {
@@ -153,6 +164,13 @@ impl SubscriptionRegistry {
                     *cleared.entry(rec.server_addr).or_insert(0) += rec.pending_deliveries;
                 }
                 rec.pending_deliveries = 0;
+                // Best-effort: a closed receiver silently drops, same
+                // as `try_deliver_err`. We don't return this through
+                // MonitorDeliveryOutcome because the caller is the
+                // disconnect bookkeeping path, not a per-frame router.
+                let _ = rec
+                    .callback_tx
+                    .try_send(Err(CaError::ServerError(ECA_DISCONN)));
             }
         }
         cleared

@@ -396,25 +396,33 @@ async fn recv_loop(
 
                         let mut ver = CaHeader::new(CA_PROTO_VERSION);
                         ver.count = CA_MINOR_VERSION;
-                        // C `cas_send_dg_msg` (`caserverio.c:194-197`)
-                        // echoes `pclient->seqNoOfReq` in `m_cid` with
-                        // `m_dataType = sequenceNoIsValid` (1) on
-                        // CA_V411+. Required for libca's stale-
-                        // response filter (`udpiiu.cpp:badSeqNumber`)
-                        // — without the echo, libca's search-timer
-                        // validation falls through and a reply that
-                        // arrived after the timer expired is accepted
-                        // anyway. Only set when the request datagram
-                        // carried a flagged VERSION; older clients
-                        // see ver.cid = 0 / data_type = 0 (no flag),
-                        // matching the pre-V411 C wire form.
+                        // C `cas_send_dg_msg` (`caserverio.c:193-201`)
+                        // emits the VERSION placeholder on the wire
+                        // ONLY when `CA_V411(pclient->minor_version_
+                        // number)` is true (the request's leading
+                        // VERSION had `m_count >= 11` and
+                        // `udp_version_action` ran). For pre-V4.11
+                        // peers the placeholder is stripped and the
+                        // outgoing datagram contains only the
+                        // SEARCH reply.
+                        //
+                        // R2-49: Pre-fix Rust always prepended a
+                        // VERSION header; pre-V4.11 clients saw an
+                        // extra header where rsrv would have sent
+                        // none. Match C: only include the VERSION
+                        // when we captured a flagged seq (which
+                        // implies CA_V411+); otherwise emit just
+                        // the SEARCH reply.
+                        let include_version = client_seq.is_some();
                         if let Some(seq) = client_seq {
                             ver.cid = seq;
                             ver.data_type = 1;
                         }
 
                         let mut reply = Vec::with_capacity(CaHeader::SIZE * 2 + 8);
-                        reply.extend_from_slice(&ver.to_bytes());
+                        if include_version {
+                            reply.extend_from_slice(&ver.to_bytes());
+                        }
                         reply.extend_from_slice(&resp.to_bytes());
                         let mut search_payload = [0u8; 8];
                         search_payload[0..2].copy_from_slice(&CA_MINOR_VERSION.to_be_bytes());

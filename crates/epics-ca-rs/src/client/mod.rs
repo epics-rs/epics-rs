@@ -3103,6 +3103,31 @@ async fn run_coordinator(
                         diag.record(DiagEvent::Unresponsive { server: server_addr });
                         tracing::warn!(server = %server_addr, "circuit unresponsive (echo timeout)");
                         metrics::counter!("ca_client_unresponsive_total", "server" => server_addr.to_string()).increment(1);
+                        // R2-38: C `tcpiiu::unresponsiveCircuitNotify`
+                        // (`libca/tcpiiu.cpp:899-941`) fires the global
+                        // exception hook with ECA_UNRESPTMO, then walks
+                        // every connected channel and calls
+                        // `pChan->unresponsiveCircuitNotify` which in
+                        // `nciu.cpp:161-182` triggers
+                        // `disconnectAllIO()` (ECA_DISCONN per IO) +
+                        // `accessRightsNotify(noRights)`. Pre-fix Rust
+                        // only flipped state and emitted
+                        // `ConnectionEvent::Unresponsive` — in-flight
+                        // get/put/subscribe waiters kept hanging,
+                        // access-rights subscribers got no signal.
+                        types::dispatch_exception(
+                            &exception_slot,
+                            types::CaException {
+                                kind: types::CaExceptionKind::ServerError,
+                                message: format!(
+                                    "circuit unresponsive: {server_addr} (matches libca ECA_UNRESPTMO)"
+                                ),
+                                server_addr: Some(server_addr),
+                                pv_name: None,
+                                status: Some(crate::protocol::ECA_UNRESPTMO),
+                            },
+                        );
+                        let mut affected_cids: Vec<u32> = Vec::new();
                         for ch in channels.values_mut() {
                             if ch.server_addr == Some(server_addr)
                                 && ch.state == ChannelState::Connected
@@ -3110,14 +3135,42 @@ async fn run_coordinator(
                                 ch.state = ChannelState::Unresponsive;
                                 if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
                                     snap.state = ChannelState::Unresponsive;
+                                    snap.access_rights = AccessRights { read: false, write: false };
                                 }
+                                ch.access_rights = AccessRights { read: false, write: false };
                                 let _ = ch.conn_tx.send(ConnectionEvent::Unresponsive);
+                                let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
+                                    read: false,
+                                    write: false,
+                                });
+                                affected_cids.push(ch.cid);
                             }
+                        }
+                        // Fan ECA_DISCONN out to in-flight reads /
+                        // writes / subscriptions (libca
+                        // `disconnectAllIO` parity). R2-37 covers the
+                        // subscription side via mark_disconnected.
+                        if !affected_cids.is_empty() {
+                            let cid_set: HashSet<u32> = affected_cids.iter().copied().collect();
+                            drain_waiters_for_cids(&cid_set, &in_flight);
+                            let _ = subscriptions.mark_disconnected(&affected_cids);
                         }
                     }
                     TransportEvent::CircuitResponsive { server_addr } => {
                         diag.record(DiagEvent::Responsive { server: server_addr });
                         tracing::info!(server = %server_addr, "circuit responsive again");
+                        // R2-39: C `tcpiiu::responsiveCircuitNotify`
+                        // (`libca/tcpiiu.cpp:861-877`) walks every
+                        // formerly-unresponsive channel, calls
+                        // `pChan->connect()` to move it through
+                        // `subscripUpdateReqPend`, and the send thread
+                        // then issues a fresh `READ_NOTIFY` per active
+                        // subscription (`tcpiiu.cpp:1610-1644`
+                        // `subscriptionUpdateRequest`) so the
+                        // subscriber sees the post-recovery value.
+                        // Pre-fix Rust only flipped state; values
+                        // changed during the gap remained invisible.
+                        let mut recovered_cids: Vec<u32> = Vec::new();
                         for ch in channels.values_mut() {
                             if ch.server_addr == Some(server_addr)
                                 && ch.state == ChannelState::Unresponsive
@@ -3127,6 +3180,29 @@ async fn run_coordinator(
                                     snap.state = ChannelState::Connected;
                                 }
                                 let _ = ch.conn_tx.send(ConnectionEvent::Connected);
+                                recovered_cids.push(ch.cid);
+                            }
+                        }
+                        for cid in recovered_cids {
+                            for sub_id in subscriptions.for_cid(cid) {
+                                if let Some(rec) = subscriptions.get(sub_id) {
+                                    if let (Some(data_type), Some(_count)) =
+                                        (rec.data_type, rec.count)
+                                    {
+                                        if let Some(ch) = channels.get(&cid) {
+                                            if let Some(addr) = ch.server_addr {
+                                                let _ =
+                                                    transport_tx.send(TransportCommand::ReadNotify {
+                                                        sid: ch.sid,
+                                                        data_type,
+                                                        count: rec.count.unwrap_or(0),
+                                                        ioid: alloc_ioid(),
+                                                        server_addr: addr,
+                                                    });
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -3467,8 +3543,18 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     // last-resort fallback. The added entries are IP literals
     // (`hostname = None`) so the periodic refresh task short-
     // circuits them.
+    // R2-57: C `ca/src/client/iocinf.cpp:186-193` uses substring
+    // semantics: `yes = true; if (strstr(pstr,"no") || strstr(pstr,
+    // "NO")) yes = false`. Any value not containing "no"/"NO" keeps
+    // auto-discovery enabled — so `"1"`, `"true"`, `"on"`, `"bogus"`
+    // all enable on C. Pre-fix Rust used strict `eq_ignore_ascii_case
+    // ("YES")`, silently disabling auto-discovery on those values.
+    // Server-side `addr_list::from_env` keeps the strict semantic
+    // because the C server var uses `envGetBoolConfigParam` (strict);
+    // only the CLIENT var has the strstr quirk that Rust must mirror.
     let auto_addr = epics_base_rs::runtime::env::get_or("EPICS_CA_AUTO_ADDR_LIST", "YES");
-    if auto_addr.eq_ignore_ascii_case("YES") {
+    let auto_addr_enabled = !(auto_addr.contains("no") || auto_addr.contains("NO"));
+    if auto_addr_enabled {
         let server_port = default_port;
         let bcasts = crate::server::addr_list::discover_broadcast_addrs();
         append_auto_addr_entries(&mut addrs, &bcasts, server_port);
@@ -3798,6 +3884,17 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_NAME_SERVERS") else {
         return Vec::new();
     };
+    // R2-59: C `cac.cpp:259` defaults bare-hostname entries to
+    // `_serverPort` (from `EPICS_CA_SERVER_PORT`, default 5064),
+    // not the hardcoded protocol constant. Pre-fix Rust used
+    // `CA_SERVER_PORT` (compile-time 5064) for the bare-hostname
+    // branch, diverging from C when sites set
+    // `EPICS_CA_SERVER_PORT=5066` to coexist with parallel C
+    // deployments. The `host:port` branch already honours the
+    // explicit port; only the bare-hostname default changes here.
+    let default_server_port: u16 = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(CA_SERVER_PORT);
     let mut out = Vec::new();
     for entry in list.split_whitespace() {
         if entry.contains(':') {
@@ -3824,8 +3921,9 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
         } else {
             // Bare hostname (no port) — treat as DNS name even if it
             // happens to look like an IP literal (caller intent is
-            // unambiguous when no port is specified).
-            if let Ok(addr) = resolve_host(entry, CA_SERVER_PORT) {
+            // unambiguous when no port is specified). R2-59: default
+            // port from EPICS_CA_SERVER_PORT (matches libca).
+            if let Ok(addr) = resolve_host(entry, default_server_port) {
                 let hostname = if entry.parse::<std::net::IpAddr>().is_ok() {
                     None
                 } else {

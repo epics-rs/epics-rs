@@ -833,15 +833,24 @@ async fn server_echo_round_trips_request_header_and_payload() {
         .await
         .expect("connect");
 
-    // Handshake: send VERSION, drain server's VERSION reply.
+    // Handshake: send VERSION, drain BOTH server VERSION frames
+    // (R2-47: unsolicited VERSION on accept + VERSION reply = 32 bytes).
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut buf = [0u8; 64];
-    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
-        .await
-        .expect("server VERSION reply timed out")
-        .expect("read VERSION");
+    let mut drained = 0;
+    while drained < 32 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf[drained..]))
+            .await
+            .expect("server VERSION drain timed out")
+            .expect("read VERSION");
+        if n == 0 {
+            break;
+        }
+        drained += n;
+    }
+    assert!(drained >= 32, "expected 2 VERSION frames; got {drained} bytes");
 
     // Send CA_PROTO_ECHO with a non-trivial header AND an 8-byte
     // payload — the C server is documented to echo m_postsize bytes
@@ -1025,15 +1034,28 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
         .await
         .expect("connect");
 
-    // Handshake: send VERSION, drain server's VERSION reply.
+    // R2-47: server now emits an unsolicited VERSION immediately
+    // after accept (libca `rsrv_version_reply` parity). The client
+    // therefore receives two CA_PROTO_VERSION frames before any
+    // command-specific reply: one unsolicited, one in response to
+    // our VERSION below. Drain both so the subsequent reads see
+    // the unknown-cmd CA_PROTO_ERROR cleanly.
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut buf = [0u8; 64];
-    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
-        .await
-        .expect("server VERSION reply timed out")
-        .expect("read VERSION");
+    let mut got = 0;
+    while got < 32 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf[got..]))
+            .await
+            .expect("server VERSION drain timed out")
+            .expect("read VERSION");
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    assert!(got >= 32, "expected two CA_PROTO_VERSION frames; got {got} bytes");
 
     // Send a TCP frame with an unknown command code. CA_PROTO_LAST_CMMD
     // in C is 27 (CA_PROTO_SERVER_DISCONN); 250 is comfortably past
@@ -1121,13 +1143,35 @@ async fn server_tcp_version_below_minimum_drops_connection() {
         .await
         .expect("connect");
 
+    // R2-47: server emits an unsolicited VERSION on accept. Drain
+    // exactly 16 bytes before sending our (unsupported) VERSION,
+    // then verify the connection closes WITHOUT a second wire
+    // frame (libca tcp_version_action parity: bad version
+    // returns RSRV_ERROR which tears down with no reply).
+    let mut buf = [0u8; 64];
+    let mut greeting = [0u8; 16];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut got = 0;
+        while got < 16 {
+            let n = sock.read(&mut greeting[got..]).await?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        Ok::<usize, std::io::Error>(got)
+    })
+    .await
+    .expect("unsolicited VERSION timed out")
+    .expect("read greeting");
+
     // CA V4.0 (minor = 0) is below CA_MINIMUM_SUPPORTED_VERSION = 4.
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = 0;
     sock.write_all(&ver.to_bytes()).await.unwrap();
 
-    // Server must drop the connection — no VERSION reply, just EOF.
-    let mut buf = [0u8; 64];
+    // Server must drop the connection — no further VERSION reply,
+    // just EOF.
     let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
         .await
         .expect("server did not close TCP after unsupported VERSION")
@@ -1215,12 +1259,42 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     frame.extend_from_slice(&create_body);
     sock.write_all(&frame).await.unwrap();
 
-    // Drain ACCESS_RIGHTS + CREATE_CHAN reply (read up to 64 bytes)
-    let mut buf = [0u8; 128];
-    let _ = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await;
-    // Find the CREATE_CHAN reply to extract SID. ACCESS_RIGHTS comes
-    // first (16 bytes); CREATE_CHAN reply follows. Parse second header.
-    let create_resp = CaHeader::from_bytes(&buf[16..32]).expect("parse CREATE_CHAN");
+    // Drain server frames and walk header-by-header to find the
+    // CREATE_CHAN reply. R2-47 added an unsolicited VERSION on
+    // accept, so the byte offset of CREATE_CHAN is no longer
+    // fixed (it depends on TCP segmentation + whether
+    // ACCESS_RIGHTS lands separately). Scan instead of indexing.
+    let mut buf = [0u8; 256];
+    let mut got = 0;
+    let create_resp = loop {
+        let n = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf[got..]))
+            .await
+            .expect("server drain timed out")
+            .expect("read");
+        if n == 0 {
+            panic!("EOF before CREATE_CHAN reply");
+        }
+        got += n;
+        // Walk 16-byte headers in `buf[..got]` looking for CREATE_CHAN.
+        let mut off = 0;
+        while off + 16 <= got {
+            if let Ok(h) = CaHeader::from_bytes(&buf[off..off + 16]) {
+                if h.cmmd == CA_PROTO_CREATE_CHAN {
+                    break;
+                }
+                // Skip past header + padded postsize for the next walk.
+                off += 16 + ((h.postsize as usize + 7) & !7);
+            } else {
+                off += 16;
+            }
+        }
+        if off + 16 <= got {
+            let h = CaHeader::from_bytes(&buf[off..off + 16]).unwrap();
+            if h.cmmd == CA_PROTO_CREATE_CHAN {
+                break h;
+            }
+        }
+    };
     assert_eq!(create_resp.cmmd, CA_PROTO_CREATE_CHAN);
     let sid = create_resp.available;
 
@@ -1309,11 +1383,19 @@ async fn server_read_notify_bad_type_closes_silently() {
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
+    // R2-47: drain BOTH server VERSION frames (unsolicited + reply).
     let mut hello = [0u8; 64];
-    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
-        .await
-        .expect("VERSION reply timed out")
-        .expect("read VERSION");
+    let mut got_hello = 0;
+    while got_hello < 32 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello[got_hello..]))
+            .await
+            .expect("VERSION drain timed out")
+            .expect("read VERSION");
+        if n == 0 {
+            break;
+        }
+        got_hello += n;
+    }
     for (cmd, name) in [
         (CA_PROTO_CLIENT_NAME, "testuser\0"),
         (CA_PROTO_HOST_NAME, "testhost\0"),
@@ -1341,10 +1423,35 @@ async fn server_read_notify_bad_type_closes_silently() {
     frame.extend_from_slice(&create.to_bytes());
     frame.extend_from_slice(&create_body);
     sock.write_all(&frame).await.unwrap();
-    let mut buf = [0u8; 128];
-    let _ = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await;
-    let create_resp = CaHeader::from_bytes(&buf[16..32]).expect("parse CREATE_CHAN");
-    let sid = create_resp.available;
+    // Walk frames to find CREATE_CHAN reply (R2-47 changed offsets).
+    let mut buf = [0u8; 256];
+    let mut got = 0;
+    let sid = loop {
+        let n = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf[got..]))
+            .await
+            .expect("server drain timed out")
+            .expect("read");
+        if n == 0 {
+            panic!("EOF before CREATE_CHAN reply");
+        }
+        got += n;
+        let mut off = 0;
+        let mut found = None;
+        while off + 16 <= got {
+            if let Ok(h) = CaHeader::from_bytes(&buf[off..off + 16]) {
+                if h.cmmd == CA_PROTO_CREATE_CHAN {
+                    found = Some(h.available);
+                    break;
+                }
+                off += 16 + ((h.postsize as usize + 7) & !7);
+            } else {
+                off += 16;
+            }
+        }
+        if let Some(v) = found {
+            break v;
+        }
+    };
 
     // READ_NOTIFY with data_type = 200 (well past LAST_BUFFER_TYPE = 38).
     let mut bad = CaHeader::new(CA_PROTO_READ_NOTIFY);
@@ -1409,11 +1516,20 @@ async fn server_read_sync_echoes_request_header() {
     let mut ver = CaHeader::new(CA_PROTO_VERSION);
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
+    // R2-47: drain both VERSION frames (unsolicited + reply).
     let mut hello = [0u8; 64];
-    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
-        .await
-        .expect("VERSION reply timed out")
-        .expect("read VERSION");
+    let mut got_hello = 0;
+    while got_hello < 32 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello[got_hello..]))
+            .await
+            .expect("VERSION drain timed out")
+            .expect("read VERSION");
+        if n == 0 {
+            break;
+        }
+        got_hello += n;
+    }
+    assert!(got_hello >= 32, "expected 2 VERSION frames; got {got_hello}");
 
     // Send READ_SYNC with distinctive field values to verify echo.
     let mut sync = CaHeader::new(CA_PROTO_READ_SYNC);

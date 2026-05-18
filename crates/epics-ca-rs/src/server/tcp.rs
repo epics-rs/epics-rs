@@ -998,6 +998,26 @@ where
     state.rate_limiter = rl_cfg.build();
     state.rate_limit_strike_threshold = rl_cfg.strike_threshold;
     state.audit("connect", "", "", "ok").await;
+
+    // R2-47: C `rsrv/caservertask.c::create_tcp_client:1525` calls
+    // `rsrv_version_reply(client)` immediately after `db_start_events`,
+    // so the server's first wire frame on any new TCP connection is
+    // an unsolicited `CA_PROTO_VERSION` (cmmd=0, count=
+    // CA_MINOR_PROTOCOL_REVISION, all other fields zero). libca's
+    // `tcpRecvWatchdog::messageArrivalNotify` uses every received
+    // frame as a liveness beat; without this, the server's first byte
+    // is delayed until the client sends its own CA_PROTO_VERSION,
+    // which can drift slow handshakes toward CA_ECHO_TIMEOUT. Also
+    // restores wire-trace parity with rsrv (the first byte from the
+    // server matches).
+    {
+        let mut hdr = CaHeader::new(CA_PROTO_VERSION);
+        hdr.count = CA_MINOR_VERSION;
+        let mut w = writer.lock().await;
+        w.write_all(&hdr.to_bytes()).await?;
+        w.flush().await?;
+    }
+
     let mut reader = reader;
 
     let mut buf = vec![0u8; 8192];
@@ -1633,6 +1653,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         Ok(claims) => {
                             tracing::debug!(peer = %state.peer, sub = %claims.sub,
                                 "cap-token verified");
+                            // R2-52: propagate auth_method / authority so
+                            // ACF rules of the form
+                            // `RULE(1, WRITE) { METHOD("cap-token")
+                            //                   AUTHORITY("ops-issuer-1") }`
+                            // can scope by authenticator subsystem and
+                            // issuer key id. Pre-fix only `state.username
+                            // = claims.sub` was set, leaving auth_method
+                            // empty (or `"x509"` if mTLS is also active),
+                            // so cap-token METHOD/AUTHORITY clauses
+                            // could not match a verified token.
+                            state.auth_method = "cap-token".to_string();
+                            state.auth_authority = claims.iss.clone();
                             claims.sub
                         }
                         Err(e) => {
@@ -1666,6 +1698,20 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // The client will retry with v4.4+ format after receiving our VERSION.
             if hdr.actual_postsize() <= 1 {
                 return Ok(());
+            }
+            // R2-55: C `rsrv/camessage.c:1190-1199` `claim_ciu_action`
+            // unconditionally executes `client->minor_version_number
+            // = mp->m_available;` — the protocol comment is explicit:
+            // "The available field is used (abused) here to
+            // communicate the minor version number starting with
+            // CA 4.1". A client that handshakes v4.4 then upgrades on
+            // CREATE_CHAN to v4.13 gets the upgrade applied through
+            // this branch, which downstream `CA_V49` checks (extended-
+            // form headers for nElem >= 0xffff) then honour. Pre-fix
+            // Rust ignored `hdr.available` here, so a peer using the
+            // upgrade pattern saw truncated counts on large arrays.
+            if (hdr.available as u16) > state.client_minor_version {
+                state.client_minor_version = hdr.available as u16;
             }
 
             // DoS guard: refuse new channels once the per-client cap is hit.
@@ -2349,13 +2395,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 Ok(g) => g,
                 Err(denied) => {
                     if is_notify {
-                        let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-                        resp.data_type = write_type as u16;
-                        resp.count = hdr.count;
-                        resp.cid = denied.eca_code();
-                        resp.available = ioid;
-                        let mut w = writer.lock().await;
-                        w.write_all(&resp.to_bytes()).await?;
+                        // R2-46: route through the R2-8 refinement
+                        // helper so large-array put-callbacks
+                        // refused by ACF carry the extended-form
+                        // count instead of the u16 marker.
+                        send_put_notify_response(
+                            writer,
+                            write_type as u16,
+                            hdr.actual_count(),
+                            denied.eca_code(),
+                            ioid,
+                        )
+                        .await?;
                     } else {
                         // C `write_action` (`rsrv/camessage.c:741-750`)
                         // emits `send_err(mp, ECA_NOWTACCESS, client,
@@ -2677,14 +2728,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     sub_id,
                     "EVENT_ADD refused: sub_id already in use on this connection"
                 );
-                send_cmd_error(
-                    writer,
-                    CA_PROTO_EVENT_ADD,
-                    requested_type,
-                    ECA_BADMONID,
-                    sub_id,
-                )
-                .await?;
+                // R2-50: use CA_PROTO_ERROR (libca exception path)
+                // instead of zero-payload EVENT_ADD which
+                // `cac::eventRespAction` treats as a cancel-ack
+                // no-op (see R2-27/R2-36 family). The libca peer
+                // otherwise silently swallows the refusal and
+                // waits forever for monitor updates.
+                send_ca_error(writer, hdr, ECA_BADMONID, entry.cid, "duplicate sub_id").await?;
                 return Ok(());
             }
             {
@@ -3510,9 +3560,20 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
     // sid the access cache has not seen before (parity with the
     // pre-fix `insert`-without-comparison behaviour for freshly
     // created channels).
+    //
+    // R2-51: C `libcom/src/as/asLibRoutines.c:1047-1051` fires
+    // `pclient->pcallback(... asClientCOAR)` (the COAR callback
+    // that calls `casAccessRightsCB` → `access_rights_reply`)
+    // ONLY when `oldaccess != access`. An ACF reload that leaves
+    // every channel at the same level emits zero ACCESS_RIGHTS
+    // frames in C. Pre-fix Rust unconditionally pushed a frame per
+    // channel, generating an O(N) burst per connection on routine
+    // reloads (typo fix, new UAG that doesn't intersect, etc.).
+    // Mirror C: only emit on actual transition.
     let mut transitions: Vec<(u32, AccessLevel, AccessLevel)> = Vec::new();
     {
         let mut w = writer.lock().await;
+        let mut any_frame_written = false;
         for (sid, cid, target) in chan_info {
             let new_access = state.compute_access(&target).await;
             let new_level = match new_access {
@@ -3524,13 +3585,19 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                 .channel_access
                 .insert(sid, new_level)
                 .unwrap_or(AccessLevel::NoAccess);
+            if old_level == new_level {
+                continue;
+            }
             transitions.push((sid, old_level, new_level));
             let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
             ar.cid = cid;
             ar.available = new_access;
             w.write_all(&ar.to_bytes()).await?;
+            any_frame_written = true;
         }
-        w.flush().await?;
+        if any_frame_written {
+            w.flush().await?;
+        }
     }
 
     fn has_read(level: AccessLevel) -> bool {

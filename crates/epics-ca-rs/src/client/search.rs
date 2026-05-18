@@ -149,6 +149,35 @@ fn cascade_smoothed_next(
 /// Normal tick cadence (1 search bucket per second).
 const NORMAL_TICK: Duration = Duration::from_secs(1);
 
+/// R2-62: `EPICS_CA_MAX_SEARCH_PERIOD` — C
+/// (`ca/src/client/udpiiu.cpp:71-89`) reads the env var as `double`
+/// seconds, defaults 300, clamps to a lower bound of 60. The C
+/// search timer uses this to bound the per-cid exponential
+/// backoff. Rust's bucket model is structurally different — a
+/// fixed `N_SEARCH_BUCKETS = 30` ring at 1 s per bucket caps the
+/// per-cid retry at ~30 s regardless of env. Honour the env var
+/// by scaling the tick: `tick = max(period / N_BUCKETS, 1 s)`,
+/// where `period` is clamped to [60, ∞) per C. Default 300 →
+/// tick 10 s; min 60 → tick 2 s. Effectively turns the bucket
+/// ring into a tunable cap-bounded retry wheel.
+fn normal_tick() -> Duration {
+    let period_secs = epics_base_rs::runtime::env::get("EPICS_CA_MAX_SEARCH_PERIOD")
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(30.0)
+        .max(30.0);
+    // If unset / <=30 we keep the historical 1s tick to preserve
+    // existing behaviour on sites that didn't set the var (Rust
+    // default ≈30 s cap). Only sites explicitly setting the var
+    // get the scaled cap.
+    if period_secs <= 30.0 {
+        NORMAL_TICK
+    } else {
+        let secs = (period_secs / N_SEARCH_BUCKETS as f64).max(1.0);
+        Duration::from_secs_f64(secs)
+    }
+}
+
 /// Fast-mode tick cadence after a beacon poke. One full bucket
 /// revolution fits in `N_SEARCH_BUCKETS * FAST_TICK = 6 s`.
 const FAST_TICK: Duration = Duration::from_millis(200);
@@ -371,7 +400,7 @@ pub(crate) async fn run_search_engine(
     // pvxs `client.cpp::tickSearch`: a single steady tick advances the
     // bucket cursor. fast_tick is engaged after a beacon poke for one
     // full revolution, then we revert to NORMAL_TICK.
-    let mut tick = interval(NORMAL_TICK);
+    let mut tick = interval(normal_tick());
     tick.tick().await; // skip immediate fire
     let mut tick_is_fast = false;
 
@@ -488,7 +517,7 @@ pub(crate) async fn run_search_engine(
             tick.tick().await; // skip immediate fire
             tick_is_fast = true;
         } else if state.fast_ticks_remaining == 0 && tick_is_fast {
-            tick = interval(NORMAL_TICK);
+            tick = interval(normal_tick());
             tick.tick().await; // skip immediate fire
             tick_is_fast = false;
         }

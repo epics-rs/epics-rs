@@ -43,6 +43,9 @@ mod put_cross_impl;
 #[path = "interop_pvxs_mods/reverse_complex_types.rs"]
 mod reverse_complex_types;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/rpc_and_get_field.rs"]
+mod rpc_and_get_field;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/tcp_search_r11.rs"]
 mod tcp_search_r11;
 #[cfg(unix)]

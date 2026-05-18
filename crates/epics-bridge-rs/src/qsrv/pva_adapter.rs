@@ -306,6 +306,65 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
+    /// BR-R37: RPC-with-query is a record WRITE in QSRV's
+    /// "set fields, read back" idiom. The default trait
+    /// `rpc_checked` gates only on READ access, so a READ-only
+    /// client could mutate records through `pvcall PV
+    /// field=value`. Override to require WRITE access whenever
+    /// the request carries any query fields (NTURI.query or a
+    /// bare structure with members).
+    #[allow(clippy::manual_async_fn)]
+    fn rpc_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        request_desc: FieldDesc,
+        request_value: PvField,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), String>> + Send {
+        async move {
+            if !checked.allows_read() {
+                return Err(format!(
+                    "RPC denied by access security: '{}' from {}@{}",
+                    checked.pv_name(),
+                    ctx.account,
+                    ctx.host,
+                ));
+            }
+            // Inspect the request to determine whether it carries
+            // query arguments that would land as a PUT inside
+            // `rpc()`. NTURI shape: `query` substructure with one
+            // or more fields. Bare-structure shape: any non-empty
+            // top-level fields list.
+            let has_writes = match &request_value {
+                PvField::Structure(root) => {
+                    if let Some((_, PvField::Structure(q))) =
+                        root.fields.iter().find(|(n, _)| n == "query")
+                    {
+                        !q.fields.is_empty()
+                    } else if root.struct_id == "epics:nt/NTURI:1.0" {
+                        false
+                    } else {
+                        root.fields
+                            .iter()
+                            .any(|(n, _)| !n.starts_with("scheme") && !n.starts_with("path"))
+                    }
+                }
+                _ => false,
+            };
+            if has_writes && !checked.allows_write() {
+                return Err(format!(
+                    "RPC write denied by access security: '{}' from {}@{} \
+                     (RPC query arguments require WRITE access in QSRV)",
+                    checked.pv_name(),
+                    ctx.account,
+                    ctx.host,
+                ));
+            }
+            self.rpc(checked.pv_name(), request_desc, request_value)
+                .await
+        }
+    }
+
     fn subscribe_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,

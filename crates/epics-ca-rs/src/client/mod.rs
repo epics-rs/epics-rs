@@ -2760,6 +2760,32 @@ async fn run_coordinator(
                             | MonitorDeliveryOutcome::NotFound => {}
                         }
                     }
+                    TransportEvent::MonitorStatusError { subid, eca_status } => {
+                        // libca `cac::eventAddRespAction`
+                        // (`cac.cpp:973-977`) routes a monitor frame
+                        // whose `m_cid` is non-NORMAL through the
+                        // per-subscription exception callback. The
+                        // SubscriptionRegistry helper performs the
+                        // equivalent — pushes
+                        // `Err(CaError::ServerError(eca_status))`
+                        // into the callback channel. Best-effort
+                        // (silently dropped if the consumer queue
+                        // is full or closed); matches libca's
+                        // exception-callback semantics.
+                        use subscription::MonitorDeliveryOutcome;
+                        match subscriptions.on_monitor_error(subid, eca_status) {
+                            MonitorDeliveryOutcome::Dropped(_) => {
+                                diag.dropped_monitors.fetch_add(1, Ordering::Relaxed);
+                                metrics::counter!(
+                                    "ca_client_monitor_error_drops_total"
+                                )
+                                .increment(1);
+                            }
+                            MonitorDeliveryOutcome::Queued(_)
+                            | MonitorDeliveryOutcome::Filtered
+                            | MonitorDeliveryOutcome::NotFound => {}
+                        }
+                    }
                     TransportEvent::AccessRightsChanged { cid, access } => {
                         if let Some(ch) = channels.get_mut(&cid) {
                             ch.access_rights = access;

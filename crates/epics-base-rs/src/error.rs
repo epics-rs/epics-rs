@@ -59,6 +59,17 @@ pub enum CaError {
     /// CA server replies `ECA_PUTCBINPROG`.
     #[error("put callback in progress for record {0}")]
     PutCallbackInProgress(String),
+
+    /// Server-emitted ECA status carried out-of-band on an otherwise
+    /// data-shaped frame — used by libca `cac::eventAddRespAction`
+    /// (`cac.cpp:973-977`) when a monitor frame's `m_cid` is non-
+    /// NORMAL (e.g. `ECA_NORDACCESS` from `no_read_access_event`
+    /// after an ACF reload). Routed to the per-subscription
+    /// callback as `Err(CaError::ServerError(eca_status))` so the
+    /// subscriber surfaces the status instead of seeing the bogus
+    /// zeroed payload that travels with the frame.
+    #[error("server reported ECA status {0:#06x}")]
+    ServerError(u32),
 }
 
 // ECA status constants (originally from protocol.rs, now in epics-ca-rs)
@@ -91,6 +102,7 @@ impl CaError {
             CaError::Io(_) => ECA_DISCONN,
             CaError::WriteFailed(code) => *code,
             CaError::PutCallbackInProgress(_) => ECA_PUTCBINPROG,
+            CaError::ServerError(code) => *code,
             _ => ECA_PUTFAIL,
         }
     }

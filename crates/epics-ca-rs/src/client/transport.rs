@@ -1238,15 +1238,32 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // delivers the no-read-access frame instead of
                     // tearing down. Gate matches libca.
                     if hdr.cid != ECA_NORMAL {
+                        // libca `cac::eventAddRespAction`
+                        // (`cac.cpp:973-977`): when the monitor frame
+                        // carries a non-NORMAL status, drop the
+                        // (zeroed) payload but route the status
+                        // through the per-subscription exception
+                        // callback. Pre-fix Rust just warn+dropped,
+                        // so e.g. an ECA_NORDACCESS from a C IOC's
+                        // `no_read_access_event` (sent when an ACF
+                        // reload revoked read access on an active
+                        // subscription) was invisible to the
+                        // subscriber. The bogus zeroed payload is
+                        // still discarded — only the status is
+                        // delivered — because libca only invokes
+                        // `pmiu->exception(status)`, never the
+                        // completion callback, on this path.
                         tracing::warn!(
                             server = %server_addr,
                             subid = hdr.available,
                             status = hdr.cid,
-                            "MONITOR delivery with non-NORMAL status (likely \
-                             ECA_NORDACCESS from C IOC no_read_access_event); \
-                             dropping bogus zeroed payload"
+                            "MONITOR status error (libca: routes through subscription exception callback)"
                         );
                         metrics::counter!("ca_client_monitor_status_drops_total").increment(1);
+                        let _ = event_tx.send(TransportEvent::MonitorStatusError {
+                            subid: hdr.available,
+                            eca_status: hdr.cid,
+                        });
                     } else {
                         let data = accumulated[data_start..data_start + actual_post].to_vec();
                         let _ = event_tx.send(TransportEvent::MonitorData {

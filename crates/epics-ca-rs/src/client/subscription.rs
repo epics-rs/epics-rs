@@ -69,6 +69,23 @@ impl SubscriptionRegistry {
         self.subscriptions.remove(&subid)
     }
 
+    /// Deliver a non-NORMAL monitor status (libca `pmiu->exception`
+    /// path, `cac.cpp:973-977`) to the per-subscription callback as
+    /// an `Err(CaError::ServerError(eca_status))`. Best-effort: the
+    /// existing `try_deliver_err` helper silently drops the error
+    /// if the receiver queue is full or closed.
+    pub fn on_monitor_error(&mut self, subid: u32, eca_status: u32) -> MonitorDeliveryOutcome {
+        let Some(rec) = self.subscriptions.get_mut(&subid) else {
+            return MonitorDeliveryOutcome::NotFound;
+        };
+        let server_addr = rec.server_addr;
+        try_deliver_err(
+            rec,
+            epics_base_rs::error::CaError::ServerError(eca_status),
+            server_addr,
+        )
+    }
+
     pub fn on_monitor_data(
         &mut self,
         subid: u32,

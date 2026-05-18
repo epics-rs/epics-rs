@@ -432,6 +432,19 @@ pub(crate) enum TransportEvent {
         count: u32,
         data: Vec<u8>,
     },
+    /// Server emitted a monitor frame with a non-NORMAL `m_cid` (ECA
+    /// status), e.g. `no_read_access_event` after an ACF reload
+    /// revoked read access on an active subscription. libca
+    /// `cac::eventAddRespAction` (`cac.cpp:973-977`) routes this to
+    /// the per-subscription `pmiu->exception` callback with the
+    /// reported status — the user's monitor callback receives an
+    /// Err result. Pre-fix Rust warn+dropped the frame, so an
+    /// `ECA_NORDACCESS` from a C IOC was silently invisible to the
+    /// subscriber.
+    MonitorStatusError {
+        subid: u32,
+        eca_status: u32,
+    },
     AccessRightsChanged {
         cid: u32,
         access: AccessRights,

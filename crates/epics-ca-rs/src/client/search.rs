@@ -565,6 +565,21 @@ async fn run_nameserver_connection(
                 // align8(postsize) — no extended-postsize support
                 // here because the dispatcher itself ignores it.
                 let mut consumed = 0usize;
+                // Distinguishes "wait for more bytes" (the legitimate
+                // `break`s out of the inner loop) from "the bytes we
+                // have are definitively malformed". Pre-fix every
+                // exit path used the same `break`, so a parse error
+                // or a misaligned `m_postsize` left the bad prefix
+                // sitting at the head of `accumulated`; the next
+                // socket read appended fresh bytes but the inner
+                // loop re-parsed the same bad prefix on every
+                // iteration, wedging the circuit. C client
+                // `tcpiiu.cpp::processIncoming:1197-1202` returns
+                // `false` on a misaligned payload — the surrounding
+                // tcpiiu shuts the connection. We mirror by exiting
+                // the outer read loop, which drops the read_task
+                // and lets the reconnect path rebuild.
+                let mut bad_frame = false;
                 loop {
                     if accumulated.len() - consumed < CaHeader::SIZE {
                         break;
@@ -573,20 +588,45 @@ async fn run_nameserver_connection(
                     // count=0 → 8 extra header bytes + true u32 size).
                     // Pure 16-byte parse would consume 65,540 bytes for
                     // a frame whose true size is 24 + payload.
+                    //
+                    // Pre-check how many header bytes the base
+                    // `m_postsize` demands so a transient "need 8 more
+                    // bytes for the annex" can be distinguished from a
+                    // definitive parse failure on a header whose bytes
+                    // are all present.
+                    let base_post =
+                        u16::from_be_bytes([accumulated[consumed + 2], accumulated[consumed + 3]]);
+                    let header_needed = if base_post == 0xFFFF { 24 } else { 16 };
+                    if accumulated.len() - consumed < header_needed {
+                        break;
+                    }
                     let (hdr, hdr_size) =
                         match CaHeader::from_bytes_extended(&accumulated[consumed..]) {
                             Ok(v) => v,
-                            Err(_) => break,
+                            Err(_) => {
+                                // 16/24 header bytes present yet
+                                // `from_bytes_extended` rejected them
+                                // ⇒ definitively malformed (e.g. the
+                                // declared payload exceeds
+                                // max_payload_size()). Close circuit
+                                // per C `tcpiiu.cpp:1197-1202`.
+                                bad_frame = true;
+                                break;
+                            }
                         };
                     let actual_post = hdr.actual_postsize();
                     // C `tcpiiu.cpp::processIncoming:1198` rejects
-                    // misaligned `m_postsize`. Closing the connection
-                    // is the only safe action — silently rounding up
-                    // (the prior `align8`) would let a hostile name
-                    // server slide our framer into the middle of the
-                    // next message. Break the read loop; the
-                    // surrounding reconnect path will rebuild.
+                    // misaligned `m_postsize` by closing the
+                    // connection. Silently rounding up (the prior
+                    // `align8`) would let a hostile name server slide
+                    // our framer into the middle of the next message;
+                    // silently breaking out (the pre-fix behaviour)
+                    // wedged the circuit, since the bad prefix stayed
+                    // in `accumulated` and was re-parsed on every
+                    // subsequent read. Close circuit, let the
+                    // reconnect path rebuild.
                     if actual_post & 0x7 != 0 {
+                        bad_frame = true;
                         break;
                     }
                     let msg_size = hdr_size + actual_post;
@@ -599,6 +639,14 @@ async fn run_nameserver_connection(
                     let frame_bytes = accumulated[..consumed].to_vec();
                     let _ = resp_tx.send((frame_bytes, addr));
                     accumulated.drain(..consumed);
+                }
+                if bad_frame {
+                    tracing::warn!(
+                        addr = ?addr,
+                        "TCP nameserver framing error; closing circuit \
+                         (C tcpiiu.cpp:1197-1202 parity)"
+                    );
+                    break;
                 }
             }
         });

@@ -73,6 +73,7 @@ pub fn spawn_monitor_sender<W>(
     writer: Arc<Mutex<BufWriter<W>>>,
     flow_control: Arc<FlowControlGate>,
     mut rx: mpsc::Receiver<MonitorEvent>,
+    denied: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -94,6 +95,15 @@ where
                     break;
                 };
                 event = coalesced;
+            }
+            // C `casAccessRightsCB` (`rsrv/camessage.c:1080-1095`)
+            // suppresses event deliveries with `db_event_disable`
+            // while read access is denied (without tearing the
+            // subscription down). Producer keeps running so a
+            // later re-enable resumes the same camonitor; we just
+            // drop the event silently.
+            if denied.load(Ordering::Acquire) {
+                continue;
             }
             if send_event(data_type, sub_id, &event, &writer)
                 .await

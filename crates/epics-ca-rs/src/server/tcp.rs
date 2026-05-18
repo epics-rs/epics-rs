@@ -2,7 +2,7 @@ use epics_base_rs::runtime::sync::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpListener;
@@ -222,6 +222,14 @@ struct SubscriptionEntry {
     channel_sid: u32,
     sub_id: u32,
     data_type: u16,
+    /// Gate flipped by `reeval_access_rights` when read access is
+    /// revoked / restored for `channel_sid`. While `true`, the
+    /// producer task drops events at the send step (matches C
+    /// `casAccessRightsCB`, `rsrv/camessage.c:1080-1095`, which
+    /// calls `db_event_disable` rather than tearing the
+    /// subscription down — so an ACF reload that later restores
+    /// access can resume the same camonitor).
+    denied: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -1420,6 +1428,30 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     hdr.count
                 )));
             }
+            // C `tcp_version_action` (`rsrv/camessage.c:371-373`) drops
+            // the connection (`return RSRV_ERROR`) when the client's
+            // requested priority (`m_dataType`) exceeds
+            // `CA_PROTO_PRIORITY_MAX` (= 99u in `caProto.h:71`). The
+            // priority drives the IOC's per-client epicsThread
+            // scheduling-priority assignment downstream, so a value
+            // outside the legal 0..=99 range is rejected hard rather
+            // than silently clamped. Pre-fix Rust accepted any
+            // priority and emitted the VERSION reply normally —
+            // benign on the wire but diverges from libca's expected
+            // close-on-bad-priority behaviour, which a strict CAC
+            // peer would notice.
+            const CA_PROTO_PRIORITY_MAX: u16 = 99;
+            if hdr.data_type > CA_PROTO_PRIORITY_MAX {
+                tracing::warn!(
+                    peer = ?peer,
+                    priority = hdr.data_type,
+                    "CAS: VERSION with priority > CA_PROTO_PRIORITY_MAX; dropping"
+                );
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "VERSION priority {} > {} (matches C tcp_version_action drop)",
+                    hdr.data_type, CA_PROTO_PRIORITY_MAX
+                )));
+            }
             state.client_minor_version = hdr.count;
             // C `rsrv_version_reply` (camessage.c:2115) emits VERSION
             // with all fields zero except `m_count = CA_MINOR_PROTOCOL_REVISION`.
@@ -2500,6 +2532,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let snap = pv.snapshot().await;
                         send_monitor_snapshot(writer, sub_id, requested_type, &snap).await?;
 
+                        let denied = Arc::new(AtomicBool::new(false));
                         let task = spawn_monitor_sender(
                             pv.clone(),
                             sub_id,
@@ -2507,6 +2540,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             writer.clone(),
                             state.flow_control.clone(),
                             rx,
+                            denied.clone(),
                         );
 
                         state.subscriptions.insert(
@@ -2516,6 +2550,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 channel_sid: sid,
                                 sub_id,
                                 data_type: requested_type,
+                                denied,
                                 task,
                             },
                         );
@@ -2585,6 +2620,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let writer_clone = writer.clone();
                         let flow_control = state.flow_control.clone();
                         let record_for_task = record.clone();
+                        let denied = Arc::new(AtomicBool::new(false));
+                        let denied_for_task = denied.clone();
                         let task = epics_base_rs::runtime::task::spawn(async move {
                             let mut rx = rx;
                             loop {
@@ -2607,6 +2644,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                         break;
                                     };
                                     event = coalesced;
+                                }
+                                // C `casAccessRightsCB`
+                                // (`rsrv/camessage.c:1080-1095`)
+                                // suppresses delivery via
+                                // `db_event_disable` while read access
+                                // is denied, without tearing the
+                                // subscription down. Producer task
+                                // stays alive so a later re-enable
+                                // resumes the same camonitor; drop
+                                // the event here while denied.
+                                if denied_for_task.load(Ordering::Acquire) {
+                                    continue;
                                 }
                                 // CA-268 monitor parity: populate
                                 // class_name on every emitted event so
@@ -2680,6 +2729,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 channel_sid: sid,
                                 sub_id,
                                 data_type: requested_type,
+                                denied,
                                 task,
                             },
                         );
@@ -3128,16 +3178,22 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
 }
 
 /// Re-evaluate and re-send CA_PROTO_ACCESS_RIGHTS for all open channels.
-/// Called when hostname or username changes.
+/// Called when hostname or username changes (e.g. ACF reload).
 ///
-/// Round-39 (R39-G2): when a sid's new access flips to `NoAccess`,
-/// any subscriptions currently mounted on that sid must be torn
-/// down. Pre-fix the reeval only updated `channel_access` (and
-/// notified the client) — active EVENT_ADD subscribers kept
-/// receiving every update on the now-denied channel until the
-/// client noticed the access drop and issued EVENT_CANCEL. The C
-/// IOC cancels subscriptions in the same situation (see
-/// `cas_access_rights_change_callback`).
+/// Tracks the *transition* per channel because the C behaviour is
+/// asymmetric: a read-access loss must push a single
+/// `no_read_access_event` frame and silence subsequent deliveries,
+/// while a read-access gain must re-enable deliveries and push one
+/// current snapshot. C `casAccessRightsCB`
+/// (`rsrv/camessage.c:1055-1106`) walks the channel's `eventq` and
+/// calls `db_event_disable` / `db_event_enable` plus
+/// `db_post_single_event` — the subscription itself is never
+/// removed. Pre-fix Rust permanently destroyed the subscription
+/// on a NoAccess transition (`state.subscriptions.remove +
+/// task.abort`), so a later ACF reload that restored read access
+/// left an orphaned camonitor: the C-equivalent re-arm never
+/// happened, and the subscriber's callback receiver went silent
+/// until the client noticed and re-subscribed manually.
 async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
     state: &mut ClientState,
     writer: &Arc<Mutex<BufWriter<W>>>,
@@ -3151,7 +3207,11 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
         .map(|(&sid, entry)| (sid, entry.cid, entry.target.clone()))
         .collect();
 
-    let mut denied_sids: Vec<u32> = Vec::new();
+    // (sid, old_level, new_level) — old defaults to NoAccess for a
+    // sid the access cache has not seen before (parity with the
+    // pre-fix `insert`-without-comparison behaviour for freshly
+    // created channels).
+    let mut transitions: Vec<(u32, AccessLevel, AccessLevel)> = Vec::new();
     {
         let mut w = writer.lock().await;
         for (sid, cid, target) in chan_info {
@@ -3161,10 +3221,11 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                 1 => AccessLevel::Read,
                 _ => AccessLevel::NoAccess,
             };
-            state.channel_access.insert(sid, new_level);
-            if new_level == AccessLevel::NoAccess {
-                denied_sids.push(sid);
-            }
+            let old_level = state
+                .channel_access
+                .insert(sid, new_level)
+                .unwrap_or(AccessLevel::NoAccess);
+            transitions.push((sid, old_level, new_level));
             let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
             ar.cid = cid;
             ar.available = new_access;
@@ -3173,24 +3234,74 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
         w.flush().await?;
     }
 
-    // Tear down every subscription rooted in a now-denied channel.
-    if !denied_sids.is_empty() {
-        let revoked: Vec<u32> = state
+    fn has_read(level: AccessLevel) -> bool {
+        matches!(level, AccessLevel::ReadWrite | AccessLevel::Read)
+    }
+
+    for (sid, old_level, new_level) in transitions {
+        let old_read = has_read(old_level);
+        let new_read = has_read(new_level);
+        if old_read == new_read {
+            continue;
+        }
+        let affected: Vec<u32> = state
             .subscriptions
             .iter()
-            .filter(|(_, s)| denied_sids.contains(&s.channel_sid))
+            .filter(|(_, s)| s.channel_sid == sid)
             .map(|(&id, _)| id)
             .collect();
-        for sub_id in revoked {
-            if let Some(sub) = state.subscriptions.remove(&sub_id) {
-                sub.task.abort();
-                match &sub.target {
-                    ChannelTarget::SimplePv(pv) => {
-                        pv.remove_subscriber(sub.sub_id).await;
-                    }
-                    ChannelTarget::RecordField { record, .. } => {
-                        record.write().await.remove_subscriber(sub.sub_id);
-                    }
+        if affected.is_empty() {
+            continue;
+        }
+        if !new_read {
+            // Read access REVOKED. C path: db_post_single_event
+            // (which emits the `no_read_access_event` —
+            // ECA_NORDACCESS in m_cid, zeroed payload) then
+            // db_event_disable. We flip the gate so the producer
+            // task suppresses future deliveries, and emit a
+            // header-only EVENT_ADD frame carrying ECA_NORDACCESS
+            // in m_cid; libca's `cac::eventAddRespAction`
+            // (`cac.cpp:973-977`) routes that through the
+            // per-subscription exception callback without touching
+            // the payload bytes (it never reads them on the
+            // non-NORMAL path), so a header-only frame is
+            // sufficient for modern peers and matches our own
+            // client's MonitorStatusError path. The subscription
+            // itself stays alive so a later access restoration can
+            // re-arm it.
+            for sub_id in &affected {
+                let Some(sub) = state.subscriptions.get(sub_id) else {
+                    continue;
+                };
+                sub.denied.store(true, Ordering::Release);
+                let data_type = sub.data_type;
+                let sub_id_v = sub.sub_id;
+                let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+                hdr.data_type = data_type;
+                hdr.cid = ECA_NORDACCESS;
+                hdr.available = sub_id_v;
+                let mut w = writer.lock().await;
+                w.write_all(&hdr.to_bytes()).await?;
+            }
+            let mut w = writer.lock().await;
+            w.flush().await?;
+        } else {
+            // Read access RESTORED. C path: db_event_enable then
+            // db_post_single_event. Clear the gate so the producer
+            // task resumes deliveries, and emit one snapshot of
+            // the current value so the subscriber sees a fresh
+            // event the moment access comes back (rather than
+            // waiting for the next natural update).
+            for sub_id in &affected {
+                let (target, data_type, sub_id_val) = {
+                    let Some(sub) = state.subscriptions.get(sub_id) else {
+                        continue;
+                    };
+                    sub.denied.store(false, Ordering::Release);
+                    (sub.target.clone(), sub.data_type, sub.sub_id)
+                };
+                if let Some(snap) = get_full_snapshot(&target).await {
+                    send_monitor_snapshot(writer, sub_id_val, data_type, &snap).await?;
                 }
             }
         }

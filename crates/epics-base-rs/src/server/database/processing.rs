@@ -525,6 +525,21 @@ impl PvDatabase {
             None
         };
 
+        // BR-R19: if the single-INP link is an external `pva://` /
+        // `ca://` link configured with `time=true`, the lset returns
+        // the latched upstream NT timestamp here and we adopt it
+        // into the owning record's `common.time`. The lset gates the
+        // option internally (returns `None` unless `time=true`), so a
+        // bare connected link without the flag still produces local
+        // processing time. Mirrors pvxs `pvalink_lset.cpp:427`.
+        let inp_link_remote_time: Option<(i64, i32)> = match inp_parsed {
+            crate::server::record::ParsedLink::Pva(ref name)
+            | crate::server::record::ParsedLink::Ca(ref name) => {
+                self.external_link_time(name).await
+            }
+            _ => None,
+        };
+
         // Read DOL value
         let dol_value = if let Some((ref dol_parsed, _oif)) = dol_info {
             self.read_link_value(dol_parsed, visited, depth).await
@@ -1061,6 +1076,24 @@ impl PvDatabase {
                 if let Some(ts) = dev_ts {
                     instance.common.time = ts;
                 }
+            }
+
+            // BR-R19: pvalink `time=true` adopts the latched upstream
+            // NT timestamp into the owning record. `external_link_time`
+            // returned `None` unless the lset signalled the option, so
+            // a `Some` here is the operator-requested remote timestamp.
+            // Apply BEFORE `apply_timestamp` so the upstream value
+            // survives the soft-channel TSE=0 default (`apply_timestamp`
+            // would otherwise stamp wall-clock-now on top).
+            if let Some((secs, ns)) = inp_link_remote_time {
+                let secs = secs.max(0) as u64;
+                let ns = ns.max(0) as u32;
+                instance.common.time =
+                    std::time::UNIX_EPOCH + std::time::Duration::new(secs, ns.min(999_999_999));
+                // TSE=-2 marks "device-set time" — `apply_timestamp`
+                // honours this by leaving `common.time` untouched,
+                // mirroring the device-support timestamp branch above.
+                instance.common.tse = -2;
             }
 
             // Transfer nsta/nsev -> sevr/stat, detect alarm change

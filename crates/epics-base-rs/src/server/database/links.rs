@@ -258,6 +258,37 @@ impl PvDatabase {
         }
     }
 
+    /// BR-R19: latched upstream timestamp from the lset, when the
+    /// link is configured with `time=true`. The lset gates internally
+    /// (returning `None` for links without the `time` option), so a
+    /// `Some` here is the authoritative remote timestamp the
+    /// processing path should adopt into the owning record's
+    /// `common.time`. Mirrors pvxs `pvalink_lset.cpp:427`.
+    ///
+    /// Returns `(seconds_since_epoch, nanoseconds)` exactly as the
+    /// lset reports them; the caller folds them into the record's
+    /// `SystemTime` via `UNIX_EPOCH + Duration::new(...)`.
+    pub(crate) async fn external_link_time(&self, name: &str) -> Option<(i64, i32)> {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+            ("pva", rest)
+        } else if let Some(rest) = name.strip_prefix("ca://") {
+            ("ca", rest)
+        } else {
+            // Bare name — try every registered lset.
+            let registry = self.inner.link_sets.read().await;
+            for s in registry.schemes() {
+                if let Some(lset) = registry.get(&s) {
+                    if let Some(ts) = lset.time_stamp(name) {
+                        return Some(ts);
+                    }
+                }
+            }
+            return None;
+        };
+        let lset = self.inner.link_sets.read().await.get(scheme)?;
+        lset.time_stamp(body)
+    }
+
     /// Build a [`LinkAlarm`] from the registered lset's alarm
     /// accessors for an external (`pva://` / `ca://`) link, or `None`
     /// when no lset is registered or the lset reports no alarm.

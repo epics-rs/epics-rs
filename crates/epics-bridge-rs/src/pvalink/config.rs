@@ -125,6 +125,13 @@ pub struct PvaLinkConfig {
     /// `-1024..=1024`. Lower values process first. Mirrors pvxs
     /// `pvaLinkConfig::monorder`.
     pub monorder: i32,
+    /// BR-R19: when true, the owning record's TIME is adopted from
+    /// the linked PV's NT `timeStamp` on each read. Mirrors pvxs
+    /// `pvaLinkConfig::time` (`pvalink_jlif.cpp:35` / parsing at
+    /// `:104`; consumer at `pvalink_lset.cpp:427`). Default `false`
+    /// — the owning record keeps its locally-stamped processing
+    /// time.
+    pub time: bool,
     /// Direction inferred from caller, not parsed.
     pub direction: LinkDirection,
 }
@@ -238,6 +245,10 @@ impl PvaLinkConfig {
             // pvxs clamps to [-1024, 1024].
             cfg.monorder = n.clamp(-1024, 1024) as i32;
         }
+        // BR-R19: `time` adopts the linked PV's NT timestamp on read.
+        if let Some(v) = opts.get("time") {
+            cfg.time = parse_bool(v)?;
+        }
 
         // Apply legacy bare modifiers
         for m in legacy_mods {
@@ -284,6 +295,7 @@ impl PvaLinkConfig {
             local: false,
             atomic: false,
             monorder: 0,
+            time: false,
             direction,
         }
     }
@@ -345,6 +357,17 @@ mod tests {
         assert_eq!(c.field, "value");
         assert!(!c.monitor);
         assert!(!c.process);
+        // BR-R19: `time` defaults to false to match pvxs.
+        assert!(!c.time);
+    }
+
+    /// BR-R19: `?time=true` enables remote-timestamp adoption.
+    #[test]
+    fn time_option_parses_true() {
+        let c = PvaLinkConfig::parse("pva://X?time=true", LinkDirection::Inp).unwrap();
+        assert!(c.time, "time=true must parse");
+        let c = PvaLinkConfig::parse("pva://X?time=false", LinkDirection::Inp).unwrap();
+        assert!(!c.time, "time=false must parse");
     }
 
     #[test]

@@ -727,9 +727,24 @@ impl LinkSet for PvaLinkResolver {
     fn time_stamp(&self, name: &str) -> Option<(i64, i32)> {
         let name = strip_scheme(name)?;
         let link = block_in_place_or_warn(|| {
-            self.handle
-                .block_on(async { self.registry.get_or_open(default_inp_cfg(name)).await.ok() })
+            self.handle.block_on(async {
+                // BR-R19: prefer the operator-installed link config so
+                // `?time=true` gates the lookup; fall back to defaults
+                // for bare auto-resolved links (which never adopt
+                // upstream time — matching pvxs `pvaLinkConfig::time`
+                // default false).
+                let cfg = self.inp_cfg_for(name);
+                self.registry.get_or_open(cfg).await.ok()
+            })
         })?;
+        // BR-R19: only adopt the upstream timestamp when the link was
+        // configured with `time=true`. pvxs `pvalink_lset.cpp:427`
+        // copies the latched remote NT timestamp into the owning
+        // record only when this flag is set; otherwise the owning
+        // record keeps its locally-stamped processing time.
+        if !link.config().time {
+            return None;
+        }
         link.time_stamp()
     }
 

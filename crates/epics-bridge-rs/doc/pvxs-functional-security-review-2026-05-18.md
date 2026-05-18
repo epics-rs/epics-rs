@@ -52,11 +52,13 @@ message.
 - BR-R37 (commit 7c87eb1) — RPC with query args requires WRITE access.
 - BR-R38 (commit 5687a6e) — PVA `PROCESS` actually runs the record's processing chain (rejects on group/native PVA PV).
 - BR-R39 (commit 2b9316a) — decoded MONITOR initial event encodes with pvRequest mask, not `BitSet::all_set`.
+- BR-R19 (commit c455586) — pvalink `time=true` adopts upstream NT timestamp; new `external_link_time` consumer in `process_record_with_links_inner`.
+- BR-R28 (commit 27f9a59) — pvalink `proc=CPP` (scanOnUpdatePassive) skips processing when owning record SCAN is not Passive.
 - BR-R44 (commit 8e67167) — gateway raw monitor reencodes on byte-order mismatch instead of silently dropping every event.
 
 Remaining open: BR-R4, R6, R7, R8, R10, R11, R12, R13, R14, R15,
-R18, R19, R21, R23, R24, R27, R28, R29, R33, R34, R40, R41, R42,
-R43 (24 findings).
+R18, R21, R23, R24, R27, R29, R33, R34, R40, R41, R42, R43
+(22 findings).
 
 ## Findings
 

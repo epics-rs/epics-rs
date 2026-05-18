@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn destroy_channel_fires_registered_close_signal() {
         use std::sync::atomic::Ordering as AtoOrd;
-        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, cancel) = fresh_router();
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid) = fresh_router();
         let flag = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(tokio::sync::Notify::new());
         let sid = 0xDEADBEEFu32;
@@ -1155,16 +1155,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        route_frame(
-            frame,
-            &by_ioid,
-            &by_cid,
-            &by_sid_close,
-            &ioid_to_sid,
-            &ioid_to_cmd,
-            order,
-            &cancel,
-        );
+        route_frame(frame, &by_ioid, &by_cid, &by_sid_close, &ioid_to_sid, order);
         assert!(flag.load(AtoOrd::Relaxed));
         assert!(!by_sid_close.contains_key(&sid));
     }
@@ -1176,7 +1167,7 @@ mod tests {
     /// before route_frame returns.
     #[test]
     fn destroy_critical_section_completes_before_route_frame_returns() {
-        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, cancel) = fresh_router();
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid) = fresh_router();
         let flag = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(tokio::sync::Notify::new());
         let sid = 7u32;
@@ -1195,9 +1186,7 @@ mod tests {
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
-            &ioid_to_cmd,
             ByteOrder::Little,
-            &cancel,
         );
         assert!(!by_sid_close.contains_key(&sid));
         assert!(flag.load(Ordering::Relaxed));
@@ -1208,7 +1197,7 @@ mod tests {
     /// sid. Without this, blocked oneshot/stream awaits hang forever.
     #[test]
     fn destroy_channel_drops_associated_ioid_streams() {
-        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, cancel) = fresh_router();
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid) = fresh_router();
         let sid = 42u32;
         let other_sid = 99u32;
 
@@ -1244,9 +1233,7 @@ mod tests {
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
-            &ioid_to_cmd,
             ByteOrder::Little,
-            &cancel,
         );
 
         assert!(

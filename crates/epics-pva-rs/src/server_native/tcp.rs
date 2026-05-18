@@ -1341,8 +1341,14 @@ async fn handle_put_get(
     }
 
     if subcmd & QosFlags::INIT != 0 {
-        // Per-channel concurrent-op cap (same rule as `handle_op`).
-        if !ch.ops.contains_key(&ioid) && ch.ops.len() >= config.max_ops_per_channel {
+        // PVA-R21: duplicate INIT on a live IOID is connection-fatal
+        // (mirror of `handle_op`).
+        if ch.ops.contains_key(&ioid) {
+            return Err(PvaError::Decode(format!(
+                "duplicate PUT_GET INIT on live IOID {ioid}"
+            )));
+        }
+        if ch.ops.len() >= config.max_ops_per_channel {
             send_op_error(
                 tx,
                 OpKind::PutGet,
@@ -1353,17 +1359,46 @@ async fn handle_put_get(
             .await?;
             return Ok(());
         }
-        let intro = ch.introspection.clone().unwrap_or(FieldDesc::Variant);
+        // PVA-R16: PUT_GET also requires a descriptor.
+        let intro = match ch.introspection.clone() {
+            Some(d) => d,
+            None => {
+                send_op_error(tx, OpKind::PutGet, ioid, "must provide prototype", order).await?;
+                return Ok(());
+            }
+        };
         // pvRequest: `type + value` (pvxs clientget.cpp). Translate to
-        // a field mask the GET leg consults; default to all-fields.
-        let req_desc = decode_type_desc(&mut cur, order).ok();
-        let _req_value = req_desc
-            .as_ref()
-            .and_then(|d| decode_pv_field(d, &mut cur, order).ok());
-        let mask = req_desc
-            .as_ref()
-            .and_then(|d| crate::pv_request::request_to_mask(&intro, d).ok())
-            .unwrap_or_else(|| BitSet::all_set(intro.total_bits()));
+        // a field mask the GET leg consults.
+        let req_desc = match decode_type_desc(&mut cur, order) {
+            Ok(d) => d,
+            Err(e) => {
+                send_op_error(
+                    tx,
+                    OpKind::PutGet,
+                    ioid,
+                    &format!("invalid pvRequest descriptor: {e}"),
+                    order,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let _req_value = decode_pv_field(&req_desc, &mut cur, order).ok();
+        // PVA-R19: empty mask is an INIT error.
+        let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
+            Ok(m) => m,
+            Err(e) => {
+                send_op_error(
+                    tx,
+                    OpKind::PutGet,
+                    ioid,
+                    &format!("invalid pvRequest mask: {e}"),
+                    order,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
         ch.ops.insert(
             ioid,
@@ -1549,7 +1584,13 @@ async fn handle_process(
     }
 
     if subcmd & QosFlags::INIT != 0 {
-        if !ch.ops.contains_key(&ioid) && ch.ops.len() >= config.max_ops_per_channel {
+        // PVA-R21: duplicate INIT on a live IOID is connection-fatal.
+        if ch.ops.contains_key(&ioid) {
+            return Err(PvaError::Decode(format!(
+                "duplicate PROCESS INIT on live IOID {ioid}"
+            )));
+        }
+        if ch.ops.len() >= config.max_ops_per_channel {
             send_op_error(
                 tx,
                 OpKind::Process,
@@ -1560,7 +1601,18 @@ async fn handle_process(
             .await?;
             return Ok(());
         }
-        let intro = ch.introspection.clone().unwrap_or(FieldDesc::Variant);
+        // PVA-R16: PROCESS still requires a descriptor — even though
+        // PROCESS has no value payload, the source must commit to
+        // *some* introspection at channel creation. A missing
+        // descriptor means the source can't describe what PROCESS
+        // would act on.
+        let intro = match ch.introspection.clone() {
+            Some(d) => d,
+            None => {
+                send_op_error(tx, OpKind::Process, ioid, "must provide prototype", order).await?;
+                return Ok(());
+            }
+        };
         // The PROCESS pvRequest carries no field selection of interest
         // (process transfers no value) — decode-and-discard so any
         // trailing bytes are consumed cleanly.
@@ -2048,30 +2100,107 @@ async fn handle_op(
     };
 
     if subcmd & 0x08 != 0 {
+        // PVA-R21: duplicate INIT on a live IOID is connection-fatal
+        // per pvxs. `serverget.cpp:378-384` and `servermon.cpp:505-511`
+        // reset the connection on `op->state != Created`; we model
+        // "already created" as `ch.ops.contains_key(&ioid)`. Pre-fix
+        // Rust let the insert below silently REPLACE the existing
+        // OpState, which could drop a MONITOR subscriber task and
+        // redirect later data frames to a different descriptor/mask
+        // than the original operation negotiated.
+        if ch.ops.contains_key(&ioid) {
+            return Err(PvaError::Decode(format!(
+                "duplicate INIT on live IOID {ioid} (pvxs serverget.cpp:378-384 protocol error)"
+            )));
+        }
         // A-G1: per-channel concurrent-op cap — refuse fresh INITs
         // once the channel's `ops` map hits the configured ceiling
         // so a malicious peer can't accumulate IOID state forever
         // by sending INIT … INIT … without ever issuing DESTROY.
-        // Existing IOIDs (re-INIT on a known IOID) are allowed to
-        // proceed — the insert below replaces the entry without
-        // growing the map.
-        if !ch.ops.contains_key(&ioid) && ch.ops.len() >= config.max_ops_per_channel {
+        if ch.ops.len() >= config.max_ops_per_channel {
             send_op_error(tx, kind, ioid, "max ops per channel exceeded", order).await?;
             return Ok(());
         }
+
+        // PVA-R16: pvxs `serverget.cpp:182-193` rejects missing
+        // prototype for non-RPC operations with "Must provide
+        // prototype". Rust's previous fallback turned a source bug
+        // (no `get_introspection`) into a successful GET/PUT/MONITOR
+        // INIT with a `Variant` descriptor — masking the bug and
+        // letting later mismatched-value encoding look valid. RPC
+        // can still proceed without a prototype (descriptor-late).
+        let intro = match (kind, ch.introspection.clone()) {
+            (OpKind::Rpc, Some(d)) => d,
+            (OpKind::Rpc, None) => FieldDesc::Variant,
+            (_, Some(d)) => d,
+            (_, None) => {
+                send_op_error(tx, kind, ioid, "must provide prototype", order).await?;
+                return Ok(());
+            }
+        };
+
         // INIT — read pvRequest (`type + full value` per pvxs
         // clientget.cpp:351-352) and translate it to a field mask the
         // emit side will consult.
-        let intro = ch.introspection.clone().unwrap_or(FieldDesc::Variant);
-
-        let req_desc = decode_type_desc(&mut cur, order).ok();
-        let req_value = req_desc
-            .as_ref()
-            .and_then(|d| decode_pv_field(d, &mut cur, order).ok());
-        let mask = req_desc
-            .as_ref()
-            .and_then(|d| crate::pv_request::request_to_mask(&intro, d).ok())
-            .unwrap_or_else(|| BitSet::all_set(intro.total_bits()));
+        //
+        // PVA-R19: pvxs `serverget.cpp:367-375` and
+        // `servermon.cpp:491-502` treat an invalid pvRequest type/value
+        // decode as bad INIT and close the connection;
+        // `pvrequest.cpp:61-62` throws on an empty mask. Pre-fix Rust
+        // discarded both errors and silently fell back to
+        // `BitSet::all_set(...)`, leaking fields the client didn't
+        // request. Reply with an INIT-status error to the client,
+        // then return Ok so the connection stays up — pvxs closes
+        // the whole connection but the per-op error path here is a
+        // less invasive parity choice that still surfaces the
+        // condition. Tests that pin the all-set fallback will need
+        // to specify `field()` or omit the pvRequest sub-structure.
+        let req_desc = match decode_type_desc(&mut cur, order) {
+            Ok(d) => d,
+            Err(e) => {
+                send_op_error(
+                    tx,
+                    kind,
+                    ioid,
+                    &format!("invalid pvRequest descriptor: {e}"),
+                    order,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        // PVA-R19: descriptor decode failure already routed through
+        // `send_op_error` above. The pvRequest VALUE body is more
+        // permissive — Rust client RPC INIT currently omits the
+        // value (only the descriptor), and pipeline-options /
+        // filter-chain parsers happily consume `None`. Treat a
+        // value-decode failure as "no parseable value" rather than
+        // INIT-level protocol error so we don't regress existing
+        // Rust↔Rust interop. pvxs requires both via
+        // `from_wire_type_value`; revisit when the client is brought
+        // up to send the full pvRequest body on RPC INIT too.
+        let req_value = decode_pv_field(&req_desc, &mut cur, order).ok();
+        let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
+            Ok(m) => m,
+            Err(e) => {
+                // The only variant today is `EmptyMask`: pvRequest
+                // selected no field that exists in the value
+                // descriptor (e.g. `field(noSuch)`). pvxs treats
+                // this as an INIT-level error
+                // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
+                // fell back to all-fields, leaking fields the client
+                // didn't request.
+                send_op_error(
+                    tx,
+                    kind,
+                    ioid,
+                    &format!("invalid pvRequest mask: {e}"),
+                    order,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
         // Pipeline flow control is opt-in via pvRequest:
         // `record[pipeline=true,queueSize=N]`. pvxs only enables the
@@ -2180,7 +2309,25 @@ async fn handle_op(
     // Data phase
     let op = ch.ops.get(&ioid).cloned();
     let (intro, mask) = match op {
-        Some(o) => (o.intro, o.mask),
+        Some(o) => {
+            // PVA-R24: data/control frames must match the operation
+            // kind bound at INIT. pvxs `serverget.cpp:421-436`
+            // resets the connection when a GET/PUT/RPC IOID is hit
+            // by the wrong operation class, and `servermon.cpp:
+            // 611-632` does the same for MONITOR. Pre-fix Rust
+            // looked up only descriptor+mask and proceeded into the
+            // current command's branch — a client could INIT a GET
+            // and later run MONITOR start/ack against the same IOID,
+            // spawning a subscriber task or sending a stray response
+            // the original operation never negotiated.
+            if o.kind != kind {
+                return Err(PvaError::Decode(format!(
+                    "data-phase command {:?} does not match INIT kind {:?} for IOID {ioid} (pvxs serverget.cpp:421-436 protocol error)",
+                    kind, o.kind
+                )));
+            }
+            (o.intro, o.mask)
+        }
         None => {
             send_op_error(tx, kind, ioid, "operation not initialised", order).await?;
             return Ok(());

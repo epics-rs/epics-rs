@@ -230,7 +230,7 @@ async fn op_get_inner(
     // Avoids the per-op `unbounded_channel` allocation that used to
     // back the stream-style path; the reader task pops FIFO from the
     // TwoShot VecDeque so first frame → rx_init, second → rx_data.
-    let (rx_init, rx_data) = server.register_ioid_twoshot(sid, ioid);
+    let (rx_init, rx_data) = server.register_ioid_twoshot(sid, ioid, Command::Get.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
     let cache = server.type_cache();
 
@@ -289,7 +289,7 @@ async fn op_get_inner(
     // IoidGuard so its Drop does NOT unregister + DESTROY — the
     // server keeps the binding alive for our reuse.
     if is_default_request && result.is_ok() {
-        let slot = server.register_ioid_reusable(sid, ioid);
+        let slot = server.register_ioid_reusable(sid, ioid, Command::Get.code());
         *channel.cached_get.lock() = Some(super::channel::CachedGet {
             server: Arc::downgrade(&server),
             sid,
@@ -382,7 +382,7 @@ pub async fn op_get_field(
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::GetField.code());
     let _ioid_guard = IoidGuard::new(server.clone(), ioid);
 
     let req = codec.build_get_field(sid, ioid, subfield);
@@ -459,7 +459,7 @@ pub async fn op_put_field(
     } else {
         std::borrow::Cow::Owned(build_pv_request_fields(&[field_path], big_endian))
     };
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
     let cache = server.type_cache();
 
@@ -551,7 +551,7 @@ pub async fn op_put_value(
     let ioid = alloc_ioid();
 
     let pv_req = build_pv_request_value_only(big_endian);
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
     let cache = server.type_cache();
 
@@ -631,7 +631,7 @@ async fn op_put_inner(
         Some(b) => b.to_vec(),
         None => build_pv_request_value_only(big_endian),
     };
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
     let cache = server.type_cache();
 
@@ -1147,7 +1147,7 @@ where
         let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
         std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian))
     };
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
     let init_req = codec.build_monitor_init(sid, ioid, &pv_req);
     server
         .send(init_req)
@@ -1553,7 +1553,7 @@ where
         }
     };
 
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
 
     // INIT
     let init_req = codec.build_monitor_init(sid, ioid, &pv_req);
@@ -1704,7 +1704,7 @@ pub async fn op_rpc(
     let mut pv_req = Vec::new();
     encode_type_desc(request_desc, order, &mut pv_req);
 
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Rpc.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
 
     // INIT
@@ -1807,7 +1807,7 @@ pub async fn op_put_get(
     let ioid = alloc_ioid();
 
     let pv_req = build_pv_request_value_only(big_endian);
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::PutGet.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
     let cache = server.type_cache();
 
@@ -1949,7 +1949,7 @@ pub async fn op_process(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResu
     let ioid = alloc_ioid();
 
     let pv_req = build_pv_request_value_only(big_endian);
-    let mut stream = server.register_ioid_stream(sid, ioid);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Process.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
 
     // INIT — `sid + ioid + 0x08 + pvRequest`.

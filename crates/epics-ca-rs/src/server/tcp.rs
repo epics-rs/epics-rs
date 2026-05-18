@@ -1870,6 +1870,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             ioid,
                         )
                         .await?;
+                    } else {
+                        // C `read_action` (`rsrv/camessage.c:636-642`)
+                        // sends `send_err(mp, ECA_NORDACCESS, client,
+                        // RECORD_NAME(pciu->dbch))` — i.e.
+                        // CA_PROTO_ERROR — for the deprecated
+                        // CA_PROTO_READ on read denial. Pre-fix Rust
+                        // silently returned, so a libca client saw a
+                        // timeout instead of the C error callback.
+                        let audit_pv = match &entry.target {
+                            ChannelTarget::SimplePv(pv) => pv.name.clone(),
+                            ChannelTarget::RecordField { record, field } => {
+                                format!("{}.{}", record.read().await.name, field)
+                            }
+                        };
+                        send_ca_error(writer, hdr, denied.eca_code(), hdr.cid, &audit_pv).await?;
                     }
                     return Ok(());
                 }
@@ -2057,6 +2072,27 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             resp.available = ioid;
                             let mut w = writer.lock().await;
                             w.write_all(&resp.to_bytes()).await?;
+                        } else {
+                            // C `write_action` (`rsrv/camessage.c:741-751`)
+                            // sends `send_err(mp, ECA_NOWTACCESS, client,
+                            // RECORD_NAME(pciu->dbch))` — i.e.
+                            // CA_PROTO_ERROR — for the deprecated
+                            // CA_PROTO_WRITE on write denial. DBR_PUT_ACKT/
+                            // DBR_PUT_ACKS travel the same WRITE opcodes,
+                            // so this branch covers alarm-acknowledge PUTs
+                            // too. Pre-fix Rust silently dropped the
+                            // denied PROTO_WRITE, so a libca client looked
+                            // like its put had succeeded — no error
+                            // callback even though the value never
+                            // reached the DB.
+                            let audit_pv = match &entry.target {
+                                ChannelTarget::SimplePv(pv) => pv.name.clone(),
+                                ChannelTarget::RecordField { record, field } => {
+                                    format!("{}.{}", record.read().await.name, field)
+                                }
+                            };
+                            send_ca_error(writer, hdr, denied.eca_code(), hdr.cid, &audit_pv)
+                                .await?;
                         }
                         return Ok(());
                     }
@@ -3270,8 +3306,20 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     // contiguous frame and issue a single `write_all` so a `send_timeout`
     // cancel cannot leave a partial frame (orphan header) in the shared
     // BufWriter and mis-frame every following message.
+    //
+    // The echoed request header is emitted in extended form when the
+    // original request used the extended layout. C `vsend_err`
+    // (`rsrv/camessage.c:201-214`) writes a 16-byte header with
+    // `m_postsize = 0xffff` plus an 8-byte annex carrying the full
+    // 32-bit postsize / count; libca `cac::exceptionRespAction`
+    // (`modules/ca/src/client/cac.cpp:1097-1107`) parses the annex
+    // first when it sees the 0xffff marker, then walks the diag
+    // string from the post-annex offset. `to_bytes_extended()`
+    // produces exactly that layout (24 bytes when `is_extended()`,
+    // 16 bytes otherwise), so an extended READ/WRITE error
+    // round-trips byte-for-byte with libca.
     let resp_bytes = resp.to_bytes_extended();
-    let orig_bytes = original_hdr.to_bytes();
+    let orig_bytes = original_hdr.to_bytes_extended();
     let mut frame = Vec::with_capacity(resp_bytes.len() + orig_bytes.len() + error_msg_bytes.len());
     frame.extend_from_slice(&resp_bytes);
     frame.extend_from_slice(&orig_bytes);

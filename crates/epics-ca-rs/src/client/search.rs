@@ -873,7 +873,15 @@ fn handle_udp_response(
                 // Any VERSION in the datagram marks subsequent SEARCH
                 // responses as fresh.  If the server echoed our
                 // sequenceNoIsValid flag, record the exact seq_no.
-                if hdr.data_type & 0x8000 != 0 {
+                //
+                // C `caProto.h:128` defines `sequenceNoIsValid = 1` —
+                // an equality marker placed in `m_dataType` of the
+                // per-datagram VERSION header (C `cas_send_dg_msg`,
+                // `caserverio.c:194-197`). Pre-fix Rust treated this
+                // as a `0x8000` bitmask, which never matched a real
+                // C server (the high bit is unused) and disabled the
+                // stale-response search-timer validation entirely.
+                if hdr.data_type == 1 {
                     state.last_valid_seq = Some(hdr.cid);
                 } else {
                     // Server didn't echo our seq — still accept
@@ -1125,7 +1133,14 @@ async fn fire_searches(
     let version_hdr = {
         let mut h = CaHeader::new(CA_PROTO_VERSION);
         h.count = CA_MINOR_VERSION;
-        h.data_type = 0x8000;
+        // C `caProto.h:128` defines `sequenceNoIsValid = 1`: this
+        // marker in the per-datagram VERSION header's `m_dataType`
+        // tells the server its `m_cid` carries a valid seqno that
+        // must be echoed in the reply VERSION (C `cas_send_dg_msg`,
+        // `caserverio.c:194-197`). Pre-fix Rust sent `0x8000`, which
+        // libca never recognises — the server then never echoed the
+        // seqno and the client could not reject stale responses.
+        h.data_type = 1;
         h.cid = state.dgram_seq;
         h.to_bytes()
     };

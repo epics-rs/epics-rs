@@ -1298,8 +1298,30 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     } else {
                         None
                     };
-                    let msg = if actual_post > 16 {
-                        let msg_bytes = &accumulated[data_start + 16..data_start + actual_post];
+                    // C `cac::exceptionRespAction` (`cac.cpp:1097-1107`):
+                    // when the echoed request used the extended layout
+                    // (`m_postsize == 0xffff`), the 8-byte annex carrying
+                    // the full 32-bit postsize and count sits between the
+                    // 16-byte header echo and the diagnostic string.
+                    // Pre-fix Rust unconditionally started the diag at
+                    // `data_start + 16`, so an extended READ/WRITE error
+                    // surfaced the annex bytes as the leading 8 bytes of
+                    // `msg` (mis-framed for the caller) and any actual
+                    // diag string was truncated by 8 bytes.
+                    let echo_hdr_size = if actual_post >= 16
+                        && u16::from_be_bytes([
+                            accumulated[data_start + 2],
+                            accumulated[data_start + 3],
+                        ]) == 0xFFFF
+                        && actual_post >= 24
+                    {
+                        24
+                    } else {
+                        16
+                    };
+                    let msg = if actual_post > echo_hdr_size {
+                        let msg_bytes =
+                            &accumulated[data_start + echo_hdr_size..data_start + actual_post];
                         let end = msg_bytes
                             .iter()
                             .position(|&b| b == 0)

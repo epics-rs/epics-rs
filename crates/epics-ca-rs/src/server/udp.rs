@@ -237,6 +237,15 @@ async fn recv_loop(
         }
 
         let mut offset = 0;
+        // Per-datagram client sequence (captured from a leading VERSION
+        // header whose `m_dataType == sequenceNoIsValid`). Echoed in any
+        // VERSION reply we emit for this datagram so the client can
+        // discard stale responses arriving after its search timer
+        // expired (C `cas_send_dg_msg`, `caserverio.c:194-197`). Stays
+        // `None` for peers that don't prepend a VERSION or that send
+        // the older non-flagged form; the reply VERSION then carries
+        // the default zero seq with the flag cleared.
+        let mut client_seq: Option<u32> = None;
         while offset + CaHeader::SIZE <= len {
             let hdr = match CaHeader::from_bytes(&buf[offset..]) {
                 Ok(h) => h,
@@ -276,6 +285,18 @@ async fn recv_loop(
             // continue.
             if hdr.cmmd != CA_PROTO_VERSION && hdr.cmmd != CA_PROTO_SEARCH {
                 break;
+            }
+            if hdr.cmmd == CA_PROTO_VERSION {
+                // C `udp_version_action` (rsrv/camessage.c:2094-2110)
+                // stores `pclient->seqNoOfReq = m_cid` and the version
+                // when the leading VERSION header marks the seq valid
+                // (`m_dataType == sequenceNoIsValid`, caProto.h:128).
+                // Capture it here so the SEARCH-reply branch can
+                // populate its VERSION echo and match
+                // `cas_send_dg_msg` byte-for-byte.
+                if hdr.data_type == 1 {
+                    client_seq = Some(hdr.cid);
+                }
             }
             if hdr.cmmd == CA_PROTO_SEARCH {
                 // C `search_reply_udp` (rsrv/camessage.c:2151-2154)
@@ -346,6 +367,22 @@ async fn recv_loop(
 
                         let mut ver = CaHeader::new(CA_PROTO_VERSION);
                         ver.count = CA_MINOR_VERSION;
+                        // C `cas_send_dg_msg` (`caserverio.c:194-197`)
+                        // echoes `pclient->seqNoOfReq` in `m_cid` with
+                        // `m_dataType = sequenceNoIsValid` (1) on
+                        // CA_V411+. Required for libca's stale-
+                        // response filter (`udpiiu.cpp:badSeqNumber`)
+                        // — without the echo, libca's search-timer
+                        // validation falls through and a reply that
+                        // arrived after the timer expired is accepted
+                        // anyway. Only set when the request datagram
+                        // carried a flagged VERSION; older clients
+                        // see ver.cid = 0 / data_type = 0 (no flag),
+                        // matching the pre-V411 C wire form.
+                        if let Some(seq) = client_seq {
+                            ver.cid = seq;
+                            ver.data_type = 1;
+                        }
 
                         let mut reply = Vec::with_capacity(CaHeader::SIZE * 2 + 8);
                         reply.extend_from_slice(&ver.to_bytes());

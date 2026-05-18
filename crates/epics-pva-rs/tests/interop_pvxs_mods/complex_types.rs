@@ -1,220 +1,34 @@
 //! Cross-implementation interop for complex PVA structures.
 //!
 //! Rust PVA server hosts a matrix of PVs covering every NT shape
-//! pvxs ships built-in plus a deeply-nested generic structure and
-//! a Variant/Any field. Real `pvxget` reads each one (via
-//! `EPICS_PVA_NAME_SERVERS` → R11 TCP search) and the test asserts
-//! the formatted output contains the expected values. Catches
-//! encoder bugs in Structure / ScalarArray / StructureArray /
-//! Variant / String paths that the simpler R1/R11/R20 tests
-//! (NTScalar Double only) cannot.
+//! pvxs ships built-in plus a deeply-nested generic structure.
+//! Real `pvxget` reads each one (via `EPICS_PVA_NAME_SERVERS` →
+//! R11 TCP search) and the test asserts the formatted output
+//! contains the expected values. Catches encoder bugs in Structure
+//! / ScalarArray / StructureArray / String paths that the simpler
+//! R1/R11/R20 tests (NTScalar Double only) cannot.
 //!
-//! Each PV is hosted on the *same* Rust server, so one
-//! handshake + many GETs amortise the per-test cost. SKIPped if
-//! `pvxget` not found.
+//! When `UPDATE_GOLDENS=1` is set in the environment, this test
+//! additionally re-encodes each PV via the Rust encoder and writes
+//! the bytes to `tests/fixtures/pvxs/<pv>.bin` after a successful
+//! pvxget round-trip. The default-suite golden replay
+//! (`tests/wire_golden_complex_types.rs`) then compares the same
+//! encoder output against those fixtures on every push without
+//! needing pvxs locally. The trust chain: interop verifies pvxs
+//! accepts the bytes → capture freezes them → default suite holds
+//! the encoder stable against the frozen artifacts.
+//!
+//! SKIPped if `pvxget` not found.
 
+use super::interop_helpers::pv_builders::{PvBuild, complex_pv_matrix, encode_pv_fixture};
 use super::interop_helpers::{PVXGET, pvxs_command, require_pvxs};
 
-use epics_pva_rs::nt::{NTEnum, NTScalar, NTTable};
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+use epics_pva_rs::server_native::{PvaServer, SharedSource};
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Open a SharedPV with the given descriptor and value.
-fn open_pv(desc: FieldDesc, value: PvField) -> SharedPV {
-    let pv = SharedPV::new();
-    pv.open(desc, value);
-    pv
-}
-
-/// Build an NTScalar PV with a concrete value.
-fn nt_scalar(t: ScalarType, value: ScalarValue) -> SharedPV {
-    let desc = NTScalar::new(t).build();
-    let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
-    root.fields
-        .push(("value".to_string(), PvField::Scalar(value)));
-    root.fields
-        .push(("alarm".to_string(), epics_pva_rs::nt::meta::alarm_default()));
-    root.fields.push((
-        "timeStamp".to_string(),
-        epics_pva_rs::nt::meta::time_default(),
-    ));
-    open_pv(desc, PvField::Structure(root))
-}
-
-/// Build an NTScalarArray PV with a concrete vector value.
-fn nt_scalar_array(t: ScalarType, value: Vec<ScalarValue>) -> SharedPV {
-    let desc = NTScalar::array(t).build();
-    let mut root = PvStructure::new("epics:nt/NTScalarArray:1.0");
-    root.fields
-        .push(("value".to_string(), PvField::ScalarArray(value)));
-    root.fields
-        .push(("alarm".to_string(), epics_pva_rs::nt::meta::alarm_default()));
-    root.fields.push((
-        "timeStamp".to_string(),
-        epics_pva_rs::nt::meta::time_default(),
-    ));
-    open_pv(desc, PvField::Structure(root))
-}
-
-/// NTEnum at a specific index with given choices.
-fn nt_enum(index: i32, choices: &[&str]) -> SharedPV {
-    let desc = NTEnum::new().with_choices(choices.iter().copied()).build();
-    let mut value_inner = PvStructure::new("enum_t");
-    value_inner.fields.push((
-        "index".to_string(),
-        PvField::Scalar(ScalarValue::Int(index)),
-    ));
-    value_inner.fields.push((
-        "choices".to_string(),
-        PvField::ScalarArray(
-            choices
-                .iter()
-                .map(|s| ScalarValue::String((*s).to_string()))
-                .collect(),
-        ),
-    ));
-    let mut root = PvStructure::new("epics:nt/NTEnum:1.0");
-    root.fields
-        .push(("value".to_string(), PvField::Structure(value_inner)));
-    root.fields
-        .push(("alarm".to_string(), epics_pva_rs::nt::meta::alarm_default()));
-    root.fields.push((
-        "timeStamp".to_string(),
-        epics_pva_rs::nt::meta::time_default(),
-    ));
-    open_pv(desc, PvField::Structure(root))
-}
-
-/// NTTable with two double columns + one string column. Values:
-/// xs = [1.0, 2.0, 3.0], ys = [10.0, 20.0, 30.0], names = ["a","b","c"].
-fn nt_table_three_columns() -> SharedPV {
-    let t = NTTable::new()
-        .add_column(ScalarType::Double, "xs", Some("X axis"))
-        .add_column(ScalarType::Double, "ys", Some("Y axis"))
-        .add_column(ScalarType::String, "name", Some("Name"));
-    let desc = t.build();
-    let mut root = PvStructure::new("epics:nt/NTTable:1.0");
-    root.fields.push((
-        "labels".to_string(),
-        PvField::ScalarArray(vec![
-            ScalarValue::String("X axis".into()),
-            ScalarValue::String("Y axis".into()),
-            ScalarValue::String("Name".into()),
-        ]),
-    ));
-    let mut cols = PvStructure::new("");
-    cols.fields.push((
-        "xs".to_string(),
-        PvField::ScalarArray(vec![
-            ScalarValue::Double(1.0),
-            ScalarValue::Double(2.0),
-            ScalarValue::Double(3.0),
-        ]),
-    ));
-    cols.fields.push((
-        "ys".to_string(),
-        PvField::ScalarArray(vec![
-            ScalarValue::Double(10.0),
-            ScalarValue::Double(20.0),
-            ScalarValue::Double(30.0),
-        ]),
-    ));
-    cols.fields.push((
-        "name".to_string(),
-        PvField::ScalarArray(vec![
-            ScalarValue::String("a".into()),
-            ScalarValue::String("b".into()),
-            ScalarValue::String("c".into()),
-        ]),
-    ));
-    root.fields
-        .push(("value".to_string(), PvField::Structure(cols)));
-    root.fields.push((
-        "descriptor".to_string(),
-        PvField::Scalar(ScalarValue::String("table".into())),
-    ));
-    root.fields
-        .push(("alarm".to_string(), epics_pva_rs::nt::meta::alarm_default()));
-    root.fields.push((
-        "timeStamp".to_string(),
-        epics_pva_rs::nt::meta::time_default(),
-    ));
-    open_pv(desc, PvField::Structure(root))
-}
-
-/// Generic nested structure 3-deep with mixed scalar leaves.
-/// Not an NT — exercises the raw Structure encoder/decoder path
-/// that NT helpers route through.
-fn nested_generic_struct() -> SharedPV {
-    let desc = FieldDesc::Structure {
-        struct_id: "test:nested:1.0".into(),
-        fields: vec![
-            (
-                "outer".into(),
-                FieldDesc::Structure {
-                    struct_id: String::new(),
-                    fields: vec![
-                        (
-                            "mid".into(),
-                            FieldDesc::Structure {
-                                struct_id: String::new(),
-                                fields: vec![
-                                    ("count".into(), FieldDesc::Scalar(ScalarType::Long)),
-                                    ("label".into(), FieldDesc::Scalar(ScalarType::String)),
-                                ],
-                            },
-                        ),
-                        ("flag".into(), FieldDesc::Scalar(ScalarType::Boolean)),
-                    ],
-                },
-            ),
-            ("tags".into(), FieldDesc::ScalarArray(ScalarType::String)),
-        ],
-    };
-    let inner = PvField::Structure(PvStructure {
-        struct_id: String::new(),
-        fields: vec![
-            (
-                "count".to_string(),
-                PvField::Scalar(ScalarValue::Long(987_654_321_i64)),
-            ),
-            (
-                "label".to_string(),
-                PvField::Scalar(ScalarValue::String("nested-leaf".into())),
-            ),
-        ],
-    });
-    let outer = PvField::Structure(PvStructure {
-        struct_id: String::new(),
-        fields: vec![
-            ("mid".to_string(), inner),
-            (
-                "flag".to_string(),
-                PvField::Scalar(ScalarValue::Boolean(true)),
-            ),
-        ],
-    });
-    let root = PvField::Structure(PvStructure {
-        struct_id: "test:nested:1.0".into(),
-        fields: vec![
-            ("outer".to_string(), outer),
-            (
-                "tags".to_string(),
-                PvField::ScalarArray(vec![
-                    ScalarValue::String("alpha".into()),
-                    ScalarValue::String("beta".into()),
-                ]),
-            ),
-        ],
-    });
-    open_pv(desc, root)
-}
-
-/// Run pvxget with `EPICS_PVA_NAME_SERVERS` pointing at `addr`
-/// and return its stdout / stderr / exit-status.
 async fn pvxget_capture(
     pvxget: &std::path::Path,
     server_str: String,
@@ -223,29 +37,39 @@ async fn pvxget_capture(
     let pvxget = pvxget.to_path_buf();
     let pv_name = pv_name.to_string();
     tokio::task::spawn_blocking(move || {
-        pvxget_command(&pvxget, &server_str, &pv_name)
-            .output()
-            .expect("pvxget exec")
+        let mut cmd = pvxs_command(&pvxget);
+        cmd.arg("-w")
+            .arg("3")
+            .arg(&pv_name)
+            .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
+            .env("EPICS_PVA_ADDR_LIST", "")
+            .env("EPICS_PVA_NAME_SERVERS", &server_str)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd.output().expect("pvxget exec")
     })
     .await
     .expect("join pvxget")
 }
 
-fn pvxget_command(
-    pvxget: &std::path::Path,
-    server_str: &str,
-    pv_name: &str,
-) -> std::process::Command {
-    let mut cmd = pvxs_command(pvxget);
-    cmd.arg("-w")
-        .arg("3")
-        .arg(pv_name)
-        .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_PVA_ADDR_LIST", "")
-        .env("EPICS_PVA_NAME_SERVERS", server_str)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    cmd
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pvxs")
+}
+
+fn capture_golden(build: &PvBuild) {
+    let dir = fixture_dir();
+    std::fs::create_dir_all(&dir).expect("mkdir fixtures");
+    // Replace ':' with '_' so the filename is portable.
+    let stem = build.name.replace([':', '/'], "_");
+    let path = dir.join(format!("{stem}.bin"));
+    let bytes = encode_pv_fixture(build);
+    std::fs::write(&path, &bytes).expect("write fixture");
+    eprintln!(
+        "UPDATE_GOLDENS: wrote {} bytes for {} → {:?}",
+        bytes.len(),
+        build.name,
+        path,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -254,78 +78,19 @@ async fn interop_complex_types_pvxget_against_rust_server() {
         return;
     };
 
-    // Build a server with every complex shape we care about.
+    let pvs = complex_pv_matrix();
     let source = SharedSource::new();
-    source.add(
-        "T:STR",
-        nt_scalar(
-            ScalarType::String,
-            ScalarValue::String("hello world".into()),
-        ),
-    );
-    source.add(
-        "T:INT",
-        nt_scalar(ScalarType::Int, ScalarValue::Int(-12345)),
-    );
-    source.add(
-        "T:LONG",
-        nt_scalar(ScalarType::Long, ScalarValue::Long(9_000_000_000_i64)),
-    );
-    // Distinct, non-constant-like double so clippy's approx_constant
-    // doesn't flag PI / E literals.
-    source.add(
-        "T:DBL",
-        nt_scalar(ScalarType::Double, ScalarValue::Double(123.456_789_f64)),
-    );
-    source.add(
-        "T:WF:DBL",
-        nt_scalar_array(
-            ScalarType::Double,
-            vec![
-                ScalarValue::Double(1.5),
-                ScalarValue::Double(2.5),
-                ScalarValue::Double(3.5),
-            ],
-        ),
-    );
-    source.add(
-        "T:WF:INT",
-        nt_scalar_array(
-            ScalarType::Int,
-            vec![
-                ScalarValue::Int(7),
-                ScalarValue::Int(8),
-                ScalarValue::Int(9),
-                ScalarValue::Int(10),
-            ],
-        ),
-    );
-    source.add(
-        "T:WF:STR",
-        nt_scalar_array(
-            ScalarType::String,
-            vec![
-                ScalarValue::String("alpha".into()),
-                ScalarValue::String("beta".into()),
-                ScalarValue::String("gamma".into()),
-            ],
-        ),
-    );
-    source.add("T:ENUM", nt_enum(2, &["OFF", "ON", "AUTO"]));
-    source.add("T:TBL", nt_table_three_columns());
-    source.add("T:NEST", nested_generic_struct());
-
+    for b in &pvs {
+        source.add(b.name, b.open());
+    }
     let server = PvaServer::isolated(Arc::new(source)).expect("server start");
     let addr = server.tcp_addr();
     let server_str = format!("127.0.0.1:{}", addr.port());
 
-    // Each row: (pv, list of grep substrings that MUST all appear).
     let matrix: &[(&'static str, &[&str])] = &[
         ("T:STR", &[r#"value string = "hello world""#]),
         ("T:INT", &["value int32_t = -12345"]),
         ("T:LONG", &["value int64_t = 9000000000"]),
-        // pvxget rounds doubles to ~6 sig figs in default `tree`
-        // format. Check the leading digits we know it must emit.
         ("T:DBL", &["value double = 123.457"]),
         ("T:WF:DBL", &["value double[]", "1.5", "2.5", "3.5"]),
         ("T:WF:INT", &["value int32_t[]", "7", "8", "9", "10"]),
@@ -373,6 +138,8 @@ async fn interop_complex_types_pvxget_against_rust_server() {
         ),
     ];
 
+    let update_goldens = std::env::var_os("UPDATE_GOLDENS").is_some();
+
     let mut failures: Vec<String> = Vec::new();
     for (pv, needles) in matrix {
         let out = pvxget_capture(&pvxget, server_str.clone(), pv).await;
@@ -395,6 +162,12 @@ async fn interop_complex_types_pvxget_against_rust_server() {
             failures.push(format!(
                 "[{pv}] missing substrings: {missing:?}\n  stdout: {stdout}\n  stderr: {stderr}",
             ));
+            continue;
+        }
+        // pvxget accepted these bytes — capture them as golden if
+        // the operator asked.
+        if update_goldens && let Some(build) = pvs.iter().find(|b| b.name == *pv) {
+            capture_golden(build);
         }
     }
 

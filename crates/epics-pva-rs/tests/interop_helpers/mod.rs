@@ -9,6 +9,8 @@
 
 #![allow(dead_code)]
 
+pub mod pv_builders;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 

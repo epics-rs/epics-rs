@@ -25,6 +25,9 @@
 mod interop_helpers;
 
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/be_byte_order.rs"]
+mod be_byte_order;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/complex_types.rs"]
 mod complex_types;
 #[cfg(unix)]

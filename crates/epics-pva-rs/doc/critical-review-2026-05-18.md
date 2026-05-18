@@ -1101,3 +1101,95 @@ These commands verify the crate's current test suite after the review doc
 change. They do not prove the twenty-eight findings above are false; the findings
 are recorded because the current suite lacks the specific parity regressions
 noted in each section.
+
+## Implementation Status (2026-05-18 fix round)
+
+22 of 28 findings landed in this session. Each fix is anchored
+to its commit and the file/line changes; deferred items are listed
+with reason.
+
+### Cleared (22)
+
+- **PVA-R1** (HIGH) — `5a69034` codec::build_monitor_init pipeline
+  initial nack + new pv_request::build_pv_request_pipeline; codec::
+  build_monitor_start no longer carries pipeline_size.
+- **PVA-R5** (HIGH) — `88232de` SharedPV::try_post_checked +
+  put_delta no-handler path enforce opened descriptor.
+- **PVA-R7** (HIGH) — `46cbb99` client_native reader splits
+  Ok(None)/Ok(Some)/Err on frame parse + cancels on header decode
+  fault.
+- **PVA-R8** (MEDIUM) — `e4056db` ADVERTISED_AUTH_METHODS reordered
+  to ["anonymous", "ca"].
+- **PVA-R9** (HIGH) — `88232de` server GET data phase calls
+  value_matches_descriptor before encoding.
+- **PVA-R10** (MEDIUM) — `ec13197` client filters SEARCH_RESPONSE
+  protocol != "tcp"; server filters SEARCH by requested protocol;
+  beacons advertise runtime transport.
+- **PVA-R12** (MEDIUM) — `add08dd` warm-GET failure sends
+  DESTROY_REQUEST + unregister_ioid before cold fallback.
+- **PVA-R13** (HIGH) — `46cbb99` Union/VariantArray encode/decode
+  use per-element presence byte.
+- **PVA-R15** (MEDIUM) — `b0f37ee` pvas_server_port + auto_beacon
+  fallback to EPICS_PVA_AUTO_ADDR_LIST + beacon_addr_list fallback
+  to EPICS_PVA_ADDR_LIST.
+- **PVA-R16** (HIGH) — `bed630f` GET/PUT/MONITOR/PUT_GET/PROCESS
+  INIT reject missing prototype; RPC retains descriptor-late.
+- **PVA-R17** (MEDIUM) — `b0f37ee` raw monitor FINISH clears
+  state.active.
+- **PVA-R18** (MEDIUM) — `ec13197` ip_from_bytes_allow_unspec
+  routes through wildcard substitution path.
+- **PVA-R19** (HIGH) — `bed630f` pvRequest descriptor / EmptyMask
+  → INIT-status error.
+- **PVA-R20** (MEDIUM) — `5a69034` pipeline option accepts
+  bool/integer/string; queueSize<2 disables pipeline.
+- **PVA-R21** (HIGH) — `bed630f` duplicate INIT on live IOID is
+  protocol-fatal.
+- **PVA-R22** (HIGH) — `e4056db` parse_client_credentials returns
+  PvaResult; auth value decode fault is connection-fatal.
+- **PVA-R23** (HIGH) — `bed630f` client ioid_to_cmd + route_frame
+  command-match gate.
+- **PVA-R24** (HIGH) — `bed630f` server data-phase frames must
+  match OpState.kind.
+- **PVA-R25** (MEDIUM) — `e4056db` client rejects 0xFF null Size
+  for auth-method count.
+- **PVA-R26** (MEDIUM) — `b0f37ee` route_frame emits
+  CMD_DESTROY_CHANNEL on late CREATE_CHANNEL success without
+  waiter.
+- **PVA-R27** (MEDIUM) — `add08dd` pvget_many only restores cache
+  on successful DATA; emits DESTROY_REQUEST on failure.
+- **PVA-R28** (MEDIUM) — `46cbb99` handle_cancel_request /
+  handle_destroy_request / handle_message / handle_create_channel
+  propagate truncated payloads as PvaError::Decode.
+
+### Deferred (6 — substantial architectural changes)
+
+- **PVA-R2** (MEDIUM) — `tcp_timeout` plumbing through
+  ConnectionPool::get_or_connect + ServerConn::connect + spawned
+  heartbeat task. Multi-layer signature change; out of scope for
+  this fix round.
+- **PVA-R3** (MEDIUM) — Nested Variant TypeCache plumbing.
+  Requires `decode_pv_field` family to accept `&mut TypeCache` and
+  thread through all op-response decoders + reader flattening.
+- **PVA-R4** (MEDIUM) — TCP name servers as persistent search
+  peers (not direct-connect fallbacks). Architectural change to
+  SearchEngine.
+- **PVA-R6** (MEDIUM) — SharedPV subscriber queue with squash-to-
+  tail semantics. tokio::mpsc has no sender-side "drop oldest";
+  faithful fix needs custom Mutex<VecDeque>+Notify or
+  tokio::sync::watch.
+- **PVA-R11** (MEDIUM) — Server TCP CMD_SEARCH handler (pvxs
+  serverchan.cpp:173-255). Requires sharing UDP request-parser
+  filtering + SEARCH_RESPONSE builder; complementary to PVA-R4
+  for full name-server parity.
+- **PVA-R14** (MEDIUM) — Decouple server source calls from per-
+  connection read loop. Requires operation-state-machine
+  restructure so source futures don't head-of-line-block the
+  socket parser.
+
+### Verification
+
+After all 22 fixes:
+
+- `cargo fmt --all -- --check`: pass
+- `cargo clippy -p epics-pva-rs --all-targets -- -D warnings`: pass
+- `cargo nextest run -p epics-pva-rs`: 520 / 520 pass, 17 skipped

@@ -136,6 +136,25 @@ async fn interop_complex_types_pvxget_against_rust_server() {
                 r#""beta""#,
             ],
         ),
+        (
+            "T:SA",
+            &[
+                "points",
+                r#"x int32_t = 1"#,
+                r#"y string = "alpha""#,
+                r#"x int32_t = 2"#,
+                r#"y string = "beta""#,
+                r#"x int32_t = 3"#,
+                r#"y string = "gamma""#,
+            ],
+        ),
+        (
+            "T:ANY",
+            &[
+                // Variant of int prints as `any.<...> int32_t = 424242`.
+                "424242",
+            ],
+        ),
     ];
 
     let update_goldens = std::env::var_os("UPDATE_GOLDENS").is_some();

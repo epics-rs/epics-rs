@@ -8,7 +8,9 @@
 #![allow(dead_code)]
 
 use epics_pva_rs::nt::{NTEnum, NTScalar, NTTable, meta};
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+use epics_pva_rs::pvdata::{
+    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, VariantValue,
+};
 use epics_pva_rs::server_native::SharedPV;
 
 #[derive(Clone)]
@@ -122,6 +124,71 @@ fn nt_table_struct() -> (FieldDesc, PvField) {
     root.fields
         .push(("timeStamp".to_string(), meta::time_default()));
     (desc, PvField::Structure(root))
+}
+
+/// Structure array of `point_t { x: int, y: string }` with 3 elements.
+/// Exercises the `0x88` StructureArray wire tag and per-element
+/// non-null marker (`PvField::StructureArray` is `Vec<PvStructure>`,
+/// each element rendered inline with the descriptor's struct shape).
+fn struct_array_points() -> (FieldDesc, PvField) {
+    let elem_desc = FieldDesc::Structure {
+        struct_id: "point_t".into(),
+        fields: vec![
+            ("x".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ("y".into(), FieldDesc::Scalar(ScalarType::String)),
+        ],
+    };
+    let desc = FieldDesc::Structure {
+        struct_id: "test:points:1.0".into(),
+        fields: vec![(
+            "points".into(),
+            FieldDesc::StructureArray {
+                struct_id: "point_t".into(),
+                fields: match &elem_desc {
+                    FieldDesc::Structure { fields, .. } => fields.clone(),
+                    _ => unreachable!(),
+                },
+            },
+        )],
+    };
+    let make = |x: i32, y: &str| PvStructure {
+        struct_id: "point_t".into(),
+        fields: vec![
+            ("x".into(), PvField::Scalar(ScalarValue::Int(x))),
+            (
+                "y".into(),
+                PvField::Scalar(ScalarValue::String(y.to_string())),
+            ),
+        ],
+    };
+    let root = PvField::Structure(PvStructure {
+        struct_id: "test:points:1.0".into(),
+        fields: vec![(
+            "points".into(),
+            PvField::StructureArray(vec![make(1, "alpha"), make(2, "beta"), make(3, "gamma")]),
+        )],
+    });
+    (desc, root)
+}
+
+/// Variant ("Any") field with a Scalar(Int) payload. pvxs wire tag
+/// 0x82 followed by the inner descriptor + value.
+fn variant_int() -> (FieldDesc, PvField) {
+    let desc = FieldDesc::Structure {
+        struct_id: "test:variant:1.0".into(),
+        fields: vec![("any".into(), FieldDesc::Variant)],
+    };
+    let root = PvField::Structure(PvStructure {
+        struct_id: "test:variant:1.0".into(),
+        fields: vec![(
+            "any".into(),
+            PvField::Variant(Box::new(VariantValue {
+                desc: Some(FieldDesc::Scalar(ScalarType::Int)),
+                value: PvField::Scalar(ScalarValue::Int(424242)),
+            })),
+        )],
+    });
+    (desc, root)
 }
 
 fn nested_struct() -> (FieldDesc, PvField) {
@@ -252,6 +319,8 @@ pub fn complex_pv_matrix() -> Vec<PvBuild> {
     push("T:ENUM", nt_enum_struct(2, &["OFF", "ON", "AUTO"]));
     push("T:TBL", nt_table_struct());
     push("T:NEST", nested_struct());
+    push("T:SA", struct_array_points());
+    push("T:ANY", variant_int());
 
     out
 }

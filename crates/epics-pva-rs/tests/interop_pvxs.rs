@@ -25,6 +25,9 @@
 mod interop_helpers;
 
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/complex_types.rs"]
+mod complex_types;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/pipeline_r1.rs"]
 mod pipeline_r1;
 #[cfg(unix)]

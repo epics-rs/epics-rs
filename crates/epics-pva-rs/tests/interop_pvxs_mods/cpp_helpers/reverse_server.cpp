@@ -1,8 +1,7 @@
-// PVA-batch-1: pvxs server hosting the same matrix of complex
-// shapes as the Rust forward-direction test. Used to verify the
-// Rust *client* (decoder) accepts what pvxs encodes — symmetric
-// to complex_types.rs which verifies pvxs accepts what Rust
-// encodes.
+// PVA-batch-1 + batch-2: pvxs server hosting the matrix of
+// complex shapes used by reverse_complex_types.rs (decoder check)
+// and — with --writable — the PUT cross-impl test
+// (put_cross_impl.rs direction B).
 //
 // Args:
 //   --port N        TCP port to bind (PVA only; we never advertise
@@ -11,6 +10,11 @@
 //   --ready FILE    Optional. After the server has bound, touch
 //                   the named file. Test uses this as a readiness
 //                   gate (more deterministic than sleep).
+//   --writable      Use SharedPV::buildMailbox (accepts PUTs +
+//                   posts to subscribers) instead of the default
+//                   buildReadonly. Only the two scalar PVs T:STR
+//                   and T:INT are wired up in this mode — the
+//                   write test doesn't need the whole matrix.
 //
 // PVs hosted:
 //   T:STR  NTScalar<string>  = "hello world"
@@ -135,13 +139,15 @@ int main(int argc, char** argv) {
 
     int port = 0;
     std::string ready_path;
+    bool writable = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--port" && i + 1 < argc) port = std::atoi(argv[++i]);
         else if (a == "--ready" && i + 1 < argc) ready_path = argv[++i];
+        else if (a == "--writable") writable = true;
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
-    if (port <= 0) { std::fprintf(stderr, "usage: %s --port N [--ready FILE]\n", argv[0]); return 2; }
+    if (port <= 0) { std::fprintf(stderr, "usage: %s --port N [--ready FILE] [--writable]\n", argv[0]); return 2; }
 
     server::Config cfg;
     cfg.tcp_port = static_cast<unsigned short>(port);
@@ -150,15 +156,28 @@ int main(int argc, char** argv) {
     cfg.auto_beacon = false;
     auto srv = cfg.build();
 
-    srv.addPV("T:STR",    make_string("hello world"));
-    srv.addPV("T:INT",    make_int32(-12345));
-    srv.addPV("T:LONG",   make_int64(9'000'000'000LL));
-    srv.addPV("T:DBL",    make_double(123.456789));
-    srv.addPV("T:WF:DBL", make_array<double, TypeCode::Float64A>({1.5, 2.5, 3.5}));
-    srv.addPV("T:WF:INT", make_array<int32_t, TypeCode::Int32A>({7, 8, 9, 10}));
-    srv.addPV("T:WF:STR", make_string_array({"alpha", "beta", "gamma"}));
-    srv.addPV("T:ENUM",   make_enum(2, {"OFF", "ON", "AUTO"}));
-    srv.addPV("T:TBL",    make_table());
+    if (writable) {
+        // Two mailbox PVs that accept PUTs and post the new value
+        // back. Initial values intentionally different from the
+        // values the PUT test writes so the assertion can
+        // distinguish "PUT applied" from "GET returned the initial".
+        auto p_str = server::SharedPV::buildMailbox();
+        p_str.open(nt::NTScalar{TypeCode::String}.create().update("value", std::string{"initial"}));
+        auto p_int = server::SharedPV::buildMailbox();
+        p_int.open(nt::NTScalar{TypeCode::Int32}.create().update("value", int32_t{0}));
+        srv.addPV("W:STR", p_str);
+        srv.addPV("W:INT", p_int);
+    } else {
+        srv.addPV("T:STR",    make_string("hello world"));
+        srv.addPV("T:INT",    make_int32(-12345));
+        srv.addPV("T:LONG",   make_int64(9'000'000'000LL));
+        srv.addPV("T:DBL",    make_double(123.456789));
+        srv.addPV("T:WF:DBL", make_array<double, TypeCode::Float64A>({1.5, 2.5, 3.5}));
+        srv.addPV("T:WF:INT", make_array<int32_t, TypeCode::Int32A>({7, 8, 9, 10}));
+        srv.addPV("T:WF:STR", make_string_array({"alpha", "beta", "gamma"}));
+        srv.addPV("T:ENUM",   make_enum(2, {"OFF", "ON", "AUTO"}));
+        srv.addPV("T:TBL",    make_table());
+    }
 
     srv.start();
     if (!ready_path.empty()) {

@@ -34,6 +34,9 @@ mod pipeline_r1;
 #[path = "interop_pvxs_mods/pipeline_r20.rs"]
 mod pipeline_r20;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/put_cross_impl.rs"]
+mod put_cross_impl;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/reverse_complex_types.rs"]
 mod reverse_complex_types;
 #[cfg(unix)]

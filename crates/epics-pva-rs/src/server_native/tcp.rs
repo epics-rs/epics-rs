@@ -2595,7 +2595,67 @@ async fn handle_op(
             let _ = tx.send(buf).await;
         }
         OpKind::Put => {
-            // Read bitset (which fields client is putting) + value.
+            // pvxs `serverget.cpp:364` derives `isput = cmd!=CMD_GET
+            // && !(subcmd&0x40)`. When the client sets `subcmd &
+            // 0x40` on a CMD_PUT frame (`clientget.cpp:300`
+            // `GPROp::GetOPut`, used by `PutBuilder::fetchPresent(true)`
+            // — the default), pvxs treats the data-phase frame as a
+            // pre-PUT GET: no bitset/value on the wire, server emits
+            // the current value so the client's `build(cb)` callback
+            // can mutate-and-resend. Pre-fix Rust always read bitset
+            // + value here and tripped `short read u8` on the empty
+            // body, killing the connection before any actual PUT
+            // landed.
+            if subcmd & 0x40 != 0 {
+                let pv_name = ch.name.clone();
+                let ctx = crate::server_native::source::ChannelContext {
+                    peer,
+                    account: cred.account.clone(),
+                    method: cred.method.clone(),
+                    host: cred.host.clone(),
+                    authority: cred.authority.clone(),
+                };
+                let checked = source
+                    .access_gate()
+                    .check(
+                        &pv_name,
+                        &ctx.host,
+                        &ctx.account,
+                        &ctx.method,
+                        &ctx.authority,
+                    )
+                    .await;
+                let value = match source.get_value_checked(checked, ctx).await {
+                    Some(v) => v,
+                    None => {
+                        send_op_error(tx, OpKind::Put, ioid, "PV not found", order).await?;
+                        return Ok(());
+                    }
+                };
+                let mut payload = Vec::new();
+                payload.put_u32(ioid, order);
+                payload.put_u8(subcmd);
+                Status::ok().write_into(order, &mut payload);
+                let changed = crate::pvdata::encode::canonical_changed_bitset(&intro, &mask);
+                changed.write_into(order, &mut payload);
+                crate::pvdata::encode::encode_pv_field_with_bitset(
+                    &value,
+                    &intro,
+                    &changed,
+                    0,
+                    order,
+                    &mut payload,
+                );
+                let h =
+                    PvaHeader::application(true, order, Command::Put.code(), payload.len() as u32);
+                let mut buf = Vec::new();
+                h.write_into(&mut buf);
+                buf.extend_from_slice(&payload);
+                let _ = tx.send(buf).await;
+                return Ok(());
+            }
+            // PUT EXEC (subcmd & 0x40 == 0): read bitset (which
+            // fields client is putting) + value.
             // The PVA client encodes the data phase as a BitSet delta
             // (`changed | partial value`, see
             // `client_native::ops_v2::op_put*` and pvxs

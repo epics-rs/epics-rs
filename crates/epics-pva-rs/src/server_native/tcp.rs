@@ -2367,6 +2367,25 @@ async fn handle_op(
                     return Ok(());
                 }
             };
+            // PVA-R9: source-side mismatch gate. pvxs
+            // `serverget.cpp:62-67` throws when GET / PUT-getback
+            // returns a value whose descriptor differs from the one
+            // passed to `connect()`. Pre-fix Rust silently coerced
+            // via `encode_pv_field`'s F-G10 generic fallback,
+            // turning application data corruption into a valid-
+            // looking PVA frame. Reply with a GET-status error
+            // (subcmd | 0x40 marker) instead.
+            if let Err(e) = crate::pvdata::value_matches_descriptor(&value, &intro) {
+                send_op_error(
+                    tx,
+                    OpKind::Get,
+                    ioid,
+                    &format!("source value does not match opened descriptor: {e}"),
+                    order,
+                )
+                .await?;
+                return Ok(());
+            }
             let mut payload = Vec::new();
             payload.put_u32(ioid, order);
             // pvxs `serverget.cpp:83` echoes the request `subcmd`

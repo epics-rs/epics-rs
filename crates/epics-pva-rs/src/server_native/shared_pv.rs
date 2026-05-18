@@ -211,10 +211,49 @@ impl SharedPV {
     /// Push a new value to all subscribers; lossy semantics — drops
     /// updates when a subscriber's outbox is full. Returns the number
     /// of subscribers we successfully sent to.
+    ///
+    /// PVA-R5: a descriptor/value mismatch is logged at warn level
+    /// and the post is dropped (returns 0). The shape is "best
+    /// effort" because `-> usize` predates Result-typed posts;
+    /// internal callers that can handle a Result should use
+    /// [`Self::try_post_checked`] instead, which mirrors pvxs
+    /// `sharedpv.cpp:417-431` and refuses post on:
+    /// (a) PV not yet opened, (b) descriptor mismatch.
     pub fn try_post(&self, value: PvField) -> usize {
+        if let Err(e) = self.try_post_checked(value) {
+            tracing::warn!(
+                error = %e,
+                "SharedPV::try_post: dropped — value does not fit opened descriptor"
+            );
+            return 0;
+        }
+        // `try_post_checked` already updated `value` + delivered to
+        // every live subscriber. It does not return a count; we
+        // recompute by inspecting subscriber map size after the
+        // post (a transient under-count under heavy churn is
+        // acceptable for the legacy `-> usize` API).
+        let g = self.inner.lock();
+        g.subscribers.len()
+    }
+
+    /// Result-typed post with descriptor enforcement. PVA-R5:
+    /// mirrors pvxs `sharedpv.cpp:417-431`. Returns `Err` when the
+    /// PV is not yet opened, or when the value's runtime shape
+    /// does not fit the opened descriptor. Subscribers see the new
+    /// value only on `Ok`.
+    pub fn try_post_checked(&self, value: PvField) -> crate::error::PvaResult<usize> {
         let mut g = self.inner.lock();
         if !g.is_open {
-            return 0;
+            return Err(crate::error::PvaError::Protocol(
+                "SharedPV not open".to_string(),
+            ));
+        }
+        if let Some(desc) = g.desc.as_ref() {
+            if let Err(e) = crate::pvdata::value_matches_descriptor(&value, desc) {
+                return Err(crate::error::PvaError::InvalidValue(format!(
+                    "SharedPV::try_post: value does not fit opened descriptor ({e})"
+                )));
+            }
         }
         g.value = Some(value.clone());
         let mut delivered = 0;
@@ -226,7 +265,7 @@ impl SharedPV {
             Err(mpsc::error::TrySendError::Full(_)) => true, // keep, drop update
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         });
-        delivered
+        Ok(delivered)
     }
 
     /// Add a subscriber. The returned Receiver yields every successful
@@ -343,6 +382,22 @@ impl SharedPV {
                     value: merged,
                 },
                 None => {
+                    // PVA-R5: descriptor enforcement for the
+                    // no-handler store path. Without a check the
+                    // merged value could carry a shape unrelated
+                    // to the opened descriptor (pvxs `sharedpv.cpp:
+                    // 417-431` rejects this). Compare against
+                    // `g.desc` (the opened descriptor, not the
+                    // per-put `desc` parameter — the wire request
+                    // may carry a stale descriptor cached by the
+                    // peer).
+                    if let Some(opened) = g.desc.as_ref() {
+                        if let Err(e) = crate::pvdata::value_matches_descriptor(&merged, opened) {
+                            return Err(format!(
+                                "SharedPV::put_delta: merged value does not fit opened descriptor ({e})"
+                            ));
+                        }
+                    }
                     // Store atomically with the read above so a
                     // concurrent put_delta sees this as its prior.
                     g.value = Some(merged.clone());

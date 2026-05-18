@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.18.0 — 2026-05-18
+
+First `main` release rolling up the `review/codebase-hardening-202605`
+branch. `main` was at `v0.17.0`; this release encompasses everything
+recorded under `v0.17.1` (C-parity hardening, 126 commits across
+eleven review rounds) and `v0.17.2` (areaDetector RBV constructor-time
+flag-consumption fix), plus the new entries below. See those sections
+for the full audit trail.
+
+### modbus-rs — absolute-mode array I/O length safety
+
+- **fix(modbus-rs)** `read_int32_array` absolute-mode requests now use
+  the record array length, not the driver-wide `modbusLength`, so a
+  short waveform record never asks the device for more registers than
+  it can buffer (`dac0dd6`).
+- **fix(modbus-rs)** Absolute-mode array writes clamp the request
+  length to `modbusLength` to prevent overrun on the device side
+  (`28160ae`).
+- **fix(modbus-rs)** Relative-mode array writes apply the same clamp
+  for the `modbusLength`-bounded register window
+  (`4b5a38c`).
+
+Workspace: `cargo fmt --all` clean, `cargo clippy --workspace
+--all-targets -- -D warnings` clean.
+
 ## v0.17.2 — 2026-05-15
 
 Patch release.

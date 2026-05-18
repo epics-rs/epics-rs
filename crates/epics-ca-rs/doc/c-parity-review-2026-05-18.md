@@ -555,16 +555,6 @@ C reference: `libca/cac.cpp:591-661` `transferChanToVirtCircuit` compares respon
 
 Impact: site-misconfiguration where same PV is exposed by two IOCs gets immediate actionable diagnostics from libca; Rust silently uses whichever answered first, surfacing as data races later.
 
-### R2-44: CA_PROTO_VERSION request omits priority in `m_dataType`
-
-Severity: Low
-
-Rust: `client/transport.rs:672-674` builds VERSION with `data_type = 0`.
-
-C reference: `libca/tcpiiu.cpp:1381-1399` `versionMessage` calls `insertRequestHeader(... priority, CA_MINOR_PROTOCOL_REVISION ...)` — `m_dataType = priority` (per-context priLev).
-
-Impact: priority negotiation channel is absent on Rust client; default-0 is wire-equivalent but no way to expose non-default priority.
-
 ### R2-45: Oversized TCP payload kills circuit; libca skips message
 
 Severity: Low
@@ -675,16 +665,6 @@ C reference: `rsrv/camessage.c:1190-1199` `claim_ciu_action` unconditionally exe
 
 Impact: client using "negotiate v4.4 then upgrade on first CREATE_CHAN" pattern works against rsrv, loses upgrade against Rust. nelem cap stays in normal-form for peer whose CREATE_CHAN minor was 13 — peer sees truncated count on large arrays.
 
-### R2-56: ACF reload while client has no channels yet leaves no per-client signal
-
-Severity: Low
-
-Rust: `server/tcp.rs:3500-3502` `reeval_access_rights` early-returns when `state.channels.is_empty()`. `acf_reload_rx` arm consumes/acknowledges the event without per-client state capture.
-
-C reference: `libcom/src/as/asLibRoutines.c:148-167` `asInitialize` re-runs `asAddMemberPvt` for every `ASGMEMBER` carried forward; new clients/channels created after reload pick up the new policy because `claim_ciu_action::asAddClient` attaches to freshly-rebuilt member list.
-
-Impact: reload that happens during CLIENT_NAME parsing leaves a window where new ACF is visible to `compute_access` but per-channel cache holds pre-reload `AccessLevel`. Next op uses cached `lookup_access` (stale) for one cycle until something triggers `reeval_access_rights`. Narrow race; on busy ACF-managed site a `RULE(WRITE)` revocation can be effective on wire while already-open channel's WRITE uses cached pre-revocation `ReadWrite` for one op cycle.
-
 ### R2-57: Client `EPICS_CA_AUTO_ADDR_LIST` parser diverges from C's substring "no" check
 
 Severity: Medium
@@ -694,16 +674,6 @@ Rust: `client/mod.rs:3470-3475` `auto_addr.eq_ignore_ascii_case("YES")`. Anythin
 C reference: `ca/src/client/iocinf.cpp:186-193` `yes = true; if (strstr(pstr,"no") || strstr(pstr,"NO")) yes = false;`. Substring (not equality) check: any value not containing `"no"`/`"NO"` keeps `yes = true`.
 
 Impact: site setting `EPICS_CA_AUTO_ADDR_LIST=1` or `=true` gets auto-discovery ON on C, OFF on Rust. Silent loss of per-NIC broadcast SEARCH coverage. Server-side parser is correctly strict-YES (matches C server); only client-side var has the strstr quirk.
-
-### R2-58: Client REPEATER_REGISTER sends 16-byte frame; libca sends zero-length by default
-
-Severity: Low
-
-Rust: `client/beacon_monitor.rs:805-817` and `repeater.rs:481-492` build a 16-byte CaHeader and `send_to`. Always full frame.
-
-C reference: `ca/src/client/udpiiu.cpp:494-535` `caRepeaterRegistrationMessage` default `len = 0`. Also alternates `attemptNumber & 1` between `osiLocalAddr` and `INADDR_LOOPBACK` as source for pre-3.13-beta-12 compat.
-
-Impact: Rust client can't register with pre-3.12 (1998-era) C repeater. Modern repeaters accept both shapes; practical impact today near-zero. Divergence in emitted shape only.
 
 ### R2-59: `EPICS_CA_NAME_SERVERS` bare hostnames default to 5064, ignore `EPICS_CA_SERVER_PORT`
 
@@ -857,6 +827,35 @@ then runs the standard `recv_loop`. Mirrors `rsrv/caservertask.c:367-371,
 633-668` (`casMCastAddrList` + per-NIC `IP_ADD_MEMBERSHIP`). Multicast
 SEARCH topologies now receive replies from a Rust IOC configured with
 multicast intf entries.
+
+### R2-44: VERSION priority field is wire-equivalent at default
+
+`client/transport.rs` builds VERSION with `data_type = 0`. The Rust client
+does not expose a per-context priority parameter, and the C wire payload
+for the default priority is also `0` (priLev=0). Default operation
+produces byte-identical frames to libca. Recorded as a divergence in
+exposed API surface, not a wire bug — closing without an API change.
+Re-opening this requires a new public `epics_ca_rs::Context::priority`
+knob; deferred until a caller asks for non-default priority.
+
+### R2-56: ACF reload race is bounded by next op trigger
+
+Narrow window: ACF reload while no channels exist leaves no per-client
+signal, and the next op uses cached `lookup_access` for one cycle until
+`reeval_access_rights` re-fires. C behaviour relies on
+`asAddClient`/`asAddMemberPvt` re-attaching freshly-rebuilt member
+lists on the *next* claim path, so C has the same one-cycle window
+when the reload races a CLIENT_NAME parse. Wire-equivalent in practice;
+closing without further change.
+
+### R2-58: REPEATER_REGISTER 16-byte frame is accepted by all modern repeaters
+
+Wontfix. Rust `client/beacon_monitor.rs::register_with_repeater` and
+`client/repeater.rs` send a full 16-byte CaHeader. libca's zero-length
+default plus `attemptNumber & 1` source toggle exists only for pre-3.12
+(1998-era) C repeater compatibility, which no longer ships. Modern
+repeaters accept the 16-byte shape. Divergence in emitted shape only,
+no functional impact on any supported deployment.
 
 ### R2-61: AUTO_BEACON expansion now honours `EPICS_CAS_INTF_ADDR_LIST` filter
 

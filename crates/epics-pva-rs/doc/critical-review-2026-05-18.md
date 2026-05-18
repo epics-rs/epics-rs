@@ -1161,33 +1161,49 @@ with reason.
   handle_destroy_request / handle_message / handle_create_channel
   propagate truncated payloads as PvaError::Decode.
 
-### Cleared in the follow-up commit
+### Cleared in the follow-up commits
 
+- **PVA-R1** (LOW, interop) — Wire-level proof that the Rust
+  client puts `record._options.pipeline` into the pvRequest sent
+  to a real pvxs server. `tests/interop_pvxs_mods/pipeline_r1.rs`
+  spawns `softIocPVX` with `PVXS_LOG=pvxs.tcp.setup=DEBUG`,
+  drives a Rust `PvaClient` with `pipeline_size(4)`, then
+  asserts the pvxs server's captured stderr contains the
+  `Monitor INIT pipeline ioid=` line emitted by
+  `pvxs/src/servermon.cpp:587` only when `op->pipeline == true`.
 - **PVA-R11** (MEDIUM) — `server_native/tcp.rs::handle_tcp_search`
   added; dispatched from the `Command::Search` arm. Reuses the
   UDP `parse_search_request` + `build_search_response_proto`
   helpers (now `pub(crate)`). Plumbed `guid` through
   `PvaServerConfig` and added a `pub fn tcp_addr()` accessor on
-  `PvaServer`. Wire-level reproducer:
-  `tests/interop_pvxs_mods/tcp_search_r11.rs::interop_r11_tcp_circuit_search_returns_matching_cid`
-  (no pvxs dep — sends a raw SEARCH on TCP, asserts the
-  SEARCH_RESPONSE cid round-trips).
-- **PVA-R20** (MEDIUM, parser coverage) — Five unit tests in
-  `server_native::tcp::tests::pva_r20_*` exercise the
-  `monitor_pipeline_options` parser through the typed forms
-  (Boolean / Int / String true / Boolean false / queueSize<2).
-  Wire-level interop originating the typed-builder shape from a
-  pvxs CLI still needs a pvxs-linked C++ harness (out of scope);
-  the Rust parser side that pvxs would speak to is verified.
+  `PvaServer`. Two reproducers:
+  - `tests/interop_pvxs_mods/tcp_search_r11.rs::interop_r11_tcp_circuit_search_returns_matching_cid`
+    builds a raw SEARCH frame on TCP and asserts cid round-trip
+    (no pvxs dep — pure-Rust validation of the handler).
+  - `tests/interop_pvxs_mods/tcp_search_r11.rs::interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server`
+    runs the real `pvxget` configured with
+    `EPICS_PVA_NAME_SERVERS=<rust>:port` against a Rust-hosted
+    PV and asserts the value is read end-to-end.
+- **PVA-R20** (MEDIUM) — Parser coverage from five unit tests in
+  `server_native::tcp::tests::pva_r20_*` (typed Bool, typed Int,
+  string `"true"`, typed Bool false, queueSize<2). Wire-level
+  interop added via a C++ harness
+  `tests/interop_pvxs_mods/cpp_helpers/r20_typed_monitor.cpp`
+  built on demand against `~/codes/pvxs/include` + libpvxs; it
+  subscribes with the typed-builder
+  `Context::request().record("pipeline", true)` shape against the
+  Rust server and the test asserts both event delivery and the
+  Rust server's new
+  `debug!("MONITOR INIT pipeline negotiated")` tracing event
+  (captured via a global `tracing_subscriber::fmt` writer). The
+  log assertion is the discriminator: with the parser sabotaged
+  to ignore typed Bool, the helper still receives events (no
+  flow control) but the log line is absent and the test fails
+  — verified by manually flipping the parser branch and re-
+  running.
 
-### Deferred (5 — substantial architectural changes)
+### Deferred (4 — substantial architectural changes)
 
-- **PVA-R1** (LOW, interop assertion only) — Real ACK-withholding
-  assertion for pipeline negotiation. Requires either a pvxs
-  harness or surfacing the per-op pipeline state through a
-  ServerReport. R20 unit tests prove the parser enables the
-  window; R1 would prove the runtime *uses* the window via a
-  timing assertion on the wire.
 - **PVA-R2** (MEDIUM) — `tcp_timeout` plumbing through
   ConnectionPool::get_or_connect + ServerConn::connect + spawned
   heartbeat task. Multi-layer signature change; out of scope for

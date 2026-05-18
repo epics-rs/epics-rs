@@ -1,39 +1,180 @@
-//! PVA-R20: Rust server parses typed bool/integer pipeline option.
+//! PVA-R20 interop: pvxs C++ client builds the *typed* pipeline
+//! pvRequest (`Context::request().record("pipeline", true)`) and
+//! connects to a Rust PVA server hosting one PV. Pre-R20 the
+//! Rust server's `monitor_pipeline_options` parser only matched
+//! the parsed-string form (`record[pipeline=true]`) and silently
+//! disabled flow control whenever a real pvxs program drove the
+//! subscription via the typed builder.
 //!
-//! pvxs `src/clientreq.cpp:85-90` stores the typed-builder shape
-//! (`Context::request().record("pipeline", true)`) as a real
-//! `Bool` / `Int` scalar; pre-R20 the Rust server only accepted
-//! the parsed-string `"true"` form (`record[pipeline=true]`) and
-//! silently disabled flow control for typed pvxs clients.
-//!
-//! This test calls `monitor_pipeline_options` directly with a
-//! `PvField::Scalar(Boolean(true))` to exercise the parser. No
-//! external dep — proves R20 without needing a pvxs-linked C++
-//! helper to originate the typed shape.
+//! The cpp helper (`cpp_helpers/r20_typed_monitor.cpp`) is built
+//! on the fly via `c++` against `~/codes/pvxs/{include,lib}` if
+//! the binary is missing. Test is SKIPped (not failed) when
+//! either the compiler or the pvxs/EPICS-base headers are absent
+//! — that way a CI host without pvxs installed isn't a hard
+//! failure but a host that *has* pvxs runs the real assertion.
 
-use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+use super::interop_helpers::{pick_localhost_port, pvxs_arch, pvxs_lib_dir};
 
-// `monitor_pipeline_options` is `fn` (not `pub`) inside
-// `server_native::tcp`. We can't reach it directly from an
-// integration test. The next-best lever: build a pvRequest value
-// in the typed shape and round-trip it through the Rust server's
-// MONITOR INIT path, then observe the resulting `monitor_window`
-// being `Some(_)` via the server's stats report. The server-info
-// PV (R6 / F6) exposes per-connection op counters but not
-// individual op flags, so we use a side-channel: subscribe with
-// a typed-bool pvRequest, hold the subscription, ask for the next
-// event with a tight timeout. With pipeline negotiated, the
-// server emits the initial-snapshot event and then *stops*
-// awaiting an ACK (the credit window is 2 by default per R20 fix).
-// Without pipeline, the server keeps streaming.
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+fn epics_base_home() -> PathBuf {
+    if let Ok(h) = std::env::var("EPICS_BASE") {
+        return PathBuf::from(h);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join("epics/epics-base")
+}
+
+fn pvxs_home() -> PathBuf {
+    if let Ok(h) = std::env::var("PVXS_HOME") {
+        return PathBuf::from(h);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join("codes/pvxs")
+}
+
+/// Ensure the helper binary exists. If missing, try to compile it
+/// from `cpp_helpers/r20_typed_monitor.cpp`. Returns `Some(path)`
+/// on success, `None` on skip with a SKIP-prefixed stderr line.
+fn build_helper() -> Option<PathBuf> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/interop_pvxs_mods/cpp_helpers/r20_typed_monitor.cpp");
+    if !src.is_file() {
+        eprintln!("SKIP: helper source missing: {src:?}");
+        return None;
+    }
+    let out_dir = std::env::var("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    std::fs::create_dir_all(&out_dir).ok();
+    let out = out_dir.join("r20_typed_monitor");
+    let need_rebuild = !out.is_file()
+        || std::fs::metadata(&src).and_then(|m| m.modified()).ok()
+            > std::fs::metadata(&out).and_then(|m| m.modified()).ok();
+    if !need_rebuild {
+        return Some(out);
+    }
+
+    let pvxs = pvxs_home();
+    let base = epics_base_home();
+    let arch = pvxs_arch();
+    let pvxs_include = pvxs.join("include");
+    let base_include = base.join("include");
+    let base_compiler_include = base.join("include/compiler/clang");
+    let base_os_include = if cfg!(target_os = "macos") {
+        base.join("include/os/Darwin")
+    } else {
+        base.join("include/os/Linux")
+    };
+    let pvxs_lib = pvxs.join("lib").join(arch);
+    let base_lib = base.join("lib").join(arch);
+
+    for p in [&pvxs_include, &base_include, &pvxs_lib, &base_lib] {
+        if !p.exists() {
+            eprintln!("SKIP: required path missing for cpp helper build: {p:?}");
+            return None;
+        }
+    }
+
+    let status = Command::new("c++")
+        .args(["-std=c++17", "-O0", "-g"])
+        .arg(format!("-I{}", pvxs_include.display()))
+        .arg(format!("-I{}", base_include.display()))
+        .arg(format!("-I{}", base_compiler_include.display()))
+        .arg(format!("-I{}", base_os_include.display()))
+        .arg(&src)
+        .arg(format!("-L{}", pvxs_lib.display()))
+        .arg("-lpvxs")
+        .arg(format!("-L{}", base_lib.display()))
+        .arg("-lCom")
+        .arg(format!("-Wl,-rpath,{}", pvxs_lib.display()))
+        .arg(format!("-Wl,-rpath,{}", base_lib.display()))
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        Ok(s) => {
+            eprintln!("SKIP: c++ build of r20 helper failed (exit {s})");
+            None
+        }
+        Err(e) => {
+            eprintln!("SKIP: c++ compiler unavailable: {e}");
+            None
+        }
+    }
+}
+
+/// Shared capture buffer for tracing output emitted by the Rust
+/// server during this test. We install a process-global subscriber
+/// once that writes formatted events into this buffer; the test
+/// snapshots its length before and after the helper run so other
+/// concurrent tests in the same binary don't pollute the slice we
+/// inspect.
+fn capture_buffer() -> Arc<Mutex<Vec<u8>>> {
+    static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone()
+}
+
+#[derive(Clone)]
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn install_tracing_once() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        use tracing_subscriber::{EnvFilter, fmt};
+        let writer = CaptureWriter(capture_buffer());
+        let _ = fmt()
+            .with_env_filter(
+                EnvFilter::try_new("epics_pva_rs=debug")
+                    .unwrap_or_else(|_| EnvFilter::new("debug")),
+            )
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_target(true)
+            .try_init();
+    });
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interop_r20_typed_bool_pipeline_round_trip_through_rust_server() {
-    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
+    use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
     use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Spin up a Rust server with one PV.
+    let Some(helper) = build_helper() else {
+        return;
+    };
+
+    install_tracing_once();
+    // Snapshot the buffer length so we only inspect output emitted
+    // during this test.
+    let buf = capture_buffer();
+    let start_len = buf.lock().unwrap().len();
+
+    // Spin up a Rust server hosting a counter PV and ticking the
+    // value every 100 ms so the subscriber sees a stream, not a
+    // single snapshot.
     let pv = SharedPV::new();
     pv.open(
         FieldDesc::Structure {
@@ -49,33 +190,108 @@ async fn interop_r20_typed_bool_pipeline_round_trip_through_rust_server() {
         }),
     );
     let source = SharedSource::new();
-    source.add("R20:PV", pv);
-    let server = PvaServer::isolated(Arc::new(source)).expect("server start");
+    source.add("R20:PV", pv.clone());
+    let source_arc = Arc::new(source);
 
-    // The R20 surface that needs proving: when the server's
-    // pipeline-parser sees a typed Bool(true), it enables the
-    // window. We *prove* the parser by inspecting the runtime
-    // behaviour with a non-typed monitor — the Rust client always
-    // uses the string form, so its behaviour through the same
-    // server doesn't distinguish the bug from the fix. Instead,
-    // exercise the parser as a unit by feeding a hand-built
-    // pvRequest value, then check that the corresponding op
-    // state has a `monitor_window`.
-    //
-    // The pipeline-parser is private — we proved its behaviour
-    // via the existing PVA-R20 unit tests in
-    // `server_native::tcp::tests` (search for
-    // `monitor_pipeline_options`). This integration scaffold
-    // documents the contract and provides a reproducer skeleton
-    // for any future regression that surfaces at the wire level
-    // (e.g. if pvxs ships a new typed scalar variant we haven't
-    // added to the parser yet).
-    eprintln!(
-        "PVA-R20: typed-bool parser behaviour covered by \
-         server_native::tcp unit tests; wire-level reproducer \
-         requires either a pvxs harness or surfacing the parser \
-         result through ServerReport (follow-up)."
+    // Bind the server to a known TCP port — the helper's nameServer
+    // entry needs an exact host:port.
+    let _bind_port = pick_localhost_port();
+    let server = PvaServer::isolated(source_arc).expect("server start");
+    let addr = server.tcp_addr();
+
+    // Ticker: post a new value every 100 ms until the helper exits.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_t = stop.clone();
+    let pv_t = pv.clone();
+    let ticker = tokio::spawn(async move {
+        let mut i = 1i32;
+        while !stop_t.load(Ordering::Relaxed) {
+            let val = PvField::Structure(PvStructure {
+                struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                fields: vec![(
+                    "value".to_string(),
+                    PvField::Scalar(ScalarValue::Double(i as f64)),
+                )],
+            });
+            let _ = pv_t.try_post(val);
+            i += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // Spawn the helper as a subprocess. Wait inside spawn_blocking
+    // so the synchronous .wait_with_output() doesn't park the
+    // runtime worker.
+    let helper_str = helper.display().to_string();
+    let server_str = format!("{}:{}", addr.ip(), addr.port());
+    let env_key = if cfg!(target_os = "macos") {
+        "DYLD_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
+    let lib_dir = pvxs_lib_dir();
+
+    let output = tokio::task::spawn_blocking(move || {
+        let child = Command::new(&helper_str)
+            .arg("--server")
+            .arg(&server_str)
+            .arg("--pv")
+            .arg("R20:PV")
+            .arg("--events")
+            .arg("3")
+            .arg("--timeout")
+            .arg("6")
+            .env(env_key, lib_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.wait_with_output()
+    })
+    .await
+    .expect("join helper");
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP: failed to run r20 helper: {e}");
+            stop.store(true, Ordering::Relaxed);
+            let _ = ticker.await;
+            server.stop();
+            return;
+        }
+    };
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = ticker.await;
+    server.stop();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "PVA-R20: pvxs typed-pipeline client did not receive the expected \
+         events from the Rust server. Helper exit={:?}\n\
+         stdout: {stdout}\nstderr: {stderr}",
+        output.status,
     );
 
-    server.stop();
+    // Discriminating assertion: the Rust server emits a debug event
+    // `MONITOR INIT pipeline negotiated` only when the parser
+    // recognises the typed-Bool pipeline option. Pre-R20 the parser
+    // returned None for typed-Bool, the event never fired, the server
+    // still echoed events back to the client (no flow control), so
+    // the helper would still exit 0 — only this log assertion
+    // distinguishes a fixed parser from a regressed one.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let captured = {
+        let g = buf.lock().unwrap();
+        String::from_utf8_lossy(&g[start_len..]).to_string()
+    };
+    assert!(
+        captured.contains("MONITOR INIT pipeline negotiated"),
+        "PVA-R20 regression: Rust server did not log \
+         `MONITOR INIT pipeline negotiated` for the typed-Bool pipeline \
+         pvRequest. monitor_pipeline_options either failed to match the \
+         typed shape or short-circuited before installing the window. \
+         Captured server output during the test window:\n{captured}",
+    );
 }

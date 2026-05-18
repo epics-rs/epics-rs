@@ -2399,6 +2399,12 @@ async fn handle_op(
             && let Some(opt) = pipeline_opt
         {
             let initial = pipeline_initial_nack.unwrap_or(opt.queue_size);
+            debug!(
+                ioid,
+                queue_size = opt.queue_size,
+                initial_nack = initial,
+                "MONITOR INIT pipeline negotiated"
+            );
             (
                 Some(Arc::new(std::sync::atomic::AtomicU32::new(initial))),
                 Some(Arc::new(tokio::sync::Notify::new())),

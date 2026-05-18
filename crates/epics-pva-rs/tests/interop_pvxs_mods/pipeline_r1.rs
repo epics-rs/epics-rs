@@ -1,101 +1,144 @@
-//! PVA-R1 interop: Rust `pvmonitor` with pipeline against
-//! `softIocPVA` (pvxs).
+//! PVA-R1 interop: Rust client (pipeline_size > 0) → pvxs
+//! `softIocPVX` server, asserting that pvxs sees the pipeline
+//! option on the wire.
 //!
-//! Verifies that a Rust client configured with
-//! `PvaClientBuilder::pipeline_size(N)` actually negotiates the
-//! pipeline protocol on the wire (per the PVA-R1 fix:
-//! `record._options.pipeline = "true"` in pvRequest + INIT subcmd
-//! bit `0x80` + initial nack trailer). Pre-fix Rust set the option
-//! on the context but never sent it; pvxs silently ran the monitor
-//! in non-pipelined mode.
+//! Pre-R1 the Rust client honoured `PvaClientBuilder::pipeline_size`
+//! locally but never put `record._options.pipeline` into the
+//! pvRequest, so pvxs ran the monitor in non-pipelined mode and
+//! we lost flow control. pvxs's `servermon.cpp:587` logs
+//! `Client … Monitor INIT pipeline ioid=…` at DEBUG level (channel
+//! `pvxs.tcp.setup`) iff `op->pipeline` is true after parsing
+//! `record._options.pipeline`. We use that log line as the
+//! authoritative wire-level signal.
 //!
-//! Approach: spawn `softIocPVA` with a counter PV that ticks every
-//! 200 ms. Subscribe with `pipeline_size = 4`, send no ACKs. Pre-
-//! fix: stream keeps flowing past the 5th event (no flow control).
-//! Post-fix: stream stalls at the initial-credit window (4 events)
-//! until we ACK.
-//!
-//! pvxs source: `src/servermon.cpp:523-552` only enables the credit
-//! window when `record._options.pipeline` parses true.
+//! Skip behaviour: if `softIocPVX` is not present under
+//! `~/codes/pvxs/bin/<arch>/`, the test prints a SKIP line and
+//! returns OK so a CI host without pvxs built doesn't fail.
 
-use super::interop_helpers::{DropChild, SOFT_IOC_PVA, require_tool};
+use super::interop_helpers::{
+    DropChild, SOFT_IOC_PVX, pick_localhost_port, pvxs_command, pvxs_dbd_dir, require_pvxs,
+};
 
-use std::process::{Command, Stdio};
+use std::io::Write;
+use std::process::Stdio;
 use std::time::Duration;
 
-/// Generate a 1-PV softIocPVA db that updates the value every
-/// 200 ms via SCAN field. softIocPVA accepts standard EPICS db
-/// syntax (it reuses dbCore).
-fn counter_db() -> &'static str {
-    "
-record(calc, \"PVA:CNT\") {
-    field(SCAN, \".2 second\")
-    field(CALC, \"A+1\")
-    field(INPA, \"PVA:CNT.VAL NPP NMS\")
-    field(VAL, \"0\")
+const COUNTER_DB: &str = r#"
+record(calc, "R1:CNT") {
+    field(SCAN, ".1 second")
+    field(CALC, "A+1")
+    field(INPA, "R1:CNT.VAL")
+    field(VAL,  "0")
 }
-"
-}
+"#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interop_r1_pipeline_window_enforced_by_pvxs_server() {
-    if !require_tool(SOFT_IOC_PVA) {
+async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
+    let Some(ioc_bin) = require_pvxs(SOFT_IOC_PVX) else {
+        return;
+    };
+    let dbd = pvxs_dbd_dir().join("softIocPVX.dbd");
+    if !dbd.is_file() {
+        eprintln!("SKIP: dbd file missing: {dbd:?}");
         return;
     }
 
-    // Write a temp .db and spawn softIocPVA.
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("counter.db");
-    std::fs::write(&db_path, counter_db()).expect("write db");
+    std::fs::File::create(&db_path)
+        .and_then(|mut f| f.write_all(COUNTER_DB.as_bytes()))
+        .expect("write db");
+    let stderr_path = dir.path().join("ioc.stderr");
+    let stdout_path = dir.path().join("ioc.stdout");
 
-    // softIocPVA defaults to PVA port 5075. We bind to a fixed
-    // ephemeral port via env so multiple test instances don't
-    // collide. Note: pvxs picks up `EPICS_PVAS_SERVER_PORT`
-    // (per PVA-R15 the Rust client also accepts it as fallback).
-    let port = {
-        use std::net::TcpListener;
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
+    let port = pick_localhost_port();
 
-    let child = Command::new(SOFT_IOC_PVA)
+    let mut cmd = pvxs_command(&ioc_bin);
+    cmd.arg("-D")
+        .arg(&dbd)
         .arg("-d")
         .arg(&db_path)
+        .arg("-S")
+        // PVA port — what we want to control.
         .env("EPICS_PVAS_SERVER_PORT", port.to_string())
-        .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_PVA_ADDR_LIST", format!("127.0.0.1:{port}"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let Ok(child) = child else {
-        eprintln!("SKIP: failed to spawn softIocPVA");
-        return;
+        .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+        // Stop softIocPVX from also fighting for CA port 5064 on
+        // hosts where another IOC owns it.
+        .env("EPICS_CAS_SERVER_PORT", "0")
+        .env("EPICS_CA_SERVER_PORT", "0")
+        // The signal we depend on.
+        .env("PVXS_LOG", "pvxs.tcp.setup=DEBUG")
+        .stdout(Stdio::from(
+            std::fs::File::create(&stdout_path).expect("stdout"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("stderr"),
+        ));
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: failed to spawn softIocPVX: {e}");
+            return;
+        }
     };
     let _ioc = DropChild { child };
-    // Give the IOC a moment to bind.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait until the IOC's PVA port is listening (poll up to 5s).
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut bound = false;
+    for _ in 0..50 {
+        if std::net::TcpStream::connect_timeout(&server_addr, Duration::from_millis(100)).is_ok() {
+            bound = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !bound {
+        eprintln!("SKIP: softIocPVX did not bind {server_addr} within 5s");
+        return;
+    }
 
-    // Build a Rust client targeting that softIocPVA.
-    let _client = epics_pva_rs::client_native::PvaClient::builder()
+    // Build a Rust client pinned to the IOC and ask for pipeline.
+    let client = epics_pva_rs::client_native::PvaClient::builder()
         .timeout(Duration::from_secs(5))
         .pipeline_size(4)
+        .server_addr(server_addr)
         .build();
 
-    // TODO(PVA-R1 interop): subscribe, withhold ACKs, time the
-    // gap between event 4 and event 5. Post-fix the gap should
-    // be > the producer interval (200 ms) because pvxs paused
-    // emission after 4 events; pre-fix the gap should match the
-    // producer interval because pvxs never enabled flow control.
-    //
-    // The full assertion needs a pvxs-side window inspector or
-    // a timing-based heuristic. Left as TODO so this commit
-    // ships the scaffolding without the timing-flake risk; the
-    // skeleton already validates compile + binary discovery.
-    eprintln!(
-        "TODO: PVA-R1 interop — scaffolding compiled, ACK-withholding \
-         assertion deferred (needs pvxs window observer)"
+    let events = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let events_cb = events.clone();
+    let handle = client
+        .pvmonitor_handle("R1:CNT", move |_desc, _v| {
+            events_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await
+        .expect("subscribe");
+
+    // Wait for the negotiation + at least 2 events (which proves the
+    // INIT round-trip completed). 3s max budget — SCAN is 0.1s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline
+        && events.load(std::sync::atomic::Ordering::Relaxed) < 2
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        events.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+        "Rust client did not receive 2 events within 3s — IOC alive but monitor stuck"
+    );
+    handle.stop();
+
+    // Give the pvxs server a moment to flush its log buffer.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let log_text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    // pvxs logs `Monitor INIT pipeline ioid=N` (with " pipeline") iff
+    // `op->pipeline == true` (servermon.cpp:587).
+    assert!(
+        log_text.contains("Monitor INIT pipeline ioid="),
+        "PVA-R1 regression: pvxs server did not log `Monitor INIT pipeline …`. \
+         The pipeline option was either absent from pvRequest or pvxs failed \
+         to parse it as true. Full pvxs stderr:\n{log_text}",
     );
 }

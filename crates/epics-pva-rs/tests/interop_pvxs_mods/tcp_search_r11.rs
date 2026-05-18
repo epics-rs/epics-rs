@@ -197,3 +197,89 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
     server.stop();
     let _ = _seq;
 }
+
+/// Second R11 case: a real pvxs `pvxget` configured with
+/// `EPICS_PVA_NAME_SERVERS=<rust>:port` should resolve the PV and
+/// fetch its value. This proves the Rust server's TCP SEARCH
+/// handler interoperates with the actual pvxs client flow (not
+/// just a hand-built frame). Pre-R11 the client would never get
+/// a SEARCH_RESPONSE on the TCP circuit and would time out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {
+    use super::interop_helpers::{PVXGET, pvxs_command, require_pvxs};
+    use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let Some(pvxget) = require_pvxs(PVXGET) else {
+        return;
+    };
+
+    // Rust server hosting a PV with a known value.
+    let pv = SharedPV::new();
+    pv.open(
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".to_string(),
+            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+        },
+        PvField::Structure(PvStructure {
+            struct_id: "epics:nt/NTScalar:1.0".to_string(),
+            fields: vec![(
+                "value".to_string(),
+                PvField::Scalar(ScalarValue::Double(42.5)),
+            )],
+        }),
+    );
+    let source = SharedSource::new();
+    source.add("R11:NS:PV", pv);
+    let server = PvaServer::isolated(Arc::new(source)).expect("server start");
+    let addr = server.tcp_addr();
+    let server_str = format!("127.0.0.1:{}", addr.port());
+
+    let output = tokio::task::spawn_blocking({
+        let server_str = server_str.clone();
+        move || {
+            pvxs_command(&pvxget)
+                .arg("-w")
+                .arg("3")
+                .arg("R11:NS:PV")
+                .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
+                .env("EPICS_PVA_ADDR_LIST", "")
+                .env("EPICS_PVA_NAME_SERVERS", &server_str)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+        }
+    })
+    .await
+    .expect("join pvxget");
+    server.stop();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP: failed to spawn pvxget: {e}");
+            return;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "pvxget exited non-zero — Rust server TCP SEARCH did not resolve \
+         R11:NS:PV via EPICS_PVA_NAME_SERVERS={server_str}.\n\
+         stdout: {stdout}\nstderr: {stderr}",
+    );
+    assert!(
+        stdout.contains("value double = 42.5"),
+        "pvxget output did not contain expected value 42.5.\n\
+         stdout: {stdout}\nstderr: {stderr}",
+    );
+
+    // Brief breathing room so background TCP teardown completes
+    // before the test process exits and trips the bind-port check
+    // in the next test (cargo serialises within-binary tests).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}

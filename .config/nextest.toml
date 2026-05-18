@@ -38,6 +38,42 @@ fail-fast = true
 # longer is worth flagging. Increase per-suite via overrides if you
 # really need it.
 slow-timeout = { period = "30s", terminate-after = 4 }
+# Opt-in suites: heavy interop matrix + wire-golden hex comparisons
+# are gated out of the default run. Either spawn external C tools
+# (softIoc / pvget / pvput) needing an EPICS install on PATH, or
+# add a noticeable runtime for "did the protocol bytes change?"
+# checks the default dev loop doesn't need. Run with
+# `cargo nextest run --profile interop`, or `--profile ci` for the
+# whole matrix. New suites pick up the gate by file-name convention.
+default-filter = """
+  not (
+    binary(interop_c_client_rust_ioc) |
+    binary(interop_rust_client_c_ioc) |
+    binary(differential_libca) |
+    binary(stress_load) |
+    binary(parity_interop) |
+    binary(wire_golden_pvxs) |
+    binary(wire_golden_ext) |
+    binary(interop_pvxs)
+  )
+"""
+
+# Opt-in profile for the gated interop / wire-golden suites. Inherits
+# the per-binary parallelism caps below (test-groups apply across
+# profiles), but flips the default-filter so only the gated suites
+# run. Use `cargo nextest run --profile interop`.
+[profile.interop]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 4 }
+default-filter = """
+  binary(interop_c_client_rust_ioc) |
+  binary(interop_rust_client_c_ioc) |
+  binary(differential_libca) |
+  binary(parity_interop) |
+  binary(wire_golden_pvxs) |
+  binary(wire_golden_ext) |
+  binary(interop_pvxs)
+"""
 
 # CI profile: friendlier output + retries for the genuinely flaky
 # integration suites. Use via `cargo nextest run --profile ci`.

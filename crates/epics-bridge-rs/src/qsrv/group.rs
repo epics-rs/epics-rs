@@ -122,6 +122,37 @@ pub fn get_nested_field<'a>(pv: &'a PvStructure, path: &str) -> Option<Cow<'a, P
     None
 }
 
+/// BR-R25: place a member's resolved value into the group structure.
+///
+/// pvxs allows a `+type:"meta"` member with an empty key (`""`) to
+/// merge its `alarm` / `timeStamp` sub-fields into the *root* of the
+/// group structure (test/ntenum.db:6). The earlier Rust path routed
+/// every member through `set_nested_field`, which silently no-oped on
+/// empty paths and dropped the root meta entirely. This helper handles
+/// the empty-path Meta case by flattening the meta sub-structure into
+/// the root `pv` before falling through to the normal nested-path
+/// setter for every other shape.
+pub fn set_member_field(pv: &mut PvStructure, member: &GroupMember, value: PvField) {
+    use crate::qsrv::FieldMapping;
+
+    if member.field_name.is_empty() && member.mapping == FieldMapping::Meta {
+        // Meta builds `{alarm, timeStamp}` — merge each sub-leaf onto
+        // the root, overwriting if a previous member already placed
+        // a field of the same name.
+        if let PvField::Structure(meta) = value {
+            for (name, sub) in meta.fields {
+                if let Some(pos) = pv.fields.iter().position(|(n, _)| n == &name) {
+                    pv.fields[pos].1 = sub;
+                } else {
+                    pv.fields.push((name, sub));
+                }
+            }
+        }
+        return;
+    }
+    set_nested_field(pv, &member.field_name, value);
+}
+
 /// Set a value at a field path within a PvStructure.
 /// Creates intermediate structures as needed. Supports `[N]` notation.
 pub fn set_nested_field(pv: &mut PvStructure, path: &str, value: PvField) {
@@ -185,6 +216,35 @@ fn get_or_create_struct_field<'a>(pv: &'a mut PvStructure, name: &str) -> &'a mu
             unreachable!()
         }
     }
+}
+
+/// BR-R25 counterpart of [`set_member_field`] for the descriptor
+/// builder. An empty-path Meta member flattens its `{alarm,
+/// timeStamp}` sub-descriptors onto the group root.
+pub fn set_member_field_desc(
+    fields: &mut Vec<(String, FieldDesc)>,
+    member: &GroupMember,
+    leaf: FieldDesc,
+) {
+    use crate::qsrv::FieldMapping;
+
+    if member.field_name.is_empty() && member.mapping == FieldMapping::Meta {
+        if let FieldDesc::Structure {
+            fields: meta_fields,
+            ..
+        } = leaf
+        {
+            for (name, sub) in meta_fields {
+                if let Some(pos) = fields.iter().position(|(n, _)| n == &name) {
+                    fields[pos].1 = sub;
+                } else {
+                    fields.push((name, sub));
+                }
+            }
+        }
+        return;
+    }
+    set_nested_field_desc(fields, &member.field_name, leaf);
 }
 
 /// Insert a nested FieldDesc at a field path (supports `[N]` notation).
@@ -367,7 +427,7 @@ impl GroupChannel {
                     continue;
                 }
                 let field = self.read_member_locked(member, &guard_map)?;
-                set_nested_field(&mut pv, &member.field_name, field);
+                set_member_field(&mut pv, member, field);
             }
         } else {
             for member in &self.def.members {
@@ -376,7 +436,7 @@ impl GroupChannel {
                     continue;
                 }
                 let field = self.read_member(member).await?;
-                set_nested_field(&mut pv, &member.field_name, field);
+                set_member_field(&mut pv, member, field);
             }
         }
 
@@ -878,9 +938,9 @@ impl super::provider::Channel for GroupChannel {
             }
 
             // Place the descriptor at its (possibly nested) path.
-            // The read side uses set_nested_field — introspection must
+            // The read side uses set_member_field — introspection must
             // emit the same shape so clients see consistent type info.
-            set_nested_field_desc(&mut fields, &member.field_name, desc);
+            set_member_field_desc(&mut fields, member, desc);
         }
 
         Ok(FieldDesc::Structure {

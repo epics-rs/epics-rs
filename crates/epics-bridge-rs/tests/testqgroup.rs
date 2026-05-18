@@ -215,6 +215,58 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     );
 }
 
+/// BR-R25: a group root meta member `""` flattens its meta sub-fields
+/// (`alarm`, `timeStamp`) into the group root, matching pvxs
+/// (test/ntenum.db:6, test/testqgroup.cpp:168). The earlier path
+/// silently no-oped on the empty member-path, dropping root meta.
+#[tokio::test]
+async fn group_root_meta_member_flattens_into_root() {
+    const ROOT_META_JSON: &str = r#"{
+        "TEST:rootmeta": {
+            "+id": "epics:nt/NTEnum:1.0",
+            "": { "+channel": "TEST:val.VAL", "+type": "meta" },
+            "value": { "+channel": "TEST:val.VAL", "+type": "plain" }
+        }
+    }"#;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:val", Box::new(AiRecord::new(7.5)))
+        .await
+        .unwrap();
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(ROOT_META_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:rootmeta")
+        .cloned()
+        .expect("registered");
+
+    let ch = GroupChannel::new(db, def);
+    let result = ch.get(&empty_request()).await.expect("get");
+
+    let names: Vec<&str> = result.fields.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"value"),
+        "root must carry the non-meta member; got {names:?}"
+    );
+    assert!(
+        names.contains(&"alarm"),
+        "root meta must flatten `alarm` onto group root; got {names:?}"
+    );
+    assert!(
+        names.contains(&"timeStamp"),
+        "root meta must flatten `timeStamp` onto group root; got {names:?}"
+    );
+    // Root must NOT carry an empty-name sub-structure (the previous
+    // silent no-op path would have produced no meta at all; the
+    // accidental-merge path would risk creating a `""` child).
+    assert!(
+        !names.contains(&""),
+        "root must not carry an empty-name sub-field; got {names:?}"
+    );
+}
+
 /// Guard: dbLoadGroup → processGroups → groups() exposes the parsed
 /// definition with the expected member roster.
 #[tokio::test]

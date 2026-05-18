@@ -29,9 +29,9 @@
 ## Cleared (this round, 2026-05-19)
 
 The following findings have been addressed and are no longer open;
-they are kept in `## Findings` below for historical context, marked
-with a `Status:` line at the top of each. Every cleared item ships
-with a regression test referenced in the commit message.
+they are kept in `## Findings` below for historical context. Every
+cleared item ships with a regression test referenced in the commit
+message.
 
 - BR-R1 (commit 4068559) — QSRV native PVA path preserves client identity (channel cache removed; `_checked` overrides thread `ctx.account`/`ctx.host`).
 - BR-R2 (commit 399d81c) — single-record channels honor `record.FIELD`; field DBF type drives DBR/NT shape.
@@ -47,14 +47,16 @@ with a regression test referenced in the commit message.
 - BR-R30 (commit 9513a56) — group members without `+putorder` are non-writable (pvxs sentinel).
 - BR-R31 (commit 0eb62a8) — group PUT rejects link-class field targets before any write fires.
 - BR-R32 (commit a1e8bb3) — ACF CALC-gated rule disable surfaces a `WARN` at parse time (still fails closed; loud divergence).
+- BR-R35 (commit 8e898b3) — `Snapshot` honors `info(Q:time:tag, "nsec:lsb:N")`; low N nanosecond bits split into `timeStamp.userTag`.
 - BR-R36 (commit 21dde24) — single-record monitor uses VALUE|ALARM + separate PROPERTY subscription.
 - BR-R37 (commit 7c87eb1) — RPC with query args requires WRITE access.
 - BR-R38 (commit 5687a6e) — PVA `PROCESS` actually runs the record's processing chain (rejects on group/native PVA PV).
 - BR-R39 (commit 2b9316a) — decoded MONITOR initial event encodes with pvRequest mask, not `BitSet::all_set`.
+- BR-R44 (commit 8e67167) — gateway raw monitor reencodes on byte-order mismatch instead of silently dropping every event.
 
 Remaining open: BR-R4, R6, R7, R8, R10, R11, R12, R13, R14, R15,
-R18, R19, R21, R23, R24, R27, R28, R29, R33, R34, R35, R40, R41,
-R42, R43, R44 (26 findings).
+R18, R19, R21, R23, R24, R27, R28, R29, R33, R34, R40, R41, R42,
+R43 (24 findings).
 
 ## Findings
 

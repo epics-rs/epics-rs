@@ -56,6 +56,12 @@ fn normalise_array_variants(v: &mut PvField) {
                 }
             }
         }
+        PvField::Union { value, .. } => {
+            normalise_array_variants(value);
+        }
+        PvField::Variant(vv) => {
+            normalise_array_variants(&mut vv.value);
+        }
         _ => {}
     }
 }

@@ -175,7 +175,13 @@ pub struct NdDimension {
 pub struct NdAttribute {
     pub name: String,
     pub value: ScalarValue,
+    /// Per pvxs `nt.cpp:240` NTAttribute element layout includes
+    /// a `tags` StringArray between `value` and `descriptor`. Empty
+    /// by default; expose to users that need to populate it.
+    pub tags: Vec<String>,
     pub descriptor: String,
+    pub alarm: NdAlarm,
+    pub time_stamp: NdTimeStamp,
     pub source_type: i32,
     pub source: String,
 }
@@ -207,19 +213,26 @@ pub struct NdCodec {
     pub parameters: Option<VariantValue>,
 }
 
+/// Field order mirrors pvxs `nt.cpp:196-251` `NTNDArray::build()` so the
+/// wire descriptor produced by [`nt_nd_array_desc`] is byte-identical to
+/// what pvxs's `NTNDArray::build()` emits. Pre-fix Rust had `descriptor`
+/// and `display` trailing fields absent from the pvxs schema, and the
+/// remaining fields were reordered, so a strict NTNDArray-aware pvxs
+/// consumer (e.g. an areaDetector plugin doing
+/// `value["uniqueId"].as<int32_t>()`) got a different field position
+/// from what its `nt::NTNDArray::create()` expects.
 #[derive(Debug, Clone)]
 pub struct NtNdArray {
     pub value: NdArrayBuffer,
     pub codec: NdCodec,
     pub compressed_size: i64,
     pub uncompressed_size: i64,
-    pub dimension: Vec<NdDimension>,
     pub unique_id: i32,
     pub data_time_stamp: NdTimeStamp,
-    pub attribute: Vec<NdAttribute>,
-    pub descriptor: String,
     pub alarm: NdAlarm,
     pub time_stamp: NdTimeStamp,
+    pub dimension: Vec<NdDimension>,
+    pub attribute: Vec<NdAttribute>,
 }
 
 // ── Descriptors ─────────────────────────────────────────────────────────
@@ -249,19 +262,6 @@ fn time_t_desc() -> FieldDesc {
     }
 }
 
-fn display_desc() -> FieldDesc {
-    FieldDesc::Structure {
-        struct_id: "display_t".into(),
-        fields: vec![
-            ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ("description".into(), FieldDesc::Scalar(ScalarType::String)),
-            ("units".into(), FieldDesc::Scalar(ScalarType::String)),
-            ("precision".into(), FieldDesc::Scalar(ScalarType::Int)),
-        ],
-    }
-}
-
 fn dimension_desc() -> FieldDesc {
     FieldDesc::StructureArray {
         struct_id: String::new(),
@@ -276,12 +276,17 @@ fn dimension_desc() -> FieldDesc {
 }
 
 fn attribute_desc() -> FieldDesc {
+    // pvxs `nt.cpp:240-249` field order. Pre-fix Rust omitted
+    // `tags`, `alarm`, `timeStamp`.
     FieldDesc::StructureArray {
         struct_id: "epics:nt/NTAttribute:1.0".into(),
         fields: vec![
             ("name".into(), FieldDesc::Scalar(ScalarType::String)),
             ("value".into(), FieldDesc::Variant),
+            ("tags".into(), FieldDesc::ScalarArray(ScalarType::String)),
             ("descriptor".into(), FieldDesc::Scalar(ScalarType::String)),
+            ("alarm".into(), alarm_desc()),
+            ("timeStamp".into(), time_t_desc()),
             ("sourceType".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("source".into(), FieldDesc::Scalar(ScalarType::String)),
         ],
@@ -340,6 +345,7 @@ pub fn value_union_desc() -> FieldDesc {
 }
 
 pub fn nt_nd_array_desc() -> FieldDesc {
+    // Field order mirrors pvxs `nt.cpp:196-251` (`NTNDArray::build`).
     FieldDesc::Structure {
         struct_id: "epics:nt/NTNDArray:1.0".into(),
         fields: vec![
@@ -350,14 +356,12 @@ pub fn nt_nd_array_desc() -> FieldDesc {
                 "uncompressedSize".into(),
                 FieldDesc::Scalar(ScalarType::Long),
             ),
-            ("dimension".into(), dimension_desc()),
             ("uniqueId".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("dataTimeStamp".into(), time_t_desc()),
-            ("attribute".into(), attribute_desc()),
-            ("descriptor".into(), FieldDesc::Scalar(ScalarType::String)),
             ("alarm".into(), alarm_desc()),
             ("timeStamp".into(), time_t_desc()),
-            ("display".into(), display_desc()),
+            ("dimension".into(), dimension_desc()),
+            ("attribute".into(), attribute_desc()),
         ],
     }
 }
@@ -393,27 +397,6 @@ fn time_t_value(t: &NdTimeStamp) -> PvField {
         "userTag".into(),
         PvField::Scalar(ScalarValue::Int(t.user_tag)),
     ));
-    PvField::Structure(s)
-}
-
-fn empty_display() -> PvField {
-    let mut s = PvStructure::new("display_t");
-    s.fields
-        .push(("limitLow".into(), PvField::Scalar(ScalarValue::Double(0.0))));
-    s.fields.push((
-        "limitHigh".into(),
-        PvField::Scalar(ScalarValue::Double(0.0)),
-    ));
-    s.fields.push((
-        "description".into(),
-        PvField::Scalar(ScalarValue::String(String::new())),
-    ));
-    s.fields.push((
-        "units".into(),
-        PvField::Scalar(ScalarValue::String(String::new())),
-    ));
-    s.fields
-        .push(("precision".into(), PvField::Scalar(ScalarValue::Int(0))));
     PvField::Structure(s)
 }
 
@@ -462,9 +445,21 @@ fn attribute_value(attrs: &[NdAttribute]) -> PvField {
                     })),
                 ));
                 s.fields.push((
+                    "tags".into(),
+                    PvField::ScalarArray(
+                        a.tags
+                            .iter()
+                            .map(|t| ScalarValue::String(t.clone()))
+                            .collect(),
+                    ),
+                ));
+                s.fields.push((
                     "descriptor".into(),
                     PvField::Scalar(ScalarValue::String(a.descriptor.clone())),
                 ));
+                s.fields.push(("alarm".into(), alarm_value(&a.alarm)));
+                s.fields
+                    .push(("timeStamp".into(), time_t_value(&a.time_stamp)));
                 s.fields.push((
                     "sourceType".into(),
                     PvField::Scalar(ScalarValue::Int(a.source_type)),
@@ -514,10 +509,9 @@ fn codec_value(c: &NdCodec) -> PvField {
 }
 
 /// Convert an [`NtNdArray`] into a `PvField::Structure` shaped according to
-/// [`nt_nd_array_desc`].
+/// [`nt_nd_array_desc`]. Field order mirrors pvxs `nt.cpp:196-251`.
 pub fn nt_nd_array_value(nt: &NtNdArray) -> PvField {
     let mut s = PvStructure::new("epics:nt/NTNDArray:1.0");
-    let value_desc = nt.value.variant_field_desc();
     let buffer_clone = nt.value.clone();
     let union = PvField::Union {
         selector: nt.value.selector(),
@@ -534,25 +528,19 @@ pub fn nt_nd_array_value(nt: &NtNdArray) -> PvField {
         "uncompressedSize".into(),
         PvField::Scalar(ScalarValue::Long(nt.uncompressed_size)),
     ));
-    s.fields
-        .push(("dimension".into(), dimension_value(&nt.dimension)));
     s.fields.push((
         "uniqueId".into(),
         PvField::Scalar(ScalarValue::Int(nt.unique_id)),
     ));
     s.fields
         .push(("dataTimeStamp".into(), time_t_value(&nt.data_time_stamp)));
-    s.fields
-        .push(("attribute".into(), attribute_value(&nt.attribute)));
-    s.fields.push((
-        "descriptor".into(),
-        PvField::Scalar(ScalarValue::String(nt.descriptor.clone())),
-    ));
     s.fields.push(("alarm".into(), alarm_value(&nt.alarm)));
     s.fields
         .push(("timeStamp".into(), time_t_value(&nt.time_stamp)));
-    s.fields.push(("display".into(), empty_display()));
-    let _ = value_desc;
+    s.fields
+        .push(("dimension".into(), dimension_value(&nt.dimension)));
+    s.fields
+        .push(("attribute".into(), attribute_value(&nt.attribute)));
     PvField::Structure(s)
 }
 
@@ -566,10 +554,26 @@ mod tests {
         match &d {
             FieldDesc::Structure { struct_id, fields } => {
                 assert_eq!(struct_id, "epics:nt/NTNDArray:1.0");
-                assert_eq!(fields.len(), 12);
-                assert_eq!(fields[0].0, "value");
-                assert_eq!(fields[1].0, "codec");
-                assert_eq!(fields[7].0, "attribute");
+                // pvxs nt.cpp:196-251 produces exactly 10 top-level
+                // fields. The earlier `12` reflected the pre-fix
+                // Rust shape that included `descriptor` + `display`.
+                assert_eq!(fields.len(), 10);
+                let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(
+                    names,
+                    vec![
+                        "value",
+                        "codec",
+                        "compressedSize",
+                        "uncompressedSize",
+                        "uniqueId",
+                        "dataTimeStamp",
+                        "alarm",
+                        "timeStamp",
+                        "dimension",
+                        "attribute",
+                    ]
+                );
             }
             _ => panic!("expected structure"),
         }
@@ -592,10 +596,9 @@ mod tests {
             }],
             unique_id: 1,
             data_time_stamp: NdTimeStamp::default(),
-            attribute: Vec::new(),
-            descriptor: String::new(),
             alarm: NdAlarm::default(),
             time_stamp: NdTimeStamp::default(),
+            attribute: Vec::new(),
         };
         let value = nt_nd_array_value(&nt);
         let desc = nt_nd_array_desc();

@@ -155,6 +155,17 @@ async fn interop_complex_types_pvxget_against_rust_server() {
                 "424242",
             ],
         ),
+        (
+            "T:NDARR",
+            &[
+                "struct \"epics:nt/NTNDArray:1.0\"",
+                // Union select via ubyteValue branch + the 4 sample values.
+                "ubyteValue",
+                "uniqueId int32_t = 7",
+                r#"alarm.message string = "NO_ALARM""#,
+                r#"name string = "ColorMode""#,
+            ],
+        ),
     ];
 
     let update_goldens = std::env::var_os("UPDATE_GOLDENS").is_some();

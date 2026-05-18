@@ -7,6 +7,10 @@
 
 #![allow(dead_code)]
 
+use epics_pva_rs::nt::nd_array::{
+    NdAlarm, NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray,
+    nt_nd_array_desc, nt_nd_array_value,
+};
 use epics_pva_rs::nt::{NTEnum, NTScalar, NTTable, meta};
 use epics_pva_rs::pvdata::{
     FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, VariantValue,
@@ -191,6 +195,40 @@ fn variant_int() -> (FieldDesc, PvField) {
     (desc, root)
 }
 
+/// NTNDArray with a tiny 4-element ubyte image. Exercises Union
+/// (value branch select), nested Structure (codec, alarm,
+/// timeStamp, dataTimeStamp), StructureArray (dimension), and
+/// StructureArray with inner Variant (attribute).
+fn nt_nd_array_4byte() -> (FieldDesc, PvField) {
+    let nt = NtNdArray {
+        value: NdArrayBuffer::UByte((0u8..4).collect()),
+        codec: NdCodec::default(),
+        compressed_size: 4,
+        uncompressed_size: 4,
+        unique_id: 7,
+        data_time_stamp: NdTimeStamp::default(),
+        alarm: NdAlarm {
+            message: "NO_ALARM".into(),
+            ..NdAlarm::default()
+        },
+        time_stamp: NdTimeStamp::default(),
+        dimension: vec![NdDimension {
+            size: 4,
+            full_size: 4,
+            binning: 1,
+            ..NdDimension::default()
+        }],
+        attribute: vec![NdAttribute {
+            name: "ColorMode".into(),
+            value: ScalarValue::Int(0),
+            descriptor: "Mono".into(),
+            source: "driver".into(),
+            ..NdAttribute::default()
+        }],
+    };
+    (nt_nd_array_desc(), nt_nd_array_value(&nt))
+}
+
 fn nested_struct() -> (FieldDesc, PvField) {
     let desc = FieldDesc::Structure {
         struct_id: "test:nested:1.0".into(),
@@ -321,6 +359,7 @@ pub fn complex_pv_matrix() -> Vec<PvBuild> {
     push("T:NEST", nested_struct());
     push("T:SA", struct_array_points());
     push("T:ANY", variant_int());
+    push("T:NDARR", nt_nd_array_4byte());
 
     out
 }

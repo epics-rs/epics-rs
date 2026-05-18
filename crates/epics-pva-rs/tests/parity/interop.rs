@@ -440,19 +440,19 @@ async fn pvxs_pvxget_to_rust_server_ntndarray() {
                     ],
                     unique_id: id,
                     data_time_stamp: NdTimeStamp::default(),
+                    alarm: NdAlarm {
+                        message: "NO_ALARM".into(),
+                        ..NdAlarm::default()
+                    },
+                    time_stamp: NdTimeStamp::default(),
                     attribute: vec![NdAttribute {
                         name: "ColorMode".into(),
                         value: ScalarValue::Int(0),
                         descriptor: "Mono".into(),
                         source_type: 0,
                         source: "driver".into(),
+                        ..NdAttribute::default()
                     }],
-                    descriptor: String::new(),
-                    alarm: NdAlarm {
-                        message: "NO_ALARM".into(),
-                        ..NdAlarm::default()
-                    },
-                    time_stamp: NdTimeStamp::default(),
                 };
                 Some(nt_nd_array_value(&nt))
             }
@@ -569,16 +569,16 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
                     }],
                     unique_id: 42,
                     data_time_stamp: NdTimeStamp::default(),
+                    alarm: NdAlarm::default(),
+                    time_stamp: NdTimeStamp::default(),
                     attribute: vec![NdAttribute {
                         name: "Test".into(),
                         value: ScalarValue::Double(3.14),
                         descriptor: "test attr".into(),
                         source_type: 1,
                         source: "fake".into(),
+                        ..NdAttribute::default()
                     }],
-                    descriptor: "ramp".into(),
-                    alarm: NdAlarm::default(),
-                    time_stamp: NdTimeStamp::default(),
                 };
                 Some(nt_nd_array_value(&nt))
             }

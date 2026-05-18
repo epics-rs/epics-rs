@@ -148,8 +148,6 @@ fn root_kind_name_desc(d: &FieldDesc) -> &'static str {
 /// `NtPayload::Generic` variant with a recursive `PvValue` tree.
 pub struct QsrvPvStore {
     provider: Arc<BridgeProvider>,
-    /// Per-PV cache of opened channels.
-    channels: RwLock<HashMap<String, Arc<AnyChannel>>>,
     /// Native PVA PVs (e.g., NTNDArray from NDPluginPva).
     pva_pvs: Arc<RwLock<HashMap<String, PvaPvHandle>>>,
 }
@@ -158,7 +156,6 @@ impl QsrvPvStore {
     pub fn new(provider: Arc<BridgeProvider>) -> Self {
         Self {
             provider,
-            channels: RwLock::new(HashMap::new()),
             pva_pvs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -205,17 +202,27 @@ impl QsrvPvStore {
             .insert(pv_name.to_string(), handle);
     }
 
-    async fn channel(&self, name: &str) -> Option<Arc<AnyChannel>> {
-        if let Some(c) = self.channels.read().await.get(name) {
-            return Some(c.clone());
-        }
-        let fresh = self.provider.create_channel(name).await.ok()?;
-        let arc = Arc::new(fresh);
-        self.channels
-            .write()
+    /// Legacy ctx-less channel path — used only by the default
+    /// trait methods (`get_value` / `put_value` / `is_writable` /
+    /// `subscribe`) that lack a `ChannelContext`. Anonymous
+    /// identity, no per-op caching. The `_checked` overrides
+    /// below carry the real `user/host` through to ACF.
+    async fn channel(&self, name: &str) -> Option<AnyChannel> {
+        self.channel_for(name, "", "").await
+    }
+
+    /// BR-R1: create a channel for the supplied identity. No
+    /// `channels` cache — caching an `AnyChannel` keyed by PV
+    /// name only reused one peer's `AccessContext` for every
+    /// subsequent peer and silently bypassed any ACF policy the
+    /// IOC runner installed. Metadata is still cached inside the
+    /// `BridgeProvider` (record_cache) so the per-call cost
+    /// stays low.
+    async fn channel_for(&self, name: &str, user: &str, host: &str) -> Option<AnyChannel> {
+        self.provider
+            .create_channel_for(name, user, host)
             .await
-            .insert(name.to_string(), arc.clone());
-        Some(arc)
+            .ok()
     }
 }
 
@@ -227,6 +234,118 @@ impl QsrvPvStore {
 // (no spvirit_server runtime involvement).
 
 impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
+    // BR-R1 / BR-R4: thread identity through the type-state
+    // `_checked` overrides so every wire op runs against the
+    // ACF policy with the correct user/host.
+
+    fn get_value_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        let pva_pvs = self.pva_pvs.clone();
+        let provider = self.provider.clone();
+        async move {
+            if !checked.allows_read() {
+                return None;
+            }
+            let name = checked.pv_name().to_string();
+            // Native PVA-pushed PVs (NDPluginPva) carry no
+            // per-record ACF — they are always readable.
+            if let Some(handle) = pva_pvs.read().await.get(&name).cloned()
+                && let Some(value) = handle.latest.lock().clone()
+            {
+                return Some(value);
+            }
+            let channel = provider
+                .create_channel_for(&name, &ctx.account, &ctx.host)
+                .await
+                .ok()?;
+            let empty_request = PvStructure::new("");
+            match channel.get(&empty_request).await {
+                Ok(pv) => Some(PvField::Structure(pv)),
+                Err(e) => {
+                    tracing::debug!(
+                        "qsrv get_value_checked({name}) {} from {}@{}: {e}",
+                        ctx.account,
+                        ctx.method,
+                        ctx.host
+                    );
+                    None
+                }
+            }
+        }
+    }
+
+    fn put_value_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        value: PvField,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let provider = self.provider.clone();
+        async move {
+            if !checked.allows_write() {
+                return Err(format!(
+                    "PUT denied by access security: '{}' from {}@{}",
+                    checked.pv_name(),
+                    ctx.account,
+                    ctx.host
+                ));
+            }
+            let name = checked.pv_name().to_string();
+            let pv = match value {
+                PvField::Structure(s) => s,
+                other => return Err(format!("qsrv PUT expects a structure value, got {other}")),
+            };
+            let channel = provider
+                .create_channel_for(&name, &ctx.account, &ctx.host)
+                .await
+                .map_err(|e| e.to_string())?;
+            channel.put(&pv).await.map_err(|e| e.to_string())
+        }
+    }
+
+    fn subscribe_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        let provider = self.provider.clone();
+        let pva_pvs = self.pva_pvs.clone();
+        async move {
+            if !checked.allows_read() {
+                return None;
+            }
+            let name = checked.pv_name().to_string();
+            if let Some(handle) = pva_pvs.read().await.get(&name).cloned() {
+                let (tx, rx) = mpsc::channel::<PvField>(64);
+                {
+                    let mut subs = handle.subscribers.lock();
+                    subs.retain(|s| !s.is_closed());
+                    subs.push(tx);
+                }
+                return Some(rx);
+            }
+            let channel = provider
+                .create_channel_for(&name, &ctx.account, &ctx.host)
+                .await
+                .ok()?;
+            let mut monitor = channel.create_monitor().await.ok()?;
+            monitor.start().await.ok()?;
+            let (tx, rx) = mpsc::channel::<PvField>(64);
+            tokio::spawn(async move {
+                while let Some(snapshot) = monitor.poll().await {
+                    if tx.send(PvField::Structure(snapshot)).await.is_err() {
+                        break;
+                    }
+                }
+                monitor.stop().await;
+            });
+            Some(rx)
+        }
+    }
+
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
@@ -429,7 +548,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // Group channels accept arbitrary member paths, so the
             // check is scoped to `AnyChannel::Single`.
             if !query.is_empty() {
-                if let AnyChannel::Single(_) = channel.as_ref() {
+                if let AnyChannel::Single(_) = &channel {
                     for (field, _) in &query {
                         let top = field.split('.').next().unwrap_or(field);
                         if top != "value" {

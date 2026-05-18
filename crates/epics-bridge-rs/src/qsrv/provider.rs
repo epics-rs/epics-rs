@@ -717,11 +717,21 @@ impl BridgeProvider {
         // Single record (or `record.FIELD`) channel — BR-R2.
         // Cache by the full requested name so field PVs do not
         // poison the record's VAL-shaped cache entry.
-        let (record_name, field) = epics_base_rs::server::database::parse_pv_name(name);
+        //
+        // BR-R40: peel off any pvxs `PV.VAL{...}` channel-filter
+        // JSON suffix before record/field resolution. The filter
+        // chain stays on `BridgeChannel`; resolution and cache
+        // lookup use the record-path-only form.
+        let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
+        let resolution_name = parsed.record_path.as_str();
+        let (record_name, field) = epics_base_rs::server::database::parse_pv_name(resolution_name);
         let field_upper = field.to_ascii_uppercase();
 
-        // Check cache first
-        {
+        // Cache hit only when the requested name has no filter
+        // suffix — a filtered subscription must take a fresh
+        // construction path through `BridgeChannel::new` so the
+        // per-channel filter chain is parsed.
+        if parsed.json_suffix.is_none() {
             let cache = self.record_cache.read().await;
             if let Some(&(nt_type, value_dbf)) = cache.get(name) {
                 return Ok(AnyChannel::Single(
@@ -738,15 +748,22 @@ impl BridgeProvider {
             }
         }
 
-        // Cache miss — introspect and create
-        if self.db.has_name(name).await {
+        // Cache miss — introspect and create. Use the
+        // record-path-only form so `has_name` resolves the
+        // unfiltered record/field; the filter suffix is consumed
+        // by `BridgeChannel::new` itself.
+        if self.db.has_name(resolution_name).await {
             let channel = BridgeChannel::new(self.db.clone(), name).await?;
 
             // Populate cache keyed by the full PV identity so a
             // subsequent `record.FIELD` hit isn't served from a
-            // `record`-only entry (or vice versa).
-            let mut cache = self.record_cache.write().await;
-            cache.insert(name.to_string(), (channel.nt_type(), channel.value_dbf()));
+            // `record`-only entry (or vice versa). Filtered names
+            // are NOT cached — each filtered subscription parses
+            // its own chain.
+            if parsed.json_suffix.is_none() {
+                let mut cache = self.record_cache.write().await;
+                cache.insert(name.to_string(), (channel.nt_type(), channel.value_dbf()));
+            }
 
             return Ok(AnyChannel::Single(channel.with_access(access_ctx)));
         }

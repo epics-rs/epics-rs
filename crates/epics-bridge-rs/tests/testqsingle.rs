@@ -218,6 +218,47 @@ fn channel_name_matches_record() {
     assert_eq!(ch_field.field(), "DESC");
 }
 
+/// BR-R40: a pvxs-compatible channel-filter suffix `PV.VAL{...}`
+/// strips off cleanly during record/field resolution, so the
+/// returned channel name reflects the full filtered identity but
+/// `record_name()` / `field()` resolve to the un-suffixed form.
+/// The filter chain attaches to the monitor subscription (not
+/// covered by this in-process test, but BR-R40's parser tests in
+/// epics-base-rs exercise the chain construction).
+#[tokio::test]
+async fn channel_filter_suffix_strips_before_resolution() {
+    use epics_bridge_rs::qsrv::provider::BridgeProvider;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:filt_ai", Box::new(AiRecord::new(1.5)))
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    let any = provider
+        .create_channel_for(r#"TEST:filt_ai.VAL{"dbnd":{"d":2.0}}"#, "u", "h")
+        .await
+        .expect("filtered channel must resolve through split_channel_name");
+    let ch = match any {
+        epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
+        _ => panic!("expected single-record channel"),
+    };
+
+    // The full client identity is preserved (used by ACF and error msgs).
+    assert_eq!(
+        ch.channel_name(),
+        r#"TEST:filt_ai.VAL{"dbnd":{"d":2.0}}"#
+    );
+    // Record / field resolution uses the un-suffixed form.
+    assert_eq!(ch.record_name(), "TEST:filt_ai");
+    assert_eq!(ch.field(), "VAL");
+
+    // GET works against the resolved record despite the filter suffix.
+    let result = ch.get(&empty_request()).await.expect("get");
+    let value = extract_value(&result).expect("NTScalar.value");
+    assert!(matches!(value, PvField::Scalar(ScalarValue::Double(v)) if (*v - 1.5).abs() < 1e-9));
+}
+
 /// BR-R2: a `record.FIELD` PV name binds to that field, not to VAL.
 /// GET on `test:ai.EGU` returns the EGU string, not the AI VAL double.
 /// PUT through the channel writes EGU, not VAL.

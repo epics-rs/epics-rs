@@ -54,6 +54,11 @@ pub struct BridgeMonitor {
     /// `with_value_mask` when the client provides
     /// `record._options.DBE` in the INIT pvRequest.
     value_mask_override: Option<u16>,
+    /// BR-R40: filter chain to install on the value subscription
+    /// when it's opened. Empty chain = no filtering. Sourced from
+    /// the pvxs-compatible `PV.VAL{...}` JSON suffix on the
+    /// channel name (parsed once by `BridgeChannel::new`).
+    filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     running: bool,
     /// Initial complete snapshot sent on first poll() after start().
     initial_snapshot: Option<PvStructure>,
@@ -73,11 +78,26 @@ impl BridgeMonitor {
             subscription: None,
             property_subscription: None,
             value_mask_override: None,
+            filters: std::sync::Arc::new(
+                epics_base_rs::server::database::filters::FilterChain::new(),
+            ),
             running: false,
             initial_snapshot: None,
             overflow_count: Arc::new(AtomicU64::new(0)),
             access: AccessContext::allow_all(),
         }
+    }
+
+    /// BR-R40: attach the pvxs-compatible channel filter chain
+    /// extracted from the `PV.VAL{...}` JSON suffix. Called by
+    /// `BridgeChannel::create_monitor_with_value_mask` before
+    /// `start()` opens the subscription.
+    pub fn with_filters(
+        mut self,
+        filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
+    ) -> Self {
+        self.filters = filters;
+        self
     }
 
     /// Inject an access control context. The PVA server (or `BridgeChannel`'s
@@ -137,9 +157,23 @@ impl PvaMonitor for BridgeMonitor {
         let value_mask = self
             .value_mask_override
             .unwrap_or_else(|| (EventMask::VALUE | EventMask::ALARM).bits());
-        let sub = DbSubscription::subscribe_with_mask(&self.db, &pv_name, 0, value_mask)
-            .await
-            .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+        // BR-R40: attach the channel-filter chain to the value
+        // subscription. Property subscription stays unfiltered;
+        // pvxs-style filters only gate value-class events.
+        let filters_opt = if self.filters.is_empty() {
+            None
+        } else {
+            Some(self.filters.as_ref())
+        };
+        let sub = DbSubscription::subscribe_with_mask_and_filters(
+            &self.db,
+            &pv_name,
+            0,
+            value_mask,
+            filters_opt,
+        )
+        .await
+        .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
         // BR-R36: pvxs QSRV opens a second subscription with the
         // PROPERTY mask (singlesource.cpp:161) so a PVA monitor

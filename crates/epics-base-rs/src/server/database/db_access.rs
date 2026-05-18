@@ -261,13 +261,35 @@ impl DbSubscription {
         ignore_origin: u64,
         mask: u16,
     ) -> Option<Self> {
+        Self::subscribe_with_mask_and_filters(db, pv_name, ignore_origin, mask, None).await
+    }
+
+    /// BR-R40: subscribe with both a custom event mask and an
+    /// optional pvxs-compatible channel filter chain. The chain's
+    /// filters are attached to the new subscriber so the per-event
+    /// filter framework gates / transforms events at posting time
+    /// (matches pvxs/dbChannel field-scoped filter semantics —
+    /// state is per-subscriber, not subscription-wide).
+    pub async fn subscribe_with_mask_and_filters(
+        db: &PvDatabase,
+        pv_name: &str,
+        ignore_origin: u64,
+        mask: u16,
+        filters: Option<&crate::server::database::filters::FilterChain>,
+    ) -> Option<Self> {
         let (record_name, field) = parse_pv_name(pv_name);
         let field = field.to_ascii_uppercase();
         let rec = db.get_record(record_name).await?;
         let sid = next_sid();
         let rx = {
             let mut instance = rec.write().await;
-            instance.add_subscriber(&field, sid, DbFieldType::Double, mask)?
+            let rx = instance.add_subscriber(&field, sid, DbFieldType::Double, mask)?;
+            if let Some(chain) = filters {
+                for filter in chain.iter() {
+                    instance.attach_filter_to_last_subscriber(&field, filter.clone());
+                }
+            }
+            rx
         };
         Some(Self {
             rx,

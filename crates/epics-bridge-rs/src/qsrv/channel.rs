@@ -208,6 +208,13 @@ pub struct BridgeChannel {
     nt_type: NtType,
     /// The DBF type of the bound field (not always VAL — BR-R2).
     value_dbf: DbFieldType,
+    /// BR-R40: parsed pvxs-compatible channel-filter chain from the
+    /// trailing JSON suffix on the PV name (`PV.VAL{"dbnd":{"d":2.0}}`
+    /// etc.). Empty chain when the name carries no suffix. Attached to
+    /// the monitor subscription so the same subscription's events go
+    /// through the filter framework; GET/PUT see the un-filtered
+    /// record state, matching pvxs's subscription-only filter scope.
+    monitor_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     /// Access control context — checked on every get/put.
     access: super::provider::AccessContext,
 }
@@ -241,6 +248,9 @@ impl BridgeChannel {
             field,
             nt_type,
             value_dbf,
+            monitor_filters: std::sync::Arc::new(
+                epics_base_rs::server::database::filters::FilterChain::new(),
+            ),
             access: super::provider::AccessContext::allow_all(),
         }
     }
@@ -257,8 +267,24 @@ impl BridgeChannel {
     /// Reads the record's field list to determine the bound field's
     /// DBF type, and derives the NormativeType from the field-vs-VAL
     /// shape.
+    ///
+    /// BR-R40: also peels off any trailing pvxs channel-filter JSON
+    /// suffix (e.g. `test:ai.VAL{"dbnd":{"d":0.0}}`) via
+    /// `split_channel_name` before record/field resolution, and
+    /// stashes the parsed filter chain on the channel so the next
+    /// `create_monitor` attaches it to the subscription.
     pub async fn new(db: Arc<PvDatabase>, name: &str) -> BridgeResult<Self> {
-        let (record_name, field) = epics_base_rs::server::database::parse_pv_name(name);
+        let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
+        let monitor_filters = match parsed.json_suffix.as_deref() {
+            Some(json) => std::sync::Arc::new(
+                epics_base_rs::server::database::filters::parse_filter_chain(json),
+            ),
+            None => {
+                std::sync::Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
+            }
+        };
+        let resolution_name = parsed.record_path.as_str();
+        let (record_name, field) = epics_base_rs::server::database::parse_pv_name(resolution_name);
         let field_upper = field.to_ascii_uppercase();
 
         let rec = db
@@ -291,6 +317,7 @@ impl BridgeChannel {
             field: field_upper,
             nt_type,
             value_dbf,
+            monitor_filters,
             access: super::provider::AccessContext::allow_all(),
         })
     }
@@ -475,7 +502,11 @@ impl BridgeChannel {
             self.field.clone(),
             self.nt_type,
         )
-        .with_access(self.access.clone());
+        .with_access(self.access.clone())
+        // BR-R40: thread the channel's parsed filter chain (from the
+        // pvxs `PV.VAL{...}` JSON suffix) into the monitor so its
+        // subscription installs the filters at the dbChannel level.
+        .with_filters(self.monitor_filters.clone());
         if let Some(mask) = value_mask {
             monitor = monitor.with_value_mask(mask);
         }

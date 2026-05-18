@@ -583,6 +583,48 @@ pub async fn run_tcp_listener(
     };
     let _ = tcp_port_tx.send(actual_port);
 
+    // R2-54: subscribe to ASG-field-change notifications and forward
+    // them into the per-client `acf_reload_tx` broadcast. C
+    // `database/src/ioc/as/asDbLib.c:107-110,144` `asSpcAsCallback`
+    // is wired by `asInitCommon` as the per-record `ASG` field
+    // special callback and re-evaluates access rights for every
+    // affected client on `dbPut record.ASG NEW_ASG`. Pre-fix Rust
+    // had no such hook — the *next* op used live `compute_access`
+    // (so enforcement was correct), but the wire ACCESS_RIGHTS the
+    // client saw still reflected the OLD ASG until CLIENT_NAME or
+    // ACF reload triggered a re-eval. UIs gating put-button enable
+    // on the cached level showed stale state. Re-using the existing
+    // `acf_reload_tx` channel is coarser than libca's per-client
+    // dispatch (we re-eval every connection, not just those
+    // referencing the changed record), but the downstream
+    // `oldaccess != access` filter in `reeval_access_rights` keeps
+    // the wire traffic bounded — exactly the same gate C uses.
+    {
+        let mut asg_rx = epics_base_rs::server::access_security::subscribe_asg_changes();
+        let acf_reload_tx_t = acf_reload_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match asg_rx.recv().await {
+                    Ok(()) => {
+                        let _ = acf_reload_tx_t.send(());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Coalesce lagged events into one re-eval; the
+                        // downstream `oldaccess != access` filter
+                        // makes a single re-eval sufficient.
+                        tracing::debug!(
+                            target: "epics_ca_rs::server::tcp",
+                            lagged = n,
+                            "ASG-change notifier lagged — issuing one coalesced re-eval"
+                        );
+                        let _ = acf_reload_tx_t.send(());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     // One accept-loop task per bound interface. When the parent
     // `run_tcp_listener` future is dropped (CaServer shutdown via
     // `tcp_abort.abort()`), this JoinSet is dropped which aborts all
@@ -2469,11 +2511,42 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // audit is off. Use the truncated renderer so a malicious
             // peer can't pin the dispatch task on `format!`-ing a
             // peer-controlled array of millions of elements.
-            let audit_value = if state.audit.is_some() {
+            //
+            // R2-53: TRAPWRITE listeners also need a string form. We
+            // render once when *either* audit or a trap-write listener
+            // is registered; the truncated form is cheap and lets
+            // listeners avoid touching the raw `EpicsValue`.
+            let trap_listeners_active =
+                epics_base_rs::server::access_security::has_trap_write_listeners();
+            let display_value = if state.audit.is_some() || trap_listeners_active {
                 new_value.display_truncated(64)
             } else {
                 String::new()
             };
+
+            // R2-53: BeforeWrite notification. libca emits
+            // `asTrapWriteWithData` *around* every dbChannel_put;
+            // pre-fix Rust had no equivalent and put-loggers migrating
+            // from rsrv saw zero events. `rule_was_trap` is forced to
+            // `true` for the time being — surfacing the matched ACF
+            // rule's `TRAPWRITE` mask through `AccessChecked` is a
+            // follow-up; until then, loggers see every write rather
+            // than missing some. caPutLog-style audit prefers
+            // over-reporting to silent gaps.
+            if trap_listeners_active {
+                epics_base_rs::server::access_security::dispatch_trap_write(
+                    &epics_base_rs::server::access_security::TrapWriteMessage {
+                        op: epics_base_rs::server::access_security::TrapWriteOp::BeforeWrite,
+                        pv_name: &audit_pv,
+                        user: &state.username,
+                        host: &state.hostname,
+                        peer: &state.peer,
+                        value_str: &display_value,
+                        status: None,
+                        rule_was_trap: true,
+                    },
+                );
+            }
 
             let write_result = match &entry.target {
                 ChannelTarget::SimplePv(pv) => {
@@ -2497,8 +2570,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
 
             let audit_result = if write_result.is_ok() { "ok" } else { "fail" };
             state
-                .audit("caput", &audit_pv, &audit_value, audit_result)
+                .audit("caput", &audit_pv, &display_value, audit_result)
                 .await;
+
+            // R2-53: AfterWrite notification with the post-put status.
+            if trap_listeners_active {
+                epics_base_rs::server::access_security::dispatch_trap_write(
+                    &epics_base_rs::server::access_security::TrapWriteMessage {
+                        op: epics_base_rs::server::access_security::TrapWriteOp::AfterWrite,
+                        pv_name: &audit_pv,
+                        user: &state.username,
+                        host: &state.hostname,
+                        peer: &state.peer,
+                        value_str: &display_value,
+                        status: Some(audit_result),
+                        rule_was_trap: true,
+                    },
+                );
+            }
 
             // R2-14: C `write_action` (`rsrv/camessage.c:781-789`):
             // even the deprecated fire-and-forget `CA_PROTO_WRITE`

@@ -573,6 +573,180 @@ impl AccessSecurityConfig {
     }
 }
 
+/// R2-53: TRAPWRITE listener subsystem.
+///
+/// C `libcom/src/as/asLib.h:57-62` defines `asTrapWriteWithData` which
+/// is invoked unconditionally around every `dbChannel_put` in
+/// `rsrv/camessage.c:768-779`. Listeners registered via
+/// `asTrapWriteRegisterListener` receive the put event — this is the
+/// hook `caPutLog` and site put-loggers attach to. Pre-fix Rust
+/// parsed the `TRAPWRITE`/`NOTRAPWRITE` keyword into
+/// `AccessRule::trap` but had no listener subsystem, so the field
+/// was a no-op and every put-logging tool migrating from rsrv saw
+/// silent regression.
+///
+/// Rust API: registrations live in a process-wide RwLock-protected
+/// `Vec<TrapWriteListener>`. The CA TCP dispatcher
+/// (`crates/epics-ca-rs/src/server/tcp.rs`) calls
+/// [`dispatch_trap_write`] before each `dbChannel_put`-equivalent
+/// (op = `BeforeWrite`) and after the put completes (op = `AfterWrite`
+/// with the post-write status). Listeners that need ACF-rule
+/// trap-mask filtering can consult [`AccessChecked::rule_was_trap`]
+/// via the message's `rule_was_trap` field — when `false`, libca-
+/// faithful loggers should skip the event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrapWriteOp {
+    BeforeWrite,
+    AfterWrite,
+}
+
+/// Read-only message handed to a [`TrapWriteListener`]. Held by
+/// reference so the listener does not own any of the strings —
+/// matches the C `asTrapWriteMessage` lifetime semantics
+/// (`libcom/src/as/asLib.h:51-56`).
+#[derive(Debug, Clone, Copy)]
+pub struct TrapWriteMessage<'a> {
+    pub op: TrapWriteOp,
+    pub pv_name: &'a str,
+    pub user: &'a str,
+    pub host: &'a str,
+    pub peer: &'a str,
+    /// Pre-rendered value string. Empty when the listener subsystem
+    /// is being notified at audit-off cost (caller may pass `""` to
+    /// avoid stringifying large arrays just for trap dispatch).
+    pub value_str: &'a str,
+    /// `Some("ok"|"fail"|EPICS error code) once `op == AfterWrite`;
+    /// always `None` for `BeforeWrite`.
+    pub status: Option<&'a str>,
+    /// True iff the matched ACF `RULE(...)` had the `TRAPWRITE`
+    /// option set. Loggers that want libca-faithful filtering should
+    /// skip events with this `false` (mirrors C `pclient->trapMask`
+    /// gate inside `asTrapWriteWithData`).
+    pub rule_was_trap: bool,
+}
+
+/// Listener closure. Must be `Send + Sync` because the CA TCP
+/// dispatcher invokes it from arbitrary tokio worker tasks. No
+/// `async` — listeners that need to await must spawn their own task
+/// off the closure (matches C's synchronous-callback contract; long
+/// work in a listener blocks the wire path).
+pub type TrapWriteListener = std::sync::Arc<dyn Fn(&TrapWriteMessage<'_>) + Send + Sync>;
+
+/// Opaque handle returned by [`register_trap_write_listener`].
+/// Drop the handle to unregister the listener (equivalent to C
+/// `asTrapWriteUnregisterListener`).
+pub struct TrapWriteListenerHandle {
+    id: u64,
+}
+
+impl Drop for TrapWriteListenerHandle {
+    fn drop(&mut self) {
+        if let Some(reg) = TRAP_WRITE_REGISTRY.get() {
+            let mut guard = reg.write().expect("trap-write registry poisoned");
+            guard.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+static TRAP_WRITE_REGISTRY: std::sync::OnceLock<std::sync::RwLock<Vec<(u64, TrapWriteListener)>>> =
+    std::sync::OnceLock::new();
+static TRAP_WRITE_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn trap_write_registry() -> &'static std::sync::RwLock<Vec<(u64, TrapWriteListener)>> {
+    TRAP_WRITE_REGISTRY.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// Register a TRAPWRITE listener. The returned handle unregisters
+/// the listener when dropped — keep it alive for as long as you
+/// want events.
+pub fn register_trap_write_listener(listener: TrapWriteListener) -> TrapWriteListenerHandle {
+    let id = TRAP_WRITE_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut guard = trap_write_registry()
+        .write()
+        .expect("trap-write registry poisoned");
+    guard.push((id, listener));
+    TrapWriteListenerHandle { id }
+}
+
+/// Cheap probe: returns `true` if any TRAPWRITE listener is
+/// currently registered. Lets the CA TCP dispatcher skip rendering
+/// the per-write value string when nothing would consume it.
+/// O(1) — `RwLock::read` + `is_empty`.
+pub fn has_trap_write_listeners() -> bool {
+    let Some(reg) = TRAP_WRITE_REGISTRY.get() else {
+        return false;
+    };
+    let guard = reg.read().expect("trap-write registry poisoned");
+    !guard.is_empty()
+}
+
+/// Dispatch a trap-write event to every registered listener.
+/// Fast path when no listeners: an `RwLock::read` and a length
+/// check, no allocation. Called by the CA TCP dispatcher before and
+/// after every `dbChannel_put`-equivalent.
+pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
+    let Some(reg) = TRAP_WRITE_REGISTRY.get() else {
+        return;
+    };
+    let guard = reg.read().expect("trap-write registry poisoned");
+    if guard.is_empty() {
+        return;
+    }
+    for (_, listener) in guard.iter() {
+        listener(msg);
+    }
+}
+
+/// R2-54: ASG-field change notifier.
+///
+/// C `database/src/ioc/as/asDbLib.c:107-110,144` registers
+/// `asSpcAsCallback` as the per-record `ASG` field's special
+/// callback; `dbPut record.ASG NEW_ASG` invokes `asChangeGroup` →
+/// `asAddMemberPvt` → `asComputePvt` for every `ASGCLIENT` and
+/// fires the COAR callback for each affected CA connection. Pre-fix
+/// Rust mutated `instance.common.asg` directly with no notification
+/// — the *next* CA op used live `compute_access` so enforcement was
+/// correct, but the wire ACCESS_RIGHTS the client saw still
+/// reflected the OLD ASG until something else (CLIENT_NAME / ACF
+/// reload) triggered a re-eval. UIs gating put-button enable on the
+/// cached level showed stale state.
+///
+/// Rust path: every record put that targets the `ASG` field calls
+/// [`notify_asg_field_changed`]; the CA server (ca-rs
+/// `server/tcp.rs`) subscribes via [`subscribe_asg_changes`] at
+/// startup and routes the event into the same per-client
+/// `reeval_access_rights` path the ACF reload uses. Coarser than
+/// libca (we re-eval every connection on any ASG-field change, not
+/// just the connections whose `ASGCLIENT` referenced the changed
+/// record), but the wire shape (ACCESS_RIGHTS push only when level
+/// actually changed) already keeps the cost bounded by the
+/// `oldaccess != access` gate downstream.
+static ASG_CHANGE_BROADCAST: std::sync::OnceLock<tokio::sync::broadcast::Sender<()>> =
+    std::sync::OnceLock::new();
+
+fn asg_change_broadcast() -> &'static tokio::sync::broadcast::Sender<()> {
+    ASG_CHANGE_BROADCAST.get_or_init(|| {
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        tx
+    })
+}
+
+/// Fire from the field-I/O layer when a record's `ASG` field is
+/// successfully written. Idempotent: if no subscriber exists yet
+/// the send is a no-op (lagged subscribers also tolerated — the
+/// wire re-eval is coarse and one missed beat is recovered by the
+/// downstream `oldaccess != access` filter).
+pub fn notify_asg_field_changed() {
+    let _ = asg_change_broadcast().send(());
+}
+
+/// Subscribe to ASG-field-change notifications. Called once at
+/// server start by the CA TCP dispatcher; events are folded into
+/// the per-client `reeval_access_rights` path.
+pub fn subscribe_asg_changes() -> tokio::sync::broadcast::Receiver<()> {
+    asg_change_broadcast().subscribe()
+}
+
 /// Parse an ACF (Access Control File).
 pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
     let mut config = AccessSecurityConfig {

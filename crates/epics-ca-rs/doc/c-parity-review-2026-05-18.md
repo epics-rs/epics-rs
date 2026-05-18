@@ -615,26 +615,6 @@ C reference: epics-base doesn't implement cap-tokens but PR #563/#618 defines ME
 
 Impact: ACF rule `RULE(1, WRITE) { METHOD("cap-token") AUTHORITY("ops-issuer-1") }` never matches authenticated cap-token peer. Operators can't express "writes only via cap-token"; a stolen plain CLIENT_NAME and a verified cap-token for same subject are indistinguishable to rule engine.
 
-### R2-53: TRAPWRITE rules silently no-op — `asTrapWrite` listener subsystem not wired
-
-Severity: Medium
-
-Rust: `server/tcp.rs:2147-2469` WRITE/WRITE_NOTIFY arms perform ACF gate, put, wire reply — no before/after notifications to registered write-trap listener. `epics-base-rs/src/server/access_security.rs:356-362` parses `TRAPWRITE` keyword and stores in `AccessRule::trap`, but field has no consumer.
-
-C reference: `libcom/src/as/asLib.h:57-62` `asTrapWriteWithData` invoked unconditionally around every `dbChannel_put` in `rsrv/camessage.c:768-779` (write_action) and WRITE_NOTIFY equivalent. Macro reads `asClientPvt->trapMask` and dispatches to listeners registered via `asTrapWriteRegisterListener`. This is what `caPutLog`/site put-loggers attach to.
-
-Impact: every put-logging tool expecting to run on Rust CA server gets zero events even when ACF requests TRAPWRITE. Sites migrating from rsrv with `caPutLog`-style audit trails see silent regression.
-
-### R2-54: Runtime ASG-field change does not re-evaluate access rights for live clients
-
-Severity: Medium
-
-Rust: `server/tcp.rs:404-479` `compute_access` reads `instance.common.asg` live on each invocation, but re-eval triggers limited to CREATE_CHAN, HOST_NAME, CLIENT_NAME, ACF reload. `caput record.ASG NEW_ASG` updates `common.asg` directly but never invokes `reeval_access_rights`.
-
-C reference: `database/src/ioc/as/asDbLib.c:107-110,144` `asInitCommon` registers `asSpcAsCallback` as ASG-field special callback. `dbPut record.ASG` invokes `asChangeGroup` → `asAddMemberPvt` → `asComputePvt` on every ASGCLIENT — fires COAR for each affected CA connection.
-
-Impact: operator reassigning a record's ASG at runtime gets correct enforcement on next op (Rust reads live) but the wire ACCESS_RIGHTS the client sees still reflects OLD ASG until something else triggers re-eval. UIs gating put-button enable on cached ACCESS_RIGHTS show stale state; a peer who held WRITE before the change and lost it issues a doomed WRITE that the server denies via live `compute_access` — unexpected NORDACCESS/NOWTACCESS the UI didn't predict.
-
 ### R2-55: CREATE_CHAN's `m_available` minor-version override not honoured
 
 Severity: Low
@@ -822,6 +802,36 @@ with `pv`/`cid`/`connected_to`/`but_also_on` fields, plus a
 async DNS lookup, so we emit IPs instead of hostnames — adding a
 resolver to the search hot path would be a heavier change than the
 diagnostic warrants.
+
+### R2-53: TRAPWRITE listener subsystem wired
+
+`epics-base-rs::server::access_security` gained
+`register_trap_write_listener` / `dispatch_trap_write` /
+`TrapWriteMessage` / `TrapWriteListenerHandle` (RAII unregister) /
+`has_trap_write_listeners` (cheap probe). `ca-rs::server::tcp.rs`
+WRITE/WRITE_NOTIFY arms call `dispatch_trap_write` with
+`BeforeWrite` / `AfterWrite` ops around every `dbChannel_put`-
+equivalent. Zero-cost when no listener is registered (single
+`RwLock::read` + `is_empty` probe). Partial vs. libca: the matched
+ACF rule's `TRAPWRITE` mask is forced to `true` at the dispatch
+sites (loggers see every write; over-reports rather than misses).
+Surfacing the per-rule mask through `AccessChecked` is a follow-up
+— caPutLog-style audit prefers over-reporting to silent gaps.
+
+### R2-54: ASG-field puts now re-evaluate access rights for live clients
+
+`epics-base-rs::server::access_security` gained a process-wide
+`tokio::sync::broadcast` channel exposed via
+`notify_asg_field_changed` (producer) and `subscribe_asg_changes`
+(consumer). `database/field_io.rs::put_record_field_from_ca` fires
+the notifier whenever `field == "ASG"`. `ca-rs::server::tcp.rs::
+run_tcp_listener` spawns a forwarder task at startup that pumps
+each notification into the existing `acf_reload_tx`, which
+re-enters the per-client `reeval_access_rights` path. Coarser than
+libca's per-ASGCLIENT dispatch (we re-eval every connection), but
+the downstream `oldaccess != access` filter already gates wire
+ACCESS_RIGHTS to only the channels whose level actually changed —
+matching C's bounded-traffic property.
 
 ### R2-48: UDP SEARCH replies now batched into a single outbound datagram
 

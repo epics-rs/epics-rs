@@ -547,6 +547,18 @@ impl PvDatabase {
 
             common_result
         };
+        // R2-54: ASG-field change re-evaluation hook. C
+        // `asDbLib.c:107-110,144` `asSpcAsCallback` invokes
+        // `asChangeGroup` → `asAddMemberPvt` → `asComputePvt` for
+        // every `ASGCLIENT` on `dbPut record.ASG NEW_ASG`. Pre-fix
+        // Rust mutated `common.asg` directly with no notification,
+        // so the wire ACCESS_RIGHTS the client saw still reflected
+        // the OLD ASG until something else triggered re-eval. Now we
+        // fire a process-wide notifier that the CA server folds into
+        // its per-client `reeval_access_rights` path.
+        if field == "ASG" {
+            crate::server::access_security::notify_asg_field_changed();
+        }
         // record lock released
 
         // Update scan index if SCAN or PHAS changed

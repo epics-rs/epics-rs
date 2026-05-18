@@ -3149,20 +3149,20 @@ async fn handle_op(
                         .get_value_checked(mon_checked.clone(), mon_ctx.clone())
                         .await
                     {
-                        // pvxs e9ab67a (2025-10): the first update is
-                        // mask-bypassed so the client receives a
-                        // *complete* prototype regardless of its
-                        // pvRequest field selection. Subsequent
-                        // updates honour `mask_clone`. Without this,
-                        // a `record[]` request with no fields marked
-                        // would silently filter out the seeding
-                        // update and `fill_unmarked_from_prior` on
-                        // the client would have no real prior to
-                        // merge against — the user would see leaves
-                        // default-filled forever.
-                        let full_mask = BitSet::all_set(intro_clone.total_bits());
+                        // BR-R39: pvxs `servermon.cpp:261` always lets
+                        // the first update enter the queue (it bypasses
+                        // the change-or-mask gate), but `:174` still
+                        // encodes the wire BitSet with
+                        // `self->pvMask` — the field mask derived
+                        // from the client's pvRequest. The earlier
+                        // Rust path bypassed both checks, sending the
+                        // initial event with `BitSet::all_set(...)`
+                        // and leaking unrequested leaves. Match pvxs
+                        // by always queueing the first event (no
+                        // change-filter here) but honouring
+                        // `mask_clone` on the wire.
                         let payload =
-                            build_monitor_payload(ioid, &intro_clone, &initial, &full_mask, order);
+                            build_monitor_payload(ioid, &intro_clone, &initial, &mask_clone, order);
                         if tx_clone.send(payload).await.is_err() {
                             return;
                         }

@@ -1274,11 +1274,21 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
             match &member.triggers {
                 TriggerDef::None => continue,
-                TriggerDef::All | TriggerDef::Fields(_) => {
-                    // pvxs always posts the FULL group structure
-                    // (groupsource.cpp:303 → subscriptionPost posts
-                    // currentValue which contains all fields). We match
-                    // this by re-reading the entire group on every trigger.
+                // BR-R29: SelfOnly (the default for missing
+                // `+trigger`) still re-reads + posts the full group
+                // structure here — pvxs `groupsource.cpp:303`
+                // posts `currentValue` which holds every field. The
+                // wire-level changed-bitset narrowing that
+                // `testqgroup.cpp:220` exercises (only `value.index`
+                // set on a VAL update) requires per-trigger BitSet
+                // plumbing into `build_monitor_payload`; until that
+                // lands, SelfOnly behaves like All on the wire but
+                // is semantically distinct from the prior unconditional
+                // collapse. See doc/pvxs-functional-security-review-2026-05-18.md
+                // for the remaining-gap entry on the BitSet plumbing.
+                TriggerDef::SelfOnly
+                | TriggerDef::All
+                | TriggerDef::Fields(_) => {
                     return group_channel.read_group().await.ok();
                 }
             }

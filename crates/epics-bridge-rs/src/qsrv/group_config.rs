@@ -91,6 +91,14 @@ pub enum TriggerDef {
     All,
     /// Named fields — update only these fields.
     Fields(Vec<String>),
+    /// BR-R29: missing `+trigger` — pvxs default is self-trigger
+    /// (`groupconfigprocessor.cpp:323`): the member triggers only
+    /// its own field, NOT every other group field. Distinct from
+    /// `All` (`"*"`) and from `None` (`""`, explicit silence). The
+    /// monitor encoder narrows the changed-bitset accordingly so
+    /// downstream clients see a tight delta instead of a full-group
+    /// reread.
+    SelfOnly,
     /// `""` — never trigger a group update for this member.
     None,
 }
@@ -334,7 +342,16 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
         TriggerDef::None
     } else {
         match obj.get("+trigger").and_then(|v| v.as_str()) {
-            Some("*") | None => TriggerDef::All,
+            Some("*") => TriggerDef::All,
+            // BR-R29: pvxs groupconfigprocessor.cpp:323 defaults a
+            // missing `+trigger` to self-trigger (only this member's
+            // own field re-emits in the group), not All. The Rust
+            // path treated None as All and emitted a full-group
+            // changed bitset on every member event — distinct from
+            // pvxs's narrow self-trigger delta visible in
+            // testqgroup.cpp:220 (NTEnum group: only `value.index`
+            // bit set on a VAL update).
+            None => TriggerDef::SelfOnly,
             Some("") => TriggerDef::None,
             Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.trim().to_string()).collect()),
         }
@@ -505,10 +522,30 @@ mod tests {
         let groups = parse_group_config(json).unwrap();
         let m = &groups[0].members[0];
         assert_eq!(m.mapping, FieldMapping::Scalar); // default
-        assert!(matches!(m.triggers, TriggerDef::All)); // default
+        // BR-R29: pvxs default for a missing `+trigger` is self-trigger
+        // (`groupconfigprocessor.cpp:323`), not All.
+        assert!(matches!(m.triggers, TriggerDef::SelfOnly));
         // BR-R30: missing `+putorder` → `None` (not putable),
         // mirroring pvxs `fieldconfig.h:37` sentinel.
         assert_eq!(m.put_order, None);
+    }
+
+    /// BR-R29: an explicit `+trigger:"*"` is still parsed as `All`
+    /// (distinct from the default self-trigger). Regression guard for
+    /// the previous None→All collapse.
+    #[test]
+    fn parse_trigger_star_is_all() {
+        let json = r#"{
+            "GRP:star": {
+                "val": {
+                    "+channel": "REC:val",
+                    "+trigger": "*"
+                }
+            }
+        }"#;
+        let groups = parse_group_config(json).unwrap();
+        let m = &groups[0].members[0];
+        assert!(matches!(m.triggers, TriggerDef::All));
     }
 
     #[test]

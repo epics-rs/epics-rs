@@ -1178,9 +1178,25 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
             let (record_name, _) = epics_base_rs::server::database::parse_pv_name(&member.channel);
 
-            // Value subscription (DBE_VALUE | DBE_ALARM)
+            // BR-R34: pvxs `groupsource.cpp:389` subscribes group
+            // value events with `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE`.
+            // `DBE_ARCHIVE` (epics-base-rs's `EventMask::LOG`) is the
+            // archive-class event that records post via
+            // `recGblFwdLink` when the LOG deadband fires — pvxs
+            // folds those into the group delta so archiver-like
+            // clients watching the group PV see the same posts the
+            // backing record's CA monitor would. Rust subscribed
+            // only with VALUE|ALARM, so log-only posts (e.g. a
+            // periodic record where VAL is unchanged but the
+            // archive deadband is satisfied) silently dropped on
+            // group monitors. The downstream collator
+            // (`run_notify_forwarder` in pvalink and the group
+            // `poll()` in this file) treats every value-side
+            // member event identically, so adding LOG here folds
+            // it into the same value-update path matching pvxs.
             let value_mask = (epics_base_rs::server::recgbl::EventMask::VALUE
-                | epics_base_rs::server::recgbl::EventMask::ALARM)
+                | epics_base_rs::server::recgbl::EventMask::ALARM
+                | epics_base_rs::server::recgbl::EventMask::LOG)
                 .bits();
             if let Some(mut sub) =
                 DbSubscription::subscribe_with_mask(&self.db, record_name, 0, value_mask).await

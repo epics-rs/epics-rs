@@ -245,10 +245,7 @@ async fn channel_filter_suffix_strips_before_resolution() {
     };
 
     // The full client identity is preserved (used by ACF and error msgs).
-    assert_eq!(
-        ch.channel_name(),
-        r#"TEST:filt_ai.VAL{"dbnd":{"d":2.0}}"#
-    );
+    assert_eq!(ch.channel_name(), r#"TEST:filt_ai.VAL{"dbnd":{"d":2.0}}"#);
     // Record / field resolution uses the un-suffixed form.
     assert_eq!(ch.record_name(), "TEST:filt_ai");
     assert_eq!(ch.field(), "VAL");

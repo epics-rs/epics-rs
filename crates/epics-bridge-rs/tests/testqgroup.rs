@@ -157,6 +157,70 @@ async fn group_nonatomic_put_updates_all_members() {
     assert_eq!(extract_long(&result, "count"), Some(99));
 }
 
+/// BR-R34: a `DBE_LOG`-only post against a backing record (archive
+/// deadband fires without a value change) wakes the group monitor,
+/// matching pvxs `groupsource.cpp:389` which subscribes group value
+/// events with `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE`.
+///
+/// Regression: the prior Rust mask was `VALUE|ALARM` only, so log
+/// posts dropped silently on group monitors and archiver-like
+/// clients tracking a group PV missed samples.
+#[tokio::test]
+async fn group_monitor_subscribes_archive_log_events() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("grp registered");
+
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+
+    // Drive priming: the Plain mapping needs a value event per
+    // member to complete priming. Use VALUE-class posts (not LOG)
+    // so the priming path doesn't accidentally satisfy itself with
+    // the bit under test.
+    for rec_name in ["TEST:level", "TEST:count"] {
+        let rec = db.get_record(rec_name).await.expect("rec exists");
+        let inst = rec.read().await;
+        inst.notify_field("VAL", EventMask::VALUE);
+    }
+    // Pull the post-priming snapshot off the queue.
+    let primed = tokio::time::timeout(Duration::from_secs(2), mon.poll()).await;
+    primed
+        .expect("priming snapshot must arrive within 2s")
+        .expect("priming snapshot");
+
+    // Now the gate is open: post a LOG-ONLY event on `level.VAL`.
+    // No VALUE / ALARM bit set; if the bridge had subscribed only
+    // with VALUE|ALARM the event would silently drop and the
+    // following poll would time out.
+    {
+        let rec = db.get_record("TEST:level").await.expect("rec exists");
+        let inst = rec.read().await;
+        inst.notify_field("VAL", EventMask::LOG);
+    }
+
+    let polled = tokio::time::timeout(Duration::from_millis(500), mon.poll()).await;
+    let snap = polled
+        .expect("LOG event must wake group poll within 500ms")
+        .expect("snapshot delivered");
+    assert!(
+        !snap.fields.is_empty(),
+        "log-event group snapshot must carry the full group structure, got {snap:?}"
+    );
+
+    mon.stop().await;
+}
+
 /// BR-R33: a group GET / MONITOR value carries
 /// `record._options.queueSize` and `record._options.atomic` at
 /// its root. pvxs `groupsource.cpp:359` stamps these into every

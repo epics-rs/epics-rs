@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::protocol::CA_REPEATER_PORT;
+use epics_base_rs::error::{CaError, CaResult};
 
 /// Configuration for the CA server's UDP layer.
 #[derive(Debug, Clone)]
@@ -47,7 +48,17 @@ impl Default for CasUdpConfig {
 /// Parse all EPICS_CAS_* environment variables and return a complete
 /// UDP configuration. Falls back to sensible defaults (single 0.0.0.0
 /// interface, broadcast-only beacon, 15s period) when nothing is set.
-pub fn from_env() -> CasUdpConfig {
+///
+/// R2-76: returns `Err` when `EPICS_CAS_INTF_ADDR_LIST` mixes
+/// `0.0.0.0` with specific interface IPs — C
+/// `rsrv/caservertask.c:390-392` `cantProceed`s on this combination
+/// (which kills the IOC process). The error propagates to the
+/// caller (`CaServer::run` / `run_tcp_listener`) which fails
+/// startup, matching C's fatal behaviour. The check runs
+/// UNCONDITIONALLY, not just when `EPICS_CAS_AUTO_BEACON_ADDR_LIST=YES`
+/// — pre-fix Rust nested it under `if auto_on`, so the misconfig
+/// silently escaped detection when AUTO=NO.
+pub fn from_env() -> CaResult<CasUdpConfig> {
     let mut cfg = CasUdpConfig::default();
 
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_INTF_ADDR_LIST") {
@@ -134,6 +145,32 @@ pub fn from_env() -> CasUdpConfig {
         None | Some("") => true,
         Some(s) => s.eq_ignore_ascii_case("YES"),
     };
+    // R2-76: mixed-0.0.0.0+specific check runs UNCONDITIONALLY, not
+    // just under `if auto_on`. C `rsrv/caservertask.c:390-392`
+    // `cantProceed`s on this combination regardless of
+    // `EPICS_CAS_AUTO_BEACON_ADDR_LIST` (the per-iteration
+    // `if(!doautobeacon) continue` at line 374-375 only short-circuits
+    // the auto-population loop body; the cantProceed sits AFTER the
+    // loop). Pre-fix Rust nested the warn inside `if auto_on`, so the
+    // misconfig escaped detection entirely when AUTO=NO; the IOC
+    // booted with conflicting wildcard + specific binds and either
+    // one of the binds failed silently or both succeeded with
+    // undefined kernel routing behaviour.
+    let intf_specific: Vec<Ipv4Addr> = cfg
+        .intf_addrs
+        .iter()
+        .copied()
+        .filter(|ip| !ip.is_unspecified())
+        .collect();
+    let intf_has_wildcard = cfg.intf_addrs.iter().any(|ip| ip.is_unspecified());
+    if !intf_specific.is_empty() && intf_has_wildcard {
+        return Err(CaError::Protocol(
+            "EPICS_CAS_INTF_ADDR_LIST may not mix 0.0.0.0 with specific interface IPs \
+             (rsrv `cantProceed` parity, caservertask.c:390-392). \
+             Use either 0.0.0.0 alone or a list of specific interface IPs."
+                .to_string(),
+        ));
+    }
     if auto_on {
         // R2-61: C `rsrv/caservertask.c:374-388` filters auto-beacon
         // expansion by `casIntfAddrList` when specific (non-wildcard)
@@ -143,23 +180,6 @@ pub fn from_env() -> CasUdpConfig {
         // leaking IOC presence onto unrelated networks. If
         // `cfg.intf_addrs` lists specific IPs (not just `0.0.0.0`),
         // derive beacon broadcasts only from those interfaces.
-        // C lines 390-392 also `cantProceed` when both `0.0.0.0`
-        // and a specific IP appear; we surface the same as a warn
-        // (Rust doesn't panic the IOC process for this kind of
-        // misconfig).
-        let intf_specific: Vec<Ipv4Addr> = cfg
-            .intf_addrs
-            .iter()
-            .copied()
-            .filter(|ip| !ip.is_unspecified())
-            .collect();
-        let intf_has_wildcard = cfg.intf_addrs.iter().any(|ip| ip.is_unspecified());
-        if !intf_specific.is_empty() && intf_has_wildcard {
-            eprintln!(
-                "Warning: EPICS_CAS_INTF_ADDR_LIST contains both 0.0.0.0 and a specific IP; \
-                 beacons may behave inconsistently (C rsrv cantProceeds on this mix)"
-            );
-        }
         let bcast_iter: Vec<Ipv4Addr> = if !intf_specific.is_empty() {
             // Restrict to broadcasts of the listed interfaces.
             intf_specific
@@ -227,7 +247,7 @@ pub fn from_env() -> CasUdpConfig {
         // else: keep default (15s) — matches C's `maxPeriod <= 0.0` branch.
     }
 
-    cfg
+    Ok(cfg)
 }
 
 /// Parse a whitespace-separated list of "host" or "host:port" tokens.
@@ -340,13 +360,78 @@ pub fn broadcast_for_ip(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
         if v4.ip != match_ip {
             continue;
         }
-        let b = v4.broadcast?;
-        if b.is_unspecified() {
-            return None;
+        if let Some(b) = v4.broadcast {
+            if !b.is_unspecified() {
+                return Some(b);
+            }
         }
-        return Some(b);
+        // R2-77: `if_addrs` only fills `broadcast` for `IFF_BROADCAST`
+        // interfaces. For `IFF_POINTOPOINT` (VPN tun, PPP, WireGuard)
+        // C `osdNetIfAddrs.c:130-151` substitutes `ifa_dstaddr` —
+        // beacons go to the remote tunnel endpoint. Fall through to a
+        // direct `getifaddrs` walk that reads dstaddr for the
+        // matched interface.
+        #[cfg(unix)]
+        {
+            if let Some(dst) = ifa_dstaddr_for_ipv4(match_ip) {
+                return Some(dst);
+            }
+        }
+        return None;
     }
     None
+}
+
+/// R2-77: walk `getifaddrs(3)` directly to extract `ifa_dstaddr`
+/// for the interface whose `ifa_addr` matches `match_ip` AND
+/// carries `IFF_POINTOPOINT`. The `if_addrs` crate only exposes
+/// `broadcast` for `IFF_BROADCAST` interfaces; P2P interfaces
+/// (VPN tun, PPP, WireGuard) need this path or beacons toward the
+/// tunnel peer are silently dropped from auto-expansion.
+/// Mirrors C `osdNetIfAddrs.c:130-151`.
+#[cfg(unix)]
+fn ifa_dstaddr_for_ipv4(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
+    // SAFETY: `getifaddrs` returns a linked list of `ifaddrs`
+    // structs we walk read-only and free via `freeifaddrs` before
+    // returning. All pointer reads are guarded against null and
+    // the matched ipv4 octets are copied out as `[u8; 4]` before
+    // the free.
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 || head.is_null() {
+            return None;
+        }
+        let mut result: Option<Ipv4Addr> = None;
+        let mut cur = head;
+        while !cur.is_null() {
+            let entry = &*cur;
+            let next = entry.ifa_next;
+            // Must be IPv4 AF_INET with the matched ip + POINTOPOINT
+            // flag. `ifa_addr` may be null on some interfaces (no
+            // address assigned); skip those.
+            if !entry.ifa_addr.is_null()
+                && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET
+                && entry.ifa_flags as libc::c_int & libc::IFF_POINTOPOINT != 0
+            {
+                let in4: &libc::sockaddr_in = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                let ip_octets = u32::from_be(in4.sin_addr.s_addr).to_be_bytes();
+                let if_ip = Ipv4Addr::from(ip_octets);
+                if if_ip == match_ip && !entry.ifa_dstaddr.is_null() {
+                    let dst4: &libc::sockaddr_in =
+                        &*(entry.ifa_dstaddr as *const libc::sockaddr_in);
+                    let dst_octets = u32::from_be(dst4.sin_addr.s_addr).to_be_bytes();
+                    let dst_ip = Ipv4Addr::from(dst_octets);
+                    if !dst_ip.is_unspecified() {
+                        result = Some(dst_ip);
+                        break;
+                    }
+                }
+            }
+            cur = next;
+        }
+        libc::freeifaddrs(head);
+        result
+    }
 }
 
 #[cfg(test)]
@@ -419,7 +504,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
         }
 
-        let cfg = from_env();
+        let cfg = from_env().expect("from_env in test");
         let leaked = cfg
             .beacon_addrs
             .iter()
@@ -461,7 +546,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
         }
 
-        let cfg = from_env();
+        let cfg = from_env().expect("from_env in test");
         let hit = cfg.beacon_addrs.iter().any(|a| {
             matches!(a, SocketAddr::V4(v4)
                 if v4.ip().octets() == [198, 51, 100, 7] && v4.port() == 5099)
@@ -502,7 +587,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "0");
         }
-        let cfg = from_env();
+        let cfg = from_env().expect("from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs(15),
@@ -513,7 +598,7 @@ mod tests {
         unsafe {
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "-5");
         }
-        let cfg = from_env();
+        let cfg = from_env().expect("from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs(15),
@@ -524,7 +609,7 @@ mod tests {
         unsafe {
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "garbage");
         }
-        let cfg = from_env();
+        let cfg = from_env().expect("from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs(15),
@@ -536,7 +621,7 @@ mod tests {
         unsafe {
             std::env::set_var("EPICS_CAS_BEACON_PERIOD", "0.05");
         }
-        let cfg = from_env();
+        let cfg = from_env().expect("from_env in test");
         assert_eq!(
             cfg.beacon_period,
             Duration::from_secs_f64(0.05),
@@ -578,7 +663,7 @@ mod tests {
             std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
         }
 
-        let cfg = from_env();
+        let cfg = from_env().expect("from_env in test");
         assert!(
             cfg.beacon_addrs.is_empty(),
             "AUTO=NO with empty explicit list must yield empty beacon_addrs (C parity), got {:?}",

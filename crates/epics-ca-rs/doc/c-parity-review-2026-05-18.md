@@ -665,106 +665,6 @@ C reference: `ca/src/client/cac.cpp:186-194` `envGetDoubleConfigParam`, then `if
 
 Impact: `EPICS_CA_CONN_TMO=0.5` gets 0.5 on C, 1 on Rust. `=0` (operator sentinel for "use default") gets 30 on C but 1 on Rust — Rust pumps ECHO every second on every circuit, multiplying inbound TCP load on each server 30×.
 
-### R2-74: Multicast responder errors are silently swallowed; only the first per-intf result propagates
-
-Severity: Medium
-
-Rust: `server/udp.rs:71-87` — `run_udp_search_responder` awaits ONLY `handles_iter.next()` (the first interface responder) and unconditionally `.abort()`s every remaining handle, including all `run_multicast_responder` handles pushed after the per-interface ones. A `run_multicast_responder` returning `Err(...)` because `any_joined == false` is dropped on the floor.
-
-C reference: `caservertask.c:633-668` calls `setsockopt(IP_ADD_MEMBERSHIP, ...)` inline during `rsrv_init`, and on failure calls `errlogPrintf("CAS: Socket mcast join %s to %s failed: %s\n", ...)`. The error is surfaced per-(interface,group) pair, every time.
-
-Impact: Operator configures `EPICS_CAS_INTF_ADDR_LIST="239.10.0.1"` on a host whose interfaces all reject IP_ADD_MEMBERSHIP. Server boots successfully, logs only the per-intf `tracing::warn!`, and PVs are invisible to multicast SEARCH.
-
-### R2-75: Multicast SEARCH replies use kernel-chosen source IP; C uses the per-interface bound socket's IP
-
-Severity: Medium
-
-Rust: `server/udp.rs:219-252` — `run_multicast_responder` binds a single wildcard `0.0.0.0:port` socket and joins the group on every supplied interface. On reply (`socket.send_to(reply, src)`), the kernel selects the outbound interface + source IP via routing, with no `IP_MULTICAST_IF` or per-NIC binding.
-
-C reference: `caservertask.c:621-668` creates one socket per `casIntfAddrList` entry, binds it to `conf->udpAddr.ia.sin_addr`, and joins each group with `imr_interface = conf->udpAddr.ia.sin_addr.s_addr`. Replies source from the bound interface IP deterministically.
-
-Impact: Multi-homed IOC: C reply carries a specific NIC's IP as source; Rust reply may carry a different NIC's. Clients matching `SEARCH_REPLY` source against the `EPICS_CA_ADDR_LIST` entry that sent the SEARCH (R2-26 surface) dedup inconsistently; per-NIC firewall rules see different traffic.
-
-### R2-76: AUTO_BEACON mixed `0.0.0.0`+specific misconfig escapes detection when `EPICS_CAS_AUTO_BEACON_ADDR_LIST=NO`
-
-Severity: High
-
-Rust: `server/addr_list.rs:137-162` — the warning for `intf_has_wildcard && !intf_specific.is_empty()` is nested inside `if auto_on { ... }`. With `EPICS_CAS_AUTO_BEACON_ADDR_LIST=NO` the block is skipped and the operator gets neither warning nor abort.
-
-C reference: `caservertask.c:390-392` — `cantProceed("CAS interface address list can not contain 0.0.0.0 and other interface addresses.\n")` is OUTSIDE the `if(!doautobeacon) continue;` check. IOC aborts at startup regardless of `autobeaconlist`. `cantProceed` is fatal (libcom kills the process), not `errlogPrintf`.
-
-Impact: Operator sets `EPICS_CAS_INTF_ADDR_LIST="0.0.0.0 10.0.0.5" EPICS_CAS_AUTO_BEACON_ADDR_LIST=NO`. C IOC refuses to start; Rust IOC starts silently with the misconfig.
-
-### R2-77: AUTO_BEACON expansion drops point-to-point interfaces C populates via `ifa_dstaddr`
-
-Severity: Medium
-
-Rust: `server/addr_list.rs:328-350` — `broadcast_for_ip` only consults `if_addrs::IfAddr::V4 { broadcast, .. }`. For `IFF_POINTOPOINT` interfaces (VPN tun, PPP, WireGuard) the `broadcast` field is `None` and the helper returns `None`. The R2-61 filter then drops the interface from `bcast_iter` entirely.
-
-C reference: `osdNetIfAddrs.c:130-151` — `osiSockDiscoverBroadcastAddresses` checks `IFF_BROADCAST` first, then `IFF_POINTOPOINT`, substituting `ifa->ifa_dstaddr` so beacons go to the remote tunnel endpoint.
-
-Impact: IOC reachable to a remote subnet only via a VPN tun, configured with `EPICS_CAS_INTF_ADDR_LIST="<tun-ip>"`, emits no beacons toward the tunnel peer. C IOC sends beacons to the tunnel's `dstaddr`.
-
-### R2-78: `IP_MULTICAST_LOOP=1` not set on the beacon-sending socket
-
-Severity: Low
-
-Rust: `server/beacon.rs:41-47` — beacon sender socket sets `set_broadcast(true)` and `set_multicast_ttl_v4(...)`, but never `set_multicast_loop_v4(true)`.
-
-C reference: `caservertask.c:307-318` — `rsrv_init` explicitly `setsockopt(beaconSocket, IPPROTO_IP, IP_MULTICAST_LOOP, &flag=1, ...)` on the beacon socket. Linux default happens to match, but non-Linux and Linux kernels with site policy disabling default loop diverge.
-
-Impact: For a beacon group fan-out where the IOC runs a local CA repeater or a co-located client subscribed to multicast beacons (self-test), loopback delivery depends on platform default rather than the explicit-1 C contract.
-
-### R2-79: UDP SEARCH-reply batch flushes per-inbound; C batches across inbounds until recv queue drains
-
-Severity: Medium
-
-Rust: `server/udp.rs:545-550` — at end-of-inbound, `if !send_buf.is_empty() { socket.send_to(&send_buf, src).await }` then drops `send_buf` (new Vec each outer iteration). No `FIONREAD`/peek to defer flush when more inbound is queued.
-
-C reference: `cast_server.c:266-281` — recv loop calls `socket_ioctl(recv_sock, FIONREAD, &nchars)` after each `camessage()` and ONLY flushes via `cas_send_dg_msg(client)` when `nchars == 0`. Peer-change detection at `205-215` flushes early on src change. C accumulates SEARCH replies across multiple inbound datagrams from the same client into ONE outbound until the recv queue drains.
-
-Impact: Client search storm of 10 datagrams × 5 PVs gets 10 reply datagrams from Rust vs (typically) 1-2 from C. R2-48 only achieved within-datagram amortization; the bulk of search-storm reduction is the cross-datagram path.
-
-### R2-80: VERSION placeholder skipped when SEARCH precedes VERSION inside the same inbound datagram
-
-Severity: Medium
-
-Rust: `server/udp.rs:502-529` — `include_version = client_seq.is_some()` evaluated at each SEARCH match. Prepend VERSION only on FIRST append. If first match arrives BEFORE a `CA_PROTO_VERSION` header (legal chained inbound), `client_seq.is_none()` → no VERSION prepended → send_buf non-empty → subsequent VERSION-after-SEARCH never inserts placeholder. Datagram flushes without VERSION.
-
-C reference: `cast_server.c:154-156` calls `rsrv_version_reply(client)` BEFORE entering the loop, seeding VERSION at byte 0. `cas_send_dg_msg` re-seeds after every flush. Placeholder always present; `cas_send_dg_msg:185-201` decides at send time whether to strip, gated on `CA_V411(pclient->minor_version_number)` which is set in `udp_version_action:2096` whenever the inbound carries VERSION at any position.
-
-Impact: V4.13 client with SEARCH-then-VERSION chained inbound (legal) gets a Rust reply with no VERSION header — cannot bind seqNoOfReq to discard stale replies; every reply passes the freshness check unconditionally.
-
-### R2-81: Silent `send_to` failure on batched reply drops all N replies, not one
-
-Severity: Medium
-
-Rust: `server/udp.rs:522, 549` — both flush sites use `let _ = socket.send_to(&send_buf, src).await;`, discarding the result. Pre-R2-48 code dropped one reply on failure; batched code drops the whole batch.
-
-C reference: `caserverio.c:214-222` — `cas_send_dg_msg` on negative `sendto` calls `errlogPrintf("CAS: UDP send to %s failed: %s\n", ...)`. C logs every drop.
-
-Impact: Under EMFILE/ENOBUFS pressure during a search storm (R2-48's target scenario), operator gets no signal. Diagnostic regression — batching enlarged the blast radius per failed send.
-
-### R2-82: `UDP_FLUSH_THRESHOLD = 1472` exceeds C's `MAX_UDP_SEND = 1024`
-
-Severity: Low
-
-Rust: `server/udp.rs:334` — `const UDP_FLUSH_THRESHOLD: usize = 1472;` (IPv4 Ethernet payload max).
-
-C reference: `caProto.h:66` — `#define MAX_UDP_SEND 1024u`. `client->send.maxstk = MAX_UDP_SEND`; `cas_copy_in_header` calls `cas_send_dg_msg` when next message would push `stk > maxstk`. C never builds a UDP datagram larger than ~1024 bytes.
-
-Impact: Third-party CA implementations (Java CAJ, asyncio-ca, embedded) may assume the 1024-byte contract and truncate larger replies. libca peers unaffected (`recvBuf[MAX_UDP_RECV]`).
-
-### R2-83: Multicast responder's wildcard socket also receives unicast/broadcast — duplicate replies
-
-Severity: Low
-
-Rust: `server/udp.rs:227` — `run_multicast_responder` calls `bind_responder_socket(Ipv4Addr::UNSPECIFIED, port)`. After joining groups, this socket also receives broadcast/unicast SEARCHes targeting local interfaces (`IP_MULTICAST_ALL=0` only filters multicast). Result: SEARCH to specific interface gets handled by both the unicast responder AND the wildcard-bound mcast responder.
-
-C reference: C creates a SEPARATE socket for multicast joins (`conf->udp` bound to specific interface IP). Wildcard recv socket and per-interface mcast-joining socket have non-overlapping recv scopes.
-
-Impact: Multi-NIC+mcast configs: TWO `send_to(reply, src)` outbound per SEARCH. C fires once.
-
 ## Cleared During Review
 
 ### R2-2: Monitor status errors are already delivered
@@ -1107,6 +1007,102 @@ inspecting `AfterWrite.status` (Rust-side now distinguishes
 implies storage attempt"; Rust parity is "Before always implies
 the entry path of the storage call, and listeners can self-filter
 by event_id + status".
+
+### R2-74: Multicast join failures now log + continue, never fail the responder tree
+
+`server/udp.rs::run_multicast_responder` returns `Ok(())` instead of
+`Err` when no interface accepted IP_ADD_MEMBERSHIP for a group —
+matching `caservertask.c:659-660`'s `errlogPrintf` + continue
+semantics. Per-(intf, group) failures inside `run_single_responder`
+are also warn-logged. The sibling-task fail-fast pattern in
+`run_udp_search_responder` no longer kills the whole UDP responder
+tree on a single misconfigured group.
+
+### R2-75 + R2-83: Per-NIC multicast joins eliminate wildcard-bind divergences
+
+`run_udp_search_responder` splits `intf_addrs` into specific vs.
+wildcard. For specific intfs, the per-intf `run_single_responder`
+socket joins each multicast group via `IP_ADD_MEMBERSHIP` with
+`imr_interface = bind_ip` — matching C `caservertask.c:621-668`'s
+one-socket-per-casIntfAddrList model. Reply source IP is now
+deterministically the bound intf IP (R2-75 closed). The previously
+spawned wildcard-bound `run_multicast_responder` per group only
+runs when ALL intfs are 0.0.0.0, so the per-intf socket's
+non-multicast recv scope no longer overlaps with a wildcard socket
+— R2-83's duplicate-dispatch case is eliminated for the common
+specific-intf+mcast config.
+
+### R2-76: Mixed `0.0.0.0`+specific is now a hard startup error
+
+`server/addr_list.rs::from_env` returns `CaResult<CasUdpConfig>`
+and rejects with a `CaError::Protocol` message when
+`EPICS_CAS_INTF_ADDR_LIST` mixes `0.0.0.0` with a specific IP. The
+check runs UNCONDITIONALLY (not under `if auto_on`), matching C
+`rsrv/caservertask.c:390-392`'s `cantProceed` which sits outside
+the `if(!doautobeacon) continue` short-circuit. Callers in
+`run_tcp_listener` and `CaServer::run` propagate the error via
+`?`, failing startup the same way C IOC's process abort does.
+
+### R2-77: AUTO_BEACON expansion now consults `ifa_dstaddr` for point-to-point interfaces
+
+`server/addr_list.rs::broadcast_for_ip` falls through to a direct
+`getifaddrs(3)` walk (`ifa_dstaddr_for_ipv4`, unix-only) when the
+matched interface has no `broadcast` field — that is, when it's
+`IFF_POINTOPOINT` rather than `IFF_BROADCAST`. Mirrors
+`osdNetIfAddrs.c:130-151`'s `IFF_POINTOPOINT` → `ifa_dstaddr`
+substitution. An IOC reachable only via a VPN tun, configured with
+`EPICS_CAS_INTF_ADDR_LIST="<tun-ip>"`, now emits beacons toward
+the tunnel peer.
+
+### R2-78: Beacon socket sets IP_MULTICAST_LOOP=1 explicitly
+
+`server/beacon.rs` calls `socket.set_multicast_loop_v4(true)`
+after the broadcast and TTL setup — matching
+`caservertask.c:307-318`'s explicit `setsockopt(beaconSocket,
+IPPROTO_IP, IP_MULTICAST_LOOP, &flag=1)`. Loopback delivery for
+self-test patterns (local CA repeater, co-located client
+subscribed to multicast beacons) no longer depends on platform
+default policy.
+
+### R2-79: UDP recv loop now batches across queued same-src inbounds
+
+`server/udp.rs::recv_loop` adds a peek-and-drain block at end of
+parse: `socket.try_recv_from(&mut peek_buf)` drains the recv queue
+into the same `send_buf` for same-src inbounds; a peer change
+flushes the current batch and resets state for the new src.
+Mirrors `cast_server.c:266-281`'s `FIONREAD` flush gate +
+peer-change detection at `:205-215`. A search storm of N small
+same-peer datagrams now yields ONE outbound batch, not N — the
+cross-datagram path R2-48 missed.
+
+### R2-80: VERSION placeholder always seeded; stripped at flush per CA_V411
+
+`server/udp.rs::flush_send_buf` patches bytes 0..16 of `send_buf`
+with the final VERSION header for CA_V411 peers (using the
+captured `client_seq` if present), and strips the placeholder
+otherwise. The placeholder is seeded on FIRST append regardless of
+whether a VERSION header has been seen yet — matching C
+`rsrv_version_reply` (seeded up-front) + `cas_send_dg_msg:185-201`
+(strip/keep decision at send time). Tracks the largest VERSION
+minor seen via the new `client_minor` state, so a chained inbound
+with SEARCH-before-VERSION still emits a VERSION-led reply.
+
+### R2-81: Batched UDP send failures now log at warn level
+
+`server/udp.rs::flush_send_buf` calls `socket.send_to(payload, src)`
+and on `Err(e)` logs at warn with `bind_ip` / `dst` / payload_len
+/ error, plus increments
+`ca_server_udp_search_reply_send_failures_total`. Mirrors
+`caserverio.c:214-222` `errlogPrintf`. Under EMFILE/ENOBUFS
+pressure during a search storm, operators now see the
+batch-drop signal instead of silent loss.
+
+### R2-82: UDP_FLUSH_THRESHOLD lowered to 1024 to match C MAX_UDP_SEND
+
+`server/udp.rs` constant `UDP_FLUSH_THRESHOLD` is now 1024 bytes
+— matching C `caProto.h:66` `MAX_UDP_SEND`. Third-party CA
+implementations that assume the 1024-byte UDP datagram contract
+no longer see truncated SEARCH replies on a Rust IOC's bursts.
 
 ### R2-91: put_pv / put_pv_and_post / put_pv_no_process now fire the ASG notifier
 

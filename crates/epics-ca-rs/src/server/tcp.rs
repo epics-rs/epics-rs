@@ -523,7 +523,7 @@ pub async fn run_tcp_listener(
     // it is logged and skipped (matches C `cleanup:` / `continue;` in
     // `caservertask.c:744-749`, which frees the conf and proceeds).
     let intf_addrs: Vec<std::net::Ipv4Addr> = {
-        let cfg = super::addr_list::from_env();
+        let cfg = super::addr_list::from_env()?;
         if cfg.intf_addrs.is_empty() {
             vec![std::net::Ipv4Addr::UNSPECIFIED]
         } else {

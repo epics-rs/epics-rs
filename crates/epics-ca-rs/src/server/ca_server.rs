@@ -1077,7 +1077,7 @@ impl CaServer {
             ))
         })?;
 
-        let udp_cfg = addr_list::from_env();
+        let udp_cfg = addr_list::from_env()?;
         eprintln!(
             "CA server: UDP search on port {port}, TCP on port {tcp_port}, beacons → {} address(es)",
             udp_cfg.beacon_addrs.len()

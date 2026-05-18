@@ -634,8 +634,20 @@ impl super::provider::Channel for GroupChannel {
         let opts = super::channel::PutOptions::from_pv_request(value);
         let use_process = opts.process != super::channel::ProcessMode::Inhibit;
 
-        let mut ordered: Vec<&GroupMember> = self.def.members.iter().collect();
-        ordered.sort_by_key(|m| m.put_order);
+        // BR-R30: only members with an explicit `+putorder` are
+        // writable. pvxs sentinel `i64::MIN` (fieldconfig.h:37)
+        // → "not putable" (groupsource.cpp:503); a member without
+        // `+putorder` must be ignored, NOT written under an
+        // implicit `0`. Drop None-order members from the PUT path
+        // up-front so the apply loops below never see them.
+        let mut ordered: Vec<(&GroupMember, i32)> = self
+            .def
+            .members
+            .iter()
+            .filter_map(|m| m.put_order.map(|po| (m, po)))
+            .collect();
+        ordered.sort_by_key(|(_, po)| *po);
+        let ordered: Vec<&GroupMember> = ordered.into_iter().map(|(m, _)| m).collect();
 
         if self.def.atomic {
             // Atomic put. C++ QSRV holds every member record's lock

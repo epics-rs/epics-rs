@@ -1060,12 +1060,15 @@ mod tests {
         use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
         use epics_pva_rs::server_native::ChannelSource;
 
+        // BR-R30: members must declare `+putorder` to be writable
+        // through group PUT/RPC. Without it pvxs (and now Rust)
+        // skip the write silently with a warning.
         const GROUP_JSON: &str = r#"{
             "RPC:GRP": {
                 "+id": "epics:nt/NTGroup:1.0",
                 "+atomic": true,
-                "level": { "+channel": "RPC:GRP:level.VAL", "+type": "plain" },
-                "count": { "+channel": "RPC:GRP:count.VAL", "+type": "plain" }
+                "level": { "+channel": "RPC:GRP:level.VAL", "+type": "plain", "+putorder": 0 },
+                "count": { "+channel": "RPC:GRP:count.VAL", "+type": "plain", "+putorder": 1 }
             }
         }"#;
 

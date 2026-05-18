@@ -182,7 +182,13 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
                         for m in &def.members {
                             ctx.println(&format!(
                                 "  {} <- {} (mapping={:?}, put_order={}, triggers={:?})",
-                                m.field_name, m.channel, m.mapping, m.put_order, m.triggers
+                                m.field_name,
+                                m.channel,
+                                m.mapping,
+                                m.put_order
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_else(|| "<none>".into()),
+                                m.triggers
                             ));
                         }
                     } else {

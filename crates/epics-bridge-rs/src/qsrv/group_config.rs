@@ -64,7 +64,15 @@ pub struct GroupMember {
     /// Which fields to update when this member changes.
     pub triggers: TriggerDef,
     /// Ordering for put operations.
-    pub put_order: i32,
+    ///
+    /// BR-R30: pvxs defaults the missing-field sentinel to
+    /// `i64::MIN` (`fieldconfig.h:37`) and treats that value as
+    /// not-putable (`groupsource.cpp:503`). Wire parity therefore
+    /// requires `Option<i32>` here, not a defaulted i32 — a
+    /// member without an explicit `+putorder` must be silently
+    /// dropped from the PUT ordering, NOT written under an
+    /// implicit `0`.
+    pub put_order: Option<i32>,
     /// Optional structure ID for this member (from `+id`).
     pub struct_id: Option<String>,
     /// Constant value for `Const` mapping (from `+value` in JSON).
@@ -313,7 +321,10 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
         }
     };
 
-    let put_order = obj.get("+putorder").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let put_order = obj
+        .get("+putorder")
+        .and_then(|v| v.as_i64())
+        .map(|n| n as i32);
 
     let struct_id = obj
         .get("+id")
@@ -450,7 +461,7 @@ mod tests {
         assert_eq!(temp.channel, "TEMP:ai");
         assert_eq!(temp.mapping, FieldMapping::Scalar);
         assert!(matches!(temp.triggers, TriggerDef::All));
-        assert_eq!(temp.put_order, 0);
+        assert_eq!(temp.put_order, Some(0));
 
         let press = &g.members[1];
         assert_eq!(press.field_name, "pressure");
@@ -476,7 +487,9 @@ mod tests {
         let m = &groups[0].members[0];
         assert_eq!(m.mapping, FieldMapping::Scalar); // default
         assert!(matches!(m.triggers, TriggerDef::All)); // default
-        assert_eq!(m.put_order, 0); // default
+        // BR-R30: missing `+putorder` → `None` (not putable),
+        // mirroring pvxs `fieldconfig.h:37` sentinel.
+        assert_eq!(m.put_order, None);
     }
 
     #[test]

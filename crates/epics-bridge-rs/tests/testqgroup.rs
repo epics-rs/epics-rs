@@ -14,20 +14,24 @@ use epics_base_rs::server::records::longin::LonginRecord;
 use epics_bridge_rs::qsrv::{BridgeProvider, Channel, group::GroupChannel};
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
+// BR-R30: members need `+putorder` to be writable. pvxs's
+// `MappingInfo::putOrder` default is `i64::MIN` → silently
+// not-putable (fieldconfig.h:37 / groupsource.cpp:503). The
+// PUT tests below explicitly opt members in.
 const GROUP_JSON: &str = r#"{
     "TEST:grp": {
         "+id": "epics:nt/NTGroup:1.0",
         "+atomic": true,
-        "level": { "+channel": "TEST:level.VAL", "+type": "plain" },
-        "count": { "+channel": "TEST:count.VAL", "+type": "plain" }
+        "level": { "+channel": "TEST:level.VAL", "+type": "plain", "+putorder": 0 },
+        "count": { "+channel": "TEST:count.VAL", "+type": "plain", "+putorder": 1 }
     }
 }"#;
 
 const GROUP_JSON_NONATOMIC: &str = r#"{
     "TEST:grp_na": {
         "+atomic": false,
-        "level": { "+channel": "TEST:level_na.VAL", "+type": "plain" },
-        "count": { "+channel": "TEST:count_na.VAL", "+type": "plain" }
+        "level": { "+channel": "TEST:level_na.VAL", "+type": "plain", "+putorder": 0 },
+        "count": { "+channel": "TEST:count_na.VAL", "+type": "plain", "+putorder": 1 }
     }
 }"#;
 

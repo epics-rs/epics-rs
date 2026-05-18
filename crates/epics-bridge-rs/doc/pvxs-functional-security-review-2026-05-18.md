@@ -26,6 +26,36 @@
 
 참고: 이 checkout의 `/Users/stevek/codes/pvxs`에는 `p2pApp`/`pva2pva` gateway 소스가 보이지 않는다. 그래서 PVA gateway 항목은 pvxs PVA client/server wire 동작과 Rust gateway 구현을 비교했다.
 
+## Cleared (this round, 2026-05-19)
+
+The following findings have been addressed and are no longer open;
+they are kept in `## Findings` below for historical context, marked
+with a `Status:` line at the top of each. Every cleared item ships
+with a regression test referenced in the commit message.
+
+- BR-R1 (commit 4068559) — QSRV native PVA path preserves client identity (channel cache removed; `_checked` overrides thread `ctx.account`/`ctx.host`).
+- BR-R2 (commit 399d81c) — single-record channels honor `record.FIELD`; field DBF type drives DBR/NT shape.
+- BR-R3 (commit 183fce3) — PUT honors INIT pvRequest `record._options.process` / `block` via `ChannelContext.pv_request`.
+- BR-R5 (commit 9d3b4cc) — MONITOR honors `record._options.DBE` via the same pvRequest channel.
+- BR-R9 (commit 3609a18) — IOC launcher installs `AcfAccessControl` on the QSRV `BridgeProvider`.
+- BR-R16 (commit baabe20) — group GET/PUT honor pvRequest `record._options.atomic`.
+- BR-R17 (commit baabe20) — group PUT performs per-member ACF check; any denial fails the whole PUT.
+- BR-R20 (commit 0eb62a8) — process=passive vs force vs inhibit routed faithfully (`put_pv` vs `put_record_field_from_ca` vs `put_pv + process_record`).
+- BR-R22 (commit 24aca4c) — NTEnum uses `int32` index + `display.description`.
+- BR-R25 (commit c14e17d) — group root meta member `""` flattens `alarm`/`timeStamp` into the group root.
+- BR-R26 (commit 0eb62a8) — group `+const` accepted (with `+value` legacy fallback).
+- BR-R30 (commit 9513a56) — group members without `+putorder` are non-writable (pvxs sentinel).
+- BR-R31 (commit 0eb62a8) — group PUT rejects link-class field targets before any write fires.
+- BR-R32 (commit a1e8bb3) — ACF CALC-gated rule disable surfaces a `WARN` at parse time (still fails closed; loud divergence).
+- BR-R36 (commit 21dde24) — single-record monitor uses VALUE|ALARM + separate PROPERTY subscription.
+- BR-R37 (commit 7c87eb1) — RPC with query args requires WRITE access.
+- BR-R38 (commit 5687a6e) — PVA `PROCESS` actually runs the record's processing chain (rejects on group/native PVA PV).
+- BR-R39 (commit 2b9316a) — decoded MONITOR initial event encodes with pvRequest mask, not `BitSet::all_set`.
+
+Remaining open: BR-R4, R6, R7, R8, R10, R11, R12, R13, R14, R15,
+R18, R19, R21, R23, R24, R27, R28, R29, R33, R34, R35, R40, R41,
+R42, R43, R44 (26 findings).
+
 ## Findings
 
 ### BR-R1. QSRV native PVA path loses client identity and caches anonymous channels

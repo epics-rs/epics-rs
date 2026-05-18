@@ -155,7 +155,26 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
 
         // C CA clients send a zero-length UDP packet for repeater
         // registration (backward compat with pre-3.12 repeaters).
+        //
+        // R2-20: C `register_new_client` (`repeater.cpp:374-424`)
+        // applies the same loopback gate to BOTH the zero-length
+        // legacy form and `CA_PROTO_REPEATER_REGISTER`. Pre-fix
+        // Rust registered any zero-length datagram regardless of
+        // source — a remote host that could reach the repeater
+        // port could become a registered fan-out recipient,
+        // exposing beacon traffic / PV presence outside the local
+        // host and turning local beacon traffic into outbound
+        // sends to the remote. Match C: zero-length registrations
+        // must come from a loopback source too.
         if len == 0 {
+            if !src.ip().is_loopback() {
+                tracing::warn!(
+                    src = %src,
+                    "caRepeater: zero-length registration from non-loopback source rejected"
+                );
+                metrics::counter!("ca_repeater_register_non_loopback_rejects_total").increment(1);
+                continue;
+            }
             register_client_debug(&mut clients, src, debug);
             continue;
         }

@@ -759,17 +759,48 @@ impl CaClient {
         let cid = alloc_cid();
         let (conn_tx, _) = broadcast::channel(16);
 
+        // R2-18: C `cac::createChannel` rejects empty names with
+        // ECA_BADSTR, and `tcpiiu::createChannelRequest` rejects
+        // padded postCnt >= 0xffff with ECA_UNAVAILINSERV before
+        // anything reaches the wire. Pre-fix Rust truncated postsize
+        // via `as u16` and still emitted the full body, producing
+        // malformed UDP SEARCH and TCP CREATE_CHAN frames that could
+        // desynchronise the peer's CA parser. Validate up front; for
+        // invalid inputs register the channel locally (so subscribe /
+        // get / drop don't panic on a missing entry) but skip the
+        // search schedule so nothing reaches the wire. The returned
+        // CaChannel sits in Disconnected and times out naturally
+        // when callers await connect, matching libca's client-side
+        // reject semantic.
+        let padded_len = crate::protocol::pad_string(&pv_name).len();
+        let name_empty = pv_name.is_empty();
+        let name_too_long = padded_len >= 0xFFFF;
+        let valid = !name_empty && !name_too_long;
+        if !valid {
+            tracing::warn!(
+                cid,
+                pv_name = %pv_name,
+                len = pv_name.len(),
+                padded_len,
+                reason = if name_empty { "empty" } else { "too long" },
+                "create_channel: invalid PV name rejected (libca ECA_BADSTR / ECA_UNAVAILINSERV parity); channel will not connect"
+            );
+            metrics::counter!("ca_client_create_channel_rejects_total").increment(1);
+        }
+
         let _ = self.coord_tx.send(CoordRequest::RegisterChannel {
             cid,
             pv_name: pv_name.clone(),
             conn_tx: conn_tx.clone(),
         });
 
-        let _ = self.search_tx.send(SearchRequest::Schedule {
-            cid,
-            pv_name: pv_name.clone(),
-            reason: SearchReason::Initial,
-        });
+        if valid {
+            let _ = self.search_tx.send(SearchRequest::Schedule {
+                cid,
+                pv_name: pv_name.clone(),
+                reason: SearchReason::Initial,
+            });
+        }
 
         let lifecycle = Arc::new(ChannelLifecycle {
             cid,
@@ -1121,6 +1152,59 @@ pub(crate) struct CachedRead {
     pub(crate) data_type: u16,
     pub(crate) element_count: u32,
     pub(crate) slot: types::WarmReplySlot,
+}
+
+/// R2-19: C `nciu::write` (`libca/nciu.cpp`) and its write-callback
+/// overload reject `countIn > this->count` before queueing the
+/// request, surfacing as `ECA_BADCOUNT`. Pre-fix Rust forwarded any
+/// caller-supplied count to the server, which the server would then
+/// reject asynchronously (callback path) or accept past its array
+/// bound (nowait path). Validate client-side so the call fails
+/// synchronously the way libca does.
+fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResult<()> {
+    if count > snap.element_count {
+        return Err(CaError::Protocol(format!(
+            "put count {} exceeds channel element count {} \
+             (matches libca nciu::write ECA_BADCOUNT)",
+            count, snap.element_count
+        )));
+    }
+    Ok(())
+}
+
+/// R2-19: C `nciu::stringVerify` rejects DBR_STRING elements that
+/// exceed `MAX_STRING_SIZE` (40 bytes including the NUL terminator)
+/// with `ECA_STRTOBIG`. Pre-fix Rust silently truncated long strings
+/// to 39 bytes + NUL inside `EpicsValue::to_bytes()`, so a
+/// `put_string()` could write a different value than the caller
+/// supplied. Validate up front so the call fails synchronously.
+const MAX_STRING_SIZE: usize = 40;
+fn validate_string_length(s: &str) -> CaResult<()> {
+    // C requires room for the trailing NUL: payload >= s.len() + 1.
+    if s.len() >= MAX_STRING_SIZE {
+        return Err(CaError::Protocol(format!(
+            "string of {} bytes exceeds MAX_STRING_SIZE - 1 = 39 \
+             (matches libca nciu::stringVerify ECA_STRTOBIG)",
+            s.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Reject any DBR_STRING / DBR_STRING_ARRAY element in `value` that
+/// exceeds the libca string cap. Scalar / numeric variants pass
+/// through unchanged.
+fn validate_put_strings(value: &EpicsValue) -> CaResult<()> {
+    match value {
+        EpicsValue::String(s) => validate_string_length(s),
+        EpicsValue::StringArray(arr) => {
+            for s in arr {
+                validate_string_length(s)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 #[derive(Clone)]
@@ -1827,6 +1911,12 @@ impl CaChannel {
 
     pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
+        // R2-19: C `nciu::write` rejects countIn > channel count with
+        // ECA_BADCOUNT before queueing the request. Pre-fix Rust sent
+        // an oversized write that the server would either accept past
+        // its array bound or reject asynchronously.
+        validate_put_count(&snap, value.count())?;
+        validate_put_strings(value)?;
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1856,6 +1946,8 @@ impl CaChannel {
     /// Write with completion callback and configurable timeout.
     pub async fn put_with_timeout(&self, value: &EpicsValue, timeout: Duration) -> CaResult<()> {
         let snap = self.snapshot()?;
+        validate_put_count(&snap, value.count())?;
+        validate_put_strings(value)?;
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1883,6 +1975,8 @@ impl CaChannel {
     /// which monitors DMOV for completion instead.
     pub async fn put_nowait(&self, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
+        validate_put_count(&snap, value.count())?;
+        validate_put_strings(value)?;
 
         let payload = value.to_bytes();
         let count = value.count() as u32;
@@ -1907,6 +2001,8 @@ impl CaChannel {
     /// writing longer strings should expect silent truncation.
     pub async fn put_string(&self, value: &str) -> CaResult<()> {
         let snap = self.snapshot()?;
+        validate_put_count(&snap, 1)?;
+        validate_string_length(value)?;
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1935,6 +2031,8 @@ impl CaChannel {
     /// server acknowledgement.
     pub async fn put_string_nowait(&self, value: &str) -> CaResult<()> {
         let snap = self.snapshot()?;
+        validate_put_count(&snap, 1)?;
+        validate_string_length(value)?;
         let payload = EpicsValue::String(value.to_string()).to_bytes();
         self.send_write_nowait_fast(&snap, 0, 1, payload)
     }
@@ -1950,6 +2048,10 @@ impl CaChannel {
     /// [`Self::put_string`].
     pub async fn put_string_array(&self, values: &[String]) -> CaResult<()> {
         let snap = self.snapshot()?;
+        validate_put_count(&snap, values.len() as u32)?;
+        for s in values {
+            validate_string_length(s)?;
+        }
 
         let ioid = alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1977,6 +2079,10 @@ impl CaChannel {
     /// Fire-and-forget variant of [`Self::put_string_array`].
     pub async fn put_string_array_nowait(&self, values: &[String]) -> CaResult<()> {
         let snap = self.snapshot()?;
+        validate_put_count(&snap, values.len() as u32)?;
+        for s in values {
+            validate_string_length(s)?;
+        }
         let payload = EpicsValue::StringArray(values.to_vec()).to_bytes();
         let count = values.len() as u32;
         self.send_write_nowait_fast(&snap, 0, count, payload)

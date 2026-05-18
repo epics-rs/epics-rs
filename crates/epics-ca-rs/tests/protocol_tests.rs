@@ -976,7 +976,8 @@ async fn server_event_cancel_unknown_sid_closes_silently() {
         .expect("server did not close after EVENT_CANCEL bad-SID")
         .expect("read after bad-SID cancel");
     assert_eq!(
-        n, 0,
+        n,
+        0,
         "EVENT_CANCEL with unknown SID must elicit a silent close \
          (matches C event_cancel_reply logBadId); got {n} bytes: {:02x?}",
         &resp[..n]

@@ -116,15 +116,21 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
 /// Convert a Snapshot into an NTEnum PvStructure.
 ///
 /// Structure ID: `epics:nt/NTEnum:1.0`
-/// Fields: value{index, choices}, alarm, timeStamp
+/// Fields: value{index, choices}, alarm, timeStamp, display{description}
+///
+/// BR-R22: pvxs's QSRV NTEnum (testqsingle.cpp:174) uses
+/// `value.index int32_t` (not ushort) and includes a trailing
+/// `display.description` field. Aligning the runtime shape and
+/// descriptor with that prevents pvxs clients from seeing
+/// a wrong-type index and missing the description field.
 pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTEnum:1.0");
 
     // value sub-structure with index + choices
     let index = match &snapshot.value {
-        EpicsValue::Enum(v) => *v,
-        EpicsValue::Short(v) => *v as u16,
-        other => other.to_f64().map(|f| f as u16).unwrap_or(0),
+        EpicsValue::Enum(v) => *v as i32,
+        EpicsValue::Short(v) => *v as i32,
+        other => other.to_f64().map(|f| f as i32).unwrap_or(0),
     };
 
     let choices: Vec<ScalarValue> = snapshot
@@ -141,7 +147,7 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
     let mut value_struct = PvStructure::new("enum_t");
     value_struct
         .fields
-        .push(("index".into(), PvField::Scalar(ScalarValue::UShort(index))));
+        .push(("index".into(), PvField::Scalar(ScalarValue::Int(index))));
     value_struct
         .fields
         .push(("choices".into(), PvField::ScalarArray(choices)));
@@ -154,6 +160,23 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
         "timeStamp".into(),
         PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
     ));
+    // BR-R22: trailing `display.description` is part of pvxs's
+    // QSRV NTEnum shape; populate from the DESC field when
+    // available, otherwise emit an empty string so the field
+    // is present (pvxs always emits the leaf).
+    let mut display = PvStructure::new("");
+    display.fields.push((
+        "description".into(),
+        PvField::Scalar(ScalarValue::String(
+            snapshot
+                .display
+                .as_ref()
+                .map(|d| d.description.clone())
+                .unwrap_or_default(),
+        )),
+    ));
+    pv.fields
+        .push(("display".into(), PvField::Structure(display)));
 
     pv
 }
@@ -327,6 +350,10 @@ pub fn build_nt_scalar_desc(scalar_type: ScalarType) -> FieldDesc {
 }
 
 /// Build a PVA FieldDesc for an NTEnum.
+///
+/// BR-R22: `value.index` is `Int` (matches pvxs QSRV
+/// `testqsingle.cpp:174` `value.index int32_t`); the shape
+/// includes a trailing `display.description` field.
 pub fn build_nt_enum_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTEnum:1.0".into(),
@@ -336,13 +363,20 @@ pub fn build_nt_enum_desc() -> FieldDesc {
                 FieldDesc::Structure {
                     struct_id: "enum_t".into(),
                     fields: vec![
-                        ("index".into(), FieldDesc::Scalar(ScalarType::UShort)),
+                        ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
                     ],
                 },
             ),
             ("alarm".into(), alarm_desc()),
             ("timeStamp".into(), timestamp_desc()),
+            (
+                "display".into(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![("description".into(), FieldDesc::Scalar(ScalarType::String))],
+                },
+            ),
         ],
     }
 }
@@ -698,6 +732,8 @@ mod tests {
         }
     }
 
+    /// BR-R22: pvxs QSRV NTEnum uses int32_t index +
+    /// `display.description` (testqsingle.cpp:174).
     #[test]
     fn nt_enum_structure() {
         let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, UNIX_EPOCH);
@@ -707,12 +743,14 @@ mod tests {
         let pv = snapshot_to_nt_enum(&snap);
 
         assert_eq!(pv.struct_id, "epics:nt/NTEnum:1.0");
-        // value is a sub-structure
         if let Some(PvField::Structure(val)) = pv.get_field("value") {
-            if let Some(PvField::Scalar(ScalarValue::UShort(idx))) = val.get_field("index") {
+            if let Some(PvField::Scalar(ScalarValue::Int(idx))) = val.get_field("index") {
                 assert_eq!(*idx, 1);
             } else {
-                panic!("expected index scalar");
+                panic!(
+                    "expected int32_t index scalar, got {:?}",
+                    val.get_field("index")
+                );
             }
             if let Some(PvField::ScalarArray(choices)) = val.get_field("choices") {
                 assert_eq!(choices.len(), 2);
@@ -721,6 +759,19 @@ mod tests {
             }
         } else {
             panic!("expected value structure");
+        }
+
+        // BR-R22: display.description is part of pvxs's NTEnum shape.
+        if let Some(PvField::Structure(d)) = pv.get_field("display") {
+            assert!(
+                matches!(
+                    d.get_field("description"),
+                    Some(PvField::Scalar(ScalarValue::String(_)))
+                ),
+                "expected display.description string"
+            );
+        } else {
+            panic!("expected display structure");
         }
     }
 
@@ -856,10 +907,13 @@ mod tests {
         }
     }
 
+    /// BR-R22: descriptor uses Int (not UShort) for `value.index`
+    /// and includes a trailing `display.description` leaf.
     #[test]
-    fn field_desc_nt_enum_index_ushort() {
+    fn field_desc_nt_enum_index_int() {
         let desc = build_nt_enum_desc();
         if let FieldDesc::Structure { fields, .. } = &desc {
+            // value.index = Int32
             if let Some((
                 _,
                 FieldDesc::Structure {
@@ -868,15 +922,32 @@ mod tests {
             )) = fields.iter().find(|(n, _)| n == "value")
             {
                 let index_field = val_fields.iter().find(|(n, _)| n == "index");
-                assert!(matches!(
-                    index_field,
-                    Some((_, FieldDesc::Scalar(ScalarType::UShort)))
-                ));
+                assert!(
+                    matches!(index_field, Some((_, FieldDesc::Scalar(ScalarType::Int)))),
+                    "expected NTEnum value.index Int32, got {index_field:?}"
+                );
             } else {
                 panic!("expected value structure");
             }
+            // display.description = String
+            if let Some((
+                _,
+                FieldDesc::Structure {
+                    fields: disp_fields,
+                    ..
+                },
+            )) = fields.iter().find(|(n, _)| n == "display")
+            {
+                let desc_field = disp_fields.iter().find(|(n, _)| n == "description");
+                assert!(
+                    matches!(desc_field, Some((_, FieldDesc::Scalar(ScalarType::String)))),
+                    "expected display.description String"
+                );
+            } else {
+                panic!("expected display sub-structure");
+            }
         } else {
-            panic!("expected structure");
+            panic!("expected NTEnum top-level structure");
         }
     }
 }

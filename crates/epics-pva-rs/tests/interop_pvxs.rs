@@ -64,5 +64,8 @@ mod rpc_and_get_field;
 #[path = "interop_pvxs_mods/tcp_search_r11.rs"]
 mod tcp_search_r11;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/tls_interop.rs"]
+mod tls_interop;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/type_cache.rs"]
 mod type_cache;

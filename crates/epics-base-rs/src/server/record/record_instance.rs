@@ -339,7 +339,46 @@ impl RecordInstance {
         // Common-field enum mapping (e.g. .SCAN choices) is field-specific
         // and not part of the per-record cache.
         self.populate_common_enum_info(field, &mut snap);
+
+        // BR-R35: apply `info(Q:time:tag, "nsec:lsb:N")` — pvxs
+        // typeutils.cpp:79 splits the low N bits of the timestamp's
+        // nanoseconds into `timeStamp.userTag` and clears those bits
+        // from `nanoseconds`. Standard pvxs convention is `nsec:lsb:N`
+        // with N in 1..=30; values outside that range are ignored to
+        // match pvxs's bounds clamp. The split is applied to both
+        // `snap.timestamp` and `snap.user_tag` so downstream encoders
+        // (NTScalar `timeStamp`, QSRV groups via `+nsecmask`) all see
+        // the same shape.
+        if let Some(n) = self.parse_qtime_tag_nsec_lsb() {
+            crate::server::snapshot::apply_nsec_lsb_split(&mut snap, n);
+        }
+
         Some(snap)
+    }
+
+    /// BR-R35: parse `info(Q:time:tag, "nsec:lsb:N")` and return `N`.
+    /// Returns `None` when the info tag is absent or malformed (pvxs
+    /// silently ignores bad values; we match that by returning None
+    /// so the timestamp is emitted unchanged).
+    fn parse_qtime_tag_nsec_lsb(&self) -> Option<u8> {
+        let raw = self.get_info("Q:time:tag")?;
+        // Accept `nsec:lsb:N` with arbitrary whitespace and case.
+        let mut parts = raw.split(':');
+        let key = parts.next()?.trim();
+        let suffix = parts.next()?.trim();
+        let n = parts.next()?.trim();
+        if !key.eq_ignore_ascii_case("nsec") || !suffix.eq_ignore_ascii_case("lsb") {
+            return None;
+        }
+        let n: u32 = n.parse().ok()?;
+        // pvxs clamps to [1, 30]; values outside leave the timestamp
+        // alone (the userTag is meaningful only with a non-trivial
+        // mask, and >30 would consume all nanoseconds).
+        if (1..=30).contains(&n) {
+            Some(n as u8)
+        } else {
+            None
+        }
     }
 
     /// Populate DisplayInfo from record fields if applicable.

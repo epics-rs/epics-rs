@@ -71,6 +71,36 @@ pub struct Snapshot {
     pub class_name: Option<String>,
 }
 
+/// BR-R35: extract the low `n` bits of `snap.timestamp.nanoseconds`
+/// into `snap.user_tag` and zero those bits in the timestamp.
+///
+/// Mirrors pvxs `iocsource.cpp:240` — for a record with
+/// `info(Q:time:tag, "nsec:lsb:N")`, the IOC publishes the timestamp
+/// with the low N nanosecond bits stripped into `timeStamp.userTag`,
+/// which clients use as a pulse-id / event-id. With N=20 (typical),
+/// `nanoseconds` keeps wall-clock precision down to ~1µs while the
+/// userTag carries a 20-bit event id.
+///
+/// `n` must be in `1..=30`; callers parse the info value and clamp
+/// before reaching this helper (out-of-range is a no-op at the
+/// caller site).
+pub fn apply_nsec_lsb_split(snap: &mut Snapshot, n: u8) {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    debug_assert!((1..=30).contains(&n));
+    let dur = match snap.timestamp.duration_since(UNIX_EPOCH) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let secs = dur.as_secs();
+    let nanos = dur.subsec_nanos();
+    let mask = (1u32 << n) - 1;
+    let user_tag_bits = nanos & mask;
+    let cleared_nanos = nanos & !mask;
+    snap.user_tag = user_tag_bits as i32;
+    snap.timestamp = UNIX_EPOCH + Duration::new(secs, cleared_nanos);
+}
+
 impl Snapshot {
     /// Create a new snapshot with minimal metadata (no display/control/enum info).
     pub fn new(value: EpicsValue, status: u16, severity: u16, timestamp: SystemTime) -> Self {
@@ -119,6 +149,37 @@ impl DbrClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BR-R35: with N=20, the low 20 nanosecond bits land in userTag
+    /// and are cleared from the timestamp. Use a known nanosecond
+    /// value so the bit math is easy to verify.
+    #[test]
+    fn nsec_lsb_split_extracts_user_tag() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let nanos: u32 = 123_456_789; // 0x075BCD15 — sub-second
+        let ts = UNIX_EPOCH + Duration::new(42, nanos);
+        let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, ts);
+        apply_nsec_lsb_split(&mut snap, 20);
+        let mask: u32 = (1 << 20) - 1;
+        let expected_user_tag = (nanos & mask) as i32;
+        let expected_nanos = nanos & !mask;
+        assert_eq!(snap.user_tag, expected_user_tag);
+        let dur = snap.timestamp.duration_since(UNIX_EPOCH).unwrap();
+        assert_eq!(dur.as_secs(), 42);
+        assert_eq!(dur.subsec_nanos(), expected_nanos);
+    }
+
+    /// BR-R35: N=1 splits the single LSB into the userTag.
+    #[test]
+    fn nsec_lsb_split_n1_keeps_high_bits() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let ts = UNIX_EPOCH + Duration::new(0, 7); // ...0111
+        let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, ts);
+        apply_nsec_lsb_split(&mut snap, 1);
+        assert_eq!(snap.user_tag, 1);
+        let dur = snap.timestamp.duration_since(UNIX_EPOCH).unwrap();
+        assert_eq!(dur.subsec_nanos(), 6);
+    }
 
     #[test]
     fn test_snapshot_construction() {

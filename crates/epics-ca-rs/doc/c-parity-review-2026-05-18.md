@@ -1221,3 +1221,17 @@ isolated subnet no longer leaks beacons onto unrelated networks.
   Two HIGH-severity items: R2-76 (silent invalid-config startup) and
   R2-84 (caPutLog AfterWrite fires before async completion). The audit
   found zero re-reports of R2-1..R2-63 findings.
+- 2026-05-18: Fixed all 24 R2-64..R2-91 findings in three batches:
+  client R2-64..R2-69 (commit 902612c — pending_access observability +
+  multiply-defined PV detection rewired through ECA_DBLCHNL),
+  listener/ASG R2-84..R2-91 (commit 5b05abd — TrapWriteMessage
+  extended with dbr_type/no_elements/event_id, async AfterWrite
+  threading, panic-safe dispatch, snapshot-then-call lock pattern,
+  ASG forwarder spawned into accept_tasks, put_pv family ASG
+  notifier), server UDP/mcast/beacon R2-74..R2-83 (commit 7b307f3 —
+  per-NIC mcast joins, hard-error mixed-0.0.0.0+specific config,
+  P2P ifa_dstaddr fallback, beacon IP_MULTICAST_LOOP, cross-inbound
+  UDP recv batching, always-seeded VERSION placeholder with
+  flush-time strip/fill, send_to failure logging,
+  UDP_FLUSH_THRESHOLD=1024). Full-workspace regression: 4584/4584
+  pass, clippy clean, doctests pass.

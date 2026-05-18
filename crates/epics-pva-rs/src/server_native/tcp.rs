@@ -2451,15 +2451,17 @@ async fn handle_op(
             true
         };
 
-        // BR-R3: stash the PUT INIT pvRequest so the data-phase PUT
-        // can forward it through `ChannelContext.pv_request`. Only
-        // worth the clone for PUT — GET / MONITOR / RPC read no
-        // per-operation options from this value beyond what was
-        // already consumed for mask/pipeline/filter parsing above.
-        let stashed_pv_request = if kind == OpKind::Put {
-            req_value.clone()
-        } else {
-            None
+        // BR-R3 / BR-R5: stash the INIT pvRequest so the data-phase
+        // dispatch can forward it through `ChannelContext.pv_request`.
+        // PUT needs `record._options.process|block`; MONITOR needs
+        // `record._options.DBE` (and other per-op stream tuning that
+        // wasn't already consumed for mask/pipeline/filter parsing).
+        // GET / RPC don't read per-op options from this value beyond
+        // what was already extracted, so we don't pay the clone for
+        // those kinds.
+        let stashed_pv_request = match kind {
+            OpKind::Put | OpKind::Monitor => req_value.clone(),
+            _ => None,
         };
 
         ch.ops.insert(
@@ -2892,13 +2894,19 @@ async fn handle_op(
                 // so the spawned task can consult ctx-aware
                 // subscribe/get_value paths. Sources without ACF
                 // delegate to the legacy methods.
+                // BR-R5: forward the INIT pvRequest so the source can
+                // honor `record._options.DBE` (per-op database event-
+                // mask selection — pvxs singlesource.cpp:115). Like
+                // BR-R3 for PUT, the data-phase START/ACK frames are
+                // pure stream control; per-operation options live in
+                // the INIT pvRequest only.
                 let mon_ctx = crate::server_native::source::ChannelContext {
                     peer,
                     account: cred.account.clone(),
                     method: cred.method.clone(),
                     host: cred.host.clone(),
                     authority: cred.authority.clone(),
-                    pv_request: None,
+                    pv_request: init_pv_request.clone(),
                 };
                 // Round 42 + R49-G1: type-state MONITOR gate.
                 //

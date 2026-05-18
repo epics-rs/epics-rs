@@ -53,6 +53,64 @@ impl Default for PutOptions {
     }
 }
 
+/// BR-R5: parse `record._options.DBE` from a MONITOR INIT
+/// pvRequest. Returns the DBE bitmask as an EPICS event mask
+/// (`EventMask::VALUE | ALARM | LOG | PROPERTY`), or `None` if
+/// the option is absent / unparseable.
+///
+/// pvxs accepts a flag string with any of these tokens separated by
+/// `|`, `,`, or whitespace: `VALUE`, `ALARM`, `LOG`/`ARCHIVE`,
+/// `PROPERTY`. Numeric form is also accepted (e.g. `"5"` =
+/// `VALUE|ALARM`).
+pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
+    use epics_base_rs::server::recgbl::EventMask;
+
+    let options = request
+        .get_field("record")
+        .and_then(|f| match f {
+            PvField::Structure(s) => s.get_field("_options"),
+            _ => None,
+        })
+        .and_then(|f| match f {
+            PvField::Structure(s) => Some(s),
+            _ => None,
+        })?;
+
+    let dbe = options.get_field("DBE")?;
+    let raw = match dbe {
+        PvField::Scalar(ScalarValue::String(s)) => s.clone(),
+        PvField::Scalar(ScalarValue::Int(n)) => return Some((*n as u32 & 0xFFFF) as u16),
+        PvField::Scalar(ScalarValue::Long(n)) => return Some((*n as u32 & 0xFFFF) as u16),
+        _ => return None,
+    };
+
+    // Numeric-as-string: `"5"` resolves to a raw mask.
+    if let Ok(n) = raw.trim().parse::<u32>() {
+        return Some((n & 0xFFFF) as u16);
+    }
+
+    let mut mask = EventMask::NONE;
+    for tok in raw.split(|c: char| c == '|' || c == ',' || c.is_whitespace()) {
+        let t = tok.trim().to_ascii_uppercase();
+        let t = t.strip_prefix("DBE_").unwrap_or(&t);
+        match t {
+            "" => continue,
+            "VALUE" => mask |= EventMask::VALUE,
+            "ALARM" => mask |= EventMask::ALARM,
+            // pvxs accepts both LOG and ARCHIVE for the legacy DBE_LOG bit.
+            "LOG" | "ARCHIVE" => mask |= EventMask::LOG,
+            "PROPERTY" => mask |= EventMask::PROPERTY,
+            _ => return None,
+        }
+    }
+
+    if mask.is_empty() {
+        None
+    } else {
+        Some(mask.bits())
+    }
+}
+
 impl PutOptions {
     /// Extract process/block options from a PvStructure.
     ///
@@ -360,6 +418,19 @@ impl Channel for BridgeChannel {
     }
 
     async fn create_monitor(&self) -> BridgeResult<super::group::AnyMonitor> {
+        self.create_monitor_with_value_mask(None).await
+    }
+}
+
+impl BridgeChannel {
+    /// BR-R5: create a monitor with an explicit value-subscription DBE
+    /// mask. Called by `QsrvPvStore::subscribe_checked` after parsing
+    /// `record._options.DBE` from the MONITOR INIT pvRequest. `None`
+    /// uses the pvxs-parity default (`VALUE | ALARM`).
+    pub async fn create_monitor_with_value_mask(
+        &self,
+        value_mask: Option<u16>,
+    ) -> BridgeResult<super::group::AnyMonitor> {
         // Check read permission up front so a denied client cannot
         // even obtain a monitor handle. start() also re-checks (defense
         // in depth: handles created via with_access elsewhere).
@@ -369,15 +440,17 @@ impl Channel for BridgeChannel {
                 self.pv_name, self.access.user, self.access.host
             )));
         }
-        Ok(super::group::AnyMonitor::Single(Box::new(
-            BridgeMonitor::new(
-                self.db.clone(),
-                self.record_name.clone(),
-                self.field.clone(),
-                self.nt_type,
-            )
-            .with_access(self.access.clone()),
-        )))
+        let mut monitor = BridgeMonitor::new(
+            self.db.clone(),
+            self.record_name.clone(),
+            self.field.clone(),
+            self.nt_type,
+        )
+        .with_access(self.access.clone());
+        if let Some(mask) = value_mask {
+            monitor = monitor.with_value_mask(mask);
+        }
+        Ok(super::group::AnyMonitor::Single(Box::new(monitor)))
     }
 }
 
@@ -448,5 +521,60 @@ mod tests {
         let opts = PutOptions::from_pv_request(&req);
         assert_eq!(opts.process, ProcessMode::Inhibit);
         assert!(!opts.block); // block disabled when process=false
+    }
+
+    fn req_with_dbe(value: PvField) -> PvStructure {
+        let mut options = PvStructure::new("");
+        options.fields.push(("DBE".into(), value));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        req
+    }
+
+    /// BR-R5: pvxs-style flag string with `|`-separated tokens
+    /// resolves to the corresponding EPICS event mask bits.
+    #[test]
+    fn dbe_mask_parses_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String(
+            "VALUE | ALARM".into(),
+        )));
+        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// BR-R5: `DBE_` prefix and `ARCHIVE` alias for LOG are accepted.
+    #[test]
+    fn dbe_mask_accepts_dbe_prefix_and_archive_alias() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String(
+            "DBE_VALUE,DBE_ARCHIVE,PROPERTY".into(),
+        )));
+        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        assert_eq!(
+            mask,
+            (EventMask::VALUE | EventMask::LOG | EventMask::PROPERTY).bits()
+        );
+    }
+
+    /// BR-R5: numeric integer DBE option is accepted as the raw mask.
+    #[test]
+    fn dbe_mask_accepts_integer_form() {
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(5)));
+        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        assert_eq!(mask, 5);
+    }
+
+    /// BR-R5: missing DBE option resolves to None so the monitor
+    /// falls back to the pvxs-parity default mask.
+    #[test]
+    fn dbe_mask_absent_returns_none() {
+        let req = PvStructure::new("request");
+        assert!(dbe_mask_from_pv_request(&req).is_none());
     }
 }

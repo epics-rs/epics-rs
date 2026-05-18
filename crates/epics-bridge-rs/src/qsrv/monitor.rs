@@ -49,6 +49,11 @@ pub struct BridgeMonitor {
     /// Without the second subscription, downstream PVA clients never see
     /// EGU / HOPR / LOPR / enum-string updates pushed through a monitor.
     property_subscription: Option<DbSubscription>,
+    /// BR-R5: override mask for the value subscription. `None` means
+    /// "use the pvxs-parity default VALUE|ALARM" (per BR-R36). Set by
+    /// `with_value_mask` when the client provides
+    /// `record._options.DBE` in the INIT pvRequest.
+    value_mask_override: Option<u16>,
     running: bool,
     /// Initial complete snapshot sent on first poll() after start().
     initial_snapshot: Option<PvStructure>,
@@ -67,6 +72,7 @@ impl BridgeMonitor {
             nt_type,
             subscription: None,
             property_subscription: None,
+            value_mask_override: None,
             running: false,
             initial_snapshot: None,
             overflow_count: Arc::new(AtomicU64::new(0)),
@@ -79,6 +85,19 @@ impl BridgeMonitor {
     /// into the monitor.
     pub fn with_access(mut self, access: AccessContext) -> Self {
         self.access = access;
+        self
+    }
+
+    /// BR-R5: override the value-subscription DBE mask.
+    ///
+    /// pvxs reads `record._options.DBE` from the MONITOR INIT
+    /// pvRequest (singlesource.cpp:115). The wire layer extracts that
+    /// option in `QsrvPvStore::subscribe_checked` and calls this
+    /// builder before `start()`. `None` leaves the pvxs-parity
+    /// default (`VALUE | ALARM`) in place; `Some(mask)` substitutes
+    /// the client-selected mask.
+    pub fn with_value_mask(mut self, mask: u16) -> Self {
+        self.value_mask_override = Some(mask);
         self
     }
 
@@ -115,8 +134,10 @@ impl PvaMonitor for BridgeMonitor {
         // `record.FIELD` binds the subscriber slot to that field's
         // subscribers vector.
         let pv_name = format!("{}.{}", self.record_name, self.field);
-        let value_alarm_mask = (EventMask::VALUE | EventMask::ALARM).bits();
-        let sub = DbSubscription::subscribe_with_mask(&self.db, &pv_name, 0, value_alarm_mask)
+        let value_mask = self
+            .value_mask_override
+            .unwrap_or_else(|| (EventMask::VALUE | EventMask::ALARM).bits());
+        let sub = DbSubscription::subscribe_with_mask(&self.db, &pv_name, 0, value_mask)
             .await
             .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 

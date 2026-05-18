@@ -408,7 +408,23 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 .create_channel_for(&name, &ctx.account, &ctx.host)
                 .await
                 .ok()?;
-            let mut monitor = channel.create_monitor().await.ok()?;
+            // BR-R5: honor `record._options.DBE` from the MONITOR INIT
+            // pvRequest. Single-record channels route through
+            // `BridgeChannel::create_monitor_with_value_mask`; group
+            // and pva_pv-registered channels fall through to the
+            // default mask (their DBE selection is not yet wired).
+            let dbe_mask = match ctx.pv_request {
+                Some(PvField::Structure(ref req)) => {
+                    crate::qsrv::channel::dbe_mask_from_pv_request(req)
+                }
+                _ => None,
+            };
+            let mut monitor = match channel {
+                crate::qsrv::AnyChannel::Single(single) => {
+                    single.create_monitor_with_value_mask(dbe_mask).await.ok()?
+                }
+                other => other.create_monitor().await.ok()?,
+            };
             monitor.start().await.ok()?;
             let (tx, rx) = mpsc::channel::<PvField>(64);
             tokio::spawn(async move {

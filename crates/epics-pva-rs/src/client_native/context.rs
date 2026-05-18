@@ -1187,8 +1187,18 @@ impl PvaClient {
                 for &wi in indices {
                     let req = &warm_reqs[wi];
                     req.warm.slot.lock().take();
-                    // Replace with a closed-error placeholder; we'll
-                    // skip the await for these.
+                    // PVA-R27: the cached warm GET this `warm` was
+                    // taken from already became stale (server send
+                    // failed). Restoring it later would re-use the
+                    // dead (sid, ioid) on the next pvget_many call.
+                    // Mark the cache as gone here so the loop below
+                    // skips the restore. Mirror pvxs `clientget.cpp:
+                    // 188-200`: on send failure, clear the reusable
+                    // slot so the next call falls back to a cold
+                    // INIT.
+                    let _ = req.warm.server.upgrade().map(|srv| {
+                        srv.unregister_ioid(req.warm.ioid);
+                    });
                     results[req.idx] = Err(PvaError::Protocol("server send failed".into()));
                 }
             }
@@ -1210,9 +1220,11 @@ impl PvaClient {
                 rx,
                 intro,
             } = req;
-            // Skip await if Phase 2 already marked this server failed.
+            // PVA-R27: skip await + DO NOT restore cache for already-
+            // failed warm reqs. Pre-fix restored the cache after
+            // Phase-2 send failure, so the next pvget_many call
+            // reused the (sid, ioid) that just failed.
             if results[idx].is_err() {
-                *channel.cached_get.lock() = Some(warm);
                 continue;
             }
             let frame_res = tokio::time::timeout(op_timeout, rx).await;
@@ -1230,8 +1242,27 @@ impl PvaClient {
                 Ok(Err(_)) => Err(PvaError::Protocol("warm GET channel closed".into())),
                 Err(_) => Err(PvaError::Timeout),
             };
-            // Restore cache so the next call also takes the batched path.
-            *channel.cached_get.lock() = Some(warm);
+            // PVA-R27: only restore cache on a successful DATA
+            // response. Pre-fix Rust restored after timeout, decode
+            // error, wrong response kind, channel-closed one-shot,
+            // and non-success GET status — leaking dead (sid, ioid)
+            // reuses. Matches pvxs `clientget.cpp:188-200` which
+            // sends DestroyRequest + erases IOID maps on cancel /
+            // implicit abandon.
+            if value.is_ok() {
+                *channel.cached_get.lock() = Some(warm);
+            } else {
+                // Tear down the abandoned (sid, ioid) — best effort.
+                let order = warm.server.upgrade().map(|srv| srv.byte_order);
+                if let (Some(srv), Some(order)) = (warm.server.upgrade(), order) {
+                    let codec = crate::codec::PvaCodec {
+                        big_endian: matches!(order, crate::proto::ByteOrder::Big),
+                    };
+                    let dr = codec.build_destroy_request(warm.sid, warm.ioid);
+                    let _ = srv.send_sync(dr);
+                    srv.unregister_ioid(warm.ioid);
+                }
+            }
             results[idx] = value;
         }
 

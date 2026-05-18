@@ -203,6 +203,7 @@ async fn op_get_inner(
             // Refill the slot with a fresh oneshot, send GET, await
             // single response. If anything goes wrong we fall through
             // to the cold path which re-establishes the cache.
+            let warm_ioid = warm.ioid;
             match try_warm_get(&server, &codec, &warm, op_timeout).await {
                 Ok(Some(pv)) => {
                     // Re-cache so the next call also takes the fast path.
@@ -210,6 +211,21 @@ async fn op_get_inner(
                     return Ok(((*pv.0).clone(), pv.1));
                 }
                 Ok(None) | Err(_) => {
+                    // PVA-R12: warm-GET failure abandoned the cached
+                    // (sid, ioid) without cleanup. The server's
+                    // per-channel op slot for that IOID stayed alive
+                    // until TCP close, and the per-circuit Reusable
+                    // routing slot lingered in `by_ioid`. Repeated
+                    // warm failures could thus push the server's per-
+                    // channel op cap. Mirror pvxs `clientget.cpp:
+                    // 188-200` — send DESTROY_REQUEST and unregister
+                    // the IOID before the cold INIT allocates a new
+                    // one.
+                    let order = server.byte_order;
+                    let dr = codec.build_destroy_request(sid, warm_ioid);
+                    let _ = server.send(dr).await;
+                    server.unregister_ioid(warm_ioid);
+                    let _ = order;
                     // Cache stale (server forgot ioid, channel reset, etc.).
                     // Fall through to cold path; do NOT restore the cache
                     // — the next cold success will refill it.

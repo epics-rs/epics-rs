@@ -314,6 +314,24 @@ async fn recv_loop(
         // the older non-flagged form; the reply VERSION then carries
         // the default zero seq with the flag cleared.
         let mut client_seq: Option<u32> = None;
+        // R2-48: accumulator for the single outbound datagram. C
+        // `rsrv/cast_server.c:163-281` + `caserverio.c:185-201` reuse
+        // one send buffer across all SEARCH matches in a single inbound
+        // datagram and flush once via `cas_send_dg_msg` — N matches in
+        // a chained SEARCH yield ONE outbound datagram, not N. Pre-fix
+        // Rust called `send_to` per match (N× IP/sendto overhead and
+        // amplification in search storms). Flush at MTU and once at
+        // end-of-datagram. The VERSION placeholder (when
+        // `CA_V411(client_minor)`, i.e. client_seq.is_some()) is
+        // prepended once on first match and re-prepended after every
+        // MTU flush, matching `cas_send_dg_msg`'s placeholder re-seed.
+        let mut send_buf: Vec<u8> = Vec::new();
+        // Conservative IPv4 UDP datagram payload limit. 1472 leaves
+        // headroom for IPv4+UDP headers under a 1500-byte MTU; C uses
+        // `MAX_UDP_SEND` from osi/osiSock.h (1024 in epics-base today,
+        // similarly conservative). Flush when the next reply would
+        // exceed this.
+        const UDP_FLUSH_THRESHOLD: usize = 1472;
         while offset + CaHeader::SIZE <= len {
             let hdr = match CaHeader::from_bytes(&buf[offset..]) {
                 Ok(h) => h,
@@ -487,16 +505,28 @@ async fn recv_loop(
                             ver.data_type = 1;
                         }
 
-                        let mut reply = Vec::with_capacity(CaHeader::SIZE * 2 + 8);
-                        if include_version {
-                            reply.extend_from_slice(&ver.to_bytes());
-                        }
-                        reply.extend_from_slice(&resp.to_bytes());
+                        let resp_bytes = resp.to_bytes();
                         let mut search_payload = [0u8; 8];
                         search_payload[0..2].copy_from_slice(&CA_MINOR_VERSION.to_be_bytes());
-                        reply.extend_from_slice(&search_payload);
 
-                        let _ = socket.send_to(&reply, src).await;
+                        // R2-48: accumulate into send_buf rather than
+                        // dispatching one datagram per match. Flush
+                        // before append if adding this reply would push
+                        // us over the UDP MTU threshold; re-seed the
+                        // VERSION placeholder after each flush
+                        // (`cas_send_dg_msg` does the same).
+                        const SEARCH_REPLY_LEN: usize = CaHeader::SIZE + 8;
+                        if !send_buf.is_empty()
+                            && send_buf.len() + SEARCH_REPLY_LEN > UDP_FLUSH_THRESHOLD
+                        {
+                            let _ = socket.send_to(&send_buf, src).await;
+                            send_buf.clear();
+                        }
+                        if send_buf.is_empty() && include_version {
+                            send_buf.extend_from_slice(&ver.to_bytes());
+                        }
+                        send_buf.extend_from_slice(&resp_bytes);
+                        send_buf.extend_from_slice(&search_payload);
                     }
                     // C parity: `search_reply_udp` (rsrv/camessage.c:2167)
                     // silently returns on `dbChannelTest` failure for ALL
@@ -511,6 +541,12 @@ async fn recv_loop(
             }
 
             offset += msg_len;
+        }
+        // R2-48: flush the accumulated SEARCH replies as a single
+        // outbound datagram. `cas_send_dg_msg` does the same after
+        // each inbound is fully parsed.
+        if !send_buf.is_empty() {
+            let _ = socket.send_to(&send_buf, src).await;
         }
     }
 }

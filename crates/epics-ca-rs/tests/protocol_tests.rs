@@ -961,15 +961,27 @@ async fn server_event_cancel_unknown_sid_closes_silently() {
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
 
-    // Send HOST_NAME and CLIENT_NAME (server will ack VERSION but the
-    // handshake doesn't strictly require these — keep minimal).
-    // Server replies with its own VERSION; we drain it before
-    // proceeding.
+    // R2-47: server emits an unsolicited VERSION when the circuit
+    // becomes ready in addition to the handshake VERSION echo, so the
+    // post-handshake drain must consume up to 2 VERSION frames
+    // (32 bytes total) before the bad-SID cancel is written. Drain
+    // until we've seen 32 bytes.
     let mut buf = [0u8; 64];
-    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
-        .await
-        .expect("server VERSION reply timed out")
-        .expect("read VERSION");
+    let mut drained = 0usize;
+    while drained < 32 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf[drained..]))
+            .await
+            .expect("server VERSION reply timed out")
+            .expect("read VERSION");
+        if n == 0 {
+            break;
+        }
+        drained += n;
+    }
+    assert!(
+        drained >= 32,
+        "expected 2 VERSION frames (32 bytes); got {drained} bytes"
+    );
 
     // Send EVENT_CANCEL with an SID that was never opened. Per R2-24
     // server must close the connection without emitting a wire frame

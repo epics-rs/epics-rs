@@ -575,16 +575,6 @@ C reference: `rsrv/caservertask.c:1525` `create_tcp_client` calls `rsrv_version_
 
 Impact: libca `tcpRecvWatchdog::messageArrivalNotify` resets recv timer on every frame; server-side unsolicited VERSION is the first liveness beat. Without it, slow handshake (client batching VERSION+HOST_NAME+CLIENT_NAME with Nagle) can drift toward CA_ECHO_TIMEOUT. Wire-trace replay against rsrv breaks on first byte.
 
-### R2-48: UDP search responder emits one VERSION-prefixed datagram per match (not batched)
-
-Severity: Medium
-
-Rust: `server/udp.rs:315-424` per-message SEARCH loop calls `send_to(&reply, src)` for each matched PV — each its own datagram with leading VERSION.
-
-C reference: `rsrv/cast_server.c:163-281` one `recvfrom` per datagram; `camessage` walks chained messages and each `search_reply_udp` appends to the same `send.buf`; after parse, `cas_send_dg_msg` ships accumulated buffer as ONE datagram. `caserverio.c:185-201` asserts first message is the placeholder VERSION (seeded by `rsrv_version_reply` and re-seeded after each flush).
-
-Impact: SEARCH datagram with N matches yields N Rust datagrams vs 1 rsrv datagram. N× IP overhead, N× kernel `sendto` cost, search-storm amplification.
-
 ### R2-49: UDP SEARCH reply ships unsolicited VERSION to pre-V411 clients
 
 Severity: Low
@@ -832,6 +822,17 @@ with `pv`/`cid`/`connected_to`/`but_also_on` fields, plus a
 async DNS lookup, so we emit IPs instead of hostnames — adding a
 resolver to the search hot path would be a heavier change than the
 diagnostic warrants.
+
+### R2-48: UDP SEARCH replies now batched into a single outbound datagram
+
+`server/udp.rs::run_single_responder` per-datagram loop now accumulates
+SEARCH match replies into `send_buf` and flushes once at end-of-datagram
+(or earlier when the buffer would exceed a 1472-byte MTU threshold, with
+VERSION placeholder re-seeded after each flush — mirroring
+`cas_send_dg_msg`). N matches in one inbound datagram yield one outbound
+datagram instead of N (was N× IP overhead / N× sendto cost / search-
+storm amplification). Mirrors `rsrv/cast_server.c:163-281` +
+`caserverio.c:185-201`.
 
 ### R2-44: VERSION priority field is wire-equivalent at default
 

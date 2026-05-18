@@ -649,6 +649,24 @@ impl super::provider::Channel for GroupChannel {
         ordered.sort_by_key(|(_, po)| *po);
         let ordered: Vec<&GroupMember> = ordered.into_iter().map(|(m, _)| m).collect();
 
+        // BR-R31: pvxs's `groupsource.cpp:548` rejects group PUT
+        // preparation for `DBF_INLINK..DBF_FWDLINK` fields —
+        // writing into a record's link field via group PUT is
+        // semantically meaningless (the link is metadata, not
+        // value state) and was a wire compatibility gap. EPICS
+        // link fields have well-known names (FLNK, DOL, INP,
+        // INP*, OUT, OUT*, SDIS). Reject any member whose target
+        // field is in that set before any write fires.
+        for m in &ordered {
+            if member_targets_link_field(&m.channel) {
+                return Err(BridgeError::PutRejected(format!(
+                    "group {} PUT: member '{}' targets link field '{}' \
+                     (pvxs groupsource.cpp:548 rejects link-class field writes)",
+                    self.def.name, m.field_name, m.channel
+                )));
+            }
+        }
+
         if self.def.atomic {
             // Atomic put. C++ QSRV holds every member record's lock
             // simultaneously via `DBManyLocker` for the whole write.
@@ -1237,6 +1255,73 @@ impl super::provider::PvaMonitor for AnyMonitor {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// BR-R31: pvxs `groupsource.cpp:548` refuses group PUT
+/// preparation for `DBF_INLINK..DBF_FWDLINK` fields. EPICS link
+/// fields share a small, stable set of names — `FLNK` /
+/// `DOL` / `SDIS` / `INP` / `OUT` plus the alphabet-suffix
+/// `INPA..INPL` / `OUTA..OUTL` families. Match on the parsed
+/// field suffix of a member's channel to enforce the same
+/// rejection.
+fn member_targets_link_field(channel: &str) -> bool {
+    let (_, field) = epics_base_rs::server::database::parse_pv_name(channel);
+    let f = field.to_ascii_uppercase();
+    if matches!(f.as_str(), "FLNK" | "DOL" | "SDIS" | "INP" | "OUT") {
+        return true;
+    }
+    // INPA..INPL, INPM..INPZ, OUTA..OUTZ are link fields on
+    // most record types (calc/calcout/aSub/etc.). Single
+    // alpha suffix after `INP` or `OUT` is the recognisable
+    // shape; this is a superset (record-type specific
+    // semantics may treat `INPx` as non-link on a handful of
+    // records) but rejecting them through group PUT is the
+    // safe direction — the pvxs rule is "never write a link
+    // through a group".
+    if let Some(rest) = f.strip_prefix("INP")
+        && rest.len() == 1
+        && rest.chars().next().unwrap().is_ascii_uppercase()
+    {
+        return true;
+    }
+    if let Some(rest) = f.strip_prefix("OUT")
+        && rest.len() == 1
+        && rest.chars().next().unwrap().is_ascii_uppercase()
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod link_field_tests {
+    use super::member_targets_link_field;
+
+    #[test]
+    fn link_class_field_names_rejected() {
+        for f in ["FLNK", "DOL", "SDIS", "INP", "OUT", "INPA", "OUTL", "INPZ"] {
+            assert!(
+                member_targets_link_field(&format!("REC.{f}")),
+                "expected {f} to be classified as a link field"
+            );
+        }
+    }
+
+    #[test]
+    fn value_class_field_names_allowed() {
+        for f in ["VAL", "DESC", "EGU", "PREC", "SCAN", "HIHI", "LOLO", "RVAL"] {
+            assert!(
+                !member_targets_link_field(&format!("REC.{f}")),
+                "expected {f} to be classified as a value field, not a link"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_record_default_is_val_not_link() {
+        // parse_pv_name returns ("REC", "VAL") for "REC".
+        assert!(!member_targets_link_field("REC"));
+    }
+}
 
 fn meta_desc() -> FieldDesc {
     FieldDesc::Structure {

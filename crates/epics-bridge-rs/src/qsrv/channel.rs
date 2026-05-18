@@ -244,29 +244,54 @@ impl Channel for BridgeChannel {
             _ => raw_val,
         };
 
+        // BR-R20: pvxs distinguishes Force vs Passive — both write
+        // VAL, but Force *also* triggers an explicit
+        // process-record afterwards. The Rust path previously
+        // collapsed Force into Passive, so a `record[process=true]`
+        // put against a SCAN=Passive record without the field
+        // having PP=YES would silently NOT process. Mirror pvxs
+        // by routing Force through put_pv + process_record (the
+        // dbProcess-equivalent that ignores PP / SCAN), and
+        // leave Passive on the standard put-record-field path
+        // that honors PP.
         match opts.process {
             ProcessMode::Inhibit => {
-                // Write without processing (like C++ ProcInhibit)
+                // Write without processing (C++ ProcInhibit).
                 self.db
                     .put_pv(&format!("{}.VAL", self.record_name), epics_val)
                     .await
                     .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
             }
-            ProcessMode::Force | ProcessMode::Passive => {
-                // Write + trigger processing (like C++ ProcForce/ProcPassive)
-                // put_record_field_from_ca returns Option<Receiver> for put_notify
+            ProcessMode::Passive => {
+                // C++ ProcPassive: write VAL through the standard
+                // CA path, which honors PP and SCAN.
                 let notify_rx = self
                     .db
                     .put_record_field_from_ca(&self.record_name, "VAL", epics_val)
                     .await
                     .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-
-                // If block=true, wait for processing to complete
                 if opts.block
                     && let Some(rx) = notify_rx
                 {
                     let _ = rx.await;
                 }
+            }
+            ProcessMode::Force => {
+                // C++ ProcForce: write VAL, then explicitly process
+                // the record regardless of PP / SCAN.
+                self.db
+                    .put_pv(&format!("{}.VAL", self.record_name), epics_val)
+                    .await
+                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                self.db
+                    .process_record(&self.record_name)
+                    .await
+                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                // `process_record` is synchronous from this call's
+                // perspective — every async record device hook has
+                // already been driven by the time it returns, so
+                // `block=true` is satisfied by simply waiting for
+                // this future.
             }
         }
 

@@ -75,7 +75,9 @@ pub struct GroupMember {
     pub put_order: Option<i32>,
     /// Optional structure ID for this member (from `+id`).
     pub struct_id: Option<String>,
-    /// Constant value for `Const` mapping (from `+value` in JSON).
+    /// Constant value for `Const` mapping. Sourced from `+const`
+    /// (pvxs canonical key, `test/qgroup.json`) with a legacy
+    /// `+value` fallback for older Rust-authored configs.
     pub const_value: Option<epics_pva_rs::pvdata::PvField>,
     /// Nanosecond mask: lower bits of nsec are extracted as userTag
     /// (pvxs `MappingInfo::nsecMask`, from `+nsecmask` in JSON).
@@ -295,15 +297,32 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             .to_string(),
     };
 
-    // Parse constant value for Const mapping. +value is required.
+    // Parse constant value for Const mapping.
+    //
+    // BR-R26: pvxs uses `+const` (test/qgroup.json:1, test/const.db:2);
+    // older Rust drafts accepted only `+value`. Accept both spellings
+    // so pvxs-authored configs load without rewriting. When both
+    // keys are present `+const` wins (matches pvxs's authoritative
+    // key); a deprecation warning surfaces so operators know to
+    // migrate.
     let const_value = if mapping == FieldMapping::Const {
-        let val = obj.get("+value").ok_or_else(|| {
-            BridgeError::GroupConfigError(format!(
-                "field '{field_name}': +type=const requires +value"
-            ))
-        })?;
+        let val = match (obj.get("+const"), obj.get("+value")) {
+            (Some(v), _) => v,
+            (None, Some(v)) => {
+                tracing::warn!(
+                    field = field_name,
+                    "+value for const mapping is deprecated; use `+const` for pvxs parity"
+                );
+                v
+            }
+            (None, None) => {
+                return Err(BridgeError::GroupConfigError(format!(
+                    "field '{field_name}': +type=const requires +const (or legacy +value)"
+                )));
+            }
+        };
         Some(json_to_pv_field(val).map_err(|e| {
-            BridgeError::GroupConfigError(format!("field '{field_name}': invalid +value: {e}"))
+            BridgeError::GroupConfigError(format!("field '{field_name}': invalid const value: {e}"))
         })?)
     } else {
         None
@@ -748,6 +767,65 @@ mod tests {
             assert_eq!(*v, 42);
         } else {
             panic!("expected Int(42), got {:?}", version.const_value);
+        }
+    }
+
+    /// BR-R26: pvxs's canonical key is `+const` (test/qgroup.json).
+    #[test]
+    fn parse_const_mapping_pvxs_const_key() {
+        let json = r#"{
+            "GRP:const": {
+                "version": {
+                    "+type": "const",
+                    "+const": 7
+                },
+                "val": { "+channel": "R:val" }
+            }
+        }"#;
+
+        let groups = parse_group_config(json).unwrap();
+        let version = groups[0]
+            .members
+            .iter()
+            .find(|m| m.field_name == "version")
+            .unwrap();
+        assert_eq!(version.mapping, FieldMapping::Const);
+        if let Some(epics_pva_rs::pvdata::PvField::Scalar(
+            epics_pva_rs::pvdata::ScalarValue::Int(v),
+        )) = &version.const_value
+        {
+            assert_eq!(*v, 7);
+        } else {
+            panic!("expected Int(7) via +const, got {:?}", version.const_value);
+        }
+    }
+
+    /// BR-R26: `+const` wins when both keys are present.
+    #[test]
+    fn parse_const_mapping_const_key_wins_over_value() {
+        let json = r#"{
+            "GRP:both": {
+                "k": {
+                    "+type": "const",
+                    "+const": 100,
+                    "+value": 999
+                },
+                "v": { "+channel": "R:val" }
+            }
+        }"#;
+        let groups = parse_group_config(json).unwrap();
+        let k = groups[0]
+            .members
+            .iter()
+            .find(|m| m.field_name == "k")
+            .unwrap();
+        if let Some(epics_pva_rs::pvdata::PvField::Scalar(
+            epics_pva_rs::pvdata::ScalarValue::Int(v),
+        )) = &k.const_value
+        {
+            assert_eq!(*v, 100, "+const should take precedence over +value");
+        } else {
+            panic!("expected Int(100), got {:?}", k.const_value);
         }
     }
 

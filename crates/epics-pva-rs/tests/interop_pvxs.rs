@@ -45,3 +45,6 @@ mod reverse_complex_types;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/tcp_search_r11.rs"]
 mod tcp_search_r11;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/type_cache.rs"]
+mod type_cache;

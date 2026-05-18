@@ -750,6 +750,20 @@ pub async fn run_ca_pva_qsrv_ioc(
 
     // ── QSRV bridge ──
     let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    // BR-R9: install the IOC-wide ACF on the QSRV bridge so PVA
+    // single-record / group operations enforce the same policy as
+    // the CA server (which gets `config.acf` via
+    // `CaServer::from_parts` below). Without this, an IOC launched
+    // with `config.acf = Some(...)` would protect CA but leave the
+    // PVA QSRV path on `AllowAllAccess` — the documented
+    // configuration trap in BR-R9.
+    if let Some(acf_cfg) = config.acf.clone() {
+        let acf = Arc::new(super::provider::AcfAccessControl::new(db.clone(), acf_cfg));
+        provider.set_access_control(acf);
+        tracing::info!("qsrv: ACF installed on BridgeProvider");
+    }
+
     let store = Arc::new(QsrvPvStore::new(provider));
 
     // Register native PVA PVs (NTNDArray from NDPvaConfigure, etc.).

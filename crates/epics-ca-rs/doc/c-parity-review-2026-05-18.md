@@ -545,16 +545,6 @@ C reference: `libca/cac.cpp:60-89` TCP jump table includes `CA_PROTO_SEARCH` (`s
 
 Impact: a CA name server or gateway emitting these frames kills the Rust circuit per occurrence. R2-29 made unknown lethal — gap is misclassifying known-valid opcodes as unknown.
 
-### R2-42: Stray ACCESS_RIGHTS frames leak per-circuit `pending_access` entries
-
-Severity: Low
-
-Rust: `client/transport.rs:1189-1199` unconditionally inserts `(hdr.cid, access)` into `pending_access` and emits `AccessRightsChanged`. Drained only when matching CREATE_CHAN arrives. A misbehaving server's ACCESS_RIGHTS for a cid the server never names in CREATE_CHAN grows the map for circuit lifetime.
-
-C reference: `libca/cac.cpp:1121-1136` `accessRightsRespAction` looks up channel by `m_cid` and silently returns if not found — no state retained.
-
-Impact: memory leak at the rate of one map entry per stray frame; ACF reload re-emitting ACCESS_RIGHTS for known channels fires both paths in Rust (event + pending update).
-
 ### R2-43: No equivalent of libca's `msgForMultiplyDefinedPV` diagnostic
 
 Severity: Low
@@ -725,26 +715,6 @@ C reference: `ca/src/client/cac.cpp:259` `addAddrToChannelAccessAddressList(...,
 
 Impact: site with `EPICS_CA_SERVER_PORT=5066` and `EPICS_CA_NAME_SERVERS="ioc.example.com"` has Rust try port 5064, C try 5066. Silent connection refused or wrong service. Two related env parsers in same file disagree.
 
-### R2-60: Rust IOC UDP server does not join multicast groups from `EPICS_CAS_INTF_ADDR_LIST`
-
-Severity: Medium
-
-Rust: `server/udp.rs:141-184` `bind_responder_socket` and `server/addr_list.rs:43-51` — multicast entries (224.0.0.0/4) treated identically to unicast/broadcast; only `bind` + `set_broadcast(true)`, never `join_multicast_v4`. No `casMCastAddrList` analog.
-
-C reference: `rsrv/caservertask.c:367-371, 633-668` splits multicast into `casMCastAddrList`; per-interface UDP responder issues `setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, ...)` for each multicast entry.
-
-Impact: C IOC with `EPICS_CAS_INTF_ADDR_LIST="192.168.1.10 224.0.10.5"` joins `224.0.10.5` group; Rust silently ignores multicast entry (likely fails the `bind` to a multicast address). Multicast SEARCH topologies work with libca, produce no replies on Rust.
-
-### R2-61: Rust beacon emitter ignores `EPICS_CAS_INTF_ADDR_LIST` when expanding AUTO_BEACON
-
-Severity: Medium
-
-Rust: `server/addr_list.rs:114-132` `discover_broadcast_addrs` walks every non-loopback interface via `if_addrs::get_if_addrs()`. `cfg.intf_addrs` not consulted for filtering.
-
-C reference: `rsrv/caservertask.c:374-388, 390-392` when auto-beacon on AND `casIntfAddrList` has specific (non-wildcard) IPs, C calls `osiSockDiscoverBroadcastAddresses(..., &match)` per listed interface — beacons only from those NICs' broadcasts. Line 380 sets `autobeaconlist = 0` to suppress wildcard fallback. Lines 390-392: `cantProceed` if both `0.0.0.0` and specific IP present.
-
-Impact: multi-NIC IOC bound to one isolated subnet via `EPICS_CAS_INTF_ADDR_LIST="192.168.1.10"` beacons to `192.168.1.255` on C; Rust beacons to every discovered NIC broadcast, leaking IOC presence onto unrelated networks. Wildcard-conflict check also missing.
-
 ### R2-62: `EPICS_CA_MAX_SEARCH_PERIOD` recognised by lint but never read
 
 Severity: Low
@@ -865,6 +835,39 @@ Current `server/tcp.rs` resolves the requested SID before consulting the flat
 subscription map. Unknown SID returns a protocol error without sending
 `ECA_BADMONID`, while valid-SID/unknown-monitor still sends `ECA_BADMONID`,
 matching `rsrv/camessage.c::event_cancel_reply()`.
+
+### R2-42: `pending_access` map now bounded and evicted oldest-first
+
+`client/transport.rs::handle_access_rights_response` caps the per-circuit
+`pending_access` map at `PENDING_ACCESS_CAP = 1024` and evicts the oldest
+entry (FIFO via `keys().next()`) when full, with a
+`ca_client_pending_access_evictions_total` metric for diagnostics. A
+misbehaving server's stray ACCESS_RIGHTS frames no longer grow without
+bound; `cac.cpp`-style silent-drop semantics for unknown cids is preserved
+by leaving the event-emit path intact.
+
+### R2-60: CA server UDP responders now join multicast groups from `EPICS_CAS_INTF_ADDR_LIST`
+
+`server/addr_list.rs::from_env` partitions parsed entries on `is_multicast()`
+into `CasUdpConfig::intf_addrs` (unicast) and `CasUdpConfig::mcast_addrs`
+(`224.0.0.0/4`). `server/udp.rs::run_udp_search_responder` spawns one
+`run_multicast_responder` task per group: it binds wildcard `0.0.0.0:port`,
+calls `join_multicast_v4` for every non-wildcard interface in `intf_addrs`,
+then runs the standard `recv_loop`. Mirrors `rsrv/caservertask.c:367-371,
+633-668` (`casMCastAddrList` + per-NIC `IP_ADD_MEMBERSHIP`). Multicast
+SEARCH topologies now receive replies from a Rust IOC configured with
+multicast intf entries.
+
+### R2-61: AUTO_BEACON expansion now honours `EPICS_CAS_INTF_ADDR_LIST` filter
+
+`server/addr_list.rs` `expand_auto_beacon` (the AUTO sentinel expansion
+path) now filters discovered broadcast addresses by `cfg.intf_addrs`: when
+non-wildcard interface IPs are present, only those NICs' broadcast addrs
+are emitted (via the existing `broadcast_for_ip` helper). A wildcard
+(`0.0.0.0`) entry mixed with specific IPs is treated as the C
+`cantProceed`-equivalent and logged at warn. Mirrors
+`rsrv/caservertask.c:374-388, 390-392`. Multi-NIC IOC bound to one
+isolated subnet no longer leaks beacons onto unrelated networks.
 
 ## Review Log
 

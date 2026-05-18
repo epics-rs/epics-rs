@@ -1280,6 +1280,32 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // cid (C orders ACCESS_RIGHTS first; the
                     // coordinator's update-by-cid is a no-op
                     // pre-channel).
+                    //
+                    // R2-42: bound the stash size. C `libca/cac.cpp:
+                    // 1121-1136` `accessRightsRespAction` looks up by
+                    // m_cid and silently returns if not found — never
+                    // accumulates state. Pre-fix Rust grew the map on
+                    // every ACCESS_RIGHTS frame, so a misbehaving /
+                    // hostile server emitting ACCESS_RIGHTS for cids
+                    // that never get named in CREATE_CHAN leaked one
+                    // entry per frame for the circuit's lifetime.
+                    // 1024 is well past the per-client channel cap
+                    // any realistic deployment hits; well below the
+                    // memory pressure threshold.
+                    const PENDING_ACCESS_CAP: usize = 1024;
+                    if pending_access.len() >= PENDING_ACCESS_CAP {
+                        // Drop the oldest stale entry. HashMap has
+                        // no LRU ordering, but `next()` on a hashmap
+                        // iter is effectively pseudo-random — good
+                        // enough to bound growth, never blocks the
+                        // legitimate ACCESS_RIGHTS-then-CREATE_CHAN
+                        // sequence which removes-on-consume.
+                        if let Some(&victim) = pending_access.keys().next() {
+                            pending_access.remove(&victim);
+                            metrics::counter!("ca_client_pending_access_evictions_total")
+                                .increment(1);
+                        }
+                    }
                     pending_access.insert(hdr.cid, access);
                     let _ = event_tx.send(TransportEvent::AccessRightsChanged {
                         cid: hdr.cid,

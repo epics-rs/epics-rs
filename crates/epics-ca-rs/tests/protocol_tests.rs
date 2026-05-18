@@ -850,7 +850,10 @@ async fn server_echo_round_trips_request_header_and_payload() {
         }
         drained += n;
     }
-    assert!(drained >= 32, "expected 2 VERSION frames; got {drained} bytes");
+    assert!(
+        drained >= 32,
+        "expected 2 VERSION frames; got {drained} bytes"
+    );
 
     // Send CA_PROTO_ECHO with a non-trivial header AND an 8-byte
     // payload — the C server is documented to echo m_postsize bytes
@@ -1055,7 +1058,10 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
         }
         got += n;
     }
-    assert!(got >= 32, "expected two CA_PROTO_VERSION frames; got {got} bytes");
+    assert!(
+        got >= 32,
+        "expected two CA_PROTO_VERSION frames; got {got} bytes"
+    );
 
     // Send a TCP frame with an unknown command code. CA_PROTO_LAST_CMMD
     // in C is 27 (CA_PROTO_SERVER_DISCONN); 250 is comfortably past
@@ -1529,7 +1535,10 @@ async fn server_read_sync_echoes_request_header() {
         }
         got_hello += n;
     }
-    assert!(got_hello >= 32, "expected 2 VERSION frames; got {got_hello}");
+    assert!(
+        got_hello >= 32,
+        "expected 2 VERSION frames; got {got_hello}"
+    );
 
     // Send READ_SYNC with distinctive field values to verify echo.
     let mut sync = CaHeader::new(CA_PROTO_READ_SYNC);

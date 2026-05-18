@@ -22,6 +22,7 @@ pub async fn run_udp_search_responder(
     tcp_port: u16,
     intf_addrs: Vec<Ipv4Addr>,
     ignore_addrs: Vec<Ipv4Addr>,
+    mcast_addrs: Vec<Ipv4Addr>,
 ) -> CaResult<()> {
     let intfs = if intf_addrs.is_empty() {
         vec![Ipv4Addr::UNSPECIFIED]
@@ -30,12 +31,39 @@ pub async fn run_udp_search_responder(
     };
 
     // Spawn one responder task per interface and wait for the first error.
-    let mut handles = Vec::with_capacity(intfs.len());
-    for ip in intfs {
+    let mut handles = Vec::with_capacity(intfs.len() + mcast_addrs.len());
+    for ip in &intfs {
         let db_t = db.clone();
         let ignore_t = ignore_addrs.clone();
+        let bind_ip = *ip;
         let handle = epics_base_rs::runtime::task::spawn(async move {
-            run_single_responder(db_t, ip, port, tcp_port, ignore_t).await
+            run_single_responder(db_t, bind_ip, port, tcp_port, ignore_t).await
+        });
+        handles.push(handle);
+    }
+
+    // R2-60: multicast responders. C `caservertask.c:633-668` creates one
+    // wildcard-bound socket per casMCastAddrList entry and calls
+    // `IP_ADD_MEMBERSHIP` for every casIntfAddrList interface (skipping
+    // wildcard intfs). Without this, EPICS_CAS_INTF_ADDR_LIST entries in
+    // 224.0.0.0/4 are silently dropped — the server never joins the
+    // multicast group and PVs are invisible to libca clients configured
+    // for multicast SEARCH.
+    let mcast_intfs: Vec<Ipv4Addr> = intfs
+        .iter()
+        .copied()
+        .filter(|ip| !ip.is_unspecified())
+        .collect();
+    for group in mcast_addrs {
+        let db_t = db.clone();
+        let ignore_t = ignore_addrs.clone();
+        let intf_join = if mcast_intfs.is_empty() {
+            vec![Ipv4Addr::UNSPECIFIED]
+        } else {
+            mcast_intfs.clone()
+        };
+        let handle = epics_base_rs::runtime::task::spawn(async move {
+            run_multicast_responder(db_t, group, intf_join, port, tcp_port, ignore_t).await
         });
         handles.push(handle);
     }
@@ -181,6 +209,46 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
         );
     }
     Ok(socket)
+}
+
+/// R2-60: multicast responder. Binds wildcard `0.0.0.0:port`, joins
+/// `group` on every supplied interface, then runs the standard
+/// recv_loop. Mirrors C `caservertask.c:633-668` which does the same
+/// thing for each casMCastAddrList entry. We do NOT bind to the
+/// multicast IP itself — Linux rejects that with EADDRNOTAVAIL.
+async fn run_multicast_responder(
+    db: Arc<PvDatabase>,
+    group: Ipv4Addr,
+    intfs: Vec<Ipv4Addr>,
+    port: u16,
+    tcp_port: u16,
+    ignore_addrs: Vec<Ipv4Addr>,
+) -> CaResult<()> {
+    let socket = bind_responder_socket(Ipv4Addr::UNSPECIFIED, port)?;
+    let mut any_joined = false;
+    for intf in &intfs {
+        match socket.join_multicast_v4(group, *intf) {
+            Ok(()) => any_joined = true,
+            Err(e) => {
+                tracing::warn!(
+                    target: "epics_ca_rs::server::udp",
+                    %group,
+                    intf = %intf,
+                    error = %e,
+                    "CA server IP_ADD_MEMBERSHIP failed for multicast group"
+                );
+            }
+        }
+    }
+    if !any_joined {
+        return Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("no interface accepted IP_ADD_MEMBERSHIP for {group}"),
+        )));
+    }
+    let socket = Arc::new(socket);
+    let udp_rl = Arc::new(UdpRateLimiter::from_env());
+    recv_loop(socket, db, group, tcp_port, ignore_addrs, udp_rl).await
 }
 
 async fn recv_loop(

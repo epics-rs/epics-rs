@@ -1235,8 +1235,17 @@ impl CaServer {
         // and miss edge-triggered epoll events).
         let intf_addrs = udp_cfg.intf_addrs.clone();
         let ignore_addrs = udp_cfg.ignore_addrs.clone();
+        let mcast_addrs = udp_cfg.mcast_addrs.clone();
         let udp_handle = epics_base_rs::runtime::task::spawn(async move {
-            udp::run_udp_search_responder(db_udp, port, tcp_port, intf_addrs, ignore_addrs).await
+            udp::run_udp_search_responder(
+                db_udp,
+                port,
+                tcp_port,
+                intf_addrs,
+                ignore_addrs,
+                mcast_addrs,
+            )
+            .await
         });
         let udp_abort = udp_handle.abort_handle();
 

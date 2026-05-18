@@ -77,6 +77,7 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
             tcp_port,
             vec![std::net::Ipv4Addr::UNSPECIFIED],
             Vec::new(),
+            Vec::new(),
         )
         .await;
     });

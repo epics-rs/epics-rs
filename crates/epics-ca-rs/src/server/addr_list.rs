@@ -21,6 +21,12 @@ pub struct CasUdpConfig {
     pub ignore_addrs: Vec<Ipv4Addr>,
     /// Steady-state beacon interval (post-ramp).
     pub beacon_period: Duration,
+    /// R2-60: multicast groups (224.0.0.0/4) extracted from
+    /// `EPICS_CAS_INTF_ADDR_LIST`. C `rsrv/caservertask.c:367-371,
+    /// 633-668` keeps these in `casMCastAddrList` and joins each
+    /// group via `IP_ADD_MEMBERSHIP` from a wildcard-bound socket;
+    /// they cannot be unicast-bound.
+    pub mcast_addrs: Vec<Ipv4Addr>,
 }
 
 impl Default for CasUdpConfig {
@@ -33,6 +39,7 @@ impl Default for CasUdpConfig {
             ))],
             ignore_addrs: Vec::new(),
             beacon_period: Duration::from_secs(15),
+            mcast_addrs: Vec::new(),
         }
     }
 }
@@ -45,8 +52,24 @@ pub fn from_env() -> CasUdpConfig {
 
     if let Some(list) = epics_base_rs::runtime::env::get("EPICS_CAS_INTF_ADDR_LIST") {
         let parsed = parse_ipv4_list(&list);
-        if !parsed.is_empty() {
-            cfg.intf_addrs = parsed;
+        // R2-60: C `rsrv/caservertask.c:367-371, 633-668` splits
+        // multicast (224.0.0.0/4) entries off into
+        // `casMCastAddrList` and joins each group via
+        // `IP_ADD_MEMBERSHIP` on a wildcard-bound socket; trying
+        // to `bind()` a unicast socket to a multicast IP fails on
+        // most kernels. Filter the multicast entries here into
+        // `cfg.mcast_addrs` so they don't reach the unicast bind
+        // path; the responder side (server/udp.rs) joins them.
+        // Without this split the multicast addresses caused
+        // silent per-interface bind failures and PVs became
+        // invisible to multicast SEARCH topologies.
+        let (mcast, unicast): (Vec<_>, Vec<_>) =
+            parsed.into_iter().partition(|ip| ip.is_multicast());
+        if !unicast.is_empty() {
+            cfg.intf_addrs = unicast;
+        }
+        if !mcast.is_empty() {
+            cfg.mcast_addrs = mcast;
         }
     }
 
@@ -112,7 +135,41 @@ pub fn from_env() -> CasUdpConfig {
         Some(s) => s.eq_ignore_ascii_case("YES"),
     };
     if auto_on {
-        for bcast in discover_broadcast_addrs() {
+        // R2-61: C `rsrv/caservertask.c:374-388` filters auto-beacon
+        // expansion by `casIntfAddrList` when specific (non-wildcard)
+        // interface IPs are listed — beacons only go out via those
+        // NICs' broadcasts. Pre-fix Rust unconditionally walked every
+        // non-loopback interface via `discover_broadcast_addrs()`,
+        // leaking IOC presence onto unrelated networks. If
+        // `cfg.intf_addrs` lists specific IPs (not just `0.0.0.0`),
+        // derive beacon broadcasts only from those interfaces.
+        // C lines 390-392 also `cantProceed` when both `0.0.0.0`
+        // and a specific IP appear; we surface the same as a warn
+        // (Rust doesn't panic the IOC process for this kind of
+        // misconfig).
+        let intf_specific: Vec<Ipv4Addr> = cfg
+            .intf_addrs
+            .iter()
+            .copied()
+            .filter(|ip| !ip.is_unspecified())
+            .collect();
+        let intf_has_wildcard = cfg.intf_addrs.iter().any(|ip| ip.is_unspecified());
+        if !intf_specific.is_empty() && intf_has_wildcard {
+            eprintln!(
+                "Warning: EPICS_CAS_INTF_ADDR_LIST contains both 0.0.0.0 and a specific IP; \
+                 beacons may behave inconsistently (C rsrv cantProceeds on this mix)"
+            );
+        }
+        let bcast_iter: Vec<Ipv4Addr> = if !intf_specific.is_empty() {
+            // Restrict to broadcasts of the listed interfaces.
+            intf_specific
+                .iter()
+                .filter_map(|ip| broadcast_for_ip(*ip))
+                .collect()
+        } else {
+            discover_broadcast_addrs()
+        };
+        for bcast in bcast_iter {
             let entry = SocketAddr::V4(SocketAddrV4::new(bcast, beacon_port));
             if !beacon_addrs.contains(&entry) {
                 beacon_addrs.push(entry);

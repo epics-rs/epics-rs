@@ -31,6 +31,9 @@ mod be_byte_order;
 #[path = "interop_pvxs_mods/complex_types.rs"]
 mod complex_types;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/monitor_stream.rs"]
+mod monitor_stream;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/pipeline_r1.rs"]
 mod pipeline_r1;
 #[cfg(unix)]

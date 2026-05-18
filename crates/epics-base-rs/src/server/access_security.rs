@@ -604,6 +604,15 @@ pub enum TrapWriteOp {
 /// reference so the listener does not own any of the strings —
 /// matches the C `asTrapWriteMessage` lifetime semantics
 /// (`libcom/src/as/asLib.h:51-56`).
+///
+/// R2-85: the message now carries the wire-level `dbr_type` and
+/// `no_elements` that C's `asTrapWriteMessage` exposes
+/// (`asLib.h:34-56`), plus a monotonic `event_id` that pairs the
+/// `BeforeWrite` and `AfterWrite` for one put. libca passes
+/// `userPvt` to the listener for per-event state (`asLib.h:45-51`),
+/// returned-then-restored across the pair; Rust's listener takes a
+/// `&TrapWriteMessage`, so listeners that need per-event state
+/// maintain a private `event_id → state` map.
 #[derive(Debug, Clone, Copy)]
 pub struct TrapWriteMessage<'a> {
     pub op: TrapWriteOp,
@@ -615,6 +624,21 @@ pub struct TrapWriteMessage<'a> {
     /// is being notified at audit-off cost (caller may pass `""` to
     /// avoid stringifying large arrays just for trap dispatch).
     pub value_str: &'a str,
+    /// R2-85: wire DBR type the put came in as (`DBR_*` constant
+    /// from `db_access.h`). Listeners that want to log or filter
+    /// by type read it here instead of reaching back through
+    /// `serverSpecific`.
+    pub dbr_type: u16,
+    /// R2-85: element count from the put header
+    /// (`asTrapWriteMessage::no_elements`). 1 for scalar, N for
+    /// waveform.
+    pub no_elements: u32,
+    /// R2-85: monotonic id that pairs the `BeforeWrite` and the
+    /// matching `AfterWrite` for a single put. The C `userPvt`
+    /// continuation slot is not a fit for `&` message — listeners
+    /// that need per-event state should index a private map by
+    /// this id and clear the entry in `AfterWrite`.
+    pub event_id: u64,
     /// `Some("ok"|"fail"|EPICS error code) once `op == AfterWrite`;
     /// always `None` for `BeforeWrite`.
     pub status: Option<&'a str>,
@@ -623,6 +647,17 @@ pub struct TrapWriteMessage<'a> {
     /// skip events with this `false` (mirrors C `pclient->trapMask`
     /// gate inside `asTrapWriteWithData`).
     pub rule_was_trap: bool,
+}
+
+/// R2-85: monotonic id allocator for `TrapWriteMessage::event_id`.
+/// Wraps at u64::MAX (~10^19 events; ~580 years at 1 Mput/s).
+static TRAP_WRITE_EVENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate the next trap-write event id. Call once at the start of
+/// a put dispatch, thread the value through `BeforeWrite` and the
+/// matching `AfterWrite`.
+pub fn next_trap_write_event_id() -> u64 {
+    TRAP_WRITE_EVENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Listener closure. Must be `Send + Sync` because the CA TCP
@@ -684,16 +719,58 @@ pub fn has_trap_write_listeners() -> bool {
 /// Fast path when no listeners: an `RwLock::read` and a length
 /// check, no allocation. Called by the CA TCP dispatcher before and
 /// after every `dbChannel_put`-equivalent.
+///
+/// R2-87 / R2-89: the listener list is *snapshotted* under the read
+/// lock (a `Vec<Arc<...>>` clone — cheap, all `Arc`-bumps), then
+/// the lock is released before any listener runs. This means a
+/// listener may register or drop another listener handle mid-
+/// callback without deadlocking on the registry's
+/// `std::sync::RwLock` (which is not re-entrant on POSIX); a
+/// `TrapWriteListenerHandle::drop` racing dispatch on a tokio
+/// worker thread does not block the worker for the unbounded
+/// listener-call duration; the writer waits at most for the Vec
+/// clone.
+///
+/// R2-86: each listener call is wrapped in `catch_unwind` so a
+/// panicking listener does not unwind into the CA per-circuit task.
+/// The listener `Fn` type does NOT carry an `UnwindSafe` bound;
+/// `AssertUnwindSafe` is sound here because the dispatch shares no
+/// mutable state with the listener (the snapshot is consumed in
+/// loop order; the message is `Copy`).
 pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
     let Some(reg) = TRAP_WRITE_REGISTRY.get() else {
         return;
     };
-    let guard = reg.read().expect("trap-write registry poisoned");
-    if guard.is_empty() {
-        return;
-    }
-    for (_, listener) in guard.iter() {
-        listener(msg);
+    let snapshot: Vec<TrapWriteListener> = {
+        let guard = reg.read().expect("trap-write registry poisoned");
+        if guard.is_empty() {
+            return;
+        }
+        guard.iter().map(|(_, l)| l.clone()).collect()
+    };
+    for listener in snapshot {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            listener(msg);
+        }));
+        if let Err(payload) = result {
+            let descr = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "(non-string panic payload)".to_string()
+            };
+            tracing::error!(
+                target: "epics_base_rs::server::access_security",
+                pv = msg.pv_name,
+                event_id = msg.event_id,
+                op = ?msg.op,
+                panic = %descr,
+                "TRAPWRITE listener panicked — isolating; remaining listeners will still run. \
+                 C asTrapWriteWithData has no unwind concept; this is a Rust-only safety net \
+                 to keep the per-circuit task alive."
+            );
+        }
     }
 }
 

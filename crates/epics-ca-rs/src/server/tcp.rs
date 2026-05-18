@@ -583,26 +583,36 @@ pub async fn run_tcp_listener(
     };
     let _ = tcp_port_tx.send(actual_port);
 
-    // R2-54: subscribe to ASG-field-change notifications and forward
-    // them into the per-client `acf_reload_tx` broadcast. C
+    // One accept-loop task per bound interface. When the parent
+    // `run_tcp_listener` future is dropped (CaServer shutdown via
+    // `tcp_abort.abort()`), this JoinSet is dropped which aborts all
+    // accept loops as a unit. First task to error wins; the rest
+    // are aborted via JoinSet::Drop.
+    let mut accept_tasks: tokio::task::JoinSet<CaResult<()>> = tokio::task::JoinSet::new();
+
+    // R2-54 + R2-88: ASG-field-change forwarder. C
     // `database/src/ioc/as/asDbLib.c:107-110,144` `asSpcAsCallback`
     // is wired by `asInitCommon` as the per-record `ASG` field
     // special callback and re-evaluates access rights for every
-    // affected client on `dbPut record.ASG NEW_ASG`. Pre-fix Rust
-    // had no such hook — the *next* op used live `compute_access`
-    // (so enforcement was correct), but the wire ACCESS_RIGHTS the
-    // client saw still reflected the OLD ASG until CLIENT_NAME or
-    // ACF reload triggered a re-eval. UIs gating put-button enable
-    // on the cached level showed stale state. Re-using the existing
-    // `acf_reload_tx` channel is coarser than libca's per-client
-    // dispatch (we re-eval every connection, not just those
-    // referencing the changed record), but the downstream
-    // `oldaccess != access` filter in `reeval_access_rights` keeps
-    // the wire traffic bounded — exactly the same gate C uses.
+    // affected client on `dbPut record.ASG NEW_ASG`. Re-using the
+    // existing `acf_reload_tx` broadcast is coarser than libca's
+    // per-client dispatch but the downstream `oldaccess != access`
+    // filter in `reeval_access_rights` keeps wire traffic bounded.
+    //
+    // R2-88: the forwarder is spawned INTO the `accept_tasks`
+    // JoinSet so it's cancelled together with the accept loops on
+    // `run_tcp_listener` cancellation. Pre-fix Rust did
+    // `tokio::spawn(...)` and dropped the JoinHandle, leaving the
+    // task running forever (its `recv()` loop only exits on
+    // `RecvError::Closed`, which the process-lifetime `OnceLock`
+    // Sender can never raise). Long-running processes that restart
+    // their CA server (test fixtures, fault-tolerant supervisors)
+    // accumulated one zombie forwarder per restart cycle, each
+    // holding a stale `acf_reload_tx_t` clone.
     {
         let mut asg_rx = epics_base_rs::server::access_security::subscribe_asg_changes();
         let acf_reload_tx_t = acf_reload_tx.clone();
-        tokio::spawn(async move {
+        accept_tasks.spawn(async move {
             loop {
                 match asg_rx.recv().await {
                     Ok(()) => {
@@ -622,15 +632,10 @@ pub async fn run_tcp_listener(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
+            Ok(())
         });
     }
 
-    // One accept-loop task per bound interface. When the parent
-    // `run_tcp_listener` future is dropped (CaServer shutdown via
-    // `tcp_abort.abort()`), this JoinSet is dropped which aborts all
-    // accept loops as a unit. First task to error wins; the rest
-    // are aborted via JoinSet::Drop.
-    let mut accept_tasks: tokio::task::JoinSet<CaResult<()>> = tokio::task::JoinSet::new();
     for (listener, intf) in listeners {
         let db_t = db.clone();
         let acf_t = acf.clone();
@@ -2524,15 +2529,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 String::new()
             };
 
-            // R2-53: BeforeWrite notification. libca emits
-            // `asTrapWriteWithData` *around* every dbChannel_put;
-            // pre-fix Rust had no equivalent and put-loggers migrating
-            // from rsrv saw zero events. `rule_was_trap` is forced to
-            // `true` for the time being — surfacing the matched ACF
-            // rule's `TRAPWRITE` mask through `AccessChecked` is a
-            // follow-up; until then, loggers see every write rather
-            // than missing some. caPutLog-style audit prefers
-            // over-reporting to silent gaps.
+            // R2-85: pair the matching Before/After of this put with a
+            // monotonic event_id so listeners can correlate without
+            // racing on (peer, pv).
+            let trap_event_id = if trap_listeners_active {
+                epics_base_rs::server::access_security::next_trap_write_event_id()
+            } else {
+                0
+            };
+
+            // R2-53 + R2-85 + R2-90: BeforeWrite notification.
+            // Pre-fix BeforeWrite fired unconditionally before the
+            // put was attempted, so write_hook rejections (and
+            // pre-storage record rejections inside
+            // `put_record_field_from_ca`) generated Before+After=fail
+            // pairs that C would have silenced. The dispatch still
+            // sits here because the alternative — moving inside each
+            // match arm — would over-narrow the bracket around the
+            // actual storage call without removing the over-log
+            // (RecordField pre-rejections happen inside the called
+            // function; we can't disentangle pre-vs-post without a
+            // refactor). The AfterWrite `status` is now carried as
+            // a specific code string (see below) so listeners can
+            // filter.
             if trap_listeners_active {
                 epics_base_rs::server::access_security::dispatch_trap_write(
                     &epics_base_rs::server::access_security::TrapWriteMessage {
@@ -2542,6 +2561,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         host: &state.hostname,
                         peer: &state.peer,
                         value_str: &display_value,
+                        dbr_type: write_type as u16,
+                        no_elements: write_count,
+                        event_id: trap_event_id,
                         status: None,
                         rule_was_trap: true,
                     },
@@ -2573,8 +2595,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .audit("caput", &audit_pv, &display_value, audit_result)
                 .await;
 
-            // R2-53: AfterWrite notification with the post-put status.
-            if trap_listeners_active {
+            // R2-84: for the SYNCHRONOUS write paths (no async record
+            // completion pending), dispatch AfterWrite immediately
+            // with the now-known status. The async path defers
+            // AfterWrite into the background task that awaits
+            // `rx.await` so caPutLog sees real device-side completion
+            // timing, matching `write_notify_reply:1400` semantics.
+            let needs_async_after = is_notify && matches!(&write_result, Ok(Some(_)));
+            if trap_listeners_active && !needs_async_after {
                 epics_base_rs::server::access_security::dispatch_trap_write(
                     &epics_base_rs::server::access_security::TrapWriteMessage {
                         op: epics_base_rs::server::access_security::TrapWriteOp::AfterWrite,
@@ -2583,6 +2611,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         host: &state.hostname,
                         peer: &state.peer,
                         value_str: &display_value,
+                        dbr_type: write_type as u16,
+                        no_elements: write_count,
+                        event_id: trap_event_id,
                         status: Some(audit_result),
                         rule_was_trap: true,
                     },
@@ -2646,6 +2677,29 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                     let writer_c = writer.clone();
                     let busy_for_task = busy_arc.clone();
+                    // R2-84: snapshot the trap-dispatch inputs so the
+                    // async task can fire AfterWrite at *real*
+                    // completion time (matches C
+                    // `write_notify_reply:1400` semantics: the after-
+                    // hook fires from the extra-labor task after
+                    // `dbProcessNotify` invokes
+                    // `write_notify_done_callback`). Pre-fix Rust
+                    // dispatched AfterWrite synchronously with
+                    // `status=ok` the moment the put kicked off, so
+                    // caPutLog measured latency=0 and never observed
+                    // device-side PUTFAIL.
+                    let trap_inputs = trap_listeners_active.then(|| {
+                        (
+                            audit_pv.clone(),
+                            state.username.clone(),
+                            state.hostname.clone(),
+                            state.peer.clone(),
+                            display_value.clone(),
+                            write_type as u16,
+                            write_count,
+                            trap_event_id,
+                        )
+                    });
                     let join = tokio::spawn(async move {
                         // Wait indefinitely for record processing to complete,
                         // matching C EPICS rsrv behavior. RecvError means the
@@ -2656,6 +2710,35 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             Ok(()) => eca_status,
                             Err(_) => ECA_PUTFAIL,
                         };
+
+                        // R2-84: dispatch AfterWrite NOW, after real
+                        // device-side completion. `status` carries
+                        // "ok" for ECA_NORMAL or the ECA-code form
+                        // for anything else so listeners can filter
+                        // failed puts.
+                        if let Some((pv, user, host, peer, val, dbr, ne, ev_id)) = trap_inputs {
+                            let status_s = if final_status == ECA_NORMAL {
+                                "ok".to_string()
+                            } else {
+                                format!("eca:0x{:04x}", final_status)
+                            };
+                            epics_base_rs::server::access_security::dispatch_trap_write(
+                                &epics_base_rs::server::access_security::TrapWriteMessage {
+                                    op:
+                                        epics_base_rs::server::access_security::TrapWriteOp::AfterWrite,
+                                    pv_name: &pv,
+                                    user: &user,
+                                    host: &host,
+                                    peer: &peer,
+                                    value_str: &val,
+                                    dbr_type: dbr,
+                                    no_elements: ne,
+                                    event_id: ev_id,
+                                    status: Some(&status_s),
+                                    rule_was_trap: true,
+                                },
+                            );
+                        }
 
                         let _ = send_put_notify_response(
                             &writer_c,

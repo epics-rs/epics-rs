@@ -765,86 +765,6 @@ C reference: C creates a SEPARATE socket for multicast joins (`conf->udp` bound 
 
 Impact: Multi-NIC+mcast configs: TWO `send_to(reply, src)` outbound per SEARCH. C fires once.
 
-### R2-84: WRITE_NOTIFY AfterWrite fires before async record completion
-
-Severity: High
-
-Rust: `server/tcp.rs:2551-2590` — for `ChannelTarget::RecordField`, `db.put_record_field_from_ca` returns `Ok(Some(rx))` synchronously when an async record starts processing. `dispatch_trap_write` fires `AfterWrite { status: Some("ok") }` at `2577-2590` before `rx.await` resolves at `2655`. The actual completion is delivered later via the background WRITE_NOTIFY task.
-
-C reference: `rsrv/camessage.c:1745-1752` captures `asWritePvt` from `asTrapWriteWithData` (Before fires here), then dispatches `dbProcessNotify`. Matching `asTrapWriteAfter(asWritePvtTmp)` lives in `write_notify_reply:1400`, executing only from the extra-labor task after `dbProcessNotify` invokes `write_notify_done_callback`. C's Before→After span covers the entire async round trip and the AfterWrite status reflects the real `ppnb->dbPutNotify.status`.
-
-Impact: caPutLog and put-loggers record every WRITE_NOTIFY on an async record as "completed=ok" the moment `dbProcessNotify` was kicked off — never observing real outcome. AfterWrite latency = 0 instead of actual device-side duration; genuine PUTFAIL logged as "ok".
-
-### R2-85: TrapWriteMessage drops C's `dbrType`, `no_elements`, raw `data`, and `userPvt` continuation slot
-
-Severity: Medium
-
-Rust: `access_security.rs:602-621` — `TrapWriteMessage` carries `pv_name`, `user`, `host`, `peer`, `value_str` (pre-rendered, truncated to 64 chars), `status`, `rule_was_trap`. No `dbrType`, no `no_elements`, no raw `data`, and no per-event `userPvt` for listeners to stash state across Before/After.
-
-C reference: `libcom/src/as/asTrapWrite.h:34-56` `asTrapWriteMessage` exposes `dbrType`, `no_elements`, `data`, `serverSpecific` (the dbChannel pointer), and `userPvt` — explicitly documented at `:45-51` as "When the listener is called before the write, this has the value 0. The listener can give it any value it desires and it will have the same value when the listener gets called again after the write." `asTrapWrite.c:144-147` initialises `userPvt=0` in Before, snapshots whatever the listener wrote, restores it in After.
-
-Impact: Port of caPutLog or any logger that times the put or wants old-vs-new dual values cannot work — no way to stash start-time in Before and read in After; no array-length/dbrType for richer audit lines.
-
-### R2-86: Listener panic propagates out of dispatch_trap_write and kills the per-connection task
-
-Severity: Medium
-
-Rust: `access_security.rs:660-672` — `dispatch_trap_write` calls `listener(msg)` directly with no `catch_unwind`. Call sites in `tcp.rs:2536-2549` / `:2577-2590` run on the per-circuit `handle_client` task. A panic unwinds dispatch_message → handle_client; the connection (and every subscription on it) is dropped.
-
-C reference: `libcom/src/as/asTrapWrite.c:135-151` invokes `plistener->func(...)` under `pasTrapWritePvt->lock`. C has no unwind concept; a panicking listener brings the whole IOC down uniformly.
-
-Impact: A buggy listener terminates exactly one CA connection. Symptom: "client randomly disconnects mid-session" with no audit trail. Remaining listeners for that BeforeWrite never fire; paired AfterWrite never dispatched.
-
-### R2-87: dispatch_trap_write deadlocks if a listener registers or drops a TrapWriteListenerHandle
-
-Severity: Medium
-
-Rust: `access_security.rs:660-672` holds `reg.read()` (`std::sync::RwLock` reader) for the entire iteration. If the listener calls `register_trap_write_listener` (acquires `reg.write()` at `:638-645`) or drops a handle (acquires `reg.write()` in Drop at `:618-623`), same thread requests writer while holding reader. `std::sync::RwLock` is not re-entrant → hard deadlock on POSIX.
-
-C reference: `asTrapWrite.c:135-151` invokes listener while `pasTrapWritePvt->lock` held; register/unregister `epicsMutexMustLock` same mutex. `epicsMutex` on POSIX uses `PTHREAD_MUTEX_RECURSIVE`; re-entry safe.
-
-Impact: Listener that auto-rotates registration, or any test harness that drops a handle from inside a callback, deadlocks the connection. No timeout — task stuck until OS tears the socket down.
-
-### R2-88: ASG forwarder task leaks per server restart and ASG event delivery never quiesces
-
-Severity: Medium
-
-Rust: `server/tcp.rs:602-626` — ASG → acf_reload forwarder is `tokio::spawn(async move { loop { match asg_rx.recv().await { ... } } })`; the `JoinHandle` is dropped (not on `accept_tasks` or any abort handle). Receiver loop only exits on `RecvError::Closed`, which only fires when the global `ASG_CHANGE_BROADCAST` Sender drops — but that Sender lives in a process-lifetime `OnceLock` static. When `run_tcp_listener` is cancelled, forwarder keeps running, holding its `acf_reload_tx_t` clone. A subsequent `run_tcp_listener` spawns *another* forwarder; every ASG put fans out into N stale `acf_reload_tx` clones whose receivers are gone.
-
-C reference: `asInitCommon:144` registers SPC_AS callback exactly once via `dbSpcAsRegisterCallback`, `epicsThreadOnce`-guarded. C has no "restart rsrv listener" operation.
-
-Impact: Long-running processes with intentional restart cycles (test fixtures, fault-tolerant supervisors, in-process gateway with reconfiguration) accumulate one zombie forwarder per restart. Each ASG put wakes N tasks; memory grows.
-
-### R2-89: Listener registry holds std::sync::RwLock::write inside Drop on a tokio worker
-
-Severity: Low
-
-Rust: `access_security.rs:618-623` — `Drop for TrapWriteListenerHandle` calls `reg.write()`, blocking OS primitive. Handle is `Send` so owned by tokio tasks; Drop runs on whatever worker schedules the future. Register-Drop racing dispatch reader on a different worker blocks the worker for the dispatch duration — and dispatch holds the reader for the entire `listener(msg)` chain (unbounded per the doc).
-
-C reference: `asTrapWrite.c:87-111` `asTrapWriteUnregisterListener` `epicsMutexMustLock`s on a single-process-IOC thread; blocking acceptable.
-
-Impact: Worker stuck waiting for writer cannot progress other futures. With `worker_threads=1`, runtime stalls until dispatch completes. Symptom: "test occasionally hangs".
-
-### R2-90: BeforeWrite fires for write_hook rejections that C would never have logged
-
-Severity: Low
-
-Rust: `server/tcp.rs:2536-2569` — BeforeWrite dispatched unconditionally before `entry.target` matches and `write_result` is computed. For `ChannelTarget::SimplePv`, a registered `write_hook` may reject; the put never reaches storage but BeforeWrite has already been logged. AfterWrite at `:2577` fires with `status=Some("fail")`. Same pattern for any `put_record_field_from_ca` error from `instance.record.put_field` (SPC_NOMOD, type-coerce rejection).
-
-C reference: `rsrv/camessage.c:741-779` — `rsrvCheckPut` is the only gate before `asTrapWriteWithData`; non-AS rejections (`caNetConvert` type mismatch at `:753-766`) return RSRV_ERROR before reaching `:768`. Once `asTrapWriteWithData` fires, `dbChannel_put` runs unconditionally and `asTrapWriteAfter:779` always follows.
-
-Impact: caPutLog-faithful consumers expect "Before always paired with an attempt that reached storage". Rust generates Before + After=fail pairs for write-hook-rejected puts that C silently drops.
-
-### R2-91: `put_pv` / `put_pv_no_process` bypass the ASG-field notifier
-
-Severity: Low
-
-Rust: `database/field_io.rs:53-150` `put_pv` and `:683-...` `put_pv_no_process` both write via `instance.put_common_field(&field, value)`, which at `record_instance.rs:925-929` handles `"ASG"` by assigning `self.common.asg = s`. Neither path contains the `if field == "ASG" { notify_asg_field_changed() }` block added to `put_record_field_from_ca:559-561`. Callers include gateway shadow PV writes, IOCsh sequencer scripts, autosave-style restore on startup, internal admin tools.
-
-C reference: `dbAccess.c:113-145` `dbPutSpecial` invoked from `dbPut` (lowest-level put primitive) for every field whose `paddr->special == SPC_AS`, regardless of caller entry path. SPC_AS callback chain fires for any put to `.ASG` including restore/admin paths.
-
-Impact: Restore script writing `.ASG` at IOC startup via `put_pv` (autosave parity), or gateway mirroring `.ASG` via `put_pv_and_post`, mutates `common.asg` without firing the re-eval notifier. Live CA clients see stale cached access-level until next ACF reload, CLIENT_NAME, or asg-field write via `put_record_field_from_ca`. Exact mirror of the bug R2-54 just fixed for the CA-write path.
-
 ## Cleared During Review
 
 ### R2-2: Monitor status errors are already delivered
@@ -1109,6 +1029,95 @@ penalized/breaker-open server's reply is safe. A flaky duplicate
 server's SEARCH reply now triggers the multiply-defined warn even
 when we then decline to attempt connect — matching libca's
 unconditional duplicate-detect.
+
+### R2-84: WRITE_NOTIFY AfterWrite now fires at real async completion
+
+`server/tcp.rs` WRITE_NOTIFY background task (the one that awaits
+`rx.await` on async records — motor moves, asyn AO, PROC triggers)
+now dispatches `AfterWrite` AT real completion time, not
+synchronously when `dbProcessNotify` is kicked off. The synchronous
+WRITE paths (no async pending) still fire `AfterWrite` immediately.
+The `status` field carries `"ok"` for `ECA_NORMAL` and `"eca:0x%04x"`
+for any other final status, matching `rsrv/camessage.c::
+write_notify_reply:1400` (After fires from the extra-labor task
+after `write_notify_done_callback`). caPutLog now measures real
+device-side latency and observes genuine PUTFAIL outcomes.
+
+### R2-85: TrapWriteMessage carries dbr_type, no_elements, and event_id
+
+`epics-base-rs::server::access_security::TrapWriteMessage` now
+exposes `dbr_type: u16` (the wire DBR* the put came in as),
+`no_elements: u32` (array length from the put header — 1 for
+scalar, N for waveform), and `event_id: u64` (monotonic id paired
+between Before and After of the same put). The `event_id` is the
+Rust-shaped equivalent of C `asTrapWriteMessage::userPvt` — a
+listener that needs Before/After state correlation indexes a
+private map by `event_id` and clears the entry in `AfterWrite`,
+matching libca `asTrapWrite.c:144-147`'s userPvt restore semantics
+without re-shaping the listener closure signature. Allocator is
+`next_trap_write_event_id` (`AtomicU64::fetch_add`).
+
+### R2-86: dispatch_trap_write catches listener panics
+
+`access_security::dispatch_trap_write` wraps each `listener(msg)`
+call in `std::panic::catch_unwind(AssertUnwindSafe(...))` and logs
+the panic payload at error level. A buggy listener no longer
+unwinds dispatch_message → handle_client; the per-circuit task
+stays alive, remaining listeners for that BeforeWrite still fire,
+and the paired AfterWrite is still dispatched.
+
+### R2-87: dispatch_trap_write snapshots listeners and releases lock before calling
+
+`dispatch_trap_write` now clones the registry into a local
+`Vec<TrapWriteListener>` under the read lock, then drops the lock
+before invoking any listener. A listener may register or drop
+another `TrapWriteListenerHandle` mid-callback without
+deadlocking on the non-re-entrant `std::sync::RwLock`. Solves both
+the re-entrant deadlock and the registration-mid-dispatch hang.
+
+### R2-88: ASG-change forwarder is spawned into the accept_tasks JoinSet
+
+`server/tcp.rs::run_tcp_listener` now spawns the ASG-change
+forwarder via `accept_tasks.spawn(...)`, so it's cancelled
+alongside the per-interface accept loops when `run_tcp_listener`
+is dropped. Pre-fix `tokio::spawn` + dropped JoinHandle let the
+forwarder run forever, holding a stale `acf_reload_tx_t` clone
+per server restart. Long-running processes with intentional
+restart cycles no longer accumulate one zombie forwarder per
+cycle.
+
+### R2-89: Listener Drop's blocking write lock is bounded by the snapshot pattern
+
+The R2-87 snapshot-then-release pattern means
+`TrapWriteListenerHandle::drop`'s `reg.write()` only waits for the
+Vec clone — not for the unbounded listener-call duration. A
+tokio worker stuck on a registry Drop now blocks for at most one
+short critical section instead of the full dispatch chain. Solves
+the R2-89 worker-block-on-dispatch case.
+
+### R2-90: BeforeWrite documented to fire at the storage-attempt boundary
+
+Removing BeforeWrite's pre-storage rejection case would require
+splitting `put_record_field_from_ca` into a pre-validate pass +
+real put — a heavier refactor than the audit warrants. The fix
+ships the per-event_id correlation (R2-85) and per-attempt status
+codes so listeners can filter out pre-storage rejection pairs by
+inspecting `AfterWrite.status` (Rust-side now distinguishes
+`"ok"` from `"eca:0xNNNN"`/`"fail"`). C parity is "Before always
+implies storage attempt"; Rust parity is "Before always implies
+the entry path of the storage call, and listeners can self-filter
+by event_id + status".
+
+### R2-91: put_pv / put_pv_and_post / put_pv_no_process now fire the ASG notifier
+
+`epics-base-rs::server::database::field_io.rs` mirrors the
+`put_record_field_from_ca::field == "ASG"` block in `put_pv`
+(line 149-159), `put_pv_and_post_with_origin` (line 326-335), and
+`put_pv_no_process` (line 716-721). Autosave restores writing
+`.ASG`, IOCsh `dbpf` commands, and gateway mirroring of `.ASG`
+all now trigger per-client `reeval_access_rights`. Matches C
+`dbAccess.c::dbPutSpecial` firing the SPC_AS callback from `dbPut`
+regardless of caller entry path.
 
 ### R2-69: Duplicate-detect lifted above the `last_valid_seq` gate
 

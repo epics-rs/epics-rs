@@ -146,6 +146,16 @@ impl PvDatabase {
                 CommonFieldPutResult::NoChange => {}
             }
 
+            // R2-91: mirror the CA-write path's ASG-field notifier so
+            // restore scripts / autosave / admin tools that go via
+            // `put_pv` (not `put_record_field_from_ca`) also trigger
+            // per-client `reeval_access_rights`. C `dbAccess.c::
+            // dbPutSpecial` invokes the SPC_AS callback from dbPut
+            // regardless of caller entry path.
+            if field == "ASG" {
+                crate::server::access_security::notify_asg_field_changed();
+            }
+
             return Ok(());
         }
 
@@ -313,6 +323,14 @@ impl PvDatabase {
                         origin,
                     );
                 }
+            }
+
+            // R2-91: same SPC_AS parity as `put_pv` / `put_pv_no_process`
+            // / the CA-write path — a gateway mirroring `.ASG` via
+            // `put_pv_and_post` must still trigger per-client
+            // re-eval.
+            if field == "ASG" {
+                crate::server::access_security::notify_asg_field_changed();
             }
 
             return Ok(());
@@ -703,6 +721,12 @@ impl PvDatabase {
             // Invalidate metadata cache only if the metadata-class
             // field actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
+            // R2-91: same SPC_AS parity as `put_pv` / the CA-write
+            // path — autosave-style restores writing `.ASG` at IOC
+            // startup must still trigger per-client re-eval.
+            if field == "ASG" {
+                crate::server::access_security::notify_asg_field_changed();
+            }
             return Ok(());
         }
 
